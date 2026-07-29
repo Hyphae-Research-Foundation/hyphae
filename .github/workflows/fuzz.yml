@@ -2,13 +2,6 @@ name: Fuzz
 
 on:
   pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/hyphae-engine/**"
-      - "crates/hyphae-storage/**"
-      - "fuzz/**"
-      - ".github/workflows/fuzz.yml"
   push:
     branches:
       - main

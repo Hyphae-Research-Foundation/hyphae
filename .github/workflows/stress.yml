@@ -2,13 +2,6 @@ name: Stress
 
 on:
   pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "tools/run_load_gate.py"
-      - "tools/run_soak_gate.py"
-      - ".github/workflows/stress.yml"
   push:
     branches:
       - main
