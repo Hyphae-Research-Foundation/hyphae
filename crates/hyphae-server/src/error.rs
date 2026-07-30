@@ -8,10 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyphae_contracts::v1::ErrorV1;
-use hyphae_engine::{EngineError, ProofError, RetrievalProofError};
+use hyphae_engine::{BoundedEngineQueryError, EngineError, ProofError, RetrievalProofError};
 use hyphae_query::QueryError;
 use hyphae_retrieval::{ExactRetrievalError, HybridError, LexicalError};
-use hyphae_storage::{LogError, MaterializedIndexError, MutationError, StorageError};
+use hyphae_storage::{
+    LogError, MaterializedIndexError, MutationError, SnapshotError, StorageError,
+    StorageLimitError, storage_limit_from_io,
+};
 use thiserror::Error;
 
 use crate::ServerConfigError;
@@ -89,6 +92,15 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn timeout(request_id: &str) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout",
+            "operation deadline elapsed without a partial result",
+            request_id,
+        )
+    }
+
     pub(crate) fn result_too_large(request_id: &str) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -135,6 +147,13 @@ impl ApiError {
             | EngineError::Proof(_)
             | EngineError::RetrievalProof(_)
             | EngineError::Retrieval(_) => Self::internal(request_id),
+        }
+    }
+
+    pub(crate) fn from_bounded_query(error: BoundedEngineQueryError, request_id: &str) -> Self {
+        match error {
+            BoundedEngineQueryError::Engine(source) => Self::from_engine(source, request_id),
+            BoundedEngineQueryError::ScannedByteBudgetExceeded { .. } => Self::limit(request_id),
         }
     }
 
@@ -199,12 +218,7 @@ impl ApiError {
 
     fn from_query(error: &QueryError, request_id: &str) -> Self {
         match error {
-            QueryError::TimedOut => Self::new(
-                StatusCode::REQUEST_TIMEOUT,
-                "timeout",
-                "query deadline elapsed without a partial result",
-                request_id,
-            ),
+            QueryError::TimedOut => Self::timeout(request_id),
             QueryError::ResultLimitExceeded { .. }
             | QueryError::FilterNodesExceeded { .. }
             | QueryError::FilterDepthExceeded { .. }
@@ -252,10 +266,15 @@ impl ApiError {
                     MaterializedIndexError::UnknownVectorSpace { .. }
                         | MaterializedIndexError::UnknownLexicalIndex { .. }
                         | MaterializedIndexError::Vector(_)
-                        | MaterializedIndexError::Lexical(_)
                 ) =>
             {
                 Self::invalid(request_id)
+            }
+            StorageError::Index { source } => {
+                if let MaterializedIndexError::Lexical(source) = source.as_ref() {
+                    return Self::from_lexical(source, request_id);
+                }
+                Self::internal(request_id)
             }
             StorageError::Mutation(
                 MutationError::EmptyKey
@@ -267,6 +286,31 @@ impl ApiError {
                 | LogError::TooManyOperations
                 | LogError::PayloadTooLarge { .. },
             ) => Self::limit(request_id),
+            StorageError::Log(LogError::Io(source))
+                if matches!(
+                    storage_limit_from_io(source),
+                    Some(StorageLimitError::TimedOut)
+                ) =>
+            {
+                Self::timeout(request_id)
+            }
+            StorageError::Log(LogError::Io(source)) if storage_limit_from_io(source).is_some() => {
+                Self::limit(request_id)
+            }
+            StorageError::Snapshot { source } if source.is_timeout() => Self::timeout(request_id),
+            StorageError::Snapshot { source } if source.storage_limit().is_some() => {
+                Self::limit(request_id)
+            }
+            StorageError::Snapshot { source }
+                if matches!(
+                    source.as_ref(),
+                    SnapshotError::FileLimitExceeded { .. }
+                        | SnapshotError::EntryLimitExceeded { .. }
+                        | SnapshotError::DecodedBytesLimitExceeded { .. }
+                ) =>
+            {
+                Self::result_too_large(request_id)
+            }
             StorageError::Log(LogError::IdempotencyConflict { .. }) => Self::new(
                 StatusCode::CONFLICT,
                 "idempotency_conflict",

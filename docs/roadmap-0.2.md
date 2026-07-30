@@ -1,14 +1,21 @@
 # Hyphae 0.2 execution roadmap
 
-Status: local `0.2.0` release-candidate closure
+Status: historical `0.2.0` implementation record
 
 Target: proof-bearing durable retrieval
 
-This roadmap records the work for Hyphae `0.2`. Gates 0 through 8 are complete
-locally with contracts, specifications, tests, and evidence. Gate 9 local
-evidence is complete; the exact hosted matrix and publication remain pending
-because no source, tag, or release may be uploaded without explicit
-authorization.
+This roadmap records the implementation work for Hyphae `0.2.0`. Gates 0
+through 8 were completed locally with contracts, specifications, tests, and
+evidence. The unchecked Gate 9 items remain unchecked because the repository
+does not contain hosted closure evidence for the exact release commit. This
+document is not current release authorization. The annotated `v0.2.0` tag
+peels to `170380453a2ca6322a4c8bc50417318daee1c011`, and the matching
+[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0) is
+published; those observable outcomes do not replace the missing retained
+hosted receipts.
+
+Maintenance release `0.2.1` is tracked separately in
+[`gates/0.2.1.md`](gates/0.2.1.md).
 
 The work starts from commit
 `51ab2bc73ac6e93664bf455c5ebeb5993482baa9`. The repository audit and baseline
@@ -71,7 +78,7 @@ scope:
 | 6 | Provider-free lexical retrieval | Complete locally |
 | 7 | Deterministic hybrid retrieval | Complete locally |
 | 8 | Equivalent SDK, CLI, and MCP surfaces | Complete locally |
-| 9 | Benchmarks, compatibility evidence, and release closure | Complete locally; hosted closure awaits authorization |
+| 9 | Benchmarks, compatibility evidence, and release closure | Complete locally; `v0.2.0` published; hosted closure not demonstrated by retained evidence |
 
 Gates are sequential. Work may be explored in parallel, but no later gate may
 be declared complete while an earlier exit criterion is red.
@@ -101,9 +108,10 @@ necessary.
 | HYP-0215 | 8 | Extend Rust, TypeScript, Python, CLI, MCP, and adapters | HYP-0212, HYP-0214 | Generated clients and shared conformance |
 | HYP-0216 | 9 | Close performance, compatibility, security, documentation, and release evidence | HYP-0215 | Exact-commit release gate |
 
-HYP-0201 through HYP-0216 are implemented and gated locally. Publication is
-not part of the implementation queue and remains a separately authorized
-action.
+HYP-0201 through HYP-0216 were implemented and gated locally. Publication was
+outside the implementation queue and required separate authorization. The
+later `v0.2.0` publication is recorded above; it does not close the missing
+hosted evidence.
 
 ## Gate 0 — Audit and baseline
 
@@ -292,7 +300,13 @@ No client or adapter may depend on an internal engine or storage crate.
   conformance, documentation, and compatibility gates.
 - [x] Update capabilities, limits, migration, backup, API, client, security,
   and release documentation.
-- [ ] Cut a release only after all evidence points to one exact commit.
+- [x] Publish the annotated `v0.2.0` tag, GitHub release, and ten Rust crates.
+- [ ] Retain commit-bound evidence proving that every required hosted result
+  and published artifact points to the exact release commit.
+
+The published `v0.2.0` outcome is recorded above. The unchecked Gate 9 items
+remain an evidence gap in this historical record, not an assertion that no
+release exists.
 
 ## Planned change slices
 

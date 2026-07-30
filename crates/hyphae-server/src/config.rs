@@ -71,7 +71,9 @@ impl fmt::Debug for BearerToken {
     }
 }
 
-/// Complete resource policy enforced by one HTTP server process.
+/// Request, response, admission, and witness policy enforced by one HTTP
+/// server process. Embedded storage recovery/maintenance uses `StorageLimits`
+/// through `HyphaeServer::open_with_storage_limits`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerLimits {
     /// Maximum complete JSON request bytes.

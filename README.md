@@ -25,10 +25,19 @@ Rust. Its base deployment is one native `hyphae` executable and one data
 directory. KV, structured query, recovery, and verification work offline
 without a database, cache, cloud service, embedding provider, or LLM.
 
-**Release version:** `0.2.0`. This release adds durable vector spaces,
-provider-free lexical retrieval, deterministic hybrid fusion, and portable
-offline-verifiable retrieval proofs while preserving the one-binary,
-one-data-directory product boundary.
+**Source candidate version:** `0.2.1`. This candidate accepts large but bounded
+offline snapshot witnesses and adds SemVer-compatible bounded query,
+recovery, snapshot, and compaction paths used by the packaged CLI/server.
+Published `0.2.0` embedded entry points retain their signatures, exhaustive
+error surfaces, and compatibility behavior. Source version preparation does
+not establish that the candidate was tagged or published.
+
+**Latest published release:** [`v0.2.0`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0).
+Its annotated tag peels to
+`170380453a2ca6322a4c8bc50417318daee1c011`, and all ten publishable Rust
+workspace crates are available on crates.io at version `0.2.0`. The historical
+release gate retains two unchecked hosted-evidence items because their exact
+receipts are not preserved in this repository.
 
 ## What Hyphae does
 
@@ -61,22 +70,24 @@ surface differences, default limits, and deliberate non-capabilities.
 
 ## Install
 
-After the crates.io publication completes, install the single native binary:
+Install the latest published native binary:
 
 ```bash
 cargo install hyphae-cli --version 0.2.0 --locked
 hyphae version --json
 ```
 
-Embed the engine with an exact product-version requirement:
+Embed the latest published engine with an exact product-version requirement:
 
 ```bash
 cargo add hyphae-engine@=0.2.0
 ```
 
-After the GitHub release workflow completes, native archives, checksums, SBOMs,
-provenance, signatures, and attestations are attached to the
-[latest GitHub release](https://github.com/celiumsai/hyphae/releases/latest).
+The `0.2.1` source candidate is not published. Use `0.2.1` package commands
+only after the corresponding registries list that version. Native archives,
+checksums, SBOMs, provenance, signatures, and attestations for `0.2.0` are
+attached to its
+[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0).
 
 ## Five-minute local flow
 
@@ -134,7 +145,7 @@ and versioned [storage specifications](docs/README.md#durable-formats).
 | `hyphae-client` | Bounded async Rust HTTP client |
 | `@celiums/hyphae` | Dependency-free TypeScript client |
 | `hyphae-sdk` | Dependency-free Python client |
-| MCP stdio | Five schema-bound tools over `/v1` |
+| MCP stdio | Twelve schema-bound tools over `/v1` |
 | Optional adapters | PliegoRS, Astro, Next, and Vite consumers |
 
 OpenAPI 3.1 and JSON Schema 2020-12 under `contracts/` are the canonical wire

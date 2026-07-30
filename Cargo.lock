@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "hyphae-client",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyphae-contracts",
  "reqwest",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-conformance-rust"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyphae-client",
  "hyphae-contracts",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -606,11 +606,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "hyphae-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-pliegors"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyphae-client",
  "thiserror",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-retrieval"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyphae-core",
  "hyphae-query",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",

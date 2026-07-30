@@ -5,6 +5,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use hyphae_core::{
@@ -13,13 +14,15 @@ use hyphae_core::{
 };
 use hyphae_query::FieldPath;
 use hyphae_retrieval::{
-    LexicalField, LexicalIndexDefinition, MAX_LEXICAL_FIELDS, MAX_LEXICAL_PATH_SEGMENT_BYTES,
-    MAX_LEXICAL_PATH_SEGMENTS,
+    LexicalError, LexicalField, LexicalIndexDefinition, MAX_LEXICAL_FIELDS,
+    MAX_LEXICAL_PATH_SEGMENT_BYTES, MAX_LEXICAL_PATH_SEGMENTS,
 };
 use thiserror::Error;
 
 use crate::{
-    CommitReceipt, MAX_KEY_BYTES, MaterializedIndexError, index::MaterializedIndex,
+    CommitReceipt, MAX_KEY_BYTES, MaterializedIndexError, StorageLimitError,
+    index::MaterializedIndex,
+    limits::{OperationDeadline, limit_io_error, storage_limit_from_io},
     log::MAX_OPERATION_BYTES,
 };
 
@@ -72,7 +75,8 @@ pub struct SnapshotInfo {
 pub struct SnapshotReadLimits {
     /// Maximum complete snapshot file length.
     pub file_bytes: u64,
-    /// Maximum number of logical KV entries.
+    /// Maximum retained KV and retrieval records. Receipts are verified but
+    /// not retained; file bytes and the cooperative deadline bound them.
     pub entries: u64,
     /// Maximum aggregate decoded key and value bytes retained in memory.
     pub decoded_bytes: u64,
@@ -187,6 +191,56 @@ pub enum SnapshotError {
     },
 }
 
+impl From<StorageLimitError> for SnapshotError {
+    fn from(source: StorageLimitError) -> Self {
+        Self::Io(limit_io_error(source))
+    }
+}
+
+impl SnapshotError {
+    /// Returns the typed finite-policy failure retained in this error's source
+    /// chain, when present.
+    pub fn storage_limit(&self) -> Option<&StorageLimitError> {
+        if let Self::Io(source) = self
+            && let Some(source) = storage_limit_from_io(source)
+        {
+            return Some(source);
+        }
+        let mut current: &(dyn std::error::Error + 'static) = self;
+        loop {
+            if let Some(source) = current.downcast_ref::<StorageLimitError>() {
+                return Some(source);
+            }
+            let source = current.source()?;
+            current = source;
+        }
+    }
+
+    /// Reports whether this snapshot failure was caused by expiration of a
+    /// cooperative storage deadline.
+    pub fn is_timeout(&self) -> bool {
+        if matches!(self, Self::Io(source) if source.kind() == io::ErrorKind::TimedOut) {
+            return true;
+        }
+        if matches!(self.storage_limit(), Some(StorageLimitError::TimedOut)) {
+            return true;
+        }
+        let mut current: &(dyn std::error::Error + 'static) = self;
+        loop {
+            if matches!(
+                current.downcast_ref::<LexicalError>(),
+                Some(LexicalError::TimedOut)
+            ) {
+                return true;
+            }
+            let Some(source) = current.source() else {
+                return false;
+            };
+            current = source;
+        }
+    }
+}
+
 impl From<MaterializedIndexError> for SnapshotError {
     fn from(source: MaterializedIndexError) -> Self {
         Self::Index {
@@ -201,7 +255,10 @@ pub(crate) fn create_snapshot(
     snapshots_directory: &Path,
     temporary_directory: &Path,
     disk_format_version: u16,
+    limits: &SnapshotReadLimits,
+    deadline: &OperationDeadline,
 ) -> Result<SnapshotInfo, SnapshotError> {
+    check_snapshot_deadline(Some(deadline))?;
     let checkpoint = index.checkpoint()?;
     if checkpoint.sequence == 0 && checkpoint.digest.is_some() {
         return Err(SnapshotError::Invalid {
@@ -209,11 +266,24 @@ pub(crate) fn create_snapshot(
         });
     }
 
-    let measurements = measure_payload(index, checkpoint.sequence, disk_format_version)?;
+    let measurements = measure_payload(
+        index,
+        checkpoint.sequence,
+        disk_format_version,
+        limits,
+        deadline,
+    )?;
+    validate_measurement_limits(&measurements, limits)?;
     let final_path =
         snapshots_directory.join(format!("snapshot-{:020}.hysnap", checkpoint.sequence));
     if final_path.exists() {
-        let existing = verify_snapshot(&final_path)?;
+        let mut existing_file = open_snapshot_file(&final_path)?;
+        let existing = verify_snapshot_file(
+            &mut existing_file,
+            &final_path,
+            Some(limits),
+            Some(deadline),
+        )?;
         if existing.checkpoint_digest != checkpoint.digest {
             return Err(SnapshotError::CheckpointConflict {
                 sequence: checkpoint.sequence,
@@ -241,6 +311,10 @@ pub(crate) fn create_snapshot(
         if checksum_error.is_some() {
             return;
         }
+        if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+            checksum_error = Some(source);
+            return;
+        }
         match encode_entry_header(key, value) {
             Ok(entry_header) => {
                 checksum = crc32c::crc32c_append(checksum, &entry_header);
@@ -257,6 +331,10 @@ pub(crate) fn create_snapshot(
     if disk_format_version >= 2 {
         index.for_each_vector_space(|definition| {
             if vector_checksum_error.is_none() {
+                if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                    vector_checksum_error = Some(source);
+                    return;
+                }
                 match encode_vector_space(definition) {
                     Ok(encoded) => checksum = crc32c::crc32c_append(checksum, &encoded),
                     Err(source) => vector_checksum_error = Some(source),
@@ -265,6 +343,10 @@ pub(crate) fn create_snapshot(
         })?;
         index.for_each_vector(|space, key, vector| {
             if vector_checksum_error.is_none() {
+                if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                    vector_checksum_error = Some(source);
+                    return;
+                }
                 match encode_vector(space, key, vector) {
                     Ok(encoded) => checksum = crc32c::crc32c_append(checksum, &encoded),
                     Err(source) => vector_checksum_error = Some(source),
@@ -273,6 +355,10 @@ pub(crate) fn create_snapshot(
         })?;
         index.for_each_lexical_index(|definition| {
             if vector_checksum_error.is_none() {
+                if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                    vector_checksum_error = Some(source);
+                    return;
+                }
                 match encode_lexical_index(definition) {
                     Ok(encoded) => checksum = crc32c::crc32c_append(checksum, &encoded),
                     Err(source) => vector_checksum_error = Some(source),
@@ -280,12 +366,18 @@ pub(crate) fn create_snapshot(
             }
         })?;
     }
+    index.for_each_receipt(|receipt| {
+        if vector_checksum_error.is_none() {
+            if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                vector_checksum_error = Some(source);
+            } else {
+                checksum = crc32c::crc32c_append(checksum, &encode_receipt(receipt));
+            }
+        }
+    })?;
     if let Some(source) = vector_checksum_error {
         return Err(source);
     }
-    index.for_each_receipt(|receipt| {
-        checksum = crc32c::crc32c_append(checksum, &encode_receipt(receipt));
-    })?;
     header[76..80].copy_from_slice(&checksum.to_le_bytes());
 
     let temporary_path = temporary_directory.join(format!(
@@ -293,6 +385,7 @@ pub(crate) fn create_snapshot(
         checkpoint.sequence,
         uuid::Uuid::now_v7()
     ));
+    let mut temporary_guard = TemporaryFileGuard::new(temporary_path.clone());
     let mut file = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -309,7 +402,7 @@ pub(crate) fn create_snapshot(
     let mut write_error = None;
     index.for_each_entry(|key, value| {
         if write_error.is_none()
-            && let Err(source) = write_entry(&mut file, &mut hasher, key, value)
+            && let Err(source) = write_entry(&mut file, &mut hasher, key, value, Some(deadline))
         {
             write_error = Some(source);
         }
@@ -321,24 +414,36 @@ pub(crate) fn create_snapshot(
     if disk_format_version >= 2 {
         index.for_each_vector_space(|definition| {
             if vector_write_error.is_none()
-                && let Err(source) =
-                    write_encoded(&mut file, &mut hasher, encode_vector_space(definition))
+                && let Err(source) = write_encoded_with_deadline(
+                    &mut file,
+                    &mut hasher,
+                    encode_vector_space(definition),
+                    Some(deadline),
+                )
             {
                 vector_write_error = Some(source);
             }
         })?;
         index.for_each_vector(|space, key, vector| {
             if vector_write_error.is_none()
-                && let Err(source) =
-                    write_encoded(&mut file, &mut hasher, encode_vector(space, key, vector))
+                && let Err(source) = write_encoded_with_deadline(
+                    &mut file,
+                    &mut hasher,
+                    encode_vector(space, key, vector),
+                    Some(deadline),
+                )
             {
                 vector_write_error = Some(source);
             }
         })?;
         index.for_each_lexical_index(|definition| {
             if vector_write_error.is_none()
-                && let Err(source) =
-                    write_encoded(&mut file, &mut hasher, encode_lexical_index(definition))
+                && let Err(source) = write_encoded_with_deadline(
+                    &mut file,
+                    &mut hasher,
+                    encode_lexical_index(definition),
+                    Some(deadline),
+                )
             {
                 vector_write_error = Some(source);
             }
@@ -350,6 +455,10 @@ pub(crate) fn create_snapshot(
     let mut receipt_write_error = None;
     index.for_each_receipt(|receipt| {
         if receipt_write_error.is_none()
+            && let Err(source) = check_snapshot_deadline(Some(deadline))
+        {
+            receipt_write_error = Some(source);
+        } else if receipt_write_error.is_none()
             && let Err(source) = write_receipt(&mut file, &mut hasher, receipt)
         {
             receipt_write_error = Some(source);
@@ -364,8 +473,16 @@ pub(crate) fn create_snapshot(
     file.sync_all()?;
     drop(file);
 
-    let temporary_info = verify_snapshot(&temporary_path)?;
+    let mut temporary_file = open_snapshot_file(&temporary_path)?;
+    let temporary_info = verify_snapshot_file(
+        &mut temporary_file,
+        &temporary_path,
+        Some(limits),
+        Some(deadline),
+    )?;
+    check_snapshot_deadline(Some(deadline))?;
     std::fs::rename(&temporary_path, &final_path)?;
+    temporary_guard.disarm();
     #[cfg(unix)]
     sync_directory(snapshots_directory)?;
     Ok(SnapshotInfo {
@@ -382,15 +499,104 @@ pub(crate) fn create_snapshot(
 /// duplicate keys, invalid checksums, or invalid digests.
 pub fn verify_snapshot(path: impl AsRef<Path>) -> Result<SnapshotInfo, SnapshotError> {
     let path = path.as_ref();
-    let mut file = File::open(path)?;
-    let file_bytes = file.metadata()?.len();
-    let mut header = [0_u8; HEADER_LENGTH];
-    read_exact_or_invalid(&mut file, &mut header, "truncated header")?;
-    let decoded = decode_header(&header, file_bytes)?;
-    let (vector_space_count, vector_count, lexical_index_count) =
-        verify_payload(&mut file, &header, &decoded)?;
+    let mut file = open_snapshot_file(path)?;
+    verify_snapshot_file(&mut file, path, None, None)
+}
 
-    Ok(SnapshotInfo {
+/// Streams and verifies a snapshot under explicit resource limits and one
+/// cooperative end-to-end timeout.
+///
+/// # Errors
+///
+/// Returns a canonical snapshot error, I/O error, concurrent-change error,
+/// resource-limit error, or a timeout detectable with
+/// [`SnapshotError::is_timeout`].
+pub fn verify_snapshot_with_limits(
+    path: impl AsRef<Path>,
+    limits: &SnapshotReadLimits,
+    timeout: Duration,
+) -> Result<SnapshotInfo, SnapshotError> {
+    let deadline = OperationDeadline::new(timeout);
+    verify_snapshot_with_policy(path.as_ref(), limits, &deadline)
+}
+
+/// Opens one snapshot, verifies that exact file handle under explicit limits,
+/// rewinds it, and returns the still-open verified handle for safe streaming.
+///
+/// Keeping this handle open prevents a path replacement between verification
+/// and consumption from selecting a different file.
+///
+/// # Errors
+///
+/// Returns a canonical snapshot error, I/O error, resource-limit error, or
+/// a timeout detectable with [`SnapshotError::is_timeout`].
+pub fn open_verified_snapshot_with_limits(
+    path: impl AsRef<Path>,
+    limits: &SnapshotReadLimits,
+    timeout: Duration,
+) -> Result<(File, SnapshotInfo), SnapshotError> {
+    let path = path.as_ref();
+    let deadline = OperationDeadline::new(timeout);
+    let mut file = open_snapshot_file(path)?;
+    let info = verify_snapshot_file(&mut file, path, Some(limits), Some(&deadline))?;
+    check_snapshot_deadline(Some(&deadline))?;
+    file.seek(SeekFrom::Start(0))?;
+    ensure_snapshot_file_length_unchanged(&file, info.file_bytes)?;
+    check_snapshot_deadline(Some(&deadline))?;
+    Ok((file, info))
+}
+
+pub(crate) fn verify_snapshot_with_policy(
+    path: &Path,
+    limits: &SnapshotReadLimits,
+    deadline: &OperationDeadline,
+) -> Result<SnapshotInfo, SnapshotError> {
+    let mut file = open_snapshot_file(path)?;
+    verify_snapshot_file(&mut file, path, Some(limits), Some(deadline))
+}
+
+fn verify_snapshot_file(
+    file: &mut File,
+    path: &Path,
+    limits: Option<&SnapshotReadLimits>,
+    deadline: Option<&OperationDeadline>,
+) -> Result<SnapshotInfo, SnapshotError> {
+    check_snapshot_deadline(deadline)?;
+    file.seek(SeekFrom::Start(0))?;
+    let file_bytes = snapshot_file_length(file)?;
+    if let Some(limits) = limits {
+        validate_file_limit(file_bytes, limits)?;
+    }
+    let mut header = [0_u8; HEADER_LENGTH];
+    read_exact_or_invalid(file, &mut header, "truncated header")?;
+    let decoded = decode_header(&header, file_bytes)?;
+    let verified_counts = verify_payload(file, &header, &decoded, limits, deadline, None)?;
+    let verified = snapshot_info(
+        path,
+        file_bytes,
+        &decoded,
+        verified_counts.0,
+        verified_counts.1,
+        verified_counts.2,
+    );
+    if let Some(limits) = limits {
+        validate_read_limits(&verified, limits)?;
+    }
+    check_snapshot_deadline(deadline)?;
+    ensure_snapshot_file_length_unchanged(file, file_bytes)?;
+    check_snapshot_deadline(deadline)?;
+    Ok(verified)
+}
+
+fn snapshot_info(
+    path: &Path,
+    file_bytes: u64,
+    decoded: &DecodedHeader,
+    vector_space_count: u64,
+    vector_count: u64,
+    lexical_index_count: u64,
+) -> SnapshotInfo {
+    SnapshotInfo {
         path: path.to_path_buf(),
         disk_format_version: decoded.disk_format_version,
         checkpoint_sequence: decoded.checkpoint_sequence,
@@ -402,15 +608,15 @@ pub fn verify_snapshot(path: impl AsRef<Path>) -> Result<SnapshotInfo, SnapshotE
         receipt_count: decoded.receipt_count,
         snapshot_digest: decoded.expected_digest,
         file_bytes,
-    })
+    }
 }
 
 /// Loads every logical KV entry from a verified snapshot under explicit
 /// resource limits.
 ///
-/// The snapshot is verified before and after streaming to reject mutation
-/// during the read. Durable idempotency receipts are verified but are not
-/// retained in the returned witness.
+/// The same pass that collects records validates their canonical order,
+/// resource bounds, checksum, and digest. Durable idempotency receipts are
+/// verified but are not retained in the returned witness.
 ///
 /// # Errors
 ///
@@ -420,7 +626,32 @@ pub fn load_snapshot(
     path: impl AsRef<Path>,
     limits: &SnapshotReadLimits,
 ) -> Result<SnapshotContents, SnapshotError> {
-    let path = path.as_ref();
+    load_snapshot_inner(path.as_ref(), limits, None)
+}
+
+/// Loads a verified snapshot under explicit resource limits and a cooperative
+/// end-to-end timeout.
+///
+/// # Errors
+///
+/// Returns a canonical snapshot error, I/O error, concurrent-change error,
+/// resource-limit error, or a timeout detectable with
+/// [`SnapshotError::is_timeout`].
+pub fn load_snapshot_with_timeout(
+    path: impl AsRef<Path>,
+    limits: &SnapshotReadLimits,
+    timeout: Duration,
+) -> Result<SnapshotContents, SnapshotError> {
+    let deadline = OperationDeadline::new(timeout);
+    load_snapshot_inner(path.as_ref(), limits, Some(&deadline))
+}
+
+fn load_snapshot_inner(
+    path: &Path,
+    limits: &SnapshotReadLimits,
+    deadline: Option<&OperationDeadline>,
+) -> Result<SnapshotContents, SnapshotError> {
+    check_snapshot_deadline(deadline)?;
     let mut collector = SnapshotCollector {
         entries: Vec::new(),
         vector_spaces: Vec::new(),
@@ -429,7 +660,7 @@ pub fn load_snapshot(
         decoded_bytes: 0,
         limits,
     };
-    let info = read_snapshot_records_with_limits(path, &mut collector, Some(limits))?;
+    let info = read_snapshot_records_with_limits(path, &mut collector, Some(limits), deadline)?;
     Ok(SnapshotContents {
         info,
         entries: collector.entries,
@@ -439,6 +670,11 @@ pub fn load_snapshot(
     })
 }
 
+/// Receives provisional records during an authenticated snapshot pass.
+///
+/// Implementations must not commit their side effects unless the surrounding
+/// snapshot read returns `Ok`; final checksum and digest validation necessarily
+/// happens after the last callback.
 pub(crate) trait SnapshotRecordVisitor {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), SnapshotError>;
     fn vector_space(&mut self, _definition: &VectorSpaceDefinition) -> Result<(), SnapshotError> {
@@ -458,110 +694,128 @@ pub(crate) trait SnapshotRecordVisitor {
     fn receipt(&mut self, receipt: &CommitReceipt) -> Result<(), SnapshotError>;
 }
 
-pub(crate) fn read_snapshot_records(
+pub(crate) fn read_snapshot_records_with_policy(
     path: &Path,
     visitor: &mut impl SnapshotRecordVisitor,
+    limits: &SnapshotReadLimits,
+    deadline: &OperationDeadline,
 ) -> Result<SnapshotInfo, SnapshotError> {
-    read_snapshot_records_with_limits(path, visitor, None)
+    read_snapshot_records_with_limits(path, visitor, Some(limits), Some(deadline))
 }
 
 fn read_snapshot_records_with_limits(
     path: &Path,
     visitor: &mut impl SnapshotRecordVisitor,
     limits: Option<&SnapshotReadLimits>,
+    deadline: Option<&OperationDeadline>,
 ) -> Result<SnapshotInfo, SnapshotError> {
-    let before = verify_snapshot(path)?;
+    check_snapshot_deadline(deadline)?;
+    let mut file = open_snapshot_file(path)?;
+    let file_bytes = snapshot_file_length(&file)?;
     if let Some(limits) = limits {
-        validate_read_limits(&before, limits)?;
+        validate_file_limit(file_bytes, limits)?;
     }
-    let mut file = File::open(path)?;
-    let file_bytes = file.metadata()?.len();
     let mut header = [0_u8; HEADER_LENGTH];
     read_exact_or_invalid(&mut file, &mut header, "truncated header")?;
     let decoded = decode_header(&header, file_bytes)?;
-    let mut consumed = 0_u64;
-    let (vector_space_count, vector_count, lexical_index_count) =
-        read_v2_counts(&mut file, &decoded, &mut consumed)?;
+    let (vector_space_count, vector_count, lexical_index_count) = verify_payload(
+        &mut file,
+        &header,
+        &decoded,
+        limits,
+        deadline,
+        Some(visitor),
+    )?;
+    let verified = snapshot_info(
+        path,
+        file_bytes,
+        &decoded,
+        vector_space_count,
+        vector_count,
+        lexical_index_count,
+    );
+    if let Some(limits) = limits {
+        validate_read_limits(&verified, limits)?;
+    }
+    check_snapshot_deadline(deadline)?;
+    ensure_snapshot_file_length_unchanged(&file, file_bytes)?;
+    check_snapshot_deadline(deadline)?;
+    Ok(verified)
+}
 
-    for _ in 0..decoded.entry_count {
-        let mut entry_header = [0_u8; ENTRY_HEADER_LENGTH];
-        read_payload_exact(
-            &mut file,
-            &mut entry_header,
-            &mut consumed,
-            decoded.payload_length,
-        )?;
-        let key_length = usize::try_from(u32::from_le_bytes(copy_array(&entry_header[..4])))
-            .map_err(|_| SnapshotError::Invalid {
-                reason: "key length overflow during restore",
-            })?;
-        let value_length = usize::try_from(u64::from_le_bytes(copy_array(&entry_header[4..12])))
-            .map_err(|_| SnapshotError::Invalid {
-                reason: "value length overflow during restore",
-            })?;
-        if key_length == 0 || key_length > MAX_KEY_BYTES || value_length > MAX_OPERATION_BYTES {
-            return Err(SnapshotError::Invalid {
-                reason: "record exceeds restore bounds",
-            });
-        }
-        let mut key = vec![0_u8; key_length];
-        let mut value = vec![0_u8; value_length];
-        read_payload_exact(&mut file, &mut key, &mut consumed, decoded.payload_length)?;
-        read_payload_exact(&mut file, &mut value, &mut consumed, decoded.payload_length)?;
-        visitor.put(&key, &value)?;
-    }
-    for _ in 0..vector_space_count {
-        let definition = read_vector_space(&mut file, &decoded, &mut consumed)?;
-        visitor.vector_space(&definition)?;
-    }
-    for _ in 0..vector_count {
-        let (space, key, vector) = read_vector(&mut file, &decoded, &mut consumed)?;
-        visitor.vector(&space, &key, &vector)?;
-    }
-    for _ in 0..lexical_index_count {
-        let definition = read_lexical_index(&mut file, &decoded, &mut consumed)?;
-        visitor.lexical_index(&definition)?;
-    }
-    for _ in 0..decoded.receipt_count {
-        let mut encoded = [0_u8; RECEIPT_LENGTH];
-        read_payload_exact(
-            &mut file,
-            &mut encoded,
-            &mut consumed,
-            decoded.payload_length,
-        )?;
-        visitor.receipt(&decode_snapshot_receipt(&encoded))?;
-    }
-    if consumed != decoded.payload_length {
+fn open_snapshot_file(path: &Path) -> Result<File, SnapshotError> {
+    if !std::fs::metadata(path)?.is_file() {
         return Err(SnapshotError::Invalid {
-            reason: "record counts do not consume payload during restore",
+            reason: "snapshot is not a regular file",
         });
     }
+    let file = File::open(path)?;
+    snapshot_file_length(&file)?;
+    Ok(file)
+}
 
-    let after = verify_snapshot(path)?;
-    if before != after {
+fn snapshot_file_length(file: &File) -> Result<u64, SnapshotError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(SnapshotError::Invalid {
-            reason: "snapshot changed during restore",
+            reason: "snapshot is not a regular file",
         });
     }
-    Ok(after)
+    Ok(metadata.len())
+}
+
+fn ensure_snapshot_file_length_unchanged(file: &File, expected: u64) -> Result<(), SnapshotError> {
+    if snapshot_file_length(file)? != expected {
+        return Err(SnapshotError::Invalid {
+            reason: "snapshot changed while being read",
+        });
+    }
+    Ok(())
+}
+
+fn validate_file_limit(file_bytes: u64, limits: &SnapshotReadLimits) -> Result<(), SnapshotError> {
+    if file_bytes > limits.file_bytes {
+        return Err(SnapshotError::FileLimitExceeded {
+            actual: file_bytes,
+            maximum: limits.file_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn check_snapshot_deadline(deadline: Option<&OperationDeadline>) -> Result<(), SnapshotError> {
+    deadline
+        .map(OperationDeadline::check)
+        .transpose()
+        .map(|_| ())
+        .map_err(SnapshotError::from)
 }
 
 fn validate_read_limits(
     info: &SnapshotInfo,
     limits: &SnapshotReadLimits,
 ) -> Result<(), SnapshotError> {
-    if info.file_bytes > limits.file_bytes {
-        return Err(SnapshotError::FileLimitExceeded {
-            actual: info.file_bytes,
-            maximum: limits.file_bytes,
-        });
-    }
-    let logical_records = info
-        .entry_count
-        .checked_add(info.vector_space_count)
-        .and_then(|count| count.checked_add(info.vector_count))
-        .and_then(|count| count.checked_add(info.lexical_index_count))
+    validate_file_limit(info.file_bytes, limits)?;
+    validate_logical_record_limit(
+        info.entry_count,
+        info.vector_space_count,
+        info.vector_count,
+        info.lexical_index_count,
+        limits,
+    )
+}
+
+fn validate_logical_record_limit(
+    entry_count: u64,
+    vector_space_count: u64,
+    vector_count: u64,
+    lexical_index_count: u64,
+    limits: &SnapshotReadLimits,
+) -> Result<(), SnapshotError> {
+    let logical_records = entry_count
+        .checked_add(vector_space_count)
+        .and_then(|count| count.checked_add(vector_count))
+        .and_then(|count| count.checked_add(lexical_index_count))
         .ok_or(SnapshotError::EntryLimitExceeded {
             actual: u64::MAX,
             maximum: limits.entries,
@@ -770,11 +1024,16 @@ fn verify_payload(
     file: &mut File,
     header: &[u8; HEADER_LENGTH],
     decoded: &DecodedHeader,
+    limits: Option<&SnapshotReadLimits>,
+    deadline: Option<&OperationDeadline>,
+    mut visitor: Option<&mut dyn SnapshotRecordVisitor>,
 ) -> Result<(u64, u64, u64), SnapshotError> {
+    check_snapshot_deadline(deadline)?;
     let mut checksum = crc32c::crc32c(&header[..CHECKSUM_PREFIX_LENGTH]);
     let mut hasher = blake3::Hasher::new();
     hasher.update(&header[..DIGEST_PREFIX_LENGTH]);
     let mut consumed = 0_u64;
+    let mut decoded_bytes = 0_u64;
     let mut counts_bytes = [0_u8; V2_COUNTS_LENGTH];
     let (vector_space_count, vector_count, lexical_index_count) =
         if decoded.disk_format_version >= 2 {
@@ -794,9 +1053,19 @@ fn verify_payload(
         } else {
             (0, 0, 0)
         };
+    if let Some(limits) = limits {
+        validate_logical_record_limit(
+            decoded.entry_count,
+            vector_space_count,
+            vector_count,
+            lexical_index_count,
+            limits,
+        )?;
+    }
     let mut previous_key: Option<Vec<u8>> = None;
     let mut buffer = vec![0_u8; COPY_BUFFER_LENGTH].into_boxed_slice();
     for _ in 0..decoded.entry_count {
+        check_snapshot_deadline(deadline)?;
         let mut entry_header = [0_u8; ENTRY_HEADER_LENGTH];
         read_payload_exact(
             file,
@@ -816,9 +1085,29 @@ fn verify_payload(
                 reason: "invalid key length",
             });
         }
+        let key_bytes =
+            u64::try_from(key_length).map_err(|_| SnapshotError::DecodedBytesLimitExceeded {
+                maximum: limits.map_or(u64::MAX, |limits| limits.decoded_bytes),
+            })?;
+        account_decoded_bytes(
+            &mut decoded_bytes,
+            key_bytes.checked_add(value_length),
+            limits,
+        )?;
+        if visitor.is_some() && value_length > MAX_OPERATION_BYTES as u64 {
+            return Err(SnapshotError::Invalid {
+                reason: "record exceeds restore bounds",
+            });
+        }
 
         let mut key = vec![0_u8; key_length];
-        read_payload_exact(file, &mut key, &mut consumed, decoded.payload_length)?;
+        read_payload_exact_with_deadline(
+            file,
+            &mut key,
+            &mut consumed,
+            decoded.payload_length,
+            deadline,
+        )?;
         checksum = crc32c::crc32c_append(checksum, &key);
         hasher.update(&key);
         if previous_key
@@ -829,29 +1118,48 @@ fn verify_payload(
                 reason: "keys are not strictly sorted",
             });
         }
-        previous_key = Some(key);
-
-        let mut remaining = value_length;
-        while remaining > 0 {
-            let chunk_length =
-                usize::try_from(remaining.min(COPY_BUFFER_LENGTH_U64)).map_err(|_| {
-                    SnapshotError::Invalid {
-                        reason: "value length overflow",
-                    }
+        if let Some(visitor) = visitor.as_deref_mut() {
+            let value_length =
+                usize::try_from(value_length).map_err(|_| SnapshotError::Invalid {
+                    reason: "value length overflow",
                 })?;
-            let chunk = &mut buffer[..chunk_length];
-            read_payload_exact(file, chunk, &mut consumed, decoded.payload_length)?;
-            checksum = crc32c::crc32c_append(checksum, chunk);
-            hasher.update(chunk);
-            remaining -= u64::try_from(chunk_length).map_err(|_| SnapshotError::Invalid {
-                reason: "value length overflow",
-            })?;
+            let mut value = vec![0_u8; value_length];
+            read_payload_exact_with_deadline(
+                file,
+                &mut value,
+                &mut consumed,
+                decoded.payload_length,
+                deadline,
+            )?;
+            checksum = crc32c::crc32c_append(checksum, &value);
+            hasher.update(&value);
+            visitor.put(&key, &value)?;
+        } else {
+            let mut remaining = value_length;
+            while remaining > 0 {
+                check_snapshot_deadline(deadline)?;
+                let chunk_length =
+                    usize::try_from(remaining.min(COPY_BUFFER_LENGTH_U64)).map_err(|_| {
+                        SnapshotError::Invalid {
+                            reason: "value length overflow",
+                        }
+                    })?;
+                let chunk = &mut buffer[..chunk_length];
+                read_payload_exact(file, chunk, &mut consumed, decoded.payload_length)?;
+                checksum = crc32c::crc32c_append(checksum, chunk);
+                hasher.update(chunk);
+                remaining -= u64::try_from(chunk_length).map_err(|_| SnapshotError::Invalid {
+                    reason: "value length overflow",
+                })?;
+            }
         }
+        previous_key = Some(key);
     }
     let mut definitions = BTreeMap::new();
     let mut previous_space: Option<VectorSpaceName> = None;
     for _ in 0..vector_space_count {
-        let encoded = read_encoded_vector_space(file, decoded, &mut consumed)?;
+        check_snapshot_deadline(deadline)?;
+        let encoded = read_encoded_vector_space(file, decoded, &mut consumed, deadline)?;
         checksum = crc32c::crc32c_append(checksum, &encoded);
         hasher.update(&encoded);
         let definition = decode_vector_space(&encoded)?;
@@ -863,12 +1171,21 @@ fn verify_payload(
                 reason: "vector spaces are not strictly sorted",
             });
         }
+        account_decoded_bytes(
+            &mut decoded_bytes,
+            u64::try_from(definition.name.as_str().len()).ok(),
+            limits,
+        )?;
+        if let Some(visitor) = visitor.as_deref_mut() {
+            visitor.vector_space(&definition)?;
+        }
         previous_space = Some(definition.name.clone());
         definitions.insert(definition.name.clone(), definition);
     }
     let mut previous_vector_identity: Option<(VectorSpaceName, Vec<u8>)> = None;
     for _ in 0..vector_count {
-        let encoded = read_encoded_vector(file, decoded, &mut consumed)?;
+        check_snapshot_deadline(deadline)?;
+        let encoded = read_encoded_vector(file, decoded, &mut consumed, deadline)?;
         checksum = crc32c::crc32c_append(checksum, &encoded);
         hasher.update(&encoded);
         let (space, key, vector) = decode_vector(&encoded)?;
@@ -888,11 +1205,23 @@ fn verify_payload(
             .map_err(|_| SnapshotError::Invalid {
                 reason: "vector dimension does not match its space",
             })?;
+        let vector_bytes = vector
+            .as_slice()
+            .len()
+            .checked_mul(2)
+            .and_then(|length| length.checked_add(space.as_str().len()))
+            .and_then(|length| length.checked_add(key.len()))
+            .and_then(|length| u64::try_from(length).ok());
+        account_decoded_bytes(&mut decoded_bytes, vector_bytes, limits)?;
+        if let Some(visitor) = visitor.as_deref_mut() {
+            visitor.vector(&space, &key, &vector)?;
+        }
         previous_vector_identity = Some((space, key));
     }
     let mut previous_lexical_name: Option<VectorSpaceName> = None;
     for _ in 0..lexical_index_count {
-        let encoded = read_encoded_lexical_index(file, decoded, &mut consumed)?;
+        check_snapshot_deadline(deadline)?;
+        let encoded = read_encoded_lexical_index(file, decoded, &mut consumed, deadline)?;
         checksum = crc32c::crc32c_append(checksum, &encoded);
         hasher.update(&encoded);
         let definition = decode_lexical_index(&encoded)?;
@@ -904,10 +1233,19 @@ fn verify_payload(
                 reason: "lexical indexes are not strictly sorted",
             });
         }
+        account_decoded_bytes(
+            &mut decoded_bytes,
+            u64::try_from(encoded.len()).ok(),
+            limits,
+        )?;
+        if let Some(visitor) = visitor.as_deref_mut() {
+            visitor.lexical_index(&definition)?;
+        }
         previous_lexical_name = Some(definition.name);
     }
     let mut previous_transaction_id = None;
     for _ in 0..decoded.receipt_count {
+        check_snapshot_deadline(deadline)?;
         let mut encoded = [0_u8; RECEIPT_LENGTH];
         read_payload_exact(file, &mut encoded, &mut consumed, decoded.payload_length)?;
         checksum = crc32c::crc32c_append(checksum, &encoded);
@@ -929,7 +1267,11 @@ fn verify_payload(
                 reason: "idempotency receipt exceeds snapshot checkpoint",
             });
         }
+        if let Some(visitor) = visitor.as_deref_mut() {
+            visitor.receipt(&decode_snapshot_receipt(&encoded))?;
+        }
     }
+    check_snapshot_deadline(deadline)?;
     if consumed != decoded.payload_length {
         return Err(SnapshotError::Invalid {
             reason: "record counts do not consume payload",
@@ -947,6 +1289,30 @@ fn verify_payload(
         });
     }
     Ok((vector_space_count, vector_count, lexical_index_count))
+}
+
+fn account_decoded_bytes(
+    total: &mut u64,
+    bytes: Option<u64>,
+    limits: Option<&SnapshotReadLimits>,
+) -> Result<(), SnapshotError> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let bytes = bytes.ok_or(SnapshotError::DecodedBytesLimitExceeded {
+        maximum: limits.decoded_bytes,
+    })?;
+    *total = total
+        .checked_add(bytes)
+        .ok_or(SnapshotError::DecodedBytesLimitExceeded {
+            maximum: limits.decoded_bytes,
+        })?;
+    if *total > limits.decoded_bytes {
+        return Err(SnapshotError::DecodedBytesLimitExceeded {
+            maximum: limits.decoded_bytes,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -974,7 +1340,10 @@ fn measure_payload(
     index: &MaterializedIndex,
     checkpoint_sequence: u64,
     disk_format_version: u16,
+    limits: &SnapshotReadLimits,
+    deadline: &OperationDeadline,
 ) -> Result<Measurements, SnapshotError> {
+    check_snapshot_deadline(Some(deadline))?;
     if !(MIN_DISK_FORMAT_VERSION..=DISK_FORMAT_VERSION).contains(&disk_format_version) {
         return Err(SnapshotError::UnsupportedVersion {
             found: disk_format_version,
@@ -983,8 +1352,18 @@ fn measure_payload(
     }
     let mut entry_count = Some(0_u64);
     let mut payload_length = Some(0_u64);
+    let mut logical_records = 0_u64;
+    let mut decoded_bytes = 0_u64;
     let mut valid = true;
+    let mut limit_error = None;
     index.for_each_entry(|key, value| {
+        if limit_error.is_some() || !valid {
+            return;
+        }
+        if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+            limit_error = Some(source);
+            return;
+        }
         if key.is_empty() || key.len() > MAX_KEY_BYTES {
             valid = false;
             return;
@@ -997,6 +1376,18 @@ fn measure_payload(
             valid = false;
             return;
         };
+        if let Err(source) = account_measurement_record(&mut logical_records, limits) {
+            limit_error = Some(source);
+            return;
+        }
+        if let Err(source) = account_decoded_bytes(
+            &mut decoded_bytes,
+            key_length.checked_add(value_length),
+            Some(limits),
+        ) {
+            limit_error = Some(source);
+            return;
+        }
         entry_count = entry_count.and_then(|count| count.checked_add(1));
         payload_length = payload_length.and_then(|length| {
             length
@@ -1004,25 +1395,61 @@ fn measure_payload(
                 .and_then(|length| length.checked_add(key_length))
                 .and_then(|length| length.checked_add(value_length))
         });
+        if let Err(source) = validate_measured_file_bytes(payload_length, limits) {
+            limit_error = Some(source);
+        }
     })?;
+    if let Some(source) = limit_error.take() {
+        return Err(source);
+    }
     let mut vector_space_count = Some(0_u64);
     let mut vector_count = Some(0_u64);
     let mut lexical_index_count = Some(0_u64);
     if disk_format_version >= 2 {
         payload_length = payload_length.and_then(|length| length.checked_add(V2_COUNTS_LENGTH_U64));
         index.for_each_vector_space(|definition| {
+            if limit_error.is_some() || !valid {
+                return;
+            }
+            if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                limit_error = Some(source);
+                return;
+            }
             let Ok(name_length) = u64::try_from(definition.name.as_str().len()) else {
                 valid = false;
                 return;
             };
+            if let Err(source) = account_measurement_record(&mut logical_records, limits) {
+                limit_error = Some(source);
+                return;
+            }
+            if let Err(source) =
+                account_decoded_bytes(&mut decoded_bytes, Some(name_length), Some(limits))
+            {
+                limit_error = Some(source);
+                return;
+            }
             vector_space_count = vector_space_count.and_then(|count| count.checked_add(1));
             payload_length = payload_length.and_then(|length| {
                 length
                     .checked_add(VECTOR_SPACE_FIXED_LENGTH_U64)
                     .and_then(|length| length.checked_add(name_length))
             });
+            if let Err(source) = validate_measured_file_bytes(payload_length, limits) {
+                limit_error = Some(source);
+            }
         })?;
+        if let Some(source) = limit_error.take() {
+            return Err(source);
+        }
         index.for_each_vector(|space, key, vector| {
+            if limit_error.is_some() || !valid {
+                return;
+            }
+            if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                limit_error = Some(source);
+                return;
+            }
             let Ok(name_length) = u64::try_from(space.as_str().len()) else {
                 valid = false;
                 return;
@@ -1035,6 +1462,20 @@ fn measure_payload(
                 valid = false;
                 return;
             };
+            if let Err(source) = account_measurement_record(&mut logical_records, limits) {
+                limit_error = Some(source);
+                return;
+            }
+            if let Err(source) = account_decoded_bytes(
+                &mut decoded_bytes,
+                name_length
+                    .checked_add(key_length)
+                    .and_then(|length| length.checked_add(vector_bytes)),
+                Some(limits),
+            ) {
+                limit_error = Some(source);
+                return;
+            }
             vector_count = vector_count.and_then(|count| count.checked_add(1));
             payload_length = payload_length.and_then(|length| {
                 length
@@ -1043,8 +1484,21 @@ fn measure_payload(
                     .and_then(|length| length.checked_add(key_length))
                     .and_then(|length| length.checked_add(vector_bytes))
             });
+            if let Err(source) = validate_measured_file_bytes(payload_length, limits) {
+                limit_error = Some(source);
+            }
         })?;
+        if let Some(source) = limit_error.take() {
+            return Err(source);
+        }
         index.for_each_lexical_index(|definition| {
+            if limit_error.is_some() || !valid {
+                return;
+            }
+            if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+                limit_error = Some(source);
+                return;
+            }
             let Ok(encoded) = encode_lexical_index(definition) else {
                 valid = false;
                 return;
@@ -1053,19 +1507,48 @@ fn measure_payload(
                 valid = false;
                 return;
             };
+            if let Err(source) = account_measurement_record(&mut logical_records, limits) {
+                limit_error = Some(source);
+                return;
+            }
+            if let Err(source) =
+                account_decoded_bytes(&mut decoded_bytes, Some(record_bytes), Some(limits))
+            {
+                limit_error = Some(source);
+                return;
+            }
             lexical_index_count = lexical_index_count.and_then(|count| count.checked_add(1));
             payload_length = payload_length.and_then(|length| length.checked_add(record_bytes));
+            if let Err(source) = validate_measured_file_bytes(payload_length, limits) {
+                limit_error = Some(source);
+            }
         })?;
+        if let Some(source) = limit_error.take() {
+            return Err(source);
+        }
     }
     let mut receipt_count = Some(0_u64);
     index.for_each_receipt(|receipt| {
+        if limit_error.is_some() || !valid {
+            return;
+        }
+        if let Err(source) = check_snapshot_deadline(Some(deadline)) {
+            limit_error = Some(source);
+            return;
+        }
         if receipt.commit_sequence == 0 || receipt.commit_sequence > checkpoint_sequence {
             valid = false;
             return;
         }
         receipt_count = receipt_count.and_then(|count| count.checked_add(1));
         payload_length = payload_length.and_then(|length| length.checked_add(RECEIPT_LENGTH_U64));
+        if let Err(source) = validate_measured_file_bytes(payload_length, limits) {
+            limit_error = Some(source);
+        }
     })?;
+    if let Some(source) = limit_error {
+        return Err(source);
+    }
     if !valid {
         return Err(SnapshotError::Invalid {
             reason: "index contains an invalid key or idempotency receipt",
@@ -1111,6 +1594,63 @@ fn measure_payload(
     })
 }
 
+fn account_measurement_record(
+    logical_records: &mut u64,
+    limits: &SnapshotReadLimits,
+) -> Result<(), SnapshotError> {
+    *logical_records = logical_records
+        .checked_add(1)
+        .ok_or(SnapshotError::EntryLimitExceeded {
+            actual: u64::MAX,
+            maximum: limits.entries,
+        })?;
+    if *logical_records > limits.entries {
+        return Err(SnapshotError::EntryLimitExceeded {
+            actual: *logical_records,
+            maximum: limits.entries,
+        });
+    }
+    Ok(())
+}
+
+fn validate_measured_file_bytes(
+    payload_length: Option<u64>,
+    limits: &SnapshotReadLimits,
+) -> Result<(), SnapshotError> {
+    let file_bytes = payload_length
+        .and_then(|length| HEADER_LENGTH_U64.checked_add(length))
+        .ok_or(SnapshotError::FileLimitExceeded {
+            actual: u64::MAX,
+            maximum: limits.file_bytes,
+        })?;
+    validate_file_limit(file_bytes, limits)
+}
+
+fn validate_measurement_limits(
+    measurements: &Measurements,
+    limits: &SnapshotReadLimits,
+) -> Result<(), SnapshotError> {
+    let info = SnapshotInfo {
+        path: PathBuf::new(),
+        disk_format_version: DISK_FORMAT_VERSION,
+        checkpoint_sequence: 0,
+        checkpoint_digest: None,
+        entry_count: measurements.entry_count,
+        vector_space_count: measurements.vector_space_count,
+        vector_count: measurements.vector_count,
+        lexical_index_count: measurements.lexical_index_count,
+        receipt_count: measurements.receipt_count,
+        snapshot_digest: [0; 32],
+        file_bytes: HEADER_LENGTH_U64
+            .checked_add(measurements.payload_length)
+            .ok_or(SnapshotError::FileLimitExceeded {
+                actual: u64::MAX,
+                maximum: limits.file_bytes,
+            })?,
+    };
+    validate_read_limits(&info, limits)
+}
+
 fn encode_entry_header(
     key: &[u8],
     value: &[u8],
@@ -1132,11 +1672,15 @@ fn write_entry(
     hasher: &mut blake3::Hasher,
     key: &[u8],
     value: &[u8],
+    deadline: Option<&OperationDeadline>,
 ) -> Result<(), SnapshotError> {
     let entry_header = encode_entry_header(key, value)?;
     for bytes in [&entry_header[..], key, value] {
-        writer.write_all(bytes)?;
-        hasher.update(bytes);
+        for chunk in bytes.chunks(COPY_BUFFER_LENGTH) {
+            check_snapshot_deadline(deadline)?;
+            writer.write_all(chunk)?;
+            hasher.update(chunk);
+        }
     }
     Ok(())
 }
@@ -1430,41 +1974,35 @@ fn decode_lexical_index(encoded: &[u8]) -> Result<LexicalIndexDefinition, Snapsh
     })
 }
 
-fn write_encoded(
+fn write_encoded_with_deadline(
     writer: &mut impl Write,
     hasher: &mut blake3::Hasher,
     encoded: Result<Vec<u8>, SnapshotError>,
+    deadline: Option<&OperationDeadline>,
 ) -> Result<(), SnapshotError> {
     let encoded = encoded?;
-    writer.write_all(&encoded)?;
-    hasher.update(&encoded);
-    Ok(())
-}
-
-fn read_v2_counts(
-    reader: &mut impl Read,
-    decoded: &DecodedHeader,
-    consumed: &mut u64,
-) -> Result<(u64, u64, u64), SnapshotError> {
-    if decoded.disk_format_version < 2 {
-        return Ok((0, 0, 0));
+    for chunk in encoded.chunks(COPY_BUFFER_LENGTH) {
+        check_snapshot_deadline(deadline)?;
+        writer.write_all(chunk)?;
+        hasher.update(chunk);
     }
-    let mut encoded = [0_u8; V2_COUNTS_LENGTH];
-    read_payload_exact(reader, &mut encoded, consumed, decoded.payload_length)?;
-    Ok((
-        u64::from_le_bytes(copy_array(&encoded[..8])),
-        u64::from_le_bytes(copy_array(&encoded[8..16])),
-        u64::from_le_bytes(copy_array(&encoded[16..24])),
-    ))
+    Ok(())
 }
 
 fn read_encoded_vector_space(
     reader: &mut impl Read,
     decoded: &DecodedHeader,
     consumed: &mut u64,
+    deadline: Option<&OperationDeadline>,
 ) -> Result<Vec<u8>, SnapshotError> {
     let mut name_length = [0_u8; 1];
-    read_payload_exact(reader, &mut name_length, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut name_length,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     let remaining = usize::from(name_length[0])
         .checked_add(4)
         .ok_or(SnapshotError::Invalid {
@@ -1472,29 +2010,40 @@ fn read_encoded_vector_space(
         })?;
     let mut encoded = vec![name_length[0]];
     let mut tail = vec![0_u8; remaining];
-    read_payload_exact(reader, &mut tail, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut tail,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     encoded.extend_from_slice(&tail);
     Ok(encoded)
-}
-
-fn read_vector_space(
-    reader: &mut impl Read,
-    decoded: &DecodedHeader,
-    consumed: &mut u64,
-) -> Result<VectorSpaceDefinition, SnapshotError> {
-    decode_vector_space(&read_encoded_vector_space(reader, decoded, consumed)?)
 }
 
 fn read_encoded_vector(
     reader: &mut impl Read,
     decoded: &DecodedHeader,
     consumed: &mut u64,
+    deadline: Option<&OperationDeadline>,
 ) -> Result<Vec<u8>, SnapshotError> {
     let mut space_length = [0_u8; 1];
-    read_payload_exact(reader, &mut space_length, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut space_length,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     let space_length = usize::from(space_length[0]);
     let mut prefix_tail = vec![0_u8; space_length + 4];
-    read_payload_exact(reader, &mut prefix_tail, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut prefix_tail,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     let key_length = usize::try_from(u32::from_le_bytes(copy_array(&prefix_tail[space_length..])))
         .map_err(|_| SnapshotError::Invalid {
             reason: "vector key length overflow",
@@ -1505,11 +2054,12 @@ fn read_encoded_vector(
         });
     }
     let mut key_and_dimension = vec![0_u8; key_length + 2];
-    read_payload_exact(
+    read_payload_exact_with_deadline(
         reader,
         &mut key_and_dimension,
         consumed,
         decoded.payload_length,
+        deadline,
     )?;
     let dimension = usize::from(u16::from_le_bytes(copy_array(
         &key_and_dimension[key_length..],
@@ -1518,7 +2068,13 @@ fn read_encoded_vector(
         reason: "vector record length overflow",
     })?;
     let mut values = vec![0_u8; vector_bytes];
-    read_payload_exact(reader, &mut values, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut values,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     let mut encoded =
         Vec::with_capacity(1 + prefix_tail.len() + key_and_dimension.len() + values.len());
     encoded.push(
@@ -1532,21 +2088,20 @@ fn read_encoded_vector(
     Ok(encoded)
 }
 
-fn read_vector(
-    reader: &mut impl Read,
-    decoded: &DecodedHeader,
-    consumed: &mut u64,
-) -> Result<(VectorSpaceName, Vec<u8>, Q15Vector), SnapshotError> {
-    decode_vector(&read_encoded_vector(reader, decoded, consumed)?)
-}
-
 fn read_encoded_lexical_index(
     reader: &mut impl Read,
     decoded: &DecodedHeader,
     consumed: &mut u64,
+    deadline: Option<&OperationDeadline>,
 ) -> Result<Vec<u8>, SnapshotError> {
     let mut name_length = [0_u8; 1];
-    read_payload_exact(reader, &mut name_length, consumed, decoded.payload_length)?;
+    read_payload_exact_with_deadline(
+        reader,
+        &mut name_length,
+        consumed,
+        decoded.payload_length,
+        deadline,
+    )?;
     let name_length_usize = usize::from(name_length[0]);
     if name_length_usize == 0 {
         return Err(SnapshotError::Invalid {
@@ -1554,11 +2109,12 @@ fn read_encoded_lexical_index(
         });
     }
     let mut name_and_counts = vec![0_u8; name_length_usize + 2];
-    read_payload_exact(
+    read_payload_exact_with_deadline(
         reader,
         &mut name_and_counts,
         consumed,
         decoded.payload_length,
+        deadline,
     )?;
     if name_and_counts[name_length_usize] != 1 {
         return Err(SnapshotError::Invalid {
@@ -1575,8 +2131,15 @@ fn read_encoded_lexical_index(
     encoded.push(name_length[0]);
     encoded.extend_from_slice(&name_and_counts);
     for _ in 0..field_count {
+        check_snapshot_deadline(deadline)?;
         let mut segment_count = [0_u8; 1];
-        read_payload_exact(reader, &mut segment_count, consumed, decoded.payload_length)?;
+        read_payload_exact_with_deadline(
+            reader,
+            &mut segment_count,
+            consumed,
+            decoded.payload_length,
+            deadline,
+        )?;
         let segment_count_usize = usize::from(segment_count[0]);
         if segment_count_usize == 0 || segment_count_usize > MAX_LEXICAL_PATH_SEGMENTS {
             return Err(SnapshotError::Invalid {
@@ -1585,8 +2148,15 @@ fn read_encoded_lexical_index(
         }
         encoded.push(segment_count[0]);
         for _ in 0..segment_count_usize {
+            check_snapshot_deadline(deadline)?;
             let mut length = [0_u8; 2];
-            read_payload_exact(reader, &mut length, consumed, decoded.payload_length)?;
+            read_payload_exact_with_deadline(
+                reader,
+                &mut length,
+                consumed,
+                decoded.payload_length,
+                deadline,
+            )?;
             let length_usize = usize::from(u16::from_le_bytes(length));
             if length_usize == 0 || length_usize > MAX_LEXICAL_PATH_SEGMENT_BYTES {
                 return Err(SnapshotError::Invalid {
@@ -1594,23 +2164,27 @@ fn read_encoded_lexical_index(
                 });
             }
             let mut segment = vec![0_u8; length_usize];
-            read_payload_exact(reader, &mut segment, consumed, decoded.payload_length)?;
+            read_payload_exact_with_deadline(
+                reader,
+                &mut segment,
+                consumed,
+                decoded.payload_length,
+                deadline,
+            )?;
             encoded.extend_from_slice(&length);
             encoded.extend_from_slice(&segment);
         }
         let mut weight = [0_u8; 4];
-        read_payload_exact(reader, &mut weight, consumed, decoded.payload_length)?;
+        read_payload_exact_with_deadline(
+            reader,
+            &mut weight,
+            consumed,
+            decoded.payload_length,
+            deadline,
+        )?;
         encoded.extend_from_slice(&weight);
     }
     Ok(encoded)
-}
-
-fn read_lexical_index(
-    reader: &mut impl Read,
-    decoded: &DecodedHeader,
-    consumed: &mut u64,
-) -> Result<LexicalIndexDefinition, SnapshotError> {
-    decode_lexical_index(&read_encoded_lexical_index(reader, decoded, consumed)?)
 }
 
 fn encode_receipt(receipt: &CommitReceipt) -> [u8; RECEIPT_LENGTH] {
@@ -1664,6 +2238,21 @@ fn read_payload_exact(
     Ok(())
 }
 
+fn read_payload_exact_with_deadline(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    consumed: &mut u64,
+    payload_length: u64,
+    deadline: Option<&OperationDeadline>,
+) -> Result<(), SnapshotError> {
+    for chunk in buffer.chunks_mut(COPY_BUFFER_LENGTH) {
+        check_snapshot_deadline(deadline)?;
+        read_payload_exact(reader, chunk, consumed, payload_length)?;
+    }
+    check_snapshot_deadline(deadline)?;
+    Ok(())
+}
+
 fn read_exact_or_invalid(
     reader: &mut impl Read,
     buffer: &mut [u8],
@@ -1688,4 +2277,274 @@ fn copy_array<const N: usize>(source: &[u8]) -> [u8; N] {
     let mut output = [0_u8; N];
     output.copy_from_slice(source);
     output
+}
+
+struct TemporaryFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ignored = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error,
+        fs::{self, OpenOptions},
+        io::{Cursor, Seek, SeekFrom, Write},
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    use super::{
+        CHECKSUM_PREFIX_LENGTH, DIGEST_PREFIX_LENGTH, DISK_FORMAT_VERSION, DecodedHeader,
+        ENTRY_HEADER_LENGTH, HEADER_LENGTH, MAGIC, OperationDeadline, SnapshotError,
+        SnapshotReadLimits, SnapshotRecordVisitor, V2_COUNTS_LENGTH, encode_entry_header,
+        read_encoded_lexical_index, read_encoded_vector, read_snapshot_records_with_policy,
+    };
+    use crate::{CommitReceipt, test_support::TestDirectory};
+
+    struct TransientMutationVisitor {
+        path: PathBuf,
+        second_value_offset: u64,
+        seen: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
+    struct GrowingSnapshotVisitor {
+        path: PathBuf,
+        grew: bool,
+    }
+
+    impl TransientMutationVisitor {
+        fn overwrite_second_value_prefix(&self, byte: u8) -> Result<(), SnapshotError> {
+            let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            file.seek(SeekFrom::Start(self.second_value_offset))?;
+            file.write_all(&[byte])?;
+            file.sync_all()?;
+            Ok(())
+        }
+    }
+
+    impl SnapshotRecordVisitor for TransientMutationVisitor {
+        fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
+            self.seen.push((key.to_vec(), value.to_vec()));
+            match self.seen.len() {
+                1 => self.overwrite_second_value_prefix(b'X')?,
+                2 => self.overwrite_second_value_prefix(b't')?,
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn receipt(&mut self, _receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+            Ok(())
+        }
+    }
+
+    impl SnapshotRecordVisitor for GrowingSnapshotVisitor {
+        fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), SnapshotError> {
+            if !self.grew {
+                let mut file = OpenOptions::new().append(true).open(&self.path)?;
+                file.write_all(b"x")?;
+                file.sync_all()?;
+                self.grew = true;
+            }
+            Ok(())
+        }
+
+        fn receipt(&mut self, _receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+            Ok(())
+        }
+    }
+
+    fn write_two_entry_snapshot(path: &Path) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let entries: [(&[u8], &[u8]); 2] = [(b"a", b"one"), (b"b", b"two")];
+        let mut payload = vec![0_u8; V2_COUNTS_LENGTH];
+        let mut second_value_offset = 0_u64;
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            let entry_header = encode_entry_header(key, value)?;
+            payload.extend_from_slice(&entry_header);
+            payload.extend_from_slice(key);
+            if index == 1 {
+                second_value_offset =
+                    u64::try_from(HEADER_LENGTH + payload.len()).map_err(|_| {
+                        SnapshotError::Invalid {
+                            reason: "test snapshot offset overflow",
+                        }
+                    })?;
+            }
+            payload.extend_from_slice(value);
+        }
+
+        let mut header = [0_u8; HEADER_LENGTH];
+        header[..8].copy_from_slice(&MAGIC);
+        header[8..10].copy_from_slice(&DISK_FORMAT_VERSION.to_le_bytes());
+        header[12..20].copy_from_slice(&1_u64.to_le_bytes());
+        header[20..52].copy_from_slice(&[7_u8; 32]);
+        header[52..60].copy_from_slice(&2_u64.to_le_bytes());
+        header[68..76].copy_from_slice(
+            &u64::try_from(payload.len())
+                .map_err(|_| SnapshotError::Invalid {
+                    reason: "test snapshot length overflow",
+                })?
+                .to_le_bytes(),
+        );
+        let checksum =
+            crc32c::crc32c_append(crc32c::crc32c(&header[..CHECKSUM_PREFIX_LENGTH]), &payload);
+        header[76..80].copy_from_slice(&checksum.to_le_bytes());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header[..DIGEST_PREFIX_LENGTH]);
+        hasher.update(&payload);
+        header[80..112].copy_from_slice(hasher.finalize().as_bytes());
+
+        let mut bytes = Vec::with_capacity(HEADER_LENGTH + payload.len());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+        fs::write(path, &bytes)?;
+        let expected_second_value_offset = u64::try_from(
+            HEADER_LENGTH
+                + V2_COUNTS_LENGTH
+                + ENTRY_HEADER_LENGTH
+                + entries[0].0.len()
+                + entries[0].1.len()
+                + ENTRY_HEADER_LENGTH
+                + entries[1].0.len(),
+        )
+        .map_err(|_| SnapshotError::Invalid {
+            reason: "test snapshot offset overflow",
+        })?;
+        debug_assert_eq!(second_value_offset, expected_second_value_offset);
+        Ok((bytes, second_value_offset))
+    }
+
+    #[test]
+    fn visitor_pass_rejects_transient_in_place_payload_mutation() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("snapshot-visitor-authentication")?;
+        let snapshot_path = temporary.path().join("transient-mutation.hysnap");
+        let (original_bytes, second_value_offset) = write_two_entry_snapshot(&snapshot_path)?;
+        let mut visitor = TransientMutationVisitor {
+            path: snapshot_path.clone(),
+            second_value_offset,
+            seen: Vec::new(),
+        };
+        let deadline = OperationDeadline::new(Duration::from_secs(5));
+
+        let result = read_snapshot_records_with_policy(
+            &snapshot_path,
+            &mut visitor,
+            &SnapshotReadLimits::default(),
+            &deadline,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SnapshotError::Invalid {
+                reason: "CRC32C mismatch"
+            })
+        ));
+        assert_eq!(
+            visitor.seen,
+            vec![
+                (b"a".to_vec(), b"one".to_vec()),
+                (b"b".to_vec(), b"Xwo".to_vec())
+            ]
+        );
+        assert_eq!(fs::read(snapshot_path)?, original_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn visitor_pass_rejects_same_handle_file_growth() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("snapshot-visitor-growth")?;
+        let snapshot_path = temporary.path().join("growing.hysnap");
+        let (original_bytes, _) = write_two_entry_snapshot(&snapshot_path)?;
+        let mut visitor = GrowingSnapshotVisitor {
+            path: snapshot_path.clone(),
+            grew: false,
+        };
+        let deadline = OperationDeadline::new(Duration::from_secs(5));
+
+        let result = read_snapshot_records_with_policy(
+            &snapshot_path,
+            &mut visitor,
+            &SnapshotReadLimits::default(),
+            &deadline,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SnapshotError::Invalid {
+                reason: "snapshot changed while being read"
+            })
+        ));
+        assert!(visitor.grew);
+        assert_eq!(
+            fs::metadata(snapshot_path)?.len(),
+            u64::try_from(original_bytes.len())? + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_reader_rejects_non_regular_paths() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("snapshot-regular-file")?;
+        assert!(matches!(
+            super::open_snapshot_file(temporary.path()),
+            Err(SnapshotError::Invalid {
+                reason: "snapshot is not a regular file"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn vector_and_lexical_payload_helpers_observe_the_shared_deadline() {
+        let decoded = DecodedHeader {
+            disk_format_version: DISK_FORMAT_VERSION,
+            checkpoint_sequence: 1,
+            checkpoint_digest: Some([1; 32]),
+            entry_count: 0,
+            receipt_count: 0,
+            payload_length: 1,
+            expected_checksum: 0,
+            expected_digest: [0; 32],
+        };
+        let deadline = OperationDeadline::new(Duration::ZERO);
+
+        let mut vector_payload = Cursor::new(vec![0_u8]);
+        let mut consumed = 0;
+        let vector = read_encoded_vector(
+            &mut vector_payload,
+            &decoded,
+            &mut consumed,
+            Some(&deadline),
+        );
+        assert!(matches!(vector, Err(source) if source.is_timeout()));
+
+        let mut lexical_payload = Cursor::new(vec![0_u8]);
+        let mut consumed = 0;
+        let lexical = read_encoded_lexical_index(
+            &mut lexical_payload,
+            &decoded,
+            &mut consumed,
+            Some(&deadline),
+        );
+        assert!(matches!(lexical, Err(source) if source.is_timeout()));
+    }
 }

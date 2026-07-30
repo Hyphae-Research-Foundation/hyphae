@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create or verify the canonical checksum manifest for release assets."""
+"""Create or verify the canonical checksum and evidence-bound release layout."""
 
 from __future__ import annotations
 
@@ -8,7 +8,18 @@ import hashlib
 import os
 from pathlib import Path
 
-from package import product_version
+from required_checks import REPORT_SUFFIX
+from release_evidence import (
+    EVIDENCE_SUFFIX,
+    TARGET_ARCHIVES,
+    archive_name,
+    current_commit,
+    evidence_name,
+    expected_primary_names,
+    require_tracked_worktree_matches,
+    source_identity,
+    validate_release_evidence_file,
+)
 
 
 ASSET_SUFFIXES = (
@@ -17,14 +28,18 @@ ASSET_SUFFIXES = (
     ".spdx.json",
     ".cdx.json",
     ".provenance.json",
+    REPORT_SUFFIX,
+    EVIDENCE_SUFFIX,
 )
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
 
 
 def require_matching_tag(tag: str) -> None:
-    expected = f"v{product_version()}"
+    expected = source_identity(current_commit()).tag
     if tag != expected:
-        raise RuntimeError(f"release tag {tag!r} does not match workspace version {expected!r}")
+        raise RuntimeError(
+            f"release tag {tag!r} does not match release commit version {expected!r}"
+        )
 
 
 def release_assets(directory: Path) -> list[Path]:
@@ -48,20 +63,51 @@ def archive_assets(directory: Path) -> list[Path]:
 
 
 def validate_release_layout(directory: Path, *, final: bool) -> None:
+    identity = source_identity(current_commit())
     entries = list(directory.iterdir())
     if any(not entry.is_file() for entry in entries):
         raise RuntimeError("release directory must contain files only")
     assets = release_assets(directory)
     asset_names = {path.name for path in assets}
-    archives = archive_assets(directory)
-    spdx = [name for name in asset_names if name.endswith(".spdx.json")]
-    cyclonedx = [name for name in asset_names if name.endswith(".cdx.json")]
-    if len(spdx) != 1 or len(cyclonedx) != 1:
-        raise RuntimeError("release requires exactly one SPDX and one CycloneDX SBOM")
+    expected_evidence = evidence_name(identity.tag)
+    candidate_assets = expected_primary_names(
+        identity.version,
+        include_required_checks=False,
+    ) | {expected_evidence}
+    tag_assets = expected_primary_names(
+        identity.version,
+        include_required_checks=True,
+    ) | {expected_evidence}
+    if asset_names not in (candidate_assets, tag_assets):
+        closest = (
+            tag_assets
+            if any(name.endswith(".required-checks.json") for name in asset_names)
+            else candidate_assets
+        )
+        missing = sorted(closest - asset_names)
+        unexpected = sorted(asset_names - closest)
+        raise RuntimeError(
+            "release assets differ from the canonical target set: "
+            f"missing={missing!r}, unexpected={unexpected!r}"
+        )
+    archives = [
+        directory / archive_name(identity.version, target)
+        for target in TARGET_ARCHIVES
+    ]
+    evidence = [name for name in asset_names if name.endswith(EVIDENCE_SUFFIX)]
+    if evidence != [expected_evidence]:
+        raise RuntimeError(
+            f"release requires exactly one canonical evidence manifest: {expected_evidence}"
+        )
     for archive in archives:
         predicate = f"{archive.name}.provenance.json"
         if predicate not in asset_names:
             raise RuntimeError(f"release archive lacks provenance predicate: {archive.name}")
+    validate_release_evidence_file(
+        directory / expected_evidence,
+        directory=directory,
+        expected_commit=identity.commit,
+    )
 
     required_bundles = {
         f"{archive.name}.intoto.sigstore.json" for archive in archives
@@ -128,10 +174,12 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--print-expected-tag", action="store_true")
     arguments = parser.parse_args()
+    commit = current_commit()
+    require_tracked_worktree_matches(commit)
     if arguments.print_expected_tag:
         if arguments.directory is not None or arguments.verify:
             raise RuntimeError("--print-expected-tag cannot be combined with release operations")
-        print(f"v{product_version()}")
+        print(source_identity(current_commit()).tag)
         return 0
     if arguments.directory is None:
         raise RuntimeError("release directory is required")

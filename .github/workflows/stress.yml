@@ -20,6 +20,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify the pull-request integration tree
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_MERGE_COMMIT: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/merge"
+          test "$(git rev-parse FETCH_HEAD)" = "$PR_MERGE_COMMIT"
+          test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')"
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:

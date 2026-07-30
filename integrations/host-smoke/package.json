@@ -9,7 +9,7 @@
   "scripts": {
     "build:astro": "astro build --root fixtures/astro",
     "build:next": "next build fixtures/next --webpack",
-    "build:vite": "vite build fixtures/vite",
+    "build:vite": "vite build --config fixtures/vite/vite.config.mjs",
     "test": "npm run build:astro && npm run build:next && npm run build:vite"
   },
   "dependencies": {

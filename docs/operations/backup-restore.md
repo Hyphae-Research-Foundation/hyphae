@@ -22,6 +22,24 @@ The operator must exclusively control the destination parent while creation
 or restore is running. Do not let another process create, rename, or replace
 entries there concurrently.
 
+Layout verification retains only whether the two canonical filenames were
+seen and fails on the first unexpected entry; it does not accumulate directory
+names. `BACKUP.json` is capped at 64 KiB. Snapshot copy opens one regular source
+handle, captures its initial length, copies no more than that boundary, and
+rejects a different copied or final length from the same handle.
+
+Backup creation inherits the engine's bounded snapshot policy. In `0.2.1`, the
+complete snapshot copy, standalone `backup-verify`, and multi-phase restore do
+not yet share the new `StorageLimits` end-to-end deadline. The fixed copy
+boundary prevents an append from extending one copy indefinitely, but it is
+not an elapsed-time deadline. `backup-verify` retains the published absolute
+limits of its `0.2.0` API, and restore still uses the legacy verification,
+reopen, and snapshot paths. A single filesystem call, `sync_all`, or a very
+large operator-selected backup cannot be preempted by Hyphae. Treat source
+size, destination free space, and an external command timeout as explicit
+operator controls; do not describe the whole backup/restore workflow as
+resource-bounded.
+
 ## Restore
 
 Restore always targets a path that does not yet exist:

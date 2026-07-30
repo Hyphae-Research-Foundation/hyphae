@@ -14,8 +14,8 @@ use hyphae_core::{
 };
 use hyphae_query::{DocumentError, FieldPath, Value, decode_document};
 use hyphae_retrieval::{
-    LexicalError, LexicalField, LexicalIndexDefinition, LexicalMaterializedCorpus,
-    LexicalMaterializedDocument, tokenize_v1,
+    ExactRetrievalError, LexicalError, LexicalField, LexicalIndexDefinition,
+    LexicalMaterializedCorpus, LexicalMaterializedDocument, tokenize_v1_checked,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use thiserror::Error;
@@ -23,8 +23,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    CommitReceipt, Mutation, MutationError, RecoveredTransaction, RecoveryReport,
-    snapshot::{SnapshotError, SnapshotInfo, SnapshotRecordVisitor, read_snapshot_records},
+    CommitReceipt, Mutation, MutationError, RecoveredTransaction, RecoveryLimits, RecoveryReport,
+    StorageLimitError,
+    limits::OperationDeadline,
+    snapshot::{
+        SnapshotError, SnapshotInfo, SnapshotReadLimits, SnapshotRecordVisitor,
+        read_snapshot_records_with_policy,
+    },
 };
 
 const KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("hyphae_kv_v1");
@@ -44,6 +49,70 @@ const APPLIED_DIGEST: &str = "applied_digest";
 const RECEIPT_LENGTH: usize = 72;
 type RawKvEntry = (Vec<u8>, Vec<u8>);
 
+pub(crate) enum VectorScanError {
+    Index(MaterializedIndexError),
+    ExactRetrieval(ExactRetrievalError),
+}
+
+impl From<MaterializedIndexError> for VectorScanError {
+    fn from(source: MaterializedIndexError) -> Self {
+        Self::Index(source)
+    }
+}
+
+impl From<ExactRetrievalError> for VectorScanError {
+    fn from(source: ExactRetrievalError) -> Self {
+        Self::ExactRetrieval(source)
+    }
+}
+
+impl From<redb::TransactionError> for VectorScanError {
+    fn from(source: redb::TransactionError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
+impl From<redb::TableError> for VectorScanError {
+    fn from(source: redb::TableError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
+impl From<redb::StorageError> for VectorScanError {
+    fn from(source: redb::StorageError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
+pub(crate) enum KvScanError {
+    Index(MaterializedIndexError),
+    ByteBudgetExceeded { maximum: u64 },
+}
+
+impl From<MaterializedIndexError> for KvScanError {
+    fn from(source: MaterializedIndexError) -> Self {
+        Self::Index(source)
+    }
+}
+
+impl From<redb::TransactionError> for KvScanError {
+    fn from(source: redb::TransactionError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
+impl From<redb::TableError> for KvScanError {
+    fn from(source: redb::TableError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
+impl From<redb::StorageError> for KvScanError {
+    fn from(source: redb::StorageError) -> Self {
+        Self::Index(MaterializedIndexError::from(source))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LexicalDocumentProjection {
     field_lengths: Vec<u64>,
@@ -55,6 +124,13 @@ struct LexicalCorpusProjection {
     document_count: u64,
     token_count: u64,
     total_field_lengths: Vec<u64>,
+}
+
+struct LexicalPreflightState {
+    definition: LexicalIndexDefinition,
+    corpus: LexicalCorpusProjection,
+    persisted: bool,
+    document_overrides: BTreeMap<Vec<u8>, Option<LexicalDocumentProjection>>,
 }
 
 /// One durable vector entry materialized from authoritative logical state.
@@ -178,7 +254,7 @@ pub enum MaterializedIndexError {
         maximum: u64,
     },
 
-    /// Reading candidates exceeded the caller's byte budget.
+    /// Reading candidates exceeded the caller's logical key/vector byte budget.
     #[error("vector candidate byte budget exceeded: {maximum}")]
     VectorByteBudgetExceeded {
         /// Maximum encoded key and vector bytes permitted.
@@ -189,6 +265,28 @@ pub enum MaterializedIndexError {
     #[cfg(test)]
     #[error("injected materialized-index failure")]
     InjectedFailure,
+}
+
+impl From<StorageLimitError> for MaterializedIndexError {
+    fn from(source: StorageLimitError) -> Self {
+        let source = match source {
+            StorageLimitError::TimedOut => LexicalError::TimedOut,
+            StorageLimitError::LexicalDocumentsExceeded { maximum } => {
+                LexicalError::DocumentBudgetExceeded { maximum }
+            }
+            StorageLimitError::LexicalTokensExceeded { maximum } => {
+                LexicalError::TokenBudgetExceeded { maximum }
+            }
+            source => {
+                debug_assert!(
+                    false,
+                    "non-lexical storage limit reached inside materialized index: {source}"
+                );
+                LexicalError::TimedOut
+            }
+        };
+        Self::Lexical(source)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -244,10 +342,30 @@ impl MaterializedIndex {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_from_snapshot(
         index_path: &Path,
         snapshot_path: &Path,
     ) -> Result<SnapshotInfo, SnapshotError> {
+        let limits = RecoveryLimits::default();
+        let deadline = OperationDeadline::new(limits.timeout);
+        Self::restore_from_snapshot_with_limits(
+            index_path,
+            snapshot_path,
+            &limits.snapshot,
+            &limits,
+            &deadline,
+        )
+    }
+
+    pub(crate) fn restore_from_snapshot_with_limits(
+        index_path: &Path,
+        snapshot_path: &Path,
+        snapshot_limits: &SnapshotReadLimits,
+        recovery_limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<SnapshotInfo, SnapshotError> {
+        deadline.check().map_err(SnapshotError::from)?;
         let index = Self::open(index_path)?;
         let mut write = index
             .database
@@ -257,8 +375,17 @@ impl MaterializedIndex {
             .set_durability(Durability::Immediate)
             .map_err(MaterializedIndexError::from)?;
         let snapshot = {
-            let mut visitor = IndexRestoreVisitor { write: &mut write };
-            read_snapshot_records(snapshot_path, &mut visitor)?
+            let mut visitor = IndexRestoreVisitor {
+                write: &mut write,
+                limits: recovery_limits,
+                deadline,
+            };
+            read_snapshot_records_with_policy(
+                snapshot_path,
+                &mut visitor,
+                snapshot_limits,
+                deadline,
+            )?
         };
         {
             let mut metadata = write
@@ -281,11 +408,25 @@ impl MaterializedIndex {
                     .map_err(MaterializedIndexError::from)?;
             }
         }
+        deadline.check().map_err(SnapshotError::from)?;
         write.commit().map_err(MaterializedIndexError::from)?;
         Ok(snapshot)
     }
 
+    #[cfg(test)]
     pub(crate) fn replay(&self, recovery: &RecoveryReport) -> Result<u64, MaterializedIndexError> {
+        let limits = RecoveryLimits::default();
+        let deadline = OperationDeadline::new(limits.timeout);
+        self.replay_with_limits(recovery, &limits, &deadline)
+    }
+
+    pub(crate) fn replay_with_limits(
+        &self,
+        recovery: &RecoveryReport,
+        limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<u64, MaterializedIndexError> {
+        deadline.check()?;
         let checkpoint = self.checkpoint()?;
         if checkpoint.sequence == 0 {
             if checkpoint.digest.is_some() || recovery.base_sequence != 0 {
@@ -314,7 +455,7 @@ impl MaterializedIndex {
             }
         }
 
-        self.reconcile_idempotency(recovery)?;
+        self.reconcile_idempotency(recovery, deadline)?;
 
         let mut replayed = 0_u64;
         for transaction in recovery
@@ -322,54 +463,55 @@ impl MaterializedIndex {
             .iter()
             .filter(|transaction| transaction.receipt.commit_sequence > checkpoint.sequence)
         {
-            self.apply(transaction)?;
+            deadline.check()?;
+            self.apply_with_limits(transaction, limits, deadline)?;
             replayed = replayed.saturating_add(1);
         }
-        self.rebuild_missing_lexical_projections()?;
+        self.rebuild_missing_lexical_projections(limits, deadline)?;
         Ok(replayed)
     }
 
-    fn rebuild_missing_lexical_projections(&self) -> Result<(), MaterializedIndexError> {
+    fn rebuild_missing_lexical_projections(
+        &self,
+        limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<(), MaterializedIndexError> {
+        deadline.check()?;
         let definitions = {
             let read = self.database.begin_read()?;
             let indexes = read.open_table(LEXICAL_INDEXES)?;
             let stats = read.open_table(LEXICAL_STATS)?;
-            indexes
-                .iter()?
-                .filter_map(|entry| {
-                    let (name, value) = match entry {
-                        Ok(entry) => entry,
-                        Err(source) => return Some(Err(MaterializedIndexError::from(source))),
-                    };
-                    match stats.get(name.value()) {
-                        Ok(Some(_)) => None,
-                        Ok(None) => {
-                            let name = match VectorSpaceName::new(name.value().to_owned()) {
-                                Ok(name) => name,
-                                Err(source) => {
-                                    return Some(Err(MaterializedIndexError::from(source)));
-                                }
-                            };
-                            Some(decode_lexical_index_value(&name, value.value()))
-                        }
-                        Err(source) => Some(Err(MaterializedIndexError::from(source))),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            let mut definitions = Vec::new();
+            for entry in indexes.iter()? {
+                deadline.check()?;
+                let (name, value) = entry?;
+                if stats.get(name.value())?.is_some() {
+                    continue;
+                }
+                let name = VectorSpaceName::new(name.value().to_owned())?;
+                definitions.push(decode_lexical_index_value(&name, value.value())?);
+            }
+            definitions
         };
         for definition in definitions {
+            deadline.check()?;
             let mut write = self.database.begin_write()?;
             write.set_durability(Durability::Immediate)?;
-            build_lexical_projection(&write, &definition)?;
+            build_lexical_projection(&write, &definition, limits, deadline)?;
+            deadline.check()?;
             write.commit()?;
         }
+        deadline.check()?;
         Ok(())
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn apply_with_limits(
         &self,
         transaction: &RecoveredTransaction,
+        limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
     ) -> Result<(), MaterializedIndexError> {
+        deadline.check()?;
         #[cfg(test)]
         if self.fail_next_apply.replace(false) {
             return Err(MaterializedIndexError::InjectedFailure);
@@ -383,17 +525,11 @@ impl MaterializedIndex {
         let mut write = self.database.begin_write()?;
         write.set_durability(redb::Durability::Immediate)?;
         for mutation in mutations {
+            deadline.check()?;
+            if apply_lexical_state_mutation(&write, &mutation, limits, deadline)? {
+                continue;
+            }
             match mutation {
-                Mutation::Put { key, value } => {
-                    update_lexical_projections(&write, &key, Some(&value))?;
-                    let mut table = write.open_table(KV)?;
-                    table.insert(key.as_slice(), value.as_slice())?;
-                }
-                Mutation::Delete { key } => {
-                    update_lexical_projections(&write, &key, None)?;
-                    let mut table = write.open_table(KV)?;
-                    table.remove(key.as_slice())?;
-                }
                 Mutation::DefineVectorSpace { definition } => {
                     apply_vector_space_definition(&write, &definition)?;
                 }
@@ -411,12 +547,14 @@ impl MaterializedIndex {
                     let mut table = write.open_table(VECTORS)?;
                     table.remove(composite_key.as_slice())?;
                 }
-                Mutation::DefineLexicalIndex { definition } => {
-                    apply_lexical_index_definition(&write, &definition)?;
-                    build_lexical_projection(&write, &definition)?;
-                }
+                Mutation::Put { .. }
+                | Mutation::Delete { .. }
+                | Mutation::DefineLexicalIndex { .. } => unreachable!(
+                    "lexical state mutations are handled before vector materialization"
+                ),
             }
         }
+        deadline.check()?;
         {
             let mut metadata = write.open_table(METADATA)?;
             metadata.insert(
@@ -432,8 +570,32 @@ impl MaterializedIndex {
                 encode_receipt(&transaction.receipt).as_slice(),
             )?;
         }
+        deadline.check()?;
         write.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn preflight_lexical_mutations(
+        &self,
+        mutations: &[Mutation],
+        limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<(), MaterializedIndexError> {
+        deadline.check()?;
+        let has_lexical_state_mutation = mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::Put { .. }
+                    | Mutation::Delete { .. }
+                    | Mutation::DefineLexicalIndex { .. }
+            )
+        });
+        if !has_lexical_state_mutation {
+            return Ok(());
+        }
+
+        let read = self.database.begin_read()?;
+        preflight_lexical_mutations_from_read(&read, mutations, limits, deadline)
     }
 
     pub(crate) fn validate_mutations(
@@ -561,12 +723,14 @@ impl MaterializedIndex {
         timeout: Duration,
     ) -> Result<LexicalMaterializedCorpus, MaterializedIndexError> {
         let started = Instant::now();
+        check_lexical_timeout(started, timeout)?;
         let read = self.database.begin_read()?;
         let stats = read.open_table(LEXICAL_STATS)?;
         let encoded_stats = stats
             .get(definition.name.as_str())?
             .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
         let corpus = decode_lexical_corpus(encoded_stats.value(), definition.fields.len())?;
+        check_lexical_timeout(started, timeout)?;
         let postings = read.open_table(LEXICAL_POSTINGS)?;
         let documents = read.open_table(LEXICAL_DOCUMENTS)?;
         let mut candidate_keys = BTreeSet::<Vec<u8>>::new();
@@ -599,25 +763,31 @@ impl MaterializedIndex {
             let encoded = documents
                 .get(encoded_key.as_slice())?
                 .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
-            let projection = decode_lexical_document(encoded.value(), definition.fields.len())?;
+            let projection = decode_lexical_document_with_timeout(
+                encoded.value(),
+                definition.fields.len(),
+                started,
+                timeout,
+            )?;
+            let mut term_frequencies = BTreeMap::new();
+            for token in query_tokens {
+                check_lexical_timeout(started, timeout)?;
+                term_frequencies.insert(
+                    token.clone(),
+                    projection
+                        .terms
+                        .get(token)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; definition.fields.len()]),
+                );
+            }
             materialized.push(LexicalMaterializedDocument {
                 key,
                 field_lengths: projection.field_lengths,
-                term_frequencies: query_tokens
-                    .iter()
-                    .map(|token| {
-                        (
-                            token.clone(),
-                            projection
-                                .terms
-                                .get(token)
-                                .cloned()
-                                .unwrap_or_else(|| vec![0; definition.fields.len()]),
-                        )
-                    })
-                    .collect(),
+                term_frequencies,
             });
         }
+        check_lexical_timeout(started, timeout)?;
         Ok(LexicalMaterializedCorpus {
             document_count: corpus.document_count,
             token_count: corpus.token_count,
@@ -632,11 +802,44 @@ impl MaterializedIndex {
         max_candidates: u64,
         max_bytes: u64,
     ) -> Result<Vec<VectorEntry>, MaterializedIndexError> {
+        match self.scan_vectors_inner(space, max_candidates, max_bytes, None) {
+            Ok(entries) => Ok(entries),
+            Err(VectorScanError::Index(source)) => Err(source),
+            Err(VectorScanError::ExactRetrieval(_)) => {
+                unreachable!("an unbounded vector scan cannot time out")
+            }
+        }
+    }
+
+    pub(crate) fn scan_vectors_with_timeout(
+        &self,
+        space: &VectorSpaceName,
+        max_candidates: u64,
+        max_bytes: u64,
+        timeout: Duration,
+    ) -> Result<Vec<VectorEntry>, VectorScanError> {
+        self.scan_vectors_inner(
+            space,
+            max_candidates,
+            max_bytes,
+            Some((Instant::now(), timeout)),
+        )
+    }
+
+    fn scan_vectors_inner(
+        &self,
+        space: &VectorSpaceName,
+        max_candidates: u64,
+        max_bytes: u64,
+        deadline: Option<(Instant, Duration)>,
+    ) -> Result<Vec<VectorEntry>, VectorScanError> {
+        check_exact_timeout(deadline)?;
         let read = self.database.begin_read()?;
         let table = read.open_table(VECTORS)?;
         let mut entries = Vec::new();
         let mut consumed_bytes = 0_u64;
         for entry in table.iter()? {
+            check_exact_timeout(deadline)?;
             let (raw_key, raw_vector) = entry?;
             let Some(key) = decode_vector_key_for_space(raw_key.value(), space)? else {
                 continue;
@@ -644,12 +847,18 @@ impl MaterializedIndex {
             if u64::try_from(entries.len()).unwrap_or(u64::MAX) >= max_candidates {
                 return Err(MaterializedIndexError::VectorCandidateBudgetExceeded {
                     maximum: max_candidates,
-                });
+                }
+                .into());
             }
+            let vector_bytes = raw_vector
+                .value()
+                .len()
+                .checked_sub(2)
+                .ok_or(MaterializedIndexError::MalformedVectorIndex)?;
             let record_bytes = u64::try_from(key.len())
                 .ok()
                 .and_then(|key_bytes| {
-                    u64::try_from(raw_vector.value().len())
+                    u64::try_from(vector_bytes)
                         .ok()
                         .and_then(|vector_bytes| key_bytes.checked_add(vector_bytes))
                 })
@@ -660,21 +869,25 @@ impl MaterializedIndex {
             if consumed_bytes > max_bytes {
                 return Err(MaterializedIndexError::VectorByteBudgetExceeded {
                     maximum: max_bytes,
-                });
+                }
+                .into());
             }
+            check_exact_timeout(deadline)?;
             entries.push(VectorEntry {
                 key,
                 vector: decode_vector_value(raw_vector.value())?,
             });
         }
+        check_exact_timeout(deadline)?;
         Ok(entries)
     }
 
-    pub(crate) fn scan_after(
+    pub(crate) fn scan_after_with_byte_limit(
         &self,
         after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<RawKvEntry>, MaterializedIndexError> {
+        max_bytes: u64,
+    ) -> Result<(Vec<RawKvEntry>, bool), KvScanError> {
         let read = self.database.begin_read()?;
         let table = read.open_table(KV)?;
         let bounds = (
@@ -682,11 +895,28 @@ impl MaterializedIndex {
             Bound::Unbounded,
         );
         let mut entries = Vec::with_capacity(limit);
-        for entry in table.range::<&[u8]>(bounds)?.take(limit) {
+        let mut consumed_bytes = 0_u64;
+        let mut range = table.range::<&[u8]>(bounds)?;
+        for entry in range.by_ref().take(limit) {
             let (key, value) = entry?;
+            let entry_bytes = u64::try_from(key.value().len())
+                .ok()
+                .and_then(|key_bytes| {
+                    u64::try_from(value.value().len())
+                        .ok()
+                        .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+                })
+                .ok_or(KvScanError::ByteBudgetExceeded { maximum: max_bytes })?;
+            consumed_bytes = consumed_bytes
+                .checked_add(entry_bytes)
+                .ok_or(KvScanError::ByteBudgetExceeded { maximum: max_bytes })?;
+            if consumed_bytes > max_bytes {
+                return Err(KvScanError::ByteBudgetExceeded { maximum: max_bytes });
+            }
             entries.push((key.value().to_vec(), value.value().to_vec()));
         }
-        Ok(entries)
+        let has_more = range.next().transpose()?.is_some();
+        Ok((entries, has_more))
     }
 
     #[cfg(test)]
@@ -798,12 +1028,15 @@ impl MaterializedIndex {
     fn reconcile_idempotency(
         &self,
         recovery: &RecoveryReport,
+        deadline: &OperationDeadline,
     ) -> Result<(), MaterializedIndexError> {
+        deadline.check()?;
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         {
             let mut table = write.open_table(IDEMPOTENCY)?;
             for transaction in &recovery.transactions {
+                deadline.check()?;
                 let receipt = transaction.receipt;
                 if let Some(encoded) = table.get(receipt.transaction_id.as_bytes().as_slice())? {
                     let existing = decode_receipt(receipt.transaction_id, encoded.value())?;
@@ -820,6 +1053,7 @@ impl MaterializedIndex {
                 }
             }
         }
+        deadline.check()?;
         write.commit()?;
         Ok(())
     }
@@ -831,6 +1065,14 @@ fn check_lexical_timeout(
 ) -> Result<(), MaterializedIndexError> {
     if started.elapsed() >= timeout {
         Err(LexicalError::TimedOut.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn check_exact_timeout(deadline: Option<(Instant, Duration)>) -> Result<(), ExactRetrievalError> {
+    if deadline.is_some_and(|(started, timeout)| started.elapsed() >= timeout) {
+        Err(ExactRetrievalError::TimedOut)
     } else {
         Ok(())
     }
@@ -884,10 +1126,307 @@ fn apply_lexical_index_definition(
     Ok(())
 }
 
+fn preflight_lexical_mutations_from_read(
+    read: &redb::ReadTransaction,
+    mutations: &[Mutation],
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<(), MaterializedIndexError> {
+    deadline.check()?;
+    let mut states = {
+        let definitions = read.open_table(LEXICAL_INDEXES)?;
+        let statistics = read.open_table(LEXICAL_STATS)?;
+        let mut states = BTreeMap::new();
+        for entry in definitions.iter()? {
+            deadline.check()?;
+            let (name, encoded_definition) = entry?;
+            let name = VectorSpaceName::new(name.value().to_owned())?;
+            let definition = decode_lexical_index_value(&name, encoded_definition.value())?;
+            let encoded_corpus = statistics
+                .get(name.as_str())?
+                .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+            let corpus = decode_lexical_corpus(encoded_corpus.value(), definition.fields.len())?;
+            validate_lexical_corpus_limits(&corpus, limits)?;
+            states.insert(
+                name,
+                LexicalPreflightState {
+                    definition,
+                    corpus,
+                    persisted: true,
+                    document_overrides: BTreeMap::new(),
+                },
+            );
+        }
+        states
+    };
+    let mut kv_overlay = BTreeMap::<Vec<u8>, Option<&[u8]>>::new();
+
+    for mutation in mutations {
+        deadline.check()?;
+        match mutation {
+            Mutation::Put { key, value } => {
+                let decoded = if states.is_empty() {
+                    None
+                } else {
+                    Some(decode_document(value)?)
+                };
+                preflight_transition_lexical_key(
+                    read,
+                    &mut states,
+                    &kv_overlay,
+                    key,
+                    decoded.as_ref(),
+                    limits,
+                    deadline,
+                )?;
+                kv_overlay.insert(key.clone(), Some(value.as_slice()));
+            }
+            Mutation::Delete { key } => {
+                preflight_transition_lexical_key(
+                    read,
+                    &mut states,
+                    &kv_overlay,
+                    key,
+                    None,
+                    limits,
+                    deadline,
+                )?;
+                kv_overlay.insert(key.clone(), None);
+            }
+            Mutation::DefineLexicalIndex { definition } => {
+                if states.contains_key(&definition.name) {
+                    continue;
+                }
+                let corpus = preflight_build_lexical_corpus(
+                    read,
+                    definition,
+                    &kv_overlay,
+                    limits,
+                    deadline,
+                )?;
+                states.insert(
+                    definition.name.clone(),
+                    LexicalPreflightState {
+                        definition: definition.clone(),
+                        corpus,
+                        persisted: false,
+                        document_overrides: BTreeMap::new(),
+                    },
+                );
+            }
+            Mutation::DefineVectorSpace { .. }
+            | Mutation::UpsertVector { .. }
+            | Mutation::DeleteVector { .. } => {}
+        }
+    }
+    deadline.check()?;
+    Ok(())
+}
+
+fn preflight_transition_lexical_key(
+    read: &redb::ReadTransaction,
+    states: &mut BTreeMap<VectorSpaceName, LexicalPreflightState>,
+    kv_overlay: &BTreeMap<Vec<u8>, Option<&[u8]>>,
+    key: &[u8],
+    next_value: Option<&Value>,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<(), MaterializedIndexError> {
+    let names = states.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        deadline.check()?;
+        let previous = {
+            let state = states
+                .get(&name)
+                .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+            preflight_previous_lexical_projection(read, state, kv_overlay, key, deadline)?
+        };
+        let state = states
+            .get_mut(&name)
+            .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+        let (next_corpus, next_projection) = transition_lexical_projection(
+            &state.corpus,
+            previous.as_ref(),
+            next_value,
+            &state.definition,
+            limits,
+            deadline,
+        )?;
+        state.corpus = next_corpus;
+        state
+            .document_overrides
+            .insert(key.to_vec(), next_projection);
+    }
+    Ok(())
+}
+
+fn preflight_previous_lexical_projection(
+    read: &redb::ReadTransaction,
+    state: &LexicalPreflightState,
+    kv_overlay: &BTreeMap<Vec<u8>, Option<&[u8]>>,
+    key: &[u8],
+    deadline: &OperationDeadline,
+) -> Result<Option<LexicalDocumentProjection>, MaterializedIndexError> {
+    deadline.check()?;
+    if let Some(projection) = state.document_overrides.get(key) {
+        return Ok(projection.clone());
+    }
+    if state.persisted {
+        let encoded_key = encode_lexical_document_key(&state.definition.name, key)?;
+        return read
+            .open_table(LEXICAL_DOCUMENTS)?
+            .get(encoded_key.as_slice())?
+            .map(|encoded| {
+                decode_lexical_document_with_deadline(
+                    encoded.value(),
+                    state.definition.fields.len(),
+                    deadline,
+                )
+            })
+            .transpose();
+    }
+
+    if let Some(overlaid) = kv_overlay.get(key) {
+        return overlaid
+            .as_deref()
+            .map(|encoded| {
+                project_encoded_lexical_document_unbounded(encoded, &state.definition, deadline)
+            })
+            .transpose();
+    }
+    read.open_table(KV)?
+        .get(key)?
+        .map(|encoded| {
+            project_encoded_lexical_document_unbounded(encoded.value(), &state.definition, deadline)
+        })
+        .transpose()
+}
+
+fn preflight_build_lexical_corpus(
+    read: &redb::ReadTransaction,
+    definition: &LexicalIndexDefinition,
+    kv_overlay: &BTreeMap<Vec<u8>, Option<&[u8]>>,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<LexicalCorpusProjection, MaterializedIndexError> {
+    deadline.check()?;
+    let table = read.open_table(KV)?;
+    let mut corpus = empty_lexical_corpus(definition.fields.len());
+    let mut shadowed_persisted_keys = BTreeSet::new();
+    for entry in table.iter()? {
+        deadline.check()?;
+        let (key, value) = entry?;
+        if let Some(overlaid) = kv_overlay.get(key.value()) {
+            shadowed_persisted_keys.insert(key.value().to_vec());
+            if let Some(encoded) = overlaid {
+                preflight_add_encoded_lexical_document(
+                    &mut corpus,
+                    encoded,
+                    definition,
+                    limits,
+                    deadline,
+                )?;
+            }
+        } else {
+            preflight_add_encoded_lexical_document(
+                &mut corpus,
+                value.value(),
+                definition,
+                limits,
+                deadline,
+            )?;
+        }
+    }
+    for (key, overlaid) in kv_overlay {
+        deadline.check()?;
+        if shadowed_persisted_keys.contains(key) {
+            continue;
+        }
+        if let Some(encoded) = overlaid {
+            preflight_add_encoded_lexical_document(
+                &mut corpus,
+                encoded,
+                definition,
+                limits,
+                deadline,
+            )?;
+        }
+    }
+    validate_lexical_corpus_limits(&corpus, limits)?;
+    Ok(corpus)
+}
+
+fn preflight_add_encoded_lexical_document(
+    corpus: &mut LexicalCorpusProjection,
+    encoded: &[u8],
+    definition: &LexicalIndexDefinition,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<(), MaterializedIndexError> {
+    deadline.check()?;
+    let value = decode_document(encoded)?;
+    let (next, _projection) =
+        transition_lexical_projection(corpus, None, Some(&value), definition, limits, deadline)?;
+    *corpus = next;
+    Ok(())
+}
+
+fn project_encoded_lexical_document_unbounded(
+    encoded: &[u8],
+    definition: &LexicalIndexDefinition,
+    deadline: &OperationDeadline,
+) -> Result<LexicalDocumentProjection, MaterializedIndexError> {
+    let value = decode_document(encoded)?;
+    let mut remaining_tokens = u64::MAX;
+    project_lexical_document(
+        &value,
+        definition,
+        &mut remaining_tokens,
+        u64::MAX,
+        deadline,
+    )
+}
+
+fn apply_lexical_state_mutation(
+    write: &redb::WriteTransaction,
+    mutation: &Mutation,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<bool, MaterializedIndexError> {
+    deadline.check()?;
+    match mutation {
+        Mutation::Put { key, value } => {
+            update_lexical_projections(write, key, Some(value), limits, deadline)?;
+            deadline.check()?;
+            write
+                .open_table(KV)?
+                .insert(key.as_slice(), value.as_slice())?;
+            Ok(true)
+        }
+        Mutation::Delete { key } => {
+            update_lexical_projections(write, key, None, limits, deadline)?;
+            deadline.check()?;
+            write.open_table(KV)?.remove(key.as_slice())?;
+            Ok(true)
+        }
+        Mutation::DefineLexicalIndex { definition } => {
+            apply_lexical_index_definition(write, definition)?;
+            build_lexical_projection(write, definition, limits, deadline)?;
+            Ok(true)
+        }
+        Mutation::DefineVectorSpace { .. }
+        | Mutation::UpsertVector { .. }
+        | Mutation::DeleteVector { .. } => Ok(false),
+    }
+}
+
 fn build_lexical_projection(
     write: &redb::WriteTransaction,
     definition: &LexicalIndexDefinition,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
 ) -> Result<(), MaterializedIndexError> {
+    deadline.check()?;
     if write
         .open_table(LEXICAL_STATS)?
         .get(definition.name.as_str())?
@@ -895,22 +1434,48 @@ fn build_lexical_projection(
     {
         return Ok(());
     }
-    let entries = {
-        let table = write.open_table(KV)?;
-        table
-            .iter()?
-            .map(|entry| {
-                let (key, value) = entry?;
-                Ok((key.value().to_vec(), value.value().to_vec()))
-            })
-            .collect::<Result<Vec<_>, redb::StorageError>>()?
-    };
     let mut corpus = empty_lexical_corpus(definition.fields.len());
-    for (key, encoded) in entries {
+    let mut after = None;
+    loop {
+        deadline.check()?;
+        let entry = {
+            let table = write.open_table(KV)?;
+            let bounds = (
+                after.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+            );
+            table
+                .range::<&[u8]>(bounds)?
+                .next()
+                .transpose()?
+                .map(
+                    |(key, value)| -> Result<RawKvEntry, MaterializedIndexError> {
+                        deadline.check()?;
+                        Ok((key.value().to_vec(), value.value().to_vec()))
+                    },
+                )
+                .transpose()?
+        };
+        let Some((key, encoded)) = entry else {
+            break;
+        };
+        deadline.check()?;
         let value = decode_document(&encoded)?;
-        let projection = project_lexical_document(&value, definition);
-        add_lexical_document(write, definition, &key, &projection, &mut corpus)?;
+        let (next_corpus, projection) = transition_lexical_projection(
+            &corpus,
+            None,
+            Some(&value),
+            definition,
+            limits,
+            deadline,
+        )?;
+        let projection = projection.ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+        add_lexical_document(write, definition, &key, &projection, deadline)?;
+        corpus = next_corpus;
+        after = Some(key);
     }
+    validate_lexical_corpus_limits(&corpus, limits)?;
+    deadline.check()?;
     let encoded = encode_lexical_corpus(&corpus)?;
     write
         .open_table(LEXICAL_STATS)?
@@ -922,95 +1487,127 @@ fn update_lexical_projections(
     write: &redb::WriteTransaction,
     key: &[u8],
     encoded_document: Option<&[u8]>,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
 ) -> Result<(), MaterializedIndexError> {
+    deadline.check()?;
     let definitions = {
         let table = write.open_table(LEXICAL_INDEXES)?;
-        table
-            .iter()?
-            .map(|entry| {
-                let (name, value) = entry?;
-                let name = VectorSpaceName::new(name.value().to_owned())?;
-                decode_lexical_index_value(&name, value.value())
-            })
-            .collect::<Result<Vec<_>, MaterializedIndexError>>()?
+        let mut definitions = Vec::new();
+        for entry in table.iter()? {
+            deadline.check()?;
+            let (name, value) = entry?;
+            let name = VectorSpaceName::new(name.value().to_owned())?;
+            definitions.push(decode_lexical_index_value(&name, value.value())?);
+        }
+        definitions
     };
     if definitions.is_empty() {
         return Ok(());
     }
+    deadline.check()?;
     let decoded = encoded_document.map(decode_document).transpose()?;
     for definition in definitions {
+        deadline.check()?;
         let encoded_key = encode_lexical_document_key(&definition.name, key)?;
         let existing = {
             let table = write.open_table(LEXICAL_DOCUMENTS)?;
             table
                 .get(encoded_key.as_slice())?
-                .map(|value| decode_lexical_document(value.value(), definition.fields.len()))
+                .map(|value| {
+                    decode_lexical_document_with_deadline(
+                        value.value(),
+                        definition.fields.len(),
+                        deadline,
+                    )
+                })
                 .transpose()?
         };
-        let mut corpus = {
+        let corpus = {
             let table = write.open_table(LEXICAL_STATS)?;
             let encoded = table
                 .get(definition.name.as_str())?
                 .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
             decode_lexical_corpus(encoded.value(), definition.fields.len())?
         };
-        if let Some(existing) = existing {
-            remove_lexical_document(write, &definition, key, &existing, &mut corpus)?;
+        let (next_corpus, next_projection) = transition_lexical_projection(
+            &corpus,
+            existing.as_ref(),
+            decoded.as_ref(),
+            &definition,
+            limits,
+            deadline,
+        )?;
+        if let Some(existing) = &existing {
+            remove_lexical_document(write, &definition, key, existing, deadline)?;
         }
-        if let Some(value) = &decoded {
-            let projection = project_lexical_document(value, &definition);
-            add_lexical_document(write, &definition, key, &projection, &mut corpus)?;
+        if let Some(projection) = &next_projection {
+            add_lexical_document(write, &definition, key, projection, deadline)?;
         }
-        let encoded = encode_lexical_corpus(&corpus)?;
+        deadline.check()?;
+        let encoded = encode_lexical_corpus(&next_corpus)?;
         write
             .open_table(LEXICAL_STATS)?
             .insert(definition.name.as_str(), encoded.as_slice())?;
     }
+    deadline.check()?;
     Ok(())
 }
 
-fn project_lexical_document(
-    value: &Value,
+fn transition_lexical_projection(
+    corpus: &LexicalCorpusProjection,
+    previous: Option<&LexicalDocumentProjection>,
+    next_value: Option<&Value>,
     definition: &LexicalIndexDefinition,
-) -> LexicalDocumentProjection {
-    let fields = definition
-        .fields
-        .iter()
-        .map(|field| match field.path.resolve(value) {
-            Some(Value::String(value)) => tokenize_v1(value),
-            _ => Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    let field_lengths = fields
-        .iter()
-        .map(|tokens| u64::try_from(tokens.len()).unwrap_or(u64::MAX))
-        .collect();
-    let mut terms = BTreeMap::<String, Vec<u64>>::new();
-    for (field_index, tokens) in fields.iter().enumerate() {
-        for token in tokens {
-            let frequencies = terms
-                .entry(token.clone())
-                .or_insert_with(|| vec![0; definition.fields.len()]);
-            frequencies[field_index] = frequencies[field_index].saturating_add(1);
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<(LexicalCorpusProjection, Option<LexicalDocumentProjection>), MaterializedIndexError> {
+    deadline.check()?;
+    let mut next_corpus = corpus.clone();
+    if let Some(previous) = previous {
+        remove_lexical_projection(&mut next_corpus, previous)?;
+    }
+    let next_projection = if let Some(value) = next_value {
+        if next_corpus.document_count >= limits.max_lexical_documents {
+            return Err(StorageLimitError::LexicalDocumentsExceeded {
+                maximum: limits.max_lexical_documents,
+            }
+            .into());
         }
-    }
-    LexicalDocumentProjection {
-        field_lengths,
-        terms,
-    }
+        let mut remaining_tokens = limits
+            .max_lexical_tokens
+            .checked_sub(next_corpus.token_count)
+            .ok_or(StorageLimitError::LexicalTokensExceeded {
+                maximum: limits.max_lexical_tokens,
+            })?;
+        let projection = project_lexical_document(
+            value,
+            definition,
+            &mut remaining_tokens,
+            limits.max_lexical_tokens,
+            deadline,
+        )?;
+        add_lexical_projection(&mut next_corpus, &projection)?;
+        Some(projection)
+    } else {
+        None
+    };
+    validate_lexical_corpus_limits(&next_corpus, limits)?;
+    deadline.check()?;
+    Ok((next_corpus, next_projection))
 }
 
-fn add_lexical_document(
-    write: &redb::WriteTransaction,
-    definition: &LexicalIndexDefinition,
-    key: &[u8],
-    projection: &LexicalDocumentProjection,
+fn add_lexical_projection(
     corpus: &mut LexicalCorpusProjection,
+    projection: &LexicalDocumentProjection,
 ) -> Result<(), MaterializedIndexError> {
     corpus.document_count = corpus
         .document_count
         .checked_add(1)
         .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+    if corpus.total_field_lengths.len() != projection.field_lengths.len() {
+        return Err(MaterializedIndexError::MalformedLexicalProjection);
+    }
     for (total, length) in corpus
         .total_field_lengths
         .iter_mut()
@@ -1024,15 +1621,119 @@ fn add_lexical_document(
             .checked_add(*length)
             .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
     }
+    Ok(())
+}
+
+fn remove_lexical_projection(
+    corpus: &mut LexicalCorpusProjection,
+    projection: &LexicalDocumentProjection,
+) -> Result<(), MaterializedIndexError> {
+    corpus.document_count = corpus
+        .document_count
+        .checked_sub(1)
+        .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+    if corpus.total_field_lengths.len() != projection.field_lengths.len() {
+        return Err(MaterializedIndexError::MalformedLexicalProjection);
+    }
+    for (total, length) in corpus
+        .total_field_lengths
+        .iter_mut()
+        .zip(&projection.field_lengths)
+    {
+        *total = total
+            .checked_sub(*length)
+            .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+        corpus.token_count = corpus
+            .token_count
+            .checked_sub(*length)
+            .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
+    }
+    Ok(())
+}
+
+fn project_lexical_document(
+    value: &Value,
+    definition: &LexicalIndexDefinition,
+    remaining_tokens: &mut u64,
+    maximum_tokens: u64,
+    deadline: &OperationDeadline,
+) -> Result<LexicalDocumentProjection, MaterializedIndexError> {
+    deadline.check()?;
+    let mut fields = Vec::with_capacity(definition.fields.len());
+    for field in &definition.fields {
+        deadline.check()?;
+        let tokens = match field.path.resolve(value) {
+            Some(Value::String(value)) => {
+                tokenize_v1_with_policy(value, remaining_tokens, maximum_tokens, deadline)?
+            }
+            _ => Vec::new(),
+        };
+        fields.push(tokens);
+    }
+    let field_lengths = fields
+        .iter()
+        .map(|tokens| u64::try_from(tokens.len()).unwrap_or(u64::MAX))
+        .collect();
+    let mut terms = BTreeMap::<String, Vec<u64>>::new();
+    for (field_index, tokens) in fields.iter().enumerate() {
+        deadline.check()?;
+        for token in tokens {
+            deadline.check()?;
+            let frequencies = terms
+                .entry(token.clone())
+                .or_insert_with(|| vec![0; definition.fields.len()]);
+            frequencies[field_index] = frequencies[field_index].saturating_add(1);
+        }
+    }
+    deadline.check()?;
+    Ok(LexicalDocumentProjection {
+        field_lengths,
+        terms,
+    })
+}
+
+fn tokenize_v1_with_policy(
+    input: &str,
+    remaining_tokens: &mut u64,
+    maximum_tokens: u64,
+    deadline: &OperationDeadline,
+) -> Result<Vec<String>, MaterializedIndexError> {
+    tokenize_v1_checked(
+        input,
+        || -> Result<(), MaterializedIndexError> {
+            deadline.check()?;
+            Ok(())
+        },
+        || -> Result<(), MaterializedIndexError> {
+            *remaining_tokens = remaining_tokens.checked_sub(1).ok_or(
+                StorageLimitError::LexicalTokensExceeded {
+                    maximum: maximum_tokens,
+                },
+            )?;
+            Ok(())
+        },
+    )
+}
+
+fn add_lexical_document(
+    write: &redb::WriteTransaction,
+    definition: &LexicalIndexDefinition,
+    key: &[u8],
+    projection: &LexicalDocumentProjection,
+    deadline: &OperationDeadline,
+) -> Result<(), MaterializedIndexError> {
+    deadline.check()?;
     {
         let mut postings = write.open_table(LEXICAL_POSTINGS)?;
         for term in projection.terms.keys() {
+            deadline.check()?;
             let posting_key = encode_lexical_posting_key(&definition.name, term, key)?;
             postings.insert(posting_key.as_slice(), [1_u8].as_slice())?;
         }
     }
+    deadline.check()?;
     let encoded_key = encode_lexical_document_key(&definition.name, key)?;
-    let encoded_projection = encode_lexical_document(projection)?;
+    let encoded_projection = encode_lexical_document_with_deadline(projection, deadline)?;
     write
         .open_table(LEXICAL_DOCUMENTS)?
         .insert(encoded_key.as_slice(), encoded_projection.as_slice())?;
@@ -1044,28 +1745,13 @@ fn remove_lexical_document(
     definition: &LexicalIndexDefinition,
     key: &[u8],
     projection: &LexicalDocumentProjection,
-    corpus: &mut LexicalCorpusProjection,
+    deadline: &OperationDeadline,
 ) -> Result<(), MaterializedIndexError> {
-    corpus.document_count = corpus
-        .document_count
-        .checked_sub(1)
-        .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
-    for (total, length) in corpus
-        .total_field_lengths
-        .iter_mut()
-        .zip(&projection.field_lengths)
-    {
-        *total = total
-            .checked_sub(*length)
-            .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
-        corpus.token_count = corpus
-            .token_count
-            .checked_sub(*length)
-            .ok_or(MaterializedIndexError::MalformedLexicalProjection)?;
-    }
+    deadline.check()?;
     {
         let mut postings = write.open_table(LEXICAL_POSTINGS)?;
         for term in projection.terms.keys() {
+            deadline.check()?;
             let posting_key = encode_lexical_posting_key(&definition.name, term, key)?;
             if postings.remove(posting_key.as_slice())?.is_none() {
                 return Err(MaterializedIndexError::MalformedLexicalProjection);
@@ -1080,6 +1766,7 @@ fn remove_lexical_document(
     {
         return Err(MaterializedIndexError::MalformedLexicalProjection);
     }
+    deadline.check()?;
     Ok(())
 }
 
@@ -1091,19 +1778,42 @@ fn empty_lexical_corpus(field_count: usize) -> LexicalCorpusProjection {
     }
 }
 
-fn encode_lexical_document(
+fn validate_lexical_corpus_limits(
+    corpus: &LexicalCorpusProjection,
+    limits: &RecoveryLimits,
+) -> Result<(), MaterializedIndexError> {
+    if corpus.document_count > limits.max_lexical_documents {
+        return Err(StorageLimitError::LexicalDocumentsExceeded {
+            maximum: limits.max_lexical_documents,
+        }
+        .into());
+    }
+    if corpus.token_count > limits.max_lexical_tokens {
+        return Err(StorageLimitError::LexicalTokensExceeded {
+            maximum: limits.max_lexical_tokens,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn encode_lexical_document_with_deadline(
     projection: &LexicalDocumentProjection,
+    deadline: &OperationDeadline,
 ) -> Result<Vec<u8>, MaterializedIndexError> {
+    deadline.check()?;
     let field_count = u8::try_from(projection.field_lengths.len())
         .map_err(|_| MaterializedIndexError::MalformedLexicalProjection)?;
     let term_count = u32::try_from(projection.terms.len())
         .map_err(|_| MaterializedIndexError::MalformedLexicalProjection)?;
     let mut encoded = vec![1, field_count];
     for length in &projection.field_lengths {
+        deadline.check()?;
         encoded.extend_from_slice(&length.to_le_bytes());
     }
     encoded.extend_from_slice(&term_count.to_le_bytes());
     for (term, frequencies) in &projection.terms {
+        deadline.check()?;
         if frequencies.len() != projection.field_lengths.len() {
             return Err(MaterializedIndexError::MalformedLexicalProjection);
         }
@@ -1112,16 +1822,41 @@ fn encode_lexical_document(
         encoded.extend_from_slice(&length.to_le_bytes());
         encoded.extend_from_slice(term.as_bytes());
         for frequency in frequencies {
+            deadline.check()?;
             encoded.extend_from_slice(&frequency.to_le_bytes());
         }
     }
+    deadline.check()?;
     Ok(encoded)
 }
 
-fn decode_lexical_document(
+fn decode_lexical_document_with_deadline(
     encoded: &[u8],
     expected_fields: usize,
+    deadline: &OperationDeadline,
 ) -> Result<LexicalDocumentProjection, MaterializedIndexError> {
+    decode_lexical_document_inner(encoded, expected_fields, || {
+        deadline.check().map_err(Into::into)
+    })
+}
+
+fn decode_lexical_document_with_timeout(
+    encoded: &[u8],
+    expected_fields: usize,
+    started: Instant,
+    timeout: Duration,
+) -> Result<LexicalDocumentProjection, MaterializedIndexError> {
+    decode_lexical_document_inner(encoded, expected_fields, || {
+        check_lexical_timeout(started, timeout)
+    })
+}
+
+fn decode_lexical_document_inner(
+    encoded: &[u8],
+    expected_fields: usize,
+    mut checkpoint: impl FnMut() -> Result<(), MaterializedIndexError>,
+) -> Result<LexicalDocumentProjection, MaterializedIndexError> {
+    checkpoint()?;
     if encoded.first() != Some(&1)
         || encoded.get(1).map(|value| usize::from(*value)) != Some(expected_fields)
     {
@@ -1130,6 +1865,7 @@ fn decode_lexical_document(
     let mut cursor = 2_usize;
     let mut field_lengths = Vec::with_capacity(expected_fields);
     for _ in 0..expected_fields {
+        checkpoint()?;
         field_lengths.push(read_u64(encoded, &mut cursor)?);
     }
     let term_count = usize::try_from(read_u32(encoded, &mut cursor)?)
@@ -1137,6 +1873,7 @@ fn decode_lexical_document(
     let mut terms = BTreeMap::new();
     let mut previous: Option<String> = None;
     for _ in 0..term_count {
+        checkpoint()?;
         let term_length = usize::from(read_u16(encoded, &mut cursor)?);
         let end = cursor
             .checked_add(term_length)
@@ -1152,9 +1889,11 @@ fn decode_lexical_document(
         if term.is_empty() || previous.as_ref().is_some_and(|previous| previous >= &term) {
             return Err(MaterializedIndexError::MalformedLexicalProjection);
         }
-        let frequencies = (0..expected_fields)
-            .map(|_| read_u64(encoded, &mut cursor))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut frequencies = Vec::with_capacity(expected_fields);
+        for _ in 0..expected_fields {
+            checkpoint()?;
+            frequencies.push(read_u64(encoded, &mut cursor)?);
+        }
         if frequencies.iter().all(|frequency| *frequency == 0) {
             return Err(MaterializedIndexError::MalformedLexicalProjection);
         }
@@ -1164,6 +1903,7 @@ fn decode_lexical_document(
     if cursor != encoded.len() {
         return Err(MaterializedIndexError::MalformedLexicalProjection);
     }
+    checkpoint()?;
     Ok(LexicalDocumentProjection {
         field_lengths,
         terms,
@@ -1492,13 +2232,16 @@ fn decode_vector_value(encoded: &[u8]) -> Result<Q15Vector, MaterializedIndexErr
     Ok(Q15Vector::new(values)?)
 }
 
-struct IndexRestoreVisitor<'transaction> {
+struct IndexRestoreVisitor<'transaction, 'limits> {
     write: &'transaction mut redb::WriteTransaction,
+    limits: &'limits RecoveryLimits,
+    deadline: &'limits OperationDeadline,
 }
 
-impl SnapshotRecordVisitor for IndexRestoreVisitor<'_> {
+impl SnapshotRecordVisitor for IndexRestoreVisitor<'_, '_> {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
-        update_lexical_projections(self.write, key, Some(value)).map_err(SnapshotError::from)?;
+        update_lexical_projections(self.write, key, Some(value), self.limits, self.deadline)
+            .map_err(SnapshotError::from)?;
         let mut table = self
             .write
             .open_table(KV)
@@ -1537,7 +2280,8 @@ impl SnapshotRecordVisitor for IndexRestoreVisitor<'_> {
 
     fn lexical_index(&mut self, definition: &LexicalIndexDefinition) -> Result<(), SnapshotError> {
         apply_lexical_index_definition(self.write, definition).map_err(SnapshotError::from)?;
-        build_lexical_projection(self.write, definition).map_err(SnapshotError::from)?;
+        build_lexical_projection(self.write, definition, self.limits, self.deadline)
+            .map_err(SnapshotError::from)?;
         Ok(())
     }
 
@@ -1605,12 +2349,16 @@ fn copy_array<const N: usize>(source: &[u8]) -> [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, time::Duration};
 
+    use hyphae_core::VectorSpaceName;
+    use hyphae_retrieval::{ExactRetrievalError, LexicalError};
     use uuid::Uuid;
 
-    use super::{MaterializedIndex, MaterializedIndexError};
-    use crate::{DurableLog, Mutation, test_support::TestDirectory};
+    use super::{
+        MaterializedIndex, MaterializedIndexError, VectorScanError, tokenize_v1_with_policy,
+    };
+    use crate::{DurableLog, Mutation, limits::OperationDeadline, test_support::TestDirectory};
 
     fn recovery_with_operation(
         path: &std::path::Path,
@@ -1621,6 +2369,36 @@ mod tests {
         drop(log);
         let (_, recovery) = DurableLog::open_file(path)?;
         Ok(recovery)
+    }
+
+    #[test]
+    fn checked_storage_tokenization_obeys_the_shared_deadline() {
+        let deadline = OperationDeadline::new(Duration::ZERO);
+        let mut remaining_tokens = u64::MAX;
+        assert!(matches!(
+            tokenize_v1_with_policy(
+                &"a".repeat(2_048),
+                &mut remaining_tokens,
+                u64::MAX,
+                &deadline
+            ),
+            Err(MaterializedIndexError::Lexical(LexicalError::TimedOut))
+        ));
+    }
+
+    #[test]
+    fn vector_scan_checks_timeout_before_reading_candidates() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("index-vector-timeout")?;
+        let index = MaterializedIndex::open(temporary.path().join("index.redb"))?;
+        let space = VectorSpaceName::new("documents")?;
+
+        assert!(matches!(
+            index.scan_vectors_with_timeout(&space, u64::MAX, u64::MAX, Duration::ZERO),
+            Err(VectorScanError::ExactRetrieval(
+                ExactRetrievalError::TimedOut
+            ))
+        ));
+        Ok(())
     }
 
     #[test]

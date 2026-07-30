@@ -17,7 +17,7 @@ members = [
 default-members = ["crates/hyphae-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Celiums Solutions LLC"]
@@ -38,14 +38,14 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 crc32c = "0.6.8"
 fs4 = "1.1.0"
 http = "1.4.0"
-hyphae-contracts = { path = "crates/hyphae-contracts", version = "=0.2.0" }
-hyphae-client = { path = "crates/hyphae-client", version = "=0.2.0" }
-hyphae-core = { path = "crates/hyphae-core", version = "=0.2.0" }
-hyphae-engine = { path = "crates/hyphae-engine", version = "=0.2.0" }
-hyphae-query = { path = "crates/hyphae-query", version = "=0.2.0" }
-hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=0.2.0" }
-hyphae-server = { path = "crates/hyphae-server", version = "=0.2.0" }
-hyphae-storage = { path = "crates/hyphae-storage", version = "=0.2.0" }
+hyphae-contracts = { path = "crates/hyphae-contracts", version = "=0.2.1" }
+hyphae-client = { path = "crates/hyphae-client", version = "=0.2.1" }
+hyphae-core = { path = "crates/hyphae-core", version = "=0.2.1" }
+hyphae-engine = { path = "crates/hyphae-engine", version = "=0.2.1" }
+hyphae-query = { path = "crates/hyphae-query", version = "=0.2.1" }
+hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=0.2.1" }
+hyphae-server = { path = "crates/hyphae-server", version = "=0.2.1" }
+hyphae-storage = { path = "crates/hyphae-storage", version = "=0.2.1" }
 libm = "0.2.16"
 proptest = "1.6.0"
 redb = "4.1.0"

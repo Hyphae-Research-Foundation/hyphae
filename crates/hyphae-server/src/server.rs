@@ -4,10 +4,12 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -36,20 +38,26 @@ use hyphae_contracts::v1::{
 };
 use hyphae_core::{Q15Vector, VectorSpaceDefinition, VectorSpaceName, current_version};
 use hyphae_engine::{
-    EngineError, ExactRetrievalProofArtifact, HybridRetrievalProofArtifact, HyphaeEngine,
-    LexicalRetrievalProofArtifact, ProofError, ProvenResult, ResultProofArtifact,
+    BoundedEngineQueryError, EngineError, ExactRetrievalProofArtifact,
+    HybridRetrievalProofArtifact, HyphaeEngine, LexicalRetrievalProofArtifact, MaintenanceLimits,
+    ProofError, ProvenResult, ResultProofArtifact, StorageLimits,
 };
-use hyphae_query::FieldPath;
+use hyphae_query::{DEFAULT_QUERY_SCAN_BYTES, FieldPath};
 use hyphae_retrieval::{
     ExactAbstentionReason, ExactRetrievalOutcome, ExactRetrievalRequest, HybridBranchAbsence,
     HybridOutcome, HybridRequest, LexicalAbstentionReason, LexicalField, LexicalIndexDefinition,
     LexicalOutcome, LexicalRequest,
 };
 use hyphae_storage::{
-    AppendOutcome, LogError, MaterializedIndexError, SnapshotError, StorageError, verify_snapshot,
+    AppendOutcome, LogError, MaterializedIndexError, SnapshotError, SnapshotReadLimits,
+    StorageError, open_verified_snapshot_with_limits,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::{net::TcpListener, sync::Semaphore};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _, ReadBuf},
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -71,6 +79,7 @@ const FEATURES: [&str; 14] = [
     "structured_aggregation",
     "typed_abstention",
 ];
+const WITNESS_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 struct RequestId(String);
@@ -82,6 +91,21 @@ struct ServerState {
     bearer_token: Option<BearerToken>,
     admission: Arc<Semaphore>,
     ready: AtomicBool,
+}
+
+struct AdmittedFile {
+    file: tokio::fs::File,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for AdmittedFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_read(context, buffer)
+    }
 }
 
 /// Opened optional HTTP surface owning exactly one embedded Hyphae engine.
@@ -101,8 +125,24 @@ impl HyphaeServer {
     /// Returns a configuration, data-directory lock, recovery, or corruption
     /// error.
     pub fn open(config: ServerConfig) -> Result<Self, ServerError> {
+        Self::open_with_storage_limits(config, StorageLimits::default())
+    }
+
+    /// Validates secure defaults and opens the engine under explicit finite
+    /// storage recovery and maintenance limits.
+    ///
+    /// No socket is opened by this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration, limit, timeout, data-directory lock,
+    /// recovery, or corruption error.
+    pub fn open_with_storage_limits(
+        config: ServerConfig,
+        storage_limits: StorageLimits,
+    ) -> Result<Self, ServerError> {
         config.validate()?;
-        let opened = HyphaeEngine::open(config.data_dir())?;
+        let opened = HyphaeEngine::open_with_limits(config.data_dir(), storage_limits)?;
         let data_dir = opened.engine.data_path().to_path_buf();
         Ok(Self {
             bind: config.bind,
@@ -357,8 +397,10 @@ async fn get_record(
 ) -> Result<Response, ApiError> {
     let request: GetRequestV1 = parse_json(request, &state, &request_id.0).await?;
     let key = decode_key_hex(&request.key_hex).map_err(|_| ApiError::invalid(&request_id.0))?;
+    let maintenance =
+        witness_maintenance_limits(state.limits.witness_bytes, WITNESS_VERIFICATION_TIMEOUT);
     let artifact = with_engine(Arc::clone(&state), &request_id.0, move |engine| {
-        engine.get_record_with_proof(&key)
+        engine.get_record_with_proof_with_limits(&key, &maintenance)
     })
     .await?;
     let proof = proof_transport(&artifact, &state, &request_id.0)?;
@@ -385,8 +427,14 @@ async fn query_records(
         .map_err(|_| ApiError::invalid(&request_id.0))?;
     let mut execution_limits = state.limits.query.clone();
     execution_limits.timeout = timeout;
-    let artifact = with_engine(Arc::clone(&state), &request_id.0, move |engine| {
-        engine.query_with_proof(&query, &execution_limits)
+    let maintenance = witness_maintenance_limits(state.limits.witness_bytes, timeout);
+    let artifact = with_bounded_query(Arc::clone(&state), &request_id.0, move |engine| {
+        engine.query_with_proof_with_limits(
+            &query,
+            &execution_limits,
+            DEFAULT_QUERY_SCAN_BYTES,
+            &maintenance,
+        )
     })
     .await?;
     let proof = proof_transport(&artifact, &state, &request_id.0)?;
@@ -491,8 +539,9 @@ async fn retrieve_exact(
     let request = exact_request(request, &request_id.0)?;
     let mut limits = state.limits.exact_retrieval.clone();
     limits.timeout = timeout;
+    let maintenance = witness_maintenance_limits(state.limits.witness_bytes, timeout);
     let artifact = with_engine(Arc::clone(&state), &request_id.0, move |engine| {
-        engine.retrieve_exact_with_proof(&request, &limits)
+        engine.retrieve_exact_with_proof_with_limits(&request, &limits, &maintenance)
     })
     .await?;
     let proof = retrieval_proof_transport(&artifact, &state, &request_id.0)?;
@@ -571,8 +620,9 @@ async fn retrieve_lexical(
     let request = lexical_request(request, &request_id.0)?;
     let mut limits = state.limits.lexical_retrieval.clone();
     limits.timeout = timeout;
+    let maintenance = witness_maintenance_limits(state.limits.witness_bytes, timeout);
     let artifact = with_engine(Arc::clone(&state), &request_id.0, move |engine| {
-        engine.retrieve_lexical_with_proof(&request, &limits)
+        engine.retrieve_lexical_with_proof_with_limits(&request, &limits, &maintenance)
     })
     .await?;
     let proof = lexical_retrieval_proof_transport(&artifact, &state, &request_id.0)?;
@@ -610,13 +660,20 @@ async fn retrieve_hybrid(
     lexical_limits.timeout = lexical_timeout;
     let mut vector_limits = state.limits.exact_retrieval.clone();
     vector_limits.timeout = vector_timeout;
+    let maintenance = witness_maintenance_limits(
+        state.limits.witness_bytes,
+        lexical_timeout
+            .checked_add(vector_timeout)
+            .unwrap_or(Duration::MAX),
+    );
     let artifact = with_engine(Arc::clone(&state), &request_id.0, move |engine| {
-        engine.retrieve_hybrid_with_proof(
+        engine.retrieve_hybrid_with_proof_with_limits(
             &lexical_request,
             &lexical_limits,
             &vector_request,
             &vector_limits,
             &hybrid_request,
+            &maintenance,
         )
     })
     .await?;
@@ -646,25 +703,46 @@ async fn download_witness(
         .try_acquire_owned()
         .map_err(|_| busy(&request_id.0))?;
     let verification_path = path.clone();
-    let verified = tokio::task::spawn_blocking(move || verify_snapshot(verification_path)).await;
-    drop(permit);
-    let info = match verified {
-        Ok(Ok(info)) => info,
+    let verification_limits = SnapshotReadLimits {
+        file_bytes: state.limits.witness_bytes,
+        entries: state.limits.witness_bytes,
+        decoded_bytes: state.limits.witness_bytes,
+    };
+    let verified = tokio::task::spawn_blocking(move || {
+        open_verified_snapshot_with_limits(
+            verification_path,
+            &verification_limits,
+            WITNESS_VERIFICATION_TIMEOUT,
+        )
+    })
+    .await;
+    let (verified_file, info) = match verified {
+        Ok(Ok(verified)) => verified,
         Ok(Err(SnapshotError::Io(source))) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(not_found(&request_id.0));
+        }
+        Ok(Err(
+            SnapshotError::FileLimitExceeded { .. }
+            | SnapshotError::EntryLimitExceeded { .. }
+            | SnapshotError::DecodedBytesLimitExceeded { .. },
+        )) => {
+            return Err(ApiError::result_too_large(&request_id.0));
+        }
+        Ok(Err(source)) if source.is_timeout() => {
+            return Err(ApiError::timeout(&request_id.0));
         }
         Ok(Err(_)) | Err(_) => return Err(ApiError::internal(&request_id.0)),
     };
     if info.checkpoint_sequence != sequence || info.snapshot_digest != expected_digest {
         return Err(not_found(&request_id.0));
     }
-    if info.file_bytes > state.limits.witness_bytes {
-        return Err(ApiError::limit(&request_id.0));
-    }
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| ApiError::internal(&request_id.0))?;
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::new(
+        AdmittedFile {
+            file: tokio::fs::File::from_std(verified_file),
+            _permit: permit,
+        }
+        .take(info.file_bytes),
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -824,6 +902,17 @@ fn requested_lexical_timeout(
     Ok(Duration::from_millis(requested_ms))
 }
 
+fn witness_maintenance_limits(witness_bytes: u64, timeout: Duration) -> MaintenanceLimits {
+    MaintenanceLimits {
+        timeout: WITNESS_VERIFICATION_TIMEOUT.min(timeout),
+        snapshot: SnapshotReadLimits {
+            file_bytes: witness_bytes,
+            entries: witness_bytes,
+            decoded_bytes: witness_bytes,
+        },
+    }
+}
+
 async fn with_engine<T, F>(
     state: Arc<ServerState>,
     request_id: &str,
@@ -860,8 +949,51 @@ where
     }
 }
 
+async fn with_bounded_query<T, F>(
+    state: Arc<ServerState>,
+    request_id: &str,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut HyphaeEngine) -> Result<T, BoundedEngineQueryError> + Send + 'static,
+{
+    if !state.ready.load(Ordering::Acquire) {
+        return Err(ApiError::unavailable(request_id));
+    }
+    let _permit = Arc::clone(&state.admission)
+        .try_acquire_owned()
+        .map_err(|_| busy(request_id))?;
+    let engine = Arc::clone(&state.engine);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut engine = engine.lock().map_err(|_| BoundedQueryTaskError::Poisoned)?;
+        operation(&mut engine).map_err(BoundedQueryTaskError::Query)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(BoundedQueryTaskError::Query(source))) => {
+            if let BoundedEngineQueryError::Engine(engine) = &source
+                && engine_error_requires_recovery(engine)
+            {
+                state.ready.store(false, Ordering::Release);
+            }
+            Err(ApiError::from_bounded_query(source, request_id))
+        }
+        Ok(Err(BoundedQueryTaskError::Poisoned)) | Err(_) => {
+            state.ready.store(false, Ordering::Release);
+            Err(ApiError::internal(request_id))
+        }
+    }
+}
+
 enum EngineTaskError {
     Engine(EngineError),
+    Poisoned,
+}
+
+enum BoundedQueryTaskError {
+    Query(BoundedEngineQueryError),
     Poisoned,
 }
 
@@ -899,15 +1031,30 @@ fn engine_error_requires_recovery(error: &EngineError) -> bool {
         EngineError::Storage(StorageError::Index { source }) => {
             materialized_index_error_requires_recovery(source)
         }
+        EngineError::Storage(StorageError::Snapshot { source }) => {
+            snapshot_error_requires_recovery(source)
+        }
         EngineError::Storage(
             StorageError::CommittedButNotIndexed { .. }
             | StorageError::StaleIndex
-            | StorageError::Snapshot { .. }
             | StorageError::DataDirectory(_)
             | StorageError::Log(LogError::Poisoned),
         )
         | EngineError::Proof(_) => true,
         _ => false,
+    }
+}
+
+fn snapshot_error_requires_recovery(error: &SnapshotError) -> bool {
+    if error.is_timeout() || error.storage_limit().is_some() {
+        return false;
+    }
+    match error {
+        SnapshotError::FileLimitExceeded { .. }
+        | SnapshotError::EntryLimitExceeded { .. }
+        | SnapshotError::DecodedBytesLimitExceeded { .. } => false,
+        SnapshotError::Index { source } => materialized_index_error_requires_recovery(source),
+        _ => true,
     }
 }
 
@@ -1283,9 +1430,20 @@ async fn method_not_allowed(Extension(request_id): Extension<RequestId>) -> ApiE
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        error::Error,
+        fs,
+        io::Write as _,
+        net::Ipv4Addr,
+        path::PathBuf,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{Request, header},
+    };
     use serde_json::Value;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -1367,11 +1525,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_witness_is_rejected_by_metadata_before_hashing() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = TestDirectory::create("oversized-witness")?;
+        let mut config = ServerConfig::new(&temporary.path);
+        config.limits.witness_bytes = 8;
+        let app = HyphaeServer::open(config)?.test_router();
+        let witness_path = temporary
+            .path
+            .join("snapshots")
+            .join("snapshot-00000000000000000001.hysnap");
+        fs::write(&witness_path, [0_u8; 9])?;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/witnesses/1/{}", "00".repeat(32)))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_error(response, StatusCode::PAYLOAD_TOO_LARGE, "result_too_large").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_failure_does_not_drop_server_readiness() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = TestDirectory::create("snapshot-policy-readiness")?;
+        let mut config = ServerConfig::new(&temporary.path);
+        config.limits.witness_bytes = 1;
+        let server = HyphaeServer::open(config)?;
+        let app = server.test_router();
+
+        let put = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/kv/put",
+                r#"{"records":[{"key_hex":"61","value":1}]}"#,
+                None,
+            )?)
+            .await?;
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let rejected = app
+            .clone()
+            .oneshot(json_request("/v1/kv/get", r#"{"key_hex":"61"}"#, None)?)
+            .await?;
+        assert_error(rejected, StatusCode::PAYLOAD_TOO_LARGE, "result_too_large").await?;
+        assert!(server.state.ready.load(Ordering::Acquire));
+
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health/ready")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(ready.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn witness_stream_stops_at_verified_length_after_late_append()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::create("witness-stream-length")?;
+        let app = HyphaeServer::open(ServerConfig::new(&temporary.path))?.test_router();
+        let put = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/kv/put",
+                r#"{"transaction_id":"018f0000-0000-7000-8000-000000000011","records":[{"key_hex":"61","value":1}]}"#,
+                None,
+            )?)
+            .await?;
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let get = app
+            .clone()
+            .oneshot(json_request("/v1/kv/get", r#"{"key_hex":"61"}"#, None)?)
+            .await?;
+        assert_eq!(get.status(), StatusCode::OK);
+        let get: Value = serde_json::from_slice(&response_bytes(get).await?)?;
+        let witness_path = get["proof"]["witness"]["path"]
+            .as_str()
+            .ok_or("missing witness path")?
+            .to_owned();
+        let witness = app
+            .oneshot(Request::builder().uri(witness_path).body(Body::empty())?)
+            .await?;
+        assert_eq!(witness.status(), StatusCode::OK);
+        let verified_length = witness
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .ok_or("missing witness content length")?
+            .to_str()?
+            .parse::<usize>()?;
+
+        let mut snapshots = fs::read_dir(temporary.path.join("snapshots"))?;
+        let snapshot_path = snapshots.next().ok_or("missing local snapshot")??.path();
+        assert!(snapshots.next().is_none());
+        let suffix = b"late-unverified-growth";
+        let mut snapshot = fs::OpenOptions::new().append(true).open(snapshot_path)?;
+        snapshot.write_all(suffix)?;
+        snapshot.sync_all()?;
+        drop(snapshot);
+
+        let streamed = response_bytes(witness).await?;
+        assert_eq!(streamed.len(), verified_length);
+        assert!(!streamed.ends_with(suffix));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn authenticated_put_get_and_witness_are_contract_shaped() -> Result<(), Box<dyn Error>> {
         let temporary = TestDirectory::create("authenticated-flow")?;
         let secret = "correct-hyphae-token-material-0001";
         let mut config = ServerConfig::new(&temporary.path);
         config.bearer_token = Some(BearerToken::new(secret)?);
+        config.limits.concurrent_operations = 1;
         let app = HyphaeServer::open(config)?.test_router();
 
         let unauthorized = app
@@ -1467,6 +1739,16 @@ mod tests {
             .await?;
         assert_eq!(witness.status(), StatusCode::OK);
         assert!(witness.headers().contains_key("digest"));
+        let blocked_while_stream_is_live = app
+            .clone()
+            .oneshot(json_request("/v1/query", r#"{"limit":1}"#, Some(secret))?)
+            .await?;
+        assert_error(
+            blocked_while_stream_is_live,
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+        )
+        .await?;
         assert!(response_bytes(witness).await?.starts_with(b"HYSNAP01"));
 
         let query = app

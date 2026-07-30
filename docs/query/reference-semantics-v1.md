@@ -65,6 +65,27 @@ plan emits no groups for zero matches.
 Before execution, shape limits validate filter nodes and recursion depth, sort
 fields, grouping fields, metric count, and requested page size. During
 execution, global scan, matched-record, and group budgets are checked before
-allocation grows beyond the limit. A caller-visible monotonic timeout is
-checked cooperatively during scan, aggregation, and after sort. Any exceeded
-budget returns an error and no partial result.
+the corresponding retained input grows beyond the limit. The additive bounded
+entry points also enforce an aggregate scanned-byte budget.
+
+Scanned bytes are counted exactly once per inspected record across all shards,
+including records rejected by the filter:
+
+```text
+binary key length
++ 56-byte HYDOC001 envelope
++ canonical Value payload length
+```
+
+`execute_with_byte_limit` and the durable facade's `query_with_byte_limit`
+accept the byte policy explicitly and return separate bounded error types. The
+standalone server passes a fixed 256 MiB ceiling without changing the v1 wire
+shape. Legacy `execute`, `execute_with_clock`, and durable `query` retain their
+`0.2.0` count-bounded behavior and do not apply this aggregate byte ceiling.
+This is an input-scan budget, not a claim that every result or aggregation
+allocation has the same byte size; separate count/shape/result limits still
+apply.
+
+A caller-visible monotonic timeout is checked cooperatively during durable
+scan, document decoding, reference execution, aggregation, and after sort.
+Any exceeded budget returns an error and no partial result.

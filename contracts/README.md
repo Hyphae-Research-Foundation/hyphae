@@ -2,13 +2,15 @@
 
 `openapi/hyphae-v1.yaml` is the canonical HTTP surface and the JSON Schema
 2020-12 documents are the canonical payload definitions for `/v1`. The data
-operations are KV put/get/delete, deterministic structured query, and result
-proof witness download. Health and capabilities disclose no data.
+operations cover KV put/get/delete, deterministic structured query, durable
+vector and lexical definitions/mutations, exact/lexical/hybrid retrieval, and
+result/retrieval proof witness download. Health and capabilities disclose no
+data.
 
 The Rust wire models in `hyphae-contracts` generate every checked-in schema.
 `cargo run -p hyphae-contracts --example generate_schemas` refreshes them and
 tests fail when generated and checked-in models differ. TypeScript and Python
-SDK generation in Phase 6 consumes only these versioned public documents.
+SDK generation consumes only these versioned public documents.
 
 ## Structured values
 

@@ -39,6 +39,18 @@ Errors do not degrade to single-modality execution. An invalid request,
 unknown definition, stale index, budget failure, or timeout in either branch
 fails the complete hybrid request without partial results.
 
+## Resource limits
+
+The complete hybrid deadline is the saturating sum of the configured lexical
+and exact-vector timeouts. The lexical branch is bounded by its own timeout and
+the remaining total. The vector branch is then bounded by its own timeout and
+the remaining total. Fusion must complete before that same total expires.
+
+Proof-producing facade methods with explicit maintenance limits spend the
+remaining hybrid total on snapshot creation as well. The legacy proof method
+retains its `0.2.0` signature and creates the snapshot afterward under the
+engine's stored maintenance policy.
+
 ## Explanation
 
 Each result records lexical rank and score when present, vector rank and score

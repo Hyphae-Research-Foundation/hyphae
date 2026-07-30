@@ -82,6 +82,18 @@ trailing or truncated bytes, CRC32C mismatch, and BLAKE3 mismatch. Format 2
 also rejects unknown vector/lexical tags, invalid Q15 values, dimension
 mismatch, and malformed field paths.
 
+Bounded verification preflights metadata length and declared logical counts
+on the same open handle later scanned, accounts decoded logical bytes during
+that scan, and checks one cooperative deadline inside record and 64 KiB
+payload loops. `SnapshotReadLimits.entries` covers retained KV, vector-space,
+vector, and lexical-definition records; receipts remain bounded by the file
+length and deadline but are not retained by an offline witness loader.
+
+Snapshot creation measures the complete logical payload before opening a
+temporary output, applies the same record/file/decoded policy throughout
+write and reread verification, and removes its unique temporary file on every
+pre-promotion error. The final rename remains the activation boundary.
+
 The checkpoint digest links logical state to a verified authoritative commit.
 CRC32C and BLAKE3 detect accidental corruption; they do not authenticate a
 directory against an attacker able to rewrite the snapshot and log together.

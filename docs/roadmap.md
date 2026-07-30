@@ -1,10 +1,22 @@
 # Hyphae roadmap
 
-The active `0.2` execution record is
-[`roadmap-0.2.md`](roadmap-0.2.md). It targets proof-bearing durable retrieval
-and records Gates 0 through 8 as complete locally. Gate 9 is locally complete;
-the hosted Linux/macOS/Windows matrix, tag, push, and publication remain
-pending explicit release authorization.
+`0.2.0` is the latest published release. Its annotated `v0.2.0` tag peels to
+`170380453a2ca6322a4c8bc50417318daee1c011`, its
+[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0) is
+published, and all ten publishable Rust workspace crates are available on
+crates.io at version `0.2.0`. The implementation record in
+[`roadmap-0.2.md`](roadmap-0.2.md) remains historical and retains two unchecked
+hosted-evidence items; it does not authorize a new release.
+
+The active maintenance target is `0.2.1`, tracked by the
+[`0.2.1` release gate](gates/0.2.1.md). It raises bounded local
+snapshot-witness verification limits; adds separate bounded query, recovery,
+snapshot, compaction, and proof-producing paths used by the packaged
+CLI/server; preserves the published Rust legacy surface; and carries
+dependency/host-smoke maintenance without changing API `/v1`, disk format `2`,
+or either proof format. Final local evidence, the hosted
+Linux/macOS/Windows matrix, exact candidate binding, tag, and publication
+remain pending.
 
 ## 0.1.0 release roadmap
 

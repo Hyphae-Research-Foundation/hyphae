@@ -1,8 +1,9 @@
 # Contributing
 
-Hyphae remains private until publication is explicitly authorized after the
-`0.1.0` gates pass on the exact selected commit. Access does not imply
-permission to publish source, artifacts, benchmarks, or design documents.
+Repository access does not imply permission to publish source, artifacts,
+benchmarks, or design documents. A release may be tagged or published only
+after its complete gate passes on the exact selected commit and publication is
+explicitly authorized.
 
 ## Development rules
 

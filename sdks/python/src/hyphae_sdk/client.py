@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import math
+import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -70,6 +74,226 @@ class HyphaeApiError(HyphaeClientError):
         )
 
 
+@dataclass(frozen=True)
+class _Deadline:
+    expires_at: float
+
+    @classmethod
+    def start(cls, timeout_seconds: float) -> _Deadline:
+        return cls(time.monotonic() + timeout_seconds)
+
+    def remaining(self) -> float:
+        remaining = self.expires_at - time.monotonic()
+        if remaining <= 0:
+            raise _deadline_error()
+        return remaining
+
+    def elapsed(self) -> bool:
+        return time.monotonic() >= self.expires_at
+
+
+def _abort_connection(connection: http.client.HTTPConnection) -> None:
+    current_socket = connection.sock
+    if current_socket is None:
+        return
+    _abort_socket(current_socket)
+
+
+class _DeadlineGuard:
+    """Interrupt blocking urllib I/O when one absolute deadline expires."""
+
+    def __init__(self, deadline: _Deadline) -> None:
+        self._deadline = deadline
+        self._cancelled = threading.Event()
+        self._expired = threading.Event()
+        self._lock = threading.Lock()
+        self._connection: http.client.HTTPConnection | None = None
+        self._socket: socket.socket | None = None
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="hyphae-http-deadline",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def attach(self, connection: http.client.HTTPConnection) -> None:
+        with self._lock:
+            self._connection = connection
+            self._socket = None
+        if self.expired():
+            _abort_connection(connection)
+
+    def attach_response(self, response) -> None:  # type: ignore[no-untyped-def]
+        response_socket = _response_socket(response)
+        with self._lock:
+            self._socket = response_socket
+        if self.expired() and response_socket is not None:
+            _abort_socket(response_socket)
+
+    def expired(self) -> bool:
+        return self._expired.is_set() or self._deadline.elapsed()
+
+    def ensure_open(self, connection: http.client.HTTPConnection) -> None:
+        if self.expired():
+            _abort_connection(connection)
+            raise TimeoutError("Hyphae HTTP deadline elapsed")
+
+    def close(self) -> None:
+        self._cancelled.set()
+        self._thread.join()
+
+    def _watch(self) -> None:
+        while True:
+            remaining = self._deadline.expires_at - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._cancelled.wait(min(remaining, 60.0)):
+                return
+        self._expired.set()
+        with self._lock:
+            connection = self._connection
+            response_socket = self._socket
+        if response_socket is not None:
+            _abort_socket(response_socket)
+        if connection is not None:
+            _abort_connection(connection)
+
+
+def _abort_socket(current_socket: socket.socket) -> None:
+    try:
+        current_socket.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        current_socket.close()
+    except OSError:
+        pass
+
+
+def _response_socket(response) -> socket.socket | None:  # type: ignore[no-untyped-def]
+    current = response
+    visited: set[int] = set()
+    for _ in range(8):
+        identity = id(current)
+        if identity in visited:
+            return None
+        visited.add(identity)
+        if isinstance(current, socket.socket):
+            return current
+        current = next(
+            (
+                candidate
+                for attribute in ("fp", "raw", "_sock")
+                if (candidate := getattr(current, attribute, None)) is not None
+            ),
+            None,
+        )
+        if current is None:
+            return None
+    return None
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self, host: str, *, guard: _DeadlineGuard, **kwargs: object
+    ) -> None:
+        super().__init__(host, **kwargs)
+        self._hyphae_guard = guard
+        guard.attach(self)
+
+    def connect(self) -> None:
+        super().connect()
+        self._hyphae_guard.ensure_open(self)
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self, host: str, *, guard: _DeadlineGuard, **kwargs: object
+    ) -> None:
+        super().__init__(host, **kwargs)
+        self._hyphae_guard = guard
+        guard.attach(self)
+
+    def connect(self) -> None:
+        super().connect()
+        self._hyphae_guard.ensure_open(self)
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, guard: _DeadlineGuard) -> None:
+        super().__init__()
+        self._guard = guard
+
+    def http_open(self, request):  # type: ignore[no-untyped-def]
+        guard = self._guard
+
+        def connection(host: str, **kwargs: object) -> _GuardedHTTPConnection:
+            return _GuardedHTTPConnection(host, guard=guard, **kwargs)
+
+        return self.do_open(connection, request)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, guard: _DeadlineGuard) -> None:
+        super().__init__()
+        self._guard = guard
+
+    def https_open(self, request):  # type: ignore[no-untyped-def]
+        guard = self._guard
+
+        def connection(host: str, **kwargs: object) -> _GuardedHTTPSConnection:
+            return _GuardedHTTPSConnection(host, guard=guard, **kwargs)
+
+        return self.do_open(
+            connection,
+            request,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(  # type: ignore[no-untyped-def]
+        self, request, file_pointer, code, message, headers, new_url
+    ):
+        del request, file_pointer, code, message, headers, new_url
+        raise HyphaeClientError("Hyphae HTTP redirects are not allowed")
+
+
+class _GuardedResponse:
+    def __init__(self, response, guard: _DeadlineGuard) -> None:  # type: ignore[no-untyped-def]
+        self._response = response
+        self._guard = guard
+        self._closed = False
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._response, name)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._response.read(size)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        finally:
+            self._guard.close()
+
+
+def _guarded_response(response, guard: _DeadlineGuard) -> _GuardedResponse:  # type: ignore[no-untyped-def]
+    try:
+        guard.attach_response(response)
+    except BaseException:
+        try:
+            response.close()
+        finally:
+            guard.close()
+        raise
+    return _GuardedResponse(response, guard)
+
+
 class HyphaeClient:
     """Dependency-free, bounded client for one root Hyphae HTTP origin."""
 
@@ -98,7 +322,7 @@ class HyphaeClient:
         if any(
             isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0
             for value in (timeout_seconds, response_bytes, witness_bytes)
-        ):
+        ) or not math.isfinite(float(timeout_seconds)):
             raise HyphaeClientError(
                 "client timeout and response limits must be positive numbers"
             )
@@ -208,6 +432,7 @@ class HyphaeClient:
     def _download_witness(
         self, proof: ProofV1 | RetrievalProofV1
     ) -> ApiResponse[bytes]:
+        deadline = _Deadline.start(self._timeout_seconds)
         expected_path = (
             f"/v1/witnesses/{proof['checkpoint_sequence']}/"
             f"{proof['snapshot_digest']}"
@@ -226,10 +451,14 @@ class HyphaeClient:
             raise HyphaeClientError(
                 f"Hyphae response exceeded local limit {self._witness_bytes} bytes"
             )
-        response = self._open(expected_path[1:], authenticated=True)
+        deadline.remaining()
+        response = self._open(
+            expected_path[1:], authenticated=True, deadline=deadline
+        )
         try:
+            deadline.remaining()
             if response.status < 200 or response.status >= 300:
-                raise self._decode_api_error(response)
+                raise self._decode_api_error(response, deadline)
             if response.status != 200:
                 raise HyphaeClientError(
                     f"Hyphae returned unexpected success status {response.status}"
@@ -241,13 +470,12 @@ class HyphaeClient:
                 raise HyphaeClientError(
                     "downloaded witness digest header differs from the proof"
                 )
-            value = _read_bounded(
-                response, self._witness_bytes, self._timeout_seconds
-            )
+            value = _read_bounded(response, self._witness_bytes, deadline)
             if len(value) != expected_bytes:
                 raise HyphaeClientError(
                     "downloaded witness length differs from the proof"
                 )
+            deadline.remaining()
             return ApiResponse(value, request_id)
         finally:
             response.close()
@@ -255,31 +483,41 @@ class HyphaeClient:
     def _json(
         self, path: str, authenticated: bool, body: object | None = None
     ) -> ApiResponse[object]:
-        response = self._open(path, authenticated=authenticated, body=body)
+        deadline = _Deadline.start(self._timeout_seconds)
+        response = self._open(
+            path, authenticated=authenticated, body=body, deadline=deadline
+        )
         try:
+            deadline.remaining()
             if response.status < 200 or response.status >= 300:
-                raise self._decode_api_error(response)
+                raise self._decode_api_error(response, deadline)
             if response.status != 200:
                 raise HyphaeClientError(
                     f"Hyphae returned unexpected success status {response.status}"
                 )
             _require_json(response.headers)
             request_id = _request_id(response.headers)
-            encoded = _read_bounded(
-                response, self._response_bytes, self._timeout_seconds
-            )
+            encoded = _read_bounded(response, self._response_bytes, deadline)
             try:
                 value = _loads_integer_json(encoded)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                if deadline.elapsed():
+                    raise _deadline_error() from error
                 raise HyphaeClientError(
                     "Hyphae response violated the version 1 JSON contract"
                 ) from error
+            deadline.remaining()
             return ApiResponse(value, request_id)
         finally:
             response.close()
 
     def _open(
-        self, path: str, *, authenticated: bool, body: object | None = None
+        self,
+        path: str,
+        *,
+        authenticated: bool,
+        deadline: _Deadline,
+        body: object | None = None,
     ):  # type: ignore[no-untyped-def]
         headers: dict[str, str] = {}
         data: bytes | None = None
@@ -298,22 +536,43 @@ class HyphaeClient:
             headers=headers,
             method=method,
         )
+        guard = _DeadlineGuard(deadline)
         try:
-            return urllib.request.urlopen(request, timeout=self._timeout_seconds)
+            opener = urllib.request.build_opener(
+                _DeadlineHTTPHandler(guard),
+                _DeadlineHTTPSHandler(guard),
+                _RejectRedirectHandler(),
+            )
+            response = opener.open(request, timeout=deadline.remaining())
         except urllib.error.HTTPError as response:
-            return response
-        except (OSError, urllib.error.URLError, TimeoutError) as error:
+            return _guarded_response(response, guard)
+        except (
+            OSError,
+            urllib.error.URLError,
+            TimeoutError,
+            http.client.HTTPException,
+        ) as error:
+            expired = guard.expired()
+            guard.close()
+            if expired or _is_timeout_error(error):
+                raise _deadline_error() from error
             raise HyphaeClientError("Hyphae HTTP transport failed") from error
+        except BaseException:
+            guard.close()
+            raise
+        return _guarded_response(response, guard)
 
-    def _decode_api_error(self, response) -> HyphaeApiError:  # type: ignore[no-untyped-def]
+    def _decode_api_error(
+        self, response, deadline: _Deadline
+    ) -> HyphaeApiError:  # type: ignore[no-untyped-def]
         _require_json(response.headers)
         request_id = _request_id(response.headers)
-        encoded = _read_bounded(
-            response, self._response_bytes, self._timeout_seconds
-        )
+        encoded = _read_bounded(response, self._response_bytes, deadline)
         try:
             value = _loads_integer_json(encoded)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            if deadline.elapsed():
+                raise _deadline_error() from error
             raise HyphaeClientError(
                 "Hyphae error response violated the version 1 JSON contract"
             ) from error
@@ -331,6 +590,7 @@ class HyphaeClient:
             raise HyphaeClientError(
                 "Hyphae error envelope request ID differs from its response header"
             )
+        deadline.remaining()
         return HyphaeApiError(response.status, envelope)
 
 
@@ -372,20 +632,76 @@ def _require_json(headers: Message) -> None:
         )
 
 
-def _read_bounded(response, maximum: int, timeout_seconds: float) -> bytes:  # type: ignore[no-untyped-def]
+def _deadline_error() -> HyphaeClientError:
+    return HyphaeClientError("Hyphae HTTP request/response deadline elapsed")
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(error, urllib.error.URLError) and isinstance(
+        error.reason, BaseException
+    ):
+        return _is_timeout_error(error.reason)
+    return False
+
+
+def _set_response_timeout(response, timeout_seconds: float) -> None:  # type: ignore[no-untyped-def]
+    # CPython exposes no public per-read timeout setter. Its urllib
+    # HTTPResponse and HTTPError wrappers reach the owned socket through a
+    # short fp/raw/_sock chain, so traverse that chain defensively.
+    current = response
+    visited: set[int] = set()
+    for _ in range(8):
+        identity = id(current)
+        if identity in visited:
+            return
+        visited.add(identity)
+        setter = getattr(current, "settimeout", None)
+        if callable(setter):
+            setter(timeout_seconds)
+            return
+        current = next(
+            (
+                candidate
+                for attribute in ("fp", "raw", "_sock")
+                if (candidate := getattr(current, attribute, None)) is not None
+            ),
+            None,
+        )
+        if current is None:
+            return
+
+
+def _read_bounded(
+    response, maximum: int, deadline: _Deadline
+) -> bytes:  # type: ignore[no-untyped-def]
     declared = _single_header(response.headers, "content-length")
     if declared is not None:
         if not declared.isascii() or not declared.isdigit() or int(declared) > maximum:
             raise HyphaeClientError(
                 f"Hyphae response exceeded local limit {maximum} bytes"
             )
-    deadline = time.monotonic() + timeout_seconds
     chunks: list[bytes] = []
     length = 0
     while True:
-        if time.monotonic() > deadline:
-            raise HyphaeClientError("Hyphae HTTP response deadline elapsed")
-        chunk = response.read(_CHUNK_BYTES)
+        remaining = deadline.remaining()
+        try:
+            _set_response_timeout(response, remaining)
+            chunk = response.read(_CHUNK_BYTES)
+        except (
+            OSError,
+            urllib.error.URLError,
+            TimeoutError,
+            http.client.HTTPException,
+            ValueError,
+        ) as error:
+            guard_expired = isinstance(response, _GuardedResponse) and (
+                response._guard.expired()
+            )
+            if guard_expired or deadline.elapsed() or _is_timeout_error(error):
+                raise _deadline_error() from error
+            raise HyphaeClientError("Hyphae HTTP transport failed") from error
         if not chunk:
             break
         length += len(chunk)
@@ -394,6 +710,7 @@ def _read_bounded(response, maximum: int, timeout_seconds: float) -> bytes:  # t
                 f"Hyphae response exceeded local limit {maximum} bytes"
             )
         chunks.append(chunk)
+    deadline.remaining()
     return b"".join(chunks)
 
 

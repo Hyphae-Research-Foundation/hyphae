@@ -29,7 +29,7 @@ pub use lexical::{
     LexicalMaterializedCorpus, LexicalMaterializedDocument, LexicalOutcome, LexicalRequest,
     LexicalTermContribution, MAX_LEXICAL_FIELD_WEIGHT_MICROS, MAX_LEXICAL_FIELDS,
     MAX_LEXICAL_PATH_SEGMENT_BYTES, MAX_LEXICAL_PATH_SEGMENTS, MAX_LEXICAL_TOKEN_BYTES,
-    retrieve_lexical, retrieve_lexical_materialized, tokenize_v1,
+    retrieve_lexical, retrieve_lexical_materialized, tokenize_v1, tokenize_v1_checked,
 };
 pub use model::{
     Abstention, AbstentionReason, RetrievalLimits, RetrievalMatch, RetrievalOutcome,

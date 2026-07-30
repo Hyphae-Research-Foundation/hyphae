@@ -18,6 +18,10 @@ use self::frame::{
     Frame, FrameKind, HEADER_LENGTH, MAX_PAYLOAD_LENGTH, ReadStatus, payload_length,
     read_exact_or_tail,
 };
+use crate::{
+    RecoveryLimits, StorageLimitError,
+    limits::{OperationDeadline, limit_io_error},
+};
 
 const DESCRIPTOR_LENGTH: usize = 36;
 const TRANSACTION_DOMAIN: &[u8] = b"hyphae-transaction-v1";
@@ -162,6 +166,12 @@ pub enum LogError {
     Poisoned,
 }
 
+impl From<StorageLimitError> for LogError {
+    fn from(source: StorageLimitError) -> Self {
+        Self::Io(limit_io_error(source))
+    }
+}
+
 /// Durable identity of a committed transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitReceipt {
@@ -241,6 +251,15 @@ impl OpenedLog<'_> {
 pub struct DurableLog {
     file: File,
     disk_format_version: u16,
+    max_file_bytes: u64,
+    max_frames: u64,
+    max_transactions: u64,
+    max_operations: u64,
+    max_decoded_operation_bytes: u64,
+    frame_count: u64,
+    transaction_count: u64,
+    operation_count: u64,
+    decoded_operation_bytes: u64,
     next_sequence: u64,
     previous_digest: [u8; 32],
     committed: HashMap<Uuid, CommitReceipt>,
@@ -280,6 +299,27 @@ impl DurableLog {
         base_digest: [u8; 32],
         disk_format_version: u16,
     ) -> Result<(DurableLog, RecoveryReport), LogError> {
+        let limits = RecoveryLimits::default();
+        let deadline = OperationDeadline::new(limits.timeout);
+        Self::open_file_at_version_with_limits(
+            path,
+            base_sequence,
+            base_digest,
+            disk_format_version,
+            &limits,
+            &deadline,
+        )
+    }
+
+    pub(crate) fn open_file_at_version_with_limits(
+        path: impl AsRef<Path>,
+        base_sequence: u64,
+        base_digest: [u8; 32],
+        disk_format_version: u16,
+        limits: &RecoveryLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<(DurableLog, RecoveryReport), LogError> {
+        deadline.check()?;
         if (base_sequence == 0) != (base_digest == [0; 32]) {
             return Err(LogError::InvalidAnchor);
         }
@@ -308,34 +348,62 @@ impl DurableLog {
                 File::open(parent)?.sync_all()?;
             }
         }
-        let recovery = scan(&mut file, base_sequence, base_digest, disk_format_version)?;
         let physical_length = file.metadata()?.len();
-        if physical_length != recovery.valid_bytes {
-            file.set_len(recovery.valid_bytes)?;
+        if physical_length > limits.max_log_file_bytes {
+            return Err(StorageLimitError::LogFileBytesExceeded {
+                actual: physical_length,
+                maximum: limits.max_log_file_bytes,
+            }
+            .into());
+        }
+        let scanned = scan(
+            &mut file,
+            physical_length,
+            base_sequence,
+            base_digest,
+            disk_format_version,
+            limits,
+            deadline,
+        )?;
+        deadline.check()?;
+        ensure_file_length_unchanged(&file, physical_length)?;
+        if physical_length != scanned.report.valid_bytes {
+            file.set_len(scanned.report.valid_bytes)?;
             file.sync_data()?;
         }
         file.seek(SeekFrom::End(0))?;
 
-        let committed = recovery
+        let committed = scanned
+            .report
             .transactions
             .iter()
             .map(|transaction| (transaction.receipt.transaction_id, transaction.receipt))
             .collect();
-        let next_sequence = recovery
+        let next_sequence = scanned
+            .report
             .last_sequence
             .checked_add(1)
             .ok_or(LogError::SequenceExhausted)?;
         let log = Self {
             file,
             disk_format_version,
+            max_file_bytes: limits.max_log_file_bytes,
+            max_frames: limits.max_log_frames,
+            max_transactions: limits.max_transactions,
+            max_operations: limits.max_operations,
+            max_decoded_operation_bytes: limits.max_decoded_operation_bytes,
+            frame_count: scanned.frame_count,
+            transaction_count: scanned.transaction_count,
+            operation_count: scanned.operation_count,
+            decoded_operation_bytes: scanned.decoded_operation_bytes,
             next_sequence,
-            previous_digest: recovery.last_digest,
+            previous_digest: scanned.report.last_digest,
             committed,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
         };
-        Ok((log, recovery))
+        Ok((log, scanned.report))
     }
 
     /// Appends and synchronizes one atomic transaction.
@@ -378,6 +446,66 @@ impl DurableLog {
                 Err(LogError::IdempotencyConflict { transaction_id })
             };
         }
+        let operation_delta =
+            u64::try_from(operations.len()).map_err(|_| LogError::TooManyOperations)?;
+        let projected_frames = self.preflight_frames(operation_delta)?;
+        let projected_transactions = self.transaction_count.checked_add(1).ok_or(
+            StorageLimitError::TransactionsExceeded {
+                maximum: self.max_transactions,
+            },
+        )?;
+        if projected_transactions > self.max_transactions {
+            return Err(StorageLimitError::TransactionsExceeded {
+                maximum: self.max_transactions,
+            }
+            .into());
+        }
+        let projected_operations = self.operation_count.checked_add(operation_delta).ok_or(
+            StorageLimitError::OperationsExceeded {
+                maximum: self.max_operations,
+            },
+        )?;
+        if projected_operations > self.max_operations {
+            return Err(StorageLimitError::OperationsExceeded {
+                maximum: self.max_operations,
+            }
+            .into());
+        }
+        let operation_byte_delta = operations.iter().try_fold(0_u64, |total, operation| {
+            let bytes = u64::try_from(operation.len()).ok()?;
+            total.checked_add(bytes)
+        });
+        let projected_operation_bytes = operation_byte_delta
+            .and_then(|delta| self.decoded_operation_bytes.checked_add(delta))
+            .ok_or(StorageLimitError::DecodedOperationBytesExceeded {
+                maximum: self.max_decoded_operation_bytes,
+            })?;
+        if projected_operation_bytes > self.max_decoded_operation_bytes {
+            return Err(StorageLimitError::DecodedOperationBytesExceeded {
+                maximum: self.max_decoded_operation_bytes,
+            }
+            .into());
+        }
+        let current_bytes = self.file.metadata()?.len();
+        let appended_bytes = transaction_encoded_length(operations).ok_or(
+            StorageLimitError::LogFileBytesExceeded {
+                actual: u64::MAX,
+                maximum: self.max_file_bytes,
+            },
+        )?;
+        let projected_bytes = current_bytes.checked_add(appended_bytes).ok_or(
+            StorageLimitError::LogFileBytesExceeded {
+                actual: u64::MAX,
+                maximum: self.max_file_bytes,
+            },
+        )?;
+        if projected_bytes > self.max_file_bytes {
+            return Err(StorageLimitError::LogFileBytesExceeded {
+                actual: projected_bytes,
+                maximum: self.max_file_bytes,
+            }
+            .into());
+        }
 
         let descriptor = encode_descriptor(operation_count, transaction_digest);
         let append_result = self.append_new_transaction(
@@ -388,8 +516,37 @@ impl DurableLog {
         );
         if append_result.is_err() {
             self.poisoned = true;
+        } else {
+            self.frame_count = projected_frames;
+            self.transaction_count = projected_transactions;
+            self.operation_count = projected_operations;
+            self.decoded_operation_bytes = projected_operation_bytes;
         }
         append_result
+    }
+
+    fn preflight_frames(&self, operation_count: u64) -> Result<u64, LogError> {
+        let frame_delta =
+            operation_count
+                .checked_add(2)
+                .ok_or(StorageLimitError::LogFramesExceeded {
+                    maximum: self.max_frames,
+                })?;
+        self.next_sequence
+            .checked_add(frame_delta)
+            .ok_or(LogError::SequenceExhausted)?;
+        let projected_frames = self.frame_count.checked_add(frame_delta).ok_or(
+            StorageLimitError::LogFramesExceeded {
+                maximum: self.max_frames,
+            },
+        )?;
+        if projected_frames > self.max_frames {
+            return Err(StorageLimitError::LogFramesExceeded {
+                maximum: self.max_frames,
+            }
+            .into());
+        }
+        Ok(projected_frames)
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
@@ -474,6 +631,19 @@ impl DurableLog {
     }
 }
 
+fn transaction_encoded_length(operations: &[Vec<u8>]) -> Option<u64> {
+    let header_bytes = u64::try_from(HEADER_LENGTH).ok()?;
+    let descriptor_bytes = u64::try_from(DESCRIPTOR_LENGTH).ok()?;
+    let mut total = header_bytes.checked_add(descriptor_bytes)?.checked_mul(2)?;
+    for operation in operations {
+        let operation_bytes = u64::try_from(operation.len()).ok()?;
+        total = total
+            .checked_add(header_bytes)?
+            .checked_add(operation_bytes)?;
+    }
+    Some(total)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct WrittenFrame {
     sequence: u64,
@@ -488,14 +658,26 @@ struct PendingTransaction {
     operations: Vec<Vec<u8>>,
 }
 
+struct ScanOutcome {
+    report: RecoveryReport,
+    frame_count: u64,
+    transaction_count: u64,
+    operation_count: u64,
+    decoded_operation_bytes: u64,
+}
+
+#[allow(clippy::too_many_lines)]
 fn scan(
     file: &mut File,
+    physical_length: u64,
     base_sequence: u64,
     base_digest: [u8; 32],
     disk_format_version: u16,
-) -> Result<RecoveryReport, LogError> {
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<ScanOutcome, LogError> {
+    deadline.check()?;
     file.seek(SeekFrom::Start(0))?;
-    let physical_length = file.metadata()?.len();
     let mut report = RecoveryReport {
         base_sequence,
         base_digest,
@@ -510,22 +692,58 @@ fn scan(
     let mut expected_previous_digest = base_digest;
     let mut pending: Option<PendingTransaction> = None;
     let mut committed: HashMap<Uuid, CommitReceipt> = HashMap::new();
+    let mut frame_count = 0_u64;
+    let mut operation_count = 0_u64;
+    let mut decoded_operation_bytes = 0_u64;
 
     loop {
+        deadline.check()?;
+        let remaining = physical_length
+            .checked_sub(offset)
+            .ok_or_else(|| io::Error::other("log scan exceeded its captured file length"))?;
+        if remaining == 0 {
+            break;
+        }
+        let header_length = u64::try_from(HEADER_LENGTH)
+            .map_err(|_| io::Error::other("log header length overflow"))?;
+        if remaining < header_length {
+            report.truncated_tail_bytes = remaining;
+            break;
+        }
         let mut header = [0_u8; HEADER_LENGTH];
         match read_exact_or_tail(file, &mut header)? {
-            ReadStatus::End => break,
-            ReadStatus::Partial => {
-                report.truncated_tail_bytes = physical_length.saturating_sub(offset);
+            ReadStatus::End | ReadStatus::Partial => {
+                report.truncated_tail_bytes = remaining;
                 break;
             }
             ReadStatus::Complete => {}
         }
         let length = payload_length(&header, offset, disk_format_version)?;
-        let mut payload = vec![0_u8; length];
-        if read_exact_or_tail(file, &mut payload)? != ReadStatus::Complete {
-            report.truncated_tail_bytes = physical_length.saturating_sub(offset);
+        let frame_length = header_length
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| io::Error::other("log payload length overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("log frame length overflow"))?;
+        if frame_length > remaining {
+            report.truncated_tail_bytes = remaining;
             break;
+        }
+        let mut payload = vec![0_u8; length];
+        if read_payload_or_tail(file, &mut payload, deadline)? != ReadStatus::Complete {
+            report.truncated_tail_bytes = remaining;
+            break;
+        }
+        frame_count = frame_count
+            .checked_add(1)
+            .ok_or(StorageLimitError::LogFramesExceeded {
+                maximum: limits.max_log_frames,
+            })?;
+        if frame_count > limits.max_log_frames {
+            return Err(StorageLimitError::LogFramesExceeded {
+                maximum: limits.max_log_frames,
+            }
+            .into());
         }
 
         let frame = Frame::decode(&header, payload, offset, disk_format_version)?;
@@ -542,13 +760,44 @@ fn scan(
             });
         }
 
-        apply_frame(&frame, &mut pending, &mut committed, &mut report)?;
-        let frame_length = u64::try_from(HEADER_LENGTH + frame.payload.len()).map_err(|_| {
-            LogError::PayloadTooLarge {
-                length: frame.payload.len(),
-                maximum: MAX_PAYLOAD_LENGTH,
+        if frame.kind == FrameKind::Operation {
+            operation_count =
+                operation_count
+                    .checked_add(1)
+                    .ok_or(StorageLimitError::OperationsExceeded {
+                        maximum: limits.max_operations,
+                    })?;
+            if operation_count > limits.max_operations {
+                return Err(StorageLimitError::OperationsExceeded {
+                    maximum: limits.max_operations,
+                }
+                .into());
             }
-        })?;
+            let payload_bytes = u64::try_from(frame.payload.len()).map_err(|_| {
+                StorageLimitError::DecodedOperationBytesExceeded {
+                    maximum: limits.max_decoded_operation_bytes,
+                }
+            })?;
+            decoded_operation_bytes = decoded_operation_bytes.checked_add(payload_bytes).ok_or(
+                StorageLimitError::DecodedOperationBytesExceeded {
+                    maximum: limits.max_decoded_operation_bytes,
+                },
+            )?;
+            if decoded_operation_bytes > limits.max_decoded_operation_bytes {
+                return Err(StorageLimitError::DecodedOperationBytesExceeded {
+                    maximum: limits.max_decoded_operation_bytes,
+                }
+                .into());
+            }
+        }
+        apply_frame(
+            &frame,
+            &mut pending,
+            &mut committed,
+            &mut report,
+            limits,
+            deadline,
+        )?;
         offset = offset
             .checked_add(frame_length)
             .ok_or(LogError::SequenceExhausted)?;
@@ -565,7 +814,43 @@ fn scan(
         report.ignored_uncommitted_transactions =
             report.ignored_uncommitted_transactions.saturating_add(1);
     }
-    Ok(report)
+    let transaction_count = u64::try_from(report.transactions.len()).map_err(|_| {
+        StorageLimitError::TransactionsExceeded {
+            maximum: limits.max_transactions,
+        }
+    })?;
+    Ok(ScanOutcome {
+        report,
+        frame_count,
+        transaction_count,
+        operation_count,
+        decoded_operation_bytes,
+    })
+}
+
+fn ensure_file_length_unchanged(file: &File, expected: u64) -> io::Result<()> {
+    let actual = file.metadata()?.len();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "log changed while being scanned: expected {expected} bytes, found {actual}"
+        )))
+    }
+}
+
+fn read_payload_or_tail(
+    file: &mut File,
+    payload: &mut [u8],
+    deadline: &OperationDeadline,
+) -> Result<ReadStatus, LogError> {
+    for chunk in payload.chunks_mut(64 * 1024) {
+        deadline.check()?;
+        if read_exact_or_tail(file, chunk)? != ReadStatus::Complete {
+            return Ok(ReadStatus::Partial);
+        }
+    }
+    Ok(ReadStatus::Complete)
 }
 
 fn apply_frame(
@@ -573,6 +858,8 @@ fn apply_frame(
     pending: &mut Option<PendingTransaction>,
     committed: &mut HashMap<Uuid, CommitReceipt>,
     report: &mut RecoveryReport,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
 ) -> Result<(), LogError> {
     match frame.kind {
         FrameKind::Begin => {
@@ -617,7 +904,11 @@ fn apply_frame(
                 decode_descriptor(&frame.payload, frame.sequence)?;
             let actual_count =
                 u32::try_from(current.operations.len()).map_err(|_| LogError::TooManyOperations)?;
-            let actual_digest = transaction_digest(&current.operations, actual_count)?;
+            let actual_digest = transaction_digest_with_deadline(
+                &current.operations,
+                actual_count,
+                Some(deadline),
+            )?;
             if operation_count != current.operation_count
                 || commit_digest != current.expected_digest
                 || actual_count != operation_count
@@ -642,6 +933,18 @@ fn apply_frame(
                 }
                 report.duplicate_commits = report.duplicate_commits.saturating_add(1);
             } else {
+                let transaction_count = u64::try_from(report.transactions.len())
+                    .ok()
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or(StorageLimitError::TransactionsExceeded {
+                        maximum: limits.max_transactions,
+                    })?;
+                if transaction_count > limits.max_transactions {
+                    return Err(StorageLimitError::TransactionsExceeded {
+                        maximum: limits.max_transactions,
+                    }
+                    .into());
+                }
                 committed.insert(frame.transaction_id, receipt);
                 report.transactions.push(RecoveredTransaction {
                     receipt,
@@ -676,16 +979,35 @@ pub(crate) fn transaction_digest(
     operations: &[Vec<u8>],
     operation_count: u32,
 ) -> Result<[u8; 32], LogError> {
+    transaction_digest_with_deadline(operations, operation_count, None)
+}
+
+fn transaction_digest_with_deadline(
+    operations: &[Vec<u8>],
+    operation_count: u32,
+    deadline: Option<&OperationDeadline>,
+) -> Result<[u8; 32], LogError> {
+    if let Some(deadline) = deadline {
+        deadline.check()?;
+    }
     let mut hasher = blake3::Hasher::new();
     hasher.update(TRANSACTION_DOMAIN);
     hasher.update(&u64::from(operation_count).to_le_bytes());
     for operation in operations {
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
         let length = u64::try_from(operation.len()).map_err(|_| LogError::PayloadTooLarge {
             length: operation.len(),
             maximum: MAX_PAYLOAD_LENGTH,
         })?;
         hasher.update(&length.to_le_bytes());
-        hasher.update(operation);
+        for chunk in operation.chunks(64 * 1024) {
+            if let Some(deadline) = deadline {
+                deadline.check()?;
+            }
+            hasher.update(chunk);
+        }
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -702,12 +1024,27 @@ mod tests {
         error::Error,
         fs::OpenOptions,
         io::{Read, Seek, SeekFrom, Write},
+        time::Duration,
     };
 
+    use hyphae_core::DISK_FORMAT_VERSION;
     use uuid::Uuid;
 
-    use super::{AppendOutcome, DurableLog, LogError, OpenedLog, frame::HEADER_LENGTH};
-    use crate::test_support::TestDirectory;
+    use super::{
+        AppendOutcome, DurableLog, LogError, OpenedLog, ensure_file_length_unchanged,
+        frame::HEADER_LENGTH, scan, transaction_encoded_length,
+    };
+    use crate::{
+        RecoveryLimits, StorageLimitError, limits::OperationDeadline, storage_limit_from_io,
+        test_support::TestDirectory,
+    };
+
+    fn log_storage_limit(error: &LogError) -> Option<&StorageLimitError> {
+        match error {
+            LogError::Io(source) => storage_limit_from_io(source),
+            _ => None,
+        }
+    }
 
     fn open_for_test(path: &std::path::Path) -> Result<OpenedLog<'static>, LogError> {
         let (log, recovery) = DurableLog::open_file(path)?;
@@ -732,6 +1069,360 @@ mod tests {
             reopened.recovery.transactions[0].operations,
             [b"put:a=1".to_vec(), b"put:b=2".to_vec()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_limits_are_exact_and_fail_before_tail_repair() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-recovery-limits")?;
+        let path = temporary.path().join("segment.hylog");
+        let mut opened = open_for_test(&path)?;
+        opened
+            .log
+            .append_transaction(Uuid::now_v7(), &[b"one".to_vec()])?;
+        opened
+            .log
+            .append_transaction(Uuid::now_v7(), &[b"four".to_vec()])?;
+        drop(opened);
+        let file_bytes = std::fs::metadata(&path)?.len();
+        let exact = RecoveryLimits {
+            max_log_file_bytes: file_bytes,
+            max_log_frames: 6,
+            max_transactions: 2,
+            max_operations: 2,
+            max_decoded_operation_bytes: 7,
+            ..RecoveryLimits::default()
+        };
+        let open = |limits: &RecoveryLimits, timeout| {
+            let deadline = OperationDeadline::new(timeout);
+            DurableLog::open_file_at_version_with_limits(
+                &path,
+                0,
+                [0; 32],
+                DISK_FORMAT_VERSION,
+                limits,
+                &deadline,
+            )
+        };
+        assert_eq!(
+            open(&exact, Duration::from_secs(5))?.1.transactions.len(),
+            2
+        );
+
+        for (limits, expected) in [
+            (
+                RecoveryLimits {
+                    max_log_file_bytes: file_bytes - 1,
+                    ..exact.clone()
+                },
+                StorageLimitError::LogFileBytesExceeded {
+                    actual: file_bytes,
+                    maximum: file_bytes - 1,
+                },
+            ),
+            (
+                RecoveryLimits {
+                    max_log_frames: 5,
+                    ..exact.clone()
+                },
+                StorageLimitError::LogFramesExceeded { maximum: 5 },
+            ),
+            (
+                RecoveryLimits {
+                    max_transactions: 1,
+                    ..exact.clone()
+                },
+                StorageLimitError::TransactionsExceeded { maximum: 1 },
+            ),
+            (
+                RecoveryLimits {
+                    max_operations: 1,
+                    ..exact.clone()
+                },
+                StorageLimitError::OperationsExceeded { maximum: 1 },
+            ),
+            (
+                RecoveryLimits {
+                    max_decoded_operation_bytes: 6,
+                    ..exact.clone()
+                },
+                StorageLimitError::DecodedOperationBytesExceeded { maximum: 6 },
+            ),
+        ] {
+            assert!(matches!(
+                open(&limits, Duration::from_secs(5)),
+                Err(source) if log_storage_limit(&source) == Some(&expected)
+            ));
+            assert_eq!(std::fs::metadata(&path)?.len(), file_bytes);
+        }
+        assert!(matches!(
+            open(&exact, Duration::ZERO),
+            Err(source)
+                if log_storage_limit(&source) == Some(&StorageLimitError::TimedOut)
+        ));
+        assert_eq!(std::fs::metadata(&path)?.len(), file_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_stops_at_captured_length_and_detects_later_growth() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-captured-length")?;
+        let path = temporary.path().join("segment.hylog");
+        let mut opened = open_for_test(&path)?;
+        opened
+            .log
+            .append_transaction(Uuid::now_v7(), &[b"first".to_vec()])?;
+        let captured_length = opened.log.file.metadata()?.len();
+        opened
+            .log
+            .append_transaction(Uuid::now_v7(), &[b"second".to_vec()])?;
+        drop(opened);
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let scanned = scan(
+            &mut file,
+            captured_length,
+            0,
+            [0; 32],
+            DISK_FORMAT_VERSION,
+            &RecoveryLimits::default(),
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+
+        assert_eq!(scanned.report.transactions.len(), 1);
+        assert_eq!(scanned.report.valid_bytes, captured_length);
+        assert_eq!(file.stream_position()?, captured_length);
+        assert!(file.metadata()?.len() > captured_length);
+        assert!(ensure_file_length_unchanged(&file, captured_length).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_payload_tail_does_not_consume_a_frame_limit() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-partial-payload-frame-limit")?;
+        let path = temporary.path().join("segment.hylog");
+        let operations = [b"one".to_vec()];
+        let transaction_bytes =
+            transaction_encoded_length(&operations).ok_or("transaction length overflow")?;
+        let limits = RecoveryLimits {
+            max_log_frames: 6,
+            ..RecoveryLimits::default()
+        };
+        let open = || {
+            DurableLog::open_file_at_version_with_limits(
+                &path,
+                0,
+                [0; 32],
+                DISK_FORMAT_VERSION,
+                &limits,
+                &OperationDeadline::new(Duration::from_secs(5)),
+            )
+        };
+
+        let (mut log, _) = open()?;
+        log.append_transaction(Uuid::now_v7(), &operations)?;
+        log.append_transaction(Uuid::now_v7(), &operations)?;
+        drop(log);
+
+        let partial_tail_bytes = u64::try_from(HEADER_LENGTH)? + 1;
+        let partial_length = transaction_bytes
+            .checked_add(partial_tail_bytes)
+            .ok_or("partial length overflow")?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        file.set_len(partial_length)?;
+        file.sync_all()?;
+        drop(file);
+
+        let (mut recovered, report) = open()?;
+        assert_eq!(report.truncated_tail_bytes, partial_tail_bytes);
+        assert_eq!(std::fs::metadata(&path)?.len(), transaction_bytes);
+        recovered.append_transaction(Uuid::now_v7(), &operations)?;
+        drop(recovered);
+
+        let (_, final_report) = open()?;
+        assert_eq!(final_report.transactions.len(), 2);
+        assert_eq!(std::fs::metadata(&path)?.len(), transaction_bytes * 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_sequence_preflight_is_exact_and_never_writes_on_exhaustion()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-sequence-preflight")?;
+        let operations = [b"one".to_vec()];
+        let limits = RecoveryLimits::default();
+        let base_digest = [7; 32];
+
+        let exact_path = temporary.path().join("exact.hylog");
+        let exact_base = u64::MAX - 4;
+        let (mut exact, _) = DurableLog::open_file_at_version_with_limits(
+            &exact_path,
+            exact_base,
+            base_digest,
+            DISK_FORMAT_VERSION,
+            &limits,
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+        let AppendOutcome::Committed(receipt) =
+            exact.append_transaction(Uuid::now_v7(), &operations)?
+        else {
+            return Err("new transaction was not committed".into());
+        };
+        assert_eq!(receipt.commit_sequence, u64::MAX - 1);
+        assert_eq!(exact.next_sequence, u64::MAX);
+        drop(exact);
+        let (_, exact_report) = DurableLog::open_file_at_version_with_limits(
+            &exact_path,
+            exact_base,
+            base_digest,
+            DISK_FORMAT_VERSION,
+            &limits,
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+        assert_eq!(exact_report.transactions.len(), 1);
+
+        let exhausted_path = temporary.path().join("exhausted.hylog");
+        let exhausted_base = u64::MAX - 3;
+        let (mut exhausted, _) = DurableLog::open_file_at_version_with_limits(
+            &exhausted_path,
+            exhausted_base,
+            base_digest,
+            DISK_FORMAT_VERSION,
+            &limits,
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+        assert!(matches!(
+            exhausted.append_transaction(Uuid::now_v7(), &operations),
+            Err(LogError::SequenceExhausted)
+        ));
+        assert!(!exhausted.is_poisoned());
+        assert_eq!(std::fs::metadata(&exhausted_path)?.len(), 0);
+        drop(exhausted);
+
+        let (_, exhausted_report) = DurableLog::open_file_at_version_with_limits(
+            &exhausted_path,
+            exhausted_base,
+            base_digest,
+            DISK_FORMAT_VERSION,
+            &limits,
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+        assert!(exhausted_report.transactions.is_empty());
+        assert_eq!(std::fs::metadata(&exhausted_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn append_never_creates_a_log_that_its_policy_cannot_reopen() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-append-limit")?;
+        let path = temporary.path().join("segment.hylog");
+        let operations = [b"one".to_vec()];
+        let transaction_bytes =
+            transaction_encoded_length(&operations).ok_or("transaction length overflow")?;
+        let limits = RecoveryLimits {
+            max_log_file_bytes: transaction_bytes,
+            ..RecoveryLimits::default()
+        };
+        let deadline = OperationDeadline::new(Duration::from_secs(5));
+        let (mut log, _) = DurableLog::open_file_at_version_with_limits(
+            &path,
+            0,
+            [0; 32],
+            DISK_FORMAT_VERSION,
+            &limits,
+            &deadline,
+        )?;
+        log.append_transaction(Uuid::now_v7(), &operations)?;
+        assert_eq!(std::fs::metadata(&path)?.len(), transaction_bytes);
+
+        assert!(matches!(
+            log.append_transaction(Uuid::now_v7(), &operations),
+            Err(source)
+                if matches!(
+                    log_storage_limit(&source),
+                    Some(StorageLimitError::LogFileBytesExceeded { actual, maximum })
+                        if *actual == transaction_bytes * 2 && *maximum == transaction_bytes
+                )
+        ));
+        assert_eq!(std::fs::metadata(&path)?.len(), transaction_bytes);
+        drop(log);
+
+        DurableLog::open_file_at_version_with_limits(
+            &path,
+            0,
+            [0; 32],
+            DISK_FORMAT_VERSION,
+            &limits,
+            &OperationDeadline::new(Duration::from_secs(5)),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn append_preserves_every_aggregate_recovery_ceiling() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("log-append-aggregate-limits")?;
+        let operations = [b"one".to_vec()];
+        for (name, limits, expected) in [
+            (
+                "frames",
+                RecoveryLimits {
+                    max_log_frames: 3,
+                    ..RecoveryLimits::default()
+                },
+                StorageLimitError::LogFramesExceeded { maximum: 3 },
+            ),
+            (
+                "transactions",
+                RecoveryLimits {
+                    max_transactions: 1,
+                    ..RecoveryLimits::default()
+                },
+                StorageLimitError::TransactionsExceeded { maximum: 1 },
+            ),
+            (
+                "operations",
+                RecoveryLimits {
+                    max_operations: 1,
+                    ..RecoveryLimits::default()
+                },
+                StorageLimitError::OperationsExceeded { maximum: 1 },
+            ),
+            (
+                "decoded-bytes",
+                RecoveryLimits {
+                    max_decoded_operation_bytes: 3,
+                    ..RecoveryLimits::default()
+                },
+                StorageLimitError::DecodedOperationBytesExceeded { maximum: 3 },
+            ),
+        ] {
+            let path = temporary.path().join(format!("{name}.hylog"));
+            let deadline = OperationDeadline::new(Duration::from_secs(5));
+            let (mut log, _) = DurableLog::open_file_at_version_with_limits(
+                &path,
+                0,
+                [0; 32],
+                DISK_FORMAT_VERSION,
+                &limits,
+                &deadline,
+            )?;
+            log.append_transaction(Uuid::now_v7(), &operations)?;
+            let accepted_bytes = std::fs::metadata(&path)?.len();
+            assert!(matches!(
+                log.append_transaction(Uuid::now_v7(), &operations),
+                Err(source) if log_storage_limit(&source) == Some(&expected)
+            ));
+            assert_eq!(std::fs::metadata(&path)?.len(), accepted_bytes);
+            drop(log);
+            DurableLog::open_file_at_version_with_limits(
+                &path,
+                0,
+                [0; 32],
+                DISK_FORMAT_VERSION,
+                &limits,
+                &OperationDeadline::new(Duration::from_secs(5)),
+            )?;
+        }
         Ok(())
     }
 

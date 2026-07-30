@@ -21,22 +21,24 @@ engine and an embedding application together.
 | `hyphae-client` | Bounded async HTTP client; never opens local storage |
 | `hyphae-core` | Product/API/disk version constants |
 
-Applications normally start with `hyphae-engine`:
+Applications normally start with `hyphae-engine`. The `0.2.1` coordinates
+below are valid only after crates.io lists the matching versions:
 
 ```toml
 [dependencies]
-hyphae-engine = "=0.2.0"
-hyphae-query = "=0.2.0"
+hyphae-engine = "=0.2.1"
+hyphae-query = "=0.2.1"
 uuid = { version = "1", features = ["v7"] }
 ```
 
 ## Open and own a directory
 
 ```rust,no_run
-use hyphae_engine::HyphaeEngine;
+use hyphae_engine::{HyphaeEngine, StorageLimits};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opened = HyphaeEngine::open("./hyphae-data")?;
+    let opened =
+        HyphaeEngine::open_with_limits("./hyphae-data", StorageLimits::default())?;
     println!("replayed={}", opened.recovery.replayed_transactions);
     let _engine = opened.engine;
     Ok(())
@@ -55,14 +57,15 @@ retrying an uncertain request.
 
 ```rust,no_run
 use std::collections::BTreeMap;
-use hyphae_engine::HyphaeEngine;
+use hyphae_engine::{HyphaeEngine, StorageLimits};
 use hyphae_query::{
     ExecutionLimits, Filter, Query, Record, Value,
 };
 use uuid::Uuid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut opened = HyphaeEngine::open("./hyphae-data")?;
+    let mut opened =
+        HyphaeEngine::open_with_limits("./hyphae-data", StorageLimits::default())?;
     let document = Value::Object(BTreeMap::from([
         ("group".into(), Value::String("x".into())),
         ("score".into(), Value::Integer(10)),
@@ -99,18 +102,25 @@ cargo run -p hyphae-engine --example embedded -- ./example-data
 
 ## Create proof-bearing results
 
-Use `get_record_with_proof` or `query_with_proof` when the caller needs a
-portable result. Each returns the canonical proof and its complete logical
-snapshot witness from the same locked checkpoint.
+Use `get_record_with_proof_with_limits` or `query_with_proof_with_limits` when
+the caller needs a portable result under one explicit deadline through snapshot
+creation. Each returns the canonical proof and its complete logical snapshot
+witness from the same locked checkpoint. The legacy methods without
+`_with_limits` retain their `0.2.0` signatures and create the snapshot afterward
+under the maintenance policy stored by the opened engine.
 
 ```rust,no_run
 use hyphae_engine::{
-    HyphaeEngine, VerificationLimits, verify_result_proof, write_result_proof,
+    HyphaeEngine, MaintenanceLimits, StorageLimits, VerificationLimits,
+    verify_result_proof, write_result_proof,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opened = HyphaeEngine::open("./hyphae-data")?;
-    let artifact = opened.engine.get_record_with_proof(b"alpha")?;
+    let opened =
+        HyphaeEngine::open_with_limits("./hyphae-data", StorageLimits::default())?;
+    let artifact = opened
+        .engine
+        .get_record_with_proof_with_limits(b"alpha", &MaintenanceLimits::default())?;
     let expected_anchor = artifact.proof.anchor_digest();
     write_result_proof("result.hyproof", &artifact.proof)?;
     let report = verify_result_proof(
@@ -141,14 +151,28 @@ behavior outside the engine.
 
 ## Snapshot, compaction, and recovery
 
-- `snapshot()` creates or reuses the canonical logical checkpoint witness.
-- `compact()` atomically selects a snapshot-anchored generation.
+- `open()` retains its published `0.2.0` compatibility behavior and does not
+  silently gain the new finite storage ceilings.
+- `open_with_limits(path, StorageLimits::default())` selects the finite
+  60-second/2 GiB/1 GiB policy used by the packaged CLI/server; the opened
+  writer preserves those log/rebuild ceilings before accepting an append.
+- `snapshot()` creates or reuses the canonical logical checkpoint witness
+  under the maintenance policy retained when the engine was opened.
+- `snapshot_with_limits()` applies one explicit maintenance deadline and
+  snapshot policy.
+- `compact()` atomically selects a snapshot-anchored generation under the
+  retained policy; `compact_with_limits()` applies one explicit shared
+  deadline through the manifest commit point.
 - `backup(destination)` creates a portable backup at the locked checkpoint.
 - `verify_backup(path)` verifies a backup without a live engine.
 - `restore_backup(source, destination)` restores only to a new path.
 
 Do not manipulate internal files or share one data directory among engine
 instances. Use application-level coordination around the one owned handle.
+Backup layout/manifest checks are bounded, and backup creation inherits the
+snapshot policy; complete backup copy/verify/restore does not yet expose the
+same shared `StorageLimits` deadline, so size retention and external command
+timeouts remain operator controls.
 
 ## Embed the HTTP server
 

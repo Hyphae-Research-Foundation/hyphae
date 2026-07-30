@@ -63,6 +63,17 @@ Opening streams and validates every complete frame before exposing replay:
 The materialized index is not part of this format and must be reconstructible
 from verified committed transactions.
 
+The finite operational policy used by the packaged CLI/server, and available
+through bounded embedded open, preflights the complete segment length before
+scan and applies aggregate ceilings to complete frames, unique committed
+transactions, operation frames, and decoded operation payload bytes under one
+60-second deadline. A writer opened under that policy retains the same
+ceilings and rejects a new transaction before append if accepting it would
+make the segment fail its next recovery under that policy. These are runtime
+policies, not fields in log format v1. Published legacy open methods preserve
+their `0.2.0` compatibility behavior; embedded callers select finite
+`RecoveryLimits` through the additive bounded APIs.
+
 Retiring a prefix follows
 [`compaction-v1.md`](compaction-v1.md); the snapshot preserves logical state
 and idempotency while the anchored segment preserves the global digest chain.

@@ -10,18 +10,20 @@ option, see [`cli/reference.md`](cli/reference.md).
 
 ## Install the binary
 
-The published release is `0.1.0`. The `0.2.0` source candidate is not
-available from crates.io or GitHub until publication is explicitly authorized.
-After publication, the matching install command will be:
+This source tree is the `0.2.1` candidate. Source version preparation is not
+evidence that publication completed. The `cargo install` command below is
+valid only after crates.io lists `hyphae-cli` version `0.2.1`:
 
 ```bash
-cargo install hyphae-cli --version 0.2.0 --locked
+cargo install hyphae-cli --version 0.2.1 --locked
 hyphae version --json
 ```
 
-Prebuilt native archives and their checksum, SBOM, signature, and provenance
-bundles will be attached to the matching
-[GitHub release](https://github.com/celiumsai/hyphae/releases/latest).
+Prebuilt native archives are a separate distribution path. Use them only
+after a matching `v0.2.1`
+[GitHub release](https://github.com/celiumsai/hyphae/releases/latest) exists;
+treat that release as valid only if it carries the matching checksum, SBOM,
+signature, provenance, required-checks, and release-evidence assets.
 
 ## Build from source
 

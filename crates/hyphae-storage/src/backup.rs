@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -463,7 +462,8 @@ fn validate_layout(path: &Path) -> Result<(), BackupError> {
             reason: "backup root must be a real directory",
         });
     }
-    let mut names = BTreeSet::new();
+    let mut manifest_seen = false;
+    let mut snapshot_seen = false;
     for entry in fs::read_dir(path).map_err(|source| BackupError::Io {
         action: "list backup directory",
         path: path.to_path_buf(),
@@ -494,10 +494,18 @@ fn validate_layout(path: &Path) -> Result<(), BackupError> {
                 reason: "backup filename is not valid Unicode",
             });
         };
-        names.insert(name);
+        match name.as_str() {
+            BACKUP_MANIFEST => manifest_seen = true,
+            BACKUP_SNAPSHOT => snapshot_seen = true,
+            _ => {
+                return Err(BackupError::InvalidLayout {
+                    path: entry.path(),
+                    reason: "backup contains an unexpected file",
+                });
+            }
+        }
     }
-    let expected = BTreeSet::from([BACKUP_MANIFEST.to_owned(), BACKUP_SNAPSHOT.to_owned()]);
-    if names != expected {
+    if !manifest_seen || !snapshot_seen {
         return Err(BackupError::InvalidLayout {
             path: path.to_path_buf(),
             reason: "backup must contain exactly BACKUP.json and snapshot.hysnap",
@@ -564,6 +572,18 @@ fn copy_new_file(
         path: source.to_path_buf(),
         source: source_error,
     })?;
+    let opened_metadata = input.metadata().map_err(|source_error| BackupError::Io {
+        action: "inspect opened source file",
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(BackupError::InvalidLayout {
+            path: source.to_path_buf(),
+            reason: "opened snapshot must be a regular file",
+        });
+    }
+    let expected_bytes = opened_metadata.len();
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -573,13 +593,33 @@ fn copy_new_file(
             path: destination.to_path_buf(),
             source: source_error,
         })?;
-    io::copy(&mut input, &mut output)
-        .and_then(|_| output.sync_all())
-        .map_err(|source_error| BackupError::Io {
-            action,
-            path: destination.to_path_buf(),
-            source: source_error,
+    let copied_bytes =
+        io::copy(&mut (&mut input).take(expected_bytes), &mut output).map_err(|source_error| {
+            BackupError::Io {
+                action,
+                path: destination.to_path_buf(),
+                source: source_error,
+            }
         })?;
+    let final_bytes = input
+        .metadata()
+        .map_err(|source_error| BackupError::Io {
+            action: "reinspect copied source file",
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    if copied_bytes != expected_bytes || final_bytes != expected_bytes {
+        return Err(BackupError::InvalidLayout {
+            path: source.to_path_buf(),
+            reason: "snapshot changed length while it was copied",
+        });
+    }
+    output.sync_all().map_err(|source_error| BackupError::Io {
+        action,
+        path: destination.to_path_buf(),
+        source: source_error,
+    })?;
     Ok(())
 }
 

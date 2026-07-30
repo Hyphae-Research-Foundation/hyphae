@@ -19,4 +19,87 @@ authorize publication.
 
 Environment details and command parameters live inside each report when the
 producer supports them. A final hosted run must be tied to the exact release
-commit before `v0.2.0` can be published.
+commit before its tag can be published.
+
+## Hosted release evidence
+
+The release workflow generates
+`hyphae-vVERSION.release-evidence.json` after the release commit is checked
+out and after the native archives, provenance predicates, and both SBOMs
+exist. The document conforms to
+[`packaging/release-evidence-v1.schema.json`](../../../packaging/release-evidence-v1.schema.json)
+and binds:
+
+- the release tag and workspace version;
+- the exact Git commit, its tree object, and, for any tag ref, the fetched tag
+  object plus peeled commit target;
+- the workflow path, full Git ref, event, run ID, run attempt, and run URL;
+- the filename, role, byte size, and SHA-256 digest of every primary release
+  payload.
+
+For a tagged `push` run, the primary payloads also include
+`hyphae-vVERSION.required-checks.json` with role `required-checks`. That report
+conforms structurally to
+[`packaging/required-checks-report-v1.schema.json`](../../../packaging/required-checks-report-v1.schema.json)
+and records exactly the 17 canonical required GitHub Actions checks for the
+release commit. Each ordered record carries the matching `head_sha`, unique
+check-run ID, workflow-run ID, canonical GitHub job URL, GitHub Actions app
+identity, canonical workflow path, PR head branch, `pull_request` event, run
+attempt, start/completion timestamps, and `completed`/`success` state. All
+checks from one workflow path must resolve to one workflow run. The report also
+records the unique merged in-repository PR to `main`, including its number,
+head/base commits, merge commit, and merge time; an all-state query for that
+head branch must return no second PR, and the PR's complete issue-event history
+must contain no base-ref change or successful automatic base change. The
+producer fetches each workflow run and requires its ID, path, `head_sha`,
+branch, event, repository, attempt, state, and conclusion to agree with that
+check. It fetches every selected Jobs API record and requires the job's exact
+ID, workflow-run ID, name, `head_sha`, state, conclusion, and `run_attempt` to
+agree with the check and the workflow run's current attempt. A partial rerun
+that mixes jobs from different attempts fails closed; a complete rerun of all
+jobs can restore one coherent attempt. For one canonical job in each of the six
+workflow runs, the producer also records the successful
+`Verify the pull-request integration tree` Jobs API step, which requires its
+event merge SHA/tree to equal the tested head SHA/tree. The release workflow
+verifies the recorded merge commit's parents and tree and its ancestry from
+`main`. It selects the latest unambiguous completion time after excluding the
+current tag workflow run and fails closed if another relevant run is still
+incomplete. Pull-request and manual candidate runs, including a manual run
+dispatched from a tag ref, omit this report and cannot publish.
+
+The schemas validate portable structure. The repository verifiers additionally
+enforce relationships JSON Schema cannot express here, including equality
+between root and per-check commits, IDs embedded in URLs, the exact
+job-to-workflow mapping, the release tag/version/commit tuple, and the
+complete canonical artifact set.
+Per-archive provenance may come from an earlier attempt of the same workflow
+run when only failed jobs are rerun. Its predicate and digest preserve that
+attempt explicitly; a different run ID or an attempt later than the assemble
+attempt is rejected. This provenance allowance does not apply to the 17
+required-check records, which must all name jobs from their workflow runs'
+current attempts. The semantic verifier also requires the canonical native
+runner pair for each target: Linux/X64, macOS/X64, macOS/ARM64, or Windows/X64.
+
+The manifest deliberately excludes itself, `SHA256SUMS`, and Sigstore bundles
+to avoid a cryptographic self-reference. `SHA256SUMS` includes the completed
+manifest, and the workflow signs both the manifest and `SHA256SUMS` with the
+same keyless release identity.
+
+This hosted manifest is a release asset, not a checked-in local gate report.
+It and the checks report record what the workflow and GitHub Checks API
+reported for one commit. The publish job fetches the checks again immediately
+before creating the GitHub Release and requires the result to be byte-identical
+to the signed report. It also re-fetches the remote tag, verifies its object and
+peeled target against the signed manifest, and rechecks target ancestry from
+`main`; any mismatch fails closed. This minimizes but cannot remove the final
+network race or prevent later mutation without immutable-release and
+protected-tag repository governance. The artifacts do not prove check
+independence or absence of flaky reruns, authorize publication, or replace the
+independent release gates.
+
+The report is not an independent trust root against repository writers. If
+branch governance does not require protected workflow ownership, independent
+review, and last-push approval, a writer can weaken a workflow before producing
+new successful checks. Preventing that authority also requires protected tags
+and immutable releases; the signed artifacts only make later substitution
+detectable.

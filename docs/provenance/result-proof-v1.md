@@ -101,6 +101,18 @@ bytes, filter nodes, rows, aggregation groups, and verification time are all
 bounded before or during allocation. Exhausting a limit is a verification
 error and never returns a partially verified result.
 
+`read_result_proof` accepts only a regular file. It checks path and opened-file
+metadata, rejects an oversized length before allocation, reads no more than
+the smaller caller/canonical proof limit plus one detection byte in bounded
+chunks, and rejects a file whose observed length changes during the read. This
+standalone decoder is byte bounded but has no timeout parameter.
+
+The verifier subtracts proof parsing from one cooperative deadline, then
+uses the same bounded reader with deadline checks between chunks and propagates
+the remaining duration through snapshot verification/loading and query replay.
+Snapshot file length and declared logical counts are checked on the opened
+handle before the canonical scan; decoded bytes are accounted during that scan.
+
 ## Security properties and limits
 
 CRC32C detects accidental corruption quickly. BLAKE3 binds proof bytes,

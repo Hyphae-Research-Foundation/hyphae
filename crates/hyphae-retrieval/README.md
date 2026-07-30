@@ -8,9 +8,12 @@
 Exact provider-neutral cosine retrieval and explicit abstention semantics for
 [Hyphae](https://hyphae.dev).
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-retrieval = "0.2.0"
+hyphae-retrieval = "0.2.1"
 ```
 
 The caller owns vectors and any optional embedding provider. This crate does

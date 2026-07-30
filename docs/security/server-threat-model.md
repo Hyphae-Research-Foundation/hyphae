@@ -46,7 +46,7 @@ environment variable or restricted file, never from an argv value. Unix token
 files with group/other permissions are rejected; Windows operators must apply
 an account-only ACL.
 
-Remote deployment still requires a trusted TLS boundary. Hyphae 0.2.0 does
+Remote deployment still requires a trusted TLS boundary. Hyphae 0.2.x does
 not claim built-in certificate management, OAuth, tenant isolation, WAF,
 rate-limit coordination across processes, or denial-of-service resistance
 beyond its documented local limits.
@@ -56,6 +56,21 @@ elements, dimensions, and zero vectors before durable append or ranking.
 Exact, lexical, and hybrid operations enforce independent work/time/result
 budgets and return no partial ranking. Lexical normalization is deterministic
 but is not a content-safety or secret-redaction mechanism.
+
+The server and public clients retain a 512 MiB witness-transfer default.
+The `0.2.1` source candidate's larger default local offline-verification
+policy does not raise that remote transport limit.
+
+Proof-bearing routes derive snapshot creation limits from that 512 MiB
+transport policy before snapshot measurement or hashing and spend only the
+originating query/retrieval request's remaining timeout. Witness download
+preflights file metadata before hashing, verifies and streams the same open
+regular-file handle, caps the stream at the verified byte length, and retains
+its admission permit until that boundary or body drop. The cap prevents a late
+append from adding unverified response bytes. It does not prevent an external
+same-length overwrite of the inode after verification; operating-system
+ownership and process isolation remain required. A snapshot limit/timeout
+returns `result_too_large`/`timeout` without changing server readiness.
 
 ## Error disclosure
 

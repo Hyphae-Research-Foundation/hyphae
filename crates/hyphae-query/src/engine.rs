@@ -9,10 +9,14 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    AggregationPlan, AggregationResult, CompareOperator, Cursor, ExecutionLimits, FieldPath,
-    Filter, GroupResult, Metric, MetricValue, NamedMetricValue, NullPlacement, Query, QueryResult,
-    Record, SortDirection, SortField, Value,
+    AggregationPlan, AggregationResult, CompareOperator, Cursor, DocumentError, ExecutionLimits,
+    FieldPath, Filter, GroupResult, Metric, MetricValue, NamedMetricValue, NullPlacement, Query,
+    QueryResult, Record, SortDirection, SortField, Value, encoded_document_len,
 };
+
+/// Fixed aggregate key and canonical-document byte budget used by the
+/// compatibility-preserving query entry points.
+pub const DEFAULT_QUERY_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Failure to validate or completely execute one structured query.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -163,6 +167,28 @@ pub enum QueryError {
     MetricStateMismatch,
 }
 
+/// Failure from the additive query entry points that enforce an aggregate
+/// key/canonical-document byte budget.
+///
+/// [`QueryError`] remains the exhaustive error surface published in 0.2.0.
+/// This separate type adds byte-policy failures without invalidating legacy
+/// downstream matches.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum BoundedQueryError {
+    /// Ordinary query validation or execution failed.
+    #[error(transparent)]
+    Query(#[from] QueryError),
+    /// Aggregate key and canonical document bytes exceeded policy.
+    #[error("global scanned-byte budget exceeded: {maximum}")]
+    ScannedByteBudgetExceeded {
+        /// Configured maximum.
+        maximum: u64,
+    },
+    /// An in-memory record cannot be represented as one canonical document.
+    #[error("query record is not a canonical document: {0}")]
+    RecordDocument(#[from] DocumentError),
+}
+
 /// Injectable monotonic clock used to make timeout semantics testable.
 pub trait MonotonicClock {
     /// Returns a nondecreasing duration in an arbitrary local epoch.
@@ -199,7 +225,28 @@ pub fn execute(
     query: &Query,
     limits: &ExecutionLimits,
 ) -> Result<QueryResult, QueryError> {
-    execute_with_clock(shards, query, limits, &mut SystemClock::default())
+    execute_with_clock_without_byte_limit(shards, query, limits, &mut SystemClock::default())
+}
+
+/// Executes one query under an explicit aggregate key/document byte budget.
+///
+/// # Errors
+///
+/// Returns a validation, budget, timeout, duplicate-key, document, or
+/// aggregation error.
+pub fn execute_with_byte_limit(
+    shards: &[&[Record]],
+    query: &Query,
+    limits: &ExecutionLimits,
+    max_scanned_bytes: u64,
+) -> Result<QueryResult, BoundedQueryError> {
+    execute_with_clock_and_byte_limit(
+        shards,
+        query,
+        limits,
+        max_scanned_bytes,
+        &mut SystemClock::default(),
+    )
 }
 
 /// Executes one query with an injectable monotonic clock.
@@ -216,6 +263,49 @@ pub fn execute_with_clock(
     limits: &ExecutionLimits,
     clock: &mut impl MonotonicClock,
 ) -> Result<QueryResult, QueryError> {
+    execute_with_clock_without_byte_limit(shards, query, limits, clock)
+}
+
+/// Executes one query with an injectable monotonic clock and explicit
+/// aggregate key/document byte budget.
+///
+/// # Errors
+///
+/// Returns a validation, budget, timeout, duplicate-key, document, or
+/// aggregation error.
+pub fn execute_with_clock_and_byte_limit(
+    shards: &[&[Record]],
+    query: &Query,
+    limits: &ExecutionLimits,
+    max_scanned_bytes: u64,
+    clock: &mut impl MonotonicClock,
+) -> Result<QueryResult, BoundedQueryError> {
+    execute_with_clock_impl(shards, query, limits, Some(max_scanned_bytes), clock)
+}
+
+fn execute_with_clock_without_byte_limit(
+    shards: &[&[Record]],
+    query: &Query,
+    limits: &ExecutionLimits,
+    clock: &mut impl MonotonicClock,
+) -> Result<QueryResult, QueryError> {
+    match execute_with_clock_impl(shards, query, limits, None, clock) {
+        Ok(result) => Ok(result),
+        Err(BoundedQueryError::Query(source)) => Err(source),
+        Err(
+            BoundedQueryError::ScannedByteBudgetExceeded { .. }
+            | BoundedQueryError::RecordDocument(_),
+        ) => unreachable!("legacy query execution does not inspect canonical document bytes"),
+    }
+}
+
+fn execute_with_clock_impl(
+    shards: &[&[Record]],
+    query: &Query,
+    limits: &ExecutionLimits,
+    max_scanned_bytes: Option<u64>,
+    clock: &mut impl MonotonicClock,
+) -> Result<QueryResult, BoundedQueryError> {
     validate_query(query, limits)?;
     let started = clock.now();
     let deadline = started.checked_add(limits.timeout).unwrap_or(Duration::MAX);
@@ -224,20 +314,23 @@ pub fn execute_with_clock(
         deadline,
         limits,
         scanned: 0,
+        scanned_bytes: 0,
+        max_scanned_bytes,
         matched: 0,
     };
     budget.check_timeout()?;
 
-    let mut keys = BTreeSet::new();
+    let mut keys = BTreeSet::<&[u8]>::new();
     let mut candidates = Vec::new();
     for shard in shards {
         for record in *shard {
             budget.scan()?;
+            budget.account_record_bytes(record)?;
             if record.key.is_empty() {
-                return Err(QueryError::EmptyRecordKey);
+                return Err(QueryError::EmptyRecordKey.into());
             }
-            if !keys.insert(record.key.clone()) {
-                return Err(QueryError::DuplicateRecordKey);
+            if !keys.insert(record.key.as_slice()) {
+                return Err(QueryError::DuplicateRecordKey.into());
             }
             if filter_matches(&query.filter, &record.value) {
                 budget.match_record()?;
@@ -261,15 +354,17 @@ pub fn execute_with_clock(
     });
     let remaining = &candidates[page_start..];
     let page_length = remaining.len().min(query.limit);
-    let rows = remaining[..page_length]
-        .iter()
-        .map(|record| (*record).clone())
-        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(page_length);
+    for record in &remaining[..page_length] {
+        budget.check_timeout()?;
+        rows.push((*record).clone());
+    }
     let next_cursor = if remaining.len() > page_length {
         rows.last().map(|record| cursor_for(record, &query.sort))
     } else {
         None
     };
+    budget.check_timeout()?;
 
     Ok(QueryResult {
         rows,
@@ -285,6 +380,8 @@ struct ExecutionBudget<'limits, 'clock, Clock> {
     deadline: Duration,
     limits: &'limits ExecutionLimits,
     scanned: u64,
+    scanned_bytes: u64,
+    max_scanned_bytes: Option<u64>,
     matched: u64,
 }
 
@@ -308,6 +405,15 @@ impl<Clock: MonotonicClock> ExecutionBudget<'_, '_, Clock> {
         Ok(())
     }
 
+    fn account_record_bytes(&mut self, record: &Record) -> Result<(), BoundedQueryError> {
+        let Some(maximum) = self.max_scanned_bytes else {
+            return Ok(());
+        };
+        self.scanned_bytes =
+            checked_scanned_bytes(self.scanned_bytes, record_bytes(record, maximum)?, maximum)?;
+        Ok(())
+    }
+
     fn match_record(&mut self) -> Result<(), QueryError> {
         if self.matched >= self.limits.max_matched_records {
             return Err(QueryError::MatchedBudgetExceeded {
@@ -317,6 +423,31 @@ impl<Clock: MonotonicClock> ExecutionBudget<'_, '_, Clock> {
         self.matched = self.matched.saturating_add(1);
         Ok(())
     }
+}
+
+fn checked_scanned_bytes(
+    consumed: u64,
+    record_bytes: u64,
+    maximum: u64,
+) -> Result<u64, BoundedQueryError> {
+    let next = consumed
+        .checked_add(record_bytes)
+        .ok_or(BoundedQueryError::ScannedByteBudgetExceeded { maximum })?;
+    if next > maximum {
+        Err(BoundedQueryError::ScannedByteBudgetExceeded { maximum })
+    } else {
+        Ok(next)
+    }
+}
+
+fn record_bytes(record: &Record, maximum: u64) -> Result<u64, BoundedQueryError> {
+    let key_bytes = u64::try_from(record.key.len())
+        .map_err(|_| BoundedQueryError::ScannedByteBudgetExceeded { maximum })?;
+    let document_bytes = u64::try_from(encoded_document_len(&record.value)?)
+        .map_err(|_| BoundedQueryError::ScannedByteBudgetExceeded { maximum })?;
+    key_bytes
+        .checked_add(document_bytes)
+        .ok_or(BoundedQueryError::ScannedByteBudgetExceeded { maximum })
 }
 
 /// Validates query shape and cursor canonicality without scanning records.
@@ -766,7 +897,10 @@ fn finish_metric(state: MetricState) -> MetricValue {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use super::{MonotonicClock, QueryError, execute, execute_with_clock};
+    use super::{
+        BoundedQueryError, MonotonicClock, QueryError, checked_scanned_bytes, execute,
+        execute_with_byte_limit, execute_with_clock,
+    };
     use crate::{
         AggregationPlan, CompareOperator, ExecutionLimits, FieldPath, Filter, Metric, MetricValue,
         NamedMetric, NullPlacement, Query, Record, SortDirection, SortField, Value,
@@ -957,6 +1091,47 @@ mod tests {
     }
 
     #[test]
+    fn scanned_byte_budget_is_exact_global_and_includes_nonmatches() -> Result<(), BoundedQueryError>
+    {
+        let first = vec![record(b"a", 1, "x")];
+        let second = vec![record(b"b", 2, "y")];
+        let shards = [first.as_slice(), second.as_slice()];
+        let query = Query {
+            filter: Filter::Compare {
+                path: FieldPath::field("score"),
+                operator: CompareOperator::Greater,
+                value: Value::Integer(100),
+            },
+            sort: Vec::new(),
+            cursor: None,
+            limit: 1,
+            aggregation: None,
+        };
+        let total = first
+            .iter()
+            .chain(&second)
+            .map(|record| super::record_bytes(record, u64::MAX))
+            .try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(bytes?)
+                    .ok_or(BoundedQueryError::ScannedByteBudgetExceeded { maximum: u64::MAX })
+            })?;
+        let result = execute_with_byte_limit(&shards, &query, &ExecutionLimits::default(), total)?;
+        assert_eq!(result.scanned_records, 2);
+        assert_eq!(result.matched_records, 0);
+        assert!(result.rows.is_empty());
+        assert_eq!(
+            execute_with_byte_limit(&shards, &query, &ExecutionLimits::default(), total - 1,),
+            Err(BoundedQueryError::ScannedByteBudgetExceeded { maximum: total - 1 })
+        );
+        assert_eq!(
+            checked_scanned_bytes(u64::MAX, 1, u64::MAX),
+            Err(BoundedQueryError::ScannedByteBudgetExceeded { maximum: u64::MAX })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn matched_and_group_budgets_are_global() {
         let records = vec![record(b"a", 1, "x"), record(b"b", 2, "y")];
         let matched_limits = ExecutionLimits {
@@ -1142,6 +1317,23 @@ mod tests {
         };
         assert_eq!(
             execute_with_clock(&[records.as_slice()], &query(1), &limits, &mut clock),
+            Err(QueryError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn timeout_is_checked_before_returning_the_final_page() {
+        let limits = ExecutionLimits {
+            timeout: Duration::from_millis(3),
+            ..ExecutionLimits::default()
+        };
+        let mut clock = StepClock {
+            current: Duration::ZERO,
+            step: Duration::from_millis(1),
+        };
+
+        assert_eq!(
+            execute_with_clock(&[&[]], &query(1), &limits, &mut clock),
             Err(QueryError::TimedOut)
         );
     }

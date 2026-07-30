@@ -9,9 +9,12 @@ Shared product, API, disk-format, and proof-format version constants for
 [Hyphae](https://hyphae.dev), the autonomous, embeddable, verifiable Rust data
 engine.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-core = "0.2.0"
+hyphae-core = "0.2.1"
 ```
 
 Most applications should depend on `hyphae-engine` instead. This crate exists

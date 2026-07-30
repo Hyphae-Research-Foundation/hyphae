@@ -183,6 +183,10 @@ Verifies a canonical result proof completely offline. The anchor is a trusted
 32-byte digest encoded as hexadecimal. The verifier validates both artifacts,
 matches the caller's anchor, reexecutes get/query, and requires the exact
 result. It opens no live data directory and performs no network request.
+Version `0.2.1` defaults to a 2 GiB snapshot file and 1 GiB of aggregate
+decoded logical payload retained by the verifier, including KV, vector-space,
+vector, and lexical-index payloads. Embedded callers may configure a different
+policy; larger values expand their resource-exposure envelope.
 
 ## `verify-retrieval`
 
@@ -196,7 +200,11 @@ operation because exact, lexical, and hybrid proof payloads are closed,
 independently decoded formats. The verifier validates both files, checks the
 trusted retrieval anchor, reconstructs the relevant durable snapshot state,
 and reexecutes the complete operation under bounded reference semantics. It
-opens no live data directory and performs no network request.
+opens no live data directory and performs no network request. Version `0.2.1`
+shares the snapshot defaults above and adds a default 1 GiB limit for
+exact-vector candidate key/vector bytes, including the exact branch of hybrid
+replay. Lexical replay remains separately bounded by its document, token, and
+candidate-count policy.
 
 ## `serve`
 
@@ -220,6 +228,16 @@ hyphae remote --base-url <ROOT_ORIGIN> [--bearer-token-file <PATH>] <COMMAND>
 The remote mode never opens a data directory. It uses only the public v1 Rust
 client and accepts `HYPHAE_BASE_URL`, `HYPHAE_BEARER_TOKEN_FILE`, and
 `HYPHAE_BEARER_TOKEN`.
+
+Request JSON from a file or stdin is capped at the server default
+`request_body_bytes` policy, currently 4 MiB. The witness command's proof JSON
+is capped at the default `response_bytes` policy, currently 32 MiB. Named files
+are rejected from metadata when already oversized, read only through the limit
+plus one detection byte, and rejected when a regular file's observed length
+changes during the read. Stdin has the same byte ceiling but no file metadata
+to recheck. These CLI ceilings are fixed defaults, not negotiated from
+`/v1/capabilities`; a custom server configured above 4 MiB request or 32 MiB
+response JSON needs a different client with a matching local policy.
 
 <!-- remote-commands:start -->
 | Command | Input | Result |
