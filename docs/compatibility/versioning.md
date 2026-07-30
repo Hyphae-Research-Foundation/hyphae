@@ -11,7 +11,7 @@ routes. It advances the current data directory to format `2`. Format 2 adds
 authoritative vector-space definitions, signed-Q15 vectors, lexical-index
 definitions, and their snapshot/receipt identity.
 
-The untagged `0.2.1` source candidate keeps API `/v1`, disk format `2`, both
+The published `0.2.1` release keeps API `/v1`, disk format `2`, both
 proof formats, and every published `0.2.0` exhaustive Rust error enum and
 legacy method signature. Its resource hardening is additive:
 

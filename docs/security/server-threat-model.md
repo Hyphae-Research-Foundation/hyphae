@@ -58,7 +58,7 @@ budgets and return no partial ranking. Lexical normalization is deterministic
 but is not a content-safety or secret-redaction mechanism.
 
 The server and public clients retain a 512 MiB witness-transfer default.
-The `0.2.1` source candidate's larger default local offline-verification
+The `0.2.1` release's larger default local offline-verification
 policy does not raise that remote transport limit.
 
 Proof-bearing routes derive snapshot creation limits from that 512 MiB
