@@ -1,6 +1,6 @@
 # Product capabilities and limits
 
-The Hyphae `0.2.1` source candidate is a local-first Rust data engine. The base
+Hyphae `0.2.1` is a published local-first Rust data engine. The base
 deployment is one native `hyphae` executable and one exclusively owned data
 directory. It starts no listener unless `serve` is selected and requires no
 database, cache, cloud account, model, embedding provider, or LLM.
