@@ -48,5 +48,19 @@ the full five-surface conformance suite.
 
 The MCP adapter is stdio only, exposes no witness binary tool, and does not
 support experimental MCP tasks. The canonical `/v1` witness remains available
-through Rust, TypeScript, Python, and CLI. Publishing SDK packages belongs to
-the phase-8 release gate; this phase proves their source and package builds.
+through Rust, TypeScript, Python, and CLI. This phase proves the TypeScript
+source build and unit tests, Python source compilation and unit tests, and the
+shared live conformance suite. A later post-hardening `0.2.1` worktree audit
+also built a Python wheel and source distribution, installed the wheel without
+an index in isolated Python 3.11, packed real TypeScript SDK and
+JavaScript-integration npm tarballs, and installed both together offline in an
+isolated consumer. SDK, Astro, Next, and Vite imports passed. Those temporary
+artifacts prove local package viability, not registry publication or
+commit-bound release identity; final package receipts remain release-gate
+work.
+
+The `0.2.1` TypeScript/Python hardening preserves exact integers, rejects
+invalid JSON, and validates error-envelope/request-ID correlation. Generated
+success models remain static types only; the clients do not validate every
+successful response shape at runtime. That accepted source-only residual must
+not be represented as full success-envelope validation.

@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use hyphae_core::{Q15Vector, VectorSpaceDefinition, VectorSpaceName};
 use hyphae_query::{
-    ExecutionLimits, Query, QueryError, QueryResult, Record, execute, validate_query,
+    BoundedQueryError, ExecutionLimits, Query, QueryError, QueryResult, Record, execute,
+    execute_with_byte_limit, validate_query,
 };
 use hyphae_retrieval::{
     DurableVectorRecord, ExactRetrievalError, ExactRetrievalLimits, ExactRetrievalOutcome,
     ExactRetrievalRequest, HybridError, HybridOutcome, HybridRequest, LexicalError,
     LexicalIndexDefinition, LexicalLimits, LexicalOutcome, LexicalRequest, RetrievalError,
     RetrievalLimits, RetrievalOutcome, RetrievalRequest, VectorRecord, fuse_hybrid, retrieve,
-    retrieve_exact, retrieve_lexical_materialized, tokenize_v1,
+    retrieve_exact, retrieve_lexical_materialized, tokenize_v1_checked,
 };
 use hyphae_storage::{
-    AppendOutcome, BackupError, BackupInfo, CompactionOutcome, MAX_SCAN_PAGE_ENTRIES, Mutation,
-    RestoreInfo, SnapshotInfo, StorageEngine, StorageError, StorageRecoveryReport, restore_backup,
-    verify_backup,
+    AppendOutcome, BackupError, BackupInfo, CompactionOutcome, MAX_SCAN_PAGE_ENTRIES,
+    MaintenanceLimits, Mutation, RestoreInfo, ScanPageError, SnapshotError, SnapshotInfo,
+    StorageEngine, StorageError, StorageLimitError, StorageLimits, StorageRecoveryReport,
+    VectorEntriesError, restore_backup, verify_backup,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -79,6 +85,35 @@ pub enum EngineError {
     EmptyBatch,
 }
 
+/// Failure from the additive engine query entry points that enforce an
+/// aggregate durable byte budget.
+#[derive(Debug, Error)]
+pub enum BoundedEngineQueryError {
+    /// Ordinary embedded-engine failure.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    /// Aggregate durable key and canonical-document bytes exceeded policy.
+    #[error("global scanned-byte budget exceeded: {maximum}")]
+    ScannedByteBudgetExceeded {
+        /// Configured maximum.
+        maximum: u64,
+    },
+}
+
+impl From<BoundedQueryError> for BoundedEngineQueryError {
+    fn from(source: BoundedQueryError) -> Self {
+        match source {
+            BoundedQueryError::Query(source) => Self::Engine(EngineError::Query(source)),
+            BoundedQueryError::RecordDocument(source) => {
+                Self::Engine(EngineError::Document(source))
+            }
+            BoundedQueryError::ScannedByteBudgetExceeded { maximum } => {
+                Self::ScannedByteBudgetExceeded { maximum }
+            }
+        }
+    }
+}
+
 /// Newly opened embeddable engine and durable recovery evidence.
 #[derive(Debug)]
 pub struct OpenedEngine {
@@ -86,6 +121,15 @@ pub struct OpenedEngine {
     pub engine: HyphaeEngine,
     /// Log verification and index replay evidence.
     pub recovery: StorageRecoveryReport,
+}
+
+#[derive(Debug)]
+struct HybridExecution {
+    started: Instant,
+    total_timeout: Duration,
+    lexical: LexicalOutcome,
+    vector: ExactRetrievalOutcome,
+    outcome: HybridOutcome,
 }
 
 /// Embeddable autonomous Hyphae engine.
@@ -103,6 +147,26 @@ impl HyphaeEngine {
     /// formats, snapshot mismatch, or failed index replay.
     pub fn open(path: impl AsRef<Path>) -> Result<OpenedEngine, EngineError> {
         let opened = StorageEngine::open(path)?;
+        Ok(OpenedEngine {
+            engine: Self {
+                storage: opened.storage,
+            },
+            recovery: opened.recovery,
+        })
+    }
+
+    /// Opens one data directory under explicit finite recovery and
+    /// maintenance limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, contention, corruption, exhausted
+    /// recovery policy, timeout, unsupported formats, or failed replay.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+    ) -> Result<OpenedEngine, EngineError> {
+        let opened = StorageEngine::open_with_limits(path, limits)?;
         Ok(OpenedEngine {
             engine: Self {
                 storage: opened.storage,
@@ -231,6 +295,28 @@ impl HyphaeEngine {
         Ok(ResultProofArtifact { proof, snapshot })
     }
 
+    /// Gets one record and creates its witness under explicit maintenance
+    /// limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a key, storage, document, snapshot-limit, timeout, or
+    /// result-proof error.
+    pub fn get_record_with_proof_with_limits(
+        &self,
+        key: &[u8],
+        maintenance: &MaintenanceLimits,
+    ) -> Result<ResultProofArtifact, EngineError> {
+        let started = Instant::now();
+        let total_timeout = maintenance.timeout;
+        let result = self.get_record(key)?;
+        let maintenance = remaining_maintenance_limits(maintenance, started, total_timeout)?;
+        let snapshot = self.snapshot_with_limits(&maintenance)?;
+        let proof = ResultProof::for_get(&snapshot, key.to_vec(), result)?;
+        ensure_total_timeout(started, total_timeout)?;
+        Ok(ResultProofArtifact { proof, snapshot })
+    }
+
     /// Executes deterministic structured query over all durable documents.
     ///
     /// Storage scan and document decoding consume the same wall-clock timeout;
@@ -245,13 +331,49 @@ impl HyphaeEngine {
         query: &Query,
         limits: &ExecutionLimits,
     ) -> Result<QueryResult, EngineError> {
-        validate_query(query, limits)?;
+        match self.query_internal(query, limits, None) {
+            Ok(result) => Ok(result),
+            Err(BoundedEngineQueryError::Engine(source)) => Err(source),
+            Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { .. }) => {
+                unreachable!("legacy query execution does not enforce an aggregate byte limit")
+            }
+        }
+    }
+
+    /// Executes deterministic structured query under an explicit aggregate
+    /// durable key/document byte budget.
+    ///
+    /// The budget is enforced inside each storage page before its key/value
+    /// bytes are cloned and again by the reference executor. Existing
+    /// Legacy [`Self::query`] callers retain the 0.2.0 count-bounded behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, document, query validation, global count/byte
+    /// budget, aggregate, or timeout error. No partial page is returned.
+    pub fn query_with_byte_limit(
+        &self,
+        query: &Query,
+        limits: &ExecutionLimits,
+        max_scanned_bytes: u64,
+    ) -> Result<QueryResult, BoundedEngineQueryError> {
+        self.query_internal(query, limits, Some(max_scanned_bytes))
+    }
+
+    fn query_internal(
+        &self,
+        query: &Query,
+        limits: &ExecutionLimits,
+        max_scanned_bytes: Option<u64>,
+    ) -> Result<QueryResult, BoundedEngineQueryError> {
+        validate_query(query, limits).map_err(EngineError::from)?;
         let started = Instant::now();
         let mut records = Vec::new();
         let mut after = None;
+        let mut scanned_bytes = 0_u64;
         loop {
             if started.elapsed() >= limits.timeout {
-                return Err(QueryError::TimedOut.into());
+                return Err(EngineError::from(QueryError::TimedOut).into());
             }
             let loaded = u64::try_from(records.len()).unwrap_or(u64::MAX);
             let remaining = limits.max_scanned_records.saturating_sub(loaded);
@@ -262,17 +384,52 @@ impl HyphaeEngine {
             let page_limit = remaining_entries
                 .saturating_add(1)
                 .min(MAX_SCAN_PAGE_ENTRIES);
-            let page = self.storage.scan_page(after.as_deref(), page_limit)?;
+            let page = if let Some(maximum) = max_scanned_bytes {
+                let remaining_bytes = maximum.saturating_sub(scanned_bytes);
+                match self.storage.scan_page_with_byte_limit(
+                    after.as_deref(),
+                    page_limit,
+                    remaining_bytes,
+                ) {
+                    Err(ScanPageError::ByteBudgetExceeded { .. }) => {
+                        return Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum });
+                    }
+                    Err(ScanPageError::Storage(source)) => {
+                        return Err(EngineError::from(source).into());
+                    }
+                    Ok(page) => page,
+                }
+            } else {
+                self.storage
+                    .scan_page(after.as_deref(), page_limit)
+                    .map_err(EngineError::from)?
+            };
             for entry in page.entries {
                 if u64::try_from(records.len()).unwrap_or(u64::MAX) >= limits.max_scanned_records {
-                    return Err(QueryError::ScannedBudgetExceeded {
+                    return Err(EngineError::from(QueryError::ScannedBudgetExceeded {
                         maximum: limits.max_scanned_records,
-                    }
+                    })
                     .into());
+                }
+                if let Some(maximum) = max_scanned_bytes {
+                    let entry_bytes = u64::try_from(entry.key.len())
+                        .ok()
+                        .and_then(|key_bytes| {
+                            u64::try_from(entry.value.len())
+                                .ok()
+                                .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+                        })
+                        .ok_or(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum })?;
+                    scanned_bytes = scanned_bytes
+                        .checked_add(entry_bytes)
+                        .ok_or(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum })?;
+                    if scanned_bytes > maximum {
+                        return Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum });
+                    }
                 }
                 records.push(Record {
                     key: entry.key,
-                    value: decode_document(&entry.value)?,
+                    value: decode_document(&entry.value).map_err(EngineError::from)?,
                 });
             }
             let Some(next_after) = page.next_after else {
@@ -283,16 +440,24 @@ impl HyphaeEngine {
 
         let elapsed = started.elapsed();
         let Some(timeout) = limits.timeout.checked_sub(elapsed) else {
-            return Err(QueryError::TimedOut.into());
+            return Err(EngineError::from(QueryError::TimedOut).into());
         };
         if timeout.is_zero() {
-            return Err(QueryError::TimedOut.into());
+            return Err(EngineError::from(QueryError::TimedOut).into());
         }
         let execution_limits = ExecutionLimits {
             timeout,
             ..limits.clone()
         };
-        Ok(execute(&[records.as_slice()], query, &execution_limits)?)
+        match max_scanned_bytes {
+            Some(maximum) => {
+                execute_with_byte_limit(&[records.as_slice()], query, &execution_limits, maximum)
+                    .map_err(BoundedEngineQueryError::from)
+            }
+            None => execute(&[records.as_slice()], query, &execution_limits)
+                .map_err(EngineError::from)
+                .map_err(BoundedEngineQueryError::from),
+        }
     }
 
     /// Executes one structured query and binds its complete logical result to
@@ -310,6 +475,34 @@ impl HyphaeEngine {
         let result = self.query(query, limits)?;
         let snapshot = self.snapshot()?;
         let proof = ResultProof::for_query(&snapshot, query.clone(), result)?;
+        Ok(ResultProofArtifact { proof, snapshot })
+    }
+
+    /// Executes one query and creates its witness under the query's remaining
+    /// end-to-end timeout and explicit maintenance bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns any ordinary query error plus snapshot-limit, timeout, or
+    /// proof-creation failures.
+    pub fn query_with_proof_with_limits(
+        &self,
+        query: &Query,
+        limits: &ExecutionLimits,
+        max_scanned_bytes: u64,
+        maintenance: &MaintenanceLimits,
+    ) -> Result<ResultProofArtifact, BoundedEngineQueryError> {
+        let started = Instant::now();
+        let result = self.query_with_byte_limit(query, limits, max_scanned_bytes)?;
+        let maintenance = remaining_maintenance_limits(maintenance, started, limits.timeout)
+            .map_err(BoundedEngineQueryError::from)?;
+        let snapshot = self
+            .snapshot_with_limits(&maintenance)
+            .map_err(BoundedEngineQueryError::from)?;
+        let proof = ResultProof::for_query(&snapshot, query.clone(), result)
+            .map_err(EngineError::from)
+            .map_err(BoundedEngineQueryError::from)?;
+        ensure_total_timeout(started, limits.timeout).map_err(BoundedEngineQueryError::from)?;
         Ok(ResultProofArtifact { proof, snapshot })
     }
 
@@ -415,6 +608,7 @@ impl HyphaeEngine {
         request: &ExactRetrievalRequest,
         limits: &ExactRetrievalLimits,
     ) -> Result<ExactRetrievalOutcome, EngineError> {
+        let started = Instant::now();
         let Some(definition) = self.storage.vector_space(&request.vector_space)? else {
             return Err(StorageError::from(
                 hyphae_storage::MaterializedIndexError::UnknownVectorSpace {
@@ -428,19 +622,55 @@ impl HyphaeEngine {
             .map_err(|source| {
                 StorageError::from(hyphae_storage::MaterializedIndexError::from(source))
             })?;
-        let candidates = self.storage.vector_entries(
+        let validation_limits = ExactRetrievalLimits {
+            timeout: Duration::MAX,
+            ..limits.clone()
+        };
+        retrieve_exact(&[], request, &validation_limits)?;
+        let timeout = remaining_exact_timeout(started, limits.timeout)?;
+        let candidates = match self.storage.vector_entries_with_timeout(
             &request.vector_space,
             limits.max_candidates,
             limits.max_candidate_bytes,
-        )?;
-        let candidates = candidates
-            .into_iter()
-            .map(|entry| DurableVectorRecord {
+            timeout,
+        ) {
+            Ok(candidates) => candidates,
+            Err(VectorEntriesError::ExactRetrieval(error)) => return Err(error.into()),
+            Err(VectorEntriesError::Storage(StorageError::Index { source })) => match *source {
+                hyphae_storage::MaterializedIndexError::VectorCandidateBudgetExceeded {
+                    maximum,
+                } => {
+                    return Err(ExactRetrievalError::CandidateBudgetExceeded { maximum }.into());
+                }
+                hyphae_storage::MaterializedIndexError::VectorByteBudgetExceeded { maximum } => {
+                    return Err(ExactRetrievalError::CandidateByteBudgetExceeded { maximum }.into());
+                }
+                source => {
+                    return Err(StorageError::Index {
+                        source: Box::new(source),
+                    }
+                    .into());
+                }
+            },
+            Err(VectorEntriesError::Storage(error)) => return Err(error.into()),
+        };
+        let mut durable_candidates = Vec::with_capacity(candidates.len());
+        for entry in candidates {
+            remaining_exact_timeout(started, limits.timeout)?;
+            durable_candidates.push(DurableVectorRecord {
                 key: entry.key,
                 vector: entry.vector,
-            })
-            .collect::<Vec<_>>();
-        Ok(retrieve_exact(&candidates, request, limits)?)
+            });
+        }
+        let execution_limits = ExactRetrievalLimits {
+            timeout: remaining_exact_timeout(started, limits.timeout)?,
+            ..limits.clone()
+        };
+        Ok(retrieve_exact(
+            &durable_candidates,
+            request,
+            &execution_limits,
+        )?)
     }
 
     /// Executes exact durable retrieval and binds its complete outcome to a
@@ -458,6 +688,29 @@ impl HyphaeEngine {
         let outcome = self.retrieve_exact(request, limits)?;
         let snapshot = self.snapshot()?;
         let proof = ExactRetrievalProof::new(&snapshot, request.clone(), outcome)?;
+        Ok(ExactRetrievalProofArtifact { proof, snapshot })
+    }
+
+    /// Executes exact retrieval and creates its witness under the retrieval
+    /// operation's remaining end-to-end timeout and explicit maintenance
+    /// bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns any exact-retrieval error plus snapshot-limit, timeout, or
+    /// proof-creation failures.
+    pub fn retrieve_exact_with_proof_with_limits(
+        &self,
+        request: &ExactRetrievalRequest,
+        limits: &ExactRetrievalLimits,
+        maintenance: &MaintenanceLimits,
+    ) -> Result<ExactRetrievalProofArtifact, EngineError> {
+        let started = Instant::now();
+        let outcome = self.retrieve_exact(request, limits)?;
+        let maintenance = remaining_maintenance_limits(maintenance, started, limits.timeout)?;
+        let snapshot = self.snapshot_with_limits(&maintenance)?;
+        let proof = ExactRetrievalProof::new(&snapshot, request.clone(), outcome)?;
+        ensure_total_timeout(started, limits.timeout)?;
         Ok(ExactRetrievalProofArtifact { proof, snapshot })
     }
 
@@ -494,6 +747,7 @@ impl HyphaeEngine {
         request: &LexicalRequest,
         limits: &LexicalLimits,
     ) -> Result<LexicalOutcome, EngineError> {
+        let started = Instant::now();
         let Some(definition) = self.storage.lexical_index(&request.index)? else {
             return Err(StorageError::from(
                 hyphae_storage::MaterializedIndexError::UnknownLexicalIndex {
@@ -502,20 +756,30 @@ impl HyphaeEngine {
             )
             .into());
         };
-        let query_tokens = tokenize_v1(&request.query)
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let query_tokens = tokenize_v1_checked(
+            &request.query,
+            || ensure_lexical_timeout(started, limits.timeout),
+            || ensure_lexical_timeout(started, limits.timeout),
+        )?
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
         if query_tokens.is_empty() {
             return Err(LexicalError::EmptyQuery.into());
         }
-        let started = Instant::now();
+        if u64::try_from(query_tokens.len()).unwrap_or(u64::MAX) > limits.max_tokens {
+            return Err(LexicalError::TokenBudgetExceeded {
+                maximum: limits.max_tokens,
+            }
+            .into());
+        }
+        let timeout = remaining_lexical_timeout(started, limits.timeout)?;
         let corpus = match self.storage.lexical_corpus(
             &definition,
             &query_tokens,
             limits.max_candidates,
-            limits.timeout,
+            timeout,
         ) {
             Ok(corpus) => corpus,
             Err(StorageError::Index { source }) => match *source {
@@ -566,6 +830,29 @@ impl HyphaeEngine {
         Ok(LexicalRetrievalProofArtifact { proof, snapshot })
     }
 
+    /// Executes lexical retrieval and creates its witness under the
+    /// retrieval operation's remaining timeout and explicit maintenance
+    /// bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns any lexical error plus snapshot-limit, timeout, or
+    /// proof-creation failures.
+    pub fn retrieve_lexical_with_proof_with_limits(
+        &self,
+        request: &LexicalRequest,
+        limits: &LexicalLimits,
+        maintenance: &MaintenanceLimits,
+    ) -> Result<LexicalRetrievalProofArtifact, EngineError> {
+        let started = Instant::now();
+        let outcome = self.retrieve_lexical(request, limits)?;
+        let maintenance = remaining_maintenance_limits(maintenance, started, limits.timeout)?;
+        let snapshot = self.snapshot_with_limits(&maintenance)?;
+        let proof = LexicalRetrievalProof::new(&snapshot, request.clone(), outcome)?;
+        ensure_total_timeout(started, limits.timeout)?;
+        Ok(LexicalRetrievalProofArtifact { proof, snapshot })
+    }
+
     /// Executes both durable branches and fuses their complete outcomes using
     /// deterministic RRF semantics.
     ///
@@ -582,9 +869,15 @@ impl HyphaeEngine {
         vector_limits: &ExactRetrievalLimits,
         hybrid_request: &HybridRequest,
     ) -> Result<HybridOutcome, EngineError> {
-        let lexical = self.retrieve_lexical(lexical_request, lexical_limits)?;
-        let vector = self.retrieve_exact(vector_request, vector_limits)?;
-        Ok(fuse_hybrid(&lexical, &vector, hybrid_request)?)
+        Ok(self
+            .execute_hybrid(
+                lexical_request,
+                lexical_limits,
+                vector_request,
+                vector_limits,
+                hybrid_request,
+            )?
+            .outcome)
     }
 
     /// Executes lexical and exact-vector branches, fuses their complete
@@ -601,20 +894,122 @@ impl HyphaeEngine {
         vector_limits: &ExactRetrievalLimits,
         hybrid_request: &HybridRequest,
     ) -> Result<HybridRetrievalProofArtifact, EngineError> {
-        let lexical_outcome = self.retrieve_lexical(lexical_request, lexical_limits)?;
-        let vector_outcome = self.retrieve_exact(vector_request, vector_limits)?;
-        let outcome = fuse_hybrid(&lexical_outcome, &vector_outcome, hybrid_request)?;
+        let execution = self.execute_hybrid(
+            lexical_request,
+            lexical_limits,
+            vector_request,
+            vector_limits,
+            hybrid_request,
+        )?;
         let snapshot = self.snapshot()?;
         let proof = HybridRetrievalProof::new(
             &snapshot,
             lexical_request.clone(),
-            lexical_outcome,
+            execution.lexical,
             vector_request.clone(),
-            vector_outcome,
+            execution.vector,
             hybrid_request.clone(),
-            outcome,
+            execution.outcome,
         )?;
         Ok(HybridRetrievalProofArtifact { proof, snapshot })
+    }
+
+    /// Executes both hybrid branches and creates their shared witness under
+    /// one combined remaining branch timeout and explicit maintenance bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns any branch, fusion, snapshot-limit, timeout, or proof error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retrieve_hybrid_with_proof_with_limits(
+        &self,
+        lexical_request: &LexicalRequest,
+        lexical_limits: &LexicalLimits,
+        vector_request: &ExactRetrievalRequest,
+        vector_limits: &ExactRetrievalLimits,
+        hybrid_request: &HybridRequest,
+        maintenance: &MaintenanceLimits,
+    ) -> Result<HybridRetrievalProofArtifact, EngineError> {
+        let execution = self.execute_hybrid(
+            lexical_request,
+            lexical_limits,
+            vector_request,
+            vector_limits,
+            hybrid_request,
+        )?;
+        let maintenance =
+            remaining_maintenance_limits(maintenance, execution.started, execution.total_timeout)?;
+        let snapshot = self.snapshot_with_limits(&maintenance)?;
+        let proof = HybridRetrievalProof::new(
+            &snapshot,
+            lexical_request.clone(),
+            execution.lexical,
+            vector_request.clone(),
+            execution.vector,
+            hybrid_request.clone(),
+            execution.outcome,
+        )?;
+        ensure_total_timeout(execution.started, execution.total_timeout)?;
+        Ok(HybridRetrievalProofArtifact { proof, snapshot })
+    }
+
+    fn execute_hybrid(
+        &self,
+        lexical_request: &LexicalRequest,
+        lexical_limits: &LexicalLimits,
+        vector_request: &ExactRetrievalRequest,
+        vector_limits: &ExactRetrievalLimits,
+        hybrid_request: &HybridRequest,
+    ) -> Result<HybridExecution, EngineError> {
+        let started = Instant::now();
+        self.execute_hybrid_with_elapsed(
+            lexical_request,
+            lexical_limits,
+            vector_request,
+            vector_limits,
+            hybrid_request,
+            started,
+            || started.elapsed(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_hybrid_with_elapsed(
+        &self,
+        lexical_request: &LexicalRequest,
+        lexical_limits: &LexicalLimits,
+        vector_request: &ExactRetrievalRequest,
+        vector_limits: &ExactRetrievalLimits,
+        hybrid_request: &HybridRequest,
+        started: Instant,
+        mut elapsed: impl FnMut() -> Duration,
+    ) -> Result<HybridExecution, EngineError> {
+        let total_timeout = lexical_limits
+            .timeout
+            .checked_add(vector_limits.timeout)
+            .unwrap_or(Duration::MAX);
+
+        let mut bounded_lexical = lexical_limits.clone();
+        bounded_lexical.timeout = bounded_lexical
+            .timeout
+            .min(remaining_exact_timeout_after(total_timeout, elapsed())?);
+        let lexical = self.retrieve_lexical(lexical_request, &bounded_lexical)?;
+
+        let mut bounded_vector = vector_limits.clone();
+        bounded_vector.timeout = bounded_vector
+            .timeout
+            .min(remaining_exact_timeout_after(total_timeout, elapsed())?);
+        let vector = self.retrieve_exact(vector_request, &bounded_vector)?;
+
+        let outcome = fuse_hybrid(&lexical, &vector, hybrid_request)?;
+        remaining_exact_timeout_after(total_timeout, elapsed())?;
+        Ok(HybridExecution {
+            started,
+            total_timeout,
+            lexical,
+            vector,
+            outcome,
+        })
     }
 
     /// Creates or reuses a verified logical snapshot.
@@ -626,6 +1021,18 @@ impl HyphaeEngine {
         Ok(self.storage.snapshot()?)
     }
 
+    /// Creates or reuses a verified logical snapshot under explicit limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a limit, timeout, stale-handle, index, or snapshot error.
+    pub fn snapshot_with_limits(
+        &self,
+        limits: &MaintenanceLimits,
+    ) -> Result<SnapshotInfo, EngineError> {
+        Ok(self.storage.snapshot_with_limits(limits)?)
+    }
+
     /// Commits an anchored compaction generation.
     ///
     /// # Errors
@@ -633,6 +1040,19 @@ impl HyphaeEngine {
     /// Returns a stale-handle, snapshot, segment, or manifest error.
     pub fn compact(&mut self) -> Result<CompactionOutcome, EngineError> {
         Ok(self.storage.compact()?)
+    }
+
+    /// Commits an anchored compaction generation under one finite deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a limit, timeout, stale-handle, snapshot, segment, or manifest
+    /// error before the manifest commit point.
+    pub fn compact_with_limits(
+        &mut self,
+        limits: &MaintenanceLimits,
+    ) -> Result<CompactionOutcome, EngineError> {
+        Ok(self.storage.compact_with_limits(limits)?)
     }
 
     /// Creates an atomic portable backup at the locked logical checkpoint.
@@ -668,24 +1088,88 @@ impl HyphaeEngine {
     }
 }
 
+fn remaining_exact_timeout(
+    started: Instant,
+    total_timeout: Duration,
+) -> Result<Duration, ExactRetrievalError> {
+    remaining_exact_timeout_after(total_timeout, started.elapsed())
+}
+
+fn remaining_exact_timeout_after(
+    total_timeout: Duration,
+    elapsed: Duration,
+) -> Result<Duration, ExactRetrievalError> {
+    total_timeout
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ExactRetrievalError::TimedOut)
+}
+
+fn ensure_lexical_timeout(started: Instant, total_timeout: Duration) -> Result<(), LexicalError> {
+    remaining_lexical_timeout(started, total_timeout)?;
+    Ok(())
+}
+
+fn remaining_lexical_timeout(
+    started: Instant,
+    total_timeout: Duration,
+) -> Result<Duration, LexicalError> {
+    total_timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(LexicalError::TimedOut)
+}
+
+fn ensure_total_timeout(started: Instant, total_timeout: Duration) -> Result<(), EngineError> {
+    if started.elapsed() >= total_timeout {
+        Err(StorageError::from(SnapshotError::from(StorageLimitError::TimedOut)).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn remaining_maintenance_limits(
+    template: &MaintenanceLimits,
+    started: Instant,
+    total_timeout: Duration,
+) -> Result<MaintenanceLimits, EngineError> {
+    let Some(remaining) = total_timeout.checked_sub(started.elapsed()) else {
+        return Err(StorageError::from(SnapshotError::from(StorageLimitError::TimedOut)).into());
+    };
+    if remaining.is_zero() {
+        return Err(StorageError::from(SnapshotError::from(StorageLimitError::TimedOut)).into());
+    }
+    Ok(MaintenanceLimits {
+        timeout: template.timeout.min(remaining),
+        snapshot: template.snapshot.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     use hyphae_core::{Q15Vector, VectorSpaceDefinition, VectorSpaceName};
     use hyphae_query::{
         AggregationPlan, CompareOperator, FieldPath, Filter, Metric, MetricValue, NamedMetric,
-        NullPlacement, SortDirection, SortField, Value,
+        NullPlacement, SortDirection, SortField, Value, encoded_document_len,
     };
     use uuid::Uuid;
 
     use hyphae_retrieval::{
-        ExactRetrievalLimits, ExactRetrievalOutcome, ExactRetrievalRequest, HybridOutcome,
-        HybridRequest, LexicalField, LexicalIndexDefinition, LexicalLimits, LexicalOutcome,
-        LexicalRequest, retrieve_lexical,
+        ExactRetrievalError, ExactRetrievalLimits, ExactRetrievalOutcome, ExactRetrievalRequest,
+        HybridOutcome, HybridRequest, LexicalField, LexicalIndexDefinition, LexicalLimits,
+        LexicalOutcome, LexicalRequest, retrieve_lexical,
     };
 
-    use super::{EngineError, ExecutionLimits, HyphaeEngine, Query, Record};
+    use super::{
+        BoundedEngineQueryError, EngineError, ExecutionLimits, HyphaeEngine, Query, Record,
+    };
 
     struct TestDirectory {
         path: PathBuf,
@@ -816,6 +1300,91 @@ mod tests {
     }
 
     #[test]
+    fn facade_enforces_query_scan_byte_budget_before_decode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new("engine-query-byte-budget")?;
+        let mut opened = HyphaeEngine::open(temporary.path().join("data"))?;
+        let records = [
+            Record::new(b"a", Value::Null),
+            Record::new(b"b", Value::String("bounded".to_owned())),
+        ];
+        let total_bytes = records.iter().try_fold(0_u64, |total, record| {
+            let document = crate::encode_document(&record.value)?;
+            let bytes = u64::try_from(record.key.len() + document.len())?;
+            Ok::<_, Box<dyn std::error::Error>>(total.checked_add(bytes).ok_or("byte overflow")?)
+        })?;
+        opened.engine.put_records(Uuid::now_v7(), &records)?;
+        let request = Query {
+            filter: Filter::MatchAll,
+            sort: Vec::new(),
+            cursor: None,
+            limit: 2,
+            aggregation: None,
+        };
+        let result = opened.engine.query_with_byte_limit(
+            &request,
+            &ExecutionLimits::default(),
+            total_bytes,
+        )?;
+        assert_eq!(result.rows, records);
+        assert!(matches!(
+            opened.engine.query_with_byte_limit(
+                &request,
+                &ExecutionLimits::default(),
+                total_bytes - 1,
+            ),
+            Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum })
+                if maximum == total_bytes - 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_scan_byte_budget_is_exact_across_storage_pages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new("engine-query-byte-pages")?;
+        let mut opened = HyphaeEngine::open(temporary.path().join("data"))?;
+        let records = (0_u64..4_097)
+            .map(|value| Record::new(value.to_be_bytes(), Value::Null))
+            .collect::<Vec<_>>();
+        let total_bytes = records.iter().try_fold(0_u64, |total, record| {
+            let key_bytes = u64::try_from(record.key.len())?;
+            let document_bytes = u64::try_from(encoded_document_len(&record.value)?)?;
+            Ok::<_, Box<dyn std::error::Error>>(
+                total
+                    .checked_add(key_bytes)
+                    .and_then(|next| next.checked_add(document_bytes))
+                    .ok_or_else(|| std::io::Error::other("scan byte total overflow"))?,
+            )
+        })?;
+        opened.engine.put_records(Uuid::now_v7(), &records)?;
+        let query = Query {
+            filter: Filter::MatchAll,
+            sort: Vec::new(),
+            cursor: None,
+            limit: 1,
+            aggregation: None,
+        };
+
+        let exact = opened.engine.query_with_byte_limit(
+            &query,
+            &ExecutionLimits::default(),
+            total_bytes,
+        )?;
+        assert_eq!(exact.rows.len(), 1);
+        assert!(matches!(
+            opened.engine.query_with_byte_limit(
+                &query,
+                &ExecutionLimits::default(),
+                total_bytes - 1,
+            ),
+            Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { maximum })
+                if maximum == total_bytes - 1
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn durable_vectors_survive_compaction_backup_restore_and_index_rebuild()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new("durable-vectors-lifecycle")?;
@@ -854,6 +1423,40 @@ mod tests {
             &expected,
             ExactRetrievalOutcome::Matches { matches, .. }
                 if matches.first().is_some_and(|matched| matched.key == b"alpha")
+        ));
+        let exact_candidate_bytes =
+            u64::try_from(b"alpha".len() + b"beta".len() + (2 * 3 * std::mem::size_of::<i16>()))?;
+        let exact_limits = ExactRetrievalLimits {
+            max_candidate_bytes: exact_candidate_bytes,
+            ..limits.clone()
+        };
+        assert_eq!(
+            opened.engine.retrieve_exact(&request, &exact_limits)?,
+            expected
+        );
+        let one_byte_short = ExactRetrievalLimits {
+            max_candidate_bytes: exact_candidate_bytes - 1,
+            ..limits.clone()
+        };
+        assert!(matches!(
+            opened.engine.retrieve_exact(&request, &one_byte_short),
+            Err(EngineError::ExactRetrieval(
+                hyphae_retrieval::ExactRetrievalError::CandidateByteBudgetExceeded {
+                    maximum
+                }
+            )) if maximum == exact_candidate_bytes - 1
+        ));
+        assert!(matches!(
+            opened.engine.retrieve_exact(
+                &request,
+                &ExactRetrievalLimits {
+                    timeout: Duration::ZERO,
+                    ..limits.clone()
+                }
+            ),
+            Err(EngineError::ExactRetrieval(
+                hyphae_retrieval::ExactRetrievalError::TimedOut
+            ))
         ));
         opened.engine.compact()?;
         assert_eq!(opened.engine.retrieve_exact(&request, &limits)?, expected);
@@ -915,6 +1518,76 @@ mod tests {
             ("body".to_owned(), Value::String(body.to_owned())),
             ("title".to_owned(), Value::String(title.to_owned())),
         ]))
+    }
+
+    #[test]
+    fn hybrid_deadline_includes_fusion_after_both_branches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new("hybrid-total-deadline")?;
+        let name = VectorSpaceName::new("documents.v1")?;
+        let mut opened = HyphaeEngine::open(temporary.path().join("data"))?;
+        opened.engine.define_lexical_index(
+            Uuid::now_v7(),
+            LexicalIndexDefinition::new(
+                name.clone(),
+                vec![LexicalField {
+                    path: FieldPath::field("title"),
+                    weight_micros: 1_000_000,
+                }],
+            )?,
+        )?;
+        opened.engine.define_vector_space(
+            Uuid::now_v7(),
+            VectorSpaceDefinition::cosine(name.clone(), 2)?,
+        )?;
+        let lexical_request = LexicalRequest {
+            index: name.clone(),
+            query: "durable".into(),
+            limit: 1,
+        };
+        let lexical_limits = LexicalLimits {
+            timeout: Duration::from_secs(5),
+            ..LexicalLimits::default()
+        };
+        let vector_request = ExactRetrievalRequest {
+            vector_space: name,
+            query: Q15Vector::new(vec![32_767, 0])?,
+            limit: 1,
+            minimum_score_nanos: -1_000_000_000,
+            minimum_margin_nanos: 0,
+        };
+        let vector_limits = ExactRetrievalLimits {
+            timeout: Duration::from_secs(5),
+            ..ExactRetrievalLimits::default()
+        };
+        let hybrid_request = HybridRequest {
+            lexical_weight: 1,
+            vector_weight: 1,
+            limit: 1,
+        };
+        let mut elapsed = [
+            Duration::ZERO,
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+        ]
+        .into_iter();
+        let Err(error) = opened.engine.execute_hybrid_with_elapsed(
+            &lexical_request,
+            &lexical_limits,
+            &vector_request,
+            &vector_limits,
+            &hybrid_request,
+            Instant::now(),
+            || elapsed.next().unwrap_or(Duration::MAX),
+        ) else {
+            return Err("fusion at the total deadline unexpectedly succeeded".into());
+        };
+        assert!(matches!(
+            error,
+            EngineError::ExactRetrieval(ExactRetrievalError::TimedOut)
+        ));
+        assert!(elapsed.next().is_none());
+        Ok(())
     }
 
     #[test]

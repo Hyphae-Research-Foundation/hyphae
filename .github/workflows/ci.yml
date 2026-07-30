@@ -19,6 +19,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify the pull-request integration tree
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_MERGE_COMMIT: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/merge"
+          test "$(git rev-parse FETCH_HEAD)" = "$PR_MERGE_COMMIT"
+          test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')"
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -57,6 +70,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -72,6 +87,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -111,6 +128,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -152,12 +171,43 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install artifact-bound SemVer verifier
+        shell: bash
+        env:
+          SEMVER_CHECKS_SHA256: fc0144b6cfd8820bdb4180228212c26e6ee6b58363a20849c3386a5d22e90c3d
+          SEMVER_CHECKS_URL: https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.48.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-semver-checks-0.48.0.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" "$SEMVER_CHECKS_URL"
+          printf '%s  %s\n' "$SEMVER_CHECKS_SHA256" "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          chmod 0755 "$RUNNER_TEMP/cargo-semver-checks"
+          test "$("$RUNNER_TEMP/cargo-semver-checks" --version)" = "cargo 0.48.0"
+      - name: Verify patch public API against v0.2.0
+        shell: bash
+        env:
+          BASELINE_COMMIT: 170380453a2ca6322a4c8bc50417318daee1c011
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/tags/v0.2.0:refs/tags/v0.2.0"
+          test "$(git rev-parse 'v0.2.0^{commit}')" = "$BASELINE_COMMIT"
+          "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
+            --workspace \
+            --baseline-rev "$BASELINE_COMMIT" \
+            --release-type patch \
+            --all-features \
+            --color never
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

@@ -23,22 +23,26 @@ use hyphae_contracts::v1::{
 };
 use hyphae_core::current_version;
 use hyphae_engine::{
-    HyphaeEngine, ProvenResult, ResultProofArtifact, RetrievalProofAnchor,
-    RetrievalVerificationLimits, VerificationLimits, verify_exact_retrieval_proof,
-    verify_hybrid_retrieval_proof, verify_lexical_retrieval_proof, verify_result_proof,
-    write_result_proof,
+    EngineError, HyphaeEngine, OpenedEngine, ProvenResult, ResultProofArtifact,
+    RetrievalProofAnchor, RetrievalVerificationLimits, StorageLimits, VerificationLimits,
+    verify_exact_retrieval_proof, verify_hybrid_retrieval_proof, verify_lexical_retrieval_proof,
+    verify_result_proof, write_result_proof,
 };
 use hyphae_query::{
     Cursor, ExecutionLimits, FieldPath, Filter, MetricValue, NullPlacement, Query, Record,
     SortDirection, SortField,
 };
-use hyphae_server::{BearerToken, HyphaeServer, ServerConfig};
+use hyphae_server::{BearerToken, HyphaeServer, ServerConfig, ServerLimits};
 use hyphae_storage::{AppendOutcome, CommitReceipt, CompactionOutcome, SnapshotInfo};
 use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::json_value::{decode_hex, encode_hex, parse_json, to_json};
+
+const MAX_BEARER_TOKEN_BYTES: u64 = 4_096;
+const MAX_BEARER_TOKEN_INPUT_BYTES: u64 = MAX_BEARER_TOKEN_BYTES + 2;
+const INITIAL_READ_CAPACITY: u64 = 64 * 1024;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 enum CliError {
@@ -57,6 +61,16 @@ enum CliError {
     #[cfg(unix)]
     #[error("bearer token file must not grant permissions to group or other users")]
     InsecureBearerTokenFile,
+
+    #[error("{input} is at least {actual} bytes, exceeding the local CLI limit {maximum}")]
+    InputTooLarge {
+        input: &'static str,
+        actual: u64,
+        maximum: u64,
+    },
+
+    #[error("{input} changed length while it was read")]
+    InputLengthChanged { input: &'static str },
 }
 
 #[derive(Debug, Parser)]
@@ -467,7 +481,7 @@ async fn remote(
             print_serializable(&client.retrieve_hybrid(&request).await?.value)
         }
         RemoteCommand::Witness { proof, out } => {
-            let encoded = read_json_value(&proof)?;
+            let encoded = read_proof_json_value(&proof)?;
             let witness = match serde_json::from_value::<ProofV1>(encoded.clone()) {
                 Ok(proof) => client.download_witness(&proof).await?.value,
                 Err(result_error) => {
@@ -546,6 +560,7 @@ fn load_remote_bearer_token(path: Option<&Path>) -> Result<Option<String>, Box<d
     if encoded.contains(&b'\n') || encoded.contains(&b'\r') {
         return Err(CliError::BearerTokenContainsNewline.into());
     }
+    enforce_input_limit(encoded.len(), MAX_BEARER_TOKEN_BYTES, "bearer token")?;
     String::from_utf8(encoded)
         .map(Some)
         .map_err(|_| CliError::InvalidBearerTokenEncoding.into())
@@ -562,29 +577,104 @@ fn load_bearer_token_bytes(path: Option<&Path>) -> Result<Option<Vec<u8>>, Box<d
                 return Err(CliError::InsecureBearerTokenFile.into());
             }
         }
-        return Ok(Some(fs::read(path)?));
+        return read_bounded_file(path, MAX_BEARER_TOKEN_INPUT_BYTES, "bearer token input")
+            .map(Some);
     }
     let Some(value) = env::var_os("HYPHAE_BEARER_TOKEN") else {
         return Ok(None);
     };
-    value
+    let encoded = value
         .into_string()
-        .map(|value| Some(value.into_bytes()))
-        .map_err(|_| CliError::InvalidBearerTokenEncoding.into())
+        .map(String::into_bytes)
+        .map_err(|_| CliError::InvalidBearerTokenEncoding)?;
+    enforce_input_limit(
+        encoded.len(),
+        MAX_BEARER_TOKEN_INPUT_BYTES,
+        "bearer token input",
+    )?;
+    Ok(Some(encoded))
 }
 
 fn read_json_request<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Box<dyn Error>> {
-    Ok(serde_json::from_value(read_json_value(path)?)?)
+    let maximum = u64::try_from(ServerLimits::default().request_body_bytes).unwrap_or(u64::MAX);
+    Ok(serde_json::from_value(read_json_value(
+        path,
+        maximum,
+        "JSON request",
+    )?)?)
 }
 
-fn read_json_value(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
-    let mut encoded = Vec::new();
+fn read_proof_json_value(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    let maximum = u64::try_from(ServerLimits::default().response_bytes).unwrap_or(u64::MAX);
+    read_json_value(path, maximum, "proof JSON")
+}
+
+fn read_json_value(
+    path: &Path,
+    maximum: u64,
+    input: &'static str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     if path == Path::new("-") {
-        stdin().lock().read_to_end(&mut encoded)?;
+        let encoded = read_bounded(stdin().lock(), maximum, input)?;
+        Ok(serde_json::from_slice(&encoded)?)
     } else {
-        encoded = fs::read(path)?;
+        let encoded = read_bounded_file(path, maximum, input)?;
+        Ok(serde_json::from_slice(&encoded)?)
     }
-    Ok(serde_json::from_slice(&encoded)?)
+}
+
+fn read_bounded_file(
+    path: &Path,
+    maximum: u64,
+    input: &'static str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > maximum {
+        return Err(CliError::InputTooLarge {
+            input,
+            actual: metadata.len(),
+            maximum,
+        }
+        .into());
+    }
+    let encoded = read_bounded(&mut file, maximum, input)?;
+    if metadata.is_file() {
+        let final_length = file.metadata()?.len();
+        let observed_length = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if final_length != metadata.len() || observed_length != final_length {
+            return Err(CliError::InputLengthChanged { input }.into());
+        }
+    }
+    Ok(encoded)
+}
+
+fn read_bounded(
+    input_reader: impl Read,
+    maximum: u64,
+    input: &'static str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let initial_capacity =
+        usize::try_from(maximum.min(INITIAL_READ_CAPACITY)).unwrap_or(usize::MAX);
+    let mut encoded = Vec::with_capacity(initial_capacity);
+    input_reader
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut encoded)?;
+    enforce_input_limit(encoded.len(), maximum, input)?;
+    Ok(encoded)
+}
+
+fn enforce_input_limit(length: usize, maximum: u64, input: &'static str) -> Result<(), CliError> {
+    let actual = u64::try_from(length).unwrap_or(u64::MAX);
+    if actual > maximum {
+        Err(CliError::InputTooLarge {
+            input,
+            actual,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn print_serializable(value: &impl serde::Serialize) -> Result<(), Box<dyn Error>> {
@@ -611,6 +701,10 @@ fn print_version(json_output: bool) -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn open_engine(data_dir: &Path) -> Result<OpenedEngine, EngineError> {
+    HyphaeEngine::open_with_limits(data_dir, StorageLimits::default())
+}
+
 fn put(
     data_dir: &Path,
     key: String,
@@ -618,7 +712,7 @@ fn put(
     transaction_id: Option<Uuid>,
 ) -> Result<(), Box<dyn Error>> {
     let value = parse_json(encoded_json)?;
-    let mut opened = HyphaeEngine::open(data_dir)?;
+    let mut opened = open_engine(data_dir)?;
     let transaction_id = transaction_id.unwrap_or_else(Uuid::now_v7);
     let outcome = opened
         .engine
@@ -627,7 +721,7 @@ fn put(
 }
 
 fn get(data_dir: &Path, key: &[u8], proof_out: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let opened = HyphaeEngine::open(data_dir)?;
+    let opened = open_engine(data_dir)?;
     let (record, proof) = if let Some(proof_path) = proof_out {
         let artifact = opened.engine.get_record_with_proof(key)?;
         write_result_proof(proof_path, &artifact.proof)?;
@@ -647,7 +741,7 @@ fn get(data_dir: &Path, key: &[u8], proof_out: Option<&Path>) -> Result<(), Box<
 }
 
 fn delete(data_dir: &Path, key: &[u8], transaction_id: Option<Uuid>) -> Result<(), Box<dyn Error>> {
-    let mut opened = HyphaeEngine::open(data_dir)?;
+    let mut opened = open_engine(data_dir)?;
     let outcome = opened
         .engine
         .delete_record(transaction_id.unwrap_or_else(Uuid::now_v7), key)?;
@@ -701,7 +795,7 @@ fn query(data_dir: &Path, arguments: QueryArguments) -> Result<(), Box<dyn Error
         limit: arguments.limit,
         aggregation: None,
     };
-    let opened = HyphaeEngine::open(data_dir)?;
+    let opened = open_engine(data_dir)?;
     let (result, proof) = if let Some(proof_path) = arguments.proof_out.as_deref() {
         let artifact = opened
             .engine
@@ -808,12 +902,12 @@ fn retrieval_verification_json(
 }
 
 fn snapshot(data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let opened = HyphaeEngine::open(data_dir)?;
+    let opened = open_engine(data_dir)?;
     print_json(&snapshot_json(&opened.engine.snapshot()?))
 }
 
 fn compact(data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let mut opened = HyphaeEngine::open(data_dir)?;
+    let mut opened = open_engine(data_dir)?;
     let value = match opened.engine.compact()? {
         CompactionOutcome::NoChanges { snapshot } => json!({
             "status": "no_changes",
@@ -831,7 +925,7 @@ fn compact(data_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn backup(data_dir: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
-    let opened = HyphaeEngine::open(data_dir)?;
+    let opened = open_engine(data_dir)?;
     let backup = opened.engine.backup(destination)?;
     print_json(&json!({
         "status": "created",
@@ -859,7 +953,7 @@ fn restore(backup: &Path, data_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn doctor(data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let opened = HyphaeEngine::open(data_dir)?;
+    let opened = open_engine(data_dir)?;
     let snapshot = opened.engine.snapshot()?;
     let log = &opened.recovery.log;
     print_json(&json!({
@@ -1011,11 +1105,14 @@ fn print_json(value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs};
+    use std::{error::Error, fs, io::Cursor};
 
     use uuid::Uuid;
 
-    use super::{CliError, load_bearer_token, parse_field_path};
+    use super::{
+        CliError, MAX_BEARER_TOKEN_BYTES, MAX_BEARER_TOKEN_INPUT_BYTES, load_bearer_token,
+        load_remote_bearer_token, parse_field_path, read_bounded,
+    };
 
     #[test]
     fn cli_field_paths_reject_empty_segments() {
@@ -1042,6 +1139,93 @@ mod tests {
         let token = load_bearer_token(Some(&path));
         let _ignored = fs::remove_file(path);
         assert!(token?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_input_accepts_exact_limit_and_rejects_next_byte() -> Result<(), Box<dyn Error>> {
+        let exact = read_bounded(Cursor::new(b"12345678"), 8, "test input")?;
+        assert_eq!(exact, b"12345678");
+
+        let Err(error) = read_bounded(Cursor::new(b"123456789"), 8, "test input") else {
+            return Err(std::io::Error::other("one byte above the limit was accepted").into());
+        };
+        assert!(matches!(
+            error.downcast_ref::<CliError>(),
+            Some(CliError::InputTooLarge {
+                input: "test input",
+                actual: 9,
+                maximum: 8,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bearer_token_file_rejects_oversized_input_before_validation() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!("hyphae-token-{}", Uuid::now_v7()));
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_BEARER_TOKEN_INPUT_BYTES + 1)?],
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        let result = load_bearer_token(Some(&path));
+        let _ignored = fs::remove_file(path);
+        let Err(error) = result else {
+            return Err(std::io::Error::other("oversized bearer token input was accepted").into());
+        };
+        assert!(matches!(
+            error.downcast_ref::<CliError>(),
+            Some(CliError::InputTooLarge {
+                input: "bearer token input",
+                actual: 4_099,
+                maximum: MAX_BEARER_TOKEN_INPUT_BYTES,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_bearer_token_enforces_canonical_limit_after_terminal_crlf()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!("hyphae-token-{}", Uuid::now_v7()));
+        let mut exact_with_crlf = vec![b'x'; usize::try_from(MAX_BEARER_TOKEN_BYTES)?];
+        exact_with_crlf.extend_from_slice(b"\r\n");
+        fs::write(&path, exact_with_crlf)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        let exact = load_remote_bearer_token(Some(&path))?;
+        assert_eq!(
+            exact.as_deref().map(str::len),
+            Some(usize::try_from(MAX_BEARER_TOKEN_BYTES)?)
+        );
+
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_BEARER_TOKEN_BYTES + 1)?],
+        )?;
+        let result = load_remote_bearer_token(Some(&path));
+        let _ignored = fs::remove_file(path);
+        let Err(error) = result else {
+            return Err(std::io::Error::other("oversized remote bearer token was accepted").into());
+        };
+        assert!(matches!(
+            error.downcast_ref::<CliError>(),
+            Some(CliError::InputTooLarge {
+                input: "bearer token",
+                actual: 4_097,
+                maximum: MAX_BEARER_TOKEN_BYTES,
+            })
+        ));
         Ok(())
     }
 }

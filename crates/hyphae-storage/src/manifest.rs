@@ -9,6 +9,11 @@ use std::{
 use hyphae_core::{DISK_FORMAT_VERSION, MIN_DISK_FORMAT_VERSION};
 use thiserror::Error;
 
+use crate::{
+    StorageLimitError,
+    limits::{OperationDeadline, limit_io_error},
+};
+
 const MAGIC: [u8; 8] = *b"HYMNFST1";
 const MANIFEST_FORMAT_VERSION: u16 = 1;
 const ENCODED_LENGTH: usize = 140;
@@ -52,6 +57,12 @@ pub enum ManifestError {
     },
 }
 
+impl From<StorageLimitError> for ManifestError {
+    fn from(source: StorageLimitError) -> Self {
+        Self::Io(limit_io_error(source))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StorageManifest {
     pub(crate) generation: u64,
@@ -72,10 +83,35 @@ impl StorageManifest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load_or_initialize(root: &Path) -> Result<Self, ManifestError> {
+        let deadline = OperationDeadline::new(std::time::Duration::from_secs(60));
+        Self::load_or_initialize_with_limits(root, 1_000_000, &deadline)
+    }
+
+    pub(crate) fn load_or_initialize_with_limits(
+        root: &Path,
+        max_directory_entries: u64,
+        deadline: &OperationDeadline,
+    ) -> Result<Self, ManifestError> {
+        deadline.check()?;
         let directory = root.join("manifest");
         let mut generations = Vec::new();
+        let mut entry_count = 0_u64;
         for entry in fs::read_dir(&directory)? {
+            deadline.check()?;
+            entry_count =
+                entry_count
+                    .checked_add(1)
+                    .ok_or(StorageLimitError::DirectoryEntriesExceeded {
+                        maximum: max_directory_entries,
+                    })?;
+            if entry_count > max_directory_entries {
+                return Err(StorageLimitError::DirectoryEntriesExceeded {
+                    maximum: max_directory_entries,
+                }
+                .into());
+            }
             let path = entry?.path();
             if let Some(generation) = generation_from_path(&path)? {
                 generations.push((generation, path));
@@ -86,12 +122,37 @@ impl StorageManifest {
             return decode_manifest(path, *generation);
         }
 
+        let required_entries =
+            entry_count
+                .checked_add(1)
+                .ok_or(StorageLimitError::DirectoryEntriesExceeded {
+                    maximum: max_directory_entries,
+                })?;
+        if required_entries > max_directory_entries {
+            return Err(StorageLimitError::DirectoryEntriesExceeded {
+                maximum: max_directory_entries,
+            }
+            .into());
+        }
         let initial = Self::initial();
         initial.write_new(root)?;
         Ok(initial)
     }
 
     pub(crate) fn write_new(&self, root: &Path) -> Result<(), ManifestError> {
+        self.write_new_inner(root, false)
+    }
+
+    #[cfg(test)]
+    fn write_new_with_injected_temporary_failure(&self, root: &Path) -> Result<(), ManifestError> {
+        self.write_new_inner(root, true)
+    }
+
+    fn write_new_inner(
+        &self,
+        root: &Path,
+        inject_temporary_failure: bool,
+    ) -> Result<(), ManifestError> {
         validate_semantics(self, &root.join(manifest_filename(self.generation)))?;
         let manifest_directory = root.join("manifest");
         let final_path = manifest_directory.join(manifest_filename(self.generation));
@@ -111,6 +172,7 @@ impl StorageManifest {
             self.generation,
             uuid::Uuid::now_v7()
         ));
+        let mut temporary_guard = TemporaryManifestGuard::new(temporary_path.clone());
         let encoded = encode_manifest(self);
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -119,10 +181,42 @@ impl StorageManifest {
         file.write_all(&encoded)?;
         file.sync_all()?;
         drop(file);
+        if inject_temporary_failure {
+            return Err(io::Error::other("injected temporary manifest failure").into());
+        }
         fs::rename(&temporary_path, &final_path)?;
+        temporary_guard.disarm();
         #[cfg(unix)]
         sync_directory(&manifest_directory)?;
         Ok(())
+    }
+
+    pub(crate) fn path(&self, root: &Path) -> PathBuf {
+        root.join("manifest")
+            .join(manifest_filename(self.generation))
+    }
+}
+
+struct TemporaryManifestGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryManifestGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryManifestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ignored = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -263,7 +357,7 @@ mod tests {
     use std::{error::Error, fs, io::Write};
 
     use super::{ManifestError, StorageManifest};
-    use crate::test_support::TestDirectory;
+    use crate::{StorageLimitError, storage_limit_from_io, test_support::TestDirectory};
 
     fn initialize_layout(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(root.join("manifest"))?;
@@ -316,6 +410,45 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn removes_a_temporary_manifest_after_a_pre_rename_failure() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("manifest-temporary-cleanup")?;
+        initialize_layout(temporary.path())?;
+        let manifest = StorageManifest::initial();
+
+        assert!(matches!(
+            manifest.write_new_with_injected_temporary_failure(temporary.path()),
+            Err(ManifestError::Io(_))
+        ));
+        assert_eq!(fs::read_dir(temporary.path().join("tmp"))?.count(), 0);
+        assert_eq!(fs::read_dir(temporary.path().join("manifest"))?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reserves_capacity_before_initializing_a_manifest() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("manifest-initial-capacity")?;
+        initialize_layout(temporary.path())?;
+        fs::write(temporary.path().join("manifest/occupied"), b"occupied")?;
+        let deadline = crate::limits::OperationDeadline::new(std::time::Duration::from_secs(1));
+
+        assert!(matches!(
+            StorageManifest::load_or_initialize_with_limits(temporary.path(), 1, &deadline),
+            Err(ManifestError::Io(source))
+                if matches!(
+                    storage_limit_from_io(&source),
+                    Some(StorageLimitError::DirectoryEntriesExceeded { maximum: 1 })
+                )
+        ));
+        assert!(
+            !temporary
+                .path()
+                .join("manifest/00000000000000000001.hymanifest")
+                .exists()
+        );
         Ok(())
     }
 }

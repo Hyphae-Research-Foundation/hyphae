@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use hyphae_core::{VectorSpaceDefinition, VectorSpaceName};
-use hyphae_retrieval::{LexicalIndexDefinition, LexicalMaterializedCorpus};
+use hyphae_retrieval::{ExactRetrievalError, LexicalIndexDefinition, LexicalMaterializedCorpus};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,12 +13,14 @@ pub const MAX_SCAN_PAGE_ENTRIES: usize = 4_096;
 use crate::log::transaction_digest;
 use crate::{
     AppendOutcome, BackupError, BackupInfo, CommitReceipt, DataDirectory, DataDirectoryError,
-    DurableLog, LogError, MaterializedIndexError, Mutation, MutationError, RecoveredTransaction,
-    RecoveryReport, SnapshotError, SnapshotInfo,
-    index::{MaterializedIndex, VectorEntry},
+    DurableLog, LogError, MaintenanceLimits, MaterializedIndexError, Mutation, MutationError,
+    RecoveredTransaction, RecoveryLimits, RecoveryReport, SnapshotError, SnapshotInfo,
+    SnapshotReadLimits, StorageLimitError, StorageLimits,
+    index::{KvScanError, MaterializedIndex, VectorEntry, VectorScanError},
+    limits::OperationDeadline,
     manifest::StorageManifest,
     mutation::validate_key,
-    snapshot::{create_snapshot, verify_snapshot},
+    snapshot::{create_snapshot, verify_snapshot_with_policy},
 };
 
 /// Failure while opening or operating the durable embedded storage engine.
@@ -84,6 +86,46 @@ pub enum StorageError {
         requested: usize,
         /// Hard maximum page size.
         maximum: usize,
+    },
+}
+
+impl From<StorageLimitError> for StorageError {
+    fn from(source: StorageLimitError) -> Self {
+        Self::Snapshot {
+            source: Box::new(SnapshotError::from(source)),
+        }
+    }
+}
+
+/// Failure while reading a vector space under an explicit end-to-end
+/// retrieval deadline.
+#[derive(Debug, Error)]
+pub enum VectorEntriesError {
+    /// Ordinary durable storage failure.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    /// The exact-retrieval deadline expired.
+    #[error(transparent)]
+    ExactRetrieval(#[from] ExactRetrievalError),
+}
+
+impl From<MaterializedIndexError> for VectorEntriesError {
+    fn from(source: MaterializedIndexError) -> Self {
+        Self::Storage(StorageError::from(source))
+    }
+}
+
+/// Failure while scanning one page under an explicit aggregate byte budget.
+#[derive(Debug, Error)]
+pub enum ScanPageError {
+    /// Ordinary durable storage failure.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    /// Aggregate key and value bytes exceeded caller policy.
+    #[error("scan page byte budget exceeded: {maximum}")]
+    ByteBudgetExceeded {
+        /// Maximum aggregate key and value bytes permitted.
+        maximum: u64,
     },
 }
 
@@ -155,6 +197,7 @@ pub struct StorageEngine {
     index: MaterializedIndex,
     index_stale: bool,
     directory: DataDirectory,
+    limits: StorageLimits,
 }
 
 impl StorageEngine {
@@ -165,24 +208,46 @@ impl StorageEngine {
     /// Returns an error for directory contention, log corruption, invalid committed
     /// mutations, a divergent index checkpoint, or filesystem failures.
     pub fn open(path: impl AsRef<Path>) -> Result<OpenedStorage, StorageError> {
-        let directory = DataDirectory::open(path)?;
+        Self::open_with_limits(path, StorageLimits::compatibility())
+    }
+
+    /// Opens and fully recovers a data directory under finite shared limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, directory contention, corruption,
+    /// exhausted recovery work/bytes, timeout, divergence, or I/O failure.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+    ) -> Result<OpenedStorage, StorageError> {
+        limits.validate()?;
+        let deadline = OperationDeadline::new(limits.recovery.timeout);
+        let directory =
+            DataDirectory::open_with_limits_and_deadline(path, &limits.recovery, &deadline)?;
         let index_path = directory.path().join("indexes").join("primary.redb");
-        ensure_snapshot_base(&directory, &index_path)?;
+        ensure_snapshot_base(&directory, &index_path, &limits.recovery, &deadline)?;
         let (base_sequence, base_digest) = directory.log_anchor();
-        let (log, log_recovery) = DurableLog::open_file_at_version(
+        let (log, log_recovery) = DurableLog::open_file_at_version_with_limits(
             directory.active_log_path(),
             base_sequence,
             base_digest,
             directory.disk_format_version(),
+            &limits.recovery,
+            &deadline,
         )?;
         let index = MaterializedIndex::open(index_path)?;
-        let replayed_transactions = index.replay(&log_recovery)?;
-        let _cleanup_complete = directory.cleanup_retired_logs();
+        let replayed_transactions =
+            index.replay_with_limits(&log_recovery, &limits.recovery, &deadline)?;
+        let _cleanup_complete =
+            directory.cleanup_retired_logs_with_limits(&limits.recovery, &deadline);
+        deadline.check()?;
         let storage = Self {
             log,
             index,
             index_stale: false,
             directory,
+            limits,
         };
         Ok(OpenedStorage {
             storage,
@@ -228,19 +293,6 @@ impl StorageEngine {
             return Err(StorageError::StaleIndex);
         }
         self.index.validate_mutations(mutations)?;
-        if mutations.iter().any(|mutation| {
-            matches!(
-                mutation,
-                Mutation::DefineVectorSpace { .. }
-                    | Mutation::UpsertVector { .. }
-                    | Mutation::DeleteVector { .. }
-                    | Mutation::DefineLexicalIndex { .. }
-            )
-        }) {
-            self.directory.promote_format()?;
-            self.log
-                .set_disk_format_version(self.directory.disk_format_version())?;
-        }
         let operations = mutations
             .iter()
             .map(Mutation::encode)
@@ -254,6 +306,25 @@ impl StorageEngine {
             } else {
                 Err(LogError::IdempotencyConflict { transaction_id }.into())
             };
+        }
+        let lexical_deadline = OperationDeadline::new(self.limits.recovery.timeout);
+        self.index.preflight_lexical_mutations(
+            mutations,
+            &self.limits.recovery,
+            &lexical_deadline,
+        )?;
+        if mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::DefineVectorSpace { .. }
+                    | Mutation::UpsertVector { .. }
+                    | Mutation::DeleteVector { .. }
+                    | Mutation::DefineLexicalIndex { .. }
+            )
+        }) {
+            self.directory.promote_format()?;
+            self.log
+                .set_disk_format_version(self.directory.disk_format_version())?;
         }
         let outcome = match self.log.append_transaction(transaction_id, &operations) {
             Ok(outcome) => outcome,
@@ -272,7 +343,10 @@ impl StorageEngine {
             receipt,
             operations,
         };
-        if let Err(source) = self.index.apply(&transaction) {
+        if let Err(source) =
+            self.index
+                .apply_with_limits(&transaction, &self.limits.recovery, &lexical_deadline)
+        {
             self.index_stale = true;
             return Err(StorageError::CommittedButNotIndexed {
                 receipt,
@@ -367,6 +441,33 @@ impl StorageEngine {
         Ok(self.index.scan_vectors(name, max_candidates, max_bytes)?)
     }
 
+    /// Reads one vector space under count, decoded-byte, and wall-clock bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale handle, malformed state, exhausted
+    /// count/byte budget, or elapsed exact-retrieval deadline. No partial list
+    /// is returned.
+    pub fn vector_entries_with_timeout(
+        &self,
+        name: &VectorSpaceName,
+        max_candidates: u64,
+        max_bytes: u64,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<VectorEntry>, VectorEntriesError> {
+        if self.index_stale {
+            return Err(StorageError::StaleIndex.into());
+        }
+        match self
+            .index
+            .scan_vectors_with_timeout(name, max_candidates, max_bytes, timeout)
+        {
+            Ok(entries) => Ok(entries),
+            Err(VectorScanError::Index(source)) => Err(source.into()),
+            Err(VectorScanError::ExactRetrieval(source)) => Err(source.into()),
+        }
+    }
+
     /// Scans one bounded page in strict binary-key order.
     ///
     /// `after` is exclusive. A returned `next_after` is present only when at
@@ -377,21 +478,53 @@ impl StorageEngine {
     /// Returns an error for a stale handle, invalid cursor key, invalid page
     /// size, or materialized-index failure.
     pub fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> Result<KvPage, StorageError> {
+        match self.scan_page_with_byte_limit(after, limit, u64::MAX) {
+            Ok(page) => Ok(page),
+            Err(ScanPageError::Storage(source)) => Err(source),
+            Err(ScanPageError::ByteBudgetExceeded { .. }) => {
+                unreachable!("an in-memory page cannot exceed the u64 byte limit")
+            }
+        }
+    }
+
+    /// Scans one ordered page under an aggregate key/value byte budget.
+    ///
+    /// The byte limit is checked inside the materialized-index iterator before
+    /// a key or value is cloned into the returned page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale handle, invalid cursor or page size,
+    /// exhausted byte budget, or materialized-index failure.
+    pub fn scan_page_with_byte_limit(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<KvPage, ScanPageError> {
         if self.index_stale {
-            return Err(StorageError::StaleIndex);
+            return Err(StorageError::StaleIndex.into());
         }
         if let Some(key) = after {
-            validate_key(key)?;
+            validate_key(key).map_err(StorageError::from)?;
         }
         if limit == 0 || limit > MAX_SCAN_PAGE_ENTRIES {
             return Err(StorageError::InvalidScanLimit {
                 requested: limit,
                 maximum: MAX_SCAN_PAGE_ENTRIES,
-            });
+            }
+            .into());
         }
-        let mut raw = self.index.scan_after(after, limit.saturating_add(1))?;
-        let has_more = raw.len() > limit;
-        raw.truncate(limit);
+        let (raw, has_more) = match self
+            .index
+            .scan_after_with_byte_limit(after, limit, max_bytes)
+        {
+            Err(KvScanError::ByteBudgetExceeded { maximum }) => {
+                return Err(ScanPageError::ByteBudgetExceeded { maximum });
+            }
+            Err(KvScanError::Index(source)) => return Err(StorageError::from(source).into()),
+            Ok(raw) => raw,
+        };
         let next_after = has_more
             .then(|| raw.last().map(|(key, _)| key.clone()))
             .flatten();
@@ -416,16 +549,54 @@ impl StorageEngine {
     /// Returns an error when the live index is stale, cannot be streamed, or the
     /// snapshot cannot be synchronized, verified, and atomically promoted.
     pub fn snapshot(&self) -> Result<SnapshotInfo, StorageError> {
+        let limits = self.limits.maintenance.clone();
+        self.snapshot_with_limits(&limits)
+    }
+
+    /// Creates or reuses a verified snapshot under explicit finite limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, stale state, exhausted records or
+    /// bytes, timeout, verification failure, or I/O failure.
+    pub fn snapshot_with_limits(
+        &self,
+        limits: &MaintenanceLimits,
+    ) -> Result<SnapshotInfo, StorageError> {
+        limits.validate()?;
+        let deadline = OperationDeadline::new(limits.timeout);
+        self.snapshot_with_deadline(limits, &deadline)
+    }
+
+    fn snapshot_with_deadline(
+        &self,
+        limits: &MaintenanceLimits,
+        deadline: &OperationDeadline,
+    ) -> Result<SnapshotInfo, StorageError> {
         if self.index_stale {
             return Err(StorageError::StaleIndex);
         }
         let snapshots = self.directory.path().join("snapshots");
         let temporary = self.directory.path().join("tmp");
+        let checkpoint = self.index.checkpoint()?;
+        let snapshot_target = self.directory.snapshot_path(checkpoint.sequence);
+        let snapshot_is_new = self.directory.reserve_target_entry(
+            "snapshots",
+            &snapshot_target,
+            &self.limits.recovery,
+            deadline,
+        )?;
+        if snapshot_is_new {
+            self.directory
+                .reserve_directory_entries("tmp", 1, &self.limits.recovery, deadline)?;
+        }
         Ok(create_snapshot(
             &self.index,
             &snapshots,
             &temporary,
             self.directory.disk_format_version(),
+            &limits.snapshot,
+            deadline,
         )?)
     }
 
@@ -440,20 +611,72 @@ impl StorageEngine {
     /// Returns an error while preparing the snapshot, segment, or manifest. A
     /// poisoned or stale handle must be reopened before compaction.
     pub fn compact(&mut self) -> Result<CompactionOutcome, StorageError> {
+        let limits = self.limits.maintenance.clone();
+        self.compact_with_limits(&limits)
+    }
+
+    /// Compacts the active generation under one shared finite deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before the manifest commit for invalid limits, stale
+    /// state, exhausted snapshot policy, timeout, corruption, or I/O failure.
+    pub fn compact_with_limits(
+        &mut self,
+        limits: &MaintenanceLimits,
+    ) -> Result<CompactionOutcome, StorageError> {
+        limits.validate()?;
+        let deadline = OperationDeadline::new(limits.timeout);
         if self.index_stale {
             return Err(StorageError::StaleIndex);
         }
-        let snapshot = self.snapshot()?;
+        let effective_limits = MaintenanceLimits {
+            timeout: limits.timeout,
+            snapshot: intersect_snapshot_limits(&limits.snapshot, &self.limits.recovery.snapshot),
+        };
         let current = self.directory.manifest();
-        if snapshot.checkpoint_sequence == 0
-            || snapshot.checkpoint_sequence == current.base_sequence
-        {
+        let checkpoint = self.index.checkpoint()?;
+        if checkpoint.sequence == 0 || checkpoint.sequence == current.base_sequence {
+            let snapshot = self.snapshot_with_deadline(&effective_limits, &deadline)?;
             return Ok(CompactionOutcome::NoChanges { snapshot });
         }
         let generation = current
             .generation
             .checked_add(1)
             .ok_or(StorageError::ManifestGenerationExhausted)?;
+        let prospective_manifest = StorageManifest {
+            generation,
+            active_segment: generation,
+            base_sequence: checkpoint.sequence,
+            base_digest: checkpoint.digest.unwrap_or([0; 32]),
+            snapshot_digest: [0; 32],
+        };
+        let snapshot_target = self.directory.snapshot_path(checkpoint.sequence);
+        let snapshot_is_new = self.directory.reserve_target_entry(
+            "snapshots",
+            &snapshot_target,
+            &self.limits.recovery,
+            &deadline,
+        )?;
+        let next_segment = self.directory.log_path(generation);
+        self.directory.reserve_target_entry(
+            "log",
+            &next_segment,
+            &self.limits.recovery,
+            &deadline,
+        )?;
+        let manifest_target = prospective_manifest.path(self.directory.path());
+        let manifest_is_new = self.directory.reserve_target_entry(
+            "manifest",
+            &manifest_target,
+            &self.limits.recovery,
+            &deadline,
+        )?;
+        if snapshot_is_new || manifest_is_new {
+            self.directory
+                .reserve_directory_entries("tmp", 1, &self.limits.recovery, &deadline)?;
+        }
+        let snapshot = self.snapshot_with_deadline(&effective_limits, &deadline)?;
         let Some(base_digest) = snapshot.checkpoint_digest else {
             return Err(SnapshotError::Invalid {
                 reason: "compaction snapshot lacks a checkpoint digest",
@@ -467,19 +690,27 @@ impl StorageEngine {
             base_digest,
             snapshot_digest: snapshot.snapshot_digest,
         };
-        let next_segment = self.directory.log_path(generation);
-        let (next_log, prepared) = DurableLog::open_file_at_version(
+        let (next_log, prepared) = DurableLog::open_file_at_version_with_limits(
             &next_segment,
             next.base_sequence,
             next.base_digest,
             self.directory.disk_format_version(),
+            &self.limits.recovery,
+            &deadline,
         )?;
         if prepared.valid_bytes != 0 {
             return Err(StorageError::PreparedSegmentNotEmpty { path: next_segment });
         }
 
         let retired_segment = self.directory.active_log_path();
-        self.directory.commit_manifest(next)?;
+        deadline.check()?;
+        if let Err(source) =
+            self.directory
+                .commit_manifest_with_limits(next, &self.limits.recovery, &deadline)
+        {
+            self.index_stale = true;
+            return Err(source.into());
+        }
         let retired_log = std::mem::replace(&mut self.log, next_log);
         drop(retired_log);
         let retired_segment_removed = remove_retired_segment(&retired_segment);
@@ -489,6 +720,17 @@ impl StorageEngine {
             retired_segment,
             retired_segment_removed,
         }))
+    }
+}
+
+fn intersect_snapshot_limits(
+    maintenance: &SnapshotReadLimits,
+    recovery: &SnapshotReadLimits,
+) -> SnapshotReadLimits {
+    SnapshotReadLimits {
+        file_bytes: maintenance.file_bytes.min(recovery.file_bytes),
+        entries: maintenance.entries.min(recovery.entries),
+        decoded_bytes: maintenance.decoded_bytes.min(recovery.decoded_bytes),
     }
 }
 
@@ -508,13 +750,19 @@ fn remove_retired_segment(path: &Path) -> bool {
     }
 }
 
-fn ensure_snapshot_base(directory: &DataDirectory, index_path: &Path) -> Result<(), StorageError> {
+fn ensure_snapshot_base(
+    directory: &DataDirectory,
+    index_path: &Path,
+    limits: &RecoveryLimits,
+    deadline: &OperationDeadline,
+) -> Result<(), StorageError> {
+    deadline.check()?;
     let manifest = directory.manifest();
     if manifest.base_sequence == 0 {
         return Ok(());
     }
     let snapshot_path = directory.snapshot_path(manifest.base_sequence);
-    let verified = verify_snapshot(&snapshot_path)?;
+    let verified = verify_snapshot_with_policy(&snapshot_path, &limits.snapshot, deadline)?;
     if verified.checkpoint_sequence != manifest.base_sequence
         || verified.checkpoint_digest != Some(manifest.base_digest)
         || verified.snapshot_digest != manifest.snapshot_digest
@@ -532,21 +780,53 @@ fn ensure_snapshot_base(directory: &DataDirectory, index_path: &Path) -> Result<
         .path()
         .join("tmp")
         .join(format!("index-restore-{}.redb.tmp", Uuid::now_v7()));
-    let restored = MaterializedIndex::restore_from_snapshot(&temporary_path, &snapshot_path)?;
+    let mut temporary_guard = TemporaryFileGuard::new(temporary_path.clone());
+    let restored = MaterializedIndex::restore_from_snapshot_with_limits(
+        &temporary_path,
+        &snapshot_path,
+        &limits.snapshot,
+        limits,
+        deadline,
+    )?;
     if restored != verified {
         return Err(SnapshotError::Invalid {
             reason: "snapshot changed while rebuilding the materialized index",
         }
         .into());
     }
+    deadline.check()?;
     std::fs::rename(&temporary_path, index_path)
         .map_err(SnapshotError::from)
         .map_err(StorageError::from)?;
+    temporary_guard.disarm();
     #[cfg(unix)]
     sync_directory(index_path.parent().ok_or(SnapshotError::Invalid {
         reason: "materialized index path has no parent",
     })?)?;
     Ok(())
+}
+
+struct TemporaryFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ignored = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -576,18 +856,46 @@ impl From<SnapshotError> for StorageError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         error::Error,
         fs::{self, OpenOptions},
         io::{Seek, SeekFrom, Write},
+        time::Duration,
     };
 
+    use hyphae_core::VectorSpaceName;
+    use hyphae_query::{FieldPath, Value, encode_document};
+    use hyphae_retrieval::{LexicalError, LexicalField, LexicalIndexDefinition};
     use uuid::Uuid;
 
-    use super::{CompactionOutcome, DurableLog, StorageEngine, StorageError, StorageManifest};
-    use crate::{
-        AppendOutcome, DataDirectory, Mutation, SnapshotError, SnapshotReadLimits,
-        index::MaterializedIndex, load_snapshot, test_support::TestDirectory, verify_snapshot,
+    use super::{
+        CompactionOutcome, DurableLog, ScanPageError, StorageEngine, StorageError, StorageManifest,
     };
+    use crate::{
+        AppendOutcome, DataDirectory, MaintenanceLimits, ManifestError, Mutation, SnapshotError,
+        SnapshotReadLimits, StorageLimitError, StorageLimits, index::MaterializedIndex,
+        load_snapshot, load_snapshot_with_timeout, storage_limit_from_io,
+        test_support::TestDirectory, verify_snapshot,
+    };
+
+    fn lexical_document(text: &str) -> Result<Vec<u8>, hyphae_query::DocumentError> {
+        encode_document(&Value::Object(BTreeMap::from([(
+            "body".to_owned(),
+            Value::String(text.to_owned()),
+        )])))
+    }
+
+    fn lexical_definition(
+        name: &str,
+    ) -> Result<LexicalIndexDefinition, Box<dyn std::error::Error>> {
+        Ok(LexicalIndexDefinition::new(
+            VectorSpaceName::new(name)?,
+            vec![LexicalField {
+                path: FieldPath::field("body"),
+                weight_micros: 1_000_000,
+            }],
+        )?)
+    }
 
     #[test]
     fn atomic_batches_persist_and_delete() -> Result<(), Box<dyn Error>> {
@@ -679,6 +987,14 @@ mod tests {
         assert_eq!(witness.entries[0].key, b"alpha");
         assert_eq!(witness.entries[0].value, b"first");
         assert!(matches!(
+            load_snapshot_with_timeout(
+                &created.path,
+                &SnapshotReadLimits::default(),
+                Duration::ZERO
+            ),
+            Err(source) if source.is_timeout()
+        ));
+        assert!(matches!(
             load_snapshot(
                 &created.path,
                 &SnapshotReadLimits {
@@ -703,6 +1019,29 @@ mod tests {
         corrupted.sync_all()?;
         drop(corrupted);
 
+        assert!(matches!(
+            load_snapshot(
+                &corrupted_path,
+                &SnapshotReadLimits {
+                    entries: 1,
+                    ..SnapshotReadLimits::default()
+                }
+            ),
+            Err(SnapshotError::EntryLimitExceeded {
+                actual: 2,
+                maximum: 1
+            })
+        ));
+        assert!(matches!(
+            load_snapshot(
+                &corrupted_path,
+                &SnapshotReadLimits {
+                    decoded_bytes: 0,
+                    ..SnapshotReadLimits::default()
+                }
+            ),
+            Err(SnapshotError::DecodedBytesLimitExceeded { maximum: 0 })
+        ));
         assert!(matches!(
             verify_snapshot(&corrupted_path),
             Err(SnapshotError::Invalid {
@@ -821,6 +1160,222 @@ mod tests {
     }
 
     #[test]
+    fn open_and_compaction_limits_fail_without_advancing_durable_state()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("bounded-open-compaction")?;
+        let root = temporary.path().join("data");
+        let mut opened = StorageEngine::open(&root)?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::put(b"a", b"one"), Mutation::put(b"b", b"two")],
+        )?;
+        let active_log = opened.storage.directory.active_log_path();
+        let log_bytes = fs::metadata(&active_log)?.len();
+        let generation = opened.storage.directory.manifest().generation;
+
+        let too_few_records = MaintenanceLimits {
+            snapshot: SnapshotReadLimits {
+                entries: 1,
+                ..SnapshotReadLimits::default()
+            },
+            ..MaintenanceLimits::default()
+        };
+        assert!(matches!(
+            opened.storage.compact_with_limits(&too_few_records),
+            Err(StorageError::Snapshot { source })
+                if matches!(
+                    source.as_ref(),
+                    SnapshotError::EntryLimitExceeded {
+                        actual: 2,
+                        maximum: 1
+                    }
+                )
+        ));
+        assert_eq!(opened.storage.directory.manifest().generation, generation);
+        assert!(active_log.is_file());
+        drop(opened);
+
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_log_file_bytes: log_bytes - 1,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        assert!(matches!(
+            StorageEngine::open_with_limits(&root, limits),
+            Err(StorageError::Log(crate::LogError::Io(source)))
+                if matches!(
+                    storage_limit_from_io(&source),
+                    Some(StorageLimitError::LogFileBytesExceeded { actual, maximum })
+                        if *actual == log_bytes && *maximum == log_bytes - 1
+                )
+        ));
+        assert_eq!(fs::metadata(&active_log)?.len(), log_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_snapshot_policy_is_reopenable_at_the_exact_recovery_limit()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("compaction-recovery-snapshot-intersection")?;
+
+        let exact_root = temporary.path().join("exact");
+        let exact_limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                snapshot: SnapshotReadLimits {
+                    entries: 2,
+                    ..SnapshotReadLimits::default()
+                },
+                ..crate::RecoveryLimits::default()
+            },
+            maintenance: MaintenanceLimits {
+                snapshot: SnapshotReadLimits {
+                    entries: 10,
+                    ..SnapshotReadLimits::default()
+                },
+                ..MaintenanceLimits::default()
+            },
+        };
+        let mut exact = StorageEngine::open_with_limits(&exact_root, exact_limits.clone())?;
+        exact.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::put(b"a", b"one"), Mutation::put(b"b", b"two")],
+        )?;
+        assert!(matches!(
+            exact.storage.compact()?,
+            CompactionOutcome::Compacted(_)
+        ));
+        drop(exact);
+        let reopened = StorageEngine::open_with_limits(&exact_root, exact_limits)?;
+        assert_eq!(reopened.storage.get(b"a")?, Some(b"one".to_vec()));
+        assert_eq!(reopened.storage.get(b"b")?, Some(b"two".to_vec()));
+        drop(reopened);
+
+        let rejected_root = temporary.path().join("exact-plus-one");
+        let rejected_limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                snapshot: SnapshotReadLimits {
+                    entries: 1,
+                    ..SnapshotReadLimits::default()
+                },
+                ..crate::RecoveryLimits::default()
+            },
+            maintenance: MaintenanceLimits {
+                snapshot: SnapshotReadLimits {
+                    entries: 2,
+                    ..SnapshotReadLimits::default()
+                },
+                ..MaintenanceLimits::default()
+            },
+        };
+        let mut rejected =
+            StorageEngine::open_with_limits(&rejected_root, rejected_limits.clone())?;
+        rejected.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::put(b"a", b"one"), Mutation::put(b"b", b"two")],
+        )?;
+        assert!(matches!(
+            rejected.storage.compact(),
+            Err(StorageError::Snapshot { source })
+                if matches!(
+                    source.as_ref(),
+                    SnapshotError::EntryLimitExceeded {
+                        actual: 2,
+                        maximum: 1
+                    }
+                )
+        ));
+        assert_eq!(rejected.storage.directory.manifest().generation, 1);
+        drop(rejected);
+        let reopened = StorageEngine::open_with_limits(&rejected_root, rejected_limits)?;
+        assert_eq!(reopened.storage.get(b"a")?, Some(b"one".to_vec()));
+        assert_eq!(reopened.storage.get(b"b")?, Some(b"two".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_reserves_directory_entries_before_creating_any_artifact()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("compaction-directory-reservation")?;
+        let root = temporary.path().join("data");
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_directory_entries: 1,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let mut opened = StorageEngine::open_with_limits(&root, limits.clone())?;
+        opened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"key", b"value")])?;
+
+        assert!(matches!(
+            opened.storage.compact(),
+            Err(StorageError::DataDirectory(
+                crate::DataDirectoryError::Manifest(ManifestError::Io(source))
+            ))
+                if matches!(
+                    storage_limit_from_io(&source),
+                    Some(StorageLimitError::DirectoryEntriesExceeded { maximum: 1 })
+                )
+        ));
+        assert_eq!(fs::read_dir(root.join("snapshots"))?.count(), 0);
+        assert_eq!(fs::read_dir(root.join("log"))?.count(), 1);
+        assert_eq!(fs::read_dir(root.join("manifest"))?.count(), 1);
+        assert_eq!(fs::read_dir(root.join("tmp"))?.count(), 0);
+        assert_eq!(opened.storage.directory.manifest().generation, 1);
+        drop(opened);
+
+        let reopened = StorageEngine::open_with_limits(&root, limits)?;
+        assert_eq!(reopened.storage.get(b"key")?, Some(b"value".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_compaction_targets_do_not_consume_another_directory_entry()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("compaction-existing-targets")?;
+        let root = temporary.path().join("data");
+        let mut opened = StorageEngine::open(&root)?;
+        opened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"key", b"value")])?;
+        let snapshot = opened.storage.snapshot()?;
+        let base_digest = snapshot
+            .checkpoint_digest
+            .ok_or("snapshot checkpoint digest is absent")?;
+        let (prepared, recovery) = DurableLog::open_file_at(
+            opened.storage.directory.log_path(2),
+            snapshot.checkpoint_sequence,
+            base_digest,
+        )?;
+        assert_eq!(recovery.valid_bytes, 0);
+        drop(prepared);
+        drop(opened);
+
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_directory_entries: 2,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let mut reopened = StorageEngine::open_with_limits(&root, limits.clone())?;
+        assert!(matches!(
+            reopened.storage.compact()?,
+            CompactionOutcome::Compacted(_)
+        ));
+        drop(reopened);
+
+        let reopened = StorageEngine::open_with_limits(&root, limits)?;
+        assert_eq!(reopened.storage.get(b"key")?, Some(b"value".to_vec()));
+        assert_eq!(reopened.storage.directory.manifest().generation, 2);
+        Ok(())
+    }
+
+    #[test]
     fn orphan_prepared_segment_is_ignored_until_manifest_commit() -> Result<(), Box<dyn Error>> {
         let temporary = TestDirectory::new("storage-compaction-orphan")?;
         let root = temporary.path().join("data");
@@ -923,6 +1478,57 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_manifest_commit_blocks_every_operation_until_reopen() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = TestDirectory::new("storage-injected-manifest-commit")?;
+        let root = temporary.path().join("data");
+        let mut opened = StorageEngine::open(&root)?;
+        opened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"durable", b"yes")])?;
+        opened
+            .storage
+            .directory
+            .inject_manifest_commit_failure_after_write();
+
+        assert!(matches!(
+            opened.storage.compact(),
+            Err(StorageError::DataDirectory(crate::DataDirectoryError::Io {
+                action: "complete injected manifest commit",
+                ..
+            }))
+        ));
+        assert!(matches!(
+            opened.storage.get(b"durable"),
+            Err(StorageError::StaleIndex)
+        ));
+        assert!(matches!(
+            opened
+                .storage
+                .write(Uuid::now_v7(), &[Mutation::put(b"blocked", b"yes")]),
+            Err(StorageError::StaleIndex)
+        ));
+        assert!(matches!(
+            opened.storage.snapshot(),
+            Err(StorageError::StaleIndex)
+        ));
+        assert!(matches!(
+            opened.storage.compact(),
+            Err(StorageError::StaleIndex)
+        ));
+        drop(opened);
+
+        let mut reopened = StorageEngine::open(&root)?;
+        assert_eq!(reopened.storage.directory.manifest().generation, 2);
+        assert_eq!(reopened.storage.get(b"durable")?, Some(b"yes".to_vec()));
+        reopened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"after", b"reopen")])?;
+        assert_eq!(reopened.storage.get(b"after")?, Some(b"reopen".to_vec()));
+        Ok(())
+    }
+
+    #[test]
     fn post_commit_index_failure_recovers_from_the_log() -> Result<(), Box<dyn Error>> {
         let temporary = TestDirectory::new("storage-injected-index")?;
         let root = temporary.path().join("data");
@@ -945,6 +1551,246 @@ mod tests {
         let reopened = StorageEngine::open(&root)?;
         assert_eq!(reopened.recovery.replayed_transactions, 1);
         assert_eq!(reopened.storage.get(b"durable")?, Some(b"yes".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_document_limit_rejects_exact_plus_one_before_append_and_rebuilds()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("storage-lexical-document-limit")?;
+        let root = temporary.path().join("data");
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_lexical_documents: 2,
+                max_lexical_tokens: 100,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let first = lexical_document("one")?;
+        let second = lexical_document("two")?;
+        let rejected = lexical_document("three")?;
+        let mut opened = StorageEngine::open_with_limits(&root, limits.clone())?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[
+                Mutation::put(b"first", first.clone()),
+                Mutation::put(b"second", second.clone()),
+            ],
+        )?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::define_lexical_index(lexical_definition(
+                "documents.limit",
+            )?)],
+        )?;
+
+        let active_log = opened.storage.directory.active_log_path();
+        let accepted_log_bytes = fs::metadata(&active_log)?.len();
+        let result = opened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"rejected", rejected)]);
+        assert!(matches!(
+            result,
+            Err(StorageError::Index { source })
+                if matches!(
+                    source.as_ref(),
+                    crate::MaterializedIndexError::Lexical(
+                        LexicalError::DocumentBudgetExceeded { maximum: 2 }
+                    )
+                )
+        ));
+        assert_eq!(opened.storage.get(b"rejected")?, None);
+        assert_eq!(opened.storage.get(b"first")?, Some(first));
+        assert_eq!(opened.storage.get(b"second")?, Some(second));
+        assert_eq!(fs::metadata(&active_log)?.len(), accepted_log_bytes);
+        drop(opened);
+
+        fs::remove_file(root.join("indexes/primary.redb"))?;
+        let rebuilt = StorageEngine::open_with_limits(&root, limits)?;
+        let rebuilt_definition = lexical_definition("documents.limit")?;
+        assert_eq!(rebuilt.storage.get(b"rejected")?, None);
+        assert_eq!(
+            rebuilt
+                .storage
+                .lexical_corpus(&rebuilt_definition, &[], 10, Duration::from_secs(1))?
+                .document_count,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_token_limit_rejects_exact_plus_one_before_append_and_rebuilds()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("storage-lexical-token-limit")?;
+        let root = temporary.path().join("data");
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_lexical_documents: 10,
+                max_lexical_tokens: 2,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let accepted = lexical_document("one two")?;
+        let rejected = lexical_document("one two three")?;
+        let mut opened = StorageEngine::open_with_limits(&root, limits.clone())?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::put(b"document", accepted.clone())],
+        )?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::define_lexical_index(lexical_definition(
+                "tokens.limit",
+            )?)],
+        )?;
+
+        let active_log = opened.storage.directory.active_log_path();
+        let accepted_log_bytes = fs::metadata(&active_log)?.len();
+        let result = opened
+            .storage
+            .write(Uuid::now_v7(), &[Mutation::put(b"document", rejected)]);
+        assert!(matches!(
+            result,
+            Err(StorageError::Index { source })
+                if matches!(
+                    source.as_ref(),
+                    crate::MaterializedIndexError::Lexical(
+                        LexicalError::TokenBudgetExceeded { maximum: 2 }
+                    )
+            )
+        ));
+        assert_eq!(opened.storage.get(b"document")?, Some(accepted.clone()));
+        assert_eq!(fs::metadata(&active_log)?.len(), accepted_log_bytes);
+        drop(opened);
+
+        fs::remove_file(root.join("indexes/primary.redb"))?;
+        let rebuilt = StorageEngine::open_with_limits(&root, limits)?;
+        let rebuilt_definition = lexical_definition("tokens.limit")?;
+        assert_eq!(rebuilt.storage.get(b"document")?, Some(accepted));
+        assert_eq!(
+            rebuilt
+                .storage
+                .lexical_corpus(&rebuilt_definition, &[], 10, Duration::from_secs(1))?
+                .token_count,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_define_over_limit_is_read_only_before_append() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("storage-lexical-define-limit")?;
+        let root = temporary.path().join("data");
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_lexical_documents: 1,
+                max_lexical_tokens: 100,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let mut opened = StorageEngine::open_with_limits(&root, limits)?;
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[
+                Mutation::put(b"first", lexical_document("one")?),
+                Mutation::put(b"second", lexical_document("two")?),
+            ],
+        )?;
+
+        let active_log = opened.storage.directory.active_log_path();
+        let format_path = root.join("FORMAT");
+        let accepted_log_bytes = fs::metadata(&active_log)?.len();
+        let accepted_format = fs::read(&format_path)?;
+
+        let definition = lexical_definition("define.limit")?;
+        let result = opened.storage.write(
+            Uuid::now_v7(),
+            &[Mutation::define_lexical_index(definition.clone())],
+        );
+        assert!(matches!(
+            result,
+            Err(StorageError::Index { source })
+                if matches!(
+                    source.as_ref(),
+                    crate::MaterializedIndexError::Lexical(
+                        LexicalError::DocumentBudgetExceeded { maximum: 1 }
+                    )
+            )
+        ));
+        assert_eq!(opened.storage.lexical_index(&definition.name)?, None);
+        assert_eq!(fs::metadata(&active_log)?.len(), accepted_log_bytes);
+        assert_eq!(fs::read(&format_path)?, accepted_format);
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_preflight_simulates_ordered_batches_and_idempotent_retries()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("storage-lexical-ordered-preflight")?;
+        let root = temporary.path().join("put-before-define");
+        let limits = StorageLimits {
+            recovery: crate::RecoveryLimits {
+                max_lexical_documents: 1,
+                max_lexical_tokens: 2,
+                ..crate::RecoveryLimits::default()
+            },
+            ..StorageLimits::default()
+        };
+        let definition = lexical_definition("ordered.limit")?;
+        let first_transaction = Uuid::now_v7();
+        let first_batch = [
+            Mutation::put(b"first", lexical_document("one two")?),
+            Mutation::define_lexical_index(definition.clone()),
+        ];
+        let mut opened = StorageEngine::open_with_limits(&root, limits.clone())?;
+        let first_outcome = opened.storage.write(first_transaction, &first_batch)?;
+        assert!(matches!(first_outcome, AppendOutcome::Committed(_)));
+
+        opened.storage.write(
+            Uuid::now_v7(),
+            &[
+                Mutation::delete(b"first"),
+                Mutation::put(b"second", lexical_document("three")?),
+            ],
+        )?;
+        assert_eq!(opened.storage.get(b"first")?, None);
+        assert!(opened.storage.get(b"second")?.is_some());
+        assert!(matches!(
+            opened.storage.write(
+                Uuid::now_v7(),
+                &[
+                    Mutation::put(b"third", lexical_document("four")?),
+                    Mutation::delete(b"second"),
+                ],
+            ),
+            Err(StorageError::Index { source })
+                if matches!(
+                    source.as_ref(),
+                    crate::MaterializedIndexError::Lexical(
+                        LexicalError::DocumentBudgetExceeded { maximum: 1 }
+                    )
+                )
+        ));
+        assert!(matches!(
+            opened.storage.write(first_transaction, &first_batch)?,
+            AppendOutcome::Existing(_)
+        ));
+        drop(opened);
+
+        let define_first_root = temporary.path().join("define-before-put");
+        let mut define_first = StorageEngine::open_with_limits(&define_first_root, limits)?;
+        define_first.storage.write(
+            Uuid::now_v7(),
+            &[
+                Mutation::define_lexical_index(lexical_definition("ordered.second")?),
+                Mutation::put(b"document", lexical_document("one two")?),
+            ],
+        )?;
+        assert!(define_first.storage.get(b"document")?.is_some());
         Ok(())
     }
 
@@ -975,6 +1821,31 @@ mod tests {
         let second = opened.storage.scan_page(first.next_after.as_deref(), 2)?;
         assert_eq!(second.entries[0].key, b"c");
         assert_eq!(second.next_after, None);
+
+        let total_bytes = u64::try_from(
+            b"a".len() + b"one".len() + b"b".len() + b"two".len() + b"c".len() + b"three".len(),
+        )?;
+        assert_eq!(
+            opened
+                .storage
+                .scan_page_with_byte_limit(None, 3, total_bytes)?
+                .entries
+                .len(),
+            3
+        );
+        assert!(matches!(
+            opened
+                .storage
+                .scan_page_with_byte_limit(None, 3, total_bytes - 1),
+            Err(ScanPageError::ByteBudgetExceeded { maximum })
+                if maximum == total_bytes - 1
+        ));
+        let first_bytes = u64::try_from(b"a".len() + b"one".len())?;
+        let first_only = opened
+            .storage
+            .scan_page_with_byte_limit(None, 1, first_bytes)?;
+        assert_eq!(first_only.entries.len(), 1);
+        assert_eq!(first_only.next_after, Some(b"a".to_vec()));
         Ok(())
     }
 }

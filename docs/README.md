@@ -72,6 +72,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Development guide](development.md)
 - [0.1.0 release gate](gates/0.1.0.md)
 - [0.2.0 release gate](gates/0.2.0.md)
+- [0.2.1 release gate](gates/0.2.1.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),
@@ -99,6 +100,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0016: Retrieval proof format](adr/0016-retrieval-proof-format.md)
 - [ADR-0017: Provider-free lexical retrieval](adr/0017-provider-free-lexical-retrieval.md)
 - [ADR-0018: Deterministic hybrid retrieval](adr/0018-deterministic-hybrid-retrieval.md)
+- [ADR-0019: Finite resource policies](adr/0019-finite-resource-policies.md)
 
 ## Documentation contract
 

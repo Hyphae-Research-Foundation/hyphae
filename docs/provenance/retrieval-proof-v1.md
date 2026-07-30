@@ -69,6 +69,23 @@ The offline verifier:
 6. reexecutes the operation's reference semantics; and
 7. requires exact canonical outcome equality.
 
+The end-to-end cooperative deadline is reduced by proof parsing and then
+propagated through snapshot verification/loading and replay loops. File
+length, logical-count, decoded-byte, and candidate-byte policies are checked
+before or during the work they bound.
+
+The standalone exact, lexical, and hybrid proof readers accept only regular
+files. They preflight the opened-file length, read no more than the smaller
+caller/canonical proof limit plus one detection byte in bounded chunks, and
+reject a file whose observed length changes during the read. These decoders are
+byte bounded but have no timeout parameter; the complete verification methods
+run the same reads under their end-to-end deadline.
+
+Exact replay, including the exact branch of hybrid replay, first scans matching
+vectors to enforce candidate count, aggregate key/vector bytes, and deadline.
+Only after that preflight succeeds does it allocate and clone the candidate
+collection used by deterministic scoring.
+
 Any mismatch, unknown version, exhausted limit, timeout, truncation, or
 trailing byte is failure. No partially verified result is success.
 

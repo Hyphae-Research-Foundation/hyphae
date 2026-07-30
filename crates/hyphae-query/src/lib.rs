@@ -9,10 +9,11 @@ mod value;
 
 pub use document::{
     DocumentError, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_NODES, decode_document,
-    encode_document,
+    encode_document, encoded_document_len,
 };
 pub use engine::{
-    MonotonicClock, QueryError, SystemClock, execute, execute_with_clock, validate_query,
+    BoundedQueryError, DEFAULT_QUERY_SCAN_BYTES, MonotonicClock, QueryError, SystemClock, execute,
+    execute_with_byte_limit, execute_with_clock, execute_with_clock_and_byte_limit, validate_query,
 };
 pub use model::{
     AggregationPlan, AggregationResult, CompareOperator, Cursor, ExecutionLimits, Filter,

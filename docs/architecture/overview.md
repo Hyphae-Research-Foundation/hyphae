@@ -31,14 +31,26 @@ than replacing live state, so an interrupted migration or compaction has one
 unambiguous winner. See
 [`manifest-format-v1.md`](../storage/manifest-format-v1.md).
 
-Logical snapshots stream sorted KV state instead of copying redb internals.
-Each snapshot records the exact verified log checkpoint and has independent
-CRC32C and BLAKE3 validation. The normative layout is documented in
+Logical snapshots stream sorted authoritative state instead of copying redb
+internals. Format 1 contains KV records and receipts. Format 2 additionally
+contains vector-space definitions, vectors, and lexical-index definitions;
+every collection is canonically ordered and participates in the witness
+digest. Each snapshot records the exact verified log checkpoint and has
+independent CRC32C and BLAKE3 validation. The normative layout is documented in
 [`snapshot-format-v1.md`](../storage/snapshot-format-v1.md).
 
 Compaction commits snapshot plus next-segment selection through a new
 immutable manifest, and only then retires the old segment. The interruption
 matrix is defined in [`compaction-v1.md`](../storage/compaction-v1.md).
+
+The packaged CLI/server and explicit bounded embedded startup carry one finite
+`RecoveryLimits` deadline through directory validation, snapshot restore, log
+scan, index replay, and lexical rebuild. The live writer retains the same
+aggregate log and lexical ceilings and rejects work before durable append if
+it would make future recovery under that policy exceed them. Snapshot and
+compaction reuse a separate shared `MaintenanceLimits` policy; their explicit
+APIs allow embedded hosts to select lower or higher finite limits. Published
+embedded `open` methods retain their `0.2.0` compatibility policy.
 
 ## Layer rules
 

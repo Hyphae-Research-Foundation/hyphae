@@ -1,12 +1,14 @@
 # Phase 8 release-candidate gate
 
-Status: complete for the private, untagged `0.1.0` release candidate. Any
-source change invalidates closure until the complete hosted matrix passes on
-the new exact commit.
+Status: historical `0.1.0` release-candidate evidence record. The candidate
+was later tagged and published; any source change still invalidates closure
+until the complete hosted matrix passes on the new exact commit.
 
 ## Implemented evidence
 
-- portable, bounded, atomic backup and verified new-directory restore;
+- portable atomic backup and verified new-directory restore, with bounded
+  layout/manifest parsing; complete copy/verify/restore resource policy
+  remains an explicit operator boundary documented for later hardening;
 - `backup`, `backup-verify`, `restore`, and `doctor` in the single binary;
 - immutable disk-format-1 fixture that rebuilds its omitted index and
   preserves idempotency;
@@ -78,6 +80,9 @@ Local evidence was replayed on 2026-07-16:
   provenance, and attestations. Publication is skipped without an explicit
   matching tag.
 
-The repository remains private and no release tag was created during this
-gate. The live pull-request checks are the authoritative evidence for the
-exact candidate commit.
+At the time this gate was replayed, the repository was private and no release
+tag had been created. The annotated `v0.1.0` tag later peeled to
+`76b0cfdad90cf9e75d949a945c94a3badf0c6b59`, and the matching
+[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.1.0) was
+published. Those later outcomes do not replace the exact candidate evidence
+recorded by the live pull-request checks.

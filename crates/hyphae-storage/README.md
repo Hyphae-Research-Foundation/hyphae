@@ -9,13 +9,34 @@ Durable local storage primitives for [Hyphae](https://hyphae.dev): an
 append-only checksummed and digest-chained log, atomic/idempotent mutation,
 recovery, snapshots, compaction, backups, and verified restore.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-storage = "0.2.0"
+hyphae-storage = "0.2.1"
 ```
 
 Most applications should use `hyphae-engine`. Use this lower-level crate only
 when directly implementing the documented durable formats and ownership model.
+
+`StorageLimits::default()` defines a complete finite recovery policy: one
+shared 60-second cooperative deadline, 2 GiB active-log/snapshot files, 1 GiB
+decoded replay/snapshot payload, one million directory entries/frames/
+transactions/operations/lexical documents, and ten million lexical tokens.
+The packaged CLI and server select that policy. Embedded applications use
+`StorageEngine::open_with_limits`; its retained writer ceilings prevent
+accepted appends from making the segment unreopenable under the same policy.
+The published `StorageEngine::open` method retains its `0.2.0` compatibility
+behavior without the new finite ceilings. `snapshot_with_limits` and
+`compact_with_limits` accept explicit maintenance policy.
+
+Backup layout validation fails on the first noncanonical entry, and snapshot
+copy is fixed to the initial length of one opened regular source handle. Full
+backup verification and restore retain their `0.2.0` behavior without a shared
+end-to-end deadline; restore still composes legacy verification, reopen, and
+snapshot paths. Filesystem calls and `sync_all` are not preemptible, so callers
+that need an absolute elapsed-time ceiling must enforce it operationally.
 
 Apache-2.0. Source and security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

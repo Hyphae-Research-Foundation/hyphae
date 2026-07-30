@@ -82,7 +82,8 @@ example, limitations, and a link from [the documentation index](README.md).
 The documentation checker verifies local links, index coverage, JSON example
 syntax, and CLI command inventory against the built binary. The documentation
 example runner starts a private loopback server and executes the maintained
-put/get/query/aggregation/delete request files end to end.
+KV/query/aggregation, vector mutation, and exact/lexical/hybrid retrieval
+request files end to end.
 
 Do not describe roadmap candidates as current behavior. If code and docs
 disagree, correct both or state the limitation explicitly; do not weaken a

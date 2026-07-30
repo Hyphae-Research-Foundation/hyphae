@@ -9,13 +9,23 @@ Pure deterministic query types and reference execution for
 [Hyphae](https://hyphae.dev). It provides structured values, filters, global
 sorting, logical cursors, aggregations, and explicit execution budgets.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-query = "0.2.0"
+hyphae-query = "0.2.1"
 ```
 
-The executor has no database, network, embedding, or LLM dependency. Budget
-or timeout exhaustion returns an error rather than partial success.
+The executor has no database, network, embedding, or LLM dependency. The
+published `execute` and `execute_with_clock` entry points retain their `0.2.0`
+count-bounded behavior. Additive `execute_with_byte_limit` and
+`execute_with_clock_and_byte_limit` apply an explicit aggregate scanned-input
+budget and return `BoundedQueryError`; the standalone server passes the
+256 MiB `DEFAULT_QUERY_SCAN_BYTES` policy. Accounting includes every inspected
+binary key and its exact canonical document bytes, including nonmatches and
+records from every shard. Budget or timeout exhaustion returns an error rather
+than partial success.
 
 Apache-2.0. Source and security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

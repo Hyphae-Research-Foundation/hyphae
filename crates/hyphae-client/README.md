@@ -8,9 +8,12 @@
 Bounded asynchronous Rust client for the [Hyphae](https://hyphae.dev) `/v1`
 HTTP API.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-client = "0.2.0"
+hyphae-client = "0.2.1"
 ```
 
 The client consumes only public versioned contracts and never opens or owns a

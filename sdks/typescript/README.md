@@ -2,7 +2,9 @@
 
 `@celiums/hyphae` is the bounded ESM client for API v1. It requires Node.js 20
 or newer, uses the runtime `fetch`, and has no runtime package dependencies.
-The `0.2.0` candidate is not published until release authorization.
+The source package version is `0.2.1`. It is maintained in this repository;
+this guide does not claim npm publication without a separate registry release
+and receipt.
 
 ## Build from this repository
 
@@ -35,7 +37,11 @@ console.log(receipt.value.status, response.requestId, witness.value.byteLength);
 ```
 
 Methods are `capabilities`, `liveness`, `readiness`, `put`, `delete`, `get`,
-`query`, and `downloadWitness`. Every result is `{ value, requestId }`.
+`query`, `defineVectorSpace`, `putVectors`, `deleteVectors`, `retrieveExact`,
+`defineLexicalIndex`, `retrieveLexical`, `retrieveHybrid`, `downloadWitness`,
+and `downloadRetrievalWitness`. Every result is `{ value, requestId }`.
+Generated success models provide static typing; the client does not validate
+each successful response shape at runtime.
 
 ## Exact integers
 
@@ -62,6 +68,14 @@ The client accepts only a root HTTP(S) origin without embedded credentials,
 path, query, or fragment. Witness download requires the canonical proof path,
 `Digest: blake3=...`, and exact declared length. A custom `fetch` can be
 injected for an audited runtime or tests.
+
+One monotonic deadline starts before request serialization and governs
+`fetch`, response headers, success/error bodies, and witness bodies. Redirect
+following is disabled. The client races an injected `fetch` and every body read
+against its own deadline, so a transport that ignores `AbortSignal` cannot make
+the client accept a late result. Such a transport can still continue external
+work after rejection if its own implementation ignores cancellation; that work
+is outside the SDK's control.
 
 See [public client semantics](../../docs/clients/v1.md),
 [data model](../../docs/concepts/data-model.md), and

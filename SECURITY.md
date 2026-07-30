@@ -12,7 +12,9 @@ impact, and any proposed mitigation.
 
 | Version | Supported |
 |---|---|
-| `0.1.x` | Yes |
+| `0.2.0` | Yes |
+| `0.1.0` | Yes |
+| `0.2.1` source candidate | Not released |
 | `< 0.1.0` | No |
 
 ## Baseline security guarantees
@@ -21,8 +23,14 @@ impact, and any proposed mitigation.
 - Remote binding requires explicit configuration and authentication.
 - Inputs have body, depth, batch, result, timeout, and concurrency limits.
 - Corrupt or future on-disk formats fail closed.
-- Result proofs are verifiable offline.
+- Result and retrieval proofs are verifiable offline under explicit resource
+  limits.
 - External providers are optional and cannot enter the core dependency path.
 
-These guarantees are validated release gates for `0.1.0`. Any source change
-requires the complete gate matrix to pass again on the new exact commit.
+These guarantees are release requirements. The historical `0.2.0` gate
+records complete local evidence, but this repository does not retain enough
+commit-bound hosted receipts to close its two hosted items. The published tag,
+GitHub release, and registry entries do not substitute for that missing
+evidence. Any source change, including the `0.2.1` candidate, requires the
+complete gate matrix to pass again on one exact commit before it becomes a
+supported release.

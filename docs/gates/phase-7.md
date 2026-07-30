@@ -27,8 +27,8 @@ cargo build -p hyphae-cli --locked
 python tools/run_integration_conformance.py
 ```
 
-The host-only suite produces static production builds with Astro 7.0.9, Next
-16.2.10, and Vite 8.1.4. Its isolated lockfile contains no Hyphae SDK or
+The host-only suite produces static production builds with Astro 7.1.3, Next
+16.2.12, and Vite 8.1.4. Its isolated lockfile contains no Hyphae SDK or
 adapter. The live suite then validates all three JavaScript adapters against a
 fresh loopback `/v1` server and data directory.
 

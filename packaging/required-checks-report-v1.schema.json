@@ -1,0 +1,609 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/schemas/required-checks-report-v1.json",
+  "title": "HyphaeRequiredChecksReportV1",
+  "description": "Canonical successful GitHub Actions pull-request check runs bound to one merged Hyphae release candidate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "repository",
+    "head_sha",
+    "pull_request",
+    "checks"
+  ],
+  "$defs": {
+    "integration_guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "number",
+        "status",
+        "conclusion"
+      ],
+      "properties": {
+        "name": {
+          "const": "Verify the pull-request integration tree"
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "completed"
+        },
+        "conclusion": {
+          "const": "success"
+        }
+      }
+    },
+    "pull_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "head_ref",
+        "head_sha",
+        "base_ref",
+        "base_sha",
+        "merge_commit_sha",
+        "merged_at",
+        "base_ref_history"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "head_ref": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z._/-]+$"
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "base_ref": {
+          "const": "main"
+        },
+        "base_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "merge_commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "merged_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "base_ref_history": {
+          "const": "unchanged"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "check_run_id",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "workflow_path",
+        "workflow_event",
+        "check_run_url",
+        "app_id",
+        "app_slug",
+        "head_sha",
+        "head_branch",
+        "status",
+        "conclusion",
+        "started_at",
+        "completed_at",
+        "integration_guard"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "Assemble and verify release candidate",
+            "Bounded parser fuzzing",
+            "Dependency and license policy",
+            "Load and kill/restart soak",
+            "Optional framework integrations",
+            "Package aarch64-apple-darwin",
+            "Package x86_64-apple-darwin",
+            "Package x86_64-pc-windows-msvc",
+            "Package x86_64-unknown-linux-gnu",
+            "Public client conformance",
+            "Quality",
+            "Release readiness",
+            "Review dependency changes",
+            "Test (Linux MSRV)",
+            "Test (Linux stable)",
+            "Test (Windows stable)",
+            "Test (macOS stable)"
+          ]
+        },
+        "check_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "workflow_run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "workflow_path": {
+          "enum": [
+            ".github/workflows/ci.yml",
+            ".github/workflows/dependency-review.yml",
+            ".github/workflows/fuzz.yml",
+            ".github/workflows/release.yml",
+            ".github/workflows/security.yml",
+            ".github/workflows/stress.yml"
+          ]
+        },
+        "workflow_event": {
+          "const": "pull_request"
+        },
+        "check_run_url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/celiumsai/hyphae/actions/runs/[1-9][0-9]*/job/[1-9][0-9]*$"
+        },
+        "app_id": {
+          "const": 15368
+        },
+        "app_slug": {
+          "const": "github-actions"
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "head_branch": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z._/-]+$"
+        },
+        "status": {
+          "const": "completed"
+        },
+        "conclusion": {
+          "const": "success"
+        },
+        "started_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "completed_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "integration_guard": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/integration_guard"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "Assemble and verify release candidate",
+                  "Bounded parser fuzzing",
+                  "Dependency and license policy",
+                  "Load and kill/restart soak",
+                  "Quality",
+                  "Review dependency changes"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "integration_guard": {
+                "$ref": "#/$defs/integration_guard"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "integration_guard": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "Assemble and verify release candidate",
+                  "Package aarch64-apple-darwin",
+                  "Package x86_64-apple-darwin",
+                  "Package x86_64-pc-windows-msvc",
+                  "Package x86_64-unknown-linux-gnu"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/release.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "Optional framework integrations",
+                  "Public client conformance",
+                  "Quality",
+                  "Release readiness",
+                  "Test (Linux MSRV)",
+                  "Test (Linux stable)",
+                  "Test (Windows stable)",
+                  "Test (macOS stable)"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/ci.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "Review dependency changes"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/dependency-review.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "Bounded parser fuzzing"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/fuzz.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "Dependency and license policy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/security.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "Load and kill/restart soak"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/stress.yml"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "schema": {
+      "const": "required-checks-report-v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "repository": {
+      "const": "celiumsai/hyphae"
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "pull_request": {
+      "$ref": "#/$defs/pull_request"
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 17,
+      "maxItems": 17,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Assemble and verify release candidate"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Bounded parser fuzzing"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Dependency and license policy"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Load and kill/restart soak"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Optional framework integrations"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Package aarch64-apple-darwin"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Package x86_64-apple-darwin"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Package x86_64-pc-windows-msvc"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Package x86_64-unknown-linux-gnu"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Public client conformance"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Quality"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Release readiness"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Review dependency changes"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Test (Linux MSRV)"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Test (Linux stable)"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Test (Windows stable)"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Test (macOS stable)"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    }
+  }
+}

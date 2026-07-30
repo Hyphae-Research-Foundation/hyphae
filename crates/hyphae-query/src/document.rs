@@ -99,6 +99,24 @@ pub fn encode_document(value: &Value) -> Result<Vec<u8>, DocumentError> {
     encode_envelope(&encoder.payload)
 }
 
+/// Returns the exact canonical envelope length without allocating the encoded
+/// document.
+///
+/// # Errors
+///
+/// Returns the same depth, node, payload, or arithmetic-limit errors as
+/// [`encode_document`].
+pub fn encoded_document_len(value: &Value) -> Result<usize, DocumentError> {
+    let mut measurer = DocumentMeasurer {
+        payload_bytes: 0,
+        nodes: 0,
+    };
+    measurer.value(value, 0)?;
+    HEADER_LENGTH
+        .checked_add(measurer.payload_bytes)
+        .ok_or(DocumentError::LengthOverflow)
+}
+
 /// Verifies and decodes one canonical binary document.
 ///
 /// # Errors
@@ -265,6 +283,90 @@ impl Encoder {
     }
 }
 
+struct DocumentMeasurer {
+    payload_bytes: usize,
+    nodes: usize,
+}
+
+impl DocumentMeasurer {
+    fn value(&mut self, value: &Value, depth: usize) -> Result<(), DocumentError> {
+        if depth > MAX_DOCUMENT_DEPTH {
+            return Err(DocumentError::TooDeep {
+                maximum: MAX_DOCUMENT_DEPTH,
+            });
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or(DocumentError::TooManyNodes {
+                maximum: MAX_DOCUMENT_NODES,
+            })?;
+        if self.nodes > MAX_DOCUMENT_NODES {
+            return Err(DocumentError::TooManyNodes {
+                maximum: MAX_DOCUMENT_NODES,
+            });
+        }
+        match value {
+            Value::Null | Value::Boolean(_) => self.append(1),
+            Value::Integer(_) => {
+                self.append(1)?;
+                self.append(8)
+            }
+            Value::String(value) => {
+                self.append(1)?;
+                self.length_prefixed(value.len())
+            }
+            Value::Bytes(value) => {
+                self.append(1)?;
+                self.length_prefixed(value.len())
+            }
+            Value::Array(values) => {
+                self.append(1)?;
+                self.append(8)?;
+                let child_depth = depth.checked_add(1).ok_or(DocumentError::TooDeep {
+                    maximum: MAX_DOCUMENT_DEPTH,
+                })?;
+                for value in values {
+                    self.value(value, child_depth)?;
+                }
+                Ok(())
+            }
+            Value::Object(values) => {
+                self.append(1)?;
+                self.append(8)?;
+                let child_depth = depth.checked_add(1).ok_or(DocumentError::TooDeep {
+                    maximum: MAX_DOCUMENT_DEPTH,
+                })?;
+                for (key, value) in values {
+                    self.length_prefixed(key.len())?;
+                    self.value(value, child_depth)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn length_prefixed(&mut self, length: usize) -> Result<(), DocumentError> {
+        self.append(8)?;
+        self.append(length)
+    }
+
+    fn append(&mut self, bytes: usize) -> Result<(), DocumentError> {
+        let next = self
+            .payload_bytes
+            .checked_add(bytes)
+            .ok_or(DocumentError::LengthOverflow)?;
+        if next > MAX_DOCUMENT_BYTES {
+            return Err(DocumentError::TooLarge {
+                actual: next,
+                maximum: MAX_DOCUMENT_BYTES,
+            });
+        }
+        self.payload_bytes = next;
+        Ok(())
+    }
+}
+
 struct Decoder<'payload> {
     payload: &'payload [u8],
     position: usize,
@@ -423,7 +525,7 @@ mod tests {
 
     use super::{
         DOCUMENT_FORMAT_VERSION, DocumentError, MAX_DOCUMENT_DEPTH, NULL, OBJECT, decode_document,
-        encode_document, encode_envelope,
+        encode_document, encode_envelope, encoded_document_len,
     };
 
     #[test]
@@ -437,6 +539,7 @@ mod tests {
         ]));
         let first = encode_document(&value)?;
         let second = encode_document(&value)?;
+        assert_eq!(encoded_document_len(&value)?, first.len());
         assert_eq!(first, second);
         assert_eq!(decode_document(&first)?, value);
         Ok(())

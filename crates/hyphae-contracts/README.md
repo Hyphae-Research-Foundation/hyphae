@@ -8,9 +8,12 @@
 Versioned Rust models and embedded OpenAPI 3.1 / JSON Schema 2020-12 contracts
 for the [Hyphae](https://hyphae.dev) `/v1` API.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-contracts = "0.2.0"
+hyphae-contracts = "0.2.1"
 ```
 
 Use this crate when implementing a client, server adapter, or conformance tool

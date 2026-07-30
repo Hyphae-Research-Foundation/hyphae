@@ -7,11 +7,12 @@ mod facade;
 pub mod proof;
 pub mod retrieval_proof;
 
-pub use facade::{EngineError, HyphaeEngine, OpenedEngine};
+pub use facade::{BoundedEngineQueryError, EngineError, HyphaeEngine, OpenedEngine};
 pub use hyphae_query::{
     DocumentError, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_NODES, decode_document,
     encode_document,
 };
+pub use hyphae_storage::{MaintenanceLimits, RecoveryLimits, StorageLimitError, StorageLimits};
 pub use proof::{
     MAX_RESULT_PROOF_BYTES, ProofAnchor, ProofError, ProvenOperation, ProvenResult,
     RESULT_PROOF_FORMAT_VERSION, ResultProof, ResultProofArtifact, VerificationLimits,

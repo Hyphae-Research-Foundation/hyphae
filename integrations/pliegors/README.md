@@ -8,9 +8,12 @@
 Optional public-contract adapter between PliegoRS applications and the
 [Hyphae](https://hyphae.dev) `/v1` API.
 
+The registry coordinate below is valid only after crates.io lists version
+`0.2.1`:
+
 ```toml
 [dependencies]
-hyphae-pliegors = "0.2.0"
+hyphae-pliegors = "0.2.1"
 ```
 
 The crate depends on `hyphae-client`, not PliegoRS internals or Hyphae storage.

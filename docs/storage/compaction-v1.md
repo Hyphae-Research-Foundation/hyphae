@@ -23,6 +23,13 @@ or digest chain. It depends on three durable records:
    supported. Cleanup failure does not roll back the committed generation and
    is retried after a fully verified reopen.
 
+Snapshot creation, prepared-segment verification, and the precommit manifest
+check spend one shared `MaintenanceLimits` deadline. A limit/timeout before
+step 5 leaves the prior manifest authoritative; temporary snapshot and
+restored-index files are removed. Once step 5 succeeds, cleanup is
+best-effort and a later elapsed deadline cannot relabel the committed
+generation as failed.
+
 ## Interruption semantics
 
 | Last durable boundary | Recovery decision |

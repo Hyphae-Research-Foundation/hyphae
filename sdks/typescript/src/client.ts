@@ -29,6 +29,77 @@ import { parseHyphaeJson, stringifyHyphaeJson } from "./json.js";
 const DEFAULT_RESPONSE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_WITNESS_BYTES = 512 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const MAX_TIMER_SLICE_MS = 2_147_483_647;
+
+class Deadline {
+  readonly #expiresAt: number;
+  readonly #controller = new AbortController();
+  #timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(timeoutMs: number) {
+    this.#expiresAt = performance.now() + timeoutMs;
+    this.#schedule();
+  }
+
+  get signal(): AbortSignal {
+    return this.#controller.signal;
+  }
+
+  elapsed(): boolean {
+    return this.#controller.signal.aborted || performance.now() >= this.#expiresAt;
+  }
+
+  throwIfElapsed(): void {
+    if (this.elapsed()) {
+      this.#expire();
+      throw deadlineError();
+    }
+  }
+
+  async race<T>(operation: PromiseLike<T>): Promise<T> {
+    this.throwIfElapsed();
+    let rejectDeadline: (() => void) | undefined;
+    const expiration = new Promise<never>((_resolve, reject) => {
+      rejectDeadline = () => reject(deadlineError());
+      this.#controller.signal.addEventListener("abort", rejectDeadline, { once: true });
+    });
+    try {
+      const result = await Promise.race([Promise.resolve(operation), expiration]);
+      this.throwIfElapsed();
+      return result;
+    } finally {
+      if (rejectDeadline !== undefined) {
+        this.#controller.signal.removeEventListener("abort", rejectDeadline);
+      }
+    }
+  }
+
+  close(): void {
+    if (this.#timer !== undefined) {
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
+    }
+    this.#expire();
+  }
+
+  #expire(): void {
+    if (!this.#controller.signal.aborted) {
+      this.#controller.abort();
+    }
+  }
+
+  #schedule(): void {
+    const remaining = this.#expiresAt - performance.now();
+    if (remaining <= 0) {
+      this.#expire();
+      return;
+    }
+    this.#timer = setTimeout(
+      () => this.#schedule(),
+      Math.min(Math.ceil(remaining), MAX_TIMER_SLICE_MS),
+    );
+  }
+}
 
 export interface HyphaeClientOptions {
   readonly bearerToken?: string;
@@ -181,71 +252,97 @@ export class HyphaeClient {
   async #downloadWitness(
     proof: ProofV1 | RetrievalProofV1,
   ): Promise<ApiResponse<Uint8Array>> {
-    const expectedPath = `/v1/witnesses/${proof.checkpoint_sequence}/${proof.snapshot_digest}`;
-    if (proof.witness.path !== expectedPath) {
-      throw new HyphaeClientError("proof contains a noncanonical witness reference");
+    const deadline = new Deadline(this.#timeoutMs);
+    let response: Response | undefined;
+    try {
+      const expectedPath = `/v1/witnesses/${proof.checkpoint_sequence}/${proof.snapshot_digest}`;
+      if (proof.witness.path !== expectedPath) {
+        throw new HyphaeClientError("proof contains a noncanonical witness reference");
+      }
+      const expectedBytes = typeof proof.witness.file_bytes === "bigint"
+        ? proof.witness.file_bytes
+        : BigInt(proof.witness.file_bytes);
+      if (expectedBytes < 0n || expectedBytes > BigInt(this.#witnessBytes)) {
+        throw new HyphaeClientError(
+          `Hyphae response exceeded local limit ${this.#witnessBytes} bytes`,
+        );
+      }
+      deadline.throwIfElapsed();
+      response = await this.#request(expectedPath.slice(1), true, deadline);
+      if (!response.ok) {
+        throw await this.#apiError(response, deadline);
+      }
+      if (response.status !== 200) {
+        throw new HyphaeClientError(`Hyphae returned unexpected success status ${response.status}`);
+      }
+      const requestId = singleHeader(response.headers, "x-request-id");
+      if (requestId === undefined) {
+        throw new HyphaeClientError("Hyphae response has no single valid X-Request-Id header");
+      }
+      if (singleHeader(response.headers, "digest") !== `blake3=${proof.snapshot_digest}`) {
+        throw new HyphaeClientError("downloaded witness digest header differs from the proof");
+      }
+      const value = await readBounded(response, this.#witnessBytes, deadline);
+      if (BigInt(value.byteLength) !== expectedBytes) {
+        throw new HyphaeClientError("downloaded witness length differs from the proof");
+      }
+      deadline.throwIfElapsed();
+      return { value, requestId };
+    } finally {
+      cancelUnusedBody(response);
+      deadline.close();
     }
-    const expectedBytes = typeof proof.witness.file_bytes === "bigint"
-      ? proof.witness.file_bytes
-      : BigInt(proof.witness.file_bytes);
-    if (expectedBytes < 0n || expectedBytes > BigInt(this.#witnessBytes)) {
-      throw new HyphaeClientError(
-        `Hyphae response exceeded local limit ${this.#witnessBytes} bytes`,
-      );
-    }
-    const response = await this.#request(expectedPath.slice(1), true);
-    if (!response.ok) {
-      throw await this.#apiError(response);
-    }
-    if (response.status !== 200) {
-      throw new HyphaeClientError(`Hyphae returned unexpected success status ${response.status}`);
-    }
-    const requestId = singleHeader(response.headers, "x-request-id");
-    if (requestId === undefined) {
-      throw new HyphaeClientError("Hyphae response has no single valid X-Request-Id header");
-    }
-    if (singleHeader(response.headers, "digest") !== `blake3=${proof.snapshot_digest}`) {
-      throw new HyphaeClientError("downloaded witness digest header differs from the proof");
-    }
-    const value = await readBounded(response, this.#witnessBytes);
-    if (BigInt(value.byteLength) !== expectedBytes) {
-      throw new HyphaeClientError("downloaded witness length differs from the proof");
-    }
-    return { value, requestId };
   }
 
   async #json<T>(path: string, authenticated: boolean, body?: unknown): Promise<ApiResponse<T>> {
-    const response = await this.#request(path, authenticated, body);
-    if (!response.ok) {
-      throw await this.#apiError(response);
-    }
-    if (response.status !== 200) {
-      throw new HyphaeClientError(`Hyphae returned unexpected success status ${response.status}`);
-    }
-    requireJson(response.headers);
-    const requestId = singleHeader(response.headers, "x-request-id");
-    if (requestId === undefined) {
-      throw new HyphaeClientError("Hyphae response has no single valid X-Request-Id header");
-    }
-    const encoded = await readBounded(response, this.#responseBytes);
+    const deadline = new Deadline(this.#timeoutMs);
+    let response: Response | undefined;
     try {
-      return { value: parseHyphaeJson(new TextDecoder("utf-8", { fatal: true }).decode(encoded)) as T, requestId };
-    } catch (cause) {
-      throw new HyphaeClientError("Hyphae response violated the version 1 JSON contract", { cause });
+      response = await this.#request(path, authenticated, deadline, body);
+      if (!response.ok) {
+        throw await this.#apiError(response, deadline);
+      }
+      if (response.status !== 200) {
+        throw new HyphaeClientError(`Hyphae returned unexpected success status ${response.status}`);
+      }
+      requireJson(response.headers);
+      const requestId = singleHeader(response.headers, "x-request-id");
+      if (requestId === undefined) {
+        throw new HyphaeClientError("Hyphae response has no single valid X-Request-Id header");
+      }
+      const encoded = await readBounded(response, this.#responseBytes, deadline);
+      try {
+        const value = parseHyphaeJson(
+          new TextDecoder("utf-8", { fatal: true }).decode(encoded),
+        ) as T;
+        deadline.throwIfElapsed();
+        return { value, requestId };
+      } catch (cause) {
+        deadline.throwIfElapsed();
+        throw new HyphaeClientError(
+          "Hyphae response violated the version 1 JSON contract",
+          { cause },
+        );
+      }
+    } finally {
+      cancelUnusedBody(response);
+      deadline.close();
     }
   }
 
-  async #apiError(response: Response): Promise<HyphaeApiError> {
+  async #apiError(response: Response, deadline: Deadline): Promise<HyphaeApiError> {
     requireJson(response.headers);
     const requestId = singleHeader(response.headers, "x-request-id");
     if (requestId === undefined) {
       throw new HyphaeClientError("Hyphae response has no single valid X-Request-Id header");
     }
-    const encoded = await readBounded(response, this.#responseBytes);
+    const encoded = await readBounded(response, this.#responseBytes, deadline);
     let envelope: ErrorV1;
     try {
       envelope = parseHyphaeJson(new TextDecoder("utf-8", { fatal: true }).decode(encoded)) as ErrorV1;
+      deadline.throwIfElapsed();
     } catch (cause) {
+      deadline.throwIfElapsed();
       throw new HyphaeClientError("Hyphae error response violated the version 1 JSON contract", { cause });
     }
     if (typeof envelope !== "object" || envelope === null ||
@@ -256,10 +353,17 @@ export class HyphaeClient {
     if (envelope.request_id !== requestId) {
       throw new HyphaeClientError("Hyphae error envelope request ID differs from its response header");
     }
+    deadline.throwIfElapsed();
     return new HyphaeApiError(response.status, envelope);
   }
 
-  async #request(path: string, authenticated: boolean, body?: unknown): Promise<Response> {
+  async #request(
+    path: string,
+    authenticated: boolean,
+    deadline: Deadline,
+    body?: unknown,
+  ): Promise<Response> {
+    deadline.throwIfElapsed();
     const headers = new Headers();
     if (authenticated && this.#bearerToken !== undefined) {
       headers.set("authorization", `Bearer ${this.#bearerToken}`);
@@ -271,15 +375,21 @@ export class HyphaeClient {
       headers.set("content-type", "application/json");
       encoded = stringifyHyphaeJson(body);
     }
+    deadline.throwIfElapsed();
     const endpoint = new URL(path, this.#origin);
     try {
-      return await this.#fetch(endpoint, {
-        method,
-        headers,
-        ...(encoded === undefined ? {} : { body: encoded }),
-        signal: AbortSignal.timeout(this.#timeoutMs),
-      });
+      return await deadline.race(
+        this.#fetch(endpoint, {
+          method,
+          headers,
+          ...(encoded === undefined ? {} : { body: encoded }),
+          redirect: "error",
+          signal: deadline.signal,
+        }),
+      );
     } catch (cause) {
+      if (cause instanceof HyphaeClientError) throw cause;
+      if (deadline.elapsed()) throw deadlineError(cause);
       throw new HyphaeClientError("Hyphae HTTP transport failed", { cause });
     }
   }
@@ -299,7 +409,24 @@ function singleHeader(headers: Headers, name: string): string | undefined {
   return value === null || value.length === 0 || value.includes(",") ? undefined : value;
 }
 
-async function readBounded(response: Response, maximum: number): Promise<Uint8Array> {
+function deadlineError(cause?: unknown): HyphaeClientError {
+  return new HyphaeClientError(
+    "Hyphae HTTP request/response deadline elapsed",
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function cancelUnusedBody(response: Response | undefined): void {
+  if (response !== undefined && response.body !== null && !response.bodyUsed) {
+    void response.body.cancel().catch(() => {});
+  }
+}
+
+async function readBounded(
+  response: Response,
+  maximum: number,
+  deadline: Deadline,
+): Promise<Uint8Array> {
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximum)) {
     throw new HyphaeClientError(`Hyphae response exceeded local limit ${maximum} bytes`);
@@ -310,21 +437,38 @@ async function readBounded(response: Response, maximum: number): Promise<Uint8Ar
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
-  for (;;) {
-    const result = await reader.read();
-    if (result.done) break;
-    length += result.value.byteLength;
-    if (length > maximum) {
-      await reader.cancel();
-      throw new HyphaeClientError(`Hyphae response exceeded local limit ${maximum} bytes`);
+  let completed = false;
+  try {
+    for (;;) {
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await deadline.race(reader.read());
+      } catch (cause) {
+        if (cause instanceof HyphaeClientError) throw cause;
+        if (deadline.elapsed()) throw deadlineError(cause);
+        throw new HyphaeClientError("Hyphae HTTP transport failed", { cause });
+      }
+      if (result.done) break;
+      length += result.value.byteLength;
+      if (length > maximum) {
+        throw new HyphaeClientError(`Hyphae response exceeded local limit ${maximum} bytes`);
+      }
+      chunks.push(result.value);
     }
-    chunks.push(result.value);
+    completed = true;
+  } finally {
+    reader.releaseLock();
+    if (!completed) {
+      void response.body.cancel().catch(() => {});
+    }
   }
+  deadline.throwIfElapsed();
   const joined = new Uint8Array(length);
   let offset = 0;
   for (const chunk of chunks) {
     joined.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  deadline.throwIfElapsed();
   return joined;
 }

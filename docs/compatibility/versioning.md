@@ -11,6 +11,23 @@ routes. It advances the current data directory to format `2`. Format 2 adds
 authoritative vector-space definitions, signed-Q15 vectors, lexical-index
 definitions, and their snapshot/receipt identity.
 
+The untagged `0.2.1` source candidate keeps API `/v1`, disk format `2`, both
+proof formats, and every published `0.2.0` exhaustive Rust error enum and
+legacy method signature. Its resource hardening is additive:
+
+- `execute_with_byte_limit`, `execute_with_clock_and_byte_limit`, and
+  `HyphaeEngine::query_with_byte_limit` return separate bounded error types;
+- the standalone server uses those APIs with a fixed 256 MiB aggregate
+  scanned-input ceiling, while legacy `execute`, `execute_with_clock`, and
+  durable `query` remain count-bounded without a new byte ceiling;
+- `StorageEngine::open_with_limits`, `HyphaeEngine::open_with_limits`, and
+  `HyphaeServer::open_with_storage_limits` accept finite storage policy;
+- the packaged CLI and ordinary server open select
+  `StorageLimits::default()`, while the published embedded `open` methods
+  retain their `0.2.0` compatibility policy;
+- finite storage failures preserve typed `StorageLimitError` causes through
+  existing error source chains instead of adding variants to those enums.
+
 A 0.2 binary opens format 1 by acquiring the exclusive directory lock,
 validating all existing state, and atomically committing the format-2
 migration before it writes new logical mutations. The immutable format-1

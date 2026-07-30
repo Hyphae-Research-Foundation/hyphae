@@ -45,9 +45,11 @@ duplicate logical identity, exhausted budget, or timeout is an error.
 
 ## Resource limits
 
-Dimension and result count are checked before scan. Candidate count, decoded
-vector bytes, and one monotonic deadline cover scan, decode, scoring, ordering,
-abstention, and result creation. A limit failure returns no ranking.
+Dimension and result count are checked before scan. Candidate count, aggregate
+candidate key/vector bytes, and one monotonic deadline cover scan, decode,
+scoring, ordering, abstention, and result creation. Offline proof replay
+preflights the same count/byte policy and deadline before allocating and cloning
+the candidate collection. A limit failure returns no ranking.
 
 ## Golden case
 

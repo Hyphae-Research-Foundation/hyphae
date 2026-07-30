@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Hyphae API
-  version: 0.2.0
+  version: 0.2.1
   description: >-
     Stable version 1 HTTP contract for the autonomous Hyphae data engine.
     Hyphae remains fully usable without starting this optional server.
@@ -577,6 +577,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/Timeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/Busy"
         "500":

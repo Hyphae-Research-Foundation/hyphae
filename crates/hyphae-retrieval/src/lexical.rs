@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     time::{Duration, Instant},
 };
 
@@ -268,31 +269,109 @@ pub enum LexicalError {
 
 /// Applies tokenizer semantics `hyphae-unicode-tokenizer-v1`.
 pub fn tokenize_v1(input: &str) -> Vec<String> {
-    let normalized = input.nfkc().case_fold().collect::<String>();
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    for character in normalized.chars() {
-        if character.is_alphanumeric() {
-            token.push(character);
-        } else {
-            push_token(&mut tokens, &mut token);
-        }
+    match tokenize_v1_checked(
+        input,
+        || Ok::<(), Infallible>(()),
+        || Ok::<(), Infallible>(()),
+    ) {
+        Ok(tokens) => tokens,
+        Err(never) => match never {},
     }
-    push_token(&mut tokens, &mut token);
-    tokens
 }
 
-fn push_token(tokens: &mut Vec<String>, token: &mut String) {
-    if !token.is_empty() && token.len() <= MAX_LEXICAL_TOKEN_BYTES {
+/// Applies tokenizer v1 while cooperatively checking work and retained-token policy.
+///
+/// `checkpoint` runs throughout normalization, including within one very long
+/// token. `accept_token` runs immediately before each retained token is added.
+///
+/// # Errors
+///
+/// Returns the first error produced by either callback without returning a
+/// partial token list.
+pub fn tokenize_v1_checked<E>(
+    input: &str,
+    mut checkpoint: impl FnMut() -> Result<(), E>,
+    mut accept_token: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<String>, E> {
+    const CHECKPOINT_INTERVAL: usize = 256;
+
+    checkpoint()?;
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut discarding_oversized_token = false;
+    for (index, character) in input.nfkc().case_fold().enumerate() {
+        if index % CHECKPOINT_INTERVAL == 0 {
+            checkpoint()?;
+        }
+        if character.is_alphanumeric() {
+            if !discarding_oversized_token {
+                let next_length = token.len().saturating_add(character.len_utf8());
+                if next_length <= MAX_LEXICAL_TOKEN_BYTES {
+                    token.push(character);
+                } else {
+                    token.clear();
+                    discarding_oversized_token = true;
+                }
+            }
+        } else {
+            push_token_checked(
+                &mut tokens,
+                &mut token,
+                &mut discarding_oversized_token,
+                &mut accept_token,
+            )?;
+        }
+    }
+    checkpoint()?;
+    push_token_checked(
+        &mut tokens,
+        &mut token,
+        &mut discarding_oversized_token,
+        &mut accept_token,
+    )?;
+    Ok(tokens)
+}
+
+fn push_token_checked<E>(
+    tokens: &mut Vec<String>,
+    token: &mut String,
+    discarding_oversized_token: &mut bool,
+    accept_token: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    if !*discarding_oversized_token && !token.is_empty() {
+        accept_token()?;
         tokens.push(std::mem::take(token));
     } else {
         token.clear();
     }
+    *discarding_oversized_token = false;
+    Ok(())
 }
 
 struct AnalyzedDocument {
     key: Vec<u8>,
     fields: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct LexicalDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl LexicalDeadline {
+    fn check(self) -> Result<(), LexicalError> {
+        check_timeout(self.started, self.timeout)
+    }
+}
+
+struct ScoringContext<'a> {
+    document_count: u64,
+    averages: &'a [f64],
+    frequencies: &'a BTreeMap<String, u64>,
+    definition: &'a LexicalIndexDefinition,
+    query_tokens: &'a [String],
+    deadline: LexicalDeadline,
 }
 
 /// Rebuildable lexical statistics for one document that contains at least one
@@ -333,7 +412,8 @@ pub fn retrieve_lexical(
     limits: &LexicalLimits,
 ) -> Result<LexicalOutcome, LexicalError> {
     validate_request(definition, request, limits)?;
-    let query_tokens = tokenize_v1(&request.query)
+    let started = Instant::now();
+    let query_tokens = tokenize_before_deadline(&request.query, started, limits.timeout)?
         .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -341,8 +421,12 @@ pub fn retrieve_lexical(
     if query_tokens.is_empty() {
         return Err(LexicalError::EmptyQuery);
     }
-    let started = Instant::now();
     let mut token_count = u64::try_from(query_tokens.len()).unwrap_or(u64::MAX);
+    if token_count > limits.max_tokens {
+        return Err(LexicalError::TokenBudgetExceeded {
+            maximum: limits.max_tokens,
+        });
+    }
     let mut keys = BTreeSet::new();
     let mut documents = Vec::with_capacity(records.len());
     let mut total_lengths = vec![0_u64; definition.fields.len()];
@@ -362,21 +446,12 @@ pub fn retrieve_lexical(
         let mut fields = Vec::with_capacity(definition.fields.len());
         for (field_index, field) in definition.fields.iter().enumerate() {
             let tokens = match field.path.resolve(&record.value) {
-                Some(Value::String(value)) => tokenize_v1(value),
+                Some(Value::String(value)) => {
+                    tokenize_with_limits(value, &mut token_count, started, limits)?
+                }
                 _ => Vec::new(),
             };
             let length = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
-            token_count =
-                token_count
-                    .checked_add(length)
-                    .ok_or(LexicalError::TokenBudgetExceeded {
-                        maximum: limits.max_tokens,
-                    })?;
-            if token_count > limits.max_tokens {
-                return Err(LexicalError::TokenBudgetExceeded {
-                    maximum: limits.max_tokens,
-                });
-            }
             total_lengths[field_index] = total_lengths[field_index]
                 .checked_add(length)
                 .ok_or(LexicalError::ArithmeticOverflow)?;
@@ -411,7 +486,8 @@ pub fn retrieve_lexical_materialized(
     limits: &LexicalLimits,
 ) -> Result<LexicalOutcome, LexicalError> {
     validate_request(definition, request, limits)?;
-    let query_tokens = tokenize_v1(&request.query)
+    let started = Instant::now();
+    let query_tokens = tokenize_before_deadline(&request.query, started, limits.timeout)?
         .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -419,8 +495,7 @@ pub fn retrieve_lexical_materialized(
     if query_tokens.is_empty() {
         return Err(LexicalError::EmptyQuery);
     }
-    validate_materialized_corpus(corpus, definition, &query_tokens, limits)?;
-    let started = Instant::now();
+    validate_materialized_corpus(corpus, definition, &query_tokens, limits, started)?;
     let averages = corpus
         .total_field_lengths
         .iter()
@@ -432,42 +507,50 @@ pub fn retrieve_lexical_materialized(
             }
         })
         .collect::<Vec<_>>();
-    let frequencies = query_tokens
-        .iter()
-        .map(|token| {
-            let frequency = corpus
-                .documents
-                .iter()
-                .filter(|document| {
-                    document
-                        .term_frequencies
-                        .get(token)
-                        .is_some_and(|fields| fields.iter().any(|frequency| *frequency > 0))
-                })
-                .count();
-            (token.clone(), u64::try_from(frequency).unwrap_or(u64::MAX))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut frequencies = BTreeMap::new();
+    for token in &query_tokens {
+        check_timeout(started, limits.timeout)?;
+        let mut frequency = 0_u64;
+        for document in &corpus.documents {
+            check_timeout(started, limits.timeout)?;
+            if document
+                .term_frequencies
+                .get(token)
+                .is_some_and(|fields| fields.iter().any(|value| *value > 0))
+            {
+                frequency = frequency
+                    .checked_add(1)
+                    .ok_or(LexicalError::ArithmeticOverflow)?;
+            }
+        }
+        frequencies.insert(token.clone(), frequency);
+    }
+    let scoring = ScoringContext {
+        document_count: corpus.document_count,
+        averages: &averages,
+        frequencies: &frequencies,
+        definition,
+        query_tokens: &query_tokens,
+        deadline: LexicalDeadline {
+            started,
+            timeout: limits.timeout,
+        },
+    };
     let mut matches = Vec::with_capacity(corpus.documents.len().min(request.limit));
     for document in &corpus.documents {
-        check_timeout(started, limits.timeout)?;
-        if let Some(matched) = score_materialized_document(
-            document,
-            corpus.document_count,
-            &averages,
-            &frequencies,
-            definition,
-            &query_tokens,
-        )? {
+        scoring.deadline.check()?;
+        if let Some(matched) = score_materialized_document(document, &scoring)? {
             matches.push(matched);
         }
     }
-    Ok(finish_ranking(
+    finish_ranking(
         matches,
         corpus.document_count,
         &query_tokens,
         request.limit,
-    ))
+        started,
+        limits.timeout,
+    )
 }
 
 fn validate_materialized_corpus(
@@ -475,7 +558,9 @@ fn validate_materialized_corpus(
     definition: &LexicalIndexDefinition,
     query_tokens: &[String],
     limits: &LexicalLimits,
+    started: Instant,
 ) -> Result<(), LexicalError> {
+    check_timeout(started, limits.timeout)?;
     if corpus.document_count > limits.max_documents {
         return Err(LexicalError::DocumentBudgetExceeded {
             maximum: limits.max_documents,
@@ -502,6 +587,7 @@ fn validate_materialized_corpus(
     }
     let mut keys = BTreeSet::new();
     for document in &corpus.documents {
+        check_timeout(started, limits.timeout)?;
         if document.key.is_empty() {
             return Err(LexicalError::EmptyDocumentKey);
         }
@@ -510,17 +596,58 @@ fn validate_materialized_corpus(
         }
         if document.field_lengths.len() != definition.fields.len()
             || document.term_frequencies.len() != query_tokens.len()
-            || query_tokens.iter().any(|token| {
-                document
-                    .term_frequencies
-                    .get(token)
-                    .is_none_or(|frequencies| frequencies.len() != definition.fields.len())
-            })
         {
             return Err(LexicalError::MalformedProjection);
         }
+        for token in query_tokens {
+            check_timeout(started, limits.timeout)?;
+            if document
+                .term_frequencies
+                .get(token)
+                .is_none_or(|frequencies| frequencies.len() != definition.fields.len())
+            {
+                return Err(LexicalError::MalformedProjection);
+            }
+        }
     }
     Ok(())
+}
+
+fn tokenize_before_deadline(
+    input: &str,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Vec<String>, LexicalError> {
+    tokenize_v1_checked(
+        input,
+        || check_timeout(started, timeout),
+        || check_timeout(started, timeout),
+    )
+}
+
+fn tokenize_with_limits(
+    input: &str,
+    token_count: &mut u64,
+    started: Instant,
+    limits: &LexicalLimits,
+) -> Result<Vec<String>, LexicalError> {
+    tokenize_v1_checked(
+        input,
+        || check_timeout(started, limits.timeout),
+        || {
+            *token_count = token_count
+                .checked_add(1)
+                .ok_or(LexicalError::TokenBudgetExceeded {
+                    maximum: limits.max_tokens,
+                })?;
+            if *token_count > limits.max_tokens {
+                return Err(LexicalError::TokenBudgetExceeded {
+                    maximum: limits.max_tokens,
+                });
+            }
+            Ok(())
+        },
+    )
 }
 
 fn validate_request(
@@ -552,6 +679,7 @@ fn score_documents(
     query_tokens: &[String],
     started: Instant,
 ) -> Result<LexicalOutcome, LexicalError> {
+    check_timeout(started, limits.timeout)?;
     let document_count = u64::try_from(documents.len()).unwrap_or(u64::MAX);
     let averages = total_lengths
         .iter()
@@ -563,32 +691,45 @@ fn score_documents(
             }
         })
         .collect::<Vec<_>>();
-    let frequencies = query_tokens
-        .iter()
-        .map(|token| {
-            let count = documents
-                .iter()
-                .filter(|document| {
-                    document
-                        .fields
-                        .iter()
-                        .any(|field| field.iter().any(|candidate| candidate == token))
-                })
-                .count();
-            (token.clone(), u64::try_from(count).unwrap_or(u64::MAX))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut frequencies = BTreeMap::new();
+    for token in query_tokens {
+        check_timeout(started, limits.timeout)?;
+        let mut count = 0_u64;
+        for document in documents {
+            check_timeout(started, limits.timeout)?;
+            let mut present = false;
+            'fields: for field in &document.fields {
+                for candidate in field {
+                    check_timeout(started, limits.timeout)?;
+                    if candidate == token {
+                        present = true;
+                        break 'fields;
+                    }
+                }
+            }
+            if present {
+                count = count
+                    .checked_add(1)
+                    .ok_or(LexicalError::ArithmeticOverflow)?;
+            }
+        }
+        frequencies.insert(token.clone(), count);
+    }
+    let scoring = ScoringContext {
+        document_count,
+        averages: &averages,
+        frequencies: &frequencies,
+        definition,
+        query_tokens,
+        deadline: LexicalDeadline {
+            started,
+            timeout: limits.timeout,
+        },
+    };
     let mut matches = Vec::new();
     for document in documents {
-        check_timeout(started, limits.timeout)?;
-        let document_match = score_document(
-            document,
-            document_count,
-            &averages,
-            &frequencies,
-            definition,
-            query_tokens,
-        )?;
+        scoring.deadline.check()?;
+        let document_match = score_document(document, &scoring)?;
         if let Some(matched) = document_match {
             if u64::try_from(matches.len()).unwrap_or(u64::MAX) >= limits.max_candidates {
                 return Err(LexicalError::CandidateBudgetExceeded {
@@ -598,94 +739,78 @@ fn score_documents(
             matches.push(matched);
         }
     }
-    Ok(finish_ranking(
+    finish_ranking(
         matches,
         document_count,
         query_tokens,
         request.limit,
-    ))
+        started,
+        limits.timeout,
+    )
 }
 
 fn score_document(
     document: &AnalyzedDocument,
-    document_count: u64,
-    averages: &[f64],
-    frequencies: &BTreeMap<String, u64>,
-    definition: &LexicalIndexDefinition,
-    query_tokens: &[String],
+    context: &ScoringContext<'_>,
 ) -> Result<Option<LexicalMatch>, LexicalError> {
+    context.deadline.check()?;
     let field_lengths = document
         .fields
         .iter()
         .map(|field| u64::try_from(field.len()).unwrap_or(u64::MAX))
         .collect::<Vec<_>>();
-    let term_frequencies = query_tokens
-        .iter()
-        .map(|token| {
-            let frequencies = document
-                .fields
-                .iter()
-                .map(|field| {
-                    u64::try_from(field.iter().filter(|candidate| *candidate == token).count())
-                        .unwrap_or(u64::MAX)
-                })
-                .collect::<Vec<_>>();
-            (token.clone(), frequencies)
-        })
-        .collect::<BTreeMap<_, _>>();
-    score_statistics(
-        &document.key,
-        &field_lengths,
-        &term_frequencies,
-        document_count,
-        averages,
-        frequencies,
-        definition,
-        query_tokens,
-    )
+    let mut term_frequencies = BTreeMap::new();
+    for token in context.query_tokens {
+        context.deadline.check()?;
+        let mut per_field = Vec::with_capacity(document.fields.len());
+        for field in &document.fields {
+            let mut frequency = 0_u64;
+            for candidate in field {
+                context.deadline.check()?;
+                if candidate == token {
+                    frequency = frequency
+                        .checked_add(1)
+                        .ok_or(LexicalError::ArithmeticOverflow)?;
+                }
+            }
+            per_field.push(frequency);
+        }
+        term_frequencies.insert(token.clone(), per_field);
+    }
+    score_statistics(&document.key, &field_lengths, &term_frequencies, context)
 }
 
 fn score_materialized_document(
     document: &LexicalMaterializedDocument,
-    document_count: u64,
-    averages: &[f64],
-    frequencies: &BTreeMap<String, u64>,
-    definition: &LexicalIndexDefinition,
-    query_tokens: &[String],
+    context: &ScoringContext<'_>,
 ) -> Result<Option<LexicalMatch>, LexicalError> {
     score_statistics(
         &document.key,
         &document.field_lengths,
         &document.term_frequencies,
-        document_count,
-        averages,
-        frequencies,
-        definition,
-        query_tokens,
+        context,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn score_statistics(
     key: &[u8],
     field_lengths: &[u64],
     term_frequencies: &BTreeMap<String, Vec<u64>>,
-    document_count: u64,
-    averages: &[f64],
-    frequencies: &BTreeMap<String, u64>,
-    definition: &LexicalIndexDefinition,
-    query_tokens: &[String],
+    context: &ScoringContext<'_>,
 ) -> Result<Option<LexicalMatch>, LexicalError> {
+    context.deadline.check()?;
     let mut terms = Vec::new();
     let mut score_nanos = 0_i64;
-    for token in query_tokens {
-        let document_frequency = frequencies[token];
+    for token in context.query_tokens {
+        context.deadline.check()?;
+        let document_frequency = context.frequencies[token];
         if document_frequency == 0 {
             continue;
         }
         let mut combined_tf = 0.0_f64;
-        let mut fields = Vec::with_capacity(definition.fields.len());
-        for (index, definition_field) in definition.fields.iter().enumerate() {
+        let mut fields = Vec::with_capacity(context.definition.fields.len());
+        for (index, definition_field) in context.definition.fields.iter().enumerate() {
+            context.deadline.check()?;
             let term_frequency = term_frequencies[token][index];
             let field_length = field_lengths[index];
             fields.push(LexicalFieldContribution {
@@ -693,9 +818,9 @@ fn score_statistics(
                 term_frequency,
                 field_length,
             });
-            if term_frequency > 0 && averages[index] > 0.0 {
+            if term_frequency > 0 && context.averages[index] > 0.0 {
                 let normalization =
-                    1.0 - B + B * bounded_count_as_f64(field_length) / averages[index];
+                    1.0 - B + B * bounded_count_as_f64(field_length) / context.averages[index];
                 combined_tf += (f64::from(definition_field.weight_micros) / WEIGHT_SCALE)
                     * bounded_count_as_f64(term_frequency)
                     / normalization;
@@ -705,7 +830,7 @@ fn score_statistics(
             continue;
         }
         let numerator =
-            bounded_count_as_f64(document_count.saturating_sub(document_frequency)) + 0.5;
+            bounded_count_as_f64(context.document_count.saturating_sub(document_frequency)) + 0.5;
         let denominator = bounded_count_as_f64(document_frequency) + 0.5;
         let idf = libm::log(1.0 + numerator / denominator);
         let term_score = quantize_score(idf * combined_tf * (K1 + 1.0) / (combined_tf + K1))?;
@@ -731,16 +856,20 @@ fn finish_ranking(
     document_count: u64,
     query_tokens: &[String],
     limit: usize,
-) -> LexicalOutcome {
+    started: Instant,
+    timeout: Duration,
+) -> Result<LexicalOutcome, LexicalError> {
+    check_timeout(started, timeout)?;
     matches.sort_by(|left, right| {
         right
             .score_nanos
             .cmp(&left.score_nanos)
             .then_with(|| left.key.cmp(&right.key))
     });
+    check_timeout(started, timeout)?;
     let matched_documents = u64::try_from(matches.len()).unwrap_or(u64::MAX);
     matches.truncate(limit);
-    if matches.is_empty() {
+    Ok(if matches.is_empty() {
         LexicalOutcome::Abstained(LexicalAbstention {
             reason: LexicalAbstentionReason::NoCandidates,
             scanned_documents: document_count,
@@ -753,7 +882,7 @@ fn finish_ranking(
             matched_documents,
             query_tokens: query_tokens.to_vec(),
         }
-    }
+    })
 }
 
 fn quantize_score(value: f64) -> Result<i64, LexicalError> {
@@ -902,6 +1031,98 @@ mod tests {
             tokenize_v1("Straße ＡＢＣ—café"),
             vec!["strasse", "abc", "café"]
         );
+    }
+
+    #[test]
+    fn checked_tokenizer_matches_v1_and_checks_inside_one_long_token() {
+        let input = "Straße ＡＢＣ—café";
+        let mut accepted = 0_usize;
+        let checked = match tokenize_v1_checked(
+            input,
+            || Ok::<(), Infallible>(()),
+            || {
+                accepted += 1;
+                Ok::<(), Infallible>(())
+            },
+        ) {
+            Ok(tokens) => tokens,
+            Err(never) => match never {},
+        };
+        assert_eq!(checked, tokenize_v1(input));
+        assert_eq!(accepted, checked.len());
+        assert_eq!(
+            tokenize_v1(&format!("{} tail", "a".repeat(257))),
+            vec!["tail"]
+        );
+
+        let long_token = "a".repeat(2_048);
+        let mut checkpoints = 0_usize;
+        let interrupted = tokenize_v1_checked(
+            &long_token,
+            || {
+                checkpoints += 1;
+                if checkpoints == 3 {
+                    Err("stop")
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok::<(), &'static str>(()),
+        );
+        assert_eq!(interrupted, Err("stop"));
+        assert_eq!(checkpoints, 3);
+    }
+
+    #[test]
+    fn zero_timeout_includes_query_tokenization_for_both_scorers() -> Result<(), LexicalError> {
+        let definition = definition()?;
+        let request = LexicalRequest {
+            index: definition.name.clone(),
+            query: "rust".into(),
+            limit: 1,
+        };
+        let limits = LexicalLimits {
+            timeout: Duration::ZERO,
+            ..LexicalLimits::default()
+        };
+        let corpus = materialize_reference_corpus(&[], &definition, &request.query);
+
+        assert_eq!(
+            retrieve_lexical(&[], &definition, &request, &limits),
+            Err(LexicalError::TimedOut)
+        );
+        assert_eq!(
+            retrieve_lexical_materialized(&corpus, &definition, &request, &limits),
+            Err(LexicalError::TimedOut)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_query_tokens_count_once_against_token_budget() -> Result<(), LexicalError> {
+        let definition = definition()?;
+        let request = LexicalRequest {
+            index: definition.name.clone(),
+            query: "rust rust".into(),
+            limit: 1,
+        };
+        let limits = LexicalLimits {
+            max_tokens: 1,
+            ..LexicalLimits::default()
+        };
+        let corpus = materialize_reference_corpus(&[], &definition, &request.query);
+
+        let reference = retrieve_lexical(&[], &definition, &request, &limits)?;
+        let materialized = retrieve_lexical_materialized(&corpus, &definition, &request, &limits)?;
+        assert_eq!(reference, materialized);
+        assert!(matches!(
+            reference,
+            LexicalOutcome::Abstained(LexicalAbstention {
+                query_tokens,
+                ..
+            }) if query_tokens == vec!["rust"]
+        ));
+        Ok(())
     }
 
     #[test]
