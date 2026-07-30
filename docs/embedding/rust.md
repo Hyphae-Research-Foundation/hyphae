@@ -21,8 +21,8 @@ engine and an embedding application together.
 | `hyphae-client` | Bounded async HTTP client; never opens local storage |
 | `hyphae-core` | Product/API/disk version constants |
 
-Applications normally start with `hyphae-engine`. The `0.2.1` coordinates
-below are valid only after crates.io lists the matching versions:
+Applications normally start with `hyphae-engine`. The published `0.2.1`
+coordinates are:
 
 ```toml
 [dependencies]

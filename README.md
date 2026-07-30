@@ -25,19 +25,16 @@ Rust. Its base deployment is one native `hyphae` executable and one data
 directory. KV, structured query, recovery, and verification work offline
 without a database, cache, cloud service, embedding provider, or LLM.
 
-**Source candidate version:** `0.2.1`. This candidate accepts large but bounded
-offline snapshot witnesses and adds SemVer-compatible bounded query,
-recovery, snapshot, and compaction paths used by the packaged CLI/server.
-Published `0.2.0` embedded entry points retain their signatures, exhaustive
-error surfaces, and compatibility behavior. Source version preparation does
-not establish that the candidate was tagged or published.
-
-**Latest published release:** [`v0.2.0`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0).
+**Latest published release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
 Its annotated tag peels to
-`170380453a2ca6322a4c8bc50417318daee1c011`, and all ten publishable Rust
-workspace crates are available on crates.io at version `0.2.0`. The historical
-release gate retains two unchecked hosted-evidence items because their exact
-receipts are not preserved in this repository.
+`08028e8dac077846c638f067ce74fbcf6fb75501`, and all ten publishable Rust
+workspace crates are available on crates.io at version `0.2.1`. This release
+accepts large but bounded offline snapshot witnesses and adds SemVer-compatible
+bounded query, recovery, snapshot, and compaction paths used by the packaged
+CLI/server. The published `0.2.0` embedded entry points retain their
+signatures, exhaustive error surfaces, and compatibility behavior. See the
+[`0.2.1` publication receipt](docs/release/receipts/0.2.1.md) for exact source,
+tag, workflow, artifact, and registry identities.
 
 ## What Hyphae does
 
@@ -73,21 +70,19 @@ surface differences, default limits, and deliberate non-capabilities.
 Install the latest published native binary:
 
 ```bash
-cargo install hyphae-cli --version 0.2.0 --locked
+cargo install hyphae-cli --version 0.2.1 --locked
 hyphae version --json
 ```
 
 Embed the latest published engine with an exact product-version requirement:
 
 ```bash
-cargo add hyphae-engine@=0.2.0
+cargo add hyphae-engine@=0.2.1
 ```
 
-The `0.2.1` source candidate is not published. Use `0.2.1` package commands
-only after the corresponding registries list that version. Native archives,
-checksums, SBOMs, provenance, signatures, and attestations for `0.2.0` are
-attached to its
-[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0).
+Native archives, checksums, SBOMs, provenance, signatures, and attestations
+for `0.2.1` are attached to its
+[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
 
 ## Five-minute local flow
 
@@ -182,6 +177,7 @@ Start at the [documentation index](docs/README.md). Key guides:
 - [Operations and troubleshooting](docs/operations/troubleshooting.md)
 - [Security model](docs/security/threat-model.md)
 - [Release verification](docs/release/verification.md)
+- [0.2.1 publication receipt](docs/release/receipts/0.2.1.md)
 - [crates.io release procedure](docs/release/crates-io.md)
 
 ## Product boundary

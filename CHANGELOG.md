@@ -5,12 +5,13 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
 ## [Unreleased]
 
-No changes after the `0.2.1` source-candidate entry below.
+No changes after the `0.2.1` release entry below.
 
-## [0.2.1] - 2026-07-29
+## [0.2.1] - 2026-07-30
 
-Status: source candidate; not yet tagged or published. The date records
-candidate preparation, not release completion.
+Status: published. The annotated `v0.2.1` tag, signed GitHub release, and all
+ten Rust crates are recorded in the
+[publication receipt](docs/release/receipts/0.2.1.md).
 
 ### Added
 
