@@ -136,6 +136,15 @@ snapshot introspection, legacy `HYCAT001` reconstruction, reopen proof, and
 fail-closed definition validation to one source commit. Catalog B+tree
 scaling, definition history, typed rows, and secondary indexes remain open.
 
+The [native typed SQL-row
+evidence](evidence/native-typed-sql-rows-2026-08-01.md) binds catalog-typed
+DDL, checked primitive and composite primary-key inserts, `HYTUPL01` row
+payloads, catalog-bound projection and prepared point lookup, strict
+failure-before-mutation behavior, reopen equivalence, and raw binary-route
+compatibility to one source commit. Scans, secondary indexes, typed
+updates/deletes, expressions, planning, joins, and the remaining G2 evidence
+remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -147,12 +156,14 @@ transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary indexes, remaining structure
-families, positional postings, segments, and ANN required by G1–G4. The structure
-keyspace has a multilevel native B+tree, direct reads, tombstone/expiry
-mutations, conditional writes, signed counters, and the first independent-field
-hash layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
-sets, streams, the expiry scheduler, model tests, and amplification evidence
-required to close G3.
+families, positional postings, segments, and ANN required by G1–G4. Typed
+point inserts and catalog-bound projection now use canonical tuples and
+primitive/composite keys, but do not close G2. The structure keyspace has a
+multilevel native B+tree, direct reads, tombstone/expiry mutations, conditional
+writes, signed counters, and the first independent-field hash layout. It still
+lacks whole-hash lifecycle/iteration, lists, sets, sorted sets, streams, the
+expiry scheduler, model tests, and amplification evidence required to close
+G3.
 
 ## G1 substrate exit
 

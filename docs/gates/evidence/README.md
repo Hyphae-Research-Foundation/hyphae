@@ -93,6 +93,11 @@ commit before its tag can be published.
   relation/structure/search definitions, full-definition WAL and `HYCAT002`
   persistence, legacy reconstruction, snapshot/reopen proof, and explicit
   single-page limits to one source commit.
+- [Native typed SQL-row evidence —
+  2026-08-01](native-typed-sql-rows-2026-08-01.md) binds catalog-typed DDL,
+  canonical `HYTUPL01` rows, primitive and composite primary-key binding,
+  typed prepared point reads, recovery, and historical binary compatibility
+  to one source commit.
 
 ## Hosted release evidence
 
