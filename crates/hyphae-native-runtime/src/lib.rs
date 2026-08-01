@@ -21,6 +21,7 @@ pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -161,6 +162,9 @@ pub enum NativeRuntimeError {
     /// The relational B+tree contains malformed namespace keys or markers.
     #[error("native relational B+tree namespace is invalid")]
     InvalidRelationalTree,
+    /// A detached write mutation cannot be reapplied to the admitted base.
+    #[error("native optimistic write batch contains an invalid mutation")]
+    InvalidPreparedMutation,
     /// Recovered commit sequences are not contiguous.
     #[error("recovered native commit sequence is not contiguous")]
     NoncontiguousCommitSequence,
@@ -659,6 +663,32 @@ impl NativeDatabase {
         Ok(BTree::from_root(root).height(&self.pages)?)
     }
 
+    /// Prepares one detached optimistic write transaction.
+    ///
+    /// Preparation captures and materializes an immutable snapshot without
+    /// acquiring the serialized writer guard. Multiple callers may therefore
+    /// prepare private write sets concurrently. Publication remains a short,
+    /// explicitly serialized operation through [`Self::commit_optimistic`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot, page, root, blob, or state corruption.
+    pub fn begin_optimistic(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
+        Ok(NativeWriteBatch {
+            snapshot,
+            state,
+            mutations: Vec::new(),
+            dirty: [false; 4],
+            durability,
+        })
+    }
+
     /// Begins one serialized native write transaction.
     ///
     /// # Errors
@@ -670,8 +700,7 @@ impl NativeDatabase {
         logical_time_micros: i64,
         durability: DurabilityClass,
     ) -> Result<NativeTransaction<'_>, NativeRuntimeError> {
-        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
-        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let batch = self.begin_optimistic(logical_time_micros, durability)?;
         let transaction_id = TransactionId::new(self.next_transaction_id)
             .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
         let root_transaction = self.coordinator.begin_write()?;
@@ -682,13 +711,10 @@ impl NativeDatabase {
             conflicts: &mut self.conflicts,
             relational_format: self.relational_format,
             root_transaction,
+            conflict_read_csn: batch.snapshot.visible_csn,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
-            snapshot,
-            state,
-            mutations: Vec::new(),
-            dirty: [false; 4],
-            durability,
+            batch,
         })
     }
 
@@ -703,6 +729,75 @@ impl NativeDatabase {
         durability: DurabilityClass,
     ) -> Result<NativeTransaction<'_>, NativeRuntimeError> {
         self.begin(logical_time_micros, durability)
+    }
+
+    /// Validates, rebases, persists, and publishes one detached write batch.
+    ///
+    /// First-committer-wins validation uses the batch's original read CSN.
+    /// Disjoint writes are reapplied to the root set current at writer
+    /// admission so a stale prepared batch cannot replace intervening state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty batch, a write conflict, invalid rebased
+    /// semantics, persistence, synchronization, codec, or MVCC publication.
+    pub fn commit_optimistic(
+        &mut self,
+        batch: NativeWriteBatch,
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.commit_optimistic_at(batch, None)
+    }
+
+    /// Publishes a detached batch with one deterministic crash interruption.
+    ///
+    /// After an injected interruption the caller must drop the database handle
+    /// and reopen the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedCrash`] at the requested boundary,
+    /// or the same errors as [`Self::commit_optimistic`].
+    pub fn commit_optimistic_with_interruption(
+        &mut self,
+        batch: NativeWriteBatch,
+        boundary: CommitBoundary,
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.commit_optimistic_at(batch, Some(boundary))
+    }
+
+    fn commit_optimistic_at(
+        &mut self,
+        mut batch: NativeWriteBatch,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        if batch.mutations.is_empty() {
+            return Err(WalSemanticError::InvalidSequence.into());
+        }
+        let conflict_read_csn = batch.snapshot.visible_csn;
+        let logical_time_micros = batch.snapshot.logical_time_micros;
+        let root_transaction = self.coordinator.begin_write()?;
+        let write_keys = mutation_write_keys(&batch.mutations);
+        self.conflicts.validate(conflict_read_csn, &write_keys)?;
+
+        let mut state = load_state(&self.pages, &self.blobs, root_transaction.base_roots())?;
+        apply_mutations_to_state(&mut state, &batch.mutations)?;
+        batch.snapshot = root_transaction.base_snapshot(logical_time_micros);
+        batch.state = state;
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        NativeTransaction {
+            pages: &mut self.pages,
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            root_transaction,
+            conflict_read_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            batch,
+        }
+        .commit_at(interruption)
     }
 
     /// Publishes and WAL-anchors one synchronized immutable root checkpoint.
@@ -793,7 +888,24 @@ impl NativeDatabase {
     }
 }
 
-/// Private write set for one all-engine native transaction.
+/// Detached private write set over one immutable all-engine snapshot.
+///
+/// A batch owns no file handle and holds no writer guard. It may be prepared
+/// concurrently and later submitted to [`NativeDatabase::commit_optimistic`].
+#[derive(Debug)]
+pub struct NativeWriteBatch {
+    snapshot: Snapshot,
+    state: MaterializedState,
+    mutations: Vec<Mutation>,
+    dirty: [bool; 4],
+    durability: DurabilityClass,
+}
+
+/// Legacy serialized transaction retaining writer admission for its lifetime.
+///
+/// This compatibility path delegates its public mutation surface to
+/// [`NativeWriteBatch`]. New concurrency-sensitive callers should prepare a
+/// detached batch and submit it explicitly.
 #[derive(Debug)]
 pub struct NativeTransaction<'database> {
     pages: &'database mut PageStore,
@@ -802,16 +914,27 @@ pub struct NativeTransaction<'database> {
     conflicts: &'database mut ConflictTable,
     relational_format: RelationalFormat,
     root_transaction: RootTransaction<'database>,
+    conflict_read_csn: Option<Csn>,
     transaction_id: TransactionId,
     next_transaction_id: &'database mut u128,
-    snapshot: Snapshot,
-    state: MaterializedState,
-    mutations: Vec<Mutation>,
-    dirty: [bool; 4],
-    durability: DurabilityClass,
+    batch: NativeWriteBatch,
 }
 
-impl NativeTransaction<'_> {
+impl Deref for NativeTransaction<'_> {
+    type Target = NativeWriteBatch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.batch
+    }
+}
+
+impl DerefMut for NativeTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.batch
+    }
+}
+
+impl NativeWriteBatch {
     /// Executes one statement in the exact first native SQL slice.
     ///
     /// The supported grammar is `CREATE TABLE`, binary primary-key `INSERT`,
@@ -1049,6 +1172,18 @@ impl NativeTransaction<'_> {
             .collect())
     }
 
+    /// Returns the snapshot CSN captured before private preparation.
+    pub fn read_csn(&self) -> Option<Csn> {
+        self.snapshot.visible_csn
+    }
+
+    /// Explicitly discards this detached write batch.
+    pub fn rollback(self) {
+        drop(self);
+    }
+}
+
+impl NativeTransaction<'_> {
     /// Commits through the normal native path.
     ///
     /// # Errors
@@ -1081,20 +1216,21 @@ impl NativeTransaction<'_> {
     }
 
     fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
-        let write_keys = mutation_write_keys(&self.mutations);
+        let write_keys = mutation_write_keys(&self.batch.mutations);
         self.conflicts
-            .validate(self.root_transaction.read_csn(), &write_keys)?;
+            .validate(self.conflict_read_csn, &write_keys)?;
         Ok(write_keys)
     }
 
     fn commit_catalog_version(&self) -> Result<CatalogVersion, CatalogError> {
-        if self.dirty[0] {
-            self.snapshot
+        if self.batch.dirty[0] {
+            self.batch
+                .snapshot
                 .catalog_version
                 .checked_next()
                 .ok_or(CatalogError::VersionExhausted)
         } else {
-            Ok(self.snapshot.catalog_version)
+            Ok(self.batch.snapshot.catalog_version)
         }
     }
 
@@ -1102,53 +1238,55 @@ impl NativeTransaction<'_> {
         mut self,
         interruption: Option<CommitBoundary>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        if self.mutations.is_empty() {
+        if self.batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
         }
         let commit_csn = self.root_transaction.commit_csn()?;
         let write_keys = self.validated_write_keys()?;
         let catalog_version = self.commit_catalog_version()?;
-        let synchronize = self.durability != DurabilityClass::Memory;
-        let staged_blobs = stage_large_relational_values(self.blobs, &self.mutations, synchronize)?;
+        let batch = self.batch;
+        let synchronize = batch.durability != DurabilityClass::Memory;
+        let staged_blobs =
+            stage_large_relational_values(self.blobs, &batch.mutations, synchronize)?;
         interrupt(interruption, CommitBoundary::BlobStaged)?;
         let blob_references = publish_staged_blobs(self.blobs, staged_blobs, synchronize)?;
         let blob_generation = self.blobs.generation()?;
         interrupt(interruption, CommitBoundary::BlobPromoted)?;
 
-        let mut roots = roots_from_snapshot(self.snapshot.roots());
-        if self.dirty[0] || roots[0].is_none() {
+        let mut roots = roots_from_snapshot(batch.snapshot.roots());
+        if batch.dirty[0] || roots[0].is_none() {
             roots[0] = Some(self.pages.append(
                 PageKind::CatalogRoot,
                 Some(commit_csn),
                 None,
-                self.state.catalog.encode()?,
+                batch.state.catalog.encode()?,
             )?);
         }
-        if self.dirty[1] || roots[1].is_none() {
+        if batch.dirty[1] || roots[1].is_none() {
             roots[1] = relational_tree_after_mutations(
                 self.pages,
                 roots[1],
                 self.relational_format,
                 commit_csn,
-                &self.mutations,
+                &batch.mutations,
                 &blob_references,
             )?
             .root();
         }
-        if self.dirty[2] || roots[2].is_none() {
+        if batch.dirty[2] || roots[2].is_none() {
             roots[2] = Some(self.pages.append(
                 PageKind::StructureNode,
                 Some(commit_csn),
                 None,
-                self.state.structures.encode()?,
+                batch.state.structures.encode()?,
             )?);
         }
-        if self.dirty[3] || roots[3].is_none() {
+        if batch.dirty[3] || roots[3].is_none() {
             roots[3] = Some(self.pages.append(
                 PageKind::SearchDelta,
                 Some(commit_csn),
                 None,
-                self.state.search.encode()?,
+                batch.state.search.encode()?,
             )?);
         }
         interrupt(interruption, CommitBoundary::PageAppended)?;
@@ -1158,13 +1296,13 @@ impl NativeTransaction<'_> {
         interrupt(interruption, CommitBoundary::PageSynchronized)?;
 
         let concrete_roots = require_roots(roots)?;
-        let wal_mutations = wal_mutations(&self.mutations, &blob_references)?;
+        let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
         let pending = encode_transaction(&TransactionPlan {
             transaction_id: self.transaction_id,
-            read_csn: self.root_transaction.read_csn(),
+            read_csn: self.conflict_read_csn,
             catalog_version,
-            logical_time_micros: self.snapshot.logical_time_micros,
-            durability: self.durability,
+            logical_time_micros: batch.snapshot.logical_time_micros,
+            durability: batch.durability,
             mutations: &wal_mutations,
             commit_csn,
             roots: concrete_roots,
@@ -1199,9 +1337,90 @@ impl NativeTransaction<'_> {
             catalog_version,
             commit_lsn: block.last_lsn,
             wal_block_digest: block.digest,
-            durability: self.durability,
+            durability: batch.durability,
         })
     }
+}
+
+fn apply_mutations_to_state(
+    state: &mut MaterializedState,
+    mutations: &[Mutation],
+) -> Result<(), NativeRuntimeError> {
+    for mutation in mutations {
+        match mutation.opcode {
+            Opcode::CreateTable => {
+                let table = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                let name = std::str::from_utf8(&mutation.value)
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+                validate_relation_definition(table, name)?;
+                state
+                    .catalog
+                    .create(table, EngineKind::Relational, name.to_owned())?;
+                state.relational.create_table(table)?;
+            }
+            Opcode::InsertRow => {
+                let table = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                state.catalog.require(table, EngineKind::Relational)?;
+                state
+                    .relational
+                    .insert(table, mutation.key.clone(), mutation.value.clone())?;
+            }
+            Opcode::UpdateRow => {
+                let table = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                state.catalog.require(table, EngineKind::Relational)?;
+                state
+                    .relational
+                    .update(table, &mutation.key, mutation.value.clone())?;
+            }
+            Opcode::DeleteRow => {
+                let table = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                state.catalog.require(table, EngineKind::Relational)?;
+                state.relational.delete(table, &mutation.key)?;
+            }
+            Opcode::SetValue => {
+                if mutation.target.is_some() {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                state.structures.set(
+                    mutation.key.clone(),
+                    mutation.value.clone(),
+                    mutation.expires_at_micros,
+                );
+            }
+            Opcode::CreateIndex => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                let name = std::str::from_utf8(&mutation.value)
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+                validate_search_definition(index, name)?;
+                state
+                    .catalog
+                    .create(index, EngineKind::Search, name.to_owned())?;
+                state.search.create_index(index)?;
+            }
+            Opcode::IndexDocument => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                let text = std::str::from_utf8(&mutation.value)
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+                state.catalog.require(index, EngineKind::Search)?;
+                state
+                    .search
+                    .index_document(index, mutation.key.clone(), text.to_owned())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
@@ -1739,7 +1958,12 @@ fn validate_commit_sequence(
     let mut expected = 1_u64;
     let mut prior = None;
     for commit in commits {
-        if commit.manifest.commit_csn.get() != expected || commit.manifest.read_csn != prior {
+        if commit.manifest.commit_csn.get() != expected
+            || commit
+                .manifest
+                .read_csn
+                .is_some_and(|read| prior.is_none_or(|published| read > published))
+        {
             return Err(NativeRuntimeError::NoncontiguousCommitSequence);
         }
         prior = Some(commit.manifest.commit_csn);
@@ -1985,7 +2209,10 @@ mod tests {
         fs,
         io::{Read, Seek, SeekFrom, Write},
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use hyphae_native_mvcc::WriteKey;
@@ -2346,6 +2573,189 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_commit_boundaries_recover_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            stage_vertical(&mut database)?.commit()?;
+            let table = ObjectId::new(1)?;
+            let mut batch = database.begin_optimistic(151, DurabilityClass::Strict)?;
+            batch.update(table, b"mario".to_vec(), b"optimistic".to_vec())?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(batch, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let snapshot = reopened.snapshot(152)?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => {
+                    assert!(matches!(
+                        boundary,
+                        CommitBoundary::BlobStaged
+                            | CommitBoundary::BlobPromoted
+                            | CommitBoundary::PageAppended
+                            | CommitBoundary::PageSynchronized
+                    ));
+                    assert_eq!(snapshot.select(table, b"mario"), Some(b"active".as_slice()));
+                }
+                Some(2) => {
+                    assert!(matches!(
+                        boundary,
+                        CommitBoundary::WalAppended
+                            | CommitBoundary::WalSynchronized
+                            | CommitBoundary::RootPublished
+                    ));
+                    assert_eq!(
+                        snapshot.select(table, b"mario"),
+                        Some(b"optimistic".as_slice())
+                    );
+                }
+                found => return Err(format!("unexpected recovered CSN: {found:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_optimistic_preparation_rebases_disjoint_writes_and_rejects_conflicts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let ((first, second), (first_read_csn, second_read_csn)) = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first_database = &database;
+            let first = scope.spawn(move || -> Result<_, NativeRuntimeError> {
+                let mut batch = first_database.begin_optimistic(151, DurabilityClass::Strict)?;
+                let read_csn = batch.read_csn();
+                first_barrier.wait();
+                batch.update(table, b"mario".to_vec(), b"first".to_vec())?;
+                batch.set(b"first".to_vec(), b"structure".to_vec(), None);
+                batch.index_document(index, b"doc-first".to_vec(), "first writer")?;
+                Ok((batch, read_csn))
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second_database = &database;
+            let second = scope.spawn(move || -> Result<_, NativeRuntimeError> {
+                let mut batch = second_database.begin_optimistic(151, DurabilityClass::Strict)?;
+                let read_csn = batch.read_csn();
+                second_barrier.wait();
+                batch.insert(table, b"second".to_vec(), b"row".to_vec())?;
+                batch.set(b"second".to_vec(), b"structure".to_vec(), None);
+                batch.index_document(index, b"doc-second".to_vec(), "second writer")?;
+                Ok((batch, read_csn))
+            });
+            let (first, first_read_csn) = first
+                .join()
+                .map_err(|_| std::io::Error::other("first writer thread panicked"))??;
+            let (second, second_read_csn) = second
+                .join()
+                .map_err(|_| std::io::Error::other("second writer thread panicked"))??;
+            Ok::<_, Box<dyn std::error::Error>>((
+                (first, second),
+                (first_read_csn, second_read_csn),
+            ))
+        })?;
+        assert_eq!(first_read_csn.map(Csn::get), Some(1));
+        assert_eq!(second_read_csn.map(Csn::get), Some(1));
+        assert_eq!(database.commit_optimistic(first)?.commit_csn.get(), 2);
+        assert_eq!(database.commit_optimistic(second)?.commit_csn.get(), 3);
+
+        let rebased = database.snapshot(152)?;
+        assert_eq!(rebased.select(table, b"mario"), Some(b"first".as_slice()));
+        assert_eq!(rebased.select(table, b"second"), Some(b"row".as_slice()));
+        assert_eq!(rebased.get(b"first"), Some(b"structure".as_slice()));
+        assert_eq!(rebased.get(b"second"), Some(b"structure".as_slice()));
+        assert_eq!(
+            rebased.match_text(index, "first", 10)?[0].document_id,
+            b"doc-first"
+        );
+        assert_eq!(
+            rebased.match_text(index, "second", 10)?[0].document_id,
+            b"doc-second"
+        );
+
+        let mut winner = database.begin_optimistic(153, DurabilityClass::Strict)?;
+        let mut loser = database.begin_optimistic(153, DurabilityClass::Strict)?;
+        assert_eq!(winner.read_csn().map(Csn::get), Some(3));
+        assert_eq!(loser.read_csn().map(Csn::get), Some(3));
+        winner.update(table, b"mario".to_vec(), b"winner".to_vec())?;
+        loser.update(table, b"mario".to_vec(), b"loser".to_vec())?;
+        assert_eq!(database.commit_optimistic(winner)?.commit_csn.get(), 4);
+        assert!(matches!(
+            database.commit_optimistic(loser),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.snapshot(154)?.select(table, b"mario"),
+            Some(b"winner".as_slice())
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 4);
+        let recovered = reopened.snapshot(155)?;
+        assert_eq!(
+            recovered.select(table, b"mario"),
+            Some(b"winner".as_slice())
+        );
+        assert_eq!(recovered.select(table, b"second"), Some(b"row".as_slice()));
+        assert_eq!(recovered.get(b"first"), Some(b"structure".as_slice()));
+        assert_eq!(recovered.get(b"second"), Some(b"structure".as_slice()));
+        assert_eq!(
+            recovered.match_text(index, "first", 10)?[0].document_id,
+            b"doc-first"
+        );
+        assert_eq!(
+            recovered.match_text(index, "second", 10)?[0].document_id,
+            b"doc-second"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disjoint_genesis_batches_recover_with_their_original_read_csn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut first = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        assert_eq!(first.read_csn(), None);
+        assert_eq!(second.read_csn(), None);
+        first.set(b"first".to_vec(), b"one".to_vec(), None);
+        second.set(b"second".to_vec(), b"two".to_vec(), None);
+        assert_eq!(database.commit_optimistic(first)?.commit_csn.get(), 1);
+        assert_eq!(database.commit_optimistic(second)?.commit_csn.get(), 2);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        let recovered = reopened.snapshot(11)?;
+        assert_eq!(recovered.get(b"first"), Some(b"one".as_slice()));
+        assert_eq!(recovered.get(b"second"), Some(b"two".as_slice()));
         Ok(())
     }
 

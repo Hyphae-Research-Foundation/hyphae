@@ -421,6 +421,26 @@ impl RootTransaction<'_> {
         self.base.visible_csn()
     }
 
+    /// Returns the immutable root set current when writer admission succeeded.
+    ///
+    /// Detached optimistic transactions use this base to reapply disjoint
+    /// writes after admission instead of publishing roots derived from a stale
+    /// snapshot.
+    pub fn base_roots(&self) -> &RootSet {
+        &self.base
+    }
+
+    /// Captures the admitted base as a snapshot with caller-supplied logical
+    /// time.
+    pub fn base_snapshot(&self, logical_time_micros: i64) -> Snapshot {
+        Snapshot {
+            visible_csn: self.base.visible_csn(),
+            catalog_version: self.base.catalog_version(),
+            logical_time_micros,
+            roots: Arc::clone(&self.base),
+        }
+    }
+
     /// Returns the CSN reserved for this serialized write attempt.
     ///
     /// No reader can observe this sequence until [`Self::commit`] publishes

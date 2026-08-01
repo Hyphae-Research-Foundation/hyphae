@@ -108,6 +108,10 @@ the WAL stores only the one-byte blob envelope plus its 56-byte reference.
 - Reusing a transaction ID with identical contents returns the original
   receipt. Reuse with different contents is an idempotency conflict.
 - A commit CSN is unique and strictly increasing.
+- A recovered read CSN is either genesis or an existing CSN lower than its
+  commit CSN. It may lag the immediately preceding commit when a detached
+  transaction prepared from an older snapshot and its write set remained
+  conflict-free.
 - Engine mutations become visible only when the root set named by `COMMIT` is
   installed and `global_visible_csn` advances.
 

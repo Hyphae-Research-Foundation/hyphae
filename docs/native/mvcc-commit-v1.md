@@ -1,10 +1,11 @@
 # Native MVCC and commit semantics v1
 
 Status: normative target contract; immutable snapshots, CSN reservation,
-root-set hashing, recovery restore, and serialized all-engine publication are
-implemented experimentally; a point-write conflict table is implemented and
-rebuilt from committed WAL, and relational writes retain explicit immutable
-version chains; concurrent-writer and lock-free publication remain pending
+root-set hashing, recovery restore, concurrent detached write preparation, and
+serialized all-engine publication are implemented experimentally; a
+point-write conflict table is rebuilt from committed WAL, and relational
+writes retain explicit immutable version chains; concurrent commit submission
+and lock-free publication remain pending
 
 V1 provides snapshot isolation across relational, structure, and search
 objects under one global commit sequence.
@@ -62,11 +63,25 @@ the global object-ID and engine-qualified name identities. Admission rejects a
 key whose latest writer is newer than the transaction read CSN, and recovery
 reconstructs the table from decoded, digest-verified committed WAL mutations.
 
-The runtime still takes one serialized writer guard for the entire
-transaction and its public write entry point requires exclusive database
-access. Therefore the table and its stale/disjoint-key unit tests establish
-the first-committer-wins substrate, not evidence of two genuinely concurrent
-writers. Concurrent isolation litmus tests remain an exit requirement.
+`begin_optimistic` captures and materializes a snapshot into an owned
+`NativeWriteBatch` without file handles or writer admission. Multiple threads
+can therefore read and mutate private batches concurrently. At
+`commit_optimistic`, writer admission is serialized, the conflict table checks
+the batch's original read CSN, and Hyphae reapplies admitted mutations to the
+current root set. This rebase preserves intervening disjoint relational,
+structure, and search writes instead of publishing stale whole-engine state.
+
+The litmus test prepares two batches concurrently from the same CSN, commits
+disjoint mutations across all three engines, rejects a later same-row loser,
+and verifies the result after recovery. A separate genesis test proves that a
+second disjoint commit may retain `read_csn = None` while receiving commit CSN
+2.
+
+Publication and durability I/O still execute under one writer guard, and the
+public submit method currently requires exclusive `&mut NativeDatabase`
+access. The evidence therefore establishes concurrent transaction execution
+with first-committer-wins and serialized commit publication, not simultaneous
+commit submissions, multi-client throughput, or lock-free writers.
 
 ## Cross-engine commit
 
@@ -136,7 +151,8 @@ atomic all-engine root publication, dropped-write nonpublication,
 stale-same-key conflict rejection, disjoint-key admission, monotonic
 idempotent conflict replay, WAL reconstruction, read-your-writes, logical TTL,
 explicit closed relational chains, same-transaction version coalescing,
-version-chain cycle rejection, V1 directory compatibility, and deterministic
-in-process commit interruptions. True concurrent writers, constraints, range
-intents, serializable execution, and model-checked publication ordering remain
-pending.
+version-chain cycle rejection, V1 directory compatibility, concurrent detached
+preparation, all-engine disjoint rebase, original-read-CSN recovery, and both
+serialized and optimistic in-process commit interruption matrices.
+Simultaneous commit submission, constraints, range intents, serializable
+execution, and model-checked publication ordering remain pending.

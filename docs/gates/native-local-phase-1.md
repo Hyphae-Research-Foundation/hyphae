@@ -94,9 +94,11 @@ values use native immutable blobs. The current implementation also retains
 explicit per-key row-version chains with closed half-open intervals while
 keeping V1 inline-row directories compatible; exact commit-bound evidence for
 that follow-on is still pending. Catalog, structure, and search state remain
-bounded single-page scaffolding; concurrent writers, retention/vacuum,
-secondary indexes, scalable structures, postings, segments, and ANN remain
-required by G1–G4.
+bounded single-page scaffolding. Detached transactions now prepare concurrently
+and rebase disjoint all-engine writes under serialized publication; simultaneous
+commit submission and concurrency/saturation evidence remain pending, along
+with retention/vacuum, secondary indexes, scalable structures, postings,
+segments, and ANN required by G1–G4.
 
 ## G1 substrate exit
 

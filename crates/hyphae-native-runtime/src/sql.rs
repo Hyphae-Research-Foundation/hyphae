@@ -3,7 +3,7 @@
 use hyphae_native_types::{CatalogVersion, EngineKind, ObjectId};
 use thiserror::Error;
 
-use crate::{NativeRuntimeError, NativeSnapshot, NativeTransaction};
+use crate::{NativeRuntimeError, NativeSnapshot, NativeWriteBatch};
 
 /// Value accepted or returned by the first native SQL slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,7 +123,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
 }
 
 pub(crate) fn execute_transaction(
-    transaction: &mut NativeTransaction<'_>,
+    transaction: &mut NativeWriteBatch,
     statement: &str,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
