@@ -82,15 +82,22 @@ The residual-filter slice admits parameterized scalar predicates:
 <filter> ::= <filter> OR <term> | <term>
 <term> ::= <term> AND <factor> | <factor>
 <factor> ::= NOT <factor> | ( <filter> ) | <predicate>
-<predicate> ::= <column> { = | <> | != | < | <= | > | >= } ?
+<predicate> ::= <column> { = | <> | != | < | <= | > | >= } <scalar>
               | <column> IS [NOT] NULL
+<scalar> ::= ? | NULL | TRUE | FALSE | <signed-integer> | <text-literal>
 ```
 
 `NOT` binds tighter than `AND`, and `AND` binds tighter than `OR`. Parentheses
 override that precedence. Complete-primary-key row comparisons remain admitted
 only as top-level `AND` range terms; they are not general row expressions.
-Literals, casts, arithmetic, functions, and column-to-column comparisons remain
-outside this milestone.
+Text literals use single quotes and double an embedded quote (`'Mario''s'`).
+Boolean, text, and integer literals bind only to the same catalog logical
+family. Integer range/domain checks use the declared signed/unsigned width.
+SQL `NULL` is admissible for every comparison and evaluates to `UNKNOWN`.
+Decimal/floating/binary/temporal/UUID/JSON literals, casts, arithmetic,
+functions, and column-to-column comparisons remain outside this milestone.
+This literal slice applies to `SELECT` filters; mutation value lists remain
+parameter-only.
 
 The binder may extract complete primary-key equality, one complete
 secondary-index equality, or complete-primary-key lower/upper bounds from

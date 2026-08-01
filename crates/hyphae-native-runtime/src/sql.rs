@@ -230,7 +230,7 @@ enum FilterExpression {
     Comparison {
         columns: Vec<String>,
         operator: ComparisonOperator,
-        parameters: Vec<usize>,
+        operands: Vec<ScalarOperand>,
     },
     IsNull {
         column: String,
@@ -246,7 +246,7 @@ enum BoundFilterExpression {
     Comparison {
         columns: Vec<usize>,
         operator: ComparisonOperator,
-        parameters: Vec<usize>,
+        operands: Vec<BoundScalarOperand>,
     },
     IsNull {
         column: usize,
@@ -258,9 +258,24 @@ enum BoundFilterExpression {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ScalarOperand {
+    Parameter(usize),
+    Null,
+    Boolean(bool),
+    Integer(String),
+    Text(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoundScalarOperand {
+    Parameter(usize),
+    Literal(SqlValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct KeyBinding {
     columns: Vec<usize>,
-    parameters: Vec<usize>,
+    operands: Vec<BoundScalarOperand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -458,7 +473,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
             ..
         } if projection.as_slice() == [1]
             && key.columns.as_slice() == [0]
-            && key.parameters.as_slice() == [0] =>
+            && key.operands.as_slice() == [BoundScalarOperand::Parameter(0)] =>
         {
             Ok(snapshot.select(*table, primary_key))
         }
@@ -1591,15 +1606,25 @@ fn bind_filter_expression(
         FilterExpression::Comparison {
             columns,
             operator,
-            parameters,
-        } => Ok(BoundFilterExpression::Comparison {
-            columns: columns
+            operands,
+        } => {
+            let columns = columns
                 .iter()
                 .map(|name| column_index(&definition.columns, name))
-                .collect::<Result<Vec<_>, _>>()?,
-            operator: *operator,
-            parameters: parameters.clone(),
-        }),
+                .collect::<Result<Vec<_>, _>>()?;
+            let operands = columns
+                .iter()
+                .zip(operands)
+                .map(|(column, operand)| {
+                    bind_scalar_operand(&definition.columns[*column].logical_type, operand)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundFilterExpression::Comparison {
+                columns,
+                operator: *operator,
+                operands,
+            })
+        }
         FilterExpression::IsNull { column, negated } => Ok(BoundFilterExpression::IsNull {
             column: column_index(&definition.columns, column)?,
             negated: *negated,
@@ -1616,6 +1641,42 @@ fn bind_filter_expression(
             bind_filter_expression(definition, expression)?,
         ))),
     }
+}
+
+fn bind_scalar_operand(
+    logical_type: &LogicalType,
+    operand: &ScalarOperand,
+) -> Result<BoundScalarOperand, SqlError> {
+    let value = match operand {
+        ScalarOperand::Parameter(position) => {
+            return Ok(BoundScalarOperand::Parameter(*position));
+        }
+        ScalarOperand::Null => SqlValue::Null,
+        ScalarOperand::Boolean(value) if *logical_type == LogicalType::Boolean => {
+            SqlValue::Boolean(*value)
+        }
+        ScalarOperand::Text(value) if *logical_type == LogicalType::Text => {
+            SqlValue::Text(value.clone())
+        }
+        ScalarOperand::Integer(value) => match logical_type {
+            LogicalType::Signed(_) => {
+                SqlValue::Signed(value.parse::<i64>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            LogicalType::Unsigned(_) => {
+                SqlValue::Unsigned(value.parse::<u64>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            _ => return Err(SqlError::TypeMismatch),
+        },
+        ScalarOperand::Boolean(_) | ScalarOperand::Text(_) => {
+            return Err(SqlError::TypeMismatch);
+        }
+    };
+    if !matches!(value, SqlValue::Null) {
+        value
+            .encode_ordered_component(logical_type)
+            .map_err(|_| SqlError::TypeMismatch)?;
+    }
+    Ok(BoundScalarOperand::Literal(value))
 }
 
 fn collect_top_level_comparisons<'filter>(
@@ -1675,7 +1736,7 @@ fn find_equality_key(
     comparisons: &[&BoundFilterExpression],
     key_columns: &[usize],
 ) -> Result<Option<KeyBinding>, SqlError> {
-    let mut parameters = Vec::with_capacity(key_columns.len());
+    let mut operands = Vec::with_capacity(key_columns.len());
     for key_column in key_columns {
         let matching = comparisons
             .iter()
@@ -1683,23 +1744,23 @@ fn find_equality_key(
                 let BoundFilterExpression::Comparison {
                     columns,
                     operator: ComparisonOperator::Equal,
-                    parameters,
+                    operands,
                 } = comparison
                 else {
                     return None;
                 };
-                (columns.as_slice() == [*key_column]).then_some(parameters[0])
+                (columns.as_slice() == [*key_column]).then(|| operands[0].clone())
             })
             .collect::<Vec<_>>();
         match matching.as_slice() {
             [] => return Ok(None),
-            [parameter] => parameters.push(*parameter),
+            [operand] => operands.push(operand.clone()),
             _ => return Err(SqlError::DuplicateColumn),
         }
     }
     Ok(Some(KeyBinding {
         columns: key_columns.to_vec(),
-        parameters,
+        operands,
     }))
 }
 
@@ -1736,7 +1797,7 @@ fn bind_primary_key_range_shape(
         let BoundFilterExpression::Comparison {
             columns,
             operator,
-            parameters,
+            operands,
         } = predicate
         else {
             continue;
@@ -1747,7 +1808,7 @@ fn bind_primary_key_range_shape(
         let endpoint = PrimaryKeyRangeEndpoint {
             key: KeyBinding {
                 columns: columns.clone(),
-                parameters: parameters.clone(),
+                operands: operands.clone(),
             },
             inclusive: matches!(
                 operator,
@@ -2047,14 +2108,9 @@ fn bind_primary_key_binding(
     parameters: &[SqlValue],
 ) -> Result<Vec<u8>, SqlError> {
     let values = key
-        .parameters
+        .operands
         .iter()
-        .map(|index| {
-            parameters
-                .get(*index)
-                .cloned()
-                .ok_or(SqlError::ParameterMismatch)
-        })
+        .map(|operand| resolve_operand(operand, parameters).cloned())
         .collect::<Result<Vec<_>, _>>()?;
     bind_primary_key(definition, &key.columns, &values)
 }
@@ -2093,14 +2149,9 @@ fn bind_secondary_index_key_binding(
     parameters: &[SqlValue],
 ) -> Result<Option<Vec<u8>>, SqlError> {
     let values = key
-        .parameters
+        .operands
         .iter()
-        .map(|position| {
-            parameters
-                .get(*position)
-                .cloned()
-                .ok_or(SqlError::ParameterMismatch)
-        })
+        .map(|operand| resolve_operand(operand, parameters).cloned())
         .collect::<Result<Vec<_>, _>>()?;
     bind_secondary_index_key(relation, index, &key.columns, &values)
 }
@@ -2160,17 +2211,13 @@ fn validate_filter_parameter_types(
 ) -> Result<(), SqlError> {
     match expression {
         BoundFilterExpression::Comparison {
-            columns,
-            parameters: positions,
-            ..
+            columns, operands, ..
         } => {
-            if columns.len() != positions.len() {
+            if columns.len() != operands.len() {
                 return Err(SqlError::ParameterMismatch);
             }
-            for (column, position) in columns.iter().zip(positions) {
-                let value = parameters
-                    .get(*position)
-                    .ok_or(SqlError::ParameterMismatch)?;
+            for (column, operand) in columns.iter().zip(operands) {
+                let value = resolve_operand(operand, parameters)?;
                 if matches!(value, SqlValue::Null) {
                     continue;
                 }
@@ -2213,8 +2260,8 @@ fn evaluate_filter(
         BoundFilterExpression::Comparison {
             columns,
             operator,
-            parameters: positions,
-        } => evaluate_comparison(definition, columns, *operator, positions, row, parameters),
+            operands,
+        } => evaluate_comparison(definition, columns, *operator, operands, row, parameters),
         BoundFilterExpression::IsNull { column, negated } => {
             let is_null = matches!(
                 row.get(*column).ok_or(SqlError::InvalidStoredRow)?,
@@ -2244,16 +2291,14 @@ fn evaluate_comparison(
     definition: &RelationDefinition,
     columns: &[usize],
     operator: ComparisonOperator,
-    positions: &[usize],
+    operands: &[BoundScalarOperand],
     row: &[SqlValue],
     parameters: &[SqlValue],
 ) -> Result<TruthValue, SqlError> {
     let mut contains_unknown = false;
-    for (column, position) in columns.iter().zip(positions) {
+    for (column, operand) in columns.iter().zip(operands) {
         let left = row.get(*column).ok_or(SqlError::InvalidStoredRow)?;
-        let right = parameters
-            .get(*position)
-            .ok_or(SqlError::ParameterMismatch)?;
+        let right = resolve_operand(operand, parameters)?;
         let Some(ordering) = compare_sql_values(
             &definition
                 .columns
@@ -2297,6 +2342,18 @@ fn evaluate_comparison(
     })
 }
 
+fn resolve_operand<'value>(
+    operand: &'value BoundScalarOperand,
+    parameters: &'value [SqlValue],
+) -> Result<&'value SqlValue, SqlError> {
+    match operand {
+        BoundScalarOperand::Parameter(position) => {
+            parameters.get(*position).ok_or(SqlError::ParameterMismatch)
+        }
+        BoundScalarOperand::Literal(value) => Ok(value),
+    }
+}
+
 fn compare_sql_values(
     logical_type: &LogicalType,
     left: &SqlValue,
@@ -2323,11 +2380,9 @@ const fn truth(value: bool) -> TruthValue {
 }
 
 fn key_contains_null(key: &KeyBinding, parameters: &[SqlValue]) -> Result<bool, SqlError> {
-    key.parameters.iter().try_fold(false, |contains, position| {
-        parameters
-            .get(*position)
+    key.operands.iter().try_fold(false, |contains, operand| {
+        resolve_operand(operand, parameters)
             .map(|value| contains || matches!(value, SqlValue::Null))
-            .ok_or(SqlError::ParameterMismatch)
     })
 }
 
@@ -2823,26 +2878,24 @@ fn parse_filter_predicate(
         });
     }
     let operator = parser.comparison_operator()?;
-    let parameter_start = *parameter_count;
-    if row_value {
+    let operands = if row_value {
         parser.expect_symbol('(')?;
+        let mut operands = Vec::with_capacity(columns.len());
         for index in 0..columns.len() {
             if index != 0 {
                 parser.expect_symbol(',')?;
             }
-            parser.expect_symbol('?')?;
+            operands.push(parser.scalar_operand(parameter_count)?);
         }
         parser.expect_symbol(')')?;
+        operands
     } else {
-        parser.expect_symbol('?')?;
-    }
-    *parameter_count = parameter_count
-        .checked_add(columns.len())
-        .ok_or(SqlError::ParameterMismatch)?;
+        vec![parser.scalar_operand(parameter_count)?]
+    };
     Ok(FilterExpression::Comparison {
         columns,
         operator,
-        parameters: (parameter_start..*parameter_count).collect(),
+        operands,
     })
 }
 
@@ -2877,6 +2930,7 @@ fn parse_parameter_predicates(parser: &mut Parser) -> Result<Vec<String>, SqlErr
 enum Token {
     Word(String),
     Number(String),
+    String(String),
     Symbol(char),
 }
 
@@ -2890,7 +2944,7 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
             offset += 1;
         } else if matches!(
             character,
-            '(' | ')' | ',' | '=' | '!' | '<' | '>' | ';' | '?' | '*'
+            '(' | ')' | ',' | '=' | '!' | '<' | '>' | '-' | ';' | '?' | '*'
         ) {
             tokens.push(Token::Symbol(character));
             offset += 1;
@@ -2917,6 +2971,29 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
                 return Err(SqlError::InvalidSyntax);
             }
             tokens.push(Token::Word(identifier));
+        } else if character == '\'' {
+            offset += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while offset < characters.len() {
+                if characters[offset] == '\'' {
+                    if characters.get(offset + 1) == Some(&'\'') {
+                        value.push('\'');
+                        offset += 2;
+                    } else {
+                        offset += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    value.push(characters[offset]);
+                    offset += 1;
+                }
+            }
+            if !closed {
+                return Err(SqlError::InvalidSyntax);
+            }
+            tokens.push(Token::String(value));
         } else if character.is_ascii_digit() {
             let start = offset;
             offset += 1;
@@ -3015,6 +3092,41 @@ impl Parser {
         } else {
             Err(SqlError::InvalidSyntax)
         }
+    }
+
+    fn scalar_operand(&mut self, parameter_count: &mut usize) -> Result<ScalarOperand, SqlError> {
+        if self.consume_symbol('?') {
+            let position = *parameter_count;
+            *parameter_count = parameter_count
+                .checked_add(1)
+                .ok_or(SqlError::ParameterMismatch)?;
+            return Ok(ScalarOperand::Parameter(position));
+        }
+        if self.consume_keyword("NULL") {
+            return Ok(ScalarOperand::Null);
+        }
+        if self.consume_keyword("TRUE") {
+            return Ok(ScalarOperand::Boolean(true));
+        }
+        if self.consume_keyword("FALSE") {
+            return Ok(ScalarOperand::Boolean(false));
+        }
+        let negative = self.consume_symbol('-');
+        if let Some(Token::Number(value)) = self.tokens.get(self.offset) {
+            let value = value.clone();
+            self.offset += 1;
+            let prefix = if negative { "-" } else { "" };
+            return Ok(ScalarOperand::Integer(format!("{prefix}{value}")));
+        }
+        if negative {
+            return Err(SqlError::InvalidSyntax);
+        }
+        if let Some(Token::String(value)) = self.tokens.get(self.offset) {
+            let value = value.clone();
+            self.offset += 1;
+            return Ok(ScalarOperand::Text(value));
+        }
+        Err(SqlError::InvalidSyntax)
     }
 
     fn identifier(&mut self) -> Result<String, SqlError> {
@@ -3137,8 +3249,8 @@ mod tests {
     use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
 
     use super::{
-        ComparisonOperator, FilterExpression, Projection, SqlError, Statement, TruthValue, parse,
-        primary_key_range_is_empty,
+        ComparisonOperator, FilterExpression, Projection, ScalarOperand, SqlError, Statement,
+        TruthValue, parse, primary_key_range_is_empty,
     };
 
     #[test]
@@ -3251,12 +3363,12 @@ mod tests {
                 Box::new(FilterExpression::Comparison {
                     columns: vec!["sequence".to_owned()],
                     operator: ComparisonOperator::Equal,
-                    parameters: vec![0],
+                    operands: vec![ScalarOperand::Parameter(0)],
                 }),
                 Box::new(FilterExpression::Comparison {
                     columns: vec!["tenant".to_owned()],
                     operator: ComparisonOperator::Equal,
-                    parameters: vec![1],
+                    operands: vec![ScalarOperand::Parameter(1)],
                 }),
             ))
         );
@@ -3292,7 +3404,7 @@ mod tests {
                         FilterExpression::Comparison {
                             columns: vec!["active".to_owned()],
                             operator: ComparisonOperator::Equal,
-                            parameters: vec![0],
+                            operands: vec![ScalarOperand::Parameter(0)],
                         },
                     ))),
                     Box::new(FilterExpression::IsNull {
@@ -3303,10 +3415,69 @@ mod tests {
                 Box::new(FilterExpression::Comparison {
                     columns: vec!["score".to_owned()],
                     operator: ComparisonOperator::NotEqual,
-                    parameters: vec![1],
+                    operands: vec![ScalarOperand::Parameter(1)],
                 }),
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_literals_parse_exactly_and_preserve_parameter_positions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Statement::Select {
+            filter,
+            parameter_count,
+            ..
+        } = parse(
+            "SELECT id FROM events
+             WHERE id >= -2
+               AND active = TRUE
+               AND note = 'Mario''s'
+               AND score > ?
+             LIMIT 4",
+        )?
+        else {
+            return Err("expected literal select".into());
+        };
+        assert_eq!(parameter_count, 1);
+        assert_eq!(
+            filter,
+            Some(FilterExpression::And(
+                Box::new(FilterExpression::And(
+                    Box::new(FilterExpression::And(
+                        Box::new(FilterExpression::Comparison {
+                            columns: vec!["id".to_owned()],
+                            operator: ComparisonOperator::GreaterOrEqual,
+                            operands: vec![ScalarOperand::Integer("-2".to_owned())],
+                        }),
+                        Box::new(FilterExpression::Comparison {
+                            columns: vec!["active".to_owned()],
+                            operator: ComparisonOperator::Equal,
+                            operands: vec![ScalarOperand::Boolean(true)],
+                        }),
+                    )),
+                    Box::new(FilterExpression::Comparison {
+                        columns: vec!["note".to_owned()],
+                        operator: ComparisonOperator::Equal,
+                        operands: vec![ScalarOperand::Text("Mario's".to_owned())],
+                    }),
+                )),
+                Box::new(FilterExpression::Comparison {
+                    columns: vec!["score".to_owned()],
+                    operator: ComparisonOperator::Greater,
+                    operands: vec![ScalarOperand::Parameter(0)],
+                }),
+            ))
+        );
+        assert!(matches!(
+            parse("SELECT id FROM events WHERE note = 'unterminated LIMIT 1"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            parse("SELECT id FROM events WHERE score = -TRUE LIMIT 1"),
+            Err(SqlError::InvalidSyntax)
+        ));
         Ok(())
     }
 
@@ -3407,12 +3578,12 @@ mod tests {
                 Box::new(FilterExpression::Comparison {
                     columns: vec!["tenant".to_owned(), "sequence".to_owned()],
                     operator: ComparisonOperator::GreaterOrEqual,
-                    parameters: vec![0, 1],
+                    operands: vec![ScalarOperand::Parameter(0), ScalarOperand::Parameter(1),],
                 }),
                 Box::new(FilterExpression::Comparison {
                     columns: vec!["tenant".to_owned(), "sequence".to_owned()],
                     operator: ComparisonOperator::Less,
-                    parameters: vec![2, 3],
+                    operands: vec![ScalarOperand::Parameter(2), ScalarOperand::Parameter(3),],
                 }),
             ))
         );
@@ -3431,7 +3602,7 @@ mod tests {
                 == Some(FilterExpression::Comparison {
                     columns: vec!["sequence".to_owned()],
                     operator: ComparisonOperator::Greater,
-                    parameters: vec![0],
+                    operands: vec![ScalarOperand::Parameter(0)],
                 }) && order_by.is_empty()
         ));
         assert!(matches!(
@@ -3517,7 +3688,7 @@ mod tests {
                         == Some(FilterExpression::Comparison {
                             columns: vec!["email".to_owned()],
                             operator: ComparisonOperator::Equal,
-                            parameters: vec![0],
+                            operands: vec![ScalarOperand::Parameter(0)],
                         })
         ));
         Ok(())
