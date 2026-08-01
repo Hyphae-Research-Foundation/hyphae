@@ -181,6 +181,16 @@ secondary ranges, descending/offset execution, zero-copy operator cursors,
 joins, aggregation, statistics/cost planning, and the remaining G2/G7
 evidence remain open.
 
+The [native primary-key range
+evidence](evidence/native-primary-key-ranges-2026-08-01.md) binds independent
+inclusive/exclusive physical bounds, separator pruning, composite SQL row
+comparisons, transaction/materialized/current-root equivalence, empty-range
+safety, reopen and failure coverage, and a clean schema-v9 WSL2 observation to
+one source commit. Residual/non-key filters, partial PK prefixes, secondary
+ranges, descending/offset execution, zero-copy operator cursors, joins,
+aggregation, statistics/cost planning, and the remaining G2/G7 evidence
+remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

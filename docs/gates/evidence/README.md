@@ -126,6 +126,16 @@ commit before its tag can be published.
   release observation for direct and prepared-SQL `LIMIT 10` scans over a
   multilevel 2,048-row typed relation. Each scan timer sample is one complete
   call; the result remains outside G7.
+- [Native primary-key range evidence —
+  2026-08-01](native-primary-key-ranges-2026-08-01.md) binds inclusive,
+  exclusive and unbounded prefix-range visitation, public current-root
+  primary-key bounds, composite SQL row comparisons, three-executor
+  equivalence, empty-range safety, reopen/failure coverage, and explicit
+  remaining G2/G7 limits to one source commit.
+- `native-microsecond-smoke-primary-range-wsl2.json` is its schema-v9 clean
+  release observation for direct and prepared-SQL `[1024, 1034)` primary-key
+  ranges over a multilevel 2,048-row typed relation. Each range timer sample
+  is one complete call; the result remains outside G7.
 
 ## Hosted release evidence
 

@@ -1,0 +1,136 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v9",
+  "status": "observation-not-gate",
+  "commit": "3d42f0b6ce8733654e31710fa9b8a33325d0c80e",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "observations_per_operation": 1000000,
+  "operations_per_observation": 32,
+  "warmup_per_operation": 100000,
+  "search_observations": 100000,
+  "search_operations_per_observation": 1,
+  "secondary_observations": 100000,
+  "secondary_operations_per_observation": 1,
+  "scan_limit": 10,
+  "range_lower_row_inclusive": 1024,
+  "range_upper_row_exclusive": 1034,
+  "scan_observations": 100000,
+  "scan_operations_per_observation": 1,
+  "concurrency": 1,
+  "durability": "memory",
+  "warm_state": true,
+  "proofs": false,
+  "primary_relational_rows": 2049,
+  "secondary_index_rows": 2048,
+  "relational_rows": 4097,
+  "relational_tree_height": 2,
+  "structure_keys": 2048,
+  "structure_tree_height": 2,
+  "hash_fields": 2048,
+  "search_documents": 2048,
+  "search_tree_height": 2,
+  "search_query_document_frequency": 1,
+  "dataset_digest_blake3": "375892d8e3a54aae47949dcb111c5fb0d2bd2d21fc0ae431bc2b9c952cadc80d",
+  "transport_note": "codec plus embedded dispatch; no named-pipe transport",
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.034,
+      "p95_us": 0.039,
+      "p99_us": 0.068,
+      "p99_9_us": 0.367,
+      "throughput_ops_s": 26636747
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.508,
+      "p95_us": 0.652,
+      "p99_us": 1.437,
+      "p99_9_us": 3.707,
+      "throughput_ops_s": 1814645
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.071,
+      "p95_us": 0.084,
+      "p99_us": 0.163,
+      "p99_9_us": 0.799,
+      "throughput_ops_s": 12911069
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 0.880,
+      "p95_us": 1.172,
+      "p99_us": 2.391,
+      "p99_9_us": 4.953,
+      "throughput_ops_s": 1057743
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 14.210,
+      "p95_us": 20.115,
+      "p99_us": 41.372,
+      "p99_9_us": 128.631,
+      "throughput_ops_s": 63748
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.033,
+      "p95_us": 0.036,
+      "p99_us": 0.070,
+      "p99_9_us": 0.412,
+      "throughput_ops_s": 27533393
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 0.960,
+      "p95_us": 1.341,
+      "p99_us": 2.748,
+      "p99_9_us": 5.820,
+      "throughput_ops_s": 948601
+    },
+    "buffered_relational_btree_pk_scan_limit10_multilevel": {
+      "p50_us": 8.922,
+      "p95_us": 11.356,
+      "p99_us": 22.981,
+      "p99_9_us": 103.277,
+      "throughput_ops_s": 102476
+    },
+    "physical_prepared_sql_pk_scan_limit10_multilevel": {
+      "p50_us": 9.762,
+      "p95_us": 13.043,
+      "p99_us": 26.937,
+      "p99_9_us": 120.185,
+      "throughput_ops_s": 92415
+    },
+    "buffered_relational_btree_pk_range_limit10_multilevel": {
+      "p50_us": 9.362,
+      "p95_us": 13.113,
+      "p99_us": 24.271,
+      "p99_9_us": 108.562,
+      "throughput_ops_s": 96323
+    },
+    "physical_prepared_sql_pk_range_limit10_multilevel": {
+      "p50_us": 10.408,
+      "p95_us": 14.086,
+      "p99_us": 26.164,
+      "p99_9_us": 98.951,
+      "throughput_ops_s": 87987
+    },
+    "buffered_relational_btree_secondary_exact_unique_multilevel": {
+      "p50_us": 6.946,
+      "p95_us": 10.292,
+      "p99_us": 24.077,
+      "p99_9_us": 90.126,
+      "throughput_ops_s": 127279
+    },
+    "physical_prepared_sql_secondary_exact_unique_multilevel": {
+      "p50_us": 7.199,
+      "p95_us": 11.749,
+      "p99_us": 24.903,
+      "p99_9_us": 94.916,
+      "throughput_ops_s": 120614
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.055,
+      "p95_us": 0.075,
+      "p99_us": 0.164,
+      "p99_9_us": 0.901,
+      "throughput_ops_s": 16130881
+    }
+  }
+}
