@@ -98,6 +98,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native optimistic-writer evidence — 2026-08-01](gates/evidence/native-optimistic-writers-2026-08-01.md)
 - [Native structure B+tree evidence — 2026-08-01](gates/evidence/native-structure-btree-2026-08-01.md)
 - [Native scalar structure mutation evidence — 2026-08-01](gates/evidence/native-scalar-structure-mutations-2026-08-01.md)
+- [Native hash structure evidence — 2026-08-01](gates/evidence/native-hash-structure-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),

@@ -68,6 +68,13 @@ commit before its tag can be published.
 - `native-microsecond-smoke-scalar-mutations-wsl2.json` is the matched clean
   read-path observation for that scalar-mutation source commit. It does not
   time mutations and remains outside G7.
+- [Native hash structure evidence —
+  2026-08-01](native-hash-structure-2026-08-01.md) binds the first compound
+  structure family, field-granular storage/conflicts, cardinality validation,
+  multilevel recovery, and explicit remaining G3 limits.
+- `native-microsecond-smoke-hash-wsl2.json` is its schema-v5 clean physical
+  `HGET` observation over 2,048 fields. It does not time mutations and remains
+  outside G7.
 
 ## Hosted release evidence
 

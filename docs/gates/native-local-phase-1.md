@@ -107,6 +107,13 @@ checked signed counters, exact-boundary TTL absence, WAL expiry-presence
 compatibility, same-key conflict admission, and crash recovery to one source
 commit.
 
+The [native hash structure
+evidence](evidence/native-hash-structure-2026-08-01.md) binds the first
+compound family: explicit type creation, independent field storage,
+cardinality metadata, field tombstones, field-granular conflict/rebase,
+multilevel scale, corruption rejection, crash recovery, and direct `HGET`
+latency to one source commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -116,10 +123,11 @@ bounded single-page scaffolding. Detached transactions now prepare concurrently
 and rebase disjoint all-engine writes under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary indexes, remaining structure
-families, postings, segments, and ANN required by G1–G4. The scalar structure
+families, postings, segments, and ANN required by G1–G4. The structure
 keyspace has a multilevel native B+tree, direct reads, tombstone/expiry
-mutations, conditional writes, and signed counters; it still lacks the
-collection families, expiry scheduler, model tests, and amplification evidence
+mutations, conditional writes, signed counters, and the first independent-field
+hash layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
+sets, streams, the expiry scheduler, model tests, and amplification evidence
 required to close G3.
 
 ## G1 substrate exit

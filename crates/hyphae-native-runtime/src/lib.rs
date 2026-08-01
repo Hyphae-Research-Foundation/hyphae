@@ -3940,8 +3940,8 @@ mod tests {
     }
 
     #[test]
-    fn multilevel_hash_fields_retain_snapshots_and_reopen()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn multilevel_hash_fields_retain_snapshots_and_reopen() -> Result<(), Box<dyn std::error::Error>>
+    {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         let target = 1_024_u32.to_be_bytes();
