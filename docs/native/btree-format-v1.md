@@ -161,6 +161,18 @@ HYRELBT1/HYRELBT2 visibility and blobs, skips visible tombstones, and stops
 when the requested live-row count is reached. It returns only that bounded
 owned page and never constructs the complete `RelationState`.
 
+The buffered visitor also accepts independent full-key `Included`, `Excluded`,
+or `Unbounded` lower and upper bounds. Bounds are intersected with the
+namespace prefix. Internal traversal compares each child's separator interval
+with both bounds and does not read disjoint subtrees; leaf traversal applies
+exact inclusivity and retains early-stop control flow. The cursor API is a
+wrapper over this range visitor with an exclusive lower bound.
+
+`scan_latest_relational_range(table, lower, upper, limit)` maps canonical
+primary-key bounds into the table's physical namespace, validates the table
+marker, resolves only visible row versions, skips tombstones, and returns no
+rows for inverted or equal-open intervals.
+
 This namespace remains the first physical relational route, not the complete
 SQL storage design. Secondary-key range cursors, a stateful zero-copy cursor,
 prefix compression, bulk load, primary-key-changing updates, free-space
@@ -209,7 +221,9 @@ semantics, buffered lookup/scan, oversized and noncanonical rejection,
 complete-node validation after an early key match, and future-node rejection.
 Buffered visitor coverage additionally proves exclusive resume, early stop,
 multilevel traversal, order equivalence with the materialized prefix scan, and
-exhaustion after the final key.
+exhaustion after the final key. Bound-aware visitor coverage proves inclusive
+and exclusive endpoints, half-open intervals, inverted/empty ranges, namespace
+intersection, multilevel separator pruning, and early stop.
 Runtime coverage additionally proves secondary-index backfill, insert,
 uniqueness, both optimistic index/row commit orders, catalog/root reopen, and
 missing-projection rejection. Direct exact lookup coverage uses a multilevel
@@ -222,6 +236,10 @@ Bounded relational scan coverage uses a multilevel tree, tombstoned and updated
 rows, exclusive pagination, zero limit, unknown relation, HYRELBT1/HYRELBT2
 reopen, and equality across transaction, materialized snapshot, and current
 physical SQL execution.
+Bounded primary-key range coverage compares transaction-private, materialized
+snapshot, and current-root physical execution for a composite key; it includes
+one-sided and mixed bounds, tombstones, inverted/equal-open safety, type/null
+and arity rejection, plan introspection, and reopen equivalence.
 The runtime benchmark refuses to run unless its relational, structure, and
 search trees are multilevel. Fuzzing, randomized model equivalence,
 sector/filesystem power-loss tests, fanout/fill-factor tuning, secondary-range

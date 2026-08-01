@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ops::Bound;
+
 use hyphae_native_catalog::{
     CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
     SecondaryIndexDefinition,
@@ -124,6 +126,15 @@ enum PreparedPlan {
         limit: usize,
         legacy_binary: bool,
     },
+    PrimaryKeyRangeScan {
+        table: ObjectId,
+        relation: Box<RelationDefinition>,
+        projection: Vec<usize>,
+        output_columns: Vec<String>,
+        range: PrimaryKeyRange,
+        limit: usize,
+        legacy_binary: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,14 +166,14 @@ enum Statement {
     Select {
         name: String,
         projection: Projection,
-        predicates: Vec<String>,
+        predicates: Vec<SelectPredicate>,
         order_by: Vec<String>,
         limit: Option<usize>,
     },
     ExplainSelect {
         name: String,
         projection: Projection,
-        predicates: Vec<String>,
+        predicates: Vec<SelectPredicate>,
         order_by: Vec<String>,
         limit: Option<usize>,
     },
@@ -187,6 +198,43 @@ enum Projection {
     Columns(Vec<String>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComparisonOperator {
+    Equal,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectPredicate {
+    columns: Vec<String>,
+    operator: ComparisonOperator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeyRangeEndpoint {
+    parameter_offset: usize,
+    parameter_columns: Vec<usize>,
+    inclusive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeyRange {
+    lower: Option<PrimaryKeyRangeEndpoint>,
+    upper: Option<PrimaryKeyRangeEndpoint>,
+    parameter_count: usize,
+}
+
+type PrimaryKeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+#[derive(Clone, Copy)]
+struct ScanExecution {
+    limit: usize,
+    legacy_binary: bool,
+}
+
 struct BoundSelect {
     table: ObjectId,
     projection: Vec<usize>,
@@ -196,9 +244,21 @@ struct BoundSelect {
 }
 
 enum SelectAccess {
-    PrimaryKey { legacy_binary: bool },
-    SecondaryIndex { index: ObjectId },
-    PrimaryKeyScan { limit: usize, legacy_binary: bool },
+    PrimaryKey {
+        legacy_binary: bool,
+    },
+    SecondaryIndex {
+        index: ObjectId,
+    },
+    PrimaryKeyScan {
+        limit: usize,
+        legacy_binary: bool,
+    },
+    PrimaryKeyRangeScan {
+        range: PrimaryKeyRange,
+        limit: usize,
+        legacy_binary: bool,
+    },
 }
 
 pub(crate) fn prepare(
@@ -258,6 +318,19 @@ pub(crate) fn prepare_catalog(
             limit,
             legacy_binary,
         },
+        SelectAccess::PrimaryKeyRangeScan {
+            range,
+            limit,
+            legacy_binary,
+        } => PreparedPlan::PrimaryKeyRangeScan {
+            table: bound.table,
+            relation: Box::new(relation),
+            projection: bound.projection,
+            output_columns: bound.output_columns,
+            range,
+            limit,
+            legacy_binary,
+        },
     };
     Ok(PreparedStatement {
         catalog_version,
@@ -302,7 +375,8 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         }
         PreparedPlan::PrimaryKeyLookup { .. }
         | PreparedPlan::SecondaryIndexLookup { .. }
-        | PreparedPlan::PrimaryKeyScan { .. } => Err(SqlError::ParameterMismatch),
+        | PreparedPlan::PrimaryKeyScan { .. }
+        | PreparedPlan::PrimaryKeyRangeScan { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -450,6 +524,9 @@ fn execute_bound_snapshot(
             })
         }
         PreparedPlan::PrimaryKeyScan { .. } => execute_snapshot_scan(snapshot, plan, parameters),
+        PreparedPlan::PrimaryKeyRangeScan { .. } => {
+            execute_snapshot_range_scan(snapshot, plan, parameters)
+        }
     }
 }
 
@@ -534,6 +611,9 @@ fn execute_bound_latest(
         PreparedPlan::PrimaryKeyScan { .. } => {
             execute_latest_scan(database, snapshot, plan, parameters)
         }
+        PreparedPlan::PrimaryKeyRangeScan { .. } => {
+            execute_latest_range_scan(database, snapshot, plan, parameters)
+        }
     }
 }
 
@@ -617,6 +697,96 @@ fn execute_latest_scan(
     })
 }
 
+fn execute_snapshot_range_scan(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyRangeScan {
+        table,
+        relation,
+        projection,
+        output_columns,
+        range,
+        limit,
+        legacy_binary,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let (lower, upper) = bind_primary_key_range(relation, range, parameters)?;
+    let stored_rows = snapshot
+        .state
+        .relational
+        .tables
+        .get(table)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    if primary_key_range_is_empty(&lower, &upper) {
+        return Ok(SqlResult::Rows {
+            columns: output_columns.clone(),
+            rows: Vec::new(),
+        });
+    }
+    let rows = stored_rows
+        .range((lower, upper))
+        .take(*limit)
+        .map(|(primary_key, stored)| {
+            materialize_scanned_row(relation, projection, *legacy_binary, primary_key, stored)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
+fn execute_latest_range_scan(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyRangeScan {
+        table,
+        relation,
+        projection,
+        output_columns,
+        range,
+        limit,
+        legacy_binary,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let (lower, upper) = bind_primary_key_range(relation, range, parameters)?;
+    let matches = database.scan_relational_range_at(
+        snapshot,
+        *table,
+        crate::bound_as_slice(&lower),
+        crate::bound_as_slice(&upper),
+        *limit,
+    )?;
+    let rows = matches
+        .into_iter()
+        .map(|matched| {
+            if matched.table != *table {
+                return Err(SqlError::InvalidCatalogObject);
+            }
+            materialize_scanned_row(
+                relation,
+                projection,
+                *legacy_binary,
+                &matched.primary_key,
+                &matched.row,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
 fn execute_create_index(
     transaction: &mut NativeWriteBatch,
     name: &str,
@@ -670,7 +840,7 @@ fn execute_explain(
     transaction: &NativeWriteBatch,
     name: &str,
     projection: &Projection,
-    predicates: &[String],
+    predicates: &[SelectPredicate],
     order_by: &[String],
     limit: Option<usize>,
     parameters: &[SqlValue],
@@ -696,6 +866,12 @@ fn execute_explain(
         SelectAccess::PrimaryKeyScan { limit, .. } => {
             format!("PrimaryKeyScan(table={},limit={limit})", bound.table)
         }
+        SelectAccess::PrimaryKeyRangeScan { range, limit, .. } => format!(
+            "PrimaryKeyRangeScan(table={},lower={},upper={},limit={limit})",
+            bound.table,
+            range_bound_name(range.lower.as_ref()),
+            range_bound_name(range.upper.as_ref()),
+        ),
     };
     Ok(SqlResult::Rows {
         columns: vec!["plan".to_owned()],
@@ -864,7 +1040,7 @@ fn execute_select(
     transaction: &NativeWriteBatch,
     name: &str,
     projection: &Projection,
-    predicates: &[String],
+    predicates: &[SelectPredicate],
     order_by: &[String],
     limit: Option<usize>,
     parameters: &[SqlValue],
@@ -937,29 +1113,31 @@ fn execute_select(
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary,
-        } => {
-            if !parameters.is_empty() {
-                return Err(SqlError::ParameterMismatch);
-            }
-            transaction
-                .state
-                .relational
-                .tables
-                .get(&bound.table)
-                .ok_or(SqlError::InvalidStoredRow)?
-                .iter()
-                .take(limit)
-                .map(|(primary_key, stored)| {
-                    materialize_scanned_row(
-                        definition,
-                        &bound.projection,
-                        legacy_binary,
-                        primary_key,
-                        stored,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        }
+        } => transaction_scan_rows(
+            transaction,
+            bound.table,
+            definition,
+            &bound.projection,
+            limit,
+            legacy_binary,
+            parameters,
+        )?,
+        SelectAccess::PrimaryKeyRangeScan {
+            range,
+            limit,
+            legacy_binary,
+        } => transaction_range_rows(
+            transaction,
+            bound.table,
+            definition,
+            &bound.projection,
+            &range,
+            ScanExecution {
+                limit,
+                legacy_binary,
+            },
+            parameters,
+        )?,
     };
     Ok(SqlResult::Rows {
         columns: bound.output_columns,
@@ -967,11 +1145,71 @@ fn execute_select(
     })
 }
 
+fn transaction_scan_rows(
+    transaction: &NativeWriteBatch,
+    table: ObjectId,
+    definition: &RelationDefinition,
+    projection: &[usize],
+    limit: usize,
+    legacy_binary: bool,
+    parameters: &[SqlValue],
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    transaction
+        .state
+        .relational
+        .tables
+        .get(&table)
+        .ok_or(SqlError::InvalidStoredRow)?
+        .iter()
+        .take(limit)
+        .map(|(primary_key, stored)| {
+            materialize_scanned_row(definition, projection, legacy_binary, primary_key, stored)
+        })
+        .collect()
+}
+
+fn transaction_range_rows(
+    transaction: &NativeWriteBatch,
+    table: ObjectId,
+    definition: &RelationDefinition,
+    projection: &[usize],
+    range: &PrimaryKeyRange,
+    execution: ScanExecution,
+    parameters: &[SqlValue],
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let (lower, upper) = bind_primary_key_range(definition, range, parameters)?;
+    let stored_rows = transaction
+        .state
+        .relational
+        .tables
+        .get(&table)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    if primary_key_range_is_empty(&lower, &upper) {
+        return Ok(Vec::new());
+    }
+    stored_rows
+        .range((lower, upper))
+        .take(execution.limit)
+        .map(|(primary_key, stored)| {
+            materialize_scanned_row(
+                definition,
+                projection,
+                execution.legacy_binary,
+                primary_key,
+                stored,
+            )
+        })
+        .collect()
+}
+
 fn bind_select(
     catalog: &crate::model::CatalogState,
     name: &str,
     projection: &Projection,
-    predicates: &[String],
+    predicates: &[SelectPredicate],
     order_by: &[String],
     limit: Option<usize>,
 ) -> Result<BoundSelect, SqlError> {
@@ -983,57 +1221,47 @@ fn bind_select(
             .map(|name| column_index(&definition.columns, name))
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let mut parameter_columns = Vec::with_capacity(predicates.len());
-    for predicate in predicates {
-        let column = column_index(&definition.columns, predicate)?;
-        if parameter_columns.contains(&column) {
-            return Err(SqlError::DuplicateColumn);
-        }
-        parameter_columns.push(column);
-    }
     let expected_primary_key = primary_key_indices(definition)?;
-    let access = if parameter_columns.is_empty() {
+    let legacy_binary = is_legacy_binary_relation(definition);
+    let (parameter_columns, access) = if predicates.is_empty() {
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
-        if !order_by.is_empty() {
-            let ordered_columns = order_by
-                .iter()
-                .map(|name| column_index(&definition.columns, name))
-                .collect::<Result<Vec<_>, _>>()?;
-            if ordered_columns != expected_primary_key {
-                return Err(SqlError::InvalidPrimaryKey);
-            }
+        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
+        (
+            Vec::new(),
+            SelectAccess::PrimaryKeyScan {
+                limit,
+                legacy_binary,
+            },
+        )
+    } else if predicates
+        .iter()
+        .all(|predicate| predicate.operator == ComparisonOperator::Equal)
+    {
+        if !order_by.is_empty() || limit.is_some() {
+            return Err(SqlError::InvalidSyntax);
         }
-        SelectAccess::PrimaryKeyScan {
-            limit,
-            legacy_binary: is_legacy_binary_relation(definition),
-        }
-    } else if !order_by.is_empty() || limit.is_some() {
-        return Err(SqlError::InvalidSyntax);
-    } else if same_column_set(&parameter_columns, &expected_primary_key) {
-        SelectAccess::PrimaryKey {
-            legacy_binary: is_legacy_binary_relation(definition),
-        }
+        let parameter_columns = bind_equality_predicate_columns(definition, predicates)?;
+        let access = bind_equality_access(
+            catalog,
+            table,
+            definition,
+            &parameter_columns,
+            &expected_primary_key,
+            legacy_binary,
+        )?;
+        (parameter_columns, access)
     } else {
-        let secondary_index = catalog.objects.iter().find_map(|(id, object)| {
-            let CatalogObject::SecondaryIndex(index) = object else {
-                return None;
-            };
-            if index.relation != table {
-                return None;
-            }
-            let columns = secondary_index_column_indices(definition, index).ok()?;
-            same_column_set(&parameter_columns, &columns).then_some(*id)
-        });
-        match secondary_index {
-            Some(index) => SelectAccess::SecondaryIndex { index },
-            None if parameter_columns
-                .iter()
-                .any(|column| expected_primary_key.contains(column)) =>
-            {
-                return Err(SqlError::InvalidPrimaryKey);
-            }
-            None => return Err(SqlError::NoAccessPath),
-        }
+        let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
+        let range = bind_primary_key_range_shape(definition, predicates, &expected_primary_key)?;
+        (
+            Vec::new(),
+            SelectAccess::PrimaryKeyRangeScan {
+                range,
+                limit,
+                legacy_binary,
+            },
+        )
     };
     let output_columns = projection
         .iter()
@@ -1046,6 +1274,136 @@ fn bind_select(
         output_columns,
         access,
     })
+}
+
+fn validate_primary_key_order(
+    definition: &RelationDefinition,
+    order_by: &[String],
+    expected_primary_key: &[usize],
+) -> Result<(), SqlError> {
+    if order_by.is_empty() {
+        return Ok(());
+    }
+    let ordered_columns = order_by
+        .iter()
+        .map(|name| column_index(&definition.columns, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ordered_columns == expected_primary_key {
+        Ok(())
+    } else {
+        Err(SqlError::InvalidPrimaryKey)
+    }
+}
+
+fn bind_equality_predicate_columns(
+    definition: &RelationDefinition,
+    predicates: &[SelectPredicate],
+) -> Result<Vec<usize>, SqlError> {
+    let mut columns = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        let [name] = predicate.columns.as_slice() else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        let column = column_index(&definition.columns, name)?;
+        if columns.contains(&column) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        columns.push(column);
+    }
+    Ok(columns)
+}
+
+fn bind_equality_access(
+    catalog: &crate::model::CatalogState,
+    table: ObjectId,
+    definition: &RelationDefinition,
+    parameter_columns: &[usize],
+    expected_primary_key: &[usize],
+    legacy_binary: bool,
+) -> Result<SelectAccess, SqlError> {
+    if same_column_set(parameter_columns, expected_primary_key) {
+        return Ok(SelectAccess::PrimaryKey { legacy_binary });
+    }
+    let secondary_index = catalog.objects.iter().find_map(|(id, object)| {
+        let CatalogObject::SecondaryIndex(index) = object else {
+            return None;
+        };
+        if index.relation != table {
+            return None;
+        }
+        let columns = secondary_index_column_indices(definition, index).ok()?;
+        same_column_set(parameter_columns, &columns).then_some(*id)
+    });
+    match secondary_index {
+        Some(index) => Ok(SelectAccess::SecondaryIndex { index }),
+        None if parameter_columns
+            .iter()
+            .any(|column| expected_primary_key.contains(column)) =>
+        {
+            Err(SqlError::InvalidPrimaryKey)
+        }
+        None => Err(SqlError::NoAccessPath),
+    }
+}
+
+fn bind_primary_key_range_shape(
+    definition: &RelationDefinition,
+    predicates: &[SelectPredicate],
+    expected_primary_key: &[usize],
+) -> Result<PrimaryKeyRange, SqlError> {
+    let mut lower = None;
+    let mut upper = None;
+    let mut parameter_count = 0_usize;
+    for predicate in predicates {
+        let columns = predicate
+            .columns
+            .iter()
+            .map(|name| column_index(&definition.columns, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns != expected_primary_key {
+            return Err(SqlError::InvalidPrimaryKey);
+        }
+        let endpoint = PrimaryKeyRangeEndpoint {
+            parameter_offset: parameter_count,
+            parameter_columns: columns,
+            inclusive: matches!(
+                predicate.operator,
+                ComparisonOperator::GreaterOrEqual | ComparisonOperator::LessOrEqual
+            ),
+        };
+        parameter_count = parameter_count
+            .checked_add(endpoint.parameter_columns.len())
+            .ok_or(SqlError::ParameterMismatch)?;
+        match predicate.operator {
+            ComparisonOperator::Greater | ComparisonOperator::GreaterOrEqual => {
+                if lower.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidPrimaryKey);
+                }
+            }
+            ComparisonOperator::Less | ComparisonOperator::LessOrEqual => {
+                if upper.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidPrimaryKey);
+                }
+            }
+            ComparisonOperator::Equal => return Err(SqlError::InvalidSyntax),
+        }
+    }
+    if lower.is_none() && upper.is_none() {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    Ok(PrimaryKeyRange {
+        lower,
+        upper,
+        parameter_count,
+    })
+}
+
+fn range_bound_name(endpoint: Option<&PrimaryKeyRangeEndpoint>) -> &'static str {
+    match endpoint {
+        Some(endpoint) if endpoint.inclusive => "inclusive",
+        Some(_) => "exclusive",
+        None => "unbounded",
+    }
 }
 
 fn same_column_set(left: &[usize], right: &[usize]) -> bool {
@@ -1243,6 +1601,66 @@ fn bind_primary_key(
         values[column] = Some(value);
     }
     encode_primary_key(definition, &values)
+}
+
+fn bind_primary_key_range(
+    definition: &RelationDefinition,
+    range: &PrimaryKeyRange,
+    parameters: &[SqlValue],
+) -> Result<PrimaryKeyBounds, SqlError> {
+    if parameters.len() != range.parameter_count {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let lower = bind_primary_key_range_endpoint(definition, range.lower.as_ref(), parameters)?
+        .map_or(Bound::Unbounded, |(key, inclusive)| {
+            if inclusive {
+                Bound::Included(key)
+            } else {
+                Bound::Excluded(key)
+            }
+        });
+    let upper = bind_primary_key_range_endpoint(definition, range.upper.as_ref(), parameters)?
+        .map_or(Bound::Unbounded, |(key, inclusive)| {
+            if inclusive {
+                Bound::Included(key)
+            } else {
+                Bound::Excluded(key)
+            }
+        });
+    Ok((lower, upper))
+}
+
+fn primary_key_range_is_empty(lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> bool {
+    let (lower_key, lower_inclusive) = match lower {
+        Bound::Included(key) => (key, true),
+        Bound::Excluded(key) => (key, false),
+        Bound::Unbounded => return false,
+    };
+    let (upper_key, upper_inclusive) = match upper {
+        Bound::Included(key) => (key, true),
+        Bound::Excluded(key) => (key, false),
+        Bound::Unbounded => return false,
+    };
+    lower_key > upper_key || (lower_key == upper_key && !(lower_inclusive && upper_inclusive))
+}
+
+fn bind_primary_key_range_endpoint(
+    definition: &RelationDefinition,
+    endpoint: Option<&PrimaryKeyRangeEndpoint>,
+    parameters: &[SqlValue],
+) -> Result<Option<(Vec<u8>, bool)>, SqlError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+    let end = endpoint
+        .parameter_offset
+        .checked_add(endpoint.parameter_columns.len())
+        .ok_or(SqlError::ParameterMismatch)?;
+    let values = parameters
+        .get(endpoint.parameter_offset..end)
+        .ok_or(SqlError::ParameterMismatch)?;
+    let primary_key = bind_primary_key(definition, &endpoint.parameter_columns, values)?;
+    Ok(Some((primary_key, endpoint.inclusive)))
 }
 
 fn bind_secondary_index_key(
@@ -1669,7 +2087,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     let predicates = if parser.consume_keyword("WHERE") {
-        parse_parameter_predicates(parser)?
+        parse_select_predicates(parser)?
     } else {
         Vec::new()
     };
@@ -1688,11 +2106,16 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         None
     };
-    if predicates.is_empty() {
-        if limit.is_none() {
-            return Err(SqlError::InvalidSyntax);
-        }
-    } else if !order_by.is_empty() || limit.is_some() {
+    if predicates.is_empty() && limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let equality_only = predicates
+        .iter()
+        .all(|predicate| predicate.operator == ComparisonOperator::Equal);
+    if !predicates.is_empty() && equality_only && (!order_by.is_empty() || limit.is_some()) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    if !predicates.is_empty() && !equality_only && limit.is_none() {
         return Err(SqlError::InvalidSyntax);
     }
     Ok(Statement::Select {
@@ -1702,6 +2125,44 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         order_by,
         limit,
     })
+}
+
+fn parse_select_predicates(parser: &mut Parser) -> Result<Vec<SelectPredicate>, SqlError> {
+    let mut predicates = Vec::new();
+    loop {
+        predicates.push(parse_select_predicate(parser)?);
+        if !parser.consume_keyword("AND") {
+            break;
+        }
+    }
+    Ok(predicates)
+}
+
+fn parse_select_predicate(parser: &mut Parser) -> Result<SelectPredicate, SqlError> {
+    let row_value = parser.consume_symbol('(');
+    let columns = if row_value {
+        let columns = parser.identifier_list(')')?;
+        if columns.len() < 2 {
+            return Err(SqlError::InvalidSyntax);
+        }
+        columns
+    } else {
+        vec![parser.identifier()?]
+    };
+    let operator = parser.comparison_operator()?;
+    if row_value {
+        parser.expect_symbol('(')?;
+        for index in 0..columns.len() {
+            if index != 0 {
+                parser.expect_symbol(',')?;
+            }
+            parser.expect_symbol('?')?;
+        }
+        parser.expect_symbol(')')?;
+    } else {
+        parser.expect_symbol('?')?;
+    }
+    Ok(SelectPredicate { columns, operator })
 }
 
 fn parse_parameter_predicates(parser: &mut Parser) -> Result<Vec<String>, SqlError> {
@@ -1732,7 +2193,10 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
         let character = characters[offset];
         if character.is_whitespace() {
             offset += 1;
-        } else if matches!(character, '(' | ')' | ',' | '=' | ';' | '?' | '*') {
+        } else if matches!(
+            character,
+            '(' | ')' | ',' | '=' | '<' | '>' | ';' | '?' | '*'
+        ) {
             tokens.push(Token::Symbol(character));
             offset += 1;
         } else if character == '"' {
@@ -1822,6 +2286,26 @@ impl Parser {
     fn expect_symbol(&mut self, expected: char) -> Result<(), SqlError> {
         if self.consume_symbol(expected) {
             Ok(())
+        } else {
+            Err(SqlError::InvalidSyntax)
+        }
+    }
+
+    fn comparison_operator(&mut self) -> Result<ComparisonOperator, SqlError> {
+        if self.consume_symbol('=') {
+            Ok(ComparisonOperator::Equal)
+        } else if self.consume_symbol('<') {
+            if self.consume_symbol('=') {
+                Ok(ComparisonOperator::LessOrEqual)
+            } else {
+                Ok(ComparisonOperator::Less)
+            }
+        } else if self.consume_symbol('>') {
+            if self.consume_symbol('=') {
+                Ok(ComparisonOperator::GreaterOrEqual)
+            } else {
+                Ok(ComparisonOperator::Greater)
+            }
         } else {
             Err(SqlError::InvalidSyntax)
         }
@@ -1942,9 +2426,14 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
 
-    use super::{Projection, SqlError, Statement, parse};
+    use super::{
+        ComparisonOperator, Projection, SelectPredicate, SqlError, Statement, parse,
+        primary_key_range_is_empty,
+    };
 
     #[test]
     fn legacy_binary_grammar_remains_accepted() -> Result<(), Box<dyn std::error::Error>> {
@@ -2049,7 +2538,19 @@ mod tests {
             projection,
             Projection::Columns(vec!["payload".to_owned(), "amount".to_owned()])
         );
-        assert_eq!(predicates, ["sequence", "tenant"]);
+        assert_eq!(
+            predicates,
+            [
+                SelectPredicate {
+                    columns: vec!["sequence".to_owned()],
+                    operator: ComparisonOperator::Equal,
+                },
+                SelectPredicate {
+                    columns: vec!["tenant".to_owned()],
+                    operator: ComparisonOperator::Equal,
+                },
+            ]
+        );
         assert!(matches!(
             parse("SELECT payload FROM events"),
             Err(SqlError::InvalidSyntax)
@@ -2102,6 +2603,103 @@ mod tests {
     }
 
     #[test]
+    fn bounded_primary_key_range_parses_row_comparisons_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Statement::Select {
+            predicates,
+            order_by,
+            limit,
+            ..
+        } = parse(
+            "SELECT payload
+             FROM events
+             WHERE (tenant, sequence) >= (?, ?)
+               AND (tenant, sequence) < (?, ?)
+             ORDER BY tenant, sequence
+             LIMIT 16",
+        )?
+        else {
+            return Err("expected bounded range select".into());
+        };
+        assert_eq!(
+            predicates,
+            [
+                SelectPredicate {
+                    columns: vec!["tenant".to_owned(), "sequence".to_owned()],
+                    operator: ComparisonOperator::GreaterOrEqual,
+                },
+                SelectPredicate {
+                    columns: vec!["tenant".to_owned(), "sequence".to_owned()],
+                    operator: ComparisonOperator::Less,
+                },
+            ]
+        );
+        assert_eq!(order_by, ["tenant", "sequence"]);
+        assert_eq!(limit, Some(16));
+
+        assert!(matches!(
+            parse("SELECT payload FROM events WHERE sequence > ? LIMIT 5")?,
+            Statement::Select {
+                predicates,
+                order_by,
+                limit: Some(5),
+                ..
+            } if predicates
+                == [SelectPredicate {
+                    columns: vec!["sequence".to_owned()],
+                    operator: ComparisonOperator::Greater,
+                }] && order_by.is_empty()
+        ));
+        assert!(matches!(
+            parse(
+                "SELECT payload FROM events
+                 WHERE (tenant, sequence) >= (?, ?)
+                 ORDER BY tenant, sequence"
+            ),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            parse("SELECT payload FROM events WHERE (tenant) >= (?) LIMIT 5"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            parse("SELECT payload FROM events WHERE sequence != ? LIMIT 5"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_primary_key_ranges_are_detected_without_btree_map_panics() {
+        let one = vec![1_u8];
+        let two = vec![2_u8];
+        assert!(!primary_key_range_is_empty(
+            &Bound::Included(one.clone()),
+            &Bound::Included(one.clone()),
+        ));
+        assert!(primary_key_range_is_empty(
+            &Bound::Excluded(one.clone()),
+            &Bound::Included(one.clone()),
+        ));
+        assert!(primary_key_range_is_empty(
+            &Bound::Included(one.clone()),
+            &Bound::Excluded(one.clone()),
+        ));
+        assert!(primary_key_range_is_empty(
+            &Bound::Excluded(one.clone()),
+            &Bound::Excluded(one.clone()),
+        ));
+        assert!(primary_key_range_is_empty(
+            &Bound::Included(two),
+            &Bound::Included(one),
+        ));
+        assert!(!primary_key_range_is_empty(
+            &Bound::Unbounded,
+            &Bound::Unbounded,
+        ));
+    }
+
+    #[test]
     fn secondary_index_and_explain_grammar_parse_exactly() -> Result<(), Box<dyn std::error::Error>>
     {
         assert!(matches!(
@@ -2124,7 +2722,12 @@ mod tests {
         assert!(matches!(
             parse("EXPLAIN SELECT id FROM people WHERE email = ?")?,
             Statement::ExplainSelect { name, predicates, .. }
-                if name == "people" && predicates == ["email"]
+                if name == "people"
+                    && predicates
+                        == [SelectPredicate {
+                            columns: vec!["email".to_owned()],
+                            operator: ComparisonOperator::Equal,
+                        }]
         ));
         Ok(())
     }

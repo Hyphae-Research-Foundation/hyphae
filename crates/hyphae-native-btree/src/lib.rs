@@ -4,7 +4,7 @@
 
 use std::{
     collections::BTreeSet,
-    ops::{ControlFlow, Range},
+    ops::{Bound, ControlFlow, Range},
     sync::Arc,
 };
 
@@ -410,6 +410,34 @@ impl BTree {
         pool: &BufferPool,
         prefix: &[u8],
         start_after: Option<&[u8]>,
+        visitor: F,
+    ) -> Result<ControlFlow<()>, BTreeError>
+    where
+        F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+    {
+        let lower = start_after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.visit_prefix_range_cached(store, pool, prefix, lower, Bound::Unbounded, visitor)
+    }
+
+    /// Visits one bounded prefix range in canonical key order through the
+    /// buffer pool.
+    ///
+    /// `lower` and `upper` are full physical-key bounds. They are intersected
+    /// with the prefix namespace. Returning [`ControlFlow::Break`] from
+    /// `visitor` stops traversal without reading or materializing the
+    /// remaining range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, buffer-pool, codec, key-order, cycle, or
+    /// height failures in every node reached before traversal stops.
+    pub fn visit_prefix_range_cached<F>(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        prefix: &[u8],
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
         mut visitor: F,
     ) -> Result<ControlFlow<()>, BTreeError>
     where
@@ -418,16 +446,17 @@ impl BTree {
         let Some(root) = self.root else {
             return Ok(ControlFlow::Continue(()));
         };
-        let upper = prefix_upper_bound(prefix);
+        let prefix_upper = prefix_upper_bound(prefix);
         let mut visited = BTreeSet::new();
         let mut last_key = None;
-        visit_prefix_node_cached(
+        visit_prefix_range_node_cached(
             store,
             pool,
             root,
             prefix,
-            upper.as_deref(),
-            start_after,
+            prefix_upper.as_deref(),
+            lower,
+            upper,
             0,
             &mut visited,
             &mut last_key,
@@ -1126,13 +1155,14 @@ fn scan_prefix_node_cached(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_prefix_node_cached<F>(
+fn visit_prefix_range_node_cached<F>(
     store: &PageStore,
     pool: &BufferPool,
     page_id: PageId,
     prefix: &[u8],
-    upper: Option<&[u8]>,
-    start_after: Option<&[u8]>,
+    prefix_upper: Option<&[u8]>,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
     depth: usize,
     visited: &mut BTreeSet<PageId>,
     last_key: &mut Option<Vec<u8>>,
@@ -1154,7 +1184,8 @@ where
                 .into_iter()
                 .skip_while(|entry| entry.key.as_slice() < prefix)
                 .take_while(|entry| entry.key.starts_with(prefix))
-                .filter(|entry| start_after.is_none_or(|cursor| entry.key.as_slice() > cursor))
+                .skip_while(|entry| !key_satisfies_lower(&entry.key, lower))
+                .take_while(|entry| key_satisfies_upper(&entry.key, upper))
             {
                 if last_key
                     .as_deref()
@@ -1173,20 +1204,21 @@ where
                 let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
                 let child_upper = keys.get(index);
                 let ends_after_prefix = child_upper.is_none_or(|bound| bound.as_slice() > prefix);
-                let ends_after_cursor = start_after
-                    .is_none_or(|cursor| child_upper.is_none_or(|bound| bound.as_slice() > cursor));
-                let starts_before_upper =
-                    upper.is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                let starts_before_prefix_upper = prefix_upper
+                    .is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                let intersects_bounds =
+                    child_intersects_bounds(child_lower, child_upper, lower, upper);
                 if ends_after_prefix
-                    && ends_after_cursor
-                    && starts_before_upper
-                    && visit_prefix_node_cached(
+                    && starts_before_prefix_upper
+                    && intersects_bounds
+                    && visit_prefix_range_node_cached(
                         store,
                         pool,
                         child,
                         prefix,
+                        prefix_upper,
+                        lower,
                         upper,
-                        start_after,
                         depth + 1,
                         visited,
                         last_key,
@@ -1200,6 +1232,42 @@ where
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+fn key_satisfies_lower(key: &[u8], lower: Bound<&[u8]>) -> bool {
+    match lower {
+        Bound::Included(bound) => key >= bound,
+        Bound::Excluded(bound) => key > bound,
+        Bound::Unbounded => true,
+    }
+}
+
+fn key_satisfies_upper(key: &[u8], upper: Bound<&[u8]>) -> bool {
+    match upper {
+        Bound::Included(bound) => key <= bound,
+        Bound::Excluded(bound) => key < bound,
+        Bound::Unbounded => true,
+    }
+}
+
+fn child_intersects_bounds(
+    child_lower: Option<&Vec<u8>>,
+    child_upper: Option<&Vec<u8>>,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> bool {
+    let ends_after_lower = match lower {
+        Bound::Included(bound) | Bound::Excluded(bound) => {
+            child_upper.is_none_or(|key| key.as_slice() > bound)
+        }
+        Bound::Unbounded => true,
+    };
+    let starts_before_upper = match upper {
+        Bound::Included(bound) => child_lower.is_none_or(|key| key.as_slice() <= bound),
+        Bound::Excluded(bound) => child_lower.is_none_or(|key| key.as_slice() < bound),
+        Bound::Unbounded => true,
+    };
+    ends_after_lower && starts_before_upper
 }
 
 fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -1300,7 +1368,7 @@ fn validate_node(
 mod tests {
     use std::{
         fs,
-        ops::ControlFlow,
+        ops::{Bound, ControlFlow},
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1489,6 +1557,114 @@ mod tests {
             })?;
         assert_eq!(outcome, ControlFlow::Continue(()));
         assert!(exhausted.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cached_prefix_range_visitor_honors_bounds_and_stops_early()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for namespace in 0..4_u8 {
+            for index in 0..512_u32 {
+                let mut key = vec![namespace];
+                key.extend_from_slice(&index.to_be_bytes());
+                tree = tree
+                    .insert_unique(
+                        &mut store,
+                        Csn::new(u64::from(namespace) * 512 + u64::from(index) + 1)?,
+                        key,
+                        index.to_be_bytes().to_vec(),
+                    )?
+                    .tree;
+            }
+        }
+        assert!(tree.height(&store)? >= 2);
+        let pool = BufferPool::new(64, 4)?;
+        let key = |index: u32| {
+            let mut key = vec![2];
+            key.extend_from_slice(&index.to_be_bytes());
+            key
+        };
+
+        let lower = key(100);
+        let upper = key(110);
+        let mut half_open = Vec::new();
+        let outcome = tree.visit_prefix_range_cached(
+            &store,
+            &pool,
+            &[2],
+            Bound::Included(lower.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+            |key, value| {
+                half_open.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        let decoded = half_open
+            .iter()
+            .map(|(_, value)| value.as_slice().try_into().map(u32::from_be_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(decoded, (100_u32..110).collect::<Vec<_>>());
+
+        let inclusive_upper = key(105);
+        let mut mixed_bytes = Vec::new();
+        let outcome = tree.visit_prefix_range_cached(
+            &store,
+            &pool,
+            &[2],
+            Bound::Excluded(lower.as_slice()),
+            Bound::Included(inclusive_upper.as_slice()),
+            |_, value| {
+                mixed_bytes.push(value.to_vec());
+                if mixed_bytes.len() == 3 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Break(()));
+        let mixed = mixed_bytes
+            .iter()
+            .map(|value| value.as_slice().try_into().map(u32::from_be_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(mixed, [101, 102, 103]);
+
+        let outside_namespace = key(512);
+        let mut empty = Vec::new();
+        let outcome = tree.visit_prefix_range_cached(
+            &store,
+            &pool,
+            &[2],
+            Bound::Included(outside_namespace.as_slice()),
+            Bound::Unbounded,
+            |key, value| {
+                empty.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        assert!(empty.is_empty());
+
+        let reversed_lower = key(300);
+        let reversed_upper = key(200);
+        let mut reversed = Vec::new();
+        let outcome = tree.visit_prefix_range_cached(
+            &store,
+            &pool,
+            &[2],
+            Bound::Included(reversed_lower.as_slice()),
+            Bound::Included(reversed_upper.as_slice()),
+            |key, value| {
+                reversed.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        assert!(reversed.is_empty());
         Ok(())
     }
 

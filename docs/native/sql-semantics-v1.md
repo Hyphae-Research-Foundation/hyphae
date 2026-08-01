@@ -4,8 +4,8 @@ Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 `INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 direct current-root prepared primary/secondary lookup, exact-primary-key typed
-`UPDATE`/`DELETE`, bounded primary-key table scan, `BEGIN`/`COMMIT`, and
-rollback are implemented experimentally. G2 remains open
+`UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
+and rollback are implemented experimentally. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -54,6 +54,27 @@ codec; row values use the catalog-ordered `HYTUPL01` tuple. Type, domain,
 nullability, duplicate-column, missing-column, incomplete-key, and invalid
 scan-order failures occur before execution or row mutation.
 
+The first primary-key range shape is:
+
+```text
+SELECT <projection>
+FROM <table>
+WHERE <complete-primary-key> { > | >= | < | <= } <parameters>
+[AND <complete-primary-key> { > | >= | < | <= } <parameters>]
+[ORDER BY <complete-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+A single-column key uses `id >= ?`. A composite key uses the SQL row form
+`(tenant, sequence) >= (?, ?)`. Every comparison must name the complete
+primary key in catalog order. At most one lower and one upper bound are
+accepted. `LIMIT` is mandatory; `ORDER BY`, when present, must be the complete
+ascending primary key. Bound parameters occur in predicate text order.
+Inclusive, exclusive, one-sided, inverted, and equal-open ranges have explicit
+semantics: inverted and empty ranges return no rows rather than raising or
+panicking. Equality predicates retain their exact point/index access contract
+and cannot be mixed with this range slice.
+
 Typed mutation accepts:
 
 ```text
@@ -88,7 +109,9 @@ any null component exempts the composite key from uniqueness, while ordinary
 `EXPLAIN SELECT` currently reports only the admitted access path:
 `PrimaryKeyLookup(table=<id>)` or
 `SecondaryIndexLookup(table=<id>,index=<id>)`, or
-`PrimaryKeyScan(table=<id>,limit=<n>)`. It is deterministic
+`PrimaryKeyScan(table=<id>,limit=<n>)`, or
+`PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`.
+Range kinds are `inclusive`, `exclusive`, or `unbounded`. This is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
 statistics report.
 
@@ -96,9 +119,10 @@ The grammar currently recognizes boolean, signed and unsigned fixed-width
 integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
-exists. General expressions, literals, casts, filters over scans, secondary
-ranges, descending scans, offsets, and constraints beyond primary
-key/nullability and the first unique index remain pending. Typed mutation does
+exists. General expressions, literals, casts, residual filters, partial
+primary-key prefix ranges, secondary ranges, descending scans, offsets, and
+constraints beyond primary key/nullability and the first unique index remain
+pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate expressions,
 or update multiple rows. The current equality binder requires the predicate
 column set to equal a complete primary or secondary key. It does not perform
@@ -121,16 +145,19 @@ relation/index definitions in the catalog-version-bound plan.
 `execute_prepared_latest` captures one immutable root set, rejects a stale
 catalog version, traverses the buffered relational B+tree directly, and
 materializes only rows reached by the exact primary/secondary key or bounded
-primary scan. The secondary path scans only the length-delimited exact
+primary scan/range. The secondary path scans only the length-delimited exact
 index-key prefix, follows each live entry to its primary-key row in the same
 root, and returns rows in canonical primary-key order. The scan path uses an
-exclusive physical visitor, skips row tombstones, and stops after `LIMIT`
-visible rows. It does not construct `MaterializedState`.
+inclusive/exclusive bound-aware physical visitor, prunes separator-disjoint
+subtrees, skips row tombstones, and stops after `LIMIT` visible rows. It does
+not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last
-primary key as the caller's next exclusive cursor. A stateful zero-copy cursor,
-secondary-key ranges, offset handling, request arenas, and allocation evidence
-remain separate work.
+primary key as the caller's next exclusive cursor.
+`scan_latest_relational_range` additionally accepts independent canonical
+primary-key `Included`, `Excluded`, or `Unbounded` bounds. A stateful zero-copy
+cursor, secondary-key ranges, offset handling, request arenas, and allocation
+evidence remain separate work.
 
 ## Null and boolean semantics
 

@@ -5,6 +5,7 @@
 use std::{
     fs,
     hint::black_box,
+    ops::Bound,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,7 +14,7 @@ use hyphae_native_runtime::{
     DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, NativeDatabase, NativeSnapshot, NativeTransaction,
     PreparedStatement, SqlResult, SqlValue, decode_frame, encode_frame,
 };
-use hyphae_native_types::{DurabilityClass, LogicalType, ObjectId};
+use hyphae_native_types::{DurabilityClass, IntegerWidth, LogicalType, ObjectId};
 
 const OBSERVATIONS: u32 = 1_000_000;
 const WARMUP: u32 = 100_000;
@@ -27,6 +28,8 @@ const SECONDARY_OPERATIONS_PER_OBSERVATION: u32 = 1;
 const SCAN_LIMIT: usize = 10;
 const SCAN_OBSERVATIONS: u32 = 100_000;
 const SCAN_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const RANGE_LOWER_ROW: u32 = SECONDARY_TARGET_ROW;
+const RANGE_UPPER_ROW: u32 = RANGE_LOWER_ROW + 10;
 const STRUCTURE_SCALE_KEYS: u32 = 2_048;
 const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
 const HASH_SCALE_FIELDS: u32 = 2_048;
@@ -80,6 +83,8 @@ struct OperationStats {
     relational_btree: Stats,
     relational_scan: Stats,
     prepared_sql_scan: Stats,
+    relational_range: Stats,
+    prepared_sql_range: Stats,
     secondary_btree: Stats,
     secondary_prepared_sql: Stats,
     codec_dispatch: Stats,
@@ -88,6 +93,7 @@ struct OperationStats {
 struct BenchmarkInputs<'a> {
     prepared: &'a PreparedStatement,
     scan_prepared: &'a PreparedStatement,
+    range_prepared: &'a PreparedStatement,
     secondary_prepared: &'a PreparedStatement,
     table: ObjectId,
     scan_table: ObjectId,
@@ -96,9 +102,19 @@ struct BenchmarkInputs<'a> {
     relational_target: &'a [u8],
     secondary_index_key: &'a [u8],
     secondary_parameters: &'a [SqlValue],
+    range_lower: &'a [u8],
+    range_upper: &'a [u8],
+    range_parameters: &'a [SqlValue],
     structure_target: &'a [u8],
     hash_target: &'a [u8],
     frame: &'a [u8],
+}
+
+struct RangeBenchmarkInput {
+    prepared: PreparedStatement,
+    lower: Vec<u8>,
+    upper: Vec<u8>,
+    parameters: [SqlValue; 2],
 }
 
 fn seed_scaled_data(
@@ -219,6 +235,18 @@ fn warm_operations(
             black_box(SCAN_LIMIT),
         )?);
         black_box(database.execute_prepared_latest(inputs.scan_prepared, &[])?);
+        black_box(database.scan_latest_relational_range(
+            inputs.scan_table,
+            Bound::Included(inputs.range_lower),
+            Bound::Excluded(inputs.range_upper),
+            black_box(SCAN_LIMIT),
+        )?);
+        black_box(
+            database.execute_prepared_latest(
+                inputs.range_prepared,
+                black_box(inputs.range_parameters),
+            )?,
+        );
         black_box(database.select_latest_secondary_index(
             inputs.secondary_index,
             black_box(inputs.secondary_index_key),
@@ -239,7 +267,8 @@ fn measure_operations(
     inputs: &BenchmarkInputs<'_>,
 ) -> Result<OperationStats, Box<dyn std::error::Error>> {
     warm_operations(database, snapshot, inputs)?;
-    let (relational_scan, prepared_sql_scan) = measure_relational_scans(database, inputs);
+    let (relational_scan, prepared_sql_scan, relational_range, prepared_sql_range) =
+        measure_relational_scans(database, inputs);
     Ok(OperationStats {
         structure: measure(|| {
             black_box(snapshot.get(black_box(b"session")));
@@ -296,6 +325,8 @@ fn measure_operations(
         }),
         relational_scan,
         prepared_sql_scan,
+        relational_range,
+        prepared_sql_range,
         secondary_btree: measure_counted(
             || {
                 black_box(
@@ -335,7 +366,7 @@ fn measure_operations(
 fn measure_relational_scans(
     database: &NativeDatabase,
     inputs: &BenchmarkInputs<'_>,
-) -> (Stats, Stats) {
+) -> (Stats, Stats, Stats, Stats) {
     let direct = measure_counted(
         || {
             black_box(
@@ -358,7 +389,37 @@ fn measure_relational_scans(
         SCAN_OBSERVATIONS,
         SCAN_OPERATIONS_PER_OBSERVATION,
     );
-    (direct, prepared)
+    let range_direct = measure_counted(
+        || {
+            black_box(
+                database
+                    .scan_latest_relational_range(
+                        inputs.scan_table,
+                        Bound::Included(inputs.range_lower),
+                        Bound::Excluded(inputs.range_upper),
+                        black_box(SCAN_LIMIT),
+                    )
+                    .is_ok(),
+            );
+        },
+        SCAN_OBSERVATIONS,
+        SCAN_OPERATIONS_PER_OBSERVATION,
+    );
+    let range_prepared = measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(
+                        inputs.range_prepared,
+                        black_box(inputs.range_parameters),
+                    )
+                    .is_ok(),
+            );
+        },
+        SCAN_OBSERVATIONS,
+        SCAN_OPERATIONS_PER_OBSERVATION,
+    );
+    (direct, prepared, range_direct, range_prepared)
 }
 
 fn validate_secondary_routes(
@@ -406,6 +467,80 @@ fn validate_scan_routes(
     Ok(())
 }
 
+fn validate_range_routes(
+    database: &NativeDatabase,
+    table: ObjectId,
+    lower: &[u8],
+    upper: &[u8],
+    prepared: &PreparedStatement,
+    parameters: &[SqlValue],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if database
+        .scan_latest_relational_range(
+            table,
+            Bound::Included(lower),
+            Bound::Excluded(upper),
+            SCAN_LIMIT,
+        )?
+        .len()
+        != SCAN_LIMIT
+    {
+        return Err("physical relational range benchmark did not reach its limit".into());
+    }
+    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(prepared, parameters)?
+    else {
+        return Err("physical relational range benchmark SQL did not return rows".into());
+    };
+    if rows.len() != SCAN_LIMIT {
+        return Err("physical relational range benchmark SQL did not reach its limit".into());
+    }
+    Ok(())
+}
+
+fn prepare_range_benchmark(
+    database: &NativeDatabase,
+    table: ObjectId,
+) -> Result<RangeBenchmarkInput, Box<dyn std::error::Error>> {
+    let prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_people
+         WHERE id >= ? AND id < ?
+         ORDER BY id
+         LIMIT 10",
+    )?;
+    let parameters = [
+        SqlValue::Signed(i64::from(RANGE_LOWER_ROW)),
+        SqlValue::Signed(i64::from(RANGE_UPPER_ROW)),
+    ];
+    let logical_type = LogicalType::Signed(IntegerWidth::Bits64);
+    let lower = parameters[0].encode_ordered_component(&logical_type)?;
+    let upper = parameters[1].encode_ordered_component(&logical_type)?;
+    validate_range_routes(database, table, &lower, &upper, &prepared, &parameters)?;
+    Ok(RangeBenchmarkInput {
+        prepared,
+        lower,
+        upper,
+        parameters,
+    })
+}
+
+fn validate_multilevel_dataset(
+    database: &NativeDatabase,
+    search_index: ObjectId,
+) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    let relational = database.latest_relational_tree_height()?;
+    let structure = database.latest_structure_tree_height()?;
+    let search = database.latest_search_tree_height()?;
+    if relational < 2 || structure < 2 || search < 2 {
+        return Err("benchmark dataset did not produce three multilevel B+trees".into());
+    }
+    if database.match_latest_text(search_index, SEARCH_QUERY, 1)?[0].document_id
+        != SEARCH_TARGET_DOCUMENT.to_be_bytes()
+    {
+        return Err("physical search benchmark target did not rank first".into());
+    }
+    Ok((relational, structure, search))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit = std::env::args()
         .nth(1)
@@ -422,33 +557,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v8");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v9");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
     let (secondary_table, secondary_index) =
         seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
     transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.commit()?;
-    let relational_tree_height = database.latest_relational_tree_height()?;
-    if relational_tree_height < 2 {
-        return Err("relational benchmark dataset did not produce a multilevel B+tree".into());
-    }
-    let structure_tree_height = database.latest_structure_tree_height()?;
-    if structure_tree_height < 2 {
-        return Err("structure benchmark dataset did not produce a multilevel B+tree".into());
-    }
-    let search_tree_height = database.latest_search_tree_height()?;
-    if search_tree_height < 2 {
-        return Err("search benchmark dataset did not produce a multilevel B+tree".into());
-    }
-    if database.match_latest_text(index, SEARCH_QUERY, 1)?[0].document_id
-        != SEARCH_TARGET_DOCUMENT.to_be_bytes()
-    {
-        return Err("physical search benchmark target did not rank first".into());
-    }
+    let (relational_tree_height, structure_tree_height, search_tree_height) =
+        validate_multilevel_dataset(&database, index)?;
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
     let scan_prepared = database
         .prepare_sql_latest("SELECT id, payload FROM benchmark_people ORDER BY id LIMIT 10")?;
+    let range = prepare_range_benchmark(&database, secondary_table)?;
     let secondary_prepared =
         database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
@@ -480,6 +601,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &BenchmarkInputs {
             prepared: &prepared,
             scan_prepared: &scan_prepared,
+            range_prepared: &range.prepared,
             secondary_prepared: &secondary_prepared,
             table,
             scan_table: secondary_table,
@@ -488,6 +610,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             relational_target: &relational_target,
             secondary_index_key: &secondary_index_key,
             secondary_parameters: &secondary_parameters,
+            range_lower: &range.lower,
+            range_upper: &range.upper,
+            range_parameters: &range.parameters,
             structure_target: &structure_target,
             hash_target: &hash_target,
             frame: &frame,
@@ -518,7 +643,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v8\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v9\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -536,6 +661,8 @@ fn print_report(
     println!("  \"secondary_observations\": {SECONDARY_OBSERVATIONS},");
     println!("  \"secondary_operations_per_observation\": {SECONDARY_OPERATIONS_PER_OBSERVATION},");
     println!("  \"scan_limit\": {SCAN_LIMIT},");
+    println!("  \"range_lower_row_inclusive\": {RANGE_LOWER_ROW},");
+    println!("  \"range_upper_row_exclusive\": {RANGE_UPPER_ROW},");
     println!("  \"scan_observations\": {SCAN_OBSERVATIONS},");
     println!("  \"scan_operations_per_observation\": {SCAN_OPERATIONS_PER_OBSERVATION},");
     println!("  \"concurrency\": 1,");
@@ -623,6 +750,16 @@ fn print_relational_scan_stats(operations: &OperationStats) {
     print_stats(
         "physical_prepared_sql_pk_scan_limit10_multilevel",
         operations.prepared_sql_scan,
+        true,
+    );
+    print_stats(
+        "buffered_relational_btree_pk_range_limit10_multilevel",
+        operations.relational_range,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_pk_range_limit10_multilevel",
+        operations.prepared_sql_range,
         true,
     );
 }

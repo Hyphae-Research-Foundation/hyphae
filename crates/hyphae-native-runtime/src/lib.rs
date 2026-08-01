@@ -21,7 +21,7 @@ pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    ops::{ControlFlow, Deref, DerefMut},
+    ops::{Bound, ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -909,11 +909,44 @@ impl NativeDatabase {
         self.scan_relational_at(&snapshot, table, start_after, limit)
     }
 
+    /// Scans one bounded current primary-key range without materializing the
+    /// complete relation.
+    ///
+    /// Bounds contain canonical primary-key bytes, not full physical keys.
+    /// A zero `limit` validates relation identity and returns no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relation does not exist or when a reached
+    /// physical key, row, page, blob, or version chain is malformed.
+    pub fn scan_latest_relational_range(
+        &self,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.scan_relational_range_at(&snapshot, table, lower, upper, limit)
+    }
+
     fn scan_relational_at(
         &self,
         snapshot: &Snapshot,
         table: ObjectId,
         start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let lower = start_after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.scan_relational_range_at(snapshot, table, lower, Bound::Unbounded, limit)
+    }
+
+    fn scan_relational_range_at(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
         limit: usize,
     ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
         let root = snapshot
@@ -932,7 +965,8 @@ impl NativeDatabase {
         }
 
         let prefix = relational_row_key(table, &[]);
-        let start_after = start_after.map(|primary_key| relational_row_key(table, primary_key));
+        let lower = map_primary_key_bound(table, lower);
+        let upper = map_primary_key_bound(table, upper);
         let context = RelationalReadContext {
             pages: &self.pages,
             pool: &self.buffer_pool,
@@ -942,11 +976,12 @@ impl NativeDatabase {
         };
         let mut rows = Vec::with_capacity(limit.min(256));
         let mut scan_error = None;
-        let _outcome = tree.visit_prefix_cached(
+        let _outcome = tree.visit_prefix_range_cached(
             &self.pages,
             &self.buffer_pool,
             &prefix,
-            start_after.as_deref(),
+            bound_as_slice(&lower),
+            bound_as_slice(&upper),
             |physical_key, encoded| {
                 let Some(primary_key) = physical_key.get(prefix.len()..) else {
                     scan_error = Some(NativeRuntimeError::InvalidRelationalTree);
@@ -4002,6 +4037,22 @@ fn relational_row_key(table: ObjectId, primary_key: &[u8]) -> Vec<u8> {
     key
 }
 
+fn map_primary_key_bound(table: ObjectId, bound: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Included(primary_key) => Bound::Included(relational_row_key(table, primary_key)),
+        Bound::Excluded(primary_key) => Bound::Excluded(relational_row_key(table, primary_key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(key) => Bound::Included(key.as_slice()),
+        Bound::Excluded(key) => Bound::Excluded(key.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SecondaryIndexProjection {
     index: ObjectId,
@@ -5267,6 +5318,7 @@ mod tests {
     use std::{
         fs,
         io::{Read, Seek, SeekFrom, Write},
+        ops::Bound,
         path::{Path, PathBuf},
         sync::{
             Arc, Barrier,
@@ -5282,7 +5334,8 @@ mod tests {
 
     use super::{
         CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase,
-        NativeRuntimeError, PAGE_FILE, SetCondition, SetOutcome, SqlError, SqlResult, SqlValue,
+        NativeRuntimeError, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SqlError,
+        SqlResult, SqlValue,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -7186,6 +7239,54 @@ mod tests {
         Ok(())
     }
 
+    fn assert_latest_relational_range_contract(
+        database: &NativeDatabase,
+        table: ObjectId,
+    ) -> Result<Vec<RelationalScanRow>, Box<dyn std::error::Error>> {
+        let lower = 2_u32.to_be_bytes();
+        let upper = 10_u32.to_be_bytes();
+        let half_open = database.scan_latest_relational_range(
+            table,
+            Bound::Included(lower.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+            16,
+        )?;
+        assert_eq!(
+            half_open
+                .iter()
+                .map(|row| row.primary_key.clone())
+                .collect::<Vec<_>>(),
+            [2_u32, 4, 5, 6]
+                .iter()
+                .map(|index| index.to_be_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        let mixed = database.scan_latest_relational_range(
+            table,
+            Bound::Excluded(lower.as_slice()),
+            Bound::Included(upper.as_slice()),
+            16,
+        )?;
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|row| row.primary_key.clone())
+                .collect::<Vec<_>>(),
+            [4_u32, 5, 6, 10]
+                .iter()
+                .map(|index| index.to_be_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        let reversed = database.scan_latest_relational_range(
+            table,
+            Bound::Included(upper.as_slice()),
+            Bound::Excluded(lower.as_slice()),
+            16,
+        )?;
+        assert!(reversed.is_empty());
+        Ok(half_open)
+    }
+
     #[test]
     fn latest_relational_scan_is_bounded_resumable_and_skips_tombstones()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -7242,6 +7343,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(database.scan_latest_relational(table, None, 0)?.is_empty());
+        let half_open = assert_latest_relational_range_contract(&database, table)?;
         assert!(matches!(
             database.scan_latest_relational(ObjectId::new(9_999)?, None, 1),
             Err(NativeRuntimeError::UnknownRelation { table: missing })
@@ -7254,6 +7356,15 @@ mod tests {
         assert_eq!(
             reopened.scan_latest_relational(table, Some(&cursor), 4)?,
             second
+        );
+        assert_eq!(
+            reopened.scan_latest_relational_range(
+                table,
+                Bound::Included(2_u32.to_be_bytes().as_slice()),
+                Bound::Excluded(10_u32.to_be_bytes().as_slice()),
+                16,
+            )?,
+            half_open
         );
         Ok(())
     }
@@ -7414,6 +7525,254 @@ mod tests {
         assert_eq!(
             reopened.execute_prepared_latest(&reopened_plan, &[])?,
             expected
+        );
+        Ok(())
+    }
+
+    const COMPOSITE_RANGE_QUERY: &str = "SELECT sequence, payload
+        FROM events
+        WHERE (tenant, sequence) >= (?, ?)
+          AND (tenant, sequence) < (?, ?)
+        ORDER BY tenant, sequence
+        LIMIT 16";
+
+    fn composite_range_parameters() -> [SqlValue; 4] {
+        [
+            SqlValue::Signed(1),
+            SqlValue::Signed(2),
+            SqlValue::Signed(1),
+            SqlValue::Signed(12),
+        ]
+    }
+
+    fn reversed_composite_range_parameters() -> [SqlValue; 4] {
+        [
+            SqlValue::Signed(1),
+            SqlValue::Signed(12),
+            SqlValue::Signed(1),
+            SqlValue::Signed(2),
+        ]
+    }
+
+    fn expected_composite_range() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["sequence".to_owned(), "payload".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(2), SqlValue::Text("updated".to_owned())],
+                vec![SqlValue::Signed(4), SqlValue::Text("event-0004".to_owned())],
+                vec![SqlValue::Signed(5), SqlValue::Text("event-0005".to_owned())],
+                vec![SqlValue::Signed(6), SqlValue::Text("event-0006".to_owned())],
+                vec![
+                    SqlValue::Signed(10),
+                    SqlValue::Text("event-0010".to_owned()),
+                ],
+                vec![
+                    SqlValue::Signed(11),
+                    SqlValue::Text("event-0011".to_owned()),
+                ],
+            ],
+        }
+    }
+
+    fn empty_composite_range() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["sequence".to_owned(), "payload".to_owned()],
+            rows: Vec::new(),
+        }
+    }
+
+    fn assert_transaction_composite_range(
+        database: &mut NativeDatabase,
+        table: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut transaction = database.begin_sql(12, DurabilityClass::Strict)?;
+        transaction.execute_sql(
+            "INSERT INTO events (tenant, sequence, payload) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Signed(512),
+                SqlValue::Text("private".to_owned()),
+            ],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT sequence FROM events
+                 WHERE (tenant, sequence) > (?, ?)
+                   AND (tenant, sequence) <= (?, ?)
+                 ORDER BY tenant, sequence
+                 LIMIT 3",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyRangeScan(table={table},lower=exclusive,\
+                     upper=inclusive,limit=3)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT sequence, payload
+                 FROM events
+                 WHERE (tenant, sequence) > (?, ?)
+                   AND (tenant, sequence) <= (?, ?)
+                 ORDER BY tenant, sequence
+                 LIMIT 3",
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(510),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(512),
+                ],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["sequence".to_owned(), "payload".to_owned()],
+                rows: vec![
+                    vec![
+                        SqlValue::Signed(511),
+                        SqlValue::Text("event-0511".to_owned()),
+                    ],
+                    vec![SqlValue::Signed(512), SqlValue::Text("private".to_owned()),],
+                ],
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                COMPOSITE_RANGE_QUERY,
+                &reversed_composite_range_parameters(),
+            )?,
+            empty_composite_range()
+        );
+        transaction.rollback();
+        Ok(())
+    }
+
+    fn assert_materialized_composite_range(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let materialized = database.snapshot(13)?;
+        let materialized_plan = materialized.prepare_sql(COMPOSITE_RANGE_QUERY)?;
+        assert_eq!(
+            materialized.execute_prepared(&materialized_plan, &composite_range_parameters())?,
+            expected_composite_range()
+        );
+        assert_eq!(
+            materialized
+                .execute_prepared(&materialized_plan, &reversed_composite_range_parameters(),)?,
+            empty_composite_range()
+        );
+        Ok(())
+    }
+
+    fn assert_latest_composite_range(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let physical_plan = database.prepare_sql_latest(COMPOSITE_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &composite_range_parameters())?,
+            expected_composite_range()
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest(
+                    "SELECT sequence FROM events
+                     WHERE (tenant, sequence) > (?, ?)
+                       AND (tenant, sequence) <= (?, ?)
+                     ORDER BY tenant, sequence
+                     LIMIT 16"
+                )?,
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(2),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(10),
+                ],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["sequence".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(4)],
+                    vec![SqlValue::Signed(5)],
+                    vec![SqlValue::Signed(6)],
+                    vec![SqlValue::Signed(10)],
+                ],
+            }
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest(
+                    "SELECT sequence FROM events
+                     WHERE (tenant, sequence) >= (?, ?)
+                     ORDER BY tenant, sequence
+                     LIMIT 4"
+                )?,
+                &[SqlValue::Signed(1), SqlValue::Signed(510)],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["sequence".to_owned()],
+                rows: vec![vec![SqlValue::Signed(510)], vec![SqlValue::Signed(511)],],
+            }
+        );
+        assert_eq!(
+            database
+                .execute_prepared_latest(&physical_plan, &reversed_composite_range_parameters(),)?,
+            empty_composite_range()
+        );
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT payload FROM events
+                 WHERE (tenant, sequence) >= (?, ?)
+                 ORDER BY tenant, sequence"
+            ),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT payload FROM events
+                 WHERE (tenant, sequence) >= (?, ?)
+                 ORDER BY sequence, tenant
+                 LIMIT 5"
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &physical_plan,
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Null,
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(12),
+                ],
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        let parameters = composite_range_parameters();
+        assert!(matches!(
+            database.execute_prepared_latest(&physical_plan, &parameters[..3]),
+            Err(SqlError::ParameterMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_composite_primary_key_range_matches_every_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_bounded_sql_scan(&mut database)?;
+        mutate_bounded_sql_scan(&mut database)?;
+        assert_transaction_composite_range(&mut database, table)?;
+        assert_materialized_composite_range(&database)?;
+        assert_latest_composite_range(&database)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(COMPOSITE_RANGE_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &composite_range_parameters())?,
+            expected_composite_range()
         );
         Ok(())
     }
