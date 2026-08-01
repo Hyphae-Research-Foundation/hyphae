@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 from tools.review_dependencies import (
+    CARGO_MANIFESTS,
     REGISTERED_DEPENDENCY_FILES,
     cargo_dependencies,
     changed_dependency_files,
@@ -100,6 +101,21 @@ class DependencyReviewTests(unittest.TestCase):
             )
         )
         validate_registered_dependency_files(set(REGISTERED_DEPENDENCY_FILES))
+
+    def test_native_crate_manifests_are_registered(self) -> None:
+        native_manifests = {
+            "crates/hyphae-native-blobs/Cargo.toml",
+            "crates/hyphae-native-btree/Cargo.toml",
+            "crates/hyphae-native-catalog/Cargo.toml",
+            "crates/hyphae-native-manifest/Cargo.toml",
+            "crates/hyphae-native-mvcc/Cargo.toml",
+            "crates/hyphae-native-pages/Cargo.toml",
+            "crates/hyphae-native-records/Cargo.toml",
+            "crates/hyphae-native-runtime/Cargo.toml",
+            "crates/hyphae-native-types/Cargo.toml",
+            "crates/hyphae-native-wal/Cargo.toml",
+        }
+        self.assertLessEqual(native_manifests, set(CARGO_MANIFESTS))
 
     def test_unregistered_dependency_families_are_rejected(self) -> None:
         paths = (
