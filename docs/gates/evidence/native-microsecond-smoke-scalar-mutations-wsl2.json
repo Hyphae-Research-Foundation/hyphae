@@ -1,0 +1,127 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v4",
+  "measured_at": "2026-08-01T12:42:43.0612898-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "6d2c52eec0d043949bc3874b2e31435ca8d3711b",
+    "tree": "b8032e186df9e3de1aa7c24cb8af3ac95ee7637b",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "This is one clean local observation without affinity, background-load, or hardware-counter controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502120448,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "structure_value_bytes": 64,
+    "dataset_digest_blake3": "dbd668573e35dec998520a7c8bac8c3d14f8bc9e81855cc8c3adf74781362f56",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "structure_path_note": "The physical route traverses a height-two native B+tree through pinned buffer-pool pages, rejects noncanonical HYSTRV01 flag combinations, evaluates TTL or tombstone absence, and copies the selected live 64-byte value.",
+    "timed_mutations": false
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.047,
+      "p95_us": 0.051,
+      "p99_us": 0.070,
+      "p99_9_us": 0.661,
+      "throughput_ops_s": 19331851
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.524,
+      "p95_us": 0.599,
+      "p99_us": 1.169,
+      "p99_9_us": 3.596,
+      "throughput_ops_s": 1802362
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.037,
+      "p95_us": 0.039,
+      "p99_us": 0.048,
+      "p99_9_us": 0.525,
+      "throughput_ops_s": 24889870
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 0.973,
+      "p95_us": 1.293,
+      "p99_us": 2.396,
+      "p99_9_us": 5.137,
+      "throughput_ops_s": 968828
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.070,
+      "p95_us": 0.081,
+      "p99_us": 0.135,
+      "p99_9_us": 0.855,
+      "throughput_ops_s": 13154557
+    }
+  },
+  "comparison": {
+    "baseline_receipt": "native-microsecond-smoke-structure-btree-wsl2.json",
+    "same_schema_and_dataset_digest": true,
+    "physical_structure_p50_us": {
+      "baseline": 0.421,
+      "current": 0.524
+    },
+    "physical_structure_p99_us": {
+      "baseline": 1.046,
+      "current": 1.169
+    },
+    "unchanged_relational_control_p50_us": {
+      "baseline": 0.805,
+      "current": 0.973
+    },
+    "interpretation": "The structure and unchanged relational controls were both slower in this uncontrolled observation. The receipt records the result but makes no causal regression or improvement claim."
+  },
+  "interpretation": {
+    "sub_microsecond_batch_average_structure_p50_observed": true,
+    "microsecond_structure_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "2,048-key corpus and tree height two only",
+      "no mutation or fsync latency measurement",
+      "no collection families, expiry scheduler, or eviction",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

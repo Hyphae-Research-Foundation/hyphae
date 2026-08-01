@@ -50,6 +50,24 @@ commit before its tag can be published.
   matched receipt. It still does not pass G7 because individual-operation,
   concurrency, transport, interference, allocation, and hardware-counter
   controls remain absent.
+- [Native relational version-chain evidence —
+  2026-08-01](native-relational-version-chains-2026-08-01.md) binds immutable
+  closed row histories and legacy V1 compatibility to one source commit.
+- [Native optimistic-writer evidence —
+  2026-08-01](native-optimistic-writers-2026-08-01.md) binds detached
+  concurrent preparation, admitted-root rebase, first-committer-wins, and
+  recovery to one source commit.
+- [Native structure B+tree evidence —
+  2026-08-01](native-structure-btree-2026-08-01.md) binds the first scalable
+  scalar keyspace, direct buffered reads, TTL/blob envelopes, and legacy
+  compatibility to one source commit.
+- [Native scalar structure mutation evidence —
+  2026-08-01](native-scalar-structure-mutations-2026-08-01.md) binds physical
+  tombstones, `DELETE`, `EXPIRE`, `NX`/`XX`, signed counters, recovery, and
+  their explicit remaining G3 limits.
+- `native-microsecond-smoke-scalar-mutations-wsl2.json` is the matched clean
+  read-path observation for that scalar-mutation source commit. It does not
+  time mutations and remains outside G7.
 
 ## Hosted release evidence
 

@@ -92,6 +92,12 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local ecosystem phase-1 gate](gates/native-local-phase-1.md)
 - [Native phase-1 kernel evidence — 2026-08-01](gates/evidence/native-phase1-kernel-2026-08-01.md)
 - [Native row, B+tree, and checkpoint evidence — 2026-08-01](gates/evidence/native-row-tree-checkpoint-2026-08-01.md)
+- [Native blobs, mutations, and conflicts evidence — 2026-08-01](gates/evidence/native-blobs-mutations-conflicts-2026-08-01.md)
+- [Native borrowed point-read evidence — 2026-08-01](gates/evidence/native-borrowed-point-read-2026-08-01.md)
+- [Native relational version-chain evidence — 2026-08-01](gates/evidence/native-relational-version-chains-2026-08-01.md)
+- [Native optimistic-writer evidence — 2026-08-01](gates/evidence/native-optimistic-writers-2026-08-01.md)
+- [Native structure B+tree evidence — 2026-08-01](gates/evidence/native-structure-btree-2026-08-01.md)
+- [Native scalar structure mutation evidence — 2026-08-01](gates/evidence/native-scalar-structure-mutations-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),

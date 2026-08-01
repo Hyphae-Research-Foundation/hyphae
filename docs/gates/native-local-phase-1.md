@@ -100,19 +100,27 @@ multilevel scalar keyspace, canonical TTL/blob envelope, legacy compatibility,
 cross-engine blob deduplication, direct buffered reads, and a clean latency
 observation to one source commit.
 
+The [scalar structure mutation
+evidence](evidence/native-scalar-structure-mutations-2026-08-01.md) binds
+canonical physical tombstones, `DELETE`, independent `EXPIRE`, `NX`/`XX`,
+checked signed counters, exact-boundary TTL absence, WAL expiry-presence
+compatibility, same-key conflict admission, and crash recovery to one source
+commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
 explicit per-key row-version chains with closed half-open intervals while
-keeping V1 inline-row directories compatible; exact commit-bound evidence for
-that follow-on is still pending. Catalog, structure, and search state remain
+keeping V1 inline-row directories compatible. Catalog and search state remain
 bounded single-page scaffolding. Detached transactions now prepare concurrently
-and rebase disjoint all-engine writes under serialized publication; simultaneous
-commit submission and concurrency/saturation evidence remain pending, along
-with retention/vacuum, secondary indexes, remaining structure families,
-postings, segments, and ANN required by G1–G4. The scalar structure keyspace
-now has a multilevel native B+tree and direct reads, but exact commit-bound
-evidence for that follow-on is still pending.
+and rebase disjoint all-engine writes under serialized publication;
+simultaneous commit submission and concurrency/saturation evidence remain
+pending, along with retention/vacuum, secondary indexes, remaining structure
+families, postings, segments, and ANN required by G1–G4. The scalar structure
+keyspace has a multilevel native B+tree, direct reads, tombstone/expiry
+mutations, conditional writes, and signed counters; it still lacks the
+collection families, expiry scheduler, model tests, and amplification evidence
+required to close G3.
 
 ## G1 substrate exit
 
