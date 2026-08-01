@@ -200,6 +200,14 @@ schema-v10 WSL2 observation to source and benchmark commits. Literals, casts,
 functions, joins, aggregation, partial/secondary ranges, statistics/cost
 planning, and the remaining G2/G7 evidence remain open.
 
+The [native SQL scalar-literal
+evidence](evidence/native-sql-scalar-literals-2026-08-01.md) binds `NULL`,
+boolean, signed-integer and escaped text literals to catalog logical types,
+retains exact/index/range access extraction, and proves materialized,
+current-root and reopened equivalence. Remaining literal families, casts,
+functions, joins, aggregation, partial/secondary ranges, statistics/cost
+planning, and the remaining G2/G7 evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

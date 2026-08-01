@@ -146,6 +146,11 @@ commit before its tag can be published.
   release observation for a prepared primary-key range plus alternating
   boolean residual filter over a multilevel 2,048-row typed relation. It
   records complete calls that return 10 matches and remains outside G7.
+- [Native SQL scalar-literal evidence —
+  2026-08-01](native-sql-scalar-literals-2026-08-01.md) binds catalog-typed
+  `NULL`, boolean, signed-integer and escaped text literals, retained physical
+  access paths, three-valued logic, materialized/current-root/reopen
+  equivalence, and explicit remaining G2 limits to one source commit.
 
 ## Hosted release evidence
 
