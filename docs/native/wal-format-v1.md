@@ -93,9 +93,11 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 60 | 32 | ordered mutation-set BLAKE3 digest |
 | 92 | 32 | four little-endian root page IDs |
 
-The current relational mutation body stores values at or below 8,192 bytes
-inline. Larger values are promoted to the immutable blob namespace first and
-the WAL stores only the one-byte blob envelope plus its 56-byte reference.
+The current relational and structure mutation bodies store values at or below
+8,192 bytes inline. Larger values are promoted to the shared immutable blob
+namespace first. The WAL stores the relational one-byte envelope or the
+structure `HYSTRV01` envelope with its 56-byte reference instead of duplicating
+large content.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 

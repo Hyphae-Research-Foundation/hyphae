@@ -118,6 +118,23 @@ SQL storage design. Secondary indexes, range cursors, prefix compression, bulk
 load, free-space policy, scan-oriented column batches, retention, and vacuum
 remain pending.
 
+## Structure namespace
+
+New structure roots use the same native B+tree codec with a separate private
+namespace:
+
+| Prefix | Key | Value |
+|---:|---|---|
+| `0x00` | exact one-byte format key | ASCII `HYSTRBT1` |
+| `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
+
+The value envelope and legacy single-page compatibility are specified in
+[Native structure-engine semantics v1](structures-semantics-v1.md). A `SET`
+rewrites only its copy-on-write leaf-to-root path; direct current reads traverse
+the buffer pool. The current implementation has no structure tombstone,
+range/prefix cursor, conditional write, expiry index, or collection-family
+layout yet.
+
 ## Verification
 
 Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,

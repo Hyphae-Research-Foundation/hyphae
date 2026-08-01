@@ -48,7 +48,10 @@ use hyphae_native_wal::{WalError, WalFile, WalRecovery};
 use thiserror::Error;
 
 use crate::{
-    model::{CatalogState, ModelError, RelationState, SearchState, StructureState, TtlValue},
+    model::{
+        CatalogState, ModelError, RelationState, SearchState, StructureEntry, StructureState,
+        TtlValue,
+    },
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_checkpoint,
         encode_transaction, recover_wal,
@@ -65,6 +68,15 @@ const RELATIONAL_ROW_PREFIX: u8 = 2;
 const RELATIONAL_VALUE_INLINE: u8 = 0;
 const RELATIONAL_VALUE_BLOB: u8 = 1;
 const RELATIONAL_INLINE_VALUE_LIMIT: usize = 8_192;
+const STRUCTURE_FORMAT_KEY: &[u8] = b"\x00";
+const STRUCTURE_FORMAT_VALUE_V1: &[u8] = b"HYSTRBT1";
+const STRUCTURE_ENTRY_PREFIX: u8 = 1;
+const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
+const STRUCTURE_VALUE_HEADER_SIZE: usize = 24;
+const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
+const STRUCTURE_VALUE_INLINE: u8 = 0;
+const STRUCTURE_VALUE_BLOB: u8 = 1;
+const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
 const DEFAULT_BUFFER_POOL_FRAMES: usize = 1_024;
 const DEFAULT_BUFFER_POOL_PARTITIONS: usize = 16;
 const SLOT_CATALOG: RootSlot = RootSlot {
@@ -106,6 +118,12 @@ impl RelationalFormat {
             _ => Err(NativeRuntimeError::InvalidRelationalTree),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructureFormat {
+    InlineStateV1,
+    BTreeV1,
 }
 
 /// Native runtime or recovery failure.
@@ -162,6 +180,9 @@ pub enum NativeRuntimeError {
     /// The relational B+tree contains malformed namespace keys or markers.
     #[error("native relational B+tree namespace is invalid")]
     InvalidRelationalTree,
+    /// The structure B+tree contains malformed namespace keys or values.
+    #[error("native structure B+tree namespace is invalid")]
+    InvalidStructureTree,
     /// A detached write mutation cannot be reapplied to the admitted base.
     #[error("native optimistic write batch contains an invalid mutation")]
     InvalidPreparedMutation,
@@ -431,6 +452,7 @@ pub struct NativeDatabase {
     coordinator: CommitCoordinator,
     conflicts: ConflictTable,
     relational_format: RelationalFormat,
+    structure_format: StructureFormat,
     next_transaction_id: u128,
     last_checkpoint_lsn: Option<Lsn>,
     recovery: RecoveryReport,
@@ -467,6 +489,7 @@ impl NativeDatabase {
             coordinator,
             conflicts: ConflictTable::default(),
             relational_format: RelationalFormat::VersionChainV2,
+            structure_format: StructureFormat::BTreeV1,
             next_transaction_id: 1,
             last_checkpoint_lsn: None,
             recovery: RecoveryReport {
@@ -540,11 +563,8 @@ impl NativeDatabase {
             &manifest_recovery.manifests,
             &committed_roots,
         )?;
-        let relational_format = latest_root
-            .as_ref()
-            .map(|root| relational_format_for_root(&opened_pages.store, root))
-            .transpose()?
-            .unwrap_or(RelationalFormat::VersionChainV2);
+        let (relational_format, structure_format) =
+            formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
         let coordinator = if let Some(root) = latest_root {
             CommitCoordinator::restore(root)?
         } else {
@@ -574,6 +594,7 @@ impl NativeDatabase {
             coordinator,
             conflicts,
             relational_format,
+            structure_format,
             next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
             recovery: RecoveryReport {
@@ -649,6 +670,64 @@ impl NativeDatabase {
             .map(Option::flatten)
     }
 
+    /// Reads one current structure value through its physical root.
+    ///
+    /// Expiry is evaluated against the supplied deterministic logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, B+tree, value-envelope, or blob corruption.
+    pub fn get_latest_structure(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        Ok(self.latest_structure_entry(key)?.and_then(|entry| {
+            entry
+                .expires_at_micros
+                .is_none_or(|expiry| expiry > logical_time_micros)
+                .then_some(entry.value)
+        }))
+    }
+
+    /// Returns current physical TTL state at deterministic logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, B+tree, value-envelope, or blob corruption.
+    pub fn ttl_latest_structure(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Ttl, NativeRuntimeError> {
+        Ok(match self.latest_structure_entry(key)? {
+            None => Ttl::Missing,
+            Some(entry) => entry.expires_at_micros.map_or(Ttl::Persistent, |expiry| {
+                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros).max(0))
+            }),
+        })
+    }
+
+    fn latest_structure_entry(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<StructureEntry>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+            return Ok(None);
+        };
+        match self.structure_format {
+            StructureFormat::InlineStateV1 => {
+                let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
+                Ok(state.entries.get(key).cloned())
+            }
+            StructureFormat::BTreeV1 => BTree::from_root(root)
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+                .transpose(),
+        }
+    }
+
     /// Verifies the current relational B+tree and returns its node height.
     ///
     /// # Errors
@@ -658,6 +737,24 @@ impl NativeDatabase {
     pub fn latest_relational_tree_height(&self) -> Result<usize, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
         let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            return Ok(0);
+        };
+        Ok(BTree::from_root(root).height(&self.pages)?)
+    }
+
+    /// Verifies the current structure B+tree and returns its node height.
+    ///
+    /// Legacy inline-state roots report zero because they are not a B+tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot, page, or B+tree corruption.
+    pub fn latest_structure_tree_height(&self) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format == StructureFormat::InlineStateV1 {
+            return Ok(0);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
             return Ok(0);
         };
         Ok(BTree::from_root(root).height(&self.pages)?)
@@ -710,6 +807,7 @@ impl NativeDatabase {
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
             relational_format: self.relational_format,
+            structure_format: self.structure_format,
             root_transaction,
             conflict_read_csn: batch.snapshot.visible_csn,
             transaction_id,
@@ -791,6 +889,7 @@ impl NativeDatabase {
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
             relational_format: self.relational_format,
+            structure_format: self.structure_format,
             root_transaction,
             conflict_read_csn,
             transaction_id,
@@ -913,6 +1012,7 @@ pub struct NativeTransaction<'database> {
     wal: &'database mut WalFile,
     conflicts: &'database mut ConflictTable,
     relational_format: RelationalFormat,
+    structure_format: StructureFormat,
     root_transaction: RootTransaction<'database>,
     conflict_read_csn: Option<Csn>,
     transaction_id: TransactionId,
@@ -1246,8 +1346,7 @@ impl NativeTransaction<'_> {
         let catalog_version = self.commit_catalog_version()?;
         let batch = self.batch;
         let synchronize = batch.durability != DurabilityClass::Memory;
-        let staged_blobs =
-            stage_large_relational_values(self.blobs, &batch.mutations, synchronize)?;
+        let staged_blobs = stage_large_values(self.blobs, &batch.mutations, synchronize)?;
         interrupt(interruption, CommitBoundary::BlobStaged)?;
         let blob_references = publish_staged_blobs(self.blobs, staged_blobs, synchronize)?;
         let blob_generation = self.blobs.generation()?;
@@ -1274,12 +1373,15 @@ impl NativeTransaction<'_> {
             .root();
         }
         if batch.dirty[2] || roots[2].is_none() {
-            roots[2] = Some(self.pages.append(
-                PageKind::StructureNode,
-                Some(commit_csn),
-                None,
-                batch.state.structures.encode()?,
-            )?);
+            roots[2] = structure_root_after_mutations(
+                self.pages,
+                roots[2],
+                self.structure_format,
+                commit_csn,
+                &batch.state.structures,
+                &batch.mutations,
+                &blob_references,
+            )?;
         }
         if batch.dirty[3] || roots[3].is_none() {
             roots[3] = Some(self.pages.append(
@@ -1520,16 +1622,19 @@ fn validate_checkpoints(
     })
 }
 
-fn stage_large_relational_values(
+fn stage_large_values(
     blobs: &BlobStore,
     mutations: &[Mutation],
     synchronize: bool,
 ) -> Result<BTreeMap<[u8; 32], StagedBlob>, NativeRuntimeError> {
     let mut staged = BTreeMap::new();
     for mutation in mutations.iter().filter(|mutation| {
-        mutation.engine == EngineKind::Relational
+        (mutation.engine == EngineKind::Relational
             && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
-            && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT
+            && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT)
+            || (mutation.engine == EngineKind::Structure
+                && mutation.opcode == Opcode::SetValue
+                && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
     }) {
         let digest = *blake3::hash(&mutation.value).as_bytes();
         if let std::collections::btree_map::Entry::Vacant(entry) = staged.entry(digest) {
@@ -1570,6 +1675,78 @@ fn relational_storage_value(
     Ok(encoded)
 }
 
+fn structure_storage_value(
+    value: &[u8],
+    expires_at_micros: Option<i64>,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let uses_blob = value.len() > STRUCTURE_INLINE_VALUE_LIMIT;
+    let payload_length = if uses_blob {
+        hyphae_native_records::BLOB_REFERENCE_SIZE
+    } else {
+        value.len()
+    };
+    let mut encoded = Vec::with_capacity(STRUCTURE_VALUE_HEADER_SIZE + payload_length);
+    encoded.extend_from_slice(STRUCTURE_VALUE_MAGIC);
+    encoded.push(u8::from(expires_at_micros.is_some()) * STRUCTURE_VALUE_HAS_EXPIRY);
+    encoded.push(if uses_blob {
+        STRUCTURE_VALUE_BLOB
+    } else {
+        STRUCTURE_VALUE_INLINE
+    });
+    encoded.extend_from_slice(&[0; 6]);
+    encoded.extend_from_slice(&expires_at_micros.unwrap_or(0).to_le_bytes());
+    if uses_blob {
+        let digest = *blake3::hash(value).as_bytes();
+        let reference = blob_references
+            .get(&digest)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        encoded.extend_from_slice(&reference.encode());
+    } else {
+        encoded.extend_from_slice(value);
+    }
+    Ok(encoded)
+}
+
+fn decode_structure_value(
+    encoded: &[u8],
+    blobs: &BlobStore,
+) -> Result<StructureEntry, NativeRuntimeError> {
+    if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        || encoded[8] & !STRUCTURE_VALUE_HAS_EXPIRY != 0
+        || encoded[10..16] != [0; 6]
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut expiry_bytes = [0_u8; 8];
+    expiry_bytes.copy_from_slice(&encoded[16..24]);
+    let raw_expiry = i64::from_le_bytes(expiry_bytes);
+    let expires_at_micros = if encoded[8] == STRUCTURE_VALUE_HAS_EXPIRY {
+        Some(raw_expiry)
+    } else if raw_expiry == 0 {
+        None
+    } else {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    };
+    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
+    let value = match encoded[9] {
+        STRUCTURE_VALUE_INLINE if payload.len() <= STRUCTURE_INLINE_VALUE_LIMIT => payload.to_vec(),
+        STRUCTURE_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= STRUCTURE_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            blobs.read(reference)?
+        }
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    Ok(StructureEntry {
+        value,
+        expires_at_micros,
+    })
+}
+
 fn wal_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -1582,10 +1759,86 @@ fn wal_mutations(
                 && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
             {
                 mutation.value = relational_storage_value(&mutation.value, blob_references)?;
+            } else if mutation.engine == EngineKind::Structure
+                && mutation.opcode == Opcode::SetValue
+            {
+                mutation.value = structure_storage_value(
+                    &mutation.value,
+                    mutation.expires_at_micros,
+                    blob_references,
+                )?;
             }
             Ok(mutation)
         })
         .collect()
+}
+
+fn structure_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(1));
+    encoded.push(STRUCTURE_ENTRY_PREFIX);
+    encoded.extend_from_slice(key);
+    encoded
+}
+
+fn structure_tree_after_mutations(
+    pages: &mut PageStore,
+    root: Option<PageId>,
+    creating_csn: Csn,
+    mutations: &[Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
+    if tree.root().is_none() {
+        tree = tree
+            .insert_unique(
+                pages,
+                creating_csn,
+                STRUCTURE_FORMAT_KEY.to_vec(),
+                STRUCTURE_FORMAT_VALUE_V1.to_vec(),
+            )?
+            .tree;
+    }
+    for mutation in mutations
+        .iter()
+        .filter(|mutation| mutation.engine == EngineKind::Structure)
+    {
+        if mutation.opcode != Opcode::SetValue || mutation.target.is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let value =
+            structure_storage_value(&mutation.value, mutation.expires_at_micros, blob_references)?;
+        tree = tree
+            .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
+            .tree;
+    }
+    Ok(tree)
+}
+
+fn structure_root_after_mutations(
+    pages: &mut PageStore,
+    root: Option<PageId>,
+    format: StructureFormat,
+    creating_csn: Csn,
+    state: &StructureState,
+    mutations: &[Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Option<PageId>, NativeRuntimeError> {
+    match format {
+        StructureFormat::InlineStateV1 => Ok(Some(pages.append(
+            PageKind::StructureNode,
+            Some(creating_csn),
+            None,
+            state.encode()?,
+        )?)),
+        StructureFormat::BTreeV1 => Ok(structure_tree_after_mutations(
+            pages,
+            root,
+            creating_csn,
+            mutations,
+            blob_references,
+        )?
+        .root()),
+    }
 }
 
 fn relational_tree_after_mutations(
@@ -1994,7 +2247,6 @@ fn validate_roots(
 ) -> Result<(), NativeRuntimeError> {
     for (slot, expected_kind) in [
         (SLOT_CATALOG, PageKind::CatalogRoot),
-        (SLOT_STRUCTURE, PageKind::StructureNode),
         (SLOT_SEARCH, PageKind::SearchDelta),
     ] {
         let page_id = roots
@@ -2028,6 +2280,29 @@ fn validate_roots(
         return Err(NativeRuntimeError::FuturePage);
     }
     BTree::from_root(relational_root).validate_visible(pages, visible_csn)?;
+
+    let structure_root = roots
+        .root(SLOT_STRUCTURE)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    let structure_page = pages.read(structure_root)?;
+    if !matches!(
+        structure_page.kind(),
+        PageKind::StructureNode | PageKind::BTreeLeaf | PageKind::BTreeInternal
+    ) {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    if structure_page
+        .creating_csn()
+        .is_none_or(|creating| creating > visible_csn)
+    {
+        return Err(NativeRuntimeError::FuturePage);
+    }
+    if matches!(
+        structure_page.kind(),
+        PageKind::BTreeLeaf | PageKind::BTreeInternal
+    ) {
+        BTree::from_root(structure_root).validate_visible(pages, visible_csn)?;
+    }
     load_state(pages, blobs, roots)?;
     Ok(())
 }
@@ -2043,14 +2318,7 @@ fn load_state(
         })?
         .unwrap_or_default(),
         relational: load_relational_state(pages, blobs, roots)?,
-        structures: load_root(
-            pages,
-            roots,
-            SLOT_STRUCTURE,
-            PageKind::StructureNode,
-            StructureState::decode,
-        )?
-        .unwrap_or_default(),
+        structures: load_structure_state(pages, blobs, roots)?,
         search: load_root(pages, roots, SLOT_SEARCH, PageKind::SearchDelta, |bytes| {
             SearchState::decode(bytes)
         })?
@@ -2120,6 +2388,21 @@ fn load_relational_state(
     Ok(RelationState { tables })
 }
 
+fn formats_for_latest_root(
+    pages: &PageStore,
+    root: Option<&RootSet>,
+) -> Result<(RelationalFormat, StructureFormat), NativeRuntimeError> {
+    root.map_or(
+        Ok((RelationalFormat::VersionChainV2, StructureFormat::BTreeV1)),
+        |root| {
+            Ok((
+                relational_format_for_root(pages, root)?,
+                structure_format_for_root(pages, root)?,
+            ))
+        },
+    )
+}
+
 fn relational_format_for_root(
     pages: &PageStore,
     roots: &RootSet,
@@ -2131,6 +2414,66 @@ fn relational_format_for_root(
         .get(pages, RELATIONAL_FORMAT_KEY)?
         .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
     RelationalFormat::decode(&marker)
+}
+
+fn load_structure_state(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+) -> Result<StructureState, NativeRuntimeError> {
+    let Some(root) = roots.root(SLOT_STRUCTURE) else {
+        return Ok(StructureState::default());
+    };
+    let page = pages.read(root)?;
+    if page.kind() == PageKind::StructureNode {
+        return Ok(StructureState::decode(page.payload())?);
+    }
+    if !matches!(page.kind(), PageKind::BTreeLeaf | PageKind::BTreeInternal) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let entries = BTree::from_root(root).scan(pages)?;
+    let mut iterator = entries.into_iter();
+    let Some((format_key, format_value)) = iterator.next() else {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    };
+    if format_key != STRUCTURE_FORMAT_KEY || format_value != STRUCTURE_FORMAT_VALUE_V1 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut decoded = BTreeMap::new();
+    for (key, value) in iterator {
+        if key.first().copied() != Some(STRUCTURE_ENTRY_PREFIX) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entry = decode_structure_value(&value, blobs)?;
+        if decoded.insert(key[1..].to_vec(), entry).is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    Ok(StructureState { entries: decoded })
+}
+
+fn structure_format_for_root(
+    pages: &PageStore,
+    roots: &RootSet,
+) -> Result<StructureFormat, NativeRuntimeError> {
+    let root = roots
+        .root(SLOT_STRUCTURE)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    let page = pages.read(root)?;
+    match page.kind() {
+        PageKind::StructureNode => Ok(StructureFormat::InlineStateV1),
+        PageKind::BTreeLeaf | PageKind::BTreeInternal => {
+            let marker = BTree::from_root(root)
+                .get(pages, STRUCTURE_FORMAT_KEY)?
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            if marker == STRUCTURE_FORMAT_VALUE_V1 {
+                Ok(StructureFormat::BTreeV1)
+            } else {
+                Err(NativeRuntimeError::InvalidStructureTree)
+            }
+        }
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
 }
 
 fn load_root<T>(
@@ -2290,11 +2633,24 @@ mod tests {
         assert_eq!(snapshot.get(b"session"), Some(b"open".as_slice()));
         assert_eq!(snapshot.ttl(b"session"), super::Ttl::RemainingMicros(50));
         assert_eq!(
+            database.get_latest_structure(b"session", 150)?,
+            Some(b"open".to_vec())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"session", 150)?,
+            super::Ttl::RemainingMicros(50)
+        );
+        assert_eq!(
             snapshot.match_text(index, "rust", 10)?[0].document_id,
             b"doc-1"
         );
         let expired = database.snapshot(200)?;
         assert_eq!(expired.get(b"session"), None);
+        assert_eq!(database.get_latest_structure(b"session", 200)?, None);
+        assert_eq!(
+            database.ttl_latest_structure(b"session", 200)?,
+            super::Ttl::RemainingMicros(0)
+        );
         Ok(())
     }
 
@@ -2315,8 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn large_relational_value_uses_verified_blob_storage() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn large_cross_engine_value_uses_one_verified_blob() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         let table = ObjectId::new(11)?;
@@ -2324,9 +2679,14 @@ mod tests {
         let mut transaction = database.begin(100, DurabilityClass::Strict)?;
         transaction.create_relation(table, "large_rows")?;
         transaction.insert(table, b"blob-row".to_vec(), value.clone())?;
+        transaction.set(b"blob-key".to_vec(), value.clone(), None);
         transaction.commit()?;
         assert_eq!(
             database.select_latest_relational(table, b"blob-row")?,
+            Some(value.clone())
+        );
+        assert_eq!(
+            database.get_latest_structure(b"blob-key", 101)?,
             Some(value.clone())
         );
         database.checkpoint()?;
@@ -2341,9 +2701,146 @@ mod tests {
             Some(value.as_slice())
         );
         assert_eq!(
+            reopened.snapshot(101)?.get(b"blob-key"),
+            Some(value.as_slice())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"blob-key", 101)?,
+            Some(value.clone())
+        );
+        assert_eq!(
             reopened.select_latest_relational(table, b"blob-row")?,
             Some(value)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_structure_tree_preserves_history_ttl_and_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let target = 1_024_u32.to_be_bytes();
+        let original = vec![0x41; 96];
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        for index in 0..2_048_u32 {
+            let value = if index == 1_024 {
+                original.clone()
+            } else {
+                vec![u8::try_from(index % 251)?; 96]
+            };
+            seed.set(index.to_be_bytes().to_vec(), value, Some(1_000));
+        }
+        seed.commit()?;
+
+        let root_snapshot = database.coordinator.snapshot(101)?;
+        let root = root_snapshot
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(hyphae_native_btree::BTree::from_root(root).height(&database.pages)? >= 2);
+        assert_eq!(
+            database.get_latest_structure(&target, 200)?,
+            Some(original.clone())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(&target, 200)?,
+            super::Ttl::RemainingMicros(800)
+        );
+        let historical = database.snapshot(200)?;
+
+        let updated = vec![0x42; 96];
+        let mut update = database.begin(201, DurabilityClass::Strict)?;
+        update.set(target.to_vec(), updated.clone(), None);
+        update.commit()?;
+        assert_eq!(historical.get(&target), Some(original.as_slice()));
+        assert_eq!(
+            database.get_latest_structure(&target, 202)?,
+            Some(updated.clone())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(&target, 202)?,
+            super::Ttl::Persistent
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert_eq!(
+            reopened.get_latest_structure(&target, 203)?,
+            Some(updated.clone())
+        );
+        assert_eq!(
+            reopened.snapshot(203)?.get(&target),
+            Some(updated.as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_structure_directories_remain_readable_and_writable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        database.structure_format = super::StructureFormat::InlineStateV1;
+        let mut create = database.begin(10, DurabilityClass::Strict)?;
+        create.set(b"legacy".to_vec(), b"v1".to_vec(), Some(50));
+        create.commit()?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.structure_format,
+            super::StructureFormat::InlineStateV1
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"legacy", 20)?,
+            Some(b"v1".to_vec())
+        );
+        let mut update = reopened.begin(21, DurabilityClass::Strict)?;
+        update.set(b"legacy".to_vec(), b"v2".to_vec(), None);
+        update.commit()?;
+        drop(reopened);
+
+        let recovered = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            recovered.get_latest_structure(b"legacy", 60)?,
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            recovered.ttl_latest_structure(b"legacy", 60)?,
+            super::Ttl::Persistent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structure_value_envelope_is_canonical_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        fs::create_dir_all(temporary.path())?;
+        let blobs = hyphae_native_blobs::BlobStore::create(temporary.path())?;
+        let encoded = super::structure_storage_value(
+            b"value",
+            Some(i64::MAX),
+            &std::collections::BTreeMap::new(),
+        )?;
+        let decoded = super::decode_structure_value(&encoded, &blobs)?;
+        assert_eq!(decoded.value, b"value");
+        assert_eq!(decoded.expires_at_micros, Some(i64::MAX));
+
+        let mut reserved = encoded.clone();
+        reserved[10] = 1;
+        assert!(matches!(
+            super::decode_structure_value(&reserved, &blobs),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        let mut noncanonical_persistent = encoded;
+        noncanonical_persistent[8] = 0;
+        assert!(matches!(
+            super::decode_structure_value(&noncanonical_persistent, &blobs),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
         Ok(())
     }
 
