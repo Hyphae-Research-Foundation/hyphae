@@ -35,6 +35,9 @@ const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
 const HASH_SCALE_FIELDS: u32 = 2_048;
 const HASH_TARGET_FIELD: u32 = HASH_SCALE_FIELDS / 2;
 const HASH_KEY: &[u8] = b"benchmark-hash";
+const SET_SCALE_MEMBERS: u32 = 2_048;
+const SET_TARGET_MEMBER: u32 = SET_SCALE_MEMBERS / 2;
+const SET_KEY: &[u8] = b"benchmark-set";
 const SEARCH_SCALE_DOCUMENTS: u32 = 2_048;
 const SEARCH_TARGET_DOCUMENT: u32 = SEARCH_SCALE_DOCUMENTS / 2;
 const SEARCH_OBSERVATIONS: u32 = 100_000;
@@ -78,6 +81,8 @@ struct OperationStats {
     structure_btree: Stats,
     hash: Stats,
     hash_btree: Stats,
+    set: Stats,
+    set_btree: Stats,
     search_btree: Stats,
     prepared_sql: Stats,
     relational_btree: Stats,
@@ -110,6 +115,7 @@ struct BenchmarkInputs<'a> {
     residual_parameters: &'a [SqlValue],
     structure_target: &'a [u8],
     hash_target: &'a [u8],
+    set_target: &'a [u8],
     frame: &'a [u8],
 }
 
@@ -147,6 +153,12 @@ fn seed_scaled_data(
         dataset_hasher.update(&field);
         dataset_hasher.update(&value);
         transaction.hset(HASH_KEY.to_vec(), field.to_vec(), value)?;
+    }
+    transaction.create_set(SET_KEY.to_vec())?;
+    for member in 0..SET_SCALE_MEMBERS {
+        let member = member.to_be_bytes();
+        dataset_hasher.update(&member);
+        transaction.sadd(SET_KEY.to_vec(), member.to_vec())?;
     }
     for document in 0..SEARCH_SCALE_DOCUMENTS {
         let document_id = document.to_be_bytes();
@@ -224,6 +236,8 @@ fn warm_operations(
         black_box(database.get_latest_structure(black_box(inputs.structure_target), 101)?);
         black_box(snapshot.hget(black_box(HASH_KEY), black_box(inputs.hash_target))?);
         black_box(database.hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))?);
+        black_box(snapshot.sismember(black_box(SET_KEY), black_box(inputs.set_target))?);
+        black_box(database.sismember_latest_set(black_box(SET_KEY), black_box(inputs.set_target))?);
         black_box(database.match_latest_text(
             inputs.search_index,
             black_box(SEARCH_QUERY),
@@ -278,34 +292,18 @@ fn measure_operations(
     inputs: &BenchmarkInputs<'_>,
 ) -> Result<OperationStats, Box<dyn std::error::Error>> {
     warm_operations(database, snapshot, inputs)?;
+    let (structure, structure_btree, hash, hash_btree, set, set_btree) =
+        measure_structure_reads(database, snapshot, inputs);
     let (relational_scan, prepared_sql_scan, relational_range, prepared_sql_range) =
         measure_relational_scans(database, inputs);
     let prepared_sql_residual_range = measure_residual_filter(database, inputs);
     Ok(OperationStats {
-        structure: measure(|| {
-            black_box(snapshot.get(black_box(b"session")));
-        }),
-        structure_btree: measure(|| {
-            black_box(
-                database
-                    .get_latest_structure(black_box(inputs.structure_target), 101)
-                    .is_ok(),
-            );
-        }),
-        hash: measure(|| {
-            black_box(
-                snapshot
-                    .hget(black_box(HASH_KEY), black_box(inputs.hash_target))
-                    .is_ok(),
-            );
-        }),
-        hash_btree: measure(|| {
-            black_box(
-                database
-                    .hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))
-                    .is_ok(),
-            );
-        }),
+        structure,
+        structure_btree,
+        hash,
+        hash_btree,
+        set,
+        set_btree,
         search_btree: measure_counted(
             || {
                 black_box(
@@ -374,6 +372,52 @@ fn measure_operations(
             }
         }),
     })
+}
+
+fn measure_structure_reads(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats, Stats, Stats, Stats, Stats) {
+    let structure = measure(|| {
+        black_box(snapshot.get(black_box(b"session")));
+    });
+    let structure_btree = measure(|| {
+        black_box(
+            database
+                .get_latest_structure(black_box(inputs.structure_target), 101)
+                .is_ok(),
+        );
+    });
+    let hash = measure(|| {
+        black_box(
+            snapshot
+                .hget(black_box(HASH_KEY), black_box(inputs.hash_target))
+                .is_ok(),
+        );
+    });
+    let hash_btree = measure(|| {
+        black_box(
+            database
+                .hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))
+                .is_ok(),
+        );
+    });
+    let set = measure(|| {
+        black_box(
+            snapshot
+                .sismember(black_box(SET_KEY), black_box(inputs.set_target))
+                .is_ok(),
+        );
+    });
+    let set_btree = measure(|| {
+        black_box(
+            database
+                .sismember_latest_set(black_box(SET_KEY), black_box(inputs.set_target))
+                .is_ok(),
+        );
+    });
+    (structure, structure_btree, hash, hash_btree, set, set_btree)
 }
 
 fn measure_relational_scans(
@@ -586,6 +630,11 @@ fn validate_multilevel_dataset(
     if relational < 2 || structure < 2 || search < 2 {
         return Err("benchmark dataset did not produce three multilevel B+trees".into());
     }
+    if database.scard_latest_set(SET_KEY)? != usize::try_from(SET_SCALE_MEMBERS)?
+        || !database.sismember_latest_set(SET_KEY, &SET_TARGET_MEMBER.to_be_bytes())?
+    {
+        return Err("physical set benchmark corpus is incomplete".into());
+    }
     if database.match_latest_text(search_index, SEARCH_QUERY, 1)?[0].document_id
         != SEARCH_TARGET_DOCUMENT.to_be_bytes()
     {
@@ -610,7 +659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v10");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v11");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
     let (secondary_table, secondary_index) =
         seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
@@ -641,6 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_scan_routes(&database, secondary_table, &scan_prepared)?;
     let structure_target = STRUCTURE_TARGET_KEY.to_be_bytes();
     let hash_target = HASH_TARGET_FIELD.to_be_bytes();
+    let set_target = SET_TARGET_MEMBER.to_be_bytes();
     let frame = encode_frame(
         FrameKind::Structure,
         1,
@@ -671,6 +721,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             residual_parameters: &residual_parameters,
             structure_target: &structure_target,
             hash_target: &hash_target,
+            set_target: &set_target,
             frame: &frame,
         },
     )?;
@@ -699,7 +750,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v10\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v11\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -740,11 +791,17 @@ fn print_report(
     println!("  \"structure_keys\": {STRUCTURE_SCALE_KEYS},");
     println!("  \"structure_tree_height\": {structure_tree_height},");
     println!("  \"hash_fields\": {HASH_SCALE_FIELDS},");
+    println!("  \"set_members\": {SET_SCALE_MEMBERS},");
     println!("  \"search_documents\": {SEARCH_SCALE_DOCUMENTS},");
     println!("  \"search_tree_height\": {search_tree_height},");
     println!("  \"search_query_document_frequency\": 1,");
     println!("  \"dataset_digest_blake3\": \"{dataset_digest}\",");
     println!("  \"transport_note\": \"codec plus embedded dispatch; no named-pipe transport\",");
+    print_operation_stats(operations);
+    println!("}}");
+}
+
+fn print_operation_stats(operations: &OperationStats) {
     println!("  \"operations\": {{");
     print_stats("embedded_structure_get_64b", operations.structure, true);
     print_stats(
@@ -760,6 +817,16 @@ fn print_report(
     print_stats(
         "buffered_hash_hget_64b_multilevel",
         operations.hash_btree,
+        true,
+    );
+    print_stats(
+        "embedded_set_sismember_materialized_scaled_snapshot",
+        operations.set,
+        true,
+    );
+    print_stats(
+        "buffered_set_sismember_multilevel",
+        operations.set_btree,
         true,
     );
     print_stats(
@@ -794,7 +861,6 @@ fn print_report(
         false,
     );
     println!("  }}");
-    println!("}}");
 }
 
 fn print_relational_scan_stats(operations: &OperationStats) {
