@@ -151,6 +151,11 @@ commit before its tag can be published.
   `NULL`, boolean, signed-integer and escaped text literals, retained physical
   access paths, three-valued logic, materialized/current-root/reopen
   equivalence, and explicit remaining G2 limits to one source commit.
+- [Native SQL mutation-literal evidence —
+  2026-08-01](native-sql-mutation-literals-2026-08-01.md) binds the same scalar
+  operands to `INSERT`, exact-primary-key `UPDATE` and `DELETE`, including
+  fail-before-write behavior, index maintenance, recovery, and explicit
+  remaining G2 limits to one source commit.
 
 ## Hosted release evidence
 

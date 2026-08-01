@@ -8851,6 +8851,154 @@ mod tests {
         Ok(())
     }
 
+    fn seed_literal_mutation_users(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                note TEXT,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO users (id, email, note, active)
+             VALUES (1, 'old@hyphae.local', NULL, FALSE)",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO users (id, email, note, active)
+             VALUES (?, 'two@hyphae.local', 'second', TRUE)",
+            &[SqlValue::Signed(2)],
+        )?;
+        let created = seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing literal-mutation index".into());
+        };
+        seed.commit()?;
+        Ok(index)
+    }
+
+    fn assert_literal_mutation_failures(
+        mutation: &mut super::NativeWriteBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            mutation.execute_sql(
+                "UPDATE users
+                 SET email = 'must-not-persist@hyphae.local', active = 1
+                 WHERE id = 1",
+                &[],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert_eq!(
+            mutation.execute_sql("SELECT id FROM users WHERE email = 'old@hyphae.local'", &[],)?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(1)]],
+            }
+        );
+        assert!(matches!(
+            mutation.execute_sql(
+                "INSERT INTO users (id, email, note, active)
+                 VALUES (?, 'bad@hyphae.local', NULL, TRUE)",
+                &[],
+            ),
+            Err(SqlError::ParameterMismatch)
+        ));
+        assert!(matches!(
+            mutation.execute_sql(
+                "INSERT INTO users (id, email, note, active)
+                 VALUES (3, NULL, NULL, TRUE)",
+                &[],
+            ),
+            Err(SqlError::NullViolation)
+        ));
+        assert!(matches!(
+            mutation.execute_sql(
+                "INSERT INTO users (id, email, note, active)
+                 VALUES (9223372036854775808, 'overflow@hyphae.local', NULL, TRUE)",
+                &[],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_mutation_literals_preserve_indexes_and_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = seed_literal_mutation_users(&mut database)?;
+
+        let mut mutation = database.begin_sql(11, DurabilityClass::Strict)?;
+        assert_literal_mutation_failures(&mut mutation)?;
+        assert_eq!(
+            mutation.execute_sql(
+                "UPDATE users
+                 SET email = 'new@hyphae.local', note = 'Mario''s', active = TRUE
+                 WHERE id = ?",
+                &[SqlValue::Signed(1)],
+            )?,
+            command_rows(1)
+        );
+        assert_eq!(
+            mutation.execute_sql("DELETE FROM users WHERE id = 2", &[])?,
+            command_rows(1)
+        );
+        mutation.commit()?;
+
+        let old = SqlValue::Text("old@hyphae.local".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let new = SqlValue::Text("new@hyphae.local".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        assert!(
+            database
+                .select_latest_secondary_index(index, &old)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.select_latest_secondary_index(index, &new)?.len(),
+            1
+        );
+        let expected = SqlResult::Rows {
+            columns: vec!["id".to_owned(), "note".to_owned()],
+            rows: vec![vec![
+                SqlValue::Signed(1),
+                SqlValue::Text("Mario's".to_owned()),
+            ]],
+        };
+        let plan = database.prepare_sql_latest(
+            "SELECT id, note FROM users
+             WHERE email = 'new@hyphae.local' AND active = TRUE",
+        )?;
+        assert_eq!(database.execute_prepared_latest(&plan, &[])?, expected);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(
+            "SELECT id, note FROM users
+             WHERE email = 'new@hyphae.local' AND active = TRUE",
+        )?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[])?,
+            expected
+        );
+        assert_eq!(
+            reopened.select_latest_secondary_index(index, &new)?.len(),
+            1
+        );
+        Ok(())
+    }
+
     #[test]
     fn indexed_updates_preserve_unique_nulls_distinct() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();

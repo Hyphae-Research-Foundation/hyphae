@@ -208,6 +208,14 @@ current-root and reopened equivalence. Remaining literal families, casts,
 functions, joins, aggregation, partial/secondary ranges, statistics/cost
 planning, and the remaining G2/G7 evidence remain open.
 
+The [native SQL mutation-literal
+evidence](evidence/native-sql-mutation-literals-2026-08-01.md) extends those
+catalog-bound operands to `INSERT`, exact-primary-key `UPDATE`, and
+exact-primary-key `DELETE`, including mixed parameter order, fail-before-write
+binding, secondary-index maintenance, and reopen. General mutation
+expressions, multi-row/range mutation, joins, aggregation, planning, and the
+remaining G2 evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

@@ -7,7 +7,7 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 `UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
-implemented for `SELECT` filters. G2 remains open
+implemented for `SELECT` filters and exact-primary-key DML. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -97,8 +97,8 @@ family. Integer range/domain checks use the declared signed/unsigned width.
 SQL `NULL` is admissible for every comparison and evaluates to `UNKNOWN`.
 Decimal/floating/binary/temporal/UUID/JSON literals, casts, arithmetic,
 functions, and column-to-column comparisons remain outside this milestone.
-This literal slice applies to `SELECT` filters; mutation value lists remain
-parameter-only.
+The same scalar operands are admitted by the exact-primary-key mutation slice
+defined below.
 
 The binder may extract complete primary-key equality, one complete
 secondary-index equality, or complete-primary-key lower/upper bounds from
@@ -119,14 +119,20 @@ number of matching rows without constructing a complete relation or
 Typed mutation accepts:
 
 ```text
+INSERT INTO <table> (<column> [, ...])
+VALUES (<scalar> [, ...])
+
 UPDATE <table>
-SET <non-primary-key-column> = ? [, ...]
-WHERE <primary-key-column> = ? [AND ...]
+SET <non-primary-key-column> = <scalar> [, ...]
+WHERE <primary-key-column> = <scalar> [AND ...]
 
 DELETE FROM <table>
-WHERE <primary-key-column> = ? [AND ...]
+WHERE <primary-key-column> = <scalar> [AND ...]
 ```
 
+`<scalar>` has the same first-slice definition used by filters: `?`, `NULL`,
+`TRUE`, `FALSE`, signed base-10 integer, or single-quoted text. Parameters and
+literals may be mixed; parameter positions follow statement text order.
 The `WHERE` column set must equal the complete primary key; predicate text
 order may differ from catalog key order. Update parameters occur in assignment
 order followed by predicate order. Assignment columns are unique, values are
@@ -167,9 +173,9 @@ remaining literal families, casts, partial primary-key prefix ranges,
 secondary ranges,
 descending scans, offsets, and constraints beyond primary key/nullability and
 the first unique index remain pending. Typed mutation does
-not yet change primary keys, use a secondary access path, evaluate expressions,
-or update multiple rows. Prefix, bitmap, and cost-based access selection remain
-pending.
+not yet change primary keys, use a secondary access path, evaluate general
+expressions, or update multiple rows. Prefix, bitmap, and cost-based access
+selection remain pending.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
