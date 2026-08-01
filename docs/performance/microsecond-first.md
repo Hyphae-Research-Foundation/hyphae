@@ -96,14 +96,16 @@ performance gates use stable, dedicated, disclosed hardware.
 
 ## Current baseline
 
-The first native convergence slice produced a
-[Windows microsecond smoke observation](../gates/evidence/native-microsecond-smoke-windows.json).
-It used one million warm observations with 32 calls averaged per timer sample
-and reported sub-microsecond batch averages for embedded structure get,
+The first native convergence slice produced a dirty-worktree
+[Windows microsecond smoke observation](../gates/evidence/native-microsecond-smoke-windows.json)
+and a clean-commit
+[WSL2 repeat](../gates/evidence/native-microsecond-smoke-wsl2.json). They used
+one million warm observations with 32 calls averaged per timer sample and
+reported sub-microsecond batch averages for embedded structure get,
 allocation-free prepared primary-key SQL, and local-frame codec plus embedded
-dispatch. It is not a passing receipt: it used a dirty worktree, tiny corpus,
-concurrency one, uncontrolled scheduling, no hardware/allocation counters, and
-no named-pipe transport.
+dispatch. Neither is a passing receipt: the corpus is tiny, concurrency is
+one, scheduling is uncontrolled, hardware/allocation counters and real
+named-pipe/UDS transport are absent, and the clean run is virtualized.
 
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50

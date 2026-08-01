@@ -91,19 +91,24 @@ group commit.
 ## Latency observation
 
 The checked [Windows smoke receipt](native-microsecond-smoke-windows.json)
-contains one million warm observations per operation, with 32 operations
-averaged in each timer observation because the Windows timer returned
-zero-duration samples for individual sub-microsecond calls.
+contains one million warm observations per operation from the initial dirty
+worktree. A second
+[WSL2 smoke receipt](native-microsecond-smoke-wsl2.json) is bound to clean
+commit `85b7a4d`. Both average 32 operations in each timer observation because
+the Windows timer returned zero-duration samples for individual
+sub-microsecond calls.
 
-The observed p99 batch-average values were 0.006 us for a 64-byte embedded
-structure get, 0.006 us for an allocation-free prepared primary-key SQL read,
-and 0.031 us for local-frame decode plus embedded structure dispatch.
+On the clean WSL2 run, observed p99 batch-average values were 0.003 us for a
+64-byte embedded structure get, 0.006 us for an allocation-free prepared
+primary-key SQL read, and 0.038 us for local-frame decode plus embedded
+structure dispatch.
 
 These numbers demonstrate that the bounded in-process path is in the
-microsecond domain on this machine. They do not pass G7: the source state was
-dirty; the corpus was tiny; named-pipe transport, concurrency 8/32, saturation,
-background interference, allocations, hardware counters, and individual tail
-samples were not measured.
+microsecond domain on this machine. They do not pass G7: the Windows source
+state was dirty and the clean run was virtualized; the corpus was tiny;
+named-pipe/UDS transport, concurrency 8/32, saturation, background
+interference, allocations, hardware counters, and individual tail samples
+were not measured.
 
 ## Explicit remaining work
 

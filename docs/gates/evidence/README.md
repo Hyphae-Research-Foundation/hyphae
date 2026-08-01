@@ -29,6 +29,10 @@ commit before its tag can be published.
 - `native-microsecond-smoke-windows.json` is a dirty-worktree, concurrency-one,
   batch-averaged observation. It is not named-pipe evidence and does not pass
   the microsecond performance gate.
+- `native-microsecond-smoke-wsl2.json` repeats the same smoke on clean commit
+  `85b7a4d` under WSL2. Commit binding improves reproducibility but the
+  batch-average, tiny-corpus, transport, concurrency, and hardware-counter
+  gaps still keep it outside the gate.
 
 ## Hosted release evidence
 
