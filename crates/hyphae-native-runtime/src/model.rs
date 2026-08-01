@@ -46,6 +46,8 @@ pub(crate) enum ModelError {
     MissingPrimaryKey,
     #[error("native relational secondary-index entry already exists")]
     DuplicateSecondaryIndexEntry,
+    #[error("native relational secondary-index entry does not exist")]
+    MissingSecondaryIndexEntry,
     #[error("native relational unique secondary index is violated")]
     UniqueSecondaryIndexViolation,
     #[error("legacy native structure state cannot encode collection families")]
@@ -292,6 +294,29 @@ impl RelationState {
             .entry(index_key)
             .or_default()
             .insert(primary_key);
+        Ok(())
+    }
+
+    pub(crate) fn remove_secondary_index(
+        &mut self,
+        index: ObjectId,
+        index_key: &[u8],
+        primary_key: &[u8],
+    ) -> Result<(), ModelError> {
+        let index = self
+            .indexes
+            .get_mut(&index)
+            .ok_or(ModelError::UnknownObject)?;
+        let entries = index
+            .entries
+            .get_mut(index_key)
+            .ok_or(ModelError::MissingSecondaryIndexEntry)?;
+        if !entries.remove(primary_key) {
+            return Err(ModelError::MissingSecondaryIndexEntry);
+        }
+        if entries.is_empty() {
+            index.entries.remove(index_key);
+        }
         Ok(())
     }
 

@@ -3,9 +3,9 @@
 Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 `INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
-direct current-root prepared primary/secondary lookup, `BEGIN`/`COMMIT`, and
-rollback are implemented experimentally. The legacy binary shape also
-supports `UPDATE` and `DELETE`; G2 remains open
+direct current-root prepared primary/secondary lookup, exact-primary-key typed
+`UPDATE`/`DELETE`, `BEGIN`/`COMMIT`, and rollback are implemented
+experimentally. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -41,10 +41,32 @@ codec; row values use the catalog-ordered `HYTUPL01` tuple. Type, domain,
 nullability, duplicate-column, missing-column, and incomplete-key failures
 occur before the row mutation.
 
+Typed mutation accepts:
+
+```text
+UPDATE <table>
+SET <non-primary-key-column> = ? [, ...]
+WHERE <primary-key-column> = ? [AND ...]
+
+DELETE FROM <table>
+WHERE <primary-key-column> = ? [AND ...]
+```
+
+The `WHERE` column set must equal the complete primary key; predicate text
+order may differ from catalog key order. Update parameters occur in assignment
+order followed by predicate order. Assignment columns are unique, values are
+type/null checked, and primary-key assignment fails with `HYSQL013` before
+mutation. A missing key returns `rows_affected = 0`. An admitted update or
+delete returns one and publishes the row version plus every old/new secondary
+projection atomically under the same root and CSN. Failure, including a new
+unique-key collision, leaves the statement's private row and indexes
+unchanged.
+
 `CREATE INDEX name ON table (columns)` and `CREATE UNIQUE INDEX` create a
 stable catalog object and a physical relational B+tree namespace. Creation
-backfills admitted rows atomically. Later inserts derive index entries from
-the catalog-bound tuple in the same transaction and WAL/CSN publication.
+backfills admitted rows atomically. Later inserts, updates, and deletes derive
+their live/tombstone index changes from catalog-bound tuples in the same
+transaction and WAL/CSN publication.
 Unique indexes reject duplicate non-null composite keys before statement or
 commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
@@ -61,10 +83,12 @@ integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions, literals, casts, heap/index scans, range access,
-constraints beyond primary key/nullability and the first unique index, and
-typed `UPDATE`/`DELETE` remain pending. The current access binder requires the
-predicate column set to equal a complete primary or secondary key. It does not
-perform prefix, residual-filter, bitmap, or cost-based access selection.
+and constraints beyond primary key/nullability and the first unique index
+remain pending. Typed mutation does not yet change primary keys, use a
+secondary access path, evaluate expressions, or update multiple rows. The
+current access binder requires the predicate column set to equal a complete
+primary or secondary key. It does not perform prefix, residual-filter, bitmap,
+or cost-based access selection.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -74,9 +98,7 @@ tombstone. Retained snapshots continue to resolve their historical roots. New
 directories retain an explicit per-key physical version chain under the
 current root and close each superseded copy's `end_csn`; the earlier inline-row
 directory format remains supported. Retention and vacuum remain pending. This
-slice does not close relational gate G2. Typed indexed `UPDATE` and `DELETE`
-are rejected until their old/new physical projection and WAL semantics are
-implemented; the runtime never permits them to leave a stale index.
+slice does not close relational gate G2.
 
 `NativeSnapshot` remains the complete materialized all-engine snapshot used
 for retained historical reads and cross-engine semantics. The separate
@@ -147,11 +169,11 @@ back that statement's private changes. An explicit transaction remains failed
 until rollback when an error can invalidate later semantics.
 
 Errors have stable Hyphae codes. The current slice implements `HYSQL001`
-through `HYSQL012` for syntax, parameters, stale plans, columns, types,
-nullability, primary-key binding, stored tuples, catalog-kind mismatch, absent
-implemented access paths, and unique-index violations. Statement byte spans,
-optional object/column IDs, retry classification, and compatibility SQLSTATE
-mapping remain target requirements.
+through `HYSQL013` for syntax, parameters, stale plans, columns, types,
+nullability, primary-key binding/mutation, stored tuples, catalog-kind
+mismatch, absent implemented access paths, and unique-index violations.
+Statement byte spans, optional object/column IDs, retry classification, and
+compatibility SQLSTATE mapping remain target requirements.
 
 ## Determinism
 

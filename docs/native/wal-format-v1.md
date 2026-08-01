@@ -100,9 +100,11 @@ Relational `CREATE TABLE` and `CREATE SECONDARY INDEX` carry one complete
 identity as their key. Secondary-index entry changes are deliberately not
 independent WAL mutations. An admitted index definition plus the canonical row
 mutation is the single projection authority: index creation backfills the
-current admitted rows, and row insertion derives every current catalog index
-entry during optimistic rebase, page construction, and recovery. This prevents
-separate row/index operation streams from diverging.
+current admitted rows; row insertion derives live projections; update removes
+old projections and adds new ones; delete removes old projections. Optimistic
+rebase, page construction, and recovery repeat those derivations from the
+admitted catalog and canonical row mutations. This prevents separate row/index
+operation streams from diverging.
 
 Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
 field bytes as their mutation key. The decoder rejects truncated identities.

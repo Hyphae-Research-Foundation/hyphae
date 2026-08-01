@@ -133,8 +133,11 @@ zero bytes. A secondary-entry identity is:
 The B+tree key remains limited to 4,096 bytes. Entry value `1` is live and `0`
 is a tombstone. Creation writes the metadata marker and backfills the final
 admitted relation state. Row insertion derives every index projection from the
-catalog-bound tuple; optimistic rebase repeats that derivation against the
-currently admitted catalog. Recovery verifies metadata against the catalog,
+catalog-bound tuple. Update writes tombstones for every old projection and live
+markers for every new projection; delete writes the old tombstones. These
+markers share the row mutation's copy-on-write root and CSN. Optimistic rebase
+repeats old/new projection maintenance against the currently admitted catalog
+and rows before publication. Recovery verifies metadata against the catalog,
 recomputes every live entry from its row, enforces uniqueness, rejects
 orphan/malformed entries, and proves that every row has every required
 projection.
@@ -148,7 +151,7 @@ closed. The public result is deterministic primary-key order.
 
 This namespace remains the first physical relational route, not the complete
 SQL storage design. Secondary-key range cursors, prefix compression, bulk load,
-allocation-free streaming, update/delete maintenance, free-space policy,
+allocation-free streaming, primary-key-changing updates, free-space policy,
 scan-oriented column batches, retention, and vacuum remain pending.
 
 ## Structure namespace

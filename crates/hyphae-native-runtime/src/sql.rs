@@ -75,6 +75,9 @@ pub enum SqlError {
     /// A non-null unique secondary-index key already identifies a row.
     #[error("HYSQL012 native SQL unique constraint failed")]
     UniqueViolation,
+    /// Updating a primary-key column is outside the current mutation contract.
+    #[error("HYSQL013 native SQL primary-key mutation is not implemented")]
+    PrimaryKeyMutationUnsupported,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -134,9 +137,12 @@ enum Statement {
     },
     Update {
         name: String,
+        assignments: Vec<String>,
+        predicates: Vec<String>,
     },
     Delete {
         name: String,
+        predicates: Vec<String>,
     },
     Select {
         name: String,
@@ -156,6 +162,11 @@ struct ParsedColumn {
     logical_type: LogicalType,
     nullable: bool,
     inline_primary_key: bool,
+}
+
+struct BoundUpdateAssignment {
+    column: usize,
+    value: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,8 +300,14 @@ pub(crate) fn execute_transaction(
         Statement::Insert { name, columns } => {
             execute_insert(transaction, &name, &columns, parameters)
         }
-        Statement::Update { name } => execute_legacy_update(transaction, &name, parameters),
-        Statement::Delete { name } => execute_legacy_delete(transaction, &name, parameters),
+        Statement::Update {
+            name,
+            assignments,
+            predicates,
+        } => execute_update(transaction, &name, &assignments, &predicates, parameters),
+        Statement::Delete { name, predicates } => {
+            execute_delete(transaction, &name, &predicates, parameters)
+        }
         Statement::Select {
             name,
             projection,
@@ -638,42 +655,67 @@ fn execute_insert(
     })
 }
 
-fn execute_legacy_update(
+fn execute_update(
     transaction: &mut NativeWriteBatch,
     name: &str,
+    assignments: &[String],
+    predicates: &[String],
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    let [SqlValue::Binary(row), SqlValue::Binary(primary_key)] = parameters else {
-        return Err(SqlError::ParameterMismatch);
-    };
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
-    if !is_legacy_binary_relation(definition) {
-        return Err(SqlError::InvalidSyntax);
+    let definition = definition.clone();
+    let assignment_columns = bind_update_columns(&definition, assignments)?;
+    let predicate_columns = bind_primary_key_columns(&definition, predicates)?;
+    if parameters.len() != assignment_columns.len() + predicate_columns.len() {
+        return Err(SqlError::ParameterMismatch);
     }
-    transaction.update(table, primary_key.clone(), row.clone())?;
-    Ok(SqlResult::Command {
-        rows_affected: 1,
-        object_id: None,
-    })
+    let (assignment_values, predicate_values) = parameters.split_at(assignment_columns.len());
+    let primary_key = bind_primary_key(&definition, &predicate_columns, predicate_values)?;
+    let update = if is_legacy_binary_relation(&definition) {
+        if assignment_columns.as_slice() != [1] {
+            return Err(SqlError::InvalidSyntax);
+        }
+        legacy_binary_value(assignment_values.first(), false)?
+    } else {
+        let assignments =
+            bind_update_assignments(&definition, &assignment_columns, assignment_values)?;
+        let Some(stored) = transaction.select(table, &primary_key) else {
+            return Ok(command_result(0));
+        };
+        encode_updated_tuple(&definition, &assignments, stored)?
+    };
+    if transaction.select(table, &primary_key).is_none() {
+        return Ok(command_result(0));
+    }
+    transaction
+        .update(table, primary_key, update)
+        .map_err(map_runtime_error)?;
+    Ok(command_result(1))
 }
 
-fn execute_legacy_delete(
+fn execute_delete(
     transaction: &mut NativeWriteBatch,
     name: &str,
+    predicates: &[String],
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    let [SqlValue::Binary(primary_key)] = parameters else {
-        return Err(SqlError::ParameterMismatch);
-    };
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
-    if !is_legacy_binary_relation(definition) {
-        return Err(SqlError::InvalidSyntax);
+    let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+    let primary_key = bind_primary_key(definition, &predicate_columns, parameters)?;
+    if transaction.select(table, &primary_key).is_none() {
+        return Ok(command_result(0));
     }
-    transaction.delete(table, primary_key.clone())?;
-    Ok(SqlResult::Command {
-        rows_affected: 1,
+    transaction
+        .delete(table, primary_key)
+        .map_err(map_runtime_error)?;
+    Ok(command_result(1))
+}
+
+fn command_result(rows_affected: u64) -> SqlResult {
+    SqlResult::Command {
+        rows_affected,
         object_id: None,
-    })
+    }
 }
 
 fn execute_select(
@@ -836,6 +878,115 @@ fn bind_insert_values<'value>(
         }
     }
     Ok(values)
+}
+
+fn bind_update_columns(
+    definition: &RelationDefinition,
+    assignments: &[String],
+) -> Result<Vec<usize>, SqlError> {
+    if assignments.is_empty() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let mut columns = Vec::with_capacity(assignments.len());
+    let primary_key = primary_key_indices(definition)?;
+    for name in assignments {
+        let column = column_index(&definition.columns, name)?;
+        if columns.contains(&column) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        if primary_key.contains(&column) {
+            return Err(SqlError::PrimaryKeyMutationUnsupported);
+        }
+        columns.push(column);
+    }
+    Ok(columns)
+}
+
+fn bind_primary_key_columns(
+    definition: &RelationDefinition,
+    predicates: &[String],
+) -> Result<Vec<usize>, SqlError> {
+    let mut columns = Vec::with_capacity(predicates.len());
+    for name in predicates {
+        let column = column_index(&definition.columns, name)?;
+        if columns.contains(&column) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        columns.push(column);
+    }
+    if !same_column_set(&columns, &primary_key_indices(definition)?) {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    Ok(columns)
+}
+
+fn bind_update_assignments(
+    definition: &RelationDefinition,
+    columns: &[usize],
+    parameters: &[SqlValue],
+) -> Result<Vec<BoundUpdateAssignment>, SqlError> {
+    if columns.len() != parameters.len() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    columns
+        .iter()
+        .copied()
+        .zip(parameters)
+        .map(|(index, value)| {
+            let column = definition
+                .columns
+                .get(index)
+                .ok_or(SqlError::InvalidCatalogObject)?;
+            let encoded = if matches!(value, SqlValue::Null) {
+                if !column.nullable {
+                    return Err(SqlError::NullViolation);
+                }
+                None
+            } else {
+                Some(
+                    value
+                        .encode_storage(&column.logical_type)
+                        .map_err(|_| SqlError::TypeMismatch)?,
+                )
+            };
+            Ok(BoundUpdateAssignment {
+                column: index,
+                value: encoded,
+            })
+        })
+        .collect()
+}
+
+fn encode_updated_tuple(
+    definition: &RelationDefinition,
+    assignments: &[BoundUpdateAssignment],
+    stored: &[u8],
+) -> Result<Vec<u8>, SqlError> {
+    let tuple = RowTupleView::decode(stored).map_err(|_| SqlError::InvalidStoredRow)?;
+    if tuple.column_count() != definition.columns.len() {
+        return Err(SqlError::InvalidStoredRow);
+    }
+    let mut values = Vec::with_capacity(definition.columns.len());
+    for (index, column) in definition.columns.iter().enumerate() {
+        let value = match tuple.value(index).ok_or(SqlError::InvalidStoredRow)? {
+            ColumnValueRef::Null => None,
+            ColumnValueRef::Bytes(encoded) => {
+                SqlValue::decode_storage(&column.logical_type, encoded)
+                    .map_err(|_| SqlError::InvalidStoredRow)?;
+                Some(encoded.to_vec())
+            }
+        };
+        values.push(value);
+    }
+    for assignment in assignments {
+        values
+            .get_mut(assignment.column)
+            .ok_or(SqlError::InvalidCatalogObject)?
+            .clone_from(&assignment.value);
+    }
+    RowTuple::new(values)
+        .and_then(|tuple| tuple.encode())
+        .map_err(|_| SqlError::InvalidStoredRow)
 }
 
 fn encode_tuple(
@@ -1250,24 +1401,30 @@ fn parse_insert(parser: &mut Parser) -> Result<Statement, SqlError> {
 fn parse_update(parser: &mut Parser) -> Result<Statement, SqlError> {
     let name = parser.identifier()?;
     parser.expect_keyword("SET")?;
-    parser.expect_keyword("ROW")?;
-    parser.expect_symbol('=')?;
-    parser.expect_symbol('?')?;
+    let mut assignments = Vec::new();
+    loop {
+        assignments.push(parser.identifier()?);
+        parser.expect_symbol('=')?;
+        parser.expect_symbol('?')?;
+        if !parser.consume_symbol(',') {
+            break;
+        }
+    }
     parser.expect_keyword("WHERE")?;
-    parser.expect_keyword("PRIMARY_KEY")?;
-    parser.expect_symbol('=')?;
-    parser.expect_symbol('?')?;
-    Ok(Statement::Update { name })
+    let predicates = parse_parameter_predicates(parser)?;
+    Ok(Statement::Update {
+        name,
+        assignments,
+        predicates,
+    })
 }
 
 fn parse_delete(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     parser.expect_keyword("WHERE")?;
-    parser.expect_keyword("PRIMARY_KEY")?;
-    parser.expect_symbol('=')?;
-    parser.expect_symbol('?')?;
-    Ok(Statement::Delete { name })
+    let predicates = parse_parameter_predicates(parser)?;
+    Ok(Statement::Delete { name, predicates })
 }
 
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
@@ -1279,6 +1436,15 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     parser.expect_keyword("WHERE")?;
+    let predicates = parse_parameter_predicates(parser)?;
+    Ok(Statement::Select {
+        name,
+        projection,
+        predicates,
+    })
+}
+
+fn parse_parameter_predicates(parser: &mut Parser) -> Result<Vec<String>, SqlError> {
     let mut predicates = Vec::new();
     loop {
         predicates.push(parser.identifier()?);
@@ -1288,11 +1454,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
             break;
         }
     }
-    Ok(Statement::Select {
-        name,
-        projection,
-        predicates,
-    })
+    Ok(predicates)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1528,11 +1690,11 @@ mod tests {
         ));
         assert!(matches!(
             parse("UPDATE accounts SET row = ? WHERE primary_key = ?")?,
-            Statement::Update { name } if name == "accounts"
+            Statement::Update { name, .. } if name == "accounts"
         ));
         assert!(matches!(
             parse("DELETE FROM accounts WHERE primary_key = ?")?,
-            Statement::Delete { name } if name == "accounts"
+            Statement::Delete { name, .. } if name == "accounts"
         ));
         assert!(matches!(
             parse("SELECT row FROM accounts WHERE primary_key = ?")?,
@@ -1572,6 +1734,35 @@ mod tests {
             LogicalType::Decimal(DecimalType::new(18, 4)?)
         );
         assert_eq!(columns[3].logical_type, LogicalType::Text);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_update_delete_parse_assignment_and_predicate_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Statement::Update {
+            name,
+            assignments,
+            predicates,
+        } = parse(
+            "UPDATE events
+             SET payload = ?, status = ?
+             WHERE sequence = ? AND tenant = ?",
+        )?
+        else {
+            return Err("expected typed update".into());
+        };
+        assert_eq!(name, "events");
+        assert_eq!(assignments, ["payload", "status"]);
+        assert_eq!(predicates, ["sequence", "tenant"]);
+
+        let Statement::Delete { name, predicates } =
+            parse("DELETE FROM events WHERE sequence = ? AND tenant = ?")?
+        else {
+            return Err("expected typed delete".into());
+        };
+        assert_eq!(name, "events");
+        assert_eq!(predicates, ["sequence", "tenant"]);
         Ok(())
     }
 

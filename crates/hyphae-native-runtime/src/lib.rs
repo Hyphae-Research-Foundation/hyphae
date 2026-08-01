@@ -207,9 +207,6 @@ pub enum NativeRuntimeError {
     /// A non-null native unique secondary-index key already identifies a row.
     #[error("native relational unique secondary index is violated")]
     UniqueSecondaryIndexViolation,
-    /// Typed update/delete maintenance is not implemented for secondary indexes.
-    #[error("native relational update/delete with secondary indexes is not implemented")]
-    SecondaryIndexMutationUnsupported,
     /// The requested native secondary index does not exist in the current root.
     #[error("native relational secondary index {index} does not exist")]
     UnknownSecondaryIndex {
@@ -1545,7 +1542,7 @@ impl NativeWriteBatch {
     /// Executes one statement in the current native SQL slice.
     ///
     /// The supported grammar includes typed `CREATE TABLE`, `CREATE INDEX`
-    /// with optional `UNIQUE`, named-column `INSERT`, legacy binary
+    /// with optional `UNIQUE`, named-column `INSERT`, exact-primary-key typed
     /// `UPDATE`/`DELETE`, exact primary/secondary-key `SELECT`, and bounded
     /// `EXPLAIN SELECT`.
     ///
@@ -1701,11 +1698,11 @@ impl NativeWriteBatch {
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
         let old_projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
-        if !old_projections.is_empty() {
-            return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
-        }
+        let new_projections = secondary_index_projections(&self.state.catalog, table, &row)?;
         let mut relational = self.state.relational.clone();
+        remove_secondary_index_projections(&mut relational, &old_projections, &primary_key)?;
         relational.update(table, &primary_key, row.clone())?;
+        insert_secondary_index_projections(&mut relational, &new_projections, &primary_key)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::UpdateRow,
@@ -1738,10 +1735,8 @@ impl NativeWriteBatch {
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
         let projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
-        if !projections.is_empty() {
-            return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
-        }
         let mut relational = self.state.relational.clone();
+        remove_secondary_index_projections(&mut relational, &projections, &primary_key)?;
         relational.delete(table, &primary_key)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
@@ -2250,6 +2245,7 @@ impl NativeTransaction<'_> {
 
         let roots = commit_engine_roots(
             self.pages,
+            self.blobs,
             roots_from_snapshot(batch.snapshot.roots()),
             self.relational_format,
             self.structure_format,
@@ -2468,15 +2464,29 @@ fn apply_relational_mutation(
             let old_row = state
                 .relational
                 .select(target, &mutation.key)
-                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-            if !secondary_index_projections(&state.catalog, target, old_row)?.is_empty() {
-                return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
-            }
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .to_vec();
+            let old_projections = secondary_index_projections(&state.catalog, target, &old_row)?;
+            remove_secondary_index_projections(
+                &mut state.relational,
+                &old_projections,
+                &mutation.key,
+            )?;
             if mutation.opcode == Opcode::UpdateRow {
+                let new_projections =
+                    secondary_index_projections(&state.catalog, target, &mutation.value)?;
                 state
                     .relational
                     .update(target, &mutation.key, mutation.value.clone())?;
+                insert_secondary_index_projections(
+                    &mut state.relational,
+                    &new_projections,
+                    &mutation.key,
+                )?;
             } else {
+                if !mutation.value.is_empty() {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
                 state.relational.delete(target, &mutation.key)?;
             }
         }
@@ -2633,6 +2643,7 @@ fn validate_checkpoints(
 #[allow(clippy::too_many_arguments)]
 fn commit_engine_roots(
     pages: &mut PageStore,
+    blobs: &BlobStore,
     mut roots: [Option<PageId>; 4],
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
@@ -2652,6 +2663,7 @@ fn commit_engine_roots(
     if batch.dirty[1] || roots[1].is_none() {
         roots[1] = relational_tree_after_mutations(
             pages,
+            blobs,
             roots[1],
             relational_format,
             commit_csn,
@@ -3633,6 +3645,7 @@ fn search_root_after_mutations(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
+    blobs: &BlobStore,
     root: Option<PageId>,
     format: RelationalFormat,
     creating_csn: Csn,
@@ -3709,6 +3722,21 @@ fn relational_tree_after_mutations(
             }
             _ => return Err(NativeRuntimeError::InvalidRelationalTree),
         };
+        let old_projections = if mutation.opcode == Opcode::InsertRow {
+            Vec::new()
+        } else {
+            let old_row = relational_tree_row(
+                pages,
+                blobs,
+                tree,
+                format,
+                target,
+                &mutation.key,
+                Some(creating_csn),
+            )?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            secondary_index_projections(catalog, target, &old_row)?
+        };
         let row = if mutation.opcode == Opcode::DeleteRow {
             RowRecord::tombstone(
                 relational_row_id(target, &mutation.key)?,
@@ -3734,19 +3762,75 @@ fn relational_tree_after_mutations(
             }
         };
         tree = tree.upsert(pages, creating_csn, key, value)?.tree;
-        if mutation.opcode == Opcode::InsertRow {
-            for projection in secondary_index_projections(catalog, target, &mutation.value)? {
-                let identity = secondary_index_entry_identity(&projection.key, &mutation.key)?;
-                tree = tree
-                    .upsert(
-                        pages,
-                        creating_csn,
-                        relational_secondary_entry_key(projection.index, &identity)?,
-                        vec![RELATIONAL_SECONDARY_ENTRY_LIVE],
-                    )?
-                    .tree;
-            }
+        tree = write_secondary_index_projection_markers(
+            pages,
+            tree,
+            creating_csn,
+            &old_projections,
+            &mutation.key,
+            RELATIONAL_SECONDARY_ENTRY_TOMBSTONE,
+        )?;
+        if mutation.opcode != Opcode::DeleteRow {
+            let new_projections = secondary_index_projections(catalog, target, &mutation.value)?;
+            tree = write_secondary_index_projection_markers(
+                pages,
+                tree,
+                creating_csn,
+                &new_projections,
+                &mutation.key,
+                RELATIONAL_SECONDARY_ENTRY_LIVE,
+            )?;
         }
+    }
+    Ok(tree)
+}
+
+fn relational_tree_row(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    tree: BTree,
+    format: RelationalFormat,
+    table: ObjectId,
+    primary_key: &[u8],
+    visible_csn: Option<Csn>,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    let Some(encoded) = tree.get(pages, &relational_row_key(table, primary_key))? else {
+        return Ok(None);
+    };
+    match format {
+        RelationalFormat::InlineRowV1 => {
+            decode_relational_row(table, primary_key, &encoded, visible_csn, blobs)
+        }
+        RelationalFormat::VersionChainV2 => {
+            decode_relational_chain(pages, table, primary_key, &encoded, visible_csn, blobs)
+        }
+    }
+}
+
+fn write_secondary_index_projection_markers(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    projections: &[SecondaryIndexProjection],
+    primary_key: &[u8],
+    marker: u8,
+) -> Result<BTree, NativeRuntimeError> {
+    if !matches!(
+        marker,
+        RELATIONAL_SECONDARY_ENTRY_TOMBSTONE | RELATIONAL_SECONDARY_ENTRY_LIVE
+    ) {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    for projection in projections {
+        let identity = secondary_index_entry_identity(&projection.key, primary_key)?;
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                relational_secondary_entry_key(projection.index, &identity)?,
+                vec![marker],
+            )?
+            .tree;
     }
     Ok(tree)
 }
@@ -3816,6 +3900,33 @@ struct SecondaryIndexProjection {
     index: ObjectId,
     key: Vec<u8>,
     contains_null: bool,
+}
+
+fn insert_secondary_index_projections(
+    relational: &mut RelationState,
+    projections: &[SecondaryIndexProjection],
+    primary_key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    for projection in projections {
+        relational.insert_secondary_index(
+            projection.index,
+            projection.key.clone(),
+            primary_key.to_vec(),
+            projection.contains_null,
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_secondary_index_projections(
+    relational: &mut RelationState,
+    projections: &[SecondaryIndexProjection],
+    primary_key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    for projection in projections {
+        relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
+    }
+    Ok(())
 }
 
 fn secondary_index_projections(
@@ -7217,6 +7328,531 @@ mod tests {
         Ok(())
     }
 
+    fn seed_mutable_secondary_indexes(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId, ObjectId), Box<dyn std::error::Error>> {
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT,
+                city TEXT NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing mutable table identity".into());
+        };
+        for (id, email, name) in [
+            (1, "mario@celiums.test", "Mario"),
+            (2, "romina@celiums.test", "Romina"),
+        ] {
+            transaction.execute_sql(
+                "INSERT INTO people (id, email, city, name) VALUES (?, ?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(email.to_owned()),
+                    SqlValue::Text("Medellin".to_owned()),
+                    SqlValue::Text(name.to_owned()),
+                ],
+            )?;
+        }
+        let created =
+            transaction.execute_sql("CREATE UNIQUE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(email_index),
+            ..
+        } = created
+        else {
+            return Err("missing email index identity".into());
+        };
+        let created = transaction.execute_sql("CREATE INDEX people_city ON people (city)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(city_index),
+            ..
+        } = created
+        else {
+            return Err("missing city index identity".into());
+        };
+        transaction.commit()?;
+        Ok((table, email_index, city_index))
+    }
+
+    fn command_rows(rows_affected: u64) -> SqlResult {
+        SqlResult::Command {
+            rows_affected,
+            object_id: None,
+        }
+    }
+
+    fn ordered_i64(value: i64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(SqlValue::Signed(value)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?)
+    }
+
+    fn assert_indexed_update_rejections(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut transaction = database.begin_sql(13, DurabilityClass::Strict)?;
+        assert!(matches!(
+            transaction.execute_sql(
+                "UPDATE people SET email = ? WHERE id = ?",
+                &[
+                    SqlValue::Text("romina@celiums.test".to_owned()),
+                    SqlValue::Signed(1),
+                ],
+            ),
+            Err(SqlError::UniqueViolation)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "UPDATE people SET id = ? WHERE id = ?",
+                &[SqlValue::Signed(3), SqlValue::Signed(1)],
+            ),
+            Err(SqlError::PrimaryKeyMutationUnsupported)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "UPDATE people SET city = ? WHERE id = ?",
+                &[SqlValue::Null, SqlValue::Signed(1)],
+            ),
+            Err(SqlError::NullViolation)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "UPDATE people SET name = ?, name = ? WHERE id = ?",
+                &[
+                    SqlValue::Text("one".to_owned()),
+                    SqlValue::Text("two".to_owned()),
+                    SqlValue::Signed(1),
+                ],
+            ),
+            Err(SqlError::DuplicateColumn)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "UPDATE people SET email = ? WHERE id = ?",
+                &[SqlValue::Signed(7), SqlValue::Signed(1)],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert_eq!(
+            transaction.execute_sql(
+                "UPDATE people SET name = ? WHERE id = ?",
+                &[SqlValue::Text("missing".to_owned()), SqlValue::Signed(99),],
+            )?,
+            command_rows(0)
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT name FROM people WHERE email = ?",
+                &[SqlValue::Text("founder@celiums.test".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned()],
+                rows: vec![vec![SqlValue::Text("Mr. Mario".to_owned())]],
+            }
+        );
+        transaction.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn typed_update_delete_maintain_secondary_indexes_history_and_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, email_index, city_index) = seed_mutable_secondary_indexes(&mut database)?;
+        let historical = database.snapshot(11)?;
+        let historical_plan = historical.prepare_sql("SELECT name FROM people WHERE email = ?")?;
+
+        let mut update = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            update.execute_sql(
+                "UPDATE people SET name = ?, email = ?, city = ? WHERE id = ?",
+                &[
+                    SqlValue::Text("Mr. Mario".to_owned()),
+                    SqlValue::Text("founder@celiums.test".to_owned()),
+                    SqlValue::Text("Bogota".to_owned()),
+                    SqlValue::Signed(1),
+                ],
+            )?,
+            SqlResult::Command {
+                rows_affected: 1,
+                object_id: None,
+            }
+        );
+        update.commit()?;
+
+        let old_email = SqlValue::Text("mario@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let new_email = SqlValue::Text("founder@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let medellin =
+            SqlValue::Text("Medellin".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        let bogota =
+            SqlValue::Text("Bogota".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        assert!(
+            database
+                .select_latest_secondary_index(email_index, &old_email)?
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .select_latest_secondary_index(email_index, &new_email)?
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .select_latest_secondary_index(city_index, &medellin)?
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .select_latest_secondary_index(city_index, &bogota)?
+                .len(),
+            1
+        );
+        assert_eq!(
+            historical.execute_prepared(
+                &historical_plan,
+                &[SqlValue::Text("mario@celiums.test".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned()],
+                rows: vec![vec![SqlValue::Text("Mario".to_owned())]],
+            }
+        );
+
+        assert_indexed_update_rejections(&mut database)?;
+        let mut delete = database.begin_sql(14, DurabilityClass::Strict)?;
+        assert_eq!(
+            delete.execute_sql("DELETE FROM people WHERE id = ?", &[SqlValue::Signed(1)])?,
+            command_rows(1)
+        );
+        delete.commit()?;
+        assert!(
+            database
+                .select_latest_secondary_index(email_index, &new_email)?
+                .is_empty()
+        );
+        assert!(
+            database
+                .select_latest_secondary_index(city_index, &bogota)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.select_latest_relational(table, &ordered_i64(1)?)?,
+            None
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert!(
+            reopened
+                .select_latest_secondary_index(email_index, &new_email)?
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .select_latest_secondary_index(city_index, &medellin)?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_indexed_updates_recheck_unique_keys_on_admitted_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_, email_index, _) = seed_mutable_secondary_indexes(&mut database)?;
+        let mut first = database.begin_optimistic(12, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(12, DurabilityClass::Strict)?;
+        for (batch, id) in [(&mut first, 1), (&mut second, 2)] {
+            assert_eq!(
+                batch.execute_sql(
+                    "UPDATE people SET email = ? WHERE id = ?",
+                    &[
+                        SqlValue::Text("shared@celiums.test".to_owned()),
+                        SqlValue::Signed(id),
+                    ],
+                )?,
+                command_rows(1)
+            );
+        }
+        database.commit_optimistic(first)?;
+        assert!(matches!(
+            database.commit_optimistic(second),
+            Err(NativeRuntimeError::UniqueSecondaryIndexViolation)
+        ));
+
+        let shared = SqlValue::Text("shared@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let first_old = SqlValue::Text("mario@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let second_old = SqlValue::Text("romina@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        assert_eq!(
+            database
+                .select_latest_secondary_index(email_index, &shared)?
+                .len(),
+            1
+        );
+        assert!(
+            database
+                .select_latest_secondary_index(email_index, &first_old)?
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .select_latest_secondary_index(email_index, &second_old)?
+                .len(),
+            1
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened
+                .select_latest_secondary_index(email_index, &shared)?
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .select_latest_secondary_index(email_index, &second_old)?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_mutation_binds_composite_primary_key_in_predicate_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE events (
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                code TEXT NOT NULL,
+                payload TEXT,
+                PRIMARY KEY (tenant, sequence)
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO events (tenant, sequence, code, payload) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::Text("celiums".to_owned()),
+                SqlValue::Signed(42),
+                SqlValue::Text("old".to_owned()),
+                SqlValue::Text("before".to_owned()),
+            ],
+        )?;
+        let created = seed.execute_sql("CREATE UNIQUE INDEX events_code ON events (code)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing composite mutation index".into());
+        };
+        seed.commit()?;
+
+        let mut update = database.begin_sql(11, DurabilityClass::Strict)?;
+        assert_eq!(
+            update.execute_sql(
+                "UPDATE events SET code = ?, payload = ?
+                 WHERE sequence = ? AND tenant = ?",
+                &[
+                    SqlValue::Text("new".to_owned()),
+                    SqlValue::Null,
+                    SqlValue::Signed(42),
+                    SqlValue::Text("celiums".to_owned()),
+                ],
+            )?,
+            command_rows(1)
+        );
+        update.commit()?;
+        let old = SqlValue::Text("old".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        let new = SqlValue::Text("new".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        assert!(
+            database
+                .select_latest_secondary_index(index, &old)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.select_latest_secondary_index(index, &new)?.len(),
+            1
+        );
+
+        let mut delete = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            delete.execute_sql(
+                "DELETE FROM events WHERE sequence = ? AND tenant = ?",
+                &[SqlValue::Signed(42), SqlValue::Text("celiums".to_owned()),],
+            )?,
+            command_rows(1)
+        );
+        delete.commit()?;
+        assert!(
+            database
+                .select_latest_secondary_index(index, &new)?
+                .is_empty()
+        );
+        drop(database);
+        NativeDatabase::open(temporary.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_updates_preserve_unique_nulls_distinct() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)",
+            &[],
+        )?;
+        for (id, email) in [(1, "one@hyphae.local"), (2, "two@hyphae.local")] {
+            seed.execute_sql(
+                "INSERT INTO users (id, email) VALUES (?, ?)",
+                &[SqlValue::Signed(id), SqlValue::Text(email.to_owned())],
+            )?;
+        }
+        let created = seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing nullable unique index".into());
+        };
+        seed.commit()?;
+
+        let mut update = database.begin_sql(11, DurabilityClass::Strict)?;
+        for id in [1, 2] {
+            assert_eq!(
+                update.execute_sql(
+                    "UPDATE users SET email = ? WHERE id = ?",
+                    &[SqlValue::Null, SqlValue::Signed(id)],
+                )?,
+                command_rows(1)
+            );
+        }
+        assert_eq!(
+            update.execute_sql("SELECT id FROM users WHERE email = ?", &[SqlValue::Null])?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        update.commit()?;
+
+        let null_key = SqlValue::Null.encode_ordered_component(&LogicalType::Text)?;
+        assert_eq!(
+            database
+                .select_latest_secondary_index(index, &null_key)?
+                .len(),
+            2
+        );
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened
+                .select_latest_secondary_index(index, &null_key)?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_update_delete_crash_boundaries_recover_prior_or_complete_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let (_, email_index, city_index) = seed_mutable_secondary_indexes(&mut database)?;
+            let mut mutate = database.begin_sql(12, DurabilityClass::Strict)?;
+            mutate.execute_sql(
+                "UPDATE people SET email = ?, city = ? WHERE id = ?",
+                &[
+                    SqlValue::Text("new@celiums.test".to_owned()),
+                    SqlValue::Text("Bogota".to_owned()),
+                    SqlValue::Signed(1),
+                ],
+            )?;
+            mutate.execute_sql("DELETE FROM people WHERE id = ?", &[SqlValue::Signed(2)])?;
+            assert!(matches!(
+                mutate.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(reached)) if reached == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let old = SqlValue::Text("mario@celiums.test".to_owned())
+                .encode_ordered_component(&LogicalType::Text)?;
+            let new = SqlValue::Text("new@celiums.test".to_owned())
+                .encode_ordered_component(&LogicalType::Text)?;
+            let medellin = SqlValue::Text("Medellin".to_owned())
+                .encode_ordered_component(&LogicalType::Text)?;
+            let bogota =
+                SqlValue::Text("Bogota".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+            let complete = matches!(
+                boundary,
+                CommitBoundary::WalAppended
+                    | CommitBoundary::WalSynchronized
+                    | CommitBoundary::RootPublished
+            );
+            assert_eq!(
+                reopened
+                    .select_latest_secondary_index(email_index, &old)?
+                    .len(),
+                usize::from(!complete)
+            );
+            assert_eq!(
+                reopened
+                    .select_latest_secondary_index(email_index, &new)?
+                    .len(),
+                usize::from(complete)
+            );
+            assert_eq!(
+                reopened
+                    .select_latest_secondary_index(city_index, &medellin)?
+                    .len(),
+                if complete { 0 } else { 2 }
+            );
+            assert_eq!(
+                reopened
+                    .select_latest_secondary_index(city_index, &bogota)?
+                    .len(),
+                usize::from(complete)
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn optimistic_unique_secondary_index_rejects_disjoint_primary_keys()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -7583,6 +8219,71 @@ mod tests {
         assert_eq!(
             recovered.select_latest_relational(table, b"key")?,
             Some(b"v2".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_row_v1_updates_preserve_secondary_index_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        database.relational_format = super::RelationalFormat::InlineRowV1;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO users (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("old@hyphae.local".to_owned()),
+            ],
+        )?;
+        let created = seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing V1 secondary index".into());
+        };
+        seed.commit()?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.relational_format,
+            super::RelationalFormat::InlineRowV1
+        );
+        let mut update = reopened.begin_sql(11, DurabilityClass::Strict)?;
+        update.execute_sql(
+            "UPDATE users SET email = ? WHERE id = ?",
+            &[
+                SqlValue::Text("new@hyphae.local".to_owned()),
+                SqlValue::Signed(1),
+            ],
+        )?;
+        update.commit()?;
+        drop(reopened);
+
+        let recovered = NativeDatabase::open(temporary.path())?;
+        let old = SqlValue::Text("old@hyphae.local".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let new = SqlValue::Text("new@hyphae.local".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        assert!(
+            recovered
+                .select_latest_secondary_index(index, &old)?
+                .is_empty()
+        );
+        assert_eq!(
+            recovered.select_latest_secondary_index(index, &new)?.len(),
+            1
         );
         Ok(())
     }
