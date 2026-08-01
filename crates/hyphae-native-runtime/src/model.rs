@@ -390,12 +390,12 @@ impl SearchState {
                         .filter(|(_, candidate)| candidate.iter().any(|token| token == query_token))
                         .count(),
                 )?;
-                let idf = (1.0
-                    + (document_count - document_frequency + 0.5) / (document_frequency + 0.5))
-                    .ln();
-                let normalization =
-                    1.2 * (1.0 - 0.75 + 0.75 * (count_f64(tokens.len())? / average_length));
-                score += idf * (term_frequency * 2.2) / (term_frequency + normalization);
+                score += bm25_term_score(
+                    bm25_idf(document_count, document_frequency),
+                    term_frequency,
+                    count_f64(tokens.len())?,
+                    average_length,
+                );
             }
             if score > 0.0 {
                 hits.push(((*document_id).clone(), score));
@@ -463,11 +463,25 @@ fn normalize_name(value: &str) -> String {
         .collect()
 }
 
-fn analyze(text: &str) -> Vec<String> {
+pub(crate) fn analyze(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+pub(crate) fn bm25_idf(document_count: f64, document_frequency: f64) -> f64 {
+    (1.0 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln()
+}
+
+pub(crate) fn bm25_term_score(
+    idf: f64,
+    term_frequency: f64,
+    document_length: f64,
+    average_length: f64,
+) -> f64 {
+    let normalization = 1.2 * (1.0 - 0.75 + 0.75 * (document_length / average_length));
+    idf * (term_frequency * 2.2) / (term_frequency + normalization)
 }
 
 fn put_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), ModelError> {

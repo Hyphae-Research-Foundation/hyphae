@@ -24,12 +24,17 @@ New structure roots also use the native B+tree: binary keys map to a canonical
 TTL/storage envelope, direct `GET`/`TTL` traverse pinned pages, and large
 structure strings share the immutable blob namespace with relational values.
 Legacy single-page structure roots remain readable and writable.
+New lexical-search roots use native collection, stored-document, term, and
+posting B+tree namespaces. Direct `MATCH` prunes to each query term's posting
+range, loads only candidate document lengths, and produces the same BM25
+scores as the materialized reference. Large UTF-8 source text shares the blob
+namespace, and legacy single-page search roots remain compatible.
 
 The implementation remains deliberately bounded: transaction snapshots still
 materialize relation state, version retention and vacuum are not implemented,
 structures currently expose only unconditional binary scalar `SET`/`GET`/TTL,
-and lexical search uses a deterministic analyzer over small copy-on-write
-collections. Detached transactions can prepare concurrently without holding
+and lexical search still lacks positions, phrases, filters, facets, doc
+values, deletes/updates, segments, and ANN. Detached transactions can prepare concurrently without holding
 writer admission; commit validates their original read CSN and rebases
 disjoint mutations over the admitted current root. Publication and its
 durability I/O are still serialized and require exclusive access to the

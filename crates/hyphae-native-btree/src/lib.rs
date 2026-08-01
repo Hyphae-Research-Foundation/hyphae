@@ -315,6 +315,80 @@ impl BTree {
         Ok(output)
     }
 
+    /// Materializes only entries whose keys begin with `prefix`.
+    ///
+    /// Internal separator ranges are used to prune subtrees that cannot
+    /// contain the requested prefix. An empty prefix is equivalent to
+    /// [`Self::scan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corruption, cycles, duplicate children, or
+    /// excessive height in every node reached by the bounded traversal.
+    pub fn scan_prefix(
+        self,
+        store: &PageStore,
+        prefix: &[u8],
+    ) -> Result<Vec<KeyValue>, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(Vec::new());
+        };
+        let upper = prefix_upper_bound(prefix);
+        let mut visited = BTreeSet::new();
+        let mut output = Vec::new();
+        scan_prefix_node(
+            store,
+            root,
+            prefix,
+            upper.as_deref(),
+            0,
+            &mut visited,
+            &mut output,
+        )?;
+        if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        Ok(output)
+    }
+
+    /// Materializes one prefix range through the verified buffer pool.
+    ///
+    /// This has the same ordering and subtree-pruning semantics as
+    /// [`Self::scan_prefix`] while retaining hot immutable pages in bounded
+    /// shared memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, buffer-pool, codec, cycle, or height
+    /// failures in every node reached by the bounded traversal.
+    pub fn scan_prefix_cached(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        prefix: &[u8],
+    ) -> Result<Vec<KeyValue>, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(Vec::new());
+        };
+        let upper = prefix_upper_bound(prefix);
+        let mut visited = BTreeSet::new();
+        let mut output = Vec::new();
+        scan_prefix_node_cached(
+            store,
+            pool,
+            root,
+            prefix,
+            upper.as_deref(),
+            0,
+            &mut visited,
+            &mut output,
+        )?;
+        if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        Ok(output)
+    }
+
     /// Verifies the complete reachable tree and returns its entry count.
     ///
     /// # Errors
@@ -911,6 +985,108 @@ fn scan_node(
     Ok(())
 }
 
+fn scan_prefix_node(
+    store: &PageStore,
+    page_id: PageId,
+    prefix: &[u8],
+    upper: Option<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    output: &mut Vec<KeyValue>,
+) -> Result<(), BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    match read_node(store, page_id)? {
+        Node::Leaf(entries) => {
+            output.extend(
+                entries
+                    .into_iter()
+                    .skip_while(|entry| entry.key.as_slice() < prefix)
+                    .take_while(|entry| entry.key.starts_with(prefix))
+                    .map(|entry| (entry.key, entry.value)),
+            );
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                let ends_after_prefix = child_upper.is_none_or(|bound| bound.as_slice() > prefix);
+                let starts_before_upper =
+                    upper.is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                if ends_after_prefix && starts_before_upper {
+                    scan_prefix_node(store, child, prefix, upper, depth + 1, visited, output)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_prefix_node_cached(
+    store: &PageStore,
+    pool: &BufferPool,
+    page_id: PageId,
+    prefix: &[u8],
+    upper: Option<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    output: &mut Vec<KeyValue>,
+) -> Result<(), BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    let frame = pool.get_or_load(store, page_id)?;
+    match decode_page(frame.page())? {
+        Node::Leaf(entries) => {
+            output.extend(
+                entries
+                    .into_iter()
+                    .skip_while(|entry| entry.key.as_slice() < prefix)
+                    .take_while(|entry| entry.key.starts_with(prefix))
+                    .map(|entry| (entry.key, entry.value)),
+            );
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                let ends_after_prefix = child_upper.is_none_or(|bound| bound.as_slice() > prefix);
+                let starts_before_upper =
+                    upper.is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                if ends_after_prefix && starts_before_upper {
+                    scan_prefix_node_cached(
+                        store,
+                        pool,
+                        child,
+                        prefix,
+                        upper,
+                        depth + 1,
+                        visited,
+                        output,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper[index] += 1;
+    upper.truncate(index + 1);
+    Some(upper)
+}
+
 struct ValidationSummary {
     minimum: Vec<u8>,
     maximum: Vec<u8>,
@@ -1069,6 +1245,66 @@ mod tests {
         let scan = tree.scan(&store)?;
         assert_eq!(scan.len(), 1_000);
         assert!(scan.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_scan_prunes_multilevel_ranges_and_preserves_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for namespace in 0..4_u8 {
+            for index in 0..512_u32 {
+                let mut key = vec![namespace];
+                key.extend_from_slice(&index.to_be_bytes());
+                tree = tree
+                    .insert_unique(
+                        &mut store,
+                        Csn::new(u64::from(namespace) * 512 + u64::from(index) + 1)?,
+                        key,
+                        index.to_be_bytes().to_vec(),
+                    )?
+                    .tree;
+            }
+        }
+        assert!(tree.height(&store)? >= 2);
+        let matches = tree.scan_prefix(&store, &[2])?;
+        assert_eq!(matches.len(), 512);
+        assert!(
+            matches
+                .iter()
+                .all(|(key, value)| key[0] == 2 && key[1..] == value[..])
+        );
+        assert!(matches.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(tree.scan_prefix(&store, &[4])?.is_empty());
+        assert_eq!(tree.scan_prefix(&store, &[])?, tree.scan(&store)?);
+        let pool = BufferPool::new(64, 4)?;
+        assert_eq!(
+            tree.scan_prefix_cached(&store, &pool, &[2])?,
+            tree.scan_prefix(&store, &[2])?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_scan_supports_unbounded_ff_suffixes() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for key in [
+            vec![0xfe, 0xff],
+            vec![0xff],
+            vec![0xff, 0x00],
+            vec![0xff, 0xff],
+            vec![0xff, 0xff, 0x00],
+        ] {
+            tree = tree
+                .insert_unique(&mut store, Csn::new(1)?, key.clone(), key)?
+                .tree;
+        }
+        assert_eq!(tree.scan_prefix(&store, &[0xff])?.len(), 4);
+        assert_eq!(tree.scan_prefix(&store, &[0xff, 0xff])?.len(), 2);
         Ok(())
     }
 

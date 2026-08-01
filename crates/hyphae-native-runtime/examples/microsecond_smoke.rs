@@ -25,6 +25,11 @@ const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
 const HASH_SCALE_FIELDS: u32 = 2_048;
 const HASH_TARGET_FIELD: u32 = HASH_SCALE_FIELDS / 2;
 const HASH_KEY: &[u8] = b"benchmark-hash";
+const SEARCH_SCALE_DOCUMENTS: u32 = 2_048;
+const SEARCH_TARGET_DOCUMENT: u32 = SEARCH_SCALE_DOCUMENTS / 2;
+const SEARCH_OBSERVATIONS: u32 = 100_000;
+const SEARCH_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const SEARCH_QUERY: &str = "needle";
 
 struct TemporaryDirectory(PathBuf);
 
@@ -63,6 +68,7 @@ struct OperationStats {
     structure_btree: Stats,
     hash: Stats,
     hash_btree: Stats,
+    search_btree: Stats,
     prepared_sql: Stats,
     relational_btree: Stats,
     codec_dispatch: Stats,
@@ -71,6 +77,7 @@ struct OperationStats {
 struct BenchmarkInputs<'a> {
     prepared: &'a PreparedStatement,
     table: ObjectId,
+    search_index: ObjectId,
     relational_target: &'a [u8],
     structure_target: &'a [u8],
     hash_target: &'a [u8],
@@ -80,6 +87,7 @@ struct BenchmarkInputs<'a> {
 fn seed_scaled_data(
     transaction: &mut NativeTransaction<'_>,
     table: ObjectId,
+    search_index: ObjectId,
     dataset_hasher: &mut blake3::Hasher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for row in 0..RELATIONAL_SCALE_ROWS {
@@ -104,6 +112,17 @@ fn seed_scaled_data(
         dataset_hasher.update(&value);
         transaction.hset(HASH_KEY.to_vec(), field.to_vec(), value)?;
     }
+    for document in 0..SEARCH_SCALE_DOCUMENTS {
+        let document_id = document.to_be_bytes();
+        let text = if document == SEARCH_TARGET_DOCUMENT {
+            format!("needle native search common document{document}")
+        } else {
+            format!("native search common document{document}")
+        };
+        dataset_hasher.update(&document_id);
+        dataset_hasher.update(text.as_bytes());
+        transaction.index_document(search_index, document_id.to_vec(), text)?;
+    }
     Ok(())
 }
 
@@ -117,6 +136,11 @@ fn measure_operations(
         black_box(database.get_latest_structure(black_box(inputs.structure_target), 101)?);
         black_box(snapshot.hget(black_box(HASH_KEY), black_box(inputs.hash_target))?);
         black_box(database.hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))?);
+        black_box(database.match_latest_text(
+            inputs.search_index,
+            black_box(SEARCH_QUERY),
+            black_box(1),
+        )?);
         black_box(
             snapshot
                 .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))?,
@@ -153,6 +177,21 @@ fn measure_operations(
                     .is_ok(),
             );
         }),
+        search_btree: measure_counted(
+            || {
+                black_box(
+                    database
+                        .match_latest_text(
+                            inputs.search_index,
+                            black_box(SEARCH_QUERY),
+                            black_box(1),
+                        )
+                        .is_ok(),
+                );
+            },
+            SEARCH_OBSERVATIONS,
+            SEARCH_OPERATIONS_PER_OBSERVATION,
+        ),
         prepared_sql: measure(|| {
             black_box(
                 snapshot
@@ -189,12 +228,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transaction = database.begin(100, DurabilityClass::Memory)?;
     transaction.create_relation(table, "accounts")?;
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
-    let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v5");
-    seed_scaled_data(&mut transaction, table, &mut dataset_hasher)?;
-    transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.create_search_index(index, "notes")?;
-    transaction.index_document(index, b"doc-1".to_vec(), "native rust search")?;
+    let mut dataset_hasher = blake3::Hasher::new();
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v6");
+    seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
+    transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.commit()?;
     let relational_tree_height = database.latest_relational_tree_height()?;
     if relational_tree_height < 2 {
@@ -203,6 +241,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let structure_tree_height = database.latest_structure_tree_height()?;
     if structure_tree_height < 2 {
         return Err("structure benchmark dataset did not produce a multilevel B+tree".into());
+    }
+    let search_tree_height = database.latest_search_tree_height()?;
+    if search_tree_height < 2 {
+        return Err("search benchmark dataset did not produce a multilevel B+tree".into());
+    }
+    if database.match_latest_text(index, SEARCH_QUERY, 1)?[0].document_id
+        != SEARCH_TARGET_DOCUMENT.to_be_bytes()
+    {
+        return Err("physical search benchmark target did not rank first".into());
     }
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
@@ -223,13 +270,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &BenchmarkInputs {
             prepared: &prepared,
             table,
+            search_index: index,
             relational_target: &relational_target,
             structure_target: &structure_target,
             hash_target: &hash_target,
             frame: &frame,
         },
     )?;
-    dataset_hasher.update(b"accounts:mario=active;session=64x07;notes:doc-1");
+    dataset_hasher.update(b"accounts:mario=active;session=64x07");
     let dataset_digest = dataset_hasher.finalize();
 
     print_report(
@@ -238,6 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dataset_digest,
         relational_tree_height,
         structure_tree_height,
+        search_tree_height,
         &operations,
     );
     Ok(())
@@ -249,10 +298,11 @@ fn print_report(
     dataset_digest: blake3::Hash,
     relational_tree_height: usize,
     structure_tree_height: usize,
+    search_tree_height: usize,
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v5\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v6\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -265,6 +315,8 @@ fn print_report(
     println!("  \"observations_per_operation\": {OBSERVATIONS},");
     println!("  \"operations_per_observation\": {OPERATIONS_PER_OBSERVATION},");
     println!("  \"warmup_per_operation\": {WARMUP},");
+    println!("  \"search_observations\": {SEARCH_OBSERVATIONS},");
+    println!("  \"search_operations_per_observation\": {SEARCH_OPERATIONS_PER_OBSERVATION},");
     println!("  \"concurrency\": 1,");
     println!("  \"durability\": \"memory\",");
     println!("  \"warm_state\": true,");
@@ -277,6 +329,9 @@ fn print_report(
     println!("  \"structure_keys\": {STRUCTURE_SCALE_KEYS},");
     println!("  \"structure_tree_height\": {structure_tree_height},");
     println!("  \"hash_fields\": {HASH_SCALE_FIELDS},");
+    println!("  \"search_documents\": {SEARCH_SCALE_DOCUMENTS},");
+    println!("  \"search_tree_height\": {search_tree_height},");
+    println!("  \"search_query_document_frequency\": 1,");
     println!("  \"dataset_digest_blake3\": \"{dataset_digest}\",");
     println!("  \"transport_note\": \"codec plus embedded dispatch; no named-pipe transport\",");
     println!("  \"operations\": {{");
@@ -294,6 +349,11 @@ fn print_report(
     print_stats(
         "buffered_hash_hget_64b_multilevel",
         operations.hash_btree,
+        true,
+    );
+    print_stats(
+        "buffered_inverted_btree_bm25_match_top1_rare_term",
+        operations.search_btree,
         true,
     );
     print_stats(
@@ -316,15 +376,23 @@ fn print_report(
 }
 
 fn measure(mut operation: impl FnMut()) -> Stats {
-    let mut observations = Vec::with_capacity(usize::try_from(OBSERVATIONS).unwrap_or(0));
+    measure_counted(&mut operation, OBSERVATIONS, OPERATIONS_PER_OBSERVATION)
+}
+
+fn measure_counted(
+    mut operation: impl FnMut(),
+    observation_count: u32,
+    operations_per_observation: u32,
+) -> Stats {
+    let mut observations = Vec::with_capacity(usize::try_from(observation_count).unwrap_or(0));
     let aggregate_start = Instant::now();
-    for _ in 0..OBSERVATIONS {
+    for _ in 0..observation_count {
         let start = Instant::now();
-        for _ in 0..OPERATIONS_PER_OBSERVATION {
+        for _ in 0..operations_per_observation {
             operation();
         }
         observations.push(
-            u64::try_from(start.elapsed().as_nanos() / u128::from(OPERATIONS_PER_OBSERVATION))
+            u64::try_from(start.elapsed().as_nanos() / u128::from(operations_per_observation))
                 .unwrap_or(u64::MAX),
         );
     }
@@ -335,7 +403,7 @@ fn measure(mut operation: impl FnMut()) -> Stats {
         p95_nanos: percentile(&observations, 950),
         p99_nanos: percentile(&observations, 990),
         p999_nanos: percentile(&observations, 999),
-        throughput_per_second: f64::from(OBSERVATIONS * OPERATIONS_PER_OBSERVATION)
+        throughput_per_second: f64::from(observation_count * operations_per_observation)
             / aggregate_elapsed.as_secs_f64(),
     }
 }

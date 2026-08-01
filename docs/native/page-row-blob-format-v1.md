@@ -149,8 +149,10 @@ The first relational route uses an 8,192-byte threshold and stores a one-byte
 value envelope inside the row column: `0` followed by inline bytes, or `1`
 followed by the fixed 56-byte blob reference. The first structure B+tree uses
 the same threshold inside its versioned TTL/storage envelope, including
-persistent native hash fields. Identical content across relational rows,
-scalars, and hash fields resolves to the same immutable blob. Blob files are named
+persistent native hash fields. Search documents use `HYDOCS01`, which stores
+their analyzed token count plus inline UTF-8 source or the same fixed blob
+reference. Identical content across relational rows, scalars, hash fields, and
+search documents resolves to the same immutable blob. Blob files are named
 `blobs/<lowercase BLAKE3 digest>.hyblob`; canonical stages are
 `tmp/blobs/<digest>.tmp`.
 

@@ -1,10 +1,10 @@
 # Native B+tree format v1
 
 Status: normative experimental format; copy-on-write insertion, replacement,
-recursive splitting, point lookup, ordered scan, complete validation,
-balanced-height validation, historical roots, and allocation-free
-buffer-pool node traversal are implemented; the relational namespace now
-supports an explicit row-version-pointer format
+recursive splitting, point lookup, ordered scan, bounded prefix scan,
+complete validation, balanced-height validation, historical roots, and
+allocation-free buffer-pool point traversal are implemented; relational,
+structure, and lexical-search namespaces now use the native tree
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -31,6 +31,13 @@ leaf's buffer-pool frame. It does not allocate key/value vectors for internal
 or leaf entries. The v1 sequential entry layout still requires a linear pass
 within each visited node; a future slotted format may add binary-searchable
 offsets only through a new format version.
+
+Prefix scans derive the exclusive binary successor of the requested prefix
+and use internal separator ranges to skip nonintersecting subtrees. A prefix
+ending entirely in `0xff` has no finite upper bound. Both page-store and
+buffer-pool variants preserve canonical key order; only reached nodes are
+decoded during the operation. Returned key/value pairs are currently owned
+allocations rather than a streaming cursor.
 
 ## Leaf payload
 
@@ -136,17 +143,30 @@ The value envelope and legacy single-page compatibility are specified in
 `DELETE` stores the canonical scalar tombstone. Direct current reads traverse
 the buffer pool. Hash field changes rewrite their own field path plus the small
 hash metadata path rather than a whole serialized map. The current
-implementation has no range/prefix cursor, expiry index/timing wheel,
+implementation has no general range/streaming cursor, expiry index/timing wheel,
 expected-version response, whole-hash deletion, or layouts for the remaining
 collection families.
+
+## Lexical-search namespace
+
+New lexical-search roots use marker `HYSEABT1` and four independent private
+prefixes for collection statistics, stored documents, term statistics, and
+postings. Query execution performs point reads for collection/term/document
+metadata and a separator-pruned prefix scan for each requested term's
+postings. Exact key/value envelopes are specified in
+[Native search-engine semantics v1](search-semantics-v1.md).
+
+Legacy page-kind-10 `SearchState` roots remain readable and writable without
+implicit conversion. New directories use the B+tree format.
 
 ## Verification
 
 Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,
-balanced-height verification, point reads, ordered scan, retained historical
-roots, duplicate/upsert semantics, buffered lookup, oversized and
-noncanonical rejection, complete-node validation after an early key match, and
-future-node rejection. The runtime benchmark also refuses to run unless its
-relational tree height is at least two. Fuzzing, randomized model equivalence,
-crash power-loss tests, fanout/fill-factor tuning, and concurrent writer
-publication remain required gate evidence.
+balanced-height verification, point reads, ordered and prefix scans (including
+an all-`0xff` upper range), retained historical roots, duplicate/upsert
+semantics, buffered lookup/scan, oversized and noncanonical rejection,
+complete-node validation after an early key match, and future-node rejection.
+The runtime benchmark refuses to run unless its relational, structure, and
+search trees are multilevel. Fuzzing, randomized model equivalence, crash
+power-loss tests, fanout/fill-factor tuning, streaming cursors, and concurrent
+writer publication remain required gate evidence.

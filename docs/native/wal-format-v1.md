@@ -124,13 +124,14 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 60 | 32 | ordered mutation-set BLAKE3 digest |
 | 92 | 32 | four little-endian root page IDs |
 
-The current relational, scalar `SET`/`EXPIRE`, and hash-field `HSET` mutation
-bodies store values at or below 8,192 bytes inline. Larger values are promoted
-to the shared immutable blob namespace first. The WAL stores the relational
-one-byte envelope or the structure `HYSTRV01` envelope with its 56-byte
-reference instead of duplicating large content. A structure or hash-field
-delete keeps its WAL value empty; page construction publishes the canonical
-`HYSTRV01` tombstone.
+The current relational, scalar `SET`/`EXPIRE`, hash-field `HSET`, and search
+`INDEX DOCUMENT` mutation bodies store values at or below 8,192 bytes inline.
+Larger values are promoted to the shared immutable blob namespace first. The
+WAL stores the relational one-byte envelope, structure `HYSTRV01` envelope, or
+search `HYDOCS01` envelope with its 56-byte reference instead of duplicating
+large content. The search envelope also binds the analyzed token count. A
+structure or hash-field delete keeps its WAL value empty; page construction
+publishes the canonical `HYSTRV01` tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 

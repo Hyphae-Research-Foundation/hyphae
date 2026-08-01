@@ -114,16 +114,24 @@ cardinality metadata, field tombstones, field-granular conflict/rebase,
 multilevel scale, corruption rejection, crash recovery, and direct `HGET`
 latency to one source commit.
 
+The native lexical-search implementation now replaces the bounded search page
+for new directories with collection/document/term/posting B+tree namespaces,
+separator-pruned posting scans, exact reference-BM25 equivalence, shared large
+text blobs, multilevel restart and corruption tests, and a legacy inline
+compatibility path. Its clean benchmark receipt and source-bound evidence are
+the next evidence publication step.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
 explicit per-key row-version chains with closed half-open intervals while
-keeping V1 inline-row directories compatible. Catalog and search state remain
-bounded single-page scaffolding. Detached transactions now prepare concurrently
+keeping V1 inline-row directories compatible. Catalog remains bounded
+single-page scaffolding; new search roots use a native inverted B+tree while
+legacy inline roots remain compatible. Detached transactions now prepare concurrently
 and rebase disjoint all-engine writes under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary indexes, remaining structure
-families, postings, segments, and ANN required by G1–G4. The structure
+families, positional postings, segments, and ANN required by G1–G4. The structure
 keyspace has a multilevel native B+tree, direct reads, tombstone/expiry
 mutations, conditional writes, signed counters, and the first independent-field
 hash layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
