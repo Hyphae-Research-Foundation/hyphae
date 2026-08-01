@@ -167,16 +167,19 @@ enum Statement {
     },
     Insert {
         name: String,
-        columns: Vec<String>,
+        values: Vec<ColumnOperand>,
+        parameter_count: usize,
     },
     Update {
         name: String,
-        assignments: Vec<String>,
-        predicates: Vec<String>,
+        assignments: Vec<ColumnOperand>,
+        predicates: Vec<ColumnOperand>,
+        parameter_count: usize,
     },
     Delete {
         name: String,
-        predicates: Vec<String>,
+        predicates: Vec<ColumnOperand>,
+        parameter_count: usize,
     },
     Select {
         name: String,
@@ -202,6 +205,12 @@ struct ParsedColumn {
     logical_type: LogicalType,
     nullable: bool,
     inline_primary_key: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColumnOperand {
+    column: String,
+    operand: ScalarOperand,
 }
 
 struct BoundUpdateAssignment {
@@ -501,17 +510,29 @@ pub(crate) fn execute_transaction(
             columns,
             unique,
         } => execute_create_index(transaction, &name, &table, &columns, unique, parameters),
-        Statement::Insert { name, columns } => {
-            execute_insert(transaction, &name, &columns, parameters)
-        }
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => execute_insert(transaction, &name, &values, parameter_count, parameters),
         Statement::Update {
             name,
             assignments,
             predicates,
-        } => execute_update(transaction, &name, &assignments, &predicates, parameters),
-        Statement::Delete { name, predicates } => {
-            execute_delete(transaction, &name, &predicates, parameters)
-        }
+            parameter_count,
+        } => execute_update(
+            transaction,
+            &name,
+            &assignments,
+            &predicates,
+            parameter_count,
+            parameters,
+        ),
+        Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } => execute_delete(transaction, &name, &predicates, parameter_count, parameters),
         Statement::Select {
             name,
             projection,
@@ -1181,15 +1202,15 @@ fn execute_create(
 fn execute_insert(
     transaction: &mut NativeWriteBatch,
     name: &str,
-    supplied_columns: &[String],
+    supplied_values: &[ColumnOperand],
+    parameter_count: usize,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    if supplied_columns.len() != parameters.len() {
-        return Err(SqlError::ParameterMismatch);
-    }
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
-    let values = bind_insert_values(&definition, supplied_columns, parameters)?;
+    let resolved =
+        resolve_mutation_operands(&definition, supplied_values, parameter_count, parameters)?;
+    let values = bind_insert_values(&definition, supplied_values, &resolved)?;
     if is_legacy_binary_relation(&definition) {
         let primary_key = legacy_binary_value(values[0], false)?;
         let row = legacy_binary_value(values[1], false)?;
@@ -1212,19 +1233,20 @@ fn execute_insert(
 fn execute_update(
     transaction: &mut NativeWriteBatch,
     name: &str,
-    assignments: &[String],
-    predicates: &[String],
+    assignments: &[ColumnOperand],
+    predicates: &[ColumnOperand],
+    parameter_count: usize,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
     let assignment_columns = bind_update_columns(&definition, assignments)?;
     let predicate_columns = bind_primary_key_columns(&definition, predicates)?;
-    if parameters.len() != assignment_columns.len() + predicate_columns.len() {
-        return Err(SqlError::ParameterMismatch);
-    }
-    let (assignment_values, predicate_values) = parameters.split_at(assignment_columns.len());
-    let primary_key = bind_primary_key(&definition, &predicate_columns, predicate_values)?;
+    let assignment_values =
+        resolve_mutation_operands(&definition, assignments, parameter_count, parameters)?;
+    let predicate_values =
+        resolve_mutation_operands(&definition, predicates, parameter_count, parameters)?;
+    let primary_key = bind_primary_key(&definition, &predicate_columns, &predicate_values)?;
     let update = if is_legacy_binary_relation(&definition) {
         if assignment_columns.as_slice() != [1] {
             return Err(SqlError::InvalidSyntax);
@@ -1232,7 +1254,7 @@ fn execute_update(
         legacy_binary_value(assignment_values.first(), false)?
     } else {
         let assignments =
-            bind_update_assignments(&definition, &assignment_columns, assignment_values)?;
+            bind_update_assignments(&definition, &assignment_columns, &assignment_values)?;
         let Some(stored) = transaction.select(table, &primary_key) else {
             return Ok(command_result(0));
         };
@@ -1250,12 +1272,15 @@ fn execute_update(
 fn execute_delete(
     transaction: &mut NativeWriteBatch,
     name: &str,
-    predicates: &[String],
+    predicates: &[ColumnOperand],
+    parameter_count: usize,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let predicate_columns = bind_primary_key_columns(definition, predicates)?;
-    let primary_key = bind_primary_key(definition, &predicate_columns, parameters)?;
+    let predicate_values =
+        resolve_mutation_operands(definition, predicates, parameter_count, parameters)?;
+    let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
@@ -1858,12 +1883,12 @@ fn same_column_set(left: &[usize], right: &[usize]) -> bool {
 
 fn bind_insert_values<'value>(
     definition: &RelationDefinition,
-    supplied_columns: &[String],
-    parameters: &'value [SqlValue],
+    supplied_values: &[ColumnOperand],
+    resolved: &'value [SqlValue],
 ) -> Result<Vec<Option<&'value SqlValue>>, SqlError> {
     let mut values = vec![None; definition.columns.len()];
-    for (name, value) in supplied_columns.iter().zip(parameters) {
-        let index = column_index(&definition.columns, name)?;
+    for (binding, value) in supplied_values.iter().zip(resolved) {
+        let index = column_index(&definition.columns, &binding.column)?;
         if values[index].is_some() {
             return Err(SqlError::DuplicateColumn);
         }
@@ -1882,15 +1907,15 @@ fn bind_insert_values<'value>(
 
 fn bind_update_columns(
     definition: &RelationDefinition,
-    assignments: &[String],
+    assignments: &[ColumnOperand],
 ) -> Result<Vec<usize>, SqlError> {
     if assignments.is_empty() {
         return Err(SqlError::InvalidSyntax);
     }
     let mut columns = Vec::with_capacity(assignments.len());
     let primary_key = primary_key_indices(definition)?;
-    for name in assignments {
-        let column = column_index(&definition.columns, name)?;
+    for assignment in assignments {
+        let column = column_index(&definition.columns, &assignment.column)?;
         if columns.contains(&column) {
             return Err(SqlError::DuplicateColumn);
         }
@@ -1904,11 +1929,11 @@ fn bind_update_columns(
 
 fn bind_primary_key_columns(
     definition: &RelationDefinition,
-    predicates: &[String],
+    predicates: &[ColumnOperand],
 ) -> Result<Vec<usize>, SqlError> {
     let mut columns = Vec::with_capacity(predicates.len());
-    for name in predicates {
-        let column = column_index(&definition.columns, name)?;
+    for predicate in predicates {
+        let column = column_index(&definition.columns, &predicate.column)?;
         if columns.contains(&column) {
             return Err(SqlError::DuplicateColumn);
         }
@@ -1918,6 +1943,35 @@ fn bind_primary_key_columns(
         return Err(SqlError::InvalidPrimaryKey);
     }
     Ok(columns)
+}
+
+fn resolve_mutation_operands(
+    definition: &RelationDefinition,
+    bindings: &[ColumnOperand],
+    parameter_count: usize,
+    parameters: &[SqlValue],
+) -> Result<Vec<SqlValue>, SqlError> {
+    if parameters.len() != parameter_count {
+        return Err(SqlError::ParameterMismatch);
+    }
+    bindings
+        .iter()
+        .map(|binding| {
+            let column = column_index(&definition.columns, &binding.column)?;
+            let definition = definition
+                .columns
+                .get(column)
+                .ok_or(SqlError::InvalidCatalogObject)?;
+            let operand = bind_scalar_operand(&definition.logical_type, &binding.operand)?;
+            let value = resolve_operand(&operand, parameters)?.clone();
+            if !matches!(value, SqlValue::Null) {
+                value
+                    .encode_storage(&definition.logical_type)
+                    .map_err(|_| SqlError::TypeMismatch)?;
+            }
+            Ok(value)
+        })
+        .collect()
 }
 
 fn bind_update_assignments(
@@ -2718,34 +2772,48 @@ fn parse_insert(parser: &mut Parser) -> Result<Statement, SqlError> {
     let columns = parser.identifier_list(')')?;
     parser.expect_keyword("VALUES")?;
     parser.expect_symbol('(')?;
-    for index in 0..columns.len() {
+    let mut parameter_count = 0_usize;
+    let mut values = Vec::with_capacity(columns.len());
+    for (index, column) in columns.into_iter().enumerate() {
         if index != 0 {
             parser.expect_symbol(',')?;
         }
-        parser.expect_symbol('?')?;
+        values.push(ColumnOperand {
+            column,
+            operand: parser.scalar_operand(&mut parameter_count)?,
+        });
     }
     parser.expect_symbol(')')?;
-    Ok(Statement::Insert { name, columns })
+    Ok(Statement::Insert {
+        name,
+        values,
+        parameter_count,
+    })
 }
 
 fn parse_update(parser: &mut Parser) -> Result<Statement, SqlError> {
     let name = parser.identifier()?;
     parser.expect_keyword("SET")?;
+    let mut parameter_count = 0_usize;
     let mut assignments = Vec::new();
     loop {
-        assignments.push(parser.identifier()?);
+        let column = parser.identifier()?;
         parser.expect_symbol('=')?;
-        parser.expect_symbol('?')?;
+        assignments.push(ColumnOperand {
+            column,
+            operand: parser.scalar_operand(&mut parameter_count)?,
+        });
         if !parser.consume_symbol(',') {
             break;
         }
     }
     parser.expect_keyword("WHERE")?;
-    let predicates = parse_parameter_predicates(parser)?;
+    let predicates = parse_mutation_predicates(parser, &mut parameter_count)?;
     Ok(Statement::Update {
         name,
         assignments,
         predicates,
+        parameter_count,
     })
 }
 
@@ -2753,8 +2821,13 @@ fn parse_delete(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     parser.expect_keyword("WHERE")?;
-    let predicates = parse_parameter_predicates(parser)?;
-    Ok(Statement::Delete { name, predicates })
+    let mut parameter_count = 0_usize;
+    let predicates = parse_mutation_predicates(parser, &mut parameter_count)?;
+    Ok(Statement::Delete {
+        name,
+        predicates,
+        parameter_count,
+    })
 }
 
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
@@ -2913,12 +2986,18 @@ fn has_top_level_scalar_equality(expression: &FilterExpression) -> bool {
     }
 }
 
-fn parse_parameter_predicates(parser: &mut Parser) -> Result<Vec<String>, SqlError> {
+fn parse_mutation_predicates(
+    parser: &mut Parser,
+    parameter_count: &mut usize,
+) -> Result<Vec<ColumnOperand>, SqlError> {
     let mut predicates = Vec::new();
     loop {
-        predicates.push(parser.identifier()?);
+        let column = parser.identifier()?;
         parser.expect_symbol('=')?;
-        parser.expect_symbol('?')?;
+        predicates.push(ColumnOperand {
+            column,
+            operand: parser.scalar_operand(parameter_count)?,
+        });
         if !parser.consume_keyword("AND") {
             break;
         }
@@ -3249,8 +3328,8 @@ mod tests {
     use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
 
     use super::{
-        ComparisonOperator, FilterExpression, Projection, ScalarOperand, SqlError, Statement,
-        TruthValue, parse, primary_key_range_is_empty,
+        ColumnOperand, ComparisonOperator, FilterExpression, Projection, ScalarOperand, SqlError,
+        Statement, TruthValue, parse, primary_key_range_is_empty,
     };
 
     #[test]
@@ -3313,12 +3392,13 @@ mod tests {
     }
 
     #[test]
-    fn typed_update_delete_parse_assignment_and_predicate_order()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn typed_mutations_parse_operands_and_parameter_order() -> Result<(), Box<dyn std::error::Error>>
+    {
         let Statement::Update {
             name,
             assignments,
             predicates,
+            parameter_count,
         } = parse(
             "UPDATE events
              SET payload = ?, status = ?
@@ -3328,16 +3408,87 @@ mod tests {
             return Err("expected typed update".into());
         };
         assert_eq!(name, "events");
-        assert_eq!(assignments, ["payload", "status"]);
-        assert_eq!(predicates, ["sequence", "tenant"]);
+        assert_eq!(
+            assignments,
+            [
+                ColumnOperand {
+                    column: "payload".to_owned(),
+                    operand: ScalarOperand::Parameter(0),
+                },
+                ColumnOperand {
+                    column: "status".to_owned(),
+                    operand: ScalarOperand::Parameter(1),
+                },
+            ]
+        );
+        assert_eq!(
+            predicates,
+            [
+                ColumnOperand {
+                    column: "sequence".to_owned(),
+                    operand: ScalarOperand::Parameter(2),
+                },
+                ColumnOperand {
+                    column: "tenant".to_owned(),
+                    operand: ScalarOperand::Parameter(3),
+                },
+            ]
+        );
+        assert_eq!(parameter_count, 4);
 
-        let Statement::Delete { name, predicates } =
-            parse("DELETE FROM events WHERE sequence = ? AND tenant = ?")?
+        let Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } = parse("DELETE FROM events WHERE sequence = ? AND tenant = ?")?
         else {
             return Err("expected typed delete".into());
         };
         assert_eq!(name, "events");
-        assert_eq!(predicates, ["sequence", "tenant"]);
+        assert_eq!(
+            predicates,
+            [
+                ColumnOperand {
+                    column: "sequence".to_owned(),
+                    operand: ScalarOperand::Parameter(0),
+                },
+                ColumnOperand {
+                    column: "tenant".to_owned(),
+                    operand: ScalarOperand::Parameter(1),
+                },
+            ]
+        );
+        assert_eq!(parameter_count, 2);
+
+        let Statement::Insert {
+            values,
+            parameter_count,
+            ..
+        } = parse(
+            "INSERT INTO events (sequence, payload, active)
+             VALUES (-2, 'Mario''s', ?)",
+        )?
+        else {
+            return Err("expected typed insert".into());
+        };
+        assert_eq!(
+            values,
+            [
+                ColumnOperand {
+                    column: "sequence".to_owned(),
+                    operand: ScalarOperand::Integer("-2".to_owned()),
+                },
+                ColumnOperand {
+                    column: "payload".to_owned(),
+                    operand: ScalarOperand::Text("Mario's".to_owned()),
+                },
+                ColumnOperand {
+                    column: "active".to_owned(),
+                    operand: ScalarOperand::Parameter(0),
+                },
+            ]
+        );
+        assert_eq!(parameter_count, 1);
         Ok(())
     }
 
