@@ -1,0 +1,117 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v3",
+  "measured_at": "2026-08-01T11:51:05.1535241-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "7b0053cdef414e411031537aa8870c05e11b1e1b",
+    "tree": "50a0991fcd781d427a77485219a94082689b363d",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "Commit binding and matched benchmark inputs support a controlled source comparison, but missing timing and environment controls keep this outside G7."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502112256,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "dataset_digest_blake3": "847c327dcb42eeafb9561513bd8b1ecb90386ff8ea2c9433468d7f6c6ce86692",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "relational_path_note": "The direct route uses a fixed path array, validates node bytes in place, pins the leaf value, validates RowRecordView in place, and copies only the returned logical value."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.002,
+      "p95_us": 0.002,
+      "p99_us": 0.004,
+      "p99_9_us": 0.005,
+      "throughput_ops_s": 331731956
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.029,
+      "p95_us": 0.033,
+      "p99_us": 0.043,
+      "p99_9_us": 0.406,
+      "throughput_ops_s": 30738037
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 0.468,
+      "p95_us": 0.529,
+      "p99_us": 1.136,
+      "p99_9_us": 3.477,
+      "throughput_ops_s": 2005761
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.023,
+      "p95_us": 0.024,
+      "p99_us": 0.032,
+      "p99_9_us": 0.249,
+      "throughput_ops_s": 39553908
+    }
+  },
+  "comparison": {
+    "baseline_commit": "5a7379527a7207142de81d84a52699d2f0de92c1",
+    "baseline_receipt": "native-microsecond-smoke-multilevel-wsl2.json",
+    "same_schema_dataset_height_and_operation_counts": true,
+    "physical_point_read": {
+      "baseline_p50_us": 2.983,
+      "current_p50_us": 0.468,
+      "p50_reduction_percent": 84.31,
+      "baseline_p99_us": 6.858,
+      "current_p99_us": 1.136,
+      "p99_reduction_percent": 83.44,
+      "baseline_p99_9_us": 12.156,
+      "current_p99_9_us": 3.477,
+      "p99_9_reduction_percent": 71.4,
+      "baseline_throughput_ops_s": 317504,
+      "current_throughput_ops_s": 2005761,
+      "throughput_multiple": 6.32
+    },
+    "caveat": "Runs were sequential on the same reported WSL2 environment, not interleaved or affinity-controlled; OS noise can still affect the observed delta."
+  },
+  "interpretation": {
+    "sub_microsecond_batch_average_p50_observed": true,
+    "microsecond_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "2,049-row corpus and tree height two only",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

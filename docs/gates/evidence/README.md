@@ -42,6 +42,14 @@ commit before its tag can be published.
   height-two physical B+tree observation to clean commit `5a73795`. It remains
   outside G7 because timing is batch-averaged, concurrency is one, and
   transport/interference/hardware controls are absent.
+- [Native borrowed point-read evidence —
+  2026-08-01](native-borrowed-point-read-2026-08-01.md) removes owned
+  per-node decoding from that height-two route and binds the matched
+  sub-microsecond batch-average p50 observation to clean commit `7b0053c`.
+- `native-microsecond-smoke-borrowed-read-wsl2.json` is the machine-readable
+  matched receipt. It still does not pass G7 because individual-operation,
+  concurrency, transport, interference, allocation, and hardware-counter
+  controls remain absent.
 
 ## Hosted release evidence
 
