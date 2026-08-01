@@ -88,6 +88,11 @@ commit before its tag can be published.
   descriptors, checked primitive row payloads, memcomparable ordered-index
   components, explicit unsupported nested codecs, and cross-platform
   validation to one source commit.
+- [Native catalog-definition evidence —
+  2026-08-01](native-catalog-definitions-2026-08-01.md) binds canonical
+  relation/structure/search definitions, full-definition WAL and `HYCAT002`
+  persistence, legacy reconstruction, snapshot/reopen proof, and explicit
+  single-page limits to one source commit.
 
 ## Hosted release evidence
 

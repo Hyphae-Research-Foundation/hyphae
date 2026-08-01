@@ -129,14 +129,22 @@ components, null separation, malformed/noncanonical failure behavior, and
 cross-platform workspace validation to one source commit. Persistent typed
 catalog definitions, typed rows, and physical secondary indexes remain open.
 
+The [native catalog-definition
+evidence](evidence/native-catalog-definitions-2026-08-01.md) binds
+`HYCOBJ01`, complete-definition WAL mutations, `HYCAT002` roots, immutable
+snapshot introspection, legacy `HYCAT001` reconstruction, reopen proof, and
+fail-closed definition validation to one source commit. Catalog B+tree
+scaling, definition history, typed rows, and secondary indexes remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
 explicit per-key row-version chains with closed half-open intervals while
-keeping V1 inline-row directories compatible. Catalog remains bounded
-single-page scaffolding; new search roots use a native inverted B+tree while
-legacy inline roots remain compatible. Detached transactions now prepare concurrently
-and rebase disjoint all-engine writes under serialized publication;
+keeping V1 inline-row directories compatible. Catalog now retains complete
+typed definitions but remains bounded to one root page; new search roots use a
+native inverted B+tree while legacy inline roots remain compatible. Detached
+transactions now prepare concurrently and rebase disjoint all-engine writes
+under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary indexes, remaining structure
 families, positional postings, segments, and ANN required by G1–G4. The structure
