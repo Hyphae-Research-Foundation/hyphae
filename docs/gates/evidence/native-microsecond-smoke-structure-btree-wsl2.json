@@ -1,0 +1,114 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v4",
+  "measured_at": "2026-08-01T12:29:07.2176113-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "ac81a3846ea64a5568ef2a753570c35f94128a5f",
+    "tree": "d0df6a735ec897b0af8ae091ba4843674760ad9f",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "This is a single clean local observation without affinity, background-load, or hardware-counter controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502120448,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "structure_value_bytes": 64,
+    "dataset_digest_blake3": "dbd668573e35dec998520a7c8bac8c3d14f8bc9e81855cc8c3adf74781362f56",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "structure_path_note": "The physical structure route traverses a height-two native B+tree through pinned buffer-pool pages, validates one HYSTRV01 envelope, evaluates TTL, and copies the selected 64-byte value."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.036,
+      "p95_us": 0.040,
+      "p99_us": 0.062,
+      "p99_9_us": 0.452,
+      "throughput_ops_s": 25290700
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.421,
+      "p95_us": 0.556,
+      "p99_us": 1.046,
+      "p99_9_us": 3.247,
+      "throughput_ops_s": 2193898
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.032,
+      "p95_us": 0.035,
+      "p99_us": 0.050,
+      "p99_9_us": 0.426,
+      "throughput_ops_s": 28474095
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 0.805,
+      "p95_us": 1.119,
+      "p99_us": 2.200,
+      "p99_9_us": 4.563,
+      "throughput_ops_s": 1148354
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.061,
+      "p95_us": 0.066,
+      "p99_us": 0.101,
+      "p99_9_us": 0.740,
+      "throughput_ops_s": 15298849
+    }
+  },
+  "comparison": {
+    "direct_structure_physical_baseline_available": false,
+    "reason": "Earlier v3 receipts measured only a materialized one-key BTreeMap lookup, not a physical multilevel structure tree. The v4 corpus also adds 2,048 structure keys and changes its digest.",
+    "relational_sanity_baseline_receipt": "native-microsecond-smoke-optimistic-writers-wsl2.json",
+    "relational_sanity_note": "The v4 relational route remained in the same microsecond regime, but cross-schema timing deltas are not treated as controlled comparisons."
+  },
+  "interpretation": {
+    "sub_microsecond_batch_average_structure_p50_observed": true,
+    "microsecond_structure_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "2,048-key corpus and tree height two only",
+      "no conditional writes, expiry scheduler, collection families, or eviction",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

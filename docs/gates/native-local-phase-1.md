@@ -94,6 +94,12 @@ detached preparation, admitted-root rebase across all three engines,
 first-committer-wins, lagging-read-CSN recovery, and the optimistic crash
 matrix to one source commit.
 
+The [structure B+tree
+evidence](evidence/native-structure-btree-2026-08-01.md) binds the first
+multilevel scalar keyspace, canonical TTL/blob envelope, legacy compatibility,
+cross-engine blob deduplication, direct buffered reads, and a clean latency
+observation to one source commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
