@@ -106,6 +106,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native secondary-index evidence — 2026-08-01](gates/evidence/native-secondary-indexes-2026-08-01.md)
 - [Native direct secondary-index execution evidence — 2026-08-01](gates/evidence/native-direct-secondary-index-2026-08-01.md)
 - [Native typed indexed-mutation evidence — 2026-08-01](gates/evidence/native-typed-indexed-mutations-2026-08-01.md)
+- [Native bounded relational-scan evidence — 2026-08-01](gates/evidence/native-bounded-relational-scan-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),

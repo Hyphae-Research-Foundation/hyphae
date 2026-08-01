@@ -171,6 +171,16 @@ and a seven-boundary crash matrix to one source commit. Primary-key changes,
 multi-row/range mutation, expressions, general constraints/planning, and the
 remaining G2 evidence remain open.
 
+The [native bounded relational-scan
+evidence](evidence/native-bounded-relational-scan-2026-08-01.md) binds a
+reentrant buffered B+tree visitor, exclusive primary-key cursor, visible-row
+limit, HYRELBT1/HYRELBT2 tombstone handling, bounded no-predicate SQL,
+transaction/materialized/physical equivalence, reopen and failure coverage,
+and a clean schema-v8 WSL2 observation to one source commit. Filters,
+secondary ranges, descending/offset execution, zero-copy operator cursors,
+joins, aggregation, statistics/cost planning, and the remaining G2/G7
+evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -182,8 +192,9 @@ transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary-index range/streaming
-execution, general relational expressions/constraints/planning, remaining
-structure families, positional postings, segments, and ANN required by G1–G4.
+execution, zero-copy relational operator cursors, general relational
+expressions/constraints/planning, remaining structure families, positional
+postings, segments, and ANN required by G1–G4.
 Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a

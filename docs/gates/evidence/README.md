@@ -117,6 +117,15 @@ commit before its tag can be published.
   exact-PK update/delete, atomic old/new projection maintenance, unique rebase,
   retained history, V1 compatibility, reopen, and a seven-boundary crash
   matrix to one source commit.
+- [Native bounded relational-scan evidence —
+  2026-08-01](native-bounded-relational-scan-2026-08-01.md) binds exclusive
+  buffered prefix visitation, bounded current-root primary-key scan,
+  transaction/materialized/physical SQL equivalence, V1/V2 reopen, typed
+  failure paths, and explicit remaining G2/G7 limits to one source commit.
+- `native-microsecond-smoke-relational-scan-wsl2.json` is its schema-v8 clean
+  release observation for direct and prepared-SQL `LIMIT 10` scans over a
+  multilevel 2,048-row typed relation. Each scan timer sample is one complete
+  call; the result remains outside G7.
 
 ## Hosted release evidence
 
