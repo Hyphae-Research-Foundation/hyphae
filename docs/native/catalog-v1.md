@@ -1,8 +1,9 @@
 # Native catalog v1
 
-Status: normative target contract; immutable object definitions and the first
-runtime catalog root are implemented experimentally; complete definition
-codec, DDL evolution, and dependency tracking remain pending
+Status: normative target contract; immutable relation/structure/search object
+definitions, their canonical `HYCOBJ01` codec, and full-definition `HYCAT002`
+runtime persistence are implemented experimentally. Scalable catalog pages,
+DDL evolution, indexes/constraints, and dependency tracking remain pending.
 
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
@@ -46,6 +47,56 @@ uses the same WAL and root-set commit boundary as data.
 
 Catalog reads use stable IDs after binding. Hot prepared execution does not
 repeat name lookup.
+
+## Implemented object-definition codec
+
+`HYCOBJ01` encodes exactly one complete object:
+
+1. object-kind tag;
+2. nonzero `ObjectId`, owner, and fully qualified name;
+3. relation columns and ordered primary-key IDs, structure kind/types/policy,
+   or search fields/analyzers/doc-values/vector declaration; and
+4. no trailing bytes.
+
+Each name component stores display and normalized lookup UTF-8 separately.
+Unquoted lookup bytes must equal ASCII-folded display bytes; quoted lookup
+bytes must equal display bytes. A component is limited to 1,024 bytes.
+
+Logical types use the canonical recursive descriptor from
+[`types-v1.md`](types-v1.md). Relation columns and search fields are strictly
+ordered by stable ID. Duplicate IDs or normalized names, nullable primary-key
+columns, wrong owners, invalid types, excessive lists, malformed booleans,
+truncation, and trailing bytes fail closed. One definition is limited to
+16 MiB and one definition list to 100,000 items.
+
+The codec currently covers `Relation`, `Structure`, and `Search` objects.
+Index, constraint, link, view, analyzer, and dependency-edge object variants
+remain to be defined.
+
+## Implemented runtime persistence
+
+New catalog-root payloads use `HYCAT002`:
+
+| Field | Encoding |
+|---|---|
+| magic | ASCII `HYCAT002` |
+| live object count | little-endian `u32` |
+| each object | little-endian `u32` byte length followed by one `HYCOBJ01` definition |
+
+New `CREATE TABLE` and search-collection WAL mutations carry the complete
+definition plus a length-framed normalized qualified-name conflict identity.
+Recovery revalidates the object kind, target ID, owner, definition, and name
+identity before applying it.
+
+Legacy `HYCAT001` roots and name-only create mutations remain readable. Their
+known fixed binary relation or single-text-field search shape is reconstructed
+explicitly; the next catalog write emits `HYCAT002`. Unknown legacy owner
+shapes fail closed instead of inventing a definition.
+
+`HYCAT002` is still stored in one 16 KiB catalog-root page. This is sufficient
+to establish definition authority and recovery compatibility, but it is not a
+scalable final catalog. A copy-on-write catalog B+tree, separate name
+namespace, definition blobs, and per-object history remain required.
 
 ## Required definitions
 
@@ -92,3 +143,12 @@ exist unless the statement explicitly and atomically replaces or drops them.
 Tests cover normalized names, stable-ID retention, non-reuse, immutable reader
 snapshots, DDL/data atomicity, dependency enforcement, crash recovery,
 concurrent prepared-plan invalidation, and schema-evolution interruption.
+
+Current executable coverage proves definition golden bytes and canonical
+round trips for all three implemented object kinds; every truncated prefix;
+owner, name, ID/order, PK-nullability, type, length, and trailing-byte
+failures; `HYCAT001` reconstruction and `HYCAT002` rewrite; full-definition
+WAL/root persistence through reopen; and the existing all-engine crash and
+recovery matrices. Non-reuse, drops/evolution, dependency enforcement, and
+prepared-plan invalidation beyond catalog-version mismatch remain target
+requirements.

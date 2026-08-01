@@ -8,9 +8,19 @@ use std::{
 };
 
 use hyphae_native_types::{
-    CatalogVersion, ColumnId, EngineKind, FieldId, LogicalType, ObjectId, VectorType,
+    CatalogVersion, ColumnId, EngineKind, FieldId, LogicalType, NativeTypeError, ObjectId,
+    VectorType,
 };
 use thiserror::Error;
+
+mod codec;
+
+/// Maximum UTF-8 byte length of one catalog name component.
+pub const MAX_CATALOG_NAME_BYTES: usize = 1_024;
+/// Maximum number of columns, fields, or key members in one definition list.
+pub const MAX_CATALOG_DEFINITION_ITEMS: usize = 100_000;
+/// Maximum canonical byte length of one catalog object definition.
+pub const MAX_CATALOG_DEFINITION_BYTES: usize = 16 * 1024 * 1024;
 
 /// Catalog construction or lookup failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -18,6 +28,9 @@ pub enum CatalogError {
     /// One name component is empty.
     #[error("catalog name component must be nonempty")]
     EmptyName,
+    /// One name component exceeds the canonical UTF-8 byte bound.
+    #[error("catalog name component exceeds 1024 UTF-8 bytes")]
+    NameTooLong,
     /// One stable object identity already exists.
     #[error("catalog object ID {0} already exists")]
     DuplicateObjectId(ObjectId),
@@ -27,12 +40,48 @@ pub enum CatalogError {
     /// A column ID is duplicated inside a relation.
     #[error("column ID {0} is duplicated")]
     DuplicateColumnId(ColumnId),
+    /// A normalized column name is duplicated inside a relation.
+    #[error("column name is duplicated: {0}")]
+    DuplicateColumnName(Box<CatalogName>),
+    /// Relation columns are not strictly ordered by stable column ID.
+    #[error("relation columns must be strictly ordered by column ID")]
+    NoncanonicalColumnOrder,
+    /// A relation has no columns.
+    #[error("relation must contain at least one column")]
+    EmptyRelation,
     /// A field ID is duplicated inside a search collection.
     #[error("field ID {0} is duplicated")]
     DuplicateFieldId(FieldId),
+    /// A normalized field name is duplicated inside a search collection.
+    #[error("search field name is duplicated: {0}")]
+    DuplicateFieldName(Box<CatalogName>),
+    /// Search fields are not strictly ordered by stable field ID.
+    #[error("search fields must be strictly ordered by field ID")]
+    NoncanonicalFieldOrder,
     /// A primary-key column is not part of the relation.
     #[error("primary-key column {0} does not exist")]
     MissingPrimaryKeyColumn(ColumnId),
+    /// A primary-key column was listed more than once.
+    #[error("primary-key column {0} is duplicated")]
+    DuplicatePrimaryKeyColumn(ColumnId),
+    /// A primary-key column was declared nullable.
+    #[error("primary-key column {0} cannot be nullable")]
+    NullablePrimaryKeyColumn(ColumnId),
+    /// An object variant names the wrong owning engine.
+    #[error("catalog object owner does not match its object kind")]
+    WrongObjectOwner,
+    /// A definition list exceeds its canonical item bound.
+    #[error("catalog definition contains more than 100000 items")]
+    TooManyDefinitionItems,
+    /// A definition exceeds its canonical byte bound.
+    #[error("catalog definition exceeds 16 MiB")]
+    DefinitionTooLarge,
+    /// A catalog definition is malformed or noncanonical.
+    #[error("catalog definition encoding is malformed or noncanonical")]
+    InvalidDefinitionEncoding,
+    /// A nested native logical-type descriptor is invalid.
+    #[error(transparent)]
+    NativeType(#[from] NativeTypeError),
     /// Catalog version space is exhausted.
     #[error("catalog version space is exhausted")]
     VersionExhausted,
@@ -53,19 +102,8 @@ impl CatalogName {
     /// Returns an error for an empty identifier.
     pub fn unquoted(value: impl Into<String>) -> Result<Self, CatalogError> {
         let display = value.into();
-        if display.is_empty() {
-            return Err(CatalogError::EmptyName);
-        }
-        let lookup = display
-            .chars()
-            .map(|character| {
-                if character.is_ascii_uppercase() {
-                    character.to_ascii_lowercase()
-                } else {
-                    character
-                }
-            })
-            .collect();
+        validate_name_length(&display)?;
+        let lookup = fold_unquoted_name(&display);
         Ok(Self { display, lookup })
     }
 
@@ -76,9 +114,7 @@ impl CatalogName {
     /// Returns an error for an empty identifier.
     pub fn quoted(value: impl Into<String>) -> Result<Self, CatalogError> {
         let display = value.into();
-        if display.is_empty() {
-            return Err(CatalogError::EmptyName);
-        }
+        validate_name_length(&display)?;
         Ok(Self {
             lookup: display.clone(),
             display,
@@ -94,6 +130,44 @@ impl CatalogName {
     pub fn lookup(&self) -> &str {
         &self.lookup
     }
+
+    fn from_encoded_parts(display: String, lookup: String) -> Result<Self, CatalogError> {
+        validate_name_length(&display)?;
+        validate_name_length(&lookup)?;
+        if lookup != display && lookup != fold_unquoted_name(&display) {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        Ok(Self { display, lookup })
+    }
+}
+
+impl std::fmt::Display for CatalogName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.display.fmt(formatter)
+    }
+}
+
+fn validate_name_length(value: &str) -> Result<(), CatalogError> {
+    if value.is_empty() {
+        return Err(CatalogError::EmptyName);
+    }
+    if value.len() > MAX_CATALOG_NAME_BYTES {
+        return Err(CatalogError::NameTooLong);
+    }
+    Ok(())
+}
+
+fn fold_unquoted_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Fully qualified normalized catalog name.
@@ -172,15 +246,49 @@ impl RelationDefinition {
     ///
     /// Returns an error for duplicate columns or a missing primary-key column.
     pub fn validate(&self) -> Result<(), CatalogError> {
-        let mut columns = BTreeSet::new();
+        if self.columns.is_empty() {
+            return Err(CatalogError::EmptyRelation);
+        }
+        if self.columns.len() > MAX_CATALOG_DEFINITION_ITEMS
+            || self.primary_key.len() > MAX_CATALOG_DEFINITION_ITEMS
+        {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        let mut column_ids = BTreeSet::new();
+        let mut column_names = BTreeSet::new();
+        let mut previous_id = None;
         for column in &self.columns {
-            if !columns.insert(column.id) {
+            if previous_id == Some(column.id) {
                 return Err(CatalogError::DuplicateColumnId(column.id));
             }
+            if previous_id.is_some_and(|previous| previous > column.id) {
+                return Err(CatalogError::NoncanonicalColumnOrder);
+            }
+            previous_id = Some(column.id);
+            if !column_ids.insert(column.id) {
+                return Err(CatalogError::DuplicateColumnId(column.id));
+            }
+            if !column_names.insert(column.name.lookup()) {
+                return Err(CatalogError::DuplicateColumnName(Box::new(
+                    column.name.clone(),
+                )));
+            }
         }
+        let mut primary_key = BTreeSet::new();
         for column in &self.primary_key {
-            if !columns.contains(column) {
+            if !primary_key.insert(*column) {
+                return Err(CatalogError::DuplicatePrimaryKeyColumn(*column));
+            }
+            if !column_ids.contains(column) {
                 return Err(CatalogError::MissingPrimaryKeyColumn(*column));
+            }
+            if self
+                .columns
+                .iter()
+                .find(|definition| definition.id == *column)
+                .is_some_and(|definition| definition.nullable)
+            {
+                return Err(CatalogError::NullablePrimaryKeyColumn(*column));
             }
         }
         Ok(())
@@ -267,10 +375,27 @@ impl SearchCollectionDefinition {
     ///
     /// Returns an error for duplicate field identities.
     pub fn validate(&self) -> Result<(), CatalogError> {
-        let mut fields = BTreeSet::new();
+        if self.fields.len() > MAX_CATALOG_DEFINITION_ITEMS {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        let mut field_ids = BTreeSet::new();
+        let mut field_names = BTreeSet::new();
+        let mut previous_id = None;
         for field in &self.fields {
-            if !fields.insert(field.id) {
+            if previous_id == Some(field.id) {
                 return Err(CatalogError::DuplicateFieldId(field.id));
+            }
+            if previous_id.is_some_and(|previous| previous > field.id) {
+                return Err(CatalogError::NoncanonicalFieldOrder);
+            }
+            previous_id = Some(field.id);
+            if !field_ids.insert(field.id) {
+                return Err(CatalogError::DuplicateFieldId(field.id));
+            }
+            if !field_names.insert(field.name.lookup()) {
+                return Err(CatalogError::DuplicateFieldName(Box::new(
+                    field.name.clone(),
+                )));
             }
         }
         Ok(())
@@ -298,11 +423,32 @@ impl CatalogObject {
         }
     }
 
-    fn validate(&self) -> Result<(), CatalogError> {
+    /// Validates the object kind, owner, names, identities, and definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object violates a canonical catalog
+    /// invariant.
+    pub fn validate(&self) -> Result<(), CatalogError> {
         match self {
-            Self::Relation(definition) => definition.validate(),
-            Self::Structure(_) => Ok(()),
-            Self::Search(definition) => definition.validate(),
+            Self::Relation(definition) => {
+                if definition.header.owner != EngineKind::Relational {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                definition.validate()
+            }
+            Self::Structure(definition) => {
+                if definition.header.owner != EngineKind::Structure {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                Ok(())
+            }
+            Self::Search(definition) => {
+                if definition.header.owner != EngineKind::Search {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                definition.validate()
+            }
         }
     }
 }

@@ -5,6 +5,12 @@ native data ecosystem. It owns a single data directory and coordinates native
 catalog, relational, structure, and lexical-search state through copy-on-write
 pages, one WAL transaction, and one published CSN.
 
+Catalog create mutations and `HYCAT002` roots retain complete canonical
+relation/search definitions instead of discarding them after validation.
+Snapshots expose the immutable definition pinned to their catalog version;
+legacy `HYCAT001` name-only roots reconstruct their known fixed shapes. The
+catalog root remains bounded to one page pending its native B+tree migration.
+
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
 through the native buffer pool. That route traverses node bytes without

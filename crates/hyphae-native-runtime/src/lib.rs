@@ -28,8 +28,8 @@ use std::{
 use hyphae_native_blobs::{BlobError, BlobStore, StagedBlob};
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
-    CatalogError, CatalogName, ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition,
-    SearchCollectionDefinition, SearchFieldDefinition,
+    CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
 };
 use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
 use hyphae_native_mvcc::{
@@ -440,6 +440,12 @@ impl NativeSnapshot {
     /// Returns the catalog version pinned by this snapshot.
     pub const fn catalog_version(&self) -> CatalogVersion {
         self.metadata.catalog_version
+    }
+
+    /// Returns one immutable catalog object definition pinned by this
+    /// snapshot.
+    pub fn catalog_object(&self, id: ObjectId) -> Option<&CatalogObject> {
+        self.state.catalog.object(id)
     }
 
     /// Performs a relational primary-key lookup.
@@ -1396,17 +1402,25 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for invalid names or duplicate catalog identity/name.
     pub fn create_relation(&mut self, id: ObjectId, name: &str) -> Result<(), NativeRuntimeError> {
-        validate_relation_definition(id, name)?;
-        self.state
-            .catalog
-            .create(id, EngineKind::Relational, name.to_owned())?;
+        self.create_relation_definition(binary_relation_definition(id, name)?)
+    }
+
+    fn create_relation_definition(
+        &mut self,
+        definition: RelationDefinition,
+    ) -> Result<(), NativeRuntimeError> {
+        let id = definition.header.id;
+        let object = CatalogObject::Relation(definition);
+        let encoded_definition = object.encode_definition()?;
+        let name_identity = catalog_name_identity(object.header())?;
+        self.state.catalog.create(object)?;
         self.state.relational.create_table(id)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::CreateTable,
             target: Some(id),
-            key: Vec::new(),
-            value: name.as_bytes().to_vec(),
+            key: name_identity,
+            value: encoded_definition,
             expires_at_micros: None,
         });
         self.dirty[0] = true;
@@ -1840,17 +1854,17 @@ impl NativeWriteBatch {
         id: ObjectId,
         name: &str,
     ) -> Result<(), NativeRuntimeError> {
-        validate_search_definition(id, name)?;
-        self.state
-            .catalog
-            .create(id, EngineKind::Search, name.to_owned())?;
+        let object = CatalogObject::Search(text_search_definition(id, name)?);
+        let encoded_definition = object.encode_definition()?;
+        let name_identity = catalog_name_identity(object.header())?;
+        self.state.catalog.create(object)?;
         self.state.search.create_index(id)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Search,
             opcode: Opcode::CreateIndex,
             target: Some(id),
-            key: Vec::new(),
-            value: name.as_bytes().to_vec(),
+            key: name_identity,
+            value: encoded_definition,
             expires_at_micros: None,
         });
         self.dirty[0] = true;
@@ -2139,12 +2153,8 @@ fn apply_mutations_to_state(
                 let table = mutation
                     .target
                     .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let name = std::str::from_utf8(&mutation.value)
-                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
-                validate_relation_definition(table, name)?;
-                state
-                    .catalog
-                    .create(table, EngineKind::Relational, name.to_owned())?;
+                let object = decode_relation_creation(table, mutation)?;
+                state.catalog.create(object)?;
                 state.relational.create_table(table)?;
             }
             Opcode::InsertRow => {
@@ -2184,12 +2194,8 @@ fn apply_mutations_to_state(
                 let index = mutation
                     .target
                     .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let name = std::str::from_utf8(&mutation.value)
-                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
-                validate_search_definition(index, name)?;
-                state
-                    .catalog
-                    .create(index, EngineKind::Search, name.to_owned())?;
+                let object = decode_search_creation(index, mutation)?;
+                state.catalog.create(object)?;
                 state.search.create_index(index)?;
             }
             Opcode::IndexDocument => {
@@ -2225,9 +2231,14 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 object_key.extend_from_slice(&object.get().to_be_bytes());
                 keys.push(WriteKey::new(EngineKind::Kernel, None, object_key));
             }
-            let mut name_key = Vec::with_capacity(mutation.value.len().saturating_add(2));
+            let name_identity = if mutation.key.is_empty() {
+                mutation.value.as_slice()
+            } else {
+                mutation.key.as_slice()
+            };
+            let mut name_key = Vec::with_capacity(name_identity.len().saturating_add(2));
             name_key.extend_from_slice(&[2, mutation.engine as u8]);
-            name_key.extend_from_slice(&mutation.value);
+            name_key.extend_from_slice(name_identity);
             keys.push(WriteKey::new(EngineKind::Kernel, None, name_key));
         }
     }
@@ -3155,9 +3166,8 @@ fn apply_search_tree_mutation(
         .ok_or(NativeRuntimeError::InvalidSearchTree)?;
     match mutation.opcode {
         Opcode::CreateIndex => {
-            if !mutation.key.is_empty()
-                || mutation.expires_at_micros.is_some()
-                || std::str::from_utf8(&mutation.value).is_err()
+            if mutation.expires_at_micros.is_some()
+                || decode_search_creation(index, mutation).is_err()
             {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
@@ -4191,7 +4201,85 @@ fn load_root<T>(
     Ok(Some(decode(page.payload())?))
 }
 
-fn validate_relation_definition(id: ObjectId, name: &str) -> Result<(), CatalogError> {
+fn decode_relation_creation(
+    id: ObjectId,
+    mutation: &Mutation,
+) -> Result<CatalogObject, NativeRuntimeError> {
+    let encoded_definition = mutation.value.starts_with(b"HYCOBJ01");
+    let object = if encoded_definition {
+        CatalogObject::decode_definition(&mutation.value)?
+    } else {
+        if !mutation.key.is_empty() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let name = std::str::from_utf8(&mutation.value)
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+        CatalogObject::Relation(binary_relation_definition(id, name)?)
+    };
+    if !matches!(&object, CatalogObject::Relation(_)) || object.header().id != id {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    if encoded_definition && mutation.key.is_empty() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    validate_catalog_creation_identity(&object, mutation)?;
+    Ok(object)
+}
+
+fn decode_search_creation(
+    id: ObjectId,
+    mutation: &Mutation,
+) -> Result<CatalogObject, NativeRuntimeError> {
+    let encoded_definition = mutation.value.starts_with(b"HYCOBJ01");
+    let object = if encoded_definition {
+        CatalogObject::decode_definition(&mutation.value)?
+    } else {
+        if !mutation.key.is_empty() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let name = std::str::from_utf8(&mutation.value)
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+        CatalogObject::Search(text_search_definition(id, name)?)
+    };
+    if !matches!(&object, CatalogObject::Search(_)) || object.header().id != id {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    if encoded_definition && mutation.key.is_empty() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    validate_catalog_creation_identity(&object, mutation)?;
+    Ok(object)
+}
+
+fn validate_catalog_creation_identity(
+    object: &CatalogObject,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    if !mutation.key.is_empty() && mutation.key != catalog_name_identity(object.header())? {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok(())
+}
+
+fn catalog_name_identity(header: &ObjectHeader) -> Result<Vec<u8>, CatalogError> {
+    let mut encoded = Vec::new();
+    for component in [
+        &header.name.database,
+        &header.name.schema,
+        &header.name.object,
+    ] {
+        let lookup = component.lookup().as_bytes();
+        let length = u32::try_from(lookup.len()).map_err(|_| CatalogError::NameTooLong)?;
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(lookup);
+    }
+    Ok(encoded)
+}
+
+fn binary_relation_definition(
+    id: ObjectId,
+    name: &str,
+) -> Result<RelationDefinition, CatalogError> {
     let definition = RelationDefinition {
         header: ObjectHeader {
             id,
@@ -4214,10 +4302,14 @@ fn validate_relation_definition(id: ObjectId, name: &str) -> Result<(), CatalogE
         ],
         primary_key: vec![ColumnId::new(1).map_err(|_| CatalogError::EmptyName)?],
     };
-    definition.validate()
+    definition.validate()?;
+    Ok(definition)
 }
 
-fn validate_search_definition(id: ObjectId, name: &str) -> Result<(), CatalogError> {
+fn text_search_definition(
+    id: ObjectId,
+    name: &str,
+) -> Result<SearchCollectionDefinition, CatalogError> {
     let definition = SearchCollectionDefinition {
         header: ObjectHeader {
             id,
@@ -4233,7 +4325,8 @@ fn validate_search_definition(id: ObjectId, name: &str) -> Result<(), CatalogErr
         }],
         vector: None,
     };
-    definition.validate()
+    definition.validate()?;
+    Ok(definition)
 }
 
 fn qualified_name(name: &str) -> Result<QualifiedName, CatalogError> {
@@ -4257,11 +4350,13 @@ mod tests {
     };
 
     use hyphae_native_mvcc::WriteKey;
-    use hyphae_native_types::{Csn, DurabilityClass, ManifestGeneration, ObjectId, PageId};
+    use hyphae_native_types::{
+        ColumnId, Csn, DurabilityClass, ManifestGeneration, ObjectId, PageId,
+    };
 
     use super::{
-        CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase, NativeRuntimeError,
-        PAGE_FILE, SetCondition, SetOutcome, SqlResult, SqlValue,
+        CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase,
+        NativeRuntimeError, PAGE_FILE, SetCondition, SetOutcome, SqlResult, SqlValue,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -5701,13 +5796,13 @@ mod tests {
             "CREATE TABLE accounts (primary_key BINARY PRIMARY KEY, row BINARY)",
             &[],
         )?;
-        assert!(matches!(
-            created,
-            SqlResult::Command {
-                object_id: Some(_),
-                ..
-            }
-        ));
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
         transaction.execute_sql(
             "INSERT INTO accounts (primary_key, row) VALUES (?, ?)",
             &[
@@ -5729,6 +5824,12 @@ mod tests {
         transaction.commit()?;
 
         let snapshot = database.snapshot(11)?;
+        let Some(CatalogObject::Relation(definition)) = snapshot.catalog_object(table) else {
+            return Err("missing persisted relation definition".into());
+        };
+        assert_eq!(definition.header.name.object.lookup(), "accounts");
+        assert_eq!(definition.columns.len(), 2);
+        assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
         let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
         assert_eq!(
             snapshot.execute_prepared(&prepared, &[SqlValue::Binary(b"mario".to_vec())],)?,
@@ -5753,6 +5854,16 @@ mod tests {
                 rows: Vec::new(),
             }
         );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let recovered = reopened.snapshot(14)?;
+        let Some(CatalogObject::Relation(definition)) = recovered.catalog_object(table) else {
+            return Err("relation definition did not survive reopen".into());
+        };
+        assert_eq!(definition.header.name.object.lookup(), "accounts");
+        assert_eq!(definition.columns.len(), 2);
+        assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
         Ok(())
     }
 

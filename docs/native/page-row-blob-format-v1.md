@@ -61,6 +61,19 @@ V1 reserves:
 Immutable search and ANN segments use their own versioned segment formats but
 are referenced from pages and the root set.
 
+## Catalog-root payload
+
+New catalog-root pages carry `HYCAT002`: a checked `u32` object count followed
+by checked length-delimited `HYCOBJ01` definitions ordered by `ObjectId`.
+Definitions retain qualified display/lookup names, stable column/field IDs,
+logical types, nullability, primary keys, structure policy, search mapping,
+and optional vector declaration.
+
+`HYCAT001` name/owner-only payloads remain readable and are reconstructed only
+for their known fixed relation and search shapes. The current catalog root is
+still one page; a native B+tree catalog and definition-blob path remain
+required before the catalog is scalable.
+
 ## Row record
 
 Rows are catalog-typed and do not repeat type tags per column.

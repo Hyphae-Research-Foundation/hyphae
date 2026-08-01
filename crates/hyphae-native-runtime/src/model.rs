@@ -2,10 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyphae_native_types::{EngineKind, ObjectId};
+use hyphae_native_catalog::{
+    CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+};
+use hyphae_native_types::{ColumnId, EngineKind, FieldId, LogicalType, ObjectId};
 use thiserror::Error;
 
-const CATALOG_MAGIC: [u8; 8] = *b"HYCAT001";
+const CATALOG_MAGIC_V1: [u8; 8] = *b"HYCAT001";
+const CATALOG_MAGIC_V2: [u8; 8] = *b"HYCAT002";
 const STRUCTURE_MAGIC: [u8; 8] = *b"HYSTR001";
 const SEARCH_MAGIC: [u8; 8] = *b"HYSEA001";
 
@@ -43,44 +48,41 @@ pub(crate) enum ModelError {
     DuplicateDocumentId,
     #[error("native state payload contains a duplicate canonical entry")]
     DuplicateEncodedEntry,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogEntry {
-    pub(crate) owner: EngineKind,
-    pub(crate) name: String,
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CatalogState {
-    pub(crate) objects: BTreeMap<ObjectId, CatalogEntry>,
+    pub(crate) objects: BTreeMap<ObjectId, CatalogObject>,
 }
 
 impl CatalogState {
-    pub(crate) fn create(
-        &mut self,
-        id: ObjectId,
-        owner: EngineKind,
-        name: String,
-    ) -> Result<(), ModelError> {
-        let lookup = normalize_name(&name);
+    pub(crate) fn create(&mut self, object: CatalogObject) -> Result<(), ModelError> {
+        object.validate()?;
+        let header = object.header();
+        let id = header.id;
         if self.objects.contains_key(&id) {
             return Err(ModelError::DuplicateObjectId);
         }
         if self
             .objects
             .values()
-            .any(|entry| normalize_name(&entry.name) == lookup)
+            .any(|entry| entry.header().name == header.name)
         {
             return Err(ModelError::DuplicateObjectName);
         }
-        self.objects.insert(id, CatalogEntry { owner, name });
+        self.objects.insert(id, object);
         Ok(())
+    }
+
+    pub(crate) fn object(&self, id: ObjectId) -> Option<&CatalogObject> {
+        self.objects.get(&id)
     }
 
     pub(crate) fn require(&self, id: ObjectId, owner: EngineKind) -> Result<(), ModelError> {
         let entry = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
-        if entry.owner != owner {
+        if entry.header().owner != owner {
             return Err(ModelError::WrongEngine);
         }
         Ok(())
@@ -90,7 +92,9 @@ impl CatalogState {
         let lookup = normalize_name(name);
         self.objects
             .iter()
-            .find(|(_, entry)| entry.owner == owner && normalize_name(&entry.name) == lookup)
+            .find(|(_, entry)| {
+                entry.header().owner == owner && entry.header().name.object.lookup() == lookup
+            })
             .map(|(id, _)| *id)
             .ok_or(ModelError::UnknownObject)
     }
@@ -104,30 +108,88 @@ impl CatalogState {
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CATALOG_MAGIC);
+        bytes.extend_from_slice(&CATALOG_MAGIC_V2);
         put_len(&mut bytes, self.objects.len())?;
-        for (id, entry) in &self.objects {
-            bytes.extend_from_slice(&id.get().to_le_bytes());
-            bytes.push(entry.owner as u8);
-            put_bytes(&mut bytes, entry.name.as_bytes())?;
+        for object in self.objects.values() {
+            put_bytes(&mut bytes, &object.encode_definition()?)?;
         }
         Ok(bytes)
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        let mut decoder = Decoder::new(bytes, CATALOG_MAGIC)?;
+        if bytes.get(..8) == Some(CATALOG_MAGIC_V1.as_slice()) {
+            return Self::decode_v1(bytes);
+        }
+        let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V2)?;
         let count = decoder.len()?;
-        let mut objects = BTreeMap::new();
+        let mut state = Self::default();
+        for _ in 0..count {
+            state.create(CatalogObject::decode_definition(&decoder.bytes()?)?)?;
+        }
+        decoder.finish()?;
+        Ok(state)
+    }
+
+    fn decode_v1(bytes: &[u8]) -> Result<Self, ModelError> {
+        let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V1)?;
+        let count = decoder.len()?;
+        let mut state = Self::default();
         for _ in 0..count {
             let id = decoder.object_id()?;
             let owner = decode_engine(decoder.byte()?)?;
             let name = decoder.string()?;
-            if objects.insert(id, CatalogEntry { owner, name }).is_some() {
-                return Err(ModelError::DuplicateEncodedEntry);
-            }
+            state.create(legacy_catalog_object(id, owner, &name)?)?;
         }
         decoder.finish()?;
-        Ok(Self { objects })
+        Ok(state)
+    }
+}
+
+fn legacy_catalog_object(
+    id: ObjectId,
+    owner: EngineKind,
+    name: &str,
+) -> Result<CatalogObject, ModelError> {
+    let header = ObjectHeader {
+        id,
+        owner,
+        name: QualifiedName::new(
+            CatalogName::unquoted("main")?,
+            CatalogName::unquoted("public")?,
+            CatalogName::unquoted(name)?,
+        ),
+    };
+    match owner {
+        EngineKind::Relational => Ok(CatalogObject::Relation(RelationDefinition {
+            header,
+            columns: vec![
+                ColumnDefinition {
+                    id: ColumnId::new(1).map_err(|_| ModelError::ZeroObjectId)?,
+                    name: CatalogName::unquoted("primary_key")?,
+                    logical_type: LogicalType::Binary,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId::new(2).map_err(|_| ModelError::ZeroObjectId)?,
+                    name: CatalogName::unquoted("row")?,
+                    logical_type: LogicalType::Binary,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![ColumnId::new(1).map_err(|_| ModelError::ZeroObjectId)?],
+        })),
+        EngineKind::Search => Ok(CatalogObject::Search(SearchCollectionDefinition {
+            header,
+            fields: vec![SearchFieldDefinition {
+                id: FieldId::new(1).map_err(|_| ModelError::ZeroObjectId)?,
+                name: CatalogName::unquoted("text")?,
+                logical_type: LogicalType::Text,
+                analyzer: None,
+                doc_values: false,
+            }],
+            vector: None,
+        })),
+        EngineKind::Kernel | EngineKind::Structure => Err(ModelError::WrongEngine),
     }
 }
 
@@ -581,9 +643,13 @@ impl<'bytes> Decoder<'bytes> {
 
 #[cfg(test)]
 mod tests {
+    use hyphae_native_catalog::CatalogObject;
     use hyphae_native_types::{EngineKind, ObjectId};
 
-    use super::{CatalogState, ModelError, RelationState, SearchState, StructureState, TtlValue};
+    use super::{
+        CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, ModelError, RelationState, SearchState,
+        StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
+    };
 
     #[test]
     fn every_engine_state_has_a_canonical_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -591,8 +657,12 @@ mod tests {
         let index = ObjectId::new(2)?;
 
         let mut catalog = CatalogState::default();
-        catalog.create(table, EngineKind::Relational, "Accounts".to_owned())?;
-        catalog.create(index, EngineKind::Search, "Notes".to_owned())?;
+        catalog.create(legacy_catalog_object(
+            table,
+            EngineKind::Relational,
+            "Accounts",
+        )?)?;
+        catalog.create(legacy_catalog_object(index, EngineKind::Search, "Notes")?)?;
         assert_eq!(CatalogState::decode(&catalog.encode()?)?, catalog);
 
         let mut relational = RelationState::default();
@@ -611,6 +681,35 @@ mod tests {
         search.create_index(index)?;
         search.index_document(index, b"doc-1".to_vec(), "native search".to_owned())?;
         assert_eq!(SearchState::decode(&search.encode()?)?, search);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_catalog_names_reconstruct_fixed_definitions_and_upgrade_on_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let mut encoded = CATALOG_MAGIC_V1.to_vec();
+        put_len(&mut encoded, 2)?;
+        encoded.extend_from_slice(&table.get().to_le_bytes());
+        encoded.push(EngineKind::Relational as u8);
+        put_bytes(&mut encoded, b"Accounts")?;
+        encoded.extend_from_slice(&index.get().to_le_bytes());
+        encoded.push(EngineKind::Search as u8);
+        put_bytes(&mut encoded, b"Notes")?;
+
+        let decoded = CatalogState::decode(&encoded)?;
+        let Some(CatalogObject::Relation(relation)) = decoded.object(table) else {
+            return Err("legacy relation was not reconstructed".into());
+        };
+        assert_eq!(relation.columns.len(), 2);
+        assert_eq!(relation.header.name.object.lookup(), "accounts");
+        let Some(CatalogObject::Search(search)) = decoded.object(index) else {
+            return Err("legacy search definition was not reconstructed".into());
+        };
+        assert_eq!(search.fields.len(), 1);
+        assert_eq!(search.header.name.object.lookup(), "notes");
+        assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V2));
         Ok(())
     }
 
