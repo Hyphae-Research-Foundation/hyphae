@@ -11,6 +11,15 @@ Snapshots expose the immutable definition pinned to their catalog version;
 legacy `HYCAT001` name-only roots reconstruct their known fixed shapes. The
 catalog root remains bounded to one page pending its native B+tree migration.
 
+Native SQL now binds primitive values and projections to those immutable
+definitions. Typed inserts encode canonical primary-key components and
+`HYTUPL01` catalog-ordered tuples; prepared point selects decode them after
+commit and reopen. Type/domain, nullability, duplicate-column, and incomplete
+primary-key failures occur before mutation. The historical two-binary-column
+shape retains its raw bytes and allocation-free prepared lookup. General
+expressions, scans, typed updates/deletes, secondary indexes, joins, grouping,
+and `EXPLAIN` remain pending.
+
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
 through the native buffer pool. That route traverses node bytes without

@@ -1,9 +1,9 @@
 # Hyphae SQL semantics v1
 
-Status: normative target contract; an exact binary first slice for `CREATE
-TABLE`, primary-key `INSERT`, `UPDATE`, `DELETE`, parameterized `SELECT`,
-prepared binding, `BEGIN`/`COMMIT`, and rollback is implemented
-experimentally; G2 remains open
+Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
+`INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
+`BEGIN`/`COMMIT`, and rollback are implemented experimentally. The legacy
+binary shape also supports `UPDATE` and `DELETE`; G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -29,15 +29,31 @@ column IDs.
   arithmetic, scalar and aggregate functions; and
 - introspection: `EXPLAIN`, catalog views and execution statistics.
 
-The first implementation slice is one fixed binary table shape, primary-key
-`INSERT`, `UPDATE ... SET row = ? WHERE primary_key = ?`, `DELETE ... WHERE
-primary_key = ?`, prepared parameterized point `SELECT`, `BEGIN`, `COMMIT`,
-and `ROLLBACK`. Updates publish a new copy-on-write root; deletes publish a
-canonical tombstone. Retained snapshots continue to resolve their historical
-roots. New directories retain an explicit per-key physical version chain under
-the current root and close each superseded copy's `end_csn`; the earlier
-inline-row directory format remains supported. Retention and vacuum remain
-pending. This slice does not close relational gate G2.
+The current implementation slice accepts catalog-typed primitive columns,
+inline or table-level ordered primary keys, explicit nullability, named-column
+`INSERT`, `SELECT *` or named projection, conjunctions covering exactly the
+primary key, and catalog-bound prepared point lookup. Primary-key components
+use the canonical memcomparable codec; row values use the catalog-ordered
+`HYTUPL01` tuple. Type, domain, nullability, duplicate-column, missing-column,
+and incomplete-primary-key failures occur before the row mutation.
+
+The grammar currently recognizes boolean, signed and unsigned fixed-width
+integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
+timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
+executable; JSON is declaration-only until its canonical scalar validator
+exists. General expressions, literals, casts, scans, secondary indexes,
+constraints beyond primary key/nullability, and typed `UPDATE`/`DELETE` remain
+pending.
+
+The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
+retains its byte-for-byte raw row route, allocation-free prepared binary point
+lookup, and fixed `UPDATE ... SET row = ? WHERE primary_key = ?` and `DELETE`
+behavior. Updates publish a new copy-on-write root; deletes publish a canonical
+tombstone. Retained snapshots continue to resolve their historical roots. New
+directories retain an explicit per-key physical version chain under the
+current root and close each superseded copy's `end_csn`; the earlier inline-row
+directory format remains supported. Retention and vacuum remain pending. This
+slice does not close relational gate G2.
 
 ## Null and boolean semantics
 
@@ -92,9 +108,11 @@ SQL statements run inside the common MVCC transaction. Statement failure rolls
 back that statement's private changes. An explicit transaction remains failed
 until rollback when an error can invalidate later semantics.
 
-Errors have stable Hyphae codes, human text, statement byte span, optional
-object/column ID, and retry classification. Compatibility SQLSTATE mapping is
-an edge concern, not the native identity.
+Errors have stable Hyphae codes. The current slice implements `HYSQL001`
+through `HYSQL010` for syntax, parameters, stale plans, columns, types,
+nullability, primary-key binding, stored tuples, and catalog-kind mismatch.
+Statement byte spans, optional object/column IDs, retry classification, and
+compatibility SQLSTATE mapping remain target requirements.
 
 ## Determinism
 

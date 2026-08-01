@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use hyphae_native_types::{CatalogVersion, EngineKind, ObjectId};
+use hyphae_native_catalog::{
+    CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
+};
+use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
+use hyphae_native_types::{
+    CatalogVersion, ColumnId, DecimalType, EngineKind, IntegerWidth, LogicalType, ObjectId,
+    ScalarValue,
+};
 use thiserror::Error;
 
-use crate::{NativeRuntimeError, NativeSnapshot, NativeWriteBatch};
+use crate::{NativeRuntimeError, NativeSnapshot, NativeWriteBatch, qualified_name};
 
-/// Value accepted or returned by the first native SQL slice.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SqlValue {
-    /// Arbitrary binary SQL value.
-    Binary(Vec<u8>),
-}
+/// Value accepted or returned by native SQL.
+pub type SqlValue = ScalarValue;
 
 /// Result of one native SQL statement or prepared execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,18 +34,39 @@ pub enum SqlResult {
     },
 }
 
-/// Native SQL lexer, binder, or execution failure.
+/// Native SQL lexer, parser, binder, or execution failure.
 #[derive(Debug, Error)]
 pub enum SqlError {
-    /// The statement is outside the exact first-slice grammar.
+    /// The statement is outside the current exact grammar.
     #[error("HYSQL001 invalid or unsupported native SQL syntax")]
     InvalidSyntax,
-    /// Parameter arity or type differs from the bound plan.
+    /// Parameter arity differs from the bound plan.
     #[error("HYSQL002 native SQL parameter mismatch")]
     ParameterMismatch,
     /// A prepared plan's catalog version is no longer current.
     #[error("HYSQL003 native SQL prepared plan requires rebind")]
     CatalogChanged,
+    /// A referenced column is absent from the bound relation.
+    #[error("HYSQL004 native SQL column does not exist")]
+    UnknownColumn,
+    /// A column was supplied more than once where identity must be unique.
+    #[error("HYSQL005 native SQL column is duplicated")]
+    DuplicateColumn,
+    /// A scalar does not match its catalog logical type or domain.
+    #[error("HYSQL006 native SQL value does not match its logical type")]
+    TypeMismatch,
+    /// A required column received or defaulted to SQL null.
+    #[error("HYSQL007 native SQL NOT NULL constraint failed")]
+    NullViolation,
+    /// A primary-key predicate is incomplete, duplicated, null, or out of order.
+    #[error("HYSQL008 native SQL primary-key binding is invalid")]
+    InvalidPrimaryKey,
+    /// Stored bytes do not match the catalog-bound tuple representation.
+    #[error("HYSQL009 native SQL stored row is malformed")]
+    InvalidStoredRow,
+    /// Catalog ownership and object kind disagree.
+    #[error("HYSQL010 native SQL catalog object kind is invalid")]
+    InvalidCatalogObject,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -64,32 +88,83 @@ impl PreparedStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreparedPlan {
-    SelectByPrimaryKey { table: ObjectId },
+    SelectByPrimaryKey {
+        table: ObjectId,
+        projection: Vec<usize>,
+        parameter_columns: Vec<usize>,
+        output_columns: Vec<String>,
+        legacy_binary: bool,
+    },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Statement {
-    CreateTable { name: String },
-    Insert { name: String },
-    Update { name: String },
-    Delete { name: String },
-    Select { name: String },
+    CreateTable {
+        name: String,
+        columns: Vec<ParsedColumn>,
+        primary_key: Vec<String>,
+    },
+    Insert {
+        name: String,
+        columns: Vec<String>,
+    },
+    Update {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    Select {
+        name: String,
+        projection: Projection,
+        predicates: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedColumn {
+    name: String,
+    logical_type: LogicalType,
+    nullable: bool,
+    inline_primary_key: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Projection {
+    All,
+    Columns(Vec<String>),
+}
+
+struct BoundSelect {
+    table: ObjectId,
+    projection: Vec<usize>,
+    parameter_columns: Vec<usize>,
+    output_columns: Vec<String>,
+    legacy_binary: bool,
 }
 
 pub(crate) fn prepare(
     snapshot: &NativeSnapshot,
     statement: &str,
 ) -> Result<PreparedStatement, SqlError> {
-    let Statement::Select { name } = parse(statement)? else {
+    let Statement::Select {
+        name,
+        projection,
+        predicates,
+    } = parse(statement)?
+    else {
         return Err(SqlError::InvalidSyntax);
     };
-    let table = snapshot
-        .state
-        .catalog
-        .id_named(&name, EngineKind::Relational)
-        .map_err(NativeRuntimeError::from)?;
+    let bound = bind_select(&snapshot.state.catalog, &name, &projection, &predicates)?;
     Ok(PreparedStatement {
         catalog_version: snapshot.catalog_version(),
-        plan: PreparedPlan::SelectByPrimaryKey { table },
+        plan: PreparedPlan::SelectByPrimaryKey {
+            table: bound.table,
+            projection: bound.projection,
+            parameter_columns: bound.parameter_columns,
+            output_columns: bound.output_columns,
+            legacy_binary: bound.legacy_binary,
+        },
     })
 }
 
@@ -98,13 +173,32 @@ pub(crate) fn execute_prepared(
     prepared: &PreparedStatement,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    let [SqlValue::Binary(primary_key)] = parameters else {
-        return Err(SqlError::ParameterMismatch);
-    };
-    let rows = execute_prepared_binary(snapshot, prepared, primary_key)?
-        .map_or_else(Vec::new, |row| vec![vec![SqlValue::Binary(row.to_vec())]]);
+    ensure_catalog_version(snapshot, prepared)?;
+    let PreparedPlan::SelectByPrimaryKey {
+        table,
+        projection,
+        parameter_columns,
+        output_columns,
+        legacy_binary,
+    } = &prepared.plan;
+    let definition = relation_by_id(&snapshot.state.catalog, *table)?;
+    let primary_key = bind_primary_key(definition, parameter_columns, parameters)?;
+    let rows = snapshot.select(*table, &primary_key).map_or_else(
+        || Ok(Vec::new()),
+        |stored| {
+            materialize_row(
+                definition,
+                projection,
+                *legacy_binary,
+                parameters,
+                parameter_columns,
+                stored,
+            )
+            .map(|row| vec![row])
+        },
+    )?;
     Ok(SqlResult::Rows {
-        columns: vec!["row".to_owned()],
+        columns: output_columns.clone(),
         rows,
     })
 }
@@ -114,11 +208,18 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
     prepared: &PreparedStatement,
     primary_key: &[u8],
 ) -> Result<Option<&'snapshot [u8]>, SqlError> {
-    if prepared.catalog_version != snapshot.catalog_version() {
-        return Err(SqlError::CatalogChanged);
-    }
-    match prepared.plan {
-        PreparedPlan::SelectByPrimaryKey { table } => Ok(snapshot.select(table, primary_key)),
+    ensure_catalog_version(snapshot, prepared)?;
+    match &prepared.plan {
+        PreparedPlan::SelectByPrimaryKey {
+            table,
+            projection,
+            parameter_columns,
+            legacy_binary: true,
+            ..
+        } if projection.as_slice() == [1] && parameter_columns.as_slice() == [0] => {
+            Ok(snapshot.select(*table, primary_key))
+        }
+        PreparedPlan::SelectByPrimaryKey { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -128,155 +229,607 @@ pub(crate) fn execute_transaction(
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     match parse(statement)? {
-        Statement::CreateTable { name } => {
-            if !parameters.is_empty() {
-                return Err(SqlError::ParameterMismatch);
+        Statement::CreateTable {
+            name,
+            columns,
+            primary_key,
+        } => execute_create(transaction, &name, columns, primary_key, parameters),
+        Statement::Insert { name, columns } => {
+            execute_insert(transaction, &name, &columns, parameters)
+        }
+        Statement::Update { name } => execute_legacy_update(transaction, &name, parameters),
+        Statement::Delete { name } => execute_legacy_delete(transaction, &name, parameters),
+        Statement::Select {
+            name,
+            projection,
+            predicates,
+        } => execute_select(transaction, &name, &projection, &predicates, parameters),
+    }
+}
+
+fn execute_create(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parsed_columns: Vec<ParsedColumn>,
+    primary_key_names: Vec<String>,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .next_object_id()
+        .map_err(NativeRuntimeError::from)?;
+    let mut columns = Vec::with_capacity(parsed_columns.len());
+    for (index, parsed) in parsed_columns.into_iter().enumerate() {
+        let raw_id = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(SqlError::InvalidSyntax)?;
+        columns.push(ColumnDefinition {
+            id: ColumnId::new(raw_id).map_err(|_| SqlError::InvalidSyntax)?,
+            name: CatalogName::unquoted(parsed.name).map_err(NativeRuntimeError::from)?,
+            logical_type: parsed.logical_type,
+            nullable: parsed.nullable,
+        });
+    }
+    let mut primary_key = Vec::with_capacity(primary_key_names.len());
+    for name in primary_key_names {
+        let index = column_index(&columns, &name)?;
+        let column = &mut columns[index];
+        if primary_key.contains(&column.id) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        column.nullable = false;
+        primary_key.push(column.id);
+    }
+    if primary_key.is_empty() {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    let mut definition = RelationDefinition {
+        header: ObjectHeader {
+            id,
+            owner: EngineKind::Relational,
+            name: qualified_name(name).map_err(NativeRuntimeError::from)?,
+        },
+        columns,
+        primary_key,
+    };
+    if is_legacy_binary_relation(&definition) {
+        for column in &mut definition.columns {
+            column.nullable = false;
+        }
+    }
+    definition.validate().map_err(NativeRuntimeError::from)?;
+    transaction.create_relation_definition(definition)?;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_insert(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    supplied_columns: &[String],
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if supplied_columns.len() != parameters.len() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+    let definition = definition.clone();
+    let values = bind_insert_values(&definition, supplied_columns, parameters)?;
+    if is_legacy_binary_relation(&definition) {
+        let primary_key = legacy_binary_value(values[0], false)?;
+        let row = legacy_binary_value(values[1], false)?;
+        transaction.insert(table, primary_key, row)?;
+    } else {
+        let primary_key = encode_primary_key(&definition, &values)?;
+        let tuple = encode_tuple(&definition, &values)?;
+        transaction.insert(table, primary_key, tuple)?;
+    }
+    Ok(SqlResult::Command {
+        rows_affected: 1,
+        object_id: None,
+    })
+}
+
+fn execute_legacy_update(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let [SqlValue::Binary(row), SqlValue::Binary(primary_key)] = parameters else {
+        return Err(SqlError::ParameterMismatch);
+    };
+    let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+    if !is_legacy_binary_relation(definition) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    transaction.update(table, primary_key.clone(), row.clone())?;
+    Ok(SqlResult::Command {
+        rows_affected: 1,
+        object_id: None,
+    })
+}
+
+fn execute_legacy_delete(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let [SqlValue::Binary(primary_key)] = parameters else {
+        return Err(SqlError::ParameterMismatch);
+    };
+    let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+    if !is_legacy_binary_relation(definition) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    transaction.delete(table, primary_key.clone())?;
+    Ok(SqlResult::Command {
+        rows_affected: 1,
+        object_id: None,
+    })
+}
+
+fn execute_select(
+    transaction: &NativeWriteBatch,
+    name: &str,
+    projection: &Projection,
+    predicates: &[String],
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let bound = bind_select(&transaction.state.catalog, name, projection, predicates)?;
+    let definition = relation_by_id(&transaction.state.catalog, bound.table)?;
+    let primary_key = bind_primary_key(definition, &bound.parameter_columns, parameters)?;
+    let rows = transaction.select(bound.table, &primary_key).map_or_else(
+        || Ok(Vec::new()),
+        |stored| {
+            materialize_row(
+                definition,
+                &bound.projection,
+                bound.legacy_binary,
+                parameters,
+                &bound.parameter_columns,
+                stored,
+            )
+            .map(|row| vec![row])
+        },
+    )?;
+    Ok(SqlResult::Rows {
+        columns: bound.output_columns,
+        rows,
+    })
+}
+
+fn bind_select(
+    catalog: &crate::model::CatalogState,
+    name: &str,
+    projection: &Projection,
+    predicates: &[String],
+) -> Result<BoundSelect, SqlError> {
+    let (table, definition) = relation_named(catalog, name)?;
+    let projection = match projection {
+        Projection::All => (0..definition.columns.len()).collect(),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| column_index(&definition.columns, name))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut parameter_columns = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        let column = column_index(&definition.columns, predicate)?;
+        if parameter_columns.contains(&column) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        parameter_columns.push(column);
+    }
+    let expected_primary_key = primary_key_indices(definition)?;
+    if parameter_columns.len() != expected_primary_key.len()
+        || expected_primary_key
+            .iter()
+            .any(|column| !parameter_columns.contains(column))
+    {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    let output_columns = projection
+        .iter()
+        .map(|index| definition.columns[*index].name.display().to_owned())
+        .collect();
+    Ok(BoundSelect {
+        table,
+        projection,
+        parameter_columns,
+        output_columns,
+        legacy_binary: is_legacy_binary_relation(definition),
+    })
+}
+
+fn bind_insert_values<'value>(
+    definition: &RelationDefinition,
+    supplied_columns: &[String],
+    parameters: &'value [SqlValue],
+) -> Result<Vec<Option<&'value SqlValue>>, SqlError> {
+    let mut values = vec![None; definition.columns.len()];
+    for (name, value) in supplied_columns.iter().zip(parameters) {
+        let index = column_index(&definition.columns, name)?;
+        if values[index].is_some() {
+            return Err(SqlError::DuplicateColumn);
+        }
+        values[index] = Some(value);
+    }
+    for (index, column) in definition.columns.iter().enumerate() {
+        if values[index].is_none() && !column.nullable {
+            return Err(SqlError::NullViolation);
+        }
+        if values[index].is_some_and(|value| matches!(value, SqlValue::Null)) && !column.nullable {
+            return Err(SqlError::NullViolation);
+        }
+    }
+    Ok(values)
+}
+
+fn encode_tuple(
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<Vec<u8>, SqlError> {
+    let mut encoded_values = Vec::with_capacity(values.len());
+    for (column, value) in definition.columns.iter().zip(values) {
+        match value {
+            None | Some(SqlValue::Null) => encoded_values.push(None),
+            Some(value) => encoded_values.push(Some(
+                value
+                    .encode_storage(&column.logical_type)
+                    .map_err(|_| SqlError::TypeMismatch)?,
+            )),
+        }
+    }
+    RowTuple::new(encoded_values)
+        .and_then(|tuple| tuple.encode())
+        .map_err(|_| SqlError::InvalidStoredRow)
+}
+
+fn encode_primary_key(
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<Vec<u8>, SqlError> {
+    let mut encoded = Vec::new();
+    for index in primary_key_indices(definition)? {
+        let value = values[index].ok_or(SqlError::InvalidPrimaryKey)?;
+        if matches!(value, SqlValue::Null) {
+            return Err(SqlError::InvalidPrimaryKey);
+        }
+        encoded.extend_from_slice(
+            &value
+                .encode_ordered_component(&definition.columns[index].logical_type)
+                .map_err(|_| SqlError::TypeMismatch)?,
+        );
+    }
+    Ok(encoded)
+}
+
+fn bind_primary_key(
+    definition: &RelationDefinition,
+    parameter_columns: &[usize],
+    parameters: &[SqlValue],
+) -> Result<Vec<u8>, SqlError> {
+    if parameter_columns.len() != parameters.len() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    if is_legacy_binary_relation(definition) {
+        let [SqlValue::Binary(primary_key)] = parameters else {
+            return Err(SqlError::ParameterMismatch);
+        };
+        return Ok(primary_key.clone());
+    }
+    let mut values = vec![None; definition.columns.len()];
+    for (column, value) in parameter_columns.iter().copied().zip(parameters) {
+        values[column] = Some(value);
+    }
+    encode_primary_key(definition, &values)
+}
+
+fn materialize_row(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    legacy_binary: bool,
+    parameters: &[SqlValue],
+    parameter_columns: &[usize],
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
+    if legacy_binary {
+        let primary_key = parameters
+            .iter()
+            .zip(parameter_columns)
+            .find_map(|(value, column)| (*column == 0).then_some(value))
+            .ok_or(SqlError::InvalidPrimaryKey)?;
+        return projection
+            .iter()
+            .map(|index| match index {
+                0 => Ok(primary_key.clone()),
+                1 => Ok(SqlValue::Binary(stored.to_vec())),
+                _ => Err(SqlError::InvalidStoredRow),
+            })
+            .collect();
+    }
+    let tuple = RowTupleView::decode(stored).map_err(|_| SqlError::InvalidStoredRow)?;
+    if tuple.column_count() != definition.columns.len() {
+        return Err(SqlError::InvalidStoredRow);
+    }
+    projection
+        .iter()
+        .map(|index| {
+            let column = definition
+                .columns
+                .get(*index)
+                .ok_or(SqlError::InvalidStoredRow)?;
+            match tuple.value(*index).ok_or(SqlError::InvalidStoredRow)? {
+                ColumnValueRef::Null => Ok(SqlValue::Null),
+                ColumnValueRef::Bytes(encoded) => {
+                    SqlValue::decode_storage(&column.logical_type, encoded)
+                        .map_err(|_| SqlError::InvalidStoredRow)
+                }
             }
-            let id = transaction
-                .state
-                .catalog
-                .next_object_id()
-                .map_err(NativeRuntimeError::from)?;
-            transaction.create_relation(id, &name)?;
-            Ok(SqlResult::Command {
-                rows_affected: 0,
-                object_id: Some(id),
-            })
+        })
+        .collect()
+}
+
+fn legacy_binary_value(value: Option<&SqlValue>, nullable: bool) -> Result<Vec<u8>, SqlError> {
+    match value {
+        Some(SqlValue::Binary(value)) => Ok(value.clone()),
+        Some(SqlValue::Null) | None if nullable => Ok(Vec::new()),
+        Some(SqlValue::Null) | None => Err(SqlError::NullViolation),
+        Some(_) => Err(SqlError::TypeMismatch),
+    }
+}
+
+fn primary_key_indices(definition: &RelationDefinition) -> Result<Vec<usize>, SqlError> {
+    definition
+        .primary_key
+        .iter()
+        .map(|id| {
+            definition
+                .columns
+                .iter()
+                .position(|column| column.id == *id)
+                .ok_or(SqlError::InvalidCatalogObject)
+        })
+        .collect()
+}
+
+fn relation_named<'catalog>(
+    catalog: &'catalog crate::model::CatalogState,
+    name: &str,
+) -> Result<(ObjectId, &'catalog RelationDefinition), SqlError> {
+    let id = catalog
+        .id_named(name, EngineKind::Relational)
+        .map_err(NativeRuntimeError::from)?;
+    Ok((id, relation_by_id(catalog, id)?))
+}
+
+fn relation_by_id(
+    catalog: &crate::model::CatalogState,
+    id: ObjectId,
+) -> Result<&RelationDefinition, SqlError> {
+    match catalog.object(id) {
+        Some(CatalogObject::Relation(definition)) => Ok(definition),
+        Some(CatalogObject::Structure(_) | CatalogObject::Search(_)) | None => {
+            Err(SqlError::InvalidCatalogObject)
         }
-        Statement::Insert { name } => {
-            let [SqlValue::Binary(primary_key), SqlValue::Binary(row)] = parameters else {
-                return Err(SqlError::ParameterMismatch);
-            };
-            let table = transaction
-                .state
-                .catalog
-                .id_named(&name, EngineKind::Relational)
-                .map_err(NativeRuntimeError::from)?;
-            transaction.insert(table, primary_key.clone(), row.clone())?;
-            Ok(SqlResult::Command {
-                rows_affected: 1,
-                object_id: None,
-            })
-        }
-        Statement::Update { name } => {
-            let [SqlValue::Binary(row), SqlValue::Binary(primary_key)] = parameters else {
-                return Err(SqlError::ParameterMismatch);
-            };
-            let table = transaction
-                .state
-                .catalog
-                .id_named(&name, EngineKind::Relational)
-                .map_err(NativeRuntimeError::from)?;
-            transaction.update(table, primary_key.clone(), row.clone())?;
-            Ok(SqlResult::Command {
-                rows_affected: 1,
-                object_id: None,
-            })
-        }
-        Statement::Delete { name } => {
-            let [SqlValue::Binary(primary_key)] = parameters else {
-                return Err(SqlError::ParameterMismatch);
-            };
-            let table = transaction
-                .state
-                .catalog
-                .id_named(&name, EngineKind::Relational)
-                .map_err(NativeRuntimeError::from)?;
-            transaction.delete(table, primary_key.clone())?;
-            Ok(SqlResult::Command {
-                rows_affected: 1,
-                object_id: None,
-            })
-        }
-        Statement::Select { name } => {
-            let [SqlValue::Binary(primary_key)] = parameters else {
-                return Err(SqlError::ParameterMismatch);
-            };
-            let table = transaction
-                .state
-                .catalog
-                .id_named(&name, EngineKind::Relational)
-                .map_err(NativeRuntimeError::from)?;
-            let rows = transaction
-                .select(table, primary_key)
-                .map_or_else(Vec::new, |row| vec![vec![SqlValue::Binary(row.to_vec())]]);
-            Ok(SqlResult::Rows {
-                columns: vec!["row".to_owned()],
-                rows,
-            })
-        }
+    }
+}
+
+fn column_index(columns: &[ColumnDefinition], name: &str) -> Result<usize, SqlError> {
+    let lookup = normalize_identifier(name);
+    columns
+        .iter()
+        .position(|column| column.name.lookup() == lookup)
+        .ok_or(SqlError::UnknownColumn)
+}
+
+fn normalize_identifier(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn is_legacy_binary_relation(definition: &RelationDefinition) -> bool {
+    definition.columns.len() == 2
+        && definition.columns[0].name.lookup() == "primary_key"
+        && definition.columns[0].logical_type == LogicalType::Binary
+        && definition.columns[1].name.lookup() == "row"
+        && definition.columns[1].logical_type == LogicalType::Binary
+        && definition.primary_key.as_slice() == [definition.columns[0].id]
+}
+
+fn ensure_catalog_version(
+    snapshot: &NativeSnapshot,
+    prepared: &PreparedStatement,
+) -> Result<(), SqlError> {
+    if prepared.catalog_version == snapshot.catalog_version() {
+        Ok(())
+    } else {
+        Err(SqlError::CatalogChanged)
     }
 }
 
 fn parse(statement: &str) -> Result<Statement, SqlError> {
     let mut parser = Parser::new(lex(statement)?);
     let parsed = if parser.consume_keyword("CREATE") {
-        parser.expect_keyword("TABLE")?;
-        let name = parser.identifier()?;
-        parser.expect_symbol("(")?;
-        parser.expect_keyword("PRIMARY_KEY")?;
-        parser.expect_keyword("BINARY")?;
-        parser.expect_keyword("PRIMARY")?;
-        parser.expect_keyword("KEY")?;
-        parser.expect_symbol(",")?;
-        parser.expect_keyword("ROW")?;
-        parser.expect_keyword("BINARY")?;
-        parser.expect_symbol(")")?;
-        Statement::CreateTable { name }
+        parse_create(&mut parser)?
     } else if parser.consume_keyword("INSERT") {
-        parser.expect_keyword("INTO")?;
-        let name = parser.identifier()?;
-        parser.expect_symbol("(")?;
-        parser.expect_keyword("PRIMARY_KEY")?;
-        parser.expect_symbol(",")?;
-        parser.expect_keyword("ROW")?;
-        parser.expect_symbol(")")?;
-        parser.expect_keyword("VALUES")?;
-        parser.expect_symbol("(")?;
-        parser.expect_symbol("?")?;
-        parser.expect_symbol(",")?;
-        parser.expect_symbol("?")?;
-        parser.expect_symbol(")")?;
-        Statement::Insert { name }
+        parse_insert(&mut parser)?
     } else if parser.consume_keyword("UPDATE") {
-        let name = parser.identifier()?;
-        parser.expect_keyword("SET")?;
-        parser.expect_keyword("ROW")?;
-        parser.expect_symbol("=")?;
-        parser.expect_symbol("?")?;
-        parser.expect_keyword("WHERE")?;
-        parser.expect_keyword("PRIMARY_KEY")?;
-        parser.expect_symbol("=")?;
-        parser.expect_symbol("?")?;
-        Statement::Update { name }
+        parse_update(&mut parser)?
     } else if parser.consume_keyword("DELETE") {
-        parser.expect_keyword("FROM")?;
-        let name = parser.identifier()?;
-        parser.expect_keyword("WHERE")?;
-        parser.expect_keyword("PRIMARY_KEY")?;
-        parser.expect_symbol("=")?;
-        parser.expect_symbol("?")?;
-        Statement::Delete { name }
+        parse_delete(&mut parser)?
     } else if parser.consume_keyword("SELECT") {
-        parser.expect_keyword("ROW")?;
-        parser.expect_keyword("FROM")?;
-        let name = parser.identifier()?;
-        parser.expect_keyword("WHERE")?;
-        parser.expect_keyword("PRIMARY_KEY")?;
-        parser.expect_symbol("=")?;
-        parser.expect_symbol("?")?;
-        Statement::Select { name }
+        parse_select(&mut parser)?
     } else {
         return Err(SqlError::InvalidSyntax);
     };
-    parser.consume_symbol(";");
+    parser.consume_symbol(';');
     parser.finish()?;
     Ok(parsed)
+}
+
+fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
+    parser.expect_keyword("TABLE")?;
+    let name = parser.identifier()?;
+    parser.expect_symbol('(')?;
+    let mut columns = Vec::new();
+    let mut table_primary_key = None;
+    loop {
+        if parser.consume_keyword("PRIMARY") {
+            if table_primary_key.is_some() {
+                return Err(SqlError::InvalidSyntax);
+            }
+            parser.expect_keyword("KEY")?;
+            parser.expect_symbol('(')?;
+            let primary_key = parser.identifier_list(')')?;
+            table_primary_key = Some(primary_key);
+        } else {
+            let column_name = parser.identifier()?;
+            let logical_type = parser.logical_type()?;
+            let mut nullable = true;
+            let mut nullability_seen = false;
+            let mut inline_primary_key = false;
+            loop {
+                if parser.consume_keyword("NOT") {
+                    if nullability_seen {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_keyword("NULL")?;
+                    nullable = false;
+                    nullability_seen = true;
+                } else if parser.consume_keyword("NULL") {
+                    if nullability_seen {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    nullable = true;
+                    nullability_seen = true;
+                } else if parser.consume_keyword("PRIMARY") {
+                    if inline_primary_key {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_keyword("KEY")?;
+                    nullable = false;
+                    inline_primary_key = true;
+                } else {
+                    break;
+                }
+            }
+            columns.push(ParsedColumn {
+                name: column_name,
+                logical_type,
+                nullable,
+                inline_primary_key,
+            });
+        }
+        if parser.consume_symbol(')') {
+            break;
+        }
+        parser.expect_symbol(',')?;
+    }
+    if columns.is_empty() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let inline_primary_key: Vec<String> = columns
+        .iter()
+        .filter(|column| column.inline_primary_key)
+        .map(|column| column.name.clone())
+        .collect();
+    let primary_key = match (table_primary_key, inline_primary_key.is_empty()) {
+        (Some(primary_key), true) => primary_key,
+        (None, false) => inline_primary_key,
+        (Some(_), false) => return Err(SqlError::InvalidSyntax),
+        (None, true) => return Err(SqlError::InvalidPrimaryKey),
+    };
+    Ok(Statement::CreateTable {
+        name,
+        columns,
+        primary_key,
+    })
+}
+
+fn parse_insert(parser: &mut Parser) -> Result<Statement, SqlError> {
+    parser.expect_keyword("INTO")?;
+    let name = parser.identifier()?;
+    parser.expect_symbol('(')?;
+    let columns = parser.identifier_list(')')?;
+    parser.expect_keyword("VALUES")?;
+    parser.expect_symbol('(')?;
+    for index in 0..columns.len() {
+        if index != 0 {
+            parser.expect_symbol(',')?;
+        }
+        parser.expect_symbol('?')?;
+    }
+    parser.expect_symbol(')')?;
+    Ok(Statement::Insert { name, columns })
+}
+
+fn parse_update(parser: &mut Parser) -> Result<Statement, SqlError> {
+    let name = parser.identifier()?;
+    parser.expect_keyword("SET")?;
+    parser.expect_keyword("ROW")?;
+    parser.expect_symbol('=')?;
+    parser.expect_symbol('?')?;
+    parser.expect_keyword("WHERE")?;
+    parser.expect_keyword("PRIMARY_KEY")?;
+    parser.expect_symbol('=')?;
+    parser.expect_symbol('?')?;
+    Ok(Statement::Update { name })
+}
+
+fn parse_delete(parser: &mut Parser) -> Result<Statement, SqlError> {
+    parser.expect_keyword("FROM")?;
+    let name = parser.identifier()?;
+    parser.expect_keyword("WHERE")?;
+    parser.expect_keyword("PRIMARY_KEY")?;
+    parser.expect_symbol('=')?;
+    parser.expect_symbol('?')?;
+    Ok(Statement::Delete { name })
+}
+
+fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    let projection = if parser.consume_symbol('*') {
+        Projection::All
+    } else {
+        Projection::Columns(parser.identifier_list_until_keyword("FROM")?)
+    };
+    parser.expect_keyword("FROM")?;
+    let name = parser.identifier()?;
+    parser.expect_keyword("WHERE")?;
+    let mut predicates = Vec::new();
+    loop {
+        predicates.push(parser.identifier()?);
+        parser.expect_symbol('=')?;
+        parser.expect_symbol('?')?;
+        if !parser.consume_keyword("AND") {
+            break;
+        }
+    }
+    Ok(Statement::Select {
+        name,
+        projection,
+        predicates,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Token {
     Word(String),
+    Number(String),
     Symbol(char),
 }
 
@@ -288,7 +841,7 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
         let character = characters[offset];
         if character.is_whitespace() {
             offset += 1;
-        } else if matches!(character, '(' | ')' | ',' | '=' | ';' | '?') {
+        } else if matches!(character, '(' | ')' | ',' | '=' | ';' | '?' | '*') {
             tokens.push(Token::Symbol(character));
             offset += 1;
         } else if character == '"' {
@@ -314,6 +867,13 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
                 return Err(SqlError::InvalidSyntax);
             }
             tokens.push(Token::Word(identifier));
+        } else if character.is_ascii_digit() {
+            let start = offset;
+            offset += 1;
+            while offset < characters.len() && characters[offset].is_ascii_digit() {
+                offset += 1;
+            }
+            tokens.push(Token::Number(characters[start..offset].iter().collect()));
         } else if character.is_alphabetic() || character == '_' {
             let start = offset;
             offset += 1;
@@ -359,10 +919,7 @@ impl Parser {
         }
     }
 
-    fn consume_symbol(&mut self, expected: &str) -> bool {
-        let Some(expected) = expected.chars().next() else {
-            return false;
-        };
+    fn consume_symbol(&mut self, expected: char) -> bool {
         if self.tokens.get(self.offset) == Some(&Token::Symbol(expected)) {
             self.offset += 1;
             true
@@ -371,7 +928,7 @@ impl Parser {
         }
     }
 
-    fn expect_symbol(&mut self, expected: &str) -> Result<(), SqlError> {
+    fn expect_symbol(&mut self, expected: char) -> Result<(), SqlError> {
         if self.consume_symbol(expected) {
             Ok(())
         } else {
@@ -387,6 +944,94 @@ impl Parser {
         Ok(identifier.clone())
     }
 
+    fn number_u8(&mut self) -> Result<u8, SqlError> {
+        let Some(Token::Number(number)) = self.tokens.get(self.offset) else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        self.offset += 1;
+        number.parse().map_err(|_| SqlError::InvalidSyntax)
+    }
+
+    fn identifier_list(&mut self, terminator: char) -> Result<Vec<String>, SqlError> {
+        let mut identifiers = vec![self.identifier()?];
+        while !self.consume_symbol(terminator) {
+            self.expect_symbol(',')?;
+            identifiers.push(self.identifier()?);
+        }
+        Ok(identifiers)
+    }
+
+    fn identifier_list_until_keyword(&mut self, terminator: &str) -> Result<Vec<String>, SqlError> {
+        let mut identifiers = vec![self.identifier()?];
+        while !self.tokens.get(self.offset).is_some_and(
+            |token| matches!(token, Token::Word(value) if value.eq_ignore_ascii_case(terminator)),
+        ) {
+            self.expect_symbol(',')?;
+            identifiers.push(self.identifier()?);
+        }
+        Ok(identifiers)
+    }
+
+    fn logical_type(&mut self) -> Result<LogicalType, SqlError> {
+        let logical_type = if self.consume_keyword("BOOLEAN") || self.consume_keyword("BOOL") {
+            LogicalType::Boolean
+        } else if self.consume_keyword("TINYINT") || self.consume_keyword("INT8") {
+            LogicalType::Signed(IntegerWidth::Bits8)
+        } else if self.consume_keyword("SMALLINT") || self.consume_keyword("INT16") {
+            LogicalType::Signed(IntegerWidth::Bits16)
+        } else if self.consume_keyword("INTEGER")
+            || self.consume_keyword("INT")
+            || self.consume_keyword("INT32")
+        {
+            LogicalType::Signed(IntegerWidth::Bits32)
+        } else if self.consume_keyword("BIGINT") || self.consume_keyword("INT64") {
+            LogicalType::Signed(IntegerWidth::Bits64)
+        } else if self.consume_keyword("UINT8") {
+            LogicalType::Unsigned(IntegerWidth::Bits8)
+        } else if self.consume_keyword("UINT16") {
+            LogicalType::Unsigned(IntegerWidth::Bits16)
+        } else if self.consume_keyword("UINT32") {
+            LogicalType::Unsigned(IntegerWidth::Bits32)
+        } else if self.consume_keyword("UINT64") {
+            LogicalType::Unsigned(IntegerWidth::Bits64)
+        } else if self.consume_keyword("DECIMAL") || self.consume_keyword("NUMERIC") {
+            self.expect_symbol('(')?;
+            let precision = self.number_u8()?;
+            self.expect_symbol(',')?;
+            let scale = self.number_u8()?;
+            self.expect_symbol(')')?;
+            LogicalType::Decimal(
+                DecimalType::new(precision, scale).map_err(|_| SqlError::InvalidSyntax)?,
+            )
+        } else if self.consume_keyword("REAL") || self.consume_keyword("FLOAT32") {
+            LogicalType::Float32
+        } else if self.consume_keyword("DOUBLE") {
+            self.consume_keyword("PRECISION");
+            LogicalType::Float64
+        } else if self.consume_keyword("FLOAT") || self.consume_keyword("FLOAT64") {
+            LogicalType::Float64
+        } else if self.consume_keyword("TEXT") {
+            LogicalType::Text
+        } else if self.consume_keyword("BINARY") {
+            LogicalType::Binary
+        } else if self.consume_keyword("DATE") {
+            LogicalType::Date
+        } else if self.consume_keyword("TIME") {
+            LogicalType::Time
+        } else if self.consume_keyword("TIMESTAMP") {
+            LogicalType::Timestamp
+        } else if self.consume_keyword("INTERVAL") {
+            LogicalType::Interval
+        } else if self.consume_keyword("UUID") {
+            LogicalType::Uuid
+        } else if self.consume_keyword("JSON") {
+            LogicalType::Json
+        } else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        Ok(logical_type)
+    }
+
     fn finish(self) -> Result<(), SqlError> {
         if self.offset == self.tokens.len() {
             Ok(())
@@ -398,17 +1043,19 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::{Statement, parse};
+    use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
+
+    use super::{Projection, SqlError, Statement, parse};
 
     #[test]
-    fn first_slice_grammar_is_exact() -> Result<(), Box<dyn std::error::Error>> {
+    fn legacy_binary_grammar_remains_accepted() -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             parse("CREATE TABLE accounts (primary_key BINARY PRIMARY KEY, row BINARY);")?,
-            Statement::CreateTable { name } if name == "accounts"
+            Statement::CreateTable { name, .. } if name == "accounts"
         ));
         assert!(matches!(
             parse("INSERT INTO accounts (primary_key, row) VALUES (?, ?)")?,
-            Statement::Insert { name } if name == "accounts"
+            Statement::Insert { name, .. } if name == "accounts"
         ));
         assert!(matches!(
             parse("UPDATE accounts SET row = ? WHERE primary_key = ?")?,
@@ -420,9 +1067,65 @@ mod tests {
         ));
         assert!(matches!(
             parse("SELECT row FROM accounts WHERE primary_key = ?")?,
-            Statement::Select { name } if name == "accounts"
+            Statement::Select { name, .. } if name == "accounts"
         ));
-        assert!(parse("SELECT * FROM accounts").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn typed_ddl_and_composite_primary_key_parse_exactly() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Statement::CreateTable {
+            columns,
+            primary_key,
+            ..
+        } = parse(
+            "CREATE TABLE events (
+                tenant UUID NOT NULL,
+                sequence BIGINT,
+                amount DECIMAL(18, 4) NULL,
+                payload TEXT,
+                PRIMARY KEY (tenant, sequence)
+            )",
+        )?
+        else {
+            return Err("expected create table".into());
+        };
+        assert_eq!(primary_key, ["tenant", "sequence"]);
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].logical_type, LogicalType::Uuid);
+        assert_eq!(
+            columns[1].logical_type,
+            LogicalType::Signed(IntegerWidth::Bits64)
+        );
+        assert_eq!(
+            columns[2].logical_type,
+            LogicalType::Decimal(DecimalType::new(18, 4)?)
+        );
+        assert_eq!(columns[3].logical_type, LogicalType::Text);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_select_projection_and_predicates_parse_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Statement::Select {
+            projection,
+            predicates,
+            ..
+        } = parse("SELECT payload, amount FROM events WHERE sequence = ? AND tenant = ?")?
+        else {
+            return Err("expected select".into());
+        };
+        assert_eq!(
+            projection,
+            Projection::Columns(vec!["payload".to_owned(), "amount".to_owned()])
+        );
+        assert_eq!(predicates, ["sequence", "tenant"]);
+        assert!(matches!(
+            parse("SELECT payload FROM events"),
+            Err(SqlError::InvalidSyntax)
+        ));
         Ok(())
     }
 }

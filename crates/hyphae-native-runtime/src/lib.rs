@@ -4351,12 +4351,13 @@ mod tests {
 
     use hyphae_native_mvcc::WriteKey;
     use hyphae_native_types::{
-        ColumnId, Csn, DurabilityClass, ManifestGeneration, ObjectId, PageId,
+        CanonicalF64, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
+        ManifestGeneration, ObjectId, PageId,
     };
 
     use super::{
         CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase,
-        NativeRuntimeError, PAGE_FILE, SetCondition, SetOutcome, SqlResult, SqlValue,
+        NativeRuntimeError, PAGE_FILE, SetCondition, SetOutcome, SqlError, SqlResult, SqlValue,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -4449,6 +4450,26 @@ mod tests {
             super::Ttl::Missing
         );
         Ok(())
+    }
+
+    fn assert_typed_sql_insert_rejections(transaction: &mut super::NativeTransaction<'_>) {
+        assert!(matches!(
+            transaction.execute_sql(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                &[SqlValue::Signed(8), SqlValue::Null],
+            ),
+            Err(SqlError::NullViolation)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                &[
+                    SqlValue::Text("wrong key type".to_owned()),
+                    SqlValue::Text("rejected".to_owned()),
+                ],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
     }
 
     #[test]
@@ -5829,6 +5850,7 @@ mod tests {
         };
         assert_eq!(definition.header.name.object.lookup(), "accounts");
         assert_eq!(definition.columns.len(), 2);
+        assert!(definition.columns.iter().all(|column| !column.nullable));
         assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
         let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
         assert_eq!(
@@ -5864,6 +5886,164 @@ mod tests {
         assert_eq!(definition.header.name.object.lookup(), "accounts");
         assert_eq!(definition.columns.len(), 2);
         assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_sql_rows_bind_to_catalog_and_survive_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                active BOOLEAN,
+                score DOUBLE
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing typed table identity".into());
+        };
+        let score = SqlValue::Float64(CanonicalF64::new(1.5));
+        transaction.execute_sql(
+            "INSERT INTO people (id, name, active, score) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(7),
+                SqlValue::Text("Mario".to_owned()),
+                SqlValue::Boolean(true),
+                score.clone(),
+            ],
+        )?;
+        assert_typed_sql_insert_rejections(&mut transaction);
+        let private = transaction.execute_sql(
+            "SELECT name, active, score FROM people WHERE id = ?",
+            &[SqlValue::Signed(7)],
+        )?;
+        assert_eq!(
+            private,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned(), "active".to_owned(), "score".to_owned()],
+                rows: vec![vec![
+                    SqlValue::Text("Mario".to_owned()),
+                    SqlValue::Boolean(true),
+                    score.clone(),
+                ]],
+            }
+        );
+        transaction.commit()?;
+
+        let snapshot = database.snapshot(11)?;
+        let Some(CatalogObject::Relation(definition)) = snapshot.catalog_object(table) else {
+            return Err("missing typed relation definition".into());
+        };
+        assert_eq!(
+            definition.columns[0].logical_type,
+            LogicalType::Signed(IntegerWidth::Bits64)
+        );
+        assert_eq!(definition.columns[1].logical_type, LogicalType::Text);
+        assert_eq!(definition.columns[2].logical_type, LogicalType::Boolean);
+        assert_eq!(definition.columns[3].logical_type, LogicalType::Float64);
+        assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
+        let prepared =
+            snapshot.prepare_sql("SELECT name, active, score FROM people WHERE id = ?")?;
+        assert_eq!(
+            snapshot.execute_prepared(&prepared, &[SqlValue::Signed(7)])?,
+            private
+        );
+        assert_eq!(
+            snapshot.execute_prepared(&prepared, &[SqlValue::Signed(8)])?,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned(), "active".to_owned(), "score".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let recovered = reopened.snapshot(12)?;
+        let recovered_plan = recovered.prepare_sql("SELECT * FROM people WHERE id = ?")?;
+        assert_eq!(
+            recovered.execute_prepared(&recovered_plan, &[SqlValue::Signed(7)])?,
+            SqlResult::Rows {
+                columns: vec![
+                    "id".to_owned(),
+                    "name".to_owned(),
+                    "active".to_owned(),
+                    "score".to_owned(),
+                ],
+                rows: vec![vec![
+                    SqlValue::Signed(7),
+                    SqlValue::Text("Mario".to_owned()),
+                    SqlValue::Boolean(true),
+                    score,
+                ]],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_sql_composite_key_binds_predicates_independent_of_text_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        transaction.execute_sql(
+            "CREATE TABLE events (
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT,
+                PRIMARY KEY (tenant, sequence)
+            )",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO events (payload, sequence, tenant) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Text("native".to_owned()),
+                SqlValue::Signed(42),
+                SqlValue::Text("celiums".to_owned()),
+            ],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT payload FROM events WHERE sequence = ? AND tenant = ?",
+                &[SqlValue::Signed(42), SqlValue::Text("celiums".to_owned()),],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["payload".to_owned()],
+                rows: vec![vec![SqlValue::Text("native".to_owned())]],
+            }
+        );
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT payload FROM events WHERE tenant = ?",
+                &[SqlValue::Text("celiums".to_owned())],
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        transaction.commit()?;
+
+        let snapshot = database.snapshot(11)?;
+        let prepared =
+            snapshot.prepare_sql("SELECT payload FROM events WHERE sequence = ? AND tenant = ?")?;
+        assert_eq!(
+            snapshot.execute_prepared(
+                &prepared,
+                &[SqlValue::Signed(42), SqlValue::Text("celiums".to_owned()),],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["payload".to_owned()],
+                rows: vec![vec![SqlValue::Text("native".to_owned())]],
+            }
+        );
         Ok(())
     }
 

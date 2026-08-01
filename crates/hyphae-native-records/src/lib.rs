@@ -5,6 +5,10 @@
 use hyphae_native_types::{BlobId, Csn, PageId, RowId};
 use thiserror::Error;
 
+mod tuple;
+
+pub use tuple::{ROW_TUPLE_HEADER_SIZE, RowTuple, RowTupleView};
+
 /// Fixed committed-row header size before null bits and offsets.
 pub const ROW_HEADER_SIZE: usize = 40;
 /// Encoded immutable blob-reference size.
@@ -61,6 +65,9 @@ pub enum RecordError {
     /// Row-version pointer has the wrong length, magic, or page identity.
     #[error("native row-version pointer is invalid")]
     InvalidRowVersionPointer,
+    /// A typed row tuple has invalid magic or reserved header bytes.
+    #[error("native typed row tuple header is invalid")]
+    InvalidTupleHeader,
 }
 
 /// Borrowed logical value for one catalog-ordered row column.

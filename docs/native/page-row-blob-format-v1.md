@@ -2,9 +2,9 @@
 
 Status: normative target contract; page codec, append-only page file, tail
 repair, partitioned buffer pool, canonical MVCC row codec, fixed blob
-reference, B+tree-backed row persistence, immutable row-version chains, and
-the first immutable content-addressed blob byte store are implemented
-experimentally
+reference, catalog-ordered typed tuple, B+tree-backed row persistence,
+immutable row-version chains, and the first immutable content-addressed blob
+byte store are implemented experimentally
 
 The native substrate uses fixed-size copy-on-write pages and separate
 content-addressed blobs. No target-path page is a Redb page.
@@ -109,6 +109,40 @@ The codec exposes both an owned `RowRecord` and a validated borrowed
 window, null-bit, offset, and tombstone invariants without allocating column
 vectors. A pinned B+tree leaf can therefore be decoded and filtered before the
 selected logical value is copied.
+
+## Catalog-ordered typed tuple
+
+The current typed SQL slice stores one self-delimiting `HYTUPL01` tuple as the
+relational row payload. The tuple carries no logical type tags: column order,
+types, and nullability come from the catalog definition pinned by the SQL
+plan.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYTUPL01` |
+| 8 | 4 | total tuple length, little-endian |
+| 12 | 2 | catalog column count, little-endian |
+| 14 | 2 | reserved zero |
+| 16 | ceil(column count / 8) | null bitmap |
+| variable | `(column count + 1) * 4` | absolute little-endian value offsets |
+| variable | remaining bytes | canonical non-null scalar payloads |
+
+The first offset equals the beginning of the value area; offsets are monotonic
+and the final offset equals the exact tuple length. Null columns consume no
+bytes, and unused null-bitmap bits are zero. Non-null bytes are the canonical
+storage form from [canonical types v1](types-v1.md). The owned `RowTuple` and
+borrowed `RowTupleView` reject wrong magic, nonzero reserved bytes, mismatched
+length, zero columns, invalid offsets, null values with bytes, unused null
+bits, and trailing bytes.
+
+The four-column golden tuple containing signed `7`, SQL null, empty bytes, and
+`00 ff` has BLAKE3
+`302a6901cd99efcb3a122805f6c52909864839e317247cfadaf717db76df5fef`.
+
+This is an explicit transitional physical route. The relational B+tree still
+wraps the primary key and tuple payload in the existing two-field MVCC
+`RowRecord`; a later format can place actual catalog columns directly in the
+version record only through a versioned migration with compatibility fixtures.
 
 ## Relational row-version chain
 
@@ -224,12 +258,13 @@ pending; they are target requirements, not current claims.
 
 ## Verification
 
-Current evidence includes stable page, row, blob-reference, complete blob-file,
-row-version-pointer, B+tree-leaf, and root-manifest encodings; exact row and
-blob round trips; malformed null/offset/window rejection; complete-blob
-corruption rejection; version-chain cycle rejection; page tail repair;
-buffer-pool pin/eviction tests; copy-on-write historical roots; deduplication;
-and blob-promotion and checkpoint interruption tests.
+Current evidence includes stable page, row, typed-tuple, blob-reference,
+complete blob-file, row-version-pointer, B+tree-leaf, and root-manifest
+encodings; exact row, tuple, and blob round trips; malformed
+header/null/offset/window rejection; complete-blob corruption rejection;
+version-chain cycle rejection; page tail repair; buffer-pool pin/eviction
+tests; copy-on-write historical roots; deduplication; and blob-promotion and
+checkpoint interruption tests.
 
 Still required are broad random/property and fuzz corpora, bit flips across
 every byte range, streaming/chunked values, compression, encryption,
