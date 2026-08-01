@@ -210,6 +210,12 @@ pub enum NativeRuntimeError {
     /// Typed update/delete maintenance is not implemented for secondary indexes.
     #[error("native relational update/delete with secondary indexes is not implemented")]
     SecondaryIndexMutationUnsupported,
+    /// The requested native secondary index does not exist in the current root.
+    #[error("native relational secondary index {index} does not exist")]
+    UnknownSecondaryIndex {
+        /// Stable catalog identity requested by the caller.
+        index: ObjectId,
+    },
     /// The requested data directory already exists.
     #[error("native data directory already exists")]
     DataDirectoryExists,
@@ -431,6 +437,17 @@ pub struct MatchHit {
     pub document_id: Vec<u8>,
     /// Native BM25 score.
     pub score: f64,
+}
+
+/// One row reached through an exact native secondary-index key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecondaryIndexRow {
+    /// Relation identified by the secondary-index metadata.
+    pub table: ObjectId,
+    /// Canonical physical primary-key bytes.
+    pub primary_key: Vec<u8>,
+    /// Visible canonical row bytes.
+    pub row: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -775,6 +792,45 @@ impl NativeDatabase {
         Ok(NativeSnapshot { metadata, state })
     }
 
+    /// Binds one parameterized SQL `SELECT` against only the current catalog.
+    ///
+    /// Unlike [`Self::snapshot`], this does not materialize any relational,
+    /// structure, or search state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot coordination, catalog corruption,
+    /// unsupported syntax, or an unknown relation.
+    pub fn prepare_sql_latest(&self, statement: &str) -> Result<PreparedStatement, SqlError> {
+        let metadata = self
+            .coordinator
+            .snapshot(0)
+            .map_err(NativeRuntimeError::from)?;
+        let catalog = load_catalog_state(&self.pages, metadata.roots())?;
+        sql::prepare_catalog(metadata.catalog_version, &catalog, statement)
+    }
+
+    /// Executes one current catalog-bound SQL plan through physical roots.
+    ///
+    /// The execution captures one root-set snapshot and does not materialize
+    /// complete engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale catalog binding, invalid parameters,
+    /// missing index metadata, or physical storage corruption.
+    pub fn execute_prepared_latest(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        let metadata = self
+            .coordinator
+            .snapshot(0)
+            .map_err(NativeRuntimeError::from)?;
+        sql::execute_prepared_latest(self, &metadata, prepared, parameters)
+    }
+
     /// Performs an owned primary-key lookup through the current relational
     /// B+tree root without materializing the complete relation state.
     ///
@@ -787,6 +843,15 @@ impl NativeDatabase {
         primary_key: &[u8],
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
+        self.select_relational_at(&snapshot, table, primary_key)
+    }
+
+    fn select_relational_at(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        primary_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
         let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
             return Ok(None);
         };
@@ -808,6 +873,87 @@ impl NativeDatabase {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// Performs an exact current secondary-index lookup through the relational
+    /// B+tree without materializing the complete relation state.
+    ///
+    /// Results are ordered by canonical primary-key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index does not exist or when physical
+    /// metadata, entries, rows, pages, or version chains are malformed.
+    pub fn select_latest_secondary_index(
+        &self,
+        index: ObjectId,
+        index_key: &[u8],
+    ) -> Result<Vec<SecondaryIndexRow>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.select_secondary_index_at(&snapshot, index, index_key)
+    }
+
+    fn select_secondary_index_at(
+        &self,
+        snapshot: &Snapshot,
+        index: ObjectId,
+        index_key: &[u8],
+    ) -> Result<Vec<SecondaryIndexRow>, NativeRuntimeError> {
+        let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            return Err(NativeRuntimeError::UnknownSecondaryIndex { index });
+        };
+        let tree = BTree::from_root(root);
+        let table = {
+            let metadata = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &relational_secondary_index_key(index),
+                )?
+                .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })?;
+            let (table, _, _) = decode_secondary_index_metadata(metadata.bytes())?;
+            table
+        };
+        let prefix = relational_secondary_entry_prefix(index, index_key)?;
+        let entries = tree.scan_prefix_cached(&self.pages, &self.buffer_pool, &prefix)?;
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut rows = Vec::with_capacity(entries.len());
+        for (physical_key, marker) in entries {
+            let identity = physical_key
+                .get(17..)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let (stored_index_key, primary_key) = decode_secondary_index_entry_identity(identity)?;
+            if stored_index_key != index_key {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            match marker.as_slice() {
+                [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => continue,
+                [RELATIONAL_SECONDARY_ENTRY_LIVE] => {}
+                _ => return Err(NativeRuntimeError::InvalidRelationalTree),
+            }
+            let encoded_row = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &relational_row_key(table, primary_key),
+                )?
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let row =
+                decode_relational_value_cached(&context, table, primary_key, encoded_row.bytes())?
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            rows.push(SecondaryIndexRow {
+                table,
+                primary_key: primary_key.to_vec(),
+                row,
+            });
+        }
+        Ok(rows)
     }
 
     /// Reads one current structure value through its physical root.
@@ -3812,6 +3958,26 @@ fn relational_secondary_entry_key(
     Ok(key)
 }
 
+fn relational_secondary_entry_prefix(
+    index: ObjectId,
+    index_key: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let index_length =
+        u32::try_from(index_key.len()).map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+    let capacity = 21_usize
+        .checked_add(index_key.len())
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    if capacity >= BTREE_MAX_KEY_SIZE {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let mut prefix = Vec::with_capacity(capacity);
+    prefix.push(RELATIONAL_SECONDARY_ENTRY_PREFIX);
+    prefix.extend_from_slice(&index.get().to_be_bytes());
+    prefix.extend_from_slice(&index_length.to_be_bytes());
+    prefix.extend_from_slice(index_key);
+    Ok(prefix)
+}
+
 fn encode_secondary_index_metadata(
     definition: &SecondaryIndexDefinition,
 ) -> [u8; RELATIONAL_SECONDARY_INDEX_META_SIZE] {
@@ -4208,14 +4374,7 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
-    let catalog = load_root(
-        pages,
-        roots,
-        SLOT_CATALOG,
-        PageKind::CatalogRoot,
-        CatalogState::decode,
-    )?
-    .unwrap_or_default();
+    let catalog = load_catalog_state(pages, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
     Ok(MaterializedState {
         catalog,
@@ -4223,6 +4382,20 @@ fn load_state(
         structures: load_structure_state(pages, blobs, roots)?,
         search: load_search_state(pages, blobs, roots)?,
     })
+}
+
+fn load_catalog_state(
+    pages: &PageStore,
+    roots: &RootSet,
+) -> Result<CatalogState, NativeRuntimeError> {
+    Ok(load_root(
+        pages,
+        roots,
+        SLOT_CATALOG,
+        PageKind::CatalogRoot,
+        CatalogState::decode,
+    )?
+    .unwrap_or_default())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6671,6 +6844,201 @@ mod tests {
             )?,
             expected
         );
+        Ok(())
+    }
+
+    fn seed_scaled_secondary_index(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        for id in 0_i64..512 {
+            let email = if matches!(id, 7 | 23 | 511) {
+                "family@celiums.test".to_owned()
+            } else {
+                format!("person-{id:04}@celiums.test")
+            };
+            transaction.execute_sql(
+                "INSERT INTO people (id, email, name) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(email),
+                    SqlValue::Text(format!("person-{id:04}")),
+                ],
+            )?;
+        }
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing secondary-index identity".into());
+        };
+        transaction.commit()?;
+        Ok((table, index))
+    }
+
+    #[test]
+    fn latest_sql_uses_exact_physical_secondary_index_without_materialized_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, index) = seed_scaled_secondary_index(&mut database)?;
+        assert!(database.latest_relational_tree_height()? >= 2);
+
+        let query = "SELECT id, name FROM people WHERE email = ?";
+        let parameters = [SqlValue::Text("family@celiums.test".to_owned())];
+        let materialized = database.snapshot(11)?;
+        let materialized_plan = materialized.prepare_sql(query)?;
+        let expected = materialized.execute_prepared(&materialized_plan, &parameters)?;
+        let physical_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &parameters)?,
+            expected
+        );
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &[SqlValue::Null])?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+
+        let index_key = parameters[0].encode_ordered_component(&LogicalType::Text)?;
+        let physical_rows = database.select_latest_secondary_index(index, &index_key)?;
+        assert_eq!(physical_rows.len(), 3);
+        assert!(physical_rows.iter().all(|row| row.table == table));
+        assert!(
+            physical_rows
+                .windows(2)
+                .all(|rows| { rows[0].primary_key.as_slice() < rows[1].primary_key.as_slice() })
+        );
+        for row in &physical_rows {
+            assert_eq!(
+                database.select_latest_relational(table, &row.primary_key)?,
+                Some(row.row.clone())
+            );
+        }
+        assert!(matches!(
+            database.select_latest_secondary_index(ObjectId::new(9_999)?, &index_key),
+            Err(NativeRuntimeError::UnknownSecondaryIndex { index: missing })
+                if missing == ObjectId::new(9_999)?
+        ));
+
+        let historical = database.snapshot(12)?;
+        let mut catalog_change = database.begin_sql(13, DurabilityClass::Strict)?;
+        catalog_change.execute_sql("CREATE TABLE audit (id BIGINT PRIMARY KEY, note TEXT)", &[])?;
+        catalog_change.commit()?;
+        assert!(matches!(
+            database.execute_prepared_latest(&physical_plan, &parameters),
+            Err(SqlError::CatalogChanged)
+        ));
+        assert_eq!(
+            historical.execute_prepared(&physical_plan, &parameters)?,
+            expected
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        assert_eq!(
+            reopened.select_latest_secondary_index(index, &index_key)?,
+            physical_rows
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_secondary_index_lookup_rejects_malformed_live_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO people (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("mario@celiums.test".to_owned()),
+            ],
+        )?;
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing secondary-index identity".into());
+        };
+        transaction.commit()?;
+
+        let index_key = SqlValue::Text("mario@celiums.test".to_owned())
+            .encode_ordered_component(&LogicalType::Text)?;
+        let primary_key = SqlValue::Signed(1)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
+        let identity = super::secondary_index_entry_identity(&index_key, &primary_key)?;
+        let physical_key = super::relational_secondary_entry_key(index, &identity)?;
+        let roots = database.coordinator.snapshot(11)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let visible_csn = roots
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(&mut database.pages, visible_csn, physical_key, vec![9])?
+            .tree;
+        let mut forged_roots = roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        forged_roots.insert(
+            super::SLOT_RELATIONAL,
+            forged_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            visible_csn,
+            roots.catalog_version(),
+            roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_roots,
+            roots.blob_generation(),
+        )?;
+        database.coordinator = hyphae_native_mvcc::CommitCoordinator::restore(forged)?;
+
+        assert!(matches!(
+            database.select_latest_secondary_index(index, &index_key),
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        ));
         Ok(())
     }
 

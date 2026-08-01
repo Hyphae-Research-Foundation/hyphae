@@ -4,6 +4,7 @@ use hyphae_native_catalog::{
     CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
     SecondaryIndexDefinition,
 };
+use hyphae_native_mvcc::Snapshot;
 use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
 use hyphae_native_types::{
     CatalogVersion, ColumnId, DecimalType, EngineKind, IntegerWidth, LogicalType, ObjectId,
@@ -11,7 +12,7 @@ use hyphae_native_types::{
 };
 use thiserror::Error;
 
-use crate::{NativeRuntimeError, NativeSnapshot, NativeWriteBatch, qualified_name};
+use crate::{NativeDatabase, NativeRuntimeError, NativeSnapshot, NativeWriteBatch, qualified_name};
 
 /// Value accepted or returned by native SQL.
 pub type SqlValue = ScalarValue;
@@ -97,6 +98,7 @@ impl PreparedStatement {
 enum PreparedPlan {
     SelectByPrimaryKey {
         table: ObjectId,
+        relation: Box<RelationDefinition>,
         projection: Vec<usize>,
         parameter_columns: Vec<usize>,
         output_columns: Vec<String>,
@@ -105,6 +107,8 @@ enum PreparedPlan {
     SelectBySecondaryIndex {
         table: ObjectId,
         index: ObjectId,
+        relation: Box<RelationDefinition>,
+        index_definition: Box<SecondaryIndexDefinition>,
         projection: Vec<usize>,
         parameter_columns: Vec<usize>,
         output_columns: Vec<String>,
@@ -177,6 +181,18 @@ pub(crate) fn prepare(
     snapshot: &NativeSnapshot,
     statement: &str,
 ) -> Result<PreparedStatement, SqlError> {
+    prepare_catalog(
+        snapshot.catalog_version(),
+        &snapshot.state.catalog,
+        statement,
+    )
+}
+
+pub(crate) fn prepare_catalog(
+    catalog_version: CatalogVersion,
+    catalog: &crate::model::CatalogState,
+    statement: &str,
+) -> Result<PreparedStatement, SqlError> {
     let Statement::Select {
         name,
         projection,
@@ -185,10 +201,12 @@ pub(crate) fn prepare(
     else {
         return Err(SqlError::InvalidSyntax);
     };
-    let bound = bind_select(&snapshot.state.catalog, &name, &projection, &predicates)?;
+    let bound = bind_select(catalog, &name, &projection, &predicates)?;
+    let relation = relation_by_id(catalog, bound.table)?.clone();
     let plan = match bound.access {
         SelectAccess::PrimaryKey { legacy_binary } => PreparedPlan::SelectByPrimaryKey {
             table: bound.table,
+            relation: Box::new(relation),
             projection: bound.projection,
             parameter_columns: bound.parameter_columns,
             output_columns: bound.output_columns,
@@ -197,13 +215,15 @@ pub(crate) fn prepare(
         SelectAccess::SecondaryIndex { index } => PreparedPlan::SelectBySecondaryIndex {
             table: bound.table,
             index,
+            relation: Box::new(relation),
+            index_definition: Box::new(secondary_index_by_id(catalog, index)?.clone()),
             projection: bound.projection,
             parameter_columns: bound.parameter_columns,
             output_columns: bound.output_columns,
         },
     };
     Ok(PreparedStatement {
-        catalog_version: snapshot.catalog_version(),
+        catalog_version,
         plan,
     })
 }
@@ -213,8 +233,18 @@ pub(crate) fn execute_prepared(
     prepared: &PreparedStatement,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    ensure_catalog_version(snapshot, prepared)?;
+    ensure_catalog_version(snapshot.catalog_version(), prepared)?;
     execute_bound_snapshot(snapshot, &prepared.plan, parameters)
+}
+
+pub(crate) fn execute_prepared_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    prepared: &PreparedStatement,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    ensure_catalog_version(snapshot.catalog_version, prepared)?;
+    execute_bound_latest(database, snapshot, &prepared.plan, parameters)
 }
 
 pub(crate) fn execute_prepared_binary<'snapshot>(
@@ -222,7 +252,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
     prepared: &PreparedStatement,
     primary_key: &[u8],
 ) -> Result<Option<&'snapshot [u8]>, SqlError> {
-    ensure_catalog_version(snapshot, prepared)?;
+    ensure_catalog_version(snapshot.catalog_version(), prepared)?;
     match &prepared.plan {
         PreparedPlan::SelectByPrimaryKey {
             table,
@@ -282,18 +312,18 @@ fn execute_bound_snapshot(
     match plan {
         PreparedPlan::SelectByPrimaryKey {
             table,
+            relation,
             projection,
             parameter_columns,
             output_columns,
             legacy_binary,
         } => {
-            let definition = relation_by_id(&snapshot.state.catalog, *table)?;
-            let primary_key = bind_primary_key(definition, parameter_columns, parameters)?;
+            let primary_key = bind_primary_key(relation, parameter_columns, parameters)?;
             let rows = snapshot.select(*table, &primary_key).map_or_else(
                 || Ok(Vec::new()),
                 |stored| {
                     materialize_row(
-                        definition,
+                        relation,
                         projection,
                         *legacy_binary,
                         parameters,
@@ -311,14 +341,14 @@ fn execute_bound_snapshot(
         PreparedPlan::SelectBySecondaryIndex {
             table,
             index,
+            relation,
+            index_definition,
             projection,
             parameter_columns,
             output_columns,
         } => {
-            let definition = relation_by_id(&snapshot.state.catalog, *table)?;
-            let index_definition = secondary_index_by_id(&snapshot.state.catalog, *index)?;
             let Some(index_key) = bind_secondary_index_key(
-                definition,
+                relation,
                 index_definition,
                 parameter_columns,
                 parameters,
@@ -342,7 +372,7 @@ fn execute_bound_snapshot(
                         .select(*table, primary_key)
                         .ok_or(SqlError::InvalidStoredRow)?;
                     rows.push(materialize_row(
-                        definition,
+                        relation,
                         projection,
                         false,
                         parameters,
@@ -350,6 +380,87 @@ fn execute_bound_snapshot(
                         stored,
                     )?);
                 }
+            }
+            Ok(SqlResult::Rows {
+                columns: output_columns.clone(),
+                rows,
+            })
+        }
+    }
+}
+
+fn execute_bound_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    match plan {
+        PreparedPlan::SelectByPrimaryKey {
+            table,
+            relation,
+            projection,
+            parameter_columns,
+            output_columns,
+            legacy_binary,
+        } => {
+            let primary_key = bind_primary_key(relation, parameter_columns, parameters)?;
+            let rows = database
+                .select_relational_at(snapshot, *table, &primary_key)?
+                .map_or_else(
+                    || Ok(Vec::new()),
+                    |stored| {
+                        materialize_row(
+                            relation,
+                            projection,
+                            *legacy_binary,
+                            parameters,
+                            parameter_columns,
+                            &stored,
+                        )
+                        .map(|row| vec![row])
+                    },
+                )?;
+            Ok(SqlResult::Rows {
+                columns: output_columns.clone(),
+                rows,
+            })
+        }
+        PreparedPlan::SelectBySecondaryIndex {
+            table,
+            index,
+            relation,
+            index_definition,
+            projection,
+            parameter_columns,
+            output_columns,
+        } => {
+            let Some(index_key) = bind_secondary_index_key(
+                relation,
+                index_definition,
+                parameter_columns,
+                parameters,
+            )?
+            else {
+                return Ok(SqlResult::Rows {
+                    columns: output_columns.clone(),
+                    rows: Vec::new(),
+                });
+            };
+            let matches = database.select_secondary_index_at(snapshot, *index, &index_key)?;
+            let mut rows = Vec::with_capacity(matches.len());
+            for matched in matches {
+                if matched.table != *table {
+                    return Err(SqlError::InvalidCatalogObject);
+                }
+                rows.push(materialize_row(
+                    relation,
+                    projection,
+                    false,
+                    parameters,
+                    parameter_columns,
+                    &matched.row,
+                )?);
             }
             Ok(SqlResult::Rows {
                 columns: output_columns.clone(),
@@ -974,10 +1085,10 @@ fn is_legacy_binary_relation(definition: &RelationDefinition) -> bool {
 }
 
 fn ensure_catalog_version(
-    snapshot: &NativeSnapshot,
+    catalog_version: CatalogVersion,
     prepared: &PreparedStatement,
 ) -> Result<(), SqlError> {
-    if prepared.catalog_version == snapshot.catalog_version() {
+    if prepared.catalog_version == catalog_version {
         Ok(())
     } else {
         Err(SqlError::CatalogChanged)

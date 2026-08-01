@@ -11,15 +11,19 @@ use std::{
 
 use hyphae_native_runtime::{
     DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, NativeDatabase, NativeSnapshot, NativeTransaction,
-    PreparedStatement, decode_frame, encode_frame,
+    PreparedStatement, SqlResult, SqlValue, decode_frame, encode_frame,
 };
-use hyphae_native_types::{DurabilityClass, ObjectId};
+use hyphae_native_types::{DurabilityClass, LogicalType, ObjectId};
 
 const OBSERVATIONS: u32 = 1_000_000;
 const WARMUP: u32 = 100_000;
 const OPERATIONS_PER_OBSERVATION: u32 = 32;
 const RELATIONAL_SCALE_ROWS: u32 = 2_048;
 const RELATIONAL_TARGET_ROW: u32 = RELATIONAL_SCALE_ROWS / 2;
+const SECONDARY_SCALE_ROWS: u32 = 2_048;
+const SECONDARY_TARGET_ROW: u32 = SECONDARY_SCALE_ROWS / 2;
+const SECONDARY_OBSERVATIONS: u32 = 100_000;
+const SECONDARY_OPERATIONS_PER_OBSERVATION: u32 = 1;
 const STRUCTURE_SCALE_KEYS: u32 = 2_048;
 const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
 const HASH_SCALE_FIELDS: u32 = 2_048;
@@ -71,14 +75,20 @@ struct OperationStats {
     search_btree: Stats,
     prepared_sql: Stats,
     relational_btree: Stats,
+    secondary_btree: Stats,
+    secondary_prepared_sql: Stats,
     codec_dispatch: Stats,
 }
 
 struct BenchmarkInputs<'a> {
     prepared: &'a PreparedStatement,
+    secondary_prepared: &'a PreparedStatement,
     table: ObjectId,
+    secondary_index: ObjectId,
     search_index: ObjectId,
     relational_target: &'a [u8],
+    secondary_index_key: &'a [u8],
+    secondary_parameters: &'a [SqlValue],
     structure_target: &'a [u8],
     hash_target: &'a [u8],
     frame: &'a [u8],
@@ -126,11 +136,59 @@ fn seed_scaled_data(
     Ok(())
 }
 
-fn measure_operations(
+fn seed_secondary_sql_data(
+    transaction: &mut NativeTransaction<'_>,
+    dataset_hasher: &mut blake3::Hasher,
+) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
+    let created = transaction.execute_sql(
+        "CREATE TABLE benchmark_people (
+            id BIGINT PRIMARY KEY,
+            email TEXT NOT NULL,
+            payload BINARY NOT NULL
+        )",
+        &[],
+    )?;
+    let SqlResult::Command {
+        object_id: Some(table),
+        ..
+    } = created
+    else {
+        return Err("secondary benchmark table identity was not returned".into());
+    };
+    for row in 0..SECONDARY_SCALE_ROWS {
+        let email = format!("person-{row:04}@hyphae.local");
+        let payload = vec![u8::try_from(row % 251)?; 96];
+        dataset_hasher.update(&row.to_be_bytes());
+        dataset_hasher.update(email.as_bytes());
+        dataset_hasher.update(&payload);
+        transaction.execute_sql(
+            "INSERT INTO benchmark_people (id, email, payload) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Signed(i64::from(row)),
+                SqlValue::Text(email),
+                SqlValue::Binary(payload),
+            ],
+        )?;
+    }
+    let created = transaction.execute_sql(
+        "CREATE UNIQUE INDEX benchmark_people_email ON benchmark_people (email)",
+        &[],
+    )?;
+    let SqlResult::Command {
+        object_id: Some(index),
+        ..
+    } = created
+    else {
+        return Err("secondary benchmark index identity was not returned".into());
+    };
+    Ok((table, index))
+}
+
+fn warm_operations(
     database: &NativeDatabase,
     snapshot: &NativeSnapshot,
     inputs: &BenchmarkInputs<'_>,
-) -> Result<OperationStats, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..WARMUP {
         black_box(snapshot.get(black_box(b"session")));
         black_box(database.get_latest_structure(black_box(inputs.structure_target), 101)?);
@@ -148,10 +206,26 @@ fn measure_operations(
         black_box(
             database.select_latest_relational(inputs.table, black_box(inputs.relational_target))?,
         );
+        black_box(database.select_latest_secondary_index(
+            inputs.secondary_index,
+            black_box(inputs.secondary_index_key),
+        )?);
+        black_box(database.execute_prepared_latest(
+            inputs.secondary_prepared,
+            black_box(inputs.secondary_parameters),
+        )?);
         let decoded = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
         black_box(snapshot.get(black_box(decoded.payload)));
     }
+    Ok(())
+}
 
+fn measure_operations(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    inputs: &BenchmarkInputs<'_>,
+) -> Result<OperationStats, Box<dyn std::error::Error>> {
+    warm_operations(database, snapshot, inputs)?;
     Ok(OperationStats {
         structure: measure(|| {
             black_box(snapshot.get(black_box(b"session")));
@@ -206,6 +280,34 @@ fn measure_operations(
                     .is_ok(),
             );
         }),
+        secondary_btree: measure_counted(
+            || {
+                black_box(
+                    database
+                        .select_latest_secondary_index(
+                            inputs.secondary_index,
+                            black_box(inputs.secondary_index_key),
+                        )
+                        .is_ok(),
+                );
+            },
+            SECONDARY_OBSERVATIONS,
+            SECONDARY_OPERATIONS_PER_OBSERVATION,
+        ),
+        secondary_prepared_sql: measure_counted(
+            || {
+                black_box(
+                    database
+                        .execute_prepared_latest(
+                            inputs.secondary_prepared,
+                            black_box(inputs.secondary_parameters),
+                        )
+                        .is_ok(),
+                );
+            },
+            SECONDARY_OBSERVATIONS,
+            SECONDARY_OPERATIONS_PER_OBSERVATION,
+        ),
         codec_dispatch: measure(|| {
             if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
                 black_box(snapshot.get(black_box(decoded.payload)));
@@ -230,8 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v6");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v7");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
+    let (_, secondary_index) = seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
     transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.commit()?;
     let relational_tree_height = database.latest_relational_tree_height()?;
@@ -253,7 +356,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
+    let secondary_prepared =
+        database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
+    let secondary_target = format!("person-{SECONDARY_TARGET_ROW:04}@hyphae.local");
+    let secondary_parameters = [SqlValue::Text(secondary_target)];
+    let secondary_index_key =
+        secondary_parameters[0].encode_ordered_component(&LogicalType::Text)?;
+    if database
+        .select_latest_secondary_index(secondary_index, &secondary_index_key)?
+        .len()
+        != 1
+    {
+        return Err("physical secondary benchmark key did not identify one row".into());
+    }
+    let SqlResult::Rows { rows, .. } =
+        database.execute_prepared_latest(&secondary_prepared, &secondary_parameters)?
+    else {
+        return Err("physical secondary benchmark SQL did not return rows".into());
+    };
+    if rows.len() != 1 {
+        return Err("physical secondary benchmark SQL did not identify one row".into());
+    }
     let structure_target = STRUCTURE_TARGET_KEY.to_be_bytes();
     let hash_target = HASH_TARGET_FIELD.to_be_bytes();
     let frame = encode_frame(
@@ -269,9 +393,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &snapshot,
         &BenchmarkInputs {
             prepared: &prepared,
+            secondary_prepared: &secondary_prepared,
             table,
+            secondary_index,
             search_index: index,
             relational_target: &relational_target,
+            secondary_index_key: &secondary_index_key,
+            secondary_parameters: &secondary_parameters,
             structure_target: &structure_target,
             hash_target: &hash_target,
             frame: &frame,
@@ -302,7 +430,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v6\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v7\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -317,13 +445,22 @@ fn print_report(
     println!("  \"warmup_per_operation\": {WARMUP},");
     println!("  \"search_observations\": {SEARCH_OBSERVATIONS},");
     println!("  \"search_operations_per_observation\": {SEARCH_OPERATIONS_PER_OBSERVATION},");
+    println!("  \"secondary_observations\": {SECONDARY_OBSERVATIONS},");
+    println!("  \"secondary_operations_per_observation\": {SECONDARY_OPERATIONS_PER_OBSERVATION},");
     println!("  \"concurrency\": 1,");
     println!("  \"durability\": \"memory\",");
     println!("  \"warm_state\": true,");
     println!("  \"proofs\": false,");
     println!(
-        "  \"relational_rows\": {},",
+        "  \"primary_relational_rows\": {},",
         RELATIONAL_SCALE_ROWS.saturating_add(1)
+    );
+    println!("  \"secondary_index_rows\": {SECONDARY_SCALE_ROWS},");
+    println!(
+        "  \"relational_rows\": {},",
+        RELATIONAL_SCALE_ROWS
+            .saturating_add(SECONDARY_SCALE_ROWS)
+            .saturating_add(1)
     );
     println!("  \"relational_tree_height\": {relational_tree_height},");
     println!("  \"structure_keys\": {STRUCTURE_SCALE_KEYS},");
@@ -364,6 +501,16 @@ fn print_report(
     print_stats(
         "buffered_relational_btree_pk_multilevel",
         operations.relational_btree,
+        true,
+    );
+    print_stats(
+        "buffered_relational_btree_secondary_exact_unique_multilevel",
+        operations.secondary_btree,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_secondary_exact_unique_multilevel",
+        operations.secondary_prepared_sql,
         true,
     );
     print_stats(

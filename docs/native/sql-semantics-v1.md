@@ -3,8 +3,9 @@
 Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 `INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
-`BEGIN`/`COMMIT`, and rollback are implemented experimentally. The legacy
-binary shape also supports `UPDATE` and `DELETE`; G2 remains open
+direct current-root prepared primary/secondary lookup, `BEGIN`/`COMMIT`, and
+rollback are implemented experimentally. The legacy binary shape also
+supports `UPDATE` and `DELETE`; G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -77,10 +78,20 @@ slice does not close relational gate G2. Typed indexed `UPDATE` and `DELETE`
 are rejected until their old/new physical projection and WAL semantics are
 implemented; the runtime never permits them to leave a stale index.
 
-Secondary-index definitions and entries are durable physical state, but the
-current general `NativeSnapshot` SQL path materializes the bounded relational
-snapshot before executing the lookup. Direct pinned physical secondary-index
-lookup, range cursors, and their microbenchmarks remain separate work.
+`NativeSnapshot` remains the complete materialized all-engine snapshot used
+for retained historical reads and cross-engine semantics. The separate
+`prepare_sql_latest` path decodes only the current catalog and embeds the
+relation/index definitions in the catalog-version-bound plan.
+`execute_prepared_latest` captures one immutable root set, rejects a stale
+catalog version, traverses the buffered relational B+tree directly, and
+materializes only rows reached by the exact primary or secondary key. The
+secondary path scans only the length-delimited exact index-key prefix, follows
+each live entry to its primary-key row in the same root, and returns rows in
+canonical primary-key order. It does not construct `MaterializedState`.
+
+The current prefix API owns the bounded match vector and row results; it is
+not allocation-free. Streaming range cursors, a request arena, and matched
+allocation evidence remain separate work.
 
 ## Null and boolean semantics
 

@@ -139,9 +139,16 @@ recomputes every live entry from its row, enforces uniqueness, rejects
 orphan/malformed entries, and proves that every row has every required
 projection.
 
+Exact current-root secondary lookup now reads `HYRIDX01`, constructs the
+length-delimited entry prefix, uses separator-pruned buffered prefix traversal,
+validates every live/tombstone marker, and follows live primary keys to visible
+rows through the same captured root. Missing metadata has a distinct
+`UnknownSecondaryIndex` failure; malformed entries or dangling live rows fail
+closed. The public result is deterministic primary-key order.
+
 This namespace remains the first physical relational route, not the complete
 SQL storage design. Secondary-key range cursors, prefix compression, bulk load,
-direct pinned index query, update/delete maintenance, free-space policy,
+allocation-free streaming, update/delete maintenance, free-space policy,
 scan-oriented column batches, retention, and vacuum remain pending.
 
 ## Structure namespace
@@ -187,7 +194,11 @@ semantics, buffered lookup/scan, oversized and noncanonical rejection,
 complete-node validation after an early key match, and future-node rejection.
 Runtime coverage additionally proves secondary-index backfill, insert,
 uniqueness, both optimistic index/row commit orders, catalog/root reopen, and
-missing-projection rejection. The runtime benchmark refuses to run unless its
-relational, structure, and search trees are multilevel. Fuzzing, randomized
-model equivalence, crash power-loss tests, fanout/fill-factor tuning, streaming
-cursors, and concurrent writer publication remain required gate evidence.
+missing-projection rejection. Direct exact lookup coverage uses a multilevel
+tree, compares physical and materialized prepared results, checks deterministic
+non-unique order, null short-circuit, stale-plan rejection, reopen equivalence,
+unknown metadata, and a forged invalid live marker. The runtime benchmark
+refuses to run unless its relational, structure, and search trees are
+multilevel. Fuzzing, randomized model equivalence, crash power-loss tests,
+fanout/fill-factor tuning, streaming cursors, and concurrent writer publication
+remain required gate evidence.

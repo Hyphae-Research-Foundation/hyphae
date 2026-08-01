@@ -164,8 +164,8 @@ native inverted B+tree while legacy inline roots remain compatible. Detached
 transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
-pending, along with retention/vacuum, direct secondary-index execution and
-ranges, indexed typed updates/deletes, remaining structure families,
+pending, along with retention/vacuum, secondary-index range/streaming
+execution, indexed typed updates/deletes, remaining structure families,
 positional postings, segments, and ANN required by G1–G4. Typed point inserts
 and catalog-bound primary/secondary-key projection now use canonical tuples
 and primitive/composite keys, but do not close G2. The structure keyspace has
