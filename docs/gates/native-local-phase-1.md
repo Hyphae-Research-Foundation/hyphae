@@ -82,6 +82,12 @@ immutable content-addressed blob store, SQL UPDATE/DELETE with copy-on-write
 roots and tombstones, a WAL-rebuilt point conflict table, two blob crash
 boundaries, and a clean height-two B+tree latency observation.
 
+The [relational version-chain
+evidence](evidence/native-relational-version-chains-2026-08-01.md) binds the V2
+row pointer, immutable closed histories, V1 compatibility, fail-closed chain
+recovery, and the measured cost of the additional version-page lookup to one
+source commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
