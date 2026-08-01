@@ -75,6 +75,13 @@ commit before its tag can be published.
 - `native-microsecond-smoke-hash-wsl2.json` is its schema-v5 clean physical
   `HGET` observation over 2,048 fields. It does not time mutations and remains
   outside G7.
+- [Native set structure evidence —
+  2026-08-01](native-set-structure-2026-08-01.md) binds the first exact binary
+  set, member-granular storage/conflicts, cardinality validation, multilevel
+  recovery, crash boundaries, and explicit remaining G3 limits.
+- `native-microsecond-smoke-set-wsl2.json` is its schema-v11 clean physical
+  `SISMEMBER` observation over 2,048 members. It does not time mutations and
+  remains outside G7.
 - [Native inverted-search evidence —
   2026-08-01](native-inverted-search-2026-08-01.md) binds the first physical
   collection/document/term/posting namespaces, prefix-pruned `MATCH`, exact
