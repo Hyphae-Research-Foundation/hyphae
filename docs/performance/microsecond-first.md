@@ -1,7 +1,7 @@
 # Microsecond-first performance contract
 
-Status: target contract; a first bounded dirty-worktree smoke observation
-exists, but no target gate has passed
+Status: target contract; versioned local smoke observations exist, but no
+target gate has passed
 
 Hyphae's local ecosystem is designed around bounded hot paths measured in
 microseconds. This is not a claim that every query, transport, or durable
@@ -117,6 +117,19 @@ observed p50 `20.926 us` and p99 `71.596 us` in the checked
 [receipt](../gates/evidence/native-microsecond-smoke-search-wsl2.json).
 Cross-schema latency is not a controlled comparison, and none of these
 observations passes G7.
+
+Schema v7 adds 2,048 rows under one unique text secondary index and measures
+one complete exact-key call per timer sample. The buffered physical
+index-to-row route observed p50 `8.514 us` and p99 `22.144 us`; the
+catalog-version-bound physical prepared-SQL route, including parameter binding,
+tuple decoding, and two projected values, observed p50 `9.497 us` and p99
+`27.479 us` in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-secondary-sql-wsl2.json).
+That is inside the provisional bounded indexed-SQL 50-us p50 and 250-us p99
+target for this single scenario. It is not G7: the unique one-row corpus/query
+is narrow, concurrency is one, results allocate, and the required
+transport/saturation/interference/cold-state/allocation/hardware-counter lanes
+are absent.
 
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50

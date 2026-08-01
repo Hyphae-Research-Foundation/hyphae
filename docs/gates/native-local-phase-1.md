@@ -154,6 +154,15 @@ validation to one source commit. Direct pinned execution, ranges, indexed
 typed updates/deletes, statistics/cost planning, and the remaining G2/G7
 evidence remain open.
 
+The [native direct secondary-index
+evidence](evidence/native-direct-secondary-index-2026-08-01.md) binds
+catalog-only latest-plan preparation, one-root physical index-to-row
+execution, deterministic order, materialized/historical equivalence,
+catalog-version invalidation, reopen/corruption coverage, and a matched clean
+schema-v7 WSL2 observation to one source commit. Streaming/ranges, indexed
+typed updates/deletes, statistics/cost planning, and the remaining G2/G7
+evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

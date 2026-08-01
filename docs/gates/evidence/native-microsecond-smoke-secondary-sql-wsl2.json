@@ -1,0 +1,172 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v7",
+  "measured_at": "2026-08-01T15:01:50.6609282-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "62267d5196a954e4e582e85cbb6b1f48ab70248c",
+    "tree": "737d3348282c8f6013e665d5e1dedbd6c3210cea",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "This is one clean local observation without affinity, background-load, allocation, or hardware-counter controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502116352,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_non_search_operation": 1000000,
+    "operations_per_non_search_observation": 32,
+    "non_search_latency_value": "integer nanosecond average of a 32-operation batch",
+    "search_observations": 100000,
+    "search_operations_per_observation": 1,
+    "secondary_observations": 100000,
+    "secondary_operations_per_observation": 1,
+    "secondary_latency_value": "one complete exact-key call per timer observation",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "primary_relational_rows": 2049,
+    "secondary_index_rows": 2048,
+    "relational_rows": 4097,
+    "relational_tree_height": 2,
+    "secondary_index_unique": true,
+    "secondary_index_columns": 1,
+    "secondary_predicate_type": "TEXT equality",
+    "secondary_result_rows": 1,
+    "secondary_selectivity": 0.00048828125,
+    "secondary_payload_bytes": 96,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "hash_fields": 2048,
+    "hash_field_value_bytes": 64,
+    "search_documents": 2048,
+    "search_tree_height": 2,
+    "search_query": "needle",
+    "search_query_terms": 1,
+    "search_query_document_frequency": 1,
+    "search_limit": 1,
+    "dataset_digest_blake3": "abd3ebff9abb876eb196bb3ffba4533b870ba24423bdcff7851abd104e34c8c4",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "secondary_storage_path_note": "The physical exact-key call reads HYRIDX01 through the buffer pool, performs one separator-pruned length-delimited prefix scan, validates one live entry, follows its primary key through the same captured relational root, and returns one owned row.",
+    "secondary_sql_path_note": "The prepared SQL call checks the captured catalog version, binds one TEXT parameter from the embedded relation and index definitions, executes the same physical route, decodes one HYTUPL01 row, and returns two projected scalar values.",
+    "timed_mutations": false
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.051,
+      "p95_us": 0.054,
+      "p99_us": 0.074,
+      "p99_9_us": 0.847,
+      "throughput_ops_s": 17822376
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.698,
+      "p95_us": 0.808,
+      "p99_us": 1.929,
+      "p99_9_us": 5.426,
+      "throughput_ops_s": 1345812
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.096,
+      "p95_us": 0.107,
+      "p99_us": 0.143,
+      "p99_9_us": 1.585,
+      "throughput_ops_s": 9550505
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 1.208,
+      "p95_us": 1.619,
+      "p99_us": 3.22,
+      "p99_9_us": 7.616,
+      "throughput_ops_s": 770801
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 19.731,
+      "p95_us": 26.172,
+      "p99_us": 62.992,
+      "p99_9_us": 189.042,
+      "throughput_ops_s": 46215
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.042,
+      "p95_us": 0.044,
+      "p99_us": 0.061,
+      "p99_9_us": 0.613,
+      "throughput_ops_s": 21828269
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.245,
+      "p95_us": 1.689,
+      "p99_us": 3.258,
+      "p99_9_us": 7.686,
+      "throughput_ops_s": 746227
+    },
+    "buffered_relational_btree_secondary_exact_unique_multilevel": {
+      "p50_us": 8.514,
+      "p95_us": 11.183,
+      "p99_us": 22.144,
+      "p99_9_us": 97.363,
+      "throughput_ops_s": 107245
+    },
+    "physical_prepared_sql_secondary_exact_unique_multilevel": {
+      "p50_us": 9.497,
+      "p95_us": 13.338,
+      "p99_us": 27.479,
+      "p99_9_us": 113.768,
+      "throughput_ops_s": 94779
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.075,
+      "p95_us": 0.082,
+      "p99_us": 0.097,
+      "p99_9_us": 1.125,
+      "throughput_ops_s": 12441267
+    }
+  },
+  "comparison": {
+    "direct_physical_secondary_baseline_available": false,
+    "reason": "Schema v7 introduces the first physical secondary-index and physical prepared SQL operations. Schema v6 has no comparable operation and a different relational corpus.",
+    "prior_receipt": "native-microsecond-smoke-search-wsl2.json",
+    "sanity_note": "Primary, structure, hash, and search routes remained in their prior microsecond regimes, but cross-schema timing deltas are not treated as a controlled comparison."
+  },
+  "interpretation": {
+    "microsecond_secondary_index_observed": true,
+    "microsecond_physical_prepared_sql_observed": true,
+    "provisional_indexed_sql_50us_p50_250us_p99_target_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "single concurrency only",
+      "2,048 indexed rows, one unique equality key, one returned row, and tree height two only",
+      "no non-unique fanout, composite, range, residual-filter, bitmap, join, sort, aggregation, spill, or cancellation workload",
+      "no index creation, WAL, checkpoint, update, delete, tombstone, vacuum, or fsync latency measurement",
+      "the physical prefix and SQL result paths allocate owned vectors and rows",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}
