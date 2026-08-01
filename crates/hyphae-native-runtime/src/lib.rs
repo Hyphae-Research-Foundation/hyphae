@@ -71,7 +71,11 @@ const RELATIONAL_INLINE_VALUE_LIMIT: usize = 8_192;
 const STRUCTURE_FORMAT_KEY: &[u8] = b"\x00";
 const STRUCTURE_FORMAT_VALUE_V1: &[u8] = b"HYSTRBT1";
 const STRUCTURE_ENTRY_PREFIX: u8 = 1;
+const STRUCTURE_HASH_META_PREFIX: u8 = 2;
+const STRUCTURE_HASH_FIELD_PREFIX: u8 = 3;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
+const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
+const STRUCTURE_HASH_META_SIZE: usize = 16;
 const STRUCTURE_VALUE_HEADER_SIZE: usize = 24;
 const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
 const STRUCTURE_VALUE_TOMBSTONE: u8 = 2;
@@ -193,6 +197,21 @@ pub enum NativeRuntimeError {
     /// A signed structure counter operation exceeded the i64 domain.
     #[error("native signed 64-bit structure counter overflow")]
     StructureIntegerOverflow,
+    /// One structure key was addressed through a different family.
+    #[error("native structure key belongs to a different family")]
+    StructureKindMismatch,
+    /// The requested native hash does not exist.
+    #[error("native structure hash does not exist")]
+    UnknownStructureHash,
+    /// The requested structure key already exists.
+    #[error("native structure key already exists")]
+    StructureKeyExists,
+    /// Collection families are unavailable in a legacy whole-state directory.
+    #[error("native collection families require the B+tree structure format")]
+    LegacyStructureFamilyUnsupported,
+    /// A composite structure identity cannot fit its canonical u32 length.
+    #[error("native structure identity exceeds its canonical length field")]
+    StructureIdentityTooLarge,
     /// Recovered commit sequences are not contiguous.
     #[error("recovered native commit sequence is not contiguous")]
     NoncontiguousCommitSequence,
@@ -286,6 +305,15 @@ pub enum SetOutcome {
     Applied,
     /// The condition was false and no mutation was added.
     NotApplied,
+}
+
+/// Result of one native hash-field upsert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HashSetOutcome {
+    /// The field did not exist and increased the hash cardinality.
+    Added,
+    /// The field existed and its value was replaced.
+    Updated,
 }
 
 /// Reopen evidence for the native data directory.
@@ -408,6 +436,36 @@ impl NativeSnapshot {
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
         }
+    }
+
+    /// Reads one field from an existing native hash in this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a scalar key or a missing hash.
+    pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<&[u8]>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self.state.structures.hashes.contains_key(key) {
+            return Err(NativeRuntimeError::UnknownStructureHash);
+        }
+        Ok(self.state.structures.hget(key, field))
+    }
+
+    /// Returns one native hash's field count in this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a scalar key or a missing hash.
+    pub fn hlen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hlen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
     /// Executes deterministic native lexical matching.
@@ -763,6 +821,91 @@ impl NativeDatabase {
         }
     }
 
+    /// Reads one field directly through the current physical hash namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a scalar key, a missing hash, or
+    /// any malformed B+tree, metadata, field envelope, or blob.
+    pub fn hget_latest_hash(
+        &self,
+        key: &[u8],
+        field: &[u8],
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )?
+        else {
+            if tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+                .transpose()?
+                .flatten()
+                .is_some()
+            {
+                return Err(NativeRuntimeError::StructureKindMismatch);
+            }
+            return Err(NativeRuntimeError::UnknownStructureHash);
+        };
+        decode_hash_metadata(metadata.bytes())?;
+        tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_field_key(key, field)?,
+        )?
+        .map(|encoded| decode_hash_field_value(encoded.bytes(), &self.blobs))
+        .transpose()
+        .map(Option::flatten)
+    }
+
+    /// Reads one hash cardinality directly from its physical metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a scalar key, a missing hash, or
+    /// malformed B+tree metadata.
+    pub fn hlen_latest_hash(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )?
+        else {
+            if tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+                .transpose()?
+                .flatten()
+                .is_some()
+            {
+                return Err(NativeRuntimeError::StructureKindMismatch);
+            }
+            return Err(NativeRuntimeError::UnknownStructureHash);
+        };
+        usize::try_from(decode_hash_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
     /// Verifies the current relational B+tree and returns its node height.
     ///
     /// # Errors
@@ -818,6 +961,7 @@ impl NativeDatabase {
             mutations: Vec::new(),
             dirty: [false; 4],
             durability,
+            structure_format: self.structure_format,
         })
     }
 
@@ -1033,6 +1177,7 @@ pub struct NativeWriteBatch {
     mutations: Vec<Mutation>,
     dirty: [bool; 4],
     durability: DurabilityClass,
+    structure_format: StructureFormat,
 }
 
 /// Legacy serialized transaction retaining writer admission for its lifetime.
@@ -1200,14 +1345,19 @@ impl NativeWriteBatch {
     }
 
     /// Sets one native structure value and optional absolute expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key belongs to a hash.
     pub fn set(
         &mut self,
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
         expires_at_micros: Option<i64>,
-    ) {
-        let outcome = self.set_conditional(key, value, expires_at_micros, SetCondition::Always);
+    ) -> Result<(), NativeRuntimeError> {
+        let outcome = self.set_conditional(key, value, expires_at_micros, SetCondition::Always)?;
         debug_assert_eq!(outcome, SetOutcome::Applied);
+        Ok(())
     }
 
     /// Sets one scalar value only when its snapshot-time predicate is true.
@@ -1215,15 +1365,22 @@ impl NativeWriteBatch {
     /// A rejected condition adds no write key and therefore needs no commit.
     /// Concurrent `IfAbsent` writers over the same missing key may both prepare,
     /// but first-committer-wins admits only one publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key belongs to a hash.
     pub fn set_conditional(
         &mut self,
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
         expires_at_micros: Option<i64>,
         condition: SetCondition,
-    ) -> SetOutcome {
+    ) -> Result<SetOutcome, NativeRuntimeError> {
         let key = key.into();
         let value = value.into();
+        if self.state.structures.hashes.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
         let exists = self
             .state
             .structures
@@ -1235,7 +1392,7 @@ impl NativeWriteBatch {
             SetCondition::IfPresent => exists,
         };
         if !applies {
-            return SetOutcome::NotApplied;
+            return Ok(SetOutcome::NotApplied);
         }
         self.state
             .structures
@@ -1249,22 +1406,32 @@ impl NativeWriteBatch {
             expires_at_micros,
         });
         self.dirty[2] = true;
-        SetOutcome::Applied
+        Ok(SetOutcome::Applied)
     }
 
     /// Deletes one unexpired scalar value from this transaction.
     ///
     /// Returns `false` without adding a mutation when the key is missing or
     /// expired at the transaction's deterministic logical time.
-    pub fn delete_structure(&mut self, key: impl Into<Vec<u8>>) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key belongs to a hash.
+    pub fn delete_structure(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
         let key = key.into();
+        if self.state.structures.hashes.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
         if self
             .state
             .structures
             .visible_entry(&key, self.snapshot.logical_time_micros)
             .is_none()
         {
-            return false;
+            return Ok(false);
         }
         let removed = self.state.structures.delete(&key);
         debug_assert!(removed.is_some());
@@ -1277,22 +1444,33 @@ impl NativeWriteBatch {
             expires_at_micros: None,
         });
         self.dirty[2] = true;
-        true
+        Ok(true)
     }
 
     /// Replaces one visible scalar value's absolute expiry.
     ///
     /// The value bytes are retained in the WAL mutation so recovery can verify
     /// the exact new physical envelope without consulting an older root.
-    pub fn expire_structure(&mut self, key: impl Into<Vec<u8>>, expires_at_micros: i64) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key belongs to a hash.
+    pub fn expire_structure(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        expires_at_micros: i64,
+    ) -> Result<bool, NativeRuntimeError> {
         let key = key.into();
+        if self.state.structures.hashes.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
         let Some(value) = self
             .state
             .structures
             .visible_entry(&key, self.snapshot.logical_time_micros)
             .map(|entry| entry.value.clone())
         else {
-            return false;
+            return Ok(false);
         };
         self.state
             .structures
@@ -1306,7 +1484,7 @@ impl NativeWriteBatch {
             expires_at_micros: Some(expires_at_micros),
         });
         self.dirty[2] = true;
-        true
+        Ok(true)
     }
 
     /// Atomically adds `delta` to one canonical signed-decimal scalar.
@@ -1326,6 +1504,9 @@ impl NativeWriteBatch {
         delta: i64,
     ) -> Result<i64, NativeRuntimeError> {
         let key = key.into();
+        if self.state.structures.hashes.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
         let existing = self
             .state
             .structures
@@ -1343,7 +1524,7 @@ impl NativeWriteBatch {
             value.to_string().into_bytes(),
             expires_at_micros,
             SetCondition::Always,
-        );
+        )?;
         debug_assert_eq!(outcome, SetOutcome::Applied);
         Ok(value)
     }
@@ -1353,6 +1534,142 @@ impl NativeWriteBatch {
         self.state
             .structures
             .get(key, self.snapshot.logical_time_micros)
+    }
+
+    /// Creates one explicitly typed empty native hash.
+    ///
+    /// Hashes are not encoded in legacy whole-state structure roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or an existing scalar/hash key.
+    pub fn create_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if !self.state.structures.create_hash(key.clone()) {
+            return Err(NativeRuntimeError::StructureKeyExists);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::CreateHash,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(())
+    }
+
+    /// Inserts or replaces one field in an existing native hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a scalar key, or a missing hash.
+    pub fn hset(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<HashSetOutcome, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let field = field.into();
+        let value = value.into();
+        let added = self
+            .state
+            .structures
+            .hset(&key, field.clone(), value.clone())
+            .ok_or(NativeRuntimeError::UnknownStructureHash)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetHashField,
+            target: None,
+            key: hash_field_identity(&key, &field)?,
+            value,
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(if added {
+            HashSetOutcome::Added
+        } else {
+            HashSetOutcome::Updated
+        })
+    }
+
+    /// Reads one field from an existing native hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a scalar key or a missing hash.
+    pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<&[u8]>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self.state.structures.hashes.contains_key(key) {
+            return Err(NativeRuntimeError::UnknownStructureHash);
+        }
+        Ok(self.state.structures.hget(key, field))
+    }
+
+    /// Deletes one field without deleting the typed hash itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a scalar key, or a missing hash.
+    pub fn hdelete(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let field = field.into();
+        let deleted = self
+            .state
+            .structures
+            .hdelete(&key, &field)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)?;
+        if !deleted {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteHashField,
+            target: None,
+            key: hash_field_identity(&key, &field)?,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Returns the current private field count for an existing native hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a scalar key or a missing hash.
+    pub fn hlen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hlen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
     /// Creates one native text search collection.
@@ -1605,6 +1922,83 @@ impl NativeTransaction<'_> {
     }
 }
 
+fn apply_structure_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    match mutation.opcode {
+        Opcode::SetValue => {
+            if mutation.target.is_some() || state.hashes.contains_key(&mutation.key) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            state.set(
+                mutation.key.clone(),
+                mutation.value.clone(),
+                mutation.expires_at_micros,
+            );
+        }
+        Opcode::DeleteValue => {
+            if mutation.target.is_some()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+                || state.hashes.contains_key(&mutation.key)
+                || state.delete(&mutation.key).is_none()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::ExpireValue => {
+            if mutation.target.is_some()
+                || mutation.expires_at_micros.is_none()
+                || state.hashes.contains_key(&mutation.key)
+                || !state.entries.contains_key(&mutation.key)
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            state.set(
+                mutation.key.clone(),
+                mutation.value.clone(),
+                mutation.expires_at_micros,
+            );
+        }
+        Opcode::CreateHash => {
+            if mutation.target.is_some()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+                || !state.create_hash(mutation.key.clone())
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::SetHashField => {
+            if mutation.target.is_some() || mutation.expires_at_micros.is_some() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let (key, field) = decode_hash_field_identity(&mutation.key)?;
+            if state
+                .hset(key, field.to_vec(), mutation.value.clone())
+                .is_none()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::DeleteHashField => {
+            if mutation.target.is_some()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let (key, field) = decode_hash_field_identity(&mutation.key)?;
+            if state.hdelete(key, field) != Some(true) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
 fn apply_mutations_to_state(
     state: &mut MaterializedState,
     mutations: &[Mutation],
@@ -1648,37 +2042,13 @@ fn apply_mutations_to_state(
                 state.catalog.require(table, EngineKind::Relational)?;
                 state.relational.delete(table, &mutation.key)?;
             }
-            Opcode::SetValue => {
-                if mutation.target.is_some() {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
-                state.structures.set(
-                    mutation.key.clone(),
-                    mutation.value.clone(),
-                    mutation.expires_at_micros,
-                );
-            }
-            Opcode::DeleteValue => {
-                if mutation.target.is_some()
-                    || !mutation.value.is_empty()
-                    || mutation.expires_at_micros.is_some()
-                    || state.structures.delete(&mutation.key).is_none()
-                {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
-            }
-            Opcode::ExpireValue => {
-                if mutation.target.is_some()
-                    || mutation.expires_at_micros.is_none()
-                    || !state.structures.entries.contains_key(&mutation.key)
-                {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
-                state.structures.set(
-                    mutation.key.clone(),
-                    mutation.value.clone(),
-                    mutation.expires_at_micros,
-                );
+            Opcode::SetValue
+            | Opcode::DeleteValue
+            | Opcode::ExpireValue
+            | Opcode::CreateHash
+            | Opcode::SetHashField
+            | Opcode::DeleteHashField => {
+                apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CreateIndex => {
                 let index = mutation
@@ -1816,7 +2186,10 @@ fn stage_large_values(
             && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
             && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Structure
-                && matches!(mutation.opcode, Opcode::SetValue | Opcode::ExpireValue)
+                && matches!(
+                    mutation.opcode,
+                    Opcode::SetValue | Opcode::ExpireValue | Opcode::SetHashField
+                )
                 && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
     }) {
         let digest = *blake3::hash(&mutation.value).as_bytes();
@@ -1901,6 +2274,14 @@ fn structure_tombstone_value() -> Vec<u8> {
     encoded
 }
 
+fn is_structure_tombstone(encoded: &[u8]) -> bool {
+    encoded.len() == STRUCTURE_VALUE_HEADER_SIZE
+        && encoded.get(..8) == Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        && encoded[8] == STRUCTURE_VALUE_TOMBSTONE
+        && encoded[9] == STRUCTURE_VALUE_INLINE
+        && encoded[10..24].iter().all(|byte| *byte == 0)
+}
+
 fn decode_structure_value(
     encoded: &[u8],
     blobs: &BlobStore,
@@ -1920,7 +2301,7 @@ fn decode_structure_value(
     let raw_expiry = i64::from_le_bytes(expiry_bytes);
     let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
     if encoded[8] == STRUCTURE_VALUE_TOMBSTONE {
-        if encoded[9] != STRUCTURE_VALUE_INLINE || raw_expiry != 0 || !payload.is_empty() {
+        if !is_structure_tombstone(encoded) {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
         return Ok(None);
@@ -1962,7 +2343,10 @@ fn wal_mutations(
             {
                 mutation.value = relational_storage_value(&mutation.value, blob_references)?;
             } else if mutation.engine == EngineKind::Structure
-                && matches!(mutation.opcode, Opcode::SetValue | Opcode::ExpireValue)
+                && matches!(
+                    mutation.opcode,
+                    Opcode::SetValue | Opcode::ExpireValue | Opcode::SetHashField
+                )
             {
                 mutation.value = structure_storage_value(
                     &mutation.value,
@@ -1982,6 +2366,81 @@ fn structure_key(key: &[u8]) -> Vec<u8> {
     encoded
 }
 
+fn structure_hash_meta_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(1));
+    encoded.push(STRUCTURE_HASH_META_PREFIX);
+    encoded.extend_from_slice(key);
+    encoded
+}
+
+fn hash_field_identity(key: &[u8], field: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    let key_length =
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+    let mut encoded = Vec::with_capacity(
+        4_usize
+            .saturating_add(key.len())
+            .saturating_add(field.len()),
+    );
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(key);
+    encoded.extend_from_slice(field);
+    Ok(encoded)
+}
+
+fn decode_hash_field_identity(encoded: &[u8]) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
+    let length_bytes = encoded
+        .get(..4)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let mut length = [0_u8; 4];
+    length.copy_from_slice(length_bytes);
+    let key_length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    let field_start = 4_usize
+        .checked_add(key_length)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    if field_start > encoded.len() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok((&encoded[4..field_start], &encoded[field_start..]))
+}
+
+fn structure_hash_field_key(key: &[u8], field: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = hash_field_identity(key, field)?;
+    let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
+    encoded.push(STRUCTURE_HASH_FIELD_PREFIX);
+    encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn encode_hash_metadata(field_count: u64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_HASH_META_SIZE);
+    encoded.extend_from_slice(STRUCTURE_HASH_META_MAGIC);
+    encoded.extend_from_slice(&field_count.to_le_bytes());
+    encoded
+}
+
+fn decode_hash_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
+    if encoded.len() != STRUCTURE_HASH_META_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_HASH_META_MAGIC.as_slice())
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut count = [0_u8; 8];
+    count.copy_from_slice(&encoded[8..16]);
+    Ok(u64::from_le_bytes(count))
+}
+
+fn decode_hash_field_value(
+    encoded: &[u8],
+    blobs: &BlobStore,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    match decode_structure_value(encoded, blobs)? {
+        Some(entry) if entry.expires_at_micros.is_none() => Ok(Some(entry.value)),
+        Some(_) => Err(NativeRuntimeError::InvalidStructureTree),
+        None => Ok(None),
+    }
+}
+
 fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
     let text =
         std::str::from_utf8(value).map_err(|_| NativeRuntimeError::StructureValueNotInteger)?;
@@ -1992,6 +2451,106 @@ fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
         return Err(NativeRuntimeError::StructureValueNotInteger);
     }
     Ok(parsed)
+}
+
+fn create_hash_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_hash_meta_key(&mutation.key);
+    if tree.get(pages, &metadata_key)?.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if tree
+        .get(pages, &structure_key(&mutation.key))?
+        .is_some_and(|value| !is_structure_tombstone(&value))
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .insert_unique(pages, creating_csn, metadata_key, encode_hash_metadata(0))?
+        .tree)
+}
+
+fn set_hash_field_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    if mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (key, field) = decode_hash_field_identity(&mutation.key)?;
+    let metadata_key = structure_hash_meta_key(key);
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let count = decode_hash_metadata(&metadata)?;
+    let field_key = structure_hash_field_key(key, field)?;
+    let added = tree
+        .get(pages, &field_key)?
+        .is_none_or(|value| is_structure_tombstone(&value));
+    let value = structure_storage_value(&mutation.value, None, blob_references)?;
+    tree = tree.upsert(pages, creating_csn, field_key, value)?.tree;
+    if added {
+        let count = count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                metadata_key,
+                encode_hash_metadata(count),
+            )?
+            .tree;
+    }
+    Ok(tree)
+}
+
+fn delete_hash_field_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (key, field) = decode_hash_field_identity(&mutation.key)?;
+    let metadata_key = structure_hash_meta_key(key);
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let count = decode_hash_metadata(&metadata)?;
+    let field_key = structure_hash_field_key(key, field)?;
+    let field_value = tree
+        .get(pages, &field_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if is_structure_tombstone(&field_value) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tree = tree
+        .upsert(pages, creating_csn, field_key, structure_tombstone_value())?
+        .tree;
+    let count = count
+        .checked_sub(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_hash_metadata(count),
+        )?
+        .tree)
 }
 
 fn structure_tree_after_mutations(
@@ -2035,8 +2594,27 @@ fn structure_tree_after_mutations(
             {
                 structure_tombstone_value()
             }
+            Opcode::CreateHash => {
+                tree = create_hash_in_tree(pages, tree, creating_csn, mutation)?;
+                continue;
+            }
+            Opcode::SetHashField => {
+                tree =
+                    set_hash_field_in_tree(pages, tree, creating_csn, mutation, blob_references)?;
+                continue;
+            }
+            Opcode::DeleteHashField => {
+                tree = delete_hash_field_in_tree(pages, tree, creating_csn, mutation)?;
+                continue;
+            }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
         };
+        if tree
+            .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
         tree = tree
             .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
             .tree;
@@ -2670,17 +3248,59 @@ fn load_structure_state(
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     let mut decoded = BTreeMap::new();
+    let mut hashes = BTreeMap::new();
+    let mut hash_counts = BTreeMap::new();
     for (key, value) in iterator {
-        if key.first().copied() != Some(STRUCTURE_ENTRY_PREFIX) {
-            return Err(NativeRuntimeError::InvalidStructureTree);
+        match key.first().copied() {
+            Some(STRUCTURE_ENTRY_PREFIX) => {
+                if let Some(entry) = decode_structure_value(&value, blobs)?
+                    && decoded.insert(key[1..].to_vec(), entry).is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
+            Some(STRUCTURE_HASH_META_PREFIX) => {
+                let hash = key[1..].to_vec();
+                if decoded.contains_key(&hash)
+                    || hashes.insert(hash.clone(), BTreeMap::new()).is_some()
+                    || hash_counts
+                        .insert(hash, decode_hash_metadata(&value)?)
+                        .is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
+            Some(STRUCTURE_HASH_FIELD_PREFIX) => {
+                let (hash, field) = decode_hash_field_identity(&key[1..])
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+                let fields = hashes
+                    .get_mut(hash)
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                if let Some(value) = decode_hash_field_value(&value, blobs)?
+                    && fields.insert(field.to_vec(), value).is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
         }
-        if let Some(entry) = decode_structure_value(&value, blobs)?
-            && decoded.insert(key[1..].to_vec(), entry).is_some()
-        {
+    }
+    for (hash, expected) in hash_counts {
+        let actual = u64::try_from(
+            hashes
+                .get(&hash)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?
+                .len(),
+        )
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if actual != expected {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
     }
-    Ok(StructureState { entries: decoded })
+    Ok(StructureState {
+        entries: decoded,
+        hashes,
+    })
 }
 
 fn structure_format_for_root(
@@ -2793,8 +3413,8 @@ mod tests {
     use hyphae_native_types::{Csn, DurabilityClass, ManifestGeneration, ObjectId, PageId};
 
     use super::{
-        CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, PAGE_FILE,
-        SetCondition, SetOutcome, SqlResult, SqlValue,
+        CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase, NativeRuntimeError,
+        PAGE_FILE, SetCondition, SetOutcome, SqlResult, SqlValue,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -2833,7 +3453,7 @@ mod tests {
         let mut transaction = database.begin(100, DurabilityClass::Strict)?;
         transaction.create_relation(table, "accounts")?;
         transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
-        transaction.set(b"session".to_vec(), b"open".to_vec(), Some(200));
+        transaction.set(b"session".to_vec(), b"open".to_vec(), Some(200))?;
         transaction.create_search_index(index, "notes")?;
         transaction.index_document(index, b"doc-1".to_vec(), "native rust search")?;
         assert_eq!(
@@ -2910,7 +3530,12 @@ mod tests {
         let mut transaction = database.begin(100, DurabilityClass::Strict)?;
         transaction.create_relation(table, "large_rows")?;
         transaction.insert(table, b"blob-row".to_vec(), value.clone())?;
-        transaction.set(b"blob-key".to_vec(), value.clone(), None);
+        transaction.set(b"blob-key".to_vec(), value.clone(), None)?;
+        transaction.create_hash(b"blob-hash".to_vec())?;
+        assert_eq!(
+            transaction.hset(b"blob-hash".to_vec(), b"payload".to_vec(), value.clone())?,
+            HashSetOutcome::Added
+        );
         transaction.commit()?;
         assert_eq!(
             database.select_latest_relational(table, b"blob-row")?,
@@ -2918,6 +3543,10 @@ mod tests {
         );
         assert_eq!(
             database.get_latest_structure(b"blob-key", 101)?,
+            Some(value.clone())
+        );
+        assert_eq!(
+            database.hget_latest_hash(b"blob-hash", b"payload")?,
             Some(value.clone())
         );
         database.checkpoint()?;
@@ -2937,6 +3566,10 @@ mod tests {
         );
         assert_eq!(
             reopened.get_latest_structure(b"blob-key", 101)?,
+            Some(value.clone())
+        );
+        assert_eq!(
+            reopened.hget_latest_hash(b"blob-hash", b"payload")?,
             Some(value.clone())
         );
         assert_eq!(
@@ -2960,7 +3593,7 @@ mod tests {
             } else {
                 vec![u8::try_from(index % 251)?; 96]
             };
-            seed.set(index.to_be_bytes().to_vec(), value, Some(1_000));
+            seed.set(index.to_be_bytes().to_vec(), value, Some(1_000))?;
         }
         seed.commit()?;
 
@@ -2982,7 +3615,7 @@ mod tests {
 
         let updated = vec![0x42; 96];
         let mut update = database.begin(201, DurabilityClass::Strict)?;
-        update.set(target.to_vec(), updated.clone(), None);
+        update.set(target.to_vec(), updated.clone(), None)?;
         update.commit()?;
         assert_eq!(historical.get(&target), Some(original.as_slice()));
         assert_eq!(
@@ -3018,7 +3651,7 @@ mod tests {
                 b"v1".to_vec(),
                 None,
                 SetCondition::IfAbsent,
-            ),
+            )?,
             SetOutcome::Applied
         );
         assert_eq!(
@@ -3027,7 +3660,7 @@ mod tests {
                 b"rejected".to_vec(),
                 None,
                 SetCondition::IfAbsent,
-            ),
+            )?,
             SetOutcome::NotApplied
         );
         assert_eq!(
@@ -3036,13 +3669,13 @@ mod tests {
                 b"v2".to_vec(),
                 None,
                 SetCondition::IfPresent,
-            ),
+            )?,
             SetOutcome::Applied
         );
-        seed.set(b"delete".to_vec(), b"old".to_vec(), None);
-        seed.set(b"expire".to_vec(), b"alive".to_vec(), None);
-        seed.set(b"max-expiry".to_vec(), b"alive".to_vec(), None);
-        seed.set(b"counter".to_vec(), b"41".to_vec(), Some(1_000));
+        seed.set(b"delete".to_vec(), b"old".to_vec(), None)?;
+        seed.set(b"expire".to_vec(), b"alive".to_vec(), None)?;
+        seed.set(b"max-expiry".to_vec(), b"alive".to_vec(), None)?;
+        seed.set(b"counter".to_vec(), b"41".to_vec(), Some(1_000))?;
         seed.commit()?;
         database.snapshot(101)
     }
@@ -3055,7 +3688,7 @@ mod tests {
                 b"still-rejected".to_vec(),
                 None,
                 SetCondition::IfAbsent,
-            ),
+            )?,
             SetOutcome::NotApplied
         );
         assert_eq!(
@@ -3064,14 +3697,14 @@ mod tests {
                 b"v3".to_vec(),
                 None,
                 SetCondition::IfPresent,
-            ),
+            )?,
             SetOutcome::Applied
         );
-        assert!(mutate.delete_structure(b"delete".to_vec()));
-        assert!(!mutate.delete_structure(b"delete".to_vec()));
-        assert!(mutate.expire_structure(b"expire".to_vec(), 250));
-        assert!(mutate.expire_structure(b"max-expiry".to_vec(), i64::MAX));
-        assert!(!mutate.expire_structure(b"missing".to_vec(), 250));
+        assert!(mutate.delete_structure(b"delete".to_vec())?);
+        assert!(!mutate.delete_structure(b"delete".to_vec())?);
+        assert!(mutate.expire_structure(b"expire".to_vec(), 250)?);
+        assert!(mutate.expire_structure(b"max-expiry".to_vec(), i64::MAX)?);
+        assert!(!mutate.expire_structure(b"missing".to_vec(), 250)?);
         assert_eq!(mutate.increment_i64(b"counter".to_vec(), 1)?, 42);
         mutate.commit()?;
         Ok(())
@@ -3150,12 +3783,12 @@ mod tests {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         let mut seed = database.begin(10, DurabilityClass::Strict)?;
-        seed.set(b"noncanonical".to_vec(), b"01".to_vec(), None);
+        seed.set(b"noncanonical".to_vec(), b"01".to_vec(), None)?;
         seed.set(
             b"overflow".to_vec(),
             i64::MAX.to_string().into_bytes(),
             None,
-        );
+        )?;
         seed.commit()?;
 
         let mut rejected = database.begin_optimistic(11, DurabilityClass::Strict)?;
@@ -3207,7 +3840,7 @@ mod tests {
                 b"first".to_vec(),
                 None,
                 SetCondition::IfAbsent,
-            ),
+            )?,
             SetOutcome::Applied
         );
         assert_eq!(
@@ -3216,7 +3849,7 @@ mod tests {
                 b"second".to_vec(),
                 None,
                 SetCondition::IfAbsent,
-            ),
+            )?,
             SetOutcome::Applied
         );
         database.commit_optimistic(first)?;
@@ -3232,13 +3865,251 @@ mod tests {
     }
 
     #[test]
+    fn native_hash_fields_preserve_history_cardinality_tombstones_and_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"profile".to_vec())?;
+        assert_eq!(
+            seed.hset(b"profile".to_vec(), b"name".to_vec(), b"Mario".to_vec())?,
+            HashSetOutcome::Added
+        );
+        assert_eq!(
+            seed.hset(b"profile".to_vec(), b"age".to_vec(), b"40".to_vec())?,
+            HashSetOutcome::Added
+        );
+        assert_eq!(
+            seed.hset(b"profile".to_vec(), b"name".to_vec(), b"mario".to_vec())?,
+            HashSetOutcome::Updated
+        );
+        assert_eq!(seed.hlen(b"profile")?, 2);
+        assert_eq!(seed.hget(b"profile", b"name")?, Some(b"mario".as_slice()));
+        assert!(matches!(
+            seed.set(b"profile".to_vec(), b"scalar".to_vec(), None),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"profile".to_vec(), b"age".to_vec())?);
+        assert!(!mutate.hdelete(b"profile".to_vec(), b"age".to_vec())?);
+        assert_eq!(
+            mutate.hset(b"profile".to_vec(), b"name".to_vec(), b"Mario".to_vec())?,
+            HashSetOutcome::Updated
+        );
+        mutate.commit()?;
+
+        assert_eq!(
+            historical.hget(b"profile", b"name")?,
+            Some(b"mario".as_slice())
+        );
+        assert_eq!(historical.hget(b"profile", b"age")?, Some(b"40".as_slice()));
+        assert_eq!(database.hlen_latest_hash(b"profile")?, 1);
+        assert_eq!(
+            database.hget_latest_hash(b"profile", b"name")?,
+            Some(b"Mario".to_vec())
+        );
+        assert_eq!(database.hget_latest_hash(b"profile", b"age")?, None);
+
+        let root = database
+            .coordinator
+            .snapshot(13)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let age = hyphae_native_btree::BTree::from_root(root)
+            .get(
+                &database.pages,
+                &super::structure_hash_field_key(b"profile", b"age")?,
+            )?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        assert!(super::is_structure_tombstone(&age));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert_eq!(reopened.hlen_latest_hash(b"profile")?, 1);
+        assert_eq!(
+            reopened.hget_latest_hash(b"profile", b"name")?,
+            Some(b"Mario".to_vec())
+        );
+        assert_eq!(reopened.hget_latest_hash(b"profile", b"age")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_hash_fields_retain_snapshots_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let target = 1_024_u32.to_be_bytes();
+        let removed = 1_025_u32.to_be_bytes();
+        let original = vec![0x41; 96];
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_hash(b"large-map".to_vec())?;
+        for index in 0..2_048_u32 {
+            let value = if index == 1_024 {
+                original.clone()
+            } else {
+                vec![u8::try_from(index % 251)?; 96]
+            };
+            seed.hset(b"large-map".to_vec(), index.to_be_bytes().to_vec(), value)?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+        assert_eq!(database.hlen_latest_hash(b"large-map")?, 2_048);
+        assert_eq!(
+            database.hget_latest_hash(b"large-map", &target)?,
+            Some(original.clone())
+        );
+        let historical = database.snapshot(101)?;
+
+        let updated = vec![0x42; 96];
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        mutate.hset(b"large-map".to_vec(), target.to_vec(), updated.clone())?;
+        assert!(mutate.hdelete(b"large-map".to_vec(), removed.to_vec())?);
+        mutate.commit()?;
+        assert_eq!(
+            historical.hget(b"large-map", &target)?,
+            Some(original.as_slice())
+        );
+        assert!(historical.hget(b"large-map", &removed)?.is_some());
+        assert_eq!(database.hlen_latest_hash(b"large-map")?, 2_047);
+        assert_eq!(
+            database.hget_latest_hash(b"large-map", &target)?,
+            Some(updated.clone())
+        );
+        assert_eq!(database.hget_latest_hash(b"large-map", &removed)?, None);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.hlen_latest_hash(b"large-map")?, 2_047);
+        assert_eq!(
+            reopened.hget_latest_hash(b"large-map", &target)?,
+            Some(updated)
+        );
+        assert_eq!(reopened.hget_latest_hash(b"large-map", &removed)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_hash_writers_rebase_disjoint_fields_and_conflict_per_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.commit()?;
+
+        let mut first = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        first.hset(b"map".to_vec(), b"alpha".to_vec(), b"1".to_vec())?;
+        second.hset(b"map".to_vec(), b"beta".to_vec(), b"2".to_vec())?;
+        database.commit_optimistic(first)?;
+        database.commit_optimistic(second)?;
+        assert_eq!(database.hlen_latest_hash(b"map")?, 2);
+
+        let historical = database.snapshot(12)?;
+        let mut winner = database.begin_optimistic(13, DurabilityClass::Strict)?;
+        let mut loser = database.begin_optimistic(13, DurabilityClass::Strict)?;
+        winner.hset(b"map".to_vec(), b"race".to_vec(), b"winner".to_vec())?;
+        loser.hset(b"map".to_vec(), b"race".to_vec(), b"loser".to_vec())?;
+        database.commit_optimistic(winner)?;
+        assert!(matches!(
+            database.commit_optimistic(loser),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(historical.hlen(b"map")?, 2);
+        assert_eq!(database.hlen_latest_hash(b"map")?, 3);
+        assert_eq!(
+            database.hget_latest_hash(b"map", b"race")?,
+            Some(b"winner".to_vec())
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 4);
+        assert_eq!(reopened.hlen_latest_hash(b"map")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn hash_metadata_count_mismatch_fails_complete_state_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.hset(b"map".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+        seed.commit()?;
+
+        let root_set = database.coordinator.snapshot(11)?.roots().clone();
+        let root = root_set
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let bad_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::structure_hash_meta_key(b"map"),
+                super::encode_hash_metadata(2),
+            )?
+            .tree;
+        let mut roots = root_set
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        roots.insert(
+            super::SLOT_STRUCTURE,
+            bad_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            root_set
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            root_set.catalog_version(),
+            root_set
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots,
+            root_set.blob_generation(),
+        )?;
+        assert!(matches!(
+            super::load_structure_state(&database.pages, &database.blobs, &forged),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_and_hash_creation_race_on_one_typed_key() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut scalar = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        let mut hash = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        scalar.set(b"typed".to_vec(), b"scalar".to_vec(), None)?;
+        hash.create_hash(b"typed".to_vec())?;
+        database.commit_optimistic(hash)?;
+        assert!(matches!(
+            database.commit_optimistic(scalar),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(database.hlen_latest_hash(b"typed")?, 0);
+        assert!(database.get_latest_structure(b"typed", 11)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn inline_structure_directories_remain_readable_and_writable()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         database.structure_format = super::StructureFormat::InlineStateV1;
         let mut create = database.begin(10, DurabilityClass::Strict)?;
-        create.set(b"legacy".to_vec(), b"v1".to_vec(), Some(50));
+        create.set(b"legacy".to_vec(), b"v1".to_vec(), Some(50))?;
         create.commit()?;
         drop(database);
 
@@ -3252,7 +4123,11 @@ mod tests {
             Some(b"v1".to_vec())
         );
         let mut update = reopened.begin(21, DurabilityClass::Strict)?;
-        update.set(b"legacy".to_vec(), b"v2".to_vec(), None);
+        assert!(matches!(
+            update.create_hash(b"legacy-hash".to_vec()),
+            Err(NativeRuntimeError::LegacyStructureFamilyUnsupported)
+        ));
+        update.set(b"legacy".to_vec(), b"v2".to_vec(), None)?;
         update.commit()?;
         drop(reopened);
 
@@ -3305,6 +4180,27 @@ mod tests {
         assert!(matches!(
             super::decode_structure_value(&noncanonical_persistent, &blobs),
             Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        let metadata = super::encode_hash_metadata(42);
+        assert_eq!(super::decode_hash_metadata(&metadata)?, 42);
+        let mut trailing_metadata = metadata;
+        trailing_metadata.push(0);
+        assert!(matches!(
+            super::decode_hash_metadata(&trailing_metadata),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        assert!(matches!(
+            super::decode_hash_field_value(&reserved, &blobs),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        let identity = super::hash_field_identity(b"hash", b"field")?;
+        assert_eq!(
+            super::decode_hash_field_identity(&identity)?,
+            (b"hash".as_slice(), b"field".as_slice())
+        );
+        assert!(matches!(
+            super::decode_hash_field_identity(&[0, 0, 0, 8, 1]),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
         ));
         Ok(())
     }
@@ -3553,13 +4449,25 @@ mod tests {
             let temporary = TestDirectory::new();
             let mut database = NativeDatabase::create(temporary.path())?;
             let mut seed = stage_vertical(&mut database)?;
-            seed.set(b"remove-on-commit".to_vec(), b"present".to_vec(), None);
+            seed.set(b"remove-on-commit".to_vec(), b"present".to_vec(), None)?;
+            seed.create_hash(b"crash-hash".to_vec())?;
+            seed.hset(
+                b"crash-hash".to_vec(),
+                b"before".to_vec(),
+                b"present".to_vec(),
+            )?;
             seed.commit()?;
             let table = ObjectId::new(1)?;
             let mut batch = database.begin_optimistic(151, DurabilityClass::Strict)?;
             batch.update(table, b"mario".to_vec(), b"optimistic".to_vec())?;
-            assert!(batch.delete_structure(b"remove-on-commit".to_vec()));
-            assert!(batch.expire_structure(b"session".to_vec(), 300));
+            assert!(batch.delete_structure(b"remove-on-commit".to_vec())?);
+            assert!(batch.expire_structure(b"session".to_vec(), 300)?);
+            assert!(batch.hdelete(b"crash-hash".to_vec(), b"before".to_vec())?);
+            batch.hset(
+                b"crash-hash".to_vec(),
+                b"after".to_vec(),
+                b"present".to_vec(),
+            )?;
             assert!(matches!(
                 database.commit_optimistic_with_interruption(batch, boundary),
                 Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
@@ -3587,6 +4495,11 @@ mod tests {
                         Some(b"present".as_slice())
                     );
                     assert_eq!(snapshot.ttl(b"session"), super::Ttl::RemainingMicros(48));
+                    assert_eq!(
+                        snapshot.hget(b"crash-hash", b"before")?,
+                        Some(b"present".as_slice())
+                    );
+                    assert_eq!(snapshot.hget(b"crash-hash", b"after")?, None);
                 }
                 Some(2) => {
                     assert!(matches!(
@@ -3601,6 +4514,11 @@ mod tests {
                     );
                     assert_eq!(snapshot.get(b"remove-on-commit"), None);
                     assert_eq!(snapshot.ttl(b"session"), super::Ttl::RemainingMicros(148));
+                    assert_eq!(snapshot.hget(b"crash-hash", b"before")?, None);
+                    assert_eq!(
+                        snapshot.hget(b"crash-hash", b"after")?,
+                        Some(b"present".as_slice())
+                    );
                 }
                 found => return Err(format!("unexpected recovered CSN: {found:?}").into()),
             }
@@ -3626,7 +4544,7 @@ mod tests {
                 let read_csn = batch.read_csn();
                 first_barrier.wait();
                 batch.update(table, b"mario".to_vec(), b"first".to_vec())?;
-                batch.set(b"first".to_vec(), b"structure".to_vec(), None);
+                batch.set(b"first".to_vec(), b"structure".to_vec(), None)?;
                 batch.index_document(index, b"doc-first".to_vec(), "first writer")?;
                 Ok((batch, read_csn))
             });
@@ -3637,7 +4555,7 @@ mod tests {
                 let read_csn = batch.read_csn();
                 second_barrier.wait();
                 batch.insert(table, b"second".to_vec(), b"row".to_vec())?;
-                batch.set(b"second".to_vec(), b"structure".to_vec(), None);
+                batch.set(b"second".to_vec(), b"structure".to_vec(), None)?;
                 batch.index_document(index, b"doc-second".to_vec(), "second writer")?;
                 Ok((batch, read_csn))
             });
@@ -3718,8 +4636,8 @@ mod tests {
         let mut second = database.begin_optimistic(10, DurabilityClass::Strict)?;
         assert_eq!(first.read_csn(), None);
         assert_eq!(second.read_csn(), None);
-        first.set(b"first".to_vec(), b"one".to_vec(), None);
-        second.set(b"second".to_vec(), b"two".to_vec(), None);
+        first.set(b"first".to_vec(), b"one".to_vec(), None)?;
+        second.set(b"second".to_vec(), b"two".to_vec(), None)?;
         assert_eq!(database.commit_optimistic(first)?.commit_csn.get(), 1);
         assert_eq!(database.commit_optimistic(second)?.commit_csn.get(), 2);
         drop(database);
@@ -4003,7 +4921,7 @@ mod tests {
         let historical = database.snapshot(150)?;
 
         let mut second = database.begin(151, DurabilityClass::Strict)?;
-        second.set(b"second".to_vec(), b"value".to_vec(), None);
+        second.set(b"second".to_vec(), b"value".to_vec(), None)?;
         let receipt = second.commit()?;
         assert_eq!(receipt.commit_csn.get(), 2);
         assert_eq!(historical.get(b"second"), None);

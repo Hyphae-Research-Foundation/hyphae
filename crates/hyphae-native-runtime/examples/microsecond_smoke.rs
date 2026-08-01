@@ -10,8 +10,8 @@ use std::{
 };
 
 use hyphae_native_runtime::{
-    DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, NativeDatabase, NativeTransaction, decode_frame,
-    encode_frame,
+    DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, NativeDatabase, NativeSnapshot, NativeTransaction,
+    PreparedStatement, decode_frame, encode_frame,
 };
 use hyphae_native_types::{DurabilityClass, ObjectId};
 
@@ -22,6 +22,9 @@ const RELATIONAL_SCALE_ROWS: u32 = 2_048;
 const RELATIONAL_TARGET_ROW: u32 = RELATIONAL_SCALE_ROWS / 2;
 const STRUCTURE_SCALE_KEYS: u32 = 2_048;
 const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
+const HASH_SCALE_FIELDS: u32 = 2_048;
+const HASH_TARGET_FIELD: u32 = HASH_SCALE_FIELDS / 2;
+const HASH_KEY: &[u8] = b"benchmark-hash";
 
 struct TemporaryDirectory(PathBuf);
 
@@ -58,9 +61,20 @@ struct Stats {
 struct OperationStats {
     structure: Stats,
     structure_btree: Stats,
+    hash: Stats,
+    hash_btree: Stats,
     prepared_sql: Stats,
     relational_btree: Stats,
     codec_dispatch: Stats,
+}
+
+struct BenchmarkInputs<'a> {
+    prepared: &'a PreparedStatement,
+    table: ObjectId,
+    relational_target: &'a [u8],
+    structure_target: &'a [u8],
+    hash_target: &'a [u8],
+    frame: &'a [u8],
 }
 
 fn seed_scaled_data(
@@ -80,9 +94,85 @@ fn seed_scaled_data(
         let value = vec![key[3] % 251; 64];
         dataset_hasher.update(&key);
         dataset_hasher.update(&value);
-        transaction.set(key.to_vec(), value, None);
+        transaction.set(key.to_vec(), value, None)?;
+    }
+    transaction.create_hash(HASH_KEY.to_vec())?;
+    for field in 0..HASH_SCALE_FIELDS {
+        let field = field.to_be_bytes();
+        let value = vec![field[3] % 251; 64];
+        dataset_hasher.update(&field);
+        dataset_hasher.update(&value);
+        transaction.hset(HASH_KEY.to_vec(), field.to_vec(), value)?;
     }
     Ok(())
+}
+
+fn measure_operations(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    inputs: &BenchmarkInputs<'_>,
+) -> Result<OperationStats, Box<dyn std::error::Error>> {
+    for _ in 0..WARMUP {
+        black_box(snapshot.get(black_box(b"session")));
+        black_box(database.get_latest_structure(black_box(inputs.structure_target), 101)?);
+        black_box(snapshot.hget(black_box(HASH_KEY), black_box(inputs.hash_target))?);
+        black_box(database.hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))?);
+        black_box(
+            snapshot
+                .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))?,
+        );
+        black_box(
+            database.select_latest_relational(inputs.table, black_box(inputs.relational_target))?,
+        );
+        let decoded = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
+        black_box(snapshot.get(black_box(decoded.payload)));
+    }
+
+    Ok(OperationStats {
+        structure: measure(|| {
+            black_box(snapshot.get(black_box(b"session")));
+        }),
+        structure_btree: measure(|| {
+            black_box(
+                database
+                    .get_latest_structure(black_box(inputs.structure_target), 101)
+                    .is_ok(),
+            );
+        }),
+        hash: measure(|| {
+            black_box(
+                snapshot
+                    .hget(black_box(HASH_KEY), black_box(inputs.hash_target))
+                    .is_ok(),
+            );
+        }),
+        hash_btree: measure(|| {
+            black_box(
+                database
+                    .hget_latest_hash(black_box(HASH_KEY), black_box(inputs.hash_target))
+                    .is_ok(),
+            );
+        }),
+        prepared_sql: measure(|| {
+            black_box(
+                snapshot
+                    .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))
+                    .is_ok(),
+            );
+        }),
+        relational_btree: measure(|| {
+            black_box(
+                database
+                    .select_latest_relational(inputs.table, black_box(inputs.relational_target))
+                    .is_ok(),
+            );
+        }),
+        codec_dispatch: measure(|| {
+            if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
+                black_box(snapshot.get(black_box(decoded.payload)));
+            }
+        }),
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,9 +190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.create_relation(table, "accounts")?;
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v4");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v5");
     seed_scaled_data(&mut transaction, table, &mut dataset_hasher)?;
-    transaction.set(b"session".to_vec(), vec![7_u8; 64], None);
+    transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.create_search_index(index, "notes")?;
     transaction.index_document(index, b"doc-1".to_vec(), "native rust search")?;
     transaction.commit()?;
@@ -118,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
     let structure_target = STRUCTURE_TARGET_KEY.to_be_bytes();
+    let hash_target = HASH_TARGET_FIELD.to_be_bytes();
     let frame = encode_frame(
         FrameKind::Structure,
         1,
@@ -126,44 +217,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_MAX_FRAME_PAYLOAD,
     )?;
 
-    for _ in 0..WARMUP {
-        black_box(snapshot.get(black_box(b"session")));
-        black_box(database.get_latest_structure(black_box(&structure_target), 101)?);
-        black_box(snapshot.execute_prepared_binary(&prepared, black_box(&relational_target))?);
-        black_box(database.select_latest_relational(table, black_box(&relational_target))?);
-        let decoded = decode_frame(black_box(&frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
-        black_box(snapshot.get(black_box(decoded.payload)));
-    }
-
-    let structure = measure(|| {
-        black_box(snapshot.get(black_box(b"session")));
-    });
-    let structure_btree = measure(|| {
-        black_box(
-            database
-                .get_latest_structure(black_box(&structure_target), 101)
-                .is_ok(),
-        );
-    });
-    let prepared_sql = measure(|| {
-        black_box(
-            snapshot
-                .execute_prepared_binary(&prepared, black_box(&relational_target))
-                .is_ok(),
-        );
-    });
-    let relational_btree = measure(|| {
-        black_box(
-            database
-                .select_latest_relational(table, black_box(&relational_target))
-                .is_ok(),
-        );
-    });
-    let codec_dispatch = measure(|| {
-        if let Ok(decoded) = decode_frame(black_box(&frame), DEFAULT_MAX_FRAME_PAYLOAD) {
-            black_box(snapshot.get(black_box(decoded.payload)));
-        }
-    });
+    let operations = measure_operations(
+        &database,
+        &snapshot,
+        &BenchmarkInputs {
+            prepared: &prepared,
+            table,
+            relational_target: &relational_target,
+            structure_target: &structure_target,
+            hash_target: &hash_target,
+            frame: &frame,
+        },
+    )?;
     dataset_hasher.update(b"accounts:mario=active;session=64x07;notes:doc-1");
     let dataset_digest = dataset_hasher.finalize();
 
@@ -173,13 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dataset_digest,
         relational_tree_height,
         structure_tree_height,
-        &OperationStats {
-            structure,
-            structure_btree,
-            prepared_sql,
-            relational_btree,
-            codec_dispatch,
-        },
+        &operations,
     );
     Ok(())
 }
@@ -193,7 +252,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v4\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v5\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -217,6 +276,7 @@ fn print_report(
     println!("  \"relational_tree_height\": {relational_tree_height},");
     println!("  \"structure_keys\": {STRUCTURE_SCALE_KEYS},");
     println!("  \"structure_tree_height\": {structure_tree_height},");
+    println!("  \"hash_fields\": {HASH_SCALE_FIELDS},");
     println!("  \"dataset_digest_blake3\": \"{dataset_digest}\",");
     println!("  \"transport_note\": \"codec plus embedded dispatch; no named-pipe transport\",");
     println!("  \"operations\": {{");
@@ -224,6 +284,16 @@ fn print_report(
     print_stats(
         "buffered_structure_btree_get_64b_multilevel",
         operations.structure_btree,
+        true,
+    );
+    print_stats(
+        "embedded_hash_hget_64b_materialized_scaled_snapshot",
+        operations.hash,
+        true,
+    );
+    print_stats(
+        "buffered_hash_hget_64b_multilevel",
+        operations.hash_btree,
         true,
     );
     print_stats(

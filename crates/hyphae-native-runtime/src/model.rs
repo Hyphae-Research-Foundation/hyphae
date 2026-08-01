@@ -37,6 +37,8 @@ pub(crate) enum ModelError {
     DuplicatePrimaryKey,
     #[error("native relational primary key does not exist")]
     MissingPrimaryKey,
+    #[error("legacy native structure state cannot encode collection families")]
+    UnsupportedLegacyStructureFamily,
     #[error("native search document ID already exists")]
     DuplicateDocumentId,
     #[error("native state payload contains a duplicate canonical entry")]
@@ -206,6 +208,7 @@ pub(crate) enum TtlValue {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
+    pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl StructureState {
@@ -240,6 +243,37 @@ impl StructureState {
         self.entries.remove(key)
     }
 
+    pub(crate) fn create_hash(&mut self, key: Vec<u8>) -> bool {
+        if self.entries.contains_key(&key) || self.hashes.contains_key(&key) {
+            return false;
+        }
+        self.hashes.insert(key, BTreeMap::new());
+        true
+    }
+
+    pub(crate) fn hset(&mut self, key: &[u8], field: Vec<u8>, value: Vec<u8>) -> Option<bool> {
+        self.hashes
+            .get_mut(key)
+            .map(|fields| fields.insert(field, value).is_none())
+    }
+
+    pub(crate) fn hget(&self, key: &[u8], field: &[u8]) -> Option<&[u8]> {
+        self.hashes
+            .get(key)
+            .and_then(|fields| fields.get(field))
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn hdelete(&mut self, key: &[u8], field: &[u8]) -> Option<bool> {
+        self.hashes
+            .get_mut(key)
+            .map(|fields| fields.remove(field).is_some())
+    }
+
+    pub(crate) fn hlen(&self, key: &[u8]) -> Option<usize> {
+        self.hashes.get(key).map(BTreeMap::len)
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
         self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
@@ -251,6 +285,9 @@ impl StructureState {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
+        if !self.hashes.is_empty() {
+            return Err(ModelError::UnsupportedLegacyStructureFamily);
+        }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&STRUCTURE_MAGIC);
         put_len(&mut bytes, self.entries.len())?;
@@ -279,7 +316,10 @@ impl StructureState {
             }
         }
         decoder.finish()?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            hashes: BTreeMap::new(),
+        })
     }
 }
 
@@ -529,7 +569,7 @@ impl<'bytes> Decoder<'bytes> {
 mod tests {
     use hyphae_native_types::{EngineKind, ObjectId};
 
-    use super::{CatalogState, RelationState, SearchState, StructureState, TtlValue};
+    use super::{CatalogState, ModelError, RelationState, SearchState, StructureState, TtlValue};
 
     #[test]
     fn every_engine_state_has_a_canonical_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -582,5 +622,32 @@ mod tests {
         assert_eq!(structures.get(b"k", 10), None);
         assert_eq!(structures.ttl_micros(b"k", 9), Some(TtlValue::Remaining(1)));
         assert_eq!(structures.ttl_micros(b"k", 10), None);
+    }
+
+    #[test]
+    fn hashes_are_typed_and_field_mutations_track_cardinality() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"profile".to_vec()));
+        assert!(!structures.create_hash(b"profile".to_vec()));
+        assert_eq!(
+            structures.hset(b"profile", b"name".to_vec(), b"Mario".to_vec()),
+            Some(true)
+        );
+        assert_eq!(
+            structures.hset(b"profile", b"name".to_vec(), b"mario".to_vec()),
+            Some(false)
+        );
+        assert_eq!(
+            structures.hget(b"profile", b"name"),
+            Some(b"mario".as_slice())
+        );
+        assert_eq!(structures.hlen(b"profile"), Some(1));
+        assert_eq!(structures.hdelete(b"profile", b"missing"), Some(false));
+        assert_eq!(structures.hdelete(b"profile", b"name"), Some(true));
+        assert_eq!(structures.hlen(b"profile"), Some(0));
+        assert!(matches!(
+            structures.encode(),
+            Err(ModelError::UnsupportedLegacyStructureFamily)
+        ));
     }
 }

@@ -148,8 +148,9 @@ reference it.
 The first relational route uses an 8,192-byte threshold and stores a one-byte
 value envelope inside the row column: `0` followed by inline bytes, or `1`
 followed by the fixed 56-byte blob reference. The first structure B+tree uses
-the same threshold inside its versioned TTL/storage envelope. Identical content
-across both engines resolves to the same immutable blob. Blob files are named
+the same threshold inside its versioned TTL/storage envelope, including
+persistent native hash fields. Identical content across relational rows,
+scalars, and hash fields resolves to the same immutable blob. Blob files are named
 `blobs/<lowercase BLAKE3 digest>.hyblob`; canonical stages are
 `tmp/blobs/<digest>.tmp`.
 

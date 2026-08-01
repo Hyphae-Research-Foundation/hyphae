@@ -127,13 +127,18 @@ namespace:
 |---:|---|---|
 | `0x00` | exact one-byte format key | ASCII `HYSTRBT1` |
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
+| `0x02` | prefix + binary hash key | `HYHSHM01` live-field count |
+| `0x03` | prefix + length-delimited hash key + field | persistent `HYSTRV01` field envelope |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
 `EXPIRE`, and `DELETE` rewrite only their copy-on-write leaf-to-root paths;
 `DELETE` stores the canonical scalar tombstone. Direct current reads traverse
-the buffer pool. The current implementation has no range/prefix cursor, expiry
-index/timing wheel, expected-version response, or collection-family layout yet.
+the buffer pool. Hash field changes rewrite their own field path plus the small
+hash metadata path rather than a whole serialized map. The current
+implementation has no range/prefix cursor, expiry index/timing wheel,
+expected-version response, whole-hash deletion, or layouts for the remaining
+collection families.
 
 ## Verification
 

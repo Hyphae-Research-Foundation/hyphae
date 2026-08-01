@@ -89,9 +89,15 @@ non-`i64::MAX` expiry as present. Unknown flag bits fail closed.
 
 Current opcodes are relational `CREATE TABLE=1`, `INSERT ROW=2`, `UPDATE
 ROW=6`, `DELETE ROW=7`; structure `SET VALUE=3`, `DELETE VALUE=8`, `EXPIRE
-VALUE=9`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`
-requires an empty value and no expiry. `EXPIRE VALUE` requires an explicit
-expiry and carries the retained logical value.
+VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`, `DELETE HASH FIELD=12`; and
+search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`, `CREATE HASH`, and
+`DELETE HASH FIELD` require an empty value and no expiry. `EXPIRE VALUE`
+requires an explicit expiry and carries the retained logical value.
+
+Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
+field bytes as their mutation key. The decoder rejects truncated identities.
+This makes first-committer-wins field-granular while keeping creation of a hash
+on the same write key as scalar creation.
 
 `COMMIT` contains:
 
@@ -118,12 +124,13 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 60 | 32 | ordered mutation-set BLAKE3 digest |
 | 92 | 32 | four little-endian root page IDs |
 
-The current relational and structure `SET`/`EXPIRE` mutation bodies store
-values at or below 8,192 bytes inline. Larger values are promoted to the shared
-immutable blob namespace first. The WAL stores the relational one-byte envelope
-or the structure `HYSTRV01` envelope with its 56-byte reference instead of
-duplicating large content. A structure `DELETE` keeps its WAL value empty; page
-construction publishes the canonical `HYSTRV01` tombstone.
+The current relational, scalar `SET`/`EXPIRE`, and hash-field `HSET` mutation
+bodies store values at or below 8,192 bytes inline. Larger values are promoted
+to the shared immutable blob namespace first. The WAL stores the relational
+one-byte envelope or the structure `HYSTRV01` envelope with its 56-byte
+reference instead of duplicating large content. A structure or hash-field
+delete keeps its WAL value empty; page construction publishes the canonical
+`HYSTRV01` tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 

@@ -43,6 +43,9 @@ pub(crate) enum Opcode {
     DeleteRow = 7,
     DeleteValue = 8,
     ExpireValue = 9,
+    CreateHash = 10,
+    SetHashField = 11,
+    DeleteHashField = 12,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -480,16 +483,8 @@ struct ActiveTransaction {
     mutations: Vec<(Mutation, Vec<u8>)>,
 }
 
-fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSemanticError> {
-    if body.len() < 44
-        || body.get(..8) != Some(MUTATION_MAGIC.as_slice())
-        || body[9] != engine as u8
-        || body[10] & !MUTATION_HAS_EXPIRY != 0
-        || body[11] != 0
-    {
-        return Err(WalSemanticError::InvalidBody);
-    }
-    let (opcode, opcode_engine) = match body[8] {
+fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
+    Ok(match value {
         value if value == Opcode::CreateTable as u8 => {
             (Opcode::CreateTable, EngineKind::Relational)
         }
@@ -499,12 +494,31 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
+        value if value == Opcode::CreateHash as u8 => (Opcode::CreateHash, EngineKind::Structure),
+        value if value == Opcode::SetHashField as u8 => {
+            (Opcode::SetHashField, EngineKind::Structure)
+        }
+        value if value == Opcode::DeleteHashField as u8 => {
+            (Opcode::DeleteHashField, EngineKind::Structure)
+        }
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
         }
         _ => return Err(WalSemanticError::InvalidBody),
-    };
+    })
+}
+
+fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSemanticError> {
+    if body.len() < 44
+        || body.get(..8) != Some(MUTATION_MAGIC.as_slice())
+        || body[9] != engine as u8
+        || body[10] & !MUTATION_HAS_EXPIRY != 0
+        || body[11] != 0
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    let (opcode, opcode_engine) = decode_opcode(body[8])?;
     if opcode_engine != engine {
         return Err(WalSemanticError::InvalidBody);
     }
@@ -532,7 +546,14 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         (raw_expiry != i64::MAX).then_some(raw_expiry)
     };
     match opcode {
-        Opcode::SetValue | Opcode::DeleteValue | Opcode::ExpireValue if target.is_some() => {
+        Opcode::SetValue
+        | Opcode::DeleteValue
+        | Opcode::ExpireValue
+        | Opcode::CreateHash
+        | Opcode::SetHashField
+        | Opcode::DeleteHashField
+            if target.is_some() =>
+        {
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::CreateTable
@@ -546,24 +567,49 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::DeleteRow if value_length != 0 => return Err(WalSemanticError::InvalidBody),
-        Opcode::DeleteValue if value_length != 0 || expires_at_micros.is_some() => {
+        Opcode::DeleteValue | Opcode::CreateHash | Opcode::DeleteHashField
+            if value_length != 0 || expires_at_micros.is_some() =>
+        {
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::ExpireValue if expires_at_micros.is_none() => {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        Opcode::SetHashField if expires_at_micros.is_some() => {
             return Err(WalSemanticError::InvalidBody);
         }
         _ => {}
     }
     let key_start = 44;
     let value_start = key_start + key_length;
+    let key = &body[key_start..value_start];
+    if matches!(opcode, Opcode::SetHashField | Opcode::DeleteHashField)
+        && !valid_hash_field_identity(key)
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
     Ok(Mutation {
         engine,
         opcode,
         target,
-        key: body[key_start..value_start].to_vec(),
+        key: key.to_vec(),
         value: body[value_start..expected].to_vec(),
         expires_at_micros,
     })
+}
+
+fn valid_hash_field_identity(encoded: &[u8]) -> bool {
+    let Some(length_bytes) = encoded.get(..4) else {
+        return false;
+    };
+    let mut length = [0_u8; 4];
+    length.copy_from_slice(length_bytes);
+    let Ok(hash_length) = usize::try_from(u32::from_be_bytes(length)) else {
+        return false;
+    };
+    4_usize
+        .checked_add(hash_length)
+        .is_some_and(|field_start| field_start <= encoded.len())
 }
 
 fn mutation_digest<'body>(
@@ -646,6 +692,8 @@ mod tests {
     fn complete_transaction_round_trips_through_physical_wal()
     -> Result<(), Box<dyn std::error::Error>> {
         let transaction_id = TransactionId::new(1)?;
+        let mut hash_field = 4_u32.to_be_bytes().to_vec();
+        hash_field.extend_from_slice(b"hashfield");
         let mutations = vec![
             Mutation {
                 engine: EngineKind::Relational,
@@ -680,6 +728,30 @@ mod tests {
                 expires_at_micros: None,
             },
             Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::CreateHash,
+                target: None,
+                key: b"hash".to_vec(),
+                value: Vec::new(),
+                expires_at_micros: None,
+            },
+            Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::SetHashField,
+                target: None,
+                key: hash_field.clone(),
+                value: b"value".to_vec(),
+                expires_at_micros: None,
+            },
+            Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::DeleteHashField,
+                target: None,
+                key: hash_field,
+                value: Vec::new(),
+                expires_at_micros: None,
+            },
+            Mutation {
                 engine: EngineKind::Search,
                 opcode: Opcode::IndexDocument,
                 target: Some(ObjectId::new(2)?),
@@ -710,7 +782,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 5);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 8);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
