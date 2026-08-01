@@ -110,6 +110,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native primary-key range evidence — 2026-08-01](gates/evidence/native-primary-key-ranges-2026-08-01.md)
 - [Native SQL residual-filter evidence — 2026-08-01](gates/evidence/native-sql-residual-filters-2026-08-01.md)
 - [Native SQL scalar-literal evidence — 2026-08-01](gates/evidence/native-sql-scalar-literals-2026-08-01.md)
+- [Native SQL mutation-literal evidence — 2026-08-01](gates/evidence/native-sql-mutation-literals-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),
