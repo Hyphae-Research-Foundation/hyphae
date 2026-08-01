@@ -6,7 +6,8 @@ exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 direct current-root prepared primary/secondary lookup, exact-primary-key typed
 `UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
 rollback, and the parameterized residual-filter slice below are implemented
-experimentally. G2 remains open
+experimentally. The first catalog-bound scalar literal slice is also
+implemented for `SELECT` filters. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -76,21 +77,28 @@ semantics: inverted and empty ranges return no rows rather than raising or
 panicking. Equality predicates retain their exact point/index access contract
 when they cover a complete primary or secondary key.
 
-The residual-filter slice admits parameterized scalar predicates:
+The residual-filter slice admits parameterized and literal scalar predicates:
 
 ```text
 <filter> ::= <filter> OR <term> | <term>
 <term> ::= <term> AND <factor> | <factor>
 <factor> ::= NOT <factor> | ( <filter> ) | <predicate>
-<predicate> ::= <column> { = | <> | != | < | <= | > | >= } ?
+<predicate> ::= <column> { = | <> | != | < | <= | > | >= } <scalar>
               | <column> IS [NOT] NULL
+<scalar> ::= ? | NULL | TRUE | FALSE | <signed-integer> | <text-literal>
 ```
 
 `NOT` binds tighter than `AND`, and `AND` binds tighter than `OR`. Parentheses
 override that precedence. Complete-primary-key row comparisons remain admitted
 only as top-level `AND` range terms; they are not general row expressions.
-Literals, casts, arithmetic, functions, and column-to-column comparisons remain
-outside this milestone.
+Text literals use single quotes and double an embedded quote (`'Mario''s'`).
+Boolean, text, and integer literals bind only to the same catalog logical
+family. Integer range/domain checks use the declared signed/unsigned width.
+SQL `NULL` is admissible for every comparison and evaluates to `UNKNOWN`.
+Decimal/floating/binary/temporal/UUID/JSON literals, casts, arithmetic,
+functions, and column-to-column comparisons remain outside this milestone.
+This literal slice applies to `SELECT` filters; mutation value lists remain
+parameter-only.
 
 The binder may extract complete primary-key equality, one complete
 secondary-index equality, or complete-primary-key lower/upper bounds from
@@ -155,7 +163,8 @@ integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
-literals, casts, partial primary-key prefix ranges, secondary ranges,
+remaining literal families, casts, partial primary-key prefix ranges,
+secondary ranges,
 descending scans, offsets, and constraints beyond primary key/nullability and
 the first unique index remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate expressions,

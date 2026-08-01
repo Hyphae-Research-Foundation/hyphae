@@ -7869,7 +7869,7 @@ mod tests {
 
     fn seed_residual_filter_rows(
         database: &mut NativeDatabase,
-    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+    ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
         let mut seed = database.begin_sql(20, DurabilityClass::Strict)?;
         let created = seed.execute_sql(
             "CREATE TABLE events (
@@ -7890,7 +7890,7 @@ mod tests {
         };
         let rows = [
             (1_i64, "alpha", 10_i64, SqlValue::Null, false),
-            (2, "alpha", 20, SqlValue::Text("low".to_owned()), false),
+            (2, "alpha", 20, SqlValue::Text("Mario's".to_owned()), false),
             (3, "alpha", 30, SqlValue::Null, true),
             (4, "beta", 40, SqlValue::Text("keep".to_owned()), false),
             (5, "beta", 50, SqlValue::Null, true),
@@ -7910,9 +7910,16 @@ mod tests {
                 ],
             )?;
         }
-        seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?;
+        let created = seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing residual-filter index identity".into());
+        };
         seed.commit()?;
-        Ok(table)
+        Ok((table, index))
     }
 
     fn residual_range_parameters() -> [SqlValue; 3] {
@@ -8047,7 +8054,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
-        let table = seed_residual_filter_rows(&mut database)?;
+        let (table, _) = seed_residual_filter_rows(&mut database)?;
         let parameters = residual_range_parameters();
         let expected = expected_residual_range();
 
@@ -8073,6 +8080,135 @@ mod tests {
         assert_eq!(
             reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
             expected
+        );
+        Ok(())
+    }
+
+    fn assert_literal_access_plans(
+        database: &mut NativeDatabase,
+        table: ObjectId,
+        index: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut explain = database.begin_sql(21, DurabilityClass::Strict)?;
+        for (statement, expected) in [
+            (
+                "EXPLAIN SELECT id FROM events
+                 WHERE id >= 2 AND active = TRUE
+                 ORDER BY id LIMIT 2",
+                format!(
+                    "PrimaryKeyRangeScan(table={table},lower=inclusive,\
+                     upper=unbounded,limit=2,residual=true)"
+                ),
+            ),
+            (
+                "EXPLAIN SELECT id FROM events
+                 WHERE tenant = 'alpha' AND active = TRUE",
+                format!("SecondaryIndexLookup(table={table},index={index},residual=true)"),
+            ),
+        ] {
+            assert_eq!(
+                explain.execute_sql(statement, &[])?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(expected)]],
+                }
+            );
+        }
+        explain.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn typed_filter_literals_bind_to_catalog_and_reuse_physical_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, index) = seed_residual_filter_rows(&mut database)?;
+
+        let literal_range = database.prepare_sql_latest(
+            "SELECT id, note FROM events
+             WHERE id >= 2
+               AND active = TRUE
+               AND (note IS NULL OR score > 45)
+             ORDER BY id LIMIT 2",
+        )?;
+        assert_eq!(
+            database.execute_prepared_latest(&literal_range, &[])?,
+            expected_residual_range()
+        );
+        let materialized = database.snapshot(22)?;
+        let materialized_plan = materialized.prepare_sql(
+            "SELECT id, note FROM events
+             WHERE id >= 2
+               AND active = TRUE
+               AND (note IS NULL OR score > 45)
+             ORDER BY id LIMIT 2",
+        )?;
+        assert_eq!(
+            materialized.execute_prepared(&materialized_plan, &[])?,
+            expected_residual_range()
+        );
+        assert_literal_access_plans(&mut database, table, index)?;
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest(
+                    "SELECT id FROM events WHERE tenant = 'alpha' AND active = TRUE"
+                )?,
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(3)]],
+            }
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest(
+                    "SELECT id FROM events WHERE note = 'Mario''s' ORDER BY id LIMIT 1"
+                )?,
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(2)]],
+            }
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest("SELECT id FROM events WHERE id = NULL")?,
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT id FROM events WHERE active = 1 LIMIT 1"),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT id FROM events WHERE id = '2'"),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT id FROM events WHERE id = 9223372036854775808"),
+            Err(SqlError::TypeMismatch)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(
+            "SELECT id FROM events
+             WHERE id >= -2 AND active = TRUE
+             ORDER BY id LIMIT 2",
+        )?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[])?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(3)], vec![SqlValue::Signed(5)],],
+            }
         );
         Ok(())
     }
