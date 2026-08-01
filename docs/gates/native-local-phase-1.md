@@ -84,10 +84,13 @@ boundaries, and a clean height-two B+tree latency observation.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
-values use native immutable blobs. Catalog, structure, and search state remain
-bounded single-page scaffolding; current-root version chains, concurrent
-writers, secondary indexes, scalable structures, postings, segments, and ANN
-remain required by G1–G4.
+values use native immutable blobs. The current implementation also retains
+explicit per-key row-version chains with closed half-open intervals while
+keeping V1 inline-row directories compatible; exact commit-bound evidence for
+that follow-on is still pending. Catalog, structure, and search state remain
+bounded single-page scaffolding; concurrent writers, retention/vacuum,
+secondary indexes, scalable structures, postings, segments, and ANN remain
+required by G1–G4.
 
 ## G1 substrate exit
 

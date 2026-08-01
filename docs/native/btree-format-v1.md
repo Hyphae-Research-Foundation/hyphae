@@ -3,7 +3,8 @@
 Status: normative experimental format; copy-on-write insertion, replacement,
 recursive splitting, point lookup, ordered scan, complete validation,
 balanced-height validation, historical roots, and allocation-free
-buffer-pool node traversal are implemented
+buffer-pool node traversal are implemented; the relational namespace now
+supports an explicit row-version-pointer format
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -84,16 +85,15 @@ No published page is changed in place. Pages appended by an interrupted
 transaction remain unreachable until a WAL-committed root set names the new
 root.
 
-## Current relational namespace
+## Relational namespaces
 
-The first relational vertical uses one tree root and these private key
-namespaces:
+The relational vertical uses one tree root and these private key namespaces:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact one-byte format key | ASCII `HYRELBT1` |
+| `0x00` | exact one-byte format key | ASCII `HYRELBT1` or `HYRELBT2` |
 | `0x01` | prefix + 128-bit big-endian table `ObjectId` | empty table marker |
-| `0x02` | prefix + table `ObjectId` + primary-key bytes | canonical MVCC row record |
+| `0x02` | prefix + table `ObjectId` + primary-key bytes | format-specific row value |
 
 The table marker preserves an empty table. A row record currently contains the
 primary-key bytes and binary row payload as two catalog-ordered columns. The
@@ -101,12 +101,21 @@ row payload column contains the runtime's inline-or-blob envelope. The runtime
 verifies the duplicated primary key, content-derived `RowId`, MVCC visibility,
 blob reference/content, and row codec before returning a value.
 
-This namespace is the first physical relational route, not the complete SQL
-storage design. UPDATE replaces the current key under a new immutable root and
-DELETE installs a canonical row tombstone; historical snapshots retain their
-prior roots. Explicit version-chain pages under the current root, closed
-superseded `end_csn` values, secondary indexes, range cursors, prefix
-compression, bulk load, free-space policy, and scan-oriented column batches
+`HYRELBT1` stores the canonical MVCC row directly as the B+tree value. It
+remains supported for open, read, mutation, and recovery. `HYRELBT2` stores the
+fixed `HYROWP01` pointer described in
+[Native page, row, and blob format v1](page-row-blob-format-v1.md). New data
+directories use `HYRELBT2`; no implicit in-place conversion rewrites an
+existing V1 directory.
+
+Under V2, UPDATE and DELETE append immutable version-chain pages and replace
+only the B+tree pointer under a new copy-on-write root. Superseded copies carry
+closed `end_csn` values and tombstones are ordinary open versions. Historical
+snapshots retain their prior roots.
+
+This namespace remains the first physical relational route, not the complete
+SQL storage design. Secondary indexes, range cursors, prefix compression, bulk
+load, free-space policy, scan-oriented column batches, retention, and vacuum
 remain pending.
 
 ## Verification

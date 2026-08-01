@@ -2,8 +2,9 @@
 
 Status: normative target contract; page codec, append-only page file, tail
 repair, partitioned buffer pool, canonical MVCC row codec, fixed blob
-reference, B+tree-backed row persistence, and the first immutable
-content-addressed blob byte store are implemented experimentally
+reference, B+tree-backed row persistence, immutable row-version chains, and
+the first immutable content-addressed blob byte store are implemented
+experimentally
 
 The native substrate uses fixed-size copy-on-write pages and separate
 content-addressed blobs. No target-path page is a Redb page.
@@ -96,6 +97,37 @@ window, null-bit, offset, and tombstone invariants without allocating column
 vectors. A pinned B+tree leaf can therefore be decoded and filtered before the
 selected logical value is copied.
 
+## Relational row-version chain
+
+A relational B+tree using marker `HYRELBT2` stores this exact 16-byte value for
+each logical primary key:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYROWP01` |
+| 8 | 8 | latest version-chain `PageId`, little-endian and nonzero |
+
+The pointed page has native page kind `3`, contains exactly one canonical row
+record, and uses the page header's `next` field to reference the immediately
+older version. The newest page is open-ended, has `creating_csn = begin_csn`,
+and has the content-derived `RowId` for the table and primary key. Every older
+page is closed: its `end_csn` equals the newer version's `begin_csn`, and its
+page `creating_csn` equals that closing CSN. Consequently begin CSNs decrease
+strictly while traversing `next`.
+
+An update or delete never changes a published page. It appends a closed copy of
+the previously open record, appends the new open row or tombstone, and publishes
+a new B+tree pointer. Multiple rewrites of one key within one transaction
+coalesce into one open version for that commit CSN. An older retained root
+continues to point to its original open record, while the current root exposes
+the complete closed chain.
+
+Readers reject a wrong page kind, pointer, row identity, future page, cycle,
+noncontiguous interval, or malformed row. Recovery traverses and validates the
+entire reachable chain, including every referenced blob, even after finding
+the visible version. Direct current-root reads use pinned pages and a bounded
+stack cycle detector, allocating a set only beyond 64 versions.
+
 ## Variable-length and blob values
 
 Values up to a catalog-configured inline threshold remain in the row or
@@ -175,12 +207,14 @@ pending; they are target requirements, not current claims.
 ## Verification
 
 Current evidence includes stable page, row, blob-reference, complete blob-file,
-B+tree-leaf, and root-manifest encodings; exact row and blob round trips;
-malformed null/offset/window rejection; complete-blob corruption rejection;
-page tail repair; buffer-pool pin/eviction tests; copy-on-write historical
-roots; deduplication; and blob-promotion and checkpoint interruption tests.
+row-version-pointer, B+tree-leaf, and root-manifest encodings; exact row and
+blob round trips; malformed null/offset/window rejection; complete-blob
+corruption rejection; version-chain cycle rejection; page tail repair;
+buffer-pool pin/eviction tests; copy-on-write historical roots; deduplication;
+and blob-promotion and checkpoint interruption tests.
 
 Still required are broad random/property and fuzz corpora, bit flips across
 every byte range, streaming/chunked values, compression, encryption,
 reference-count/retention tests across snapshots, orphan reclamation, and
-large-corpus garbage collection.
+large-corpus garbage collection. Version-chain vacuum and retention policy are
+also pending.

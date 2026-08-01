@@ -34,9 +34,10 @@ The first implementation slice is one fixed binary table shape, primary-key
 primary_key = ?`, prepared parameterized point `SELECT`, `BEGIN`, `COMMIT`,
 and `ROLLBACK`. Updates publish a new copy-on-write root; deletes publish a
 canonical tombstone. Retained snapshots continue to resolve their historical
-roots. The current root does not yet retain an explicit per-key physical
-version chain or close the superseded row's `end_csn`; vacuum and chain
-traversal remain pending. This slice does not close relational gate G2.
+roots. New directories retain an explicit per-key physical version chain under
+the current root and close each superseded copy's `end_csn`; the earlier
+inline-row directory format remains supported. Retention and vacuum remain
+pending. This slice does not close relational gate G2.
 
 ## Null and boolean semantics
 

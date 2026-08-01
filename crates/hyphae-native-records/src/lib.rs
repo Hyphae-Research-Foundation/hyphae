@@ -2,16 +2,19 @@
 
 //! Canonical committed-row and immutable blob-reference codecs.
 
-use hyphae_native_types::{BlobId, Csn, RowId};
+use hyphae_native_types::{BlobId, Csn, PageId, RowId};
 use thiserror::Error;
 
 /// Fixed committed-row header size before null bits and offsets.
 pub const ROW_HEADER_SIZE: usize = 40;
 /// Encoded immutable blob-reference size.
 pub const BLOB_REFERENCE_SIZE: usize = 56;
+/// Encoded B+tree locator for one latest row-version page.
+pub const ROW_VERSION_POINTER_SIZE: usize = 16;
 
 const TOMBSTONE_FLAG: u16 = 1;
 const OPEN_END_CSN: u64 = u64::MAX;
+const ROW_VERSION_POINTER_MAGIC: &[u8; 8] = b"HYROWP01";
 
 /// Row or blob-reference codec failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -55,6 +58,9 @@ pub enum RecordError {
     /// Blob reference does not have its exact fixed length.
     #[error("native blob reference must be exactly {BLOB_REFERENCE_SIZE} bytes")]
     InvalidBlobReferenceLength,
+    /// Row-version pointer has the wrong length, magic, or page identity.
+    #[error("native row-version pointer is invalid")]
+    InvalidRowVersionPointer,
 }
 
 /// Borrowed logical value for one catalog-ordered row column.
@@ -74,6 +80,39 @@ pub struct RowRecord {
     end_csn: Option<Csn>,
     tombstone: bool,
     values: Vec<Option<Vec<u8>>>,
+}
+
+/// Fixed B+tree value pointing to the latest immutable row-version page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowVersionPointer {
+    /// Latest version-chain page.
+    pub page_id: PageId,
+}
+
+impl RowVersionPointer {
+    /// Encodes the exact 16-byte row-version pointer.
+    pub fn encode(self) -> [u8; ROW_VERSION_POINTER_SIZE] {
+        let mut encoded = [0_u8; ROW_VERSION_POINTER_SIZE];
+        encoded[0..8].copy_from_slice(ROW_VERSION_POINTER_MAGIC);
+        encoded[8..16].copy_from_slice(&self.page_id.get().to_le_bytes());
+        encoded
+    }
+
+    /// Decodes one exact row-version pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong length, magic, or zero page identity.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        if bytes.len() != ROW_VERSION_POINTER_SIZE
+            || bytes.get(..8) != Some(ROW_VERSION_POINTER_MAGIC.as_slice())
+        {
+            return Err(RecordError::InvalidRowVersionPointer);
+        }
+        let page_id = PageId::new(read_u64(&bytes[8..16]))
+            .map_err(|_| RecordError::InvalidRowVersionPointer)?;
+        Ok(Self { page_id })
+    }
 }
 
 /// Borrowed validated view over one canonical MVCC row record.
@@ -355,6 +394,24 @@ impl RowRecord {
         self.begin_csn <= visible && self.end_csn.is_none_or(|end| visible < end)
     }
 
+    /// Closes an open immutable version at the supplied later CSN.
+    ///
+    /// The returned record is a new value; the source record is consumed and
+    /// no published bytes are changed in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this version is already closed or `end_csn` does
+    /// not form a valid half-open interval.
+    pub fn close_at(mut self, end_csn: Csn) -> Result<Self, RecordError> {
+        if self.end_csn.is_some() {
+            return Err(RecordError::InvalidVersionWindow);
+        }
+        validate_window(self.begin_csn, Some(end_csn))?;
+        self.end_csn = Some(end_csn);
+        Ok(self)
+    }
+
     /// Encodes one exact canonical row record.
     ///
     /// # Errors
@@ -552,8 +609,8 @@ mod tests {
     use hyphae_native_types::{BlobId, Csn, RowId};
 
     use super::{
-        BLOB_REFERENCE_SIZE, BlobReference, ColumnValueRef, ROW_HEADER_SIZE, RecordError,
-        RowRecord, RowRecordView,
+        BLOB_REFERENCE_SIZE, BlobReference, ColumnValueRef, ROW_HEADER_SIZE,
+        ROW_VERSION_POINTER_SIZE, RecordError, RowRecord, RowRecordView, RowVersionPointer,
     };
 
     #[test]
@@ -682,6 +739,34 @@ mod tests {
         assert_eq!(
             BlobReference::decode(&encoded[..BLOB_REFERENCE_SIZE - 1]),
             Err(RecordError::InvalidBlobReferenceLength)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn row_version_pointer_and_closed_copy_are_canonical() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pointer = RowVersionPointer {
+            page_id: hyphae_native_types::PageId::new(42)?,
+        };
+        let encoded = pointer.encode();
+        assert_eq!(encoded.len(), ROW_VERSION_POINTER_SIZE);
+        assert_eq!(&encoded[..8], b"HYROWP01");
+        assert_eq!(&encoded[8..], &42_u64.to_le_bytes());
+        assert_eq!(RowVersionPointer::decode(&encoded)?, pointer);
+
+        let open = RowRecord::new(
+            RowId::new(2)?,
+            Csn::new(3)?,
+            None,
+            vec![Some(b"row".to_vec())],
+        )?;
+        let closed = open.close_at(Csn::new(5)?)?;
+        assert_eq!(closed.begin_csn(), Csn::new(3)?);
+        assert_eq!(closed.end_csn(), Some(Csn::new(5)?));
+        assert_eq!(
+            closed.clone().close_at(Csn::new(6)?),
+            Err(RecordError::InvalidVersionWindow)
         );
         Ok(())
     }

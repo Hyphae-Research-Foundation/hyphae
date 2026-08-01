@@ -19,7 +19,7 @@ pub use local_protocol::{
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -36,7 +36,9 @@ use hyphae_native_mvcc::{
     WalAnchor, WriteConflict, WriteKey,
 };
 use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
-use hyphae_native_records::{BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView};
+use hyphae_native_records::{
+    BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView, RowVersionPointer,
+};
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
     ManifestGeneration, ObjectId, PageId, RowId, TransactionId,
@@ -55,7 +57,8 @@ use crate::{
 const PAGE_FILE: &str = "pages.hydb";
 const WAL_FILE: &str = "wal.hywal";
 const RELATIONAL_FORMAT_KEY: &[u8] = b"\x00";
-const RELATIONAL_FORMAT_VALUE: &[u8] = b"HYRELBT1";
+const RELATIONAL_FORMAT_VALUE_V1: &[u8] = b"HYRELBT1";
+const RELATIONAL_FORMAT_VALUE_V2: &[u8] = b"HYRELBT2";
 const RELATIONAL_TABLE_PREFIX: u8 = 1;
 const RELATIONAL_ROW_PREFIX: u8 = 2;
 const RELATIONAL_VALUE_INLINE: u8 = 0;
@@ -80,6 +83,29 @@ const SLOT_SEARCH: RootSlot = RootSlot {
     partition: 0,
 };
 const ROOT_SLOTS: [RootSlot; 4] = [SLOT_CATALOG, SLOT_RELATIONAL, SLOT_STRUCTURE, SLOT_SEARCH];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelationalFormat {
+    InlineRowV1,
+    VersionChainV2,
+}
+
+impl RelationalFormat {
+    const fn marker(self) -> &'static [u8] {
+        match self {
+            Self::InlineRowV1 => RELATIONAL_FORMAT_VALUE_V1,
+            Self::VersionChainV2 => RELATIONAL_FORMAT_VALUE_V2,
+        }
+    }
+
+    fn decode(marker: &[u8]) -> Result<Self, NativeRuntimeError> {
+        match marker {
+            RELATIONAL_FORMAT_VALUE_V1 => Ok(Self::InlineRowV1),
+            RELATIONAL_FORMAT_VALUE_V2 => Ok(Self::VersionChainV2),
+            _ => Err(NativeRuntimeError::InvalidRelationalTree),
+        }
+    }
+}
 
 /// Native runtime or recovery failure.
 #[derive(Debug, Error)]
@@ -400,6 +426,7 @@ pub struct NativeDatabase {
     manifests: RootManifestStore,
     coordinator: CommitCoordinator,
     conflicts: ConflictTable,
+    relational_format: RelationalFormat,
     next_transaction_id: u128,
     last_checkpoint_lsn: Option<Lsn>,
     recovery: RecoveryReport,
@@ -435,6 +462,7 @@ impl NativeDatabase {
             manifests,
             coordinator,
             conflicts: ConflictTable::default(),
+            relational_format: RelationalFormat::VersionChainV2,
             next_transaction_id: 1,
             last_checkpoint_lsn: None,
             recovery: RecoveryReport {
@@ -508,6 +536,11 @@ impl NativeDatabase {
             &manifest_recovery.manifests,
             &committed_roots,
         )?;
+        let relational_format = latest_root
+            .as_ref()
+            .map(|root| relational_format_for_root(&opened_pages.store, root))
+            .transpose()?
+            .unwrap_or(RelationalFormat::VersionChainV2);
         let coordinator = if let Some(root) = latest_root {
             CommitCoordinator::restore(root)?
         } else {
@@ -536,6 +569,7 @@ impl NativeDatabase {
             manifests,
             coordinator,
             conflicts,
+            relational_format,
             next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
             recovery: RecoveryReport {
@@ -598,13 +632,14 @@ impl NativeDatabase {
         )?;
         encoded
             .map(|encoded| {
-                decode_relational_row(
-                    table,
-                    primary_key,
-                    encoded.bytes(),
-                    snapshot.visible_csn,
-                    &self.blobs,
-                )
+                let context = RelationalReadContext {
+                    pages: &self.pages,
+                    pool: &self.buffer_pool,
+                    blobs: &self.blobs,
+                    format: self.relational_format,
+                    visible_csn: snapshot.visible_csn,
+                };
+                decode_relational_value_cached(&context, table, primary_key, encoded.bytes())
             })
             .transpose()
             .map(Option::flatten)
@@ -645,6 +680,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
             root_transaction,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
@@ -764,6 +800,7 @@ pub struct NativeTransaction<'database> {
     blobs: &'database mut BlobStore,
     wal: &'database mut WalFile,
     conflicts: &'database mut ConflictTable,
+    relational_format: RelationalFormat,
     root_transaction: RootTransaction<'database>,
     transaction_id: TransactionId,
     next_transaction_id: &'database mut u128,
@@ -1091,6 +1128,7 @@ impl NativeTransaction<'_> {
             roots[1] = relational_tree_after_mutations(
                 self.pages,
                 roots[1],
+                self.relational_format,
                 commit_csn,
                 &self.mutations,
                 &blob_references,
@@ -1334,6 +1372,7 @@ fn wal_mutations(
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
+    format: RelationalFormat,
     creating_csn: Csn,
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -1345,7 +1384,7 @@ fn relational_tree_after_mutations(
                 pages,
                 creating_csn,
                 RELATIONAL_FORMAT_KEY.to_vec(),
-                RELATIONAL_FORMAT_VALUE.to_vec(),
+                format.marker().to_vec(),
             )?
             .tree;
     }
@@ -1368,9 +1407,8 @@ fn relational_tree_after_mutations(
             }
             _ => return Err(NativeRuntimeError::InvalidRelationalTree),
         };
-        let value = if mutation.opcode == Opcode::DeleteRow {
+        let row = if mutation.opcode == Opcode::DeleteRow {
             RowRecord::tombstone(relational_row_id(table, &mutation.key)?, creating_csn, None)?
-                .encode()?
         } else {
             RowRecord::new(
                 relational_row_id(table, &mutation.key)?,
@@ -1381,11 +1419,62 @@ fn relational_tree_after_mutations(
                     Some(relational_storage_value(&mutation.value, blob_references)?),
                 ],
             )?
-            .encode()?
+        };
+        let value = match format {
+            RelationalFormat::InlineRowV1 => row.encode()?,
+            RelationalFormat::VersionChainV2 => {
+                let previous = tree.get(pages, &key)?;
+                append_row_version(pages, previous.as_deref(), &row, creating_csn)?
+            }
         };
         tree = tree.upsert(pages, creating_csn, key, value)?.tree;
     }
     Ok(tree)
+}
+
+fn append_row_version(
+    pages: &mut PageStore,
+    previous_pointer: Option<&[u8]>,
+    row: &RowRecord,
+    creating_csn: Csn,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    if row.begin_csn() != creating_csn || row.end_csn().is_some() {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let next = if let Some(previous_pointer) = previous_pointer {
+        let pointer = RowVersionPointer::decode(previous_pointer)?;
+        let previous_page = pages.read(pointer.page_id)?;
+        if previous_page.kind() != PageKind::VersionChain
+            || previous_page
+                .creating_csn()
+                .is_none_or(|created| created > creating_csn)
+        {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        let previous = RowRecord::decode(previous_page.payload())?;
+        if previous.row_id() != row.row_id() || previous.end_csn().is_some() {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        if previous.begin_csn() == creating_csn {
+            previous_page.next()
+        } else {
+            Some(pages.append(
+                PageKind::VersionChain,
+                Some(creating_csn),
+                previous_page.next(),
+                previous.close_at(creating_csn)?.encode()?,
+            )?)
+        }
+    } else {
+        None
+    };
+    let latest = pages.append(
+        PageKind::VersionChain,
+        Some(creating_csn),
+        next,
+        row.encode()?,
+    )?;
+    Ok(RowVersionPointer { page_id: latest }.encode().to_vec())
 }
 
 fn relational_table_key(table: ObjectId) -> Vec<u8> {
@@ -1434,7 +1523,18 @@ fn decode_relational_row(
     if row.row_id() != relational_row_id(table, primary_key)? {
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }
-    if !row.is_visible_at(visible_csn) || row.is_tombstone() {
+    if !row.is_visible_at(visible_csn) {
+        return Ok(None);
+    }
+    decode_relational_row_value(row, primary_key, blobs)
+}
+
+fn decode_relational_row_value(
+    row: RowRecordView<'_>,
+    primary_key: &[u8],
+    blobs: &BlobStore,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    if row.is_tombstone() {
         return Ok(None);
     }
     if row.column_count() != 2 {
@@ -1459,6 +1559,147 @@ fn decode_relational_row(
         }
         _ => Err(NativeRuntimeError::InvalidRelationalTree),
     }
+}
+
+struct RelationalReadContext<'a> {
+    pages: &'a PageStore,
+    pool: &'a BufferPool,
+    blobs: &'a BlobStore,
+    format: RelationalFormat,
+    visible_csn: Option<Csn>,
+}
+
+fn decode_relational_value_cached(
+    context: &RelationalReadContext<'_>,
+    table: ObjectId,
+    primary_key: &[u8],
+    encoded: &[u8],
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    match context.format {
+        RelationalFormat::InlineRowV1 => decode_relational_row(
+            table,
+            primary_key,
+            encoded,
+            context.visible_csn,
+            context.blobs,
+        ),
+        RelationalFormat::VersionChainV2 => {
+            let mut page_id = RowVersionPointer::decode(encoded)?.page_id;
+            let mut stack_visited = [0_u64; 64];
+            let mut overflow_visited = None;
+            let mut depth = 0_usize;
+            let mut newer_begin = None;
+            loop {
+                track_version_page(page_id, depth, &mut stack_visited, &mut overflow_visited)?;
+                let frame = context.pool.get_or_load(context.pages, page_id)?;
+                let page = frame.page();
+                if page.kind() != PageKind::VersionChain {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                }
+                let row = RowRecordView::decode(page.payload())?;
+                validate_version_page(
+                    page,
+                    row,
+                    table,
+                    primary_key,
+                    context.visible_csn,
+                    newer_begin,
+                )?;
+                if row.is_visible_at(context.visible_csn) {
+                    return decode_relational_row_value(row, primary_key, context.blobs);
+                }
+                newer_begin = Some(row.begin_csn());
+                page_id = page
+                    .next()
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            }
+        }
+    }
+}
+
+fn track_version_page(
+    page_id: PageId,
+    depth: usize,
+    stack_visited: &mut [u64; 64],
+    overflow_visited: &mut Option<BTreeSet<u64>>,
+) -> Result<(), NativeRuntimeError> {
+    if depth < stack_visited.len() {
+        if stack_visited[..depth].contains(&page_id.get()) {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        stack_visited[depth] = page_id.get();
+        return Ok(());
+    }
+    let visited = overflow_visited.get_or_insert_with(|| stack_visited.iter().copied().collect());
+    if !visited.insert(page_id.get()) {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    Ok(())
+}
+
+fn validate_version_page(
+    page: &hyphae_native_pages::Page,
+    row: RowRecordView<'_>,
+    table: ObjectId,
+    primary_key: &[u8],
+    visible_csn: Option<Csn>,
+    newer_begin: Option<Csn>,
+) -> Result<(), NativeRuntimeError> {
+    let created = page
+        .creating_csn()
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    if visible_csn.is_none_or(|visible| created > visible)
+        || row.row_id() != relational_row_id(table, primary_key)?
+    {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    match newer_begin {
+        None if row.end_csn().is_some() || created != row.begin_csn() => {
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        }
+        Some(newer) if row.end_csn() != Some(newer) || created != newer => {
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn decode_relational_chain(
+    pages: &PageStore,
+    table: ObjectId,
+    primary_key: &[u8],
+    encoded: &[u8],
+    visible_csn: Option<Csn>,
+    blobs: &BlobStore,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    let mut page_id = RowVersionPointer::decode(encoded)?.page_id;
+    let mut visited = BTreeSet::new();
+    let mut newer_begin = None;
+    let mut selected = None;
+    loop {
+        if !visited.insert(page_id) {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        let page = pages.read(page_id)?;
+        if page.kind() != PageKind::VersionChain {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        let row = RowRecordView::decode(page.payload())?;
+        validate_version_page(&page, row, table, primary_key, visible_csn, newer_begin)?;
+        let value = decode_relational_row_value(row, primary_key, blobs)?;
+        if selected.is_none() && row.is_visible_at(visible_csn) {
+            selected = Some(value);
+        }
+        newer_begin = Some(row.begin_csn());
+        let Some(next) = page.next() else {
+            break;
+        };
+        page_id = next;
+    }
+    selected.ok_or(NativeRuntimeError::InvalidRelationalTree)
 }
 
 fn decode_relational_table(key: &[u8], prefix: u8) -> Result<ObjectId, NativeRuntimeError> {
@@ -1606,9 +1847,10 @@ fn load_relational_state(
     let Some((format_key, format_value)) = iterator.next() else {
         return Err(NativeRuntimeError::InvalidRelationalTree);
     };
-    if format_key != RELATIONAL_FORMAT_KEY || format_value != RELATIONAL_FORMAT_VALUE {
+    if format_key != RELATIONAL_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }
+    let format = RelationalFormat::decode(&format_value)?;
     let mut tables = BTreeMap::new();
     for (key, value) in iterator {
         match key.first().copied() {
@@ -1624,9 +1866,24 @@ fn load_relational_state(
                     .get_mut(&table)
                     .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
                 let primary_key = &key[17..];
-                let Some(value) =
-                    decode_relational_row(table, primary_key, &value, roots.visible_csn(), blobs)?
-                else {
+                let decoded = match format {
+                    RelationalFormat::InlineRowV1 => decode_relational_row(
+                        table,
+                        primary_key,
+                        &value,
+                        roots.visible_csn(),
+                        blobs,
+                    )?,
+                    RelationalFormat::VersionChainV2 => decode_relational_chain(
+                        pages,
+                        table,
+                        primary_key,
+                        &value,
+                        roots.visible_csn(),
+                        blobs,
+                    )?,
+                };
+                let Some(value) = decoded else {
                     continue;
                 };
                 if rows.insert(primary_key.to_vec(), value).is_some() {
@@ -1637,6 +1894,19 @@ fn load_relational_state(
         }
     }
     Ok(RelationState { tables })
+}
+
+fn relational_format_for_root(
+    pages: &PageStore,
+    roots: &RootSet,
+) -> Result<RelationalFormat, NativeRuntimeError> {
+    let root = roots
+        .root(SLOT_RELATIONAL)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    let marker = BTree::from_root(root)
+        .get(pages, RELATIONAL_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    RelationalFormat::decode(&marker)
 }
 
 fn load_root<T>(
@@ -1719,7 +1989,7 @@ mod tests {
     };
 
     use hyphae_native_mvcc::WriteKey;
-    use hyphae_native_types::{DurabilityClass, ManifestGeneration, ObjectId};
+    use hyphae_native_types::{Csn, DurabilityClass, ManifestGeneration, ObjectId, PageId};
 
     use super::{
         CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, PAGE_FILE,
@@ -1847,6 +2117,54 @@ mod tests {
             reopened.select_latest_relational(table, b"blob-row")?,
             Some(value)
         );
+        Ok(())
+    }
+
+    fn assert_three_version_row_chain(
+        database: &NativeDatabase,
+        table: ObjectId,
+    ) -> Result<(), NativeRuntimeError> {
+        let current = database.coordinator.snapshot(16)?;
+        let relational_root = current
+            .roots()
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let pointer_bytes = hyphae_native_btree::BTree::from_root(relational_root)
+            .get(&database.pages, &super::relational_row_key(table, b"mario"))?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let pointer = hyphae_native_records::RowVersionPointer::decode(&pointer_bytes)?;
+        let latest_page = database.pages.read(pointer.page_id)?;
+        let latest = hyphae_native_records::RowRecord::decode(latest_page.payload())?;
+        assert_eq!(latest.begin_csn().get(), 3);
+        assert_eq!(latest.end_csn(), None);
+        assert!(latest.is_tombstone());
+
+        let updated_page = database.pages.read(
+            latest_page
+                .next()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        )?;
+        let updated = hyphae_native_records::RowRecord::decode(updated_page.payload())?;
+        assert_eq!(updated.begin_csn().get(), 2);
+        assert_eq!(
+            updated.end_csn().map(hyphae_native_types::Csn::get),
+            Some(3)
+        );
+        assert!(!updated.is_tombstone());
+
+        let inserted_page = database.pages.read(
+            updated_page
+                .next()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        )?;
+        let inserted = hyphae_native_records::RowRecord::decode(inserted_page.payload())?;
+        assert_eq!(inserted.begin_csn().get(), 1);
+        assert_eq!(
+            inserted.end_csn().map(hyphae_native_types::Csn::get),
+            Some(2)
+        );
+        assert!(!inserted.is_tombstone());
+        assert_eq!(inserted_page.next(), None);
         Ok(())
     }
 
@@ -2152,6 +2470,7 @@ mod tests {
         assert_eq!(database.select_latest_relational(table, b"mario")?, None);
         assert_eq!(version_one.select(table, b"mario"), Some(b"v1".as_slice()));
         assert_eq!(version_two.select(table, b"mario"), Some(b"v2".as_slice()));
+        assert_three_version_row_chain(&database, table)?;
         drop(database);
 
         let reopened = NativeDatabase::open(temporary.path())?;
@@ -2169,6 +2488,126 @@ mod tests {
                 .map(hyphae_native_types::Csn::get),
             Some(3)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn same_transaction_row_rewrites_coalesce_into_one_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(21)?;
+        let mut transaction = database.begin(10, DurabilityClass::Strict)?;
+        transaction.create_relation(table, "coalesced_rows")?;
+        transaction.insert(table, b"key".to_vec(), b"one".to_vec())?;
+        transaction.update(table, b"key".to_vec(), b"two".to_vec())?;
+        transaction.delete(table, b"key".to_vec())?;
+        transaction.insert(table, b"key".to_vec(), b"final".to_vec())?;
+        transaction.commit()?;
+        assert_eq!(
+            database.select_latest_relational(table, b"key")?,
+            Some(b"final".to_vec())
+        );
+
+        let snapshot = database.coordinator.snapshot(11)?;
+        let root = snapshot
+            .roots()
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let pointer_bytes = hyphae_native_btree::BTree::from_root(root)
+            .get(&database.pages, &super::relational_row_key(table, b"key"))?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let pointer = hyphae_native_records::RowVersionPointer::decode(&pointer_bytes)?;
+        let page = database.pages.read(pointer.page_id)?;
+        let row = hyphae_native_records::RowRecord::decode(page.payload())?;
+        assert_eq!(row.begin_csn().get(), 1);
+        assert_eq!(row.end_csn(), None);
+        assert_eq!(page.next(), None);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"final".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_row_v1_directories_remain_readable_and_writable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        database.relational_format = super::RelationalFormat::InlineRowV1;
+        let table = ObjectId::new(22)?;
+        let mut create = database.begin(10, DurabilityClass::Strict)?;
+        create.create_relation(table, "legacy_rows")?;
+        create.insert(table, b"key".to_vec(), b"v1".to_vec())?;
+        create.commit()?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.relational_format,
+            super::RelationalFormat::InlineRowV1
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"v1".to_vec())
+        );
+        let mut update = reopened.begin(11, DurabilityClass::Strict)?;
+        update.update(table, b"key".to_vec(), b"v2".to_vec())?;
+        update.commit()?;
+        drop(reopened);
+
+        let recovered = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            recovered.select_latest_relational(table, b"key")?,
+            Some(b"v2".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relational_version_chain_cycles_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        fs::create_dir_all(temporary.path())?;
+        let mut pages =
+            hyphae_native_pages::PageStore::create(temporary.path().join("cycle-pages.hydb"))?;
+        let blobs = hyphae_native_blobs::BlobStore::create(temporary.path())?;
+        let table = ObjectId::new(23)?;
+        let primary_key = b"key";
+        let row = hyphae_native_records::RowRecord::new(
+            super::relational_row_id(table, primary_key)?,
+            Csn::new(1)?,
+            None,
+            vec![
+                Some(primary_key.to_vec()),
+                Some([super::RELATIONAL_VALUE_INLINE, b'v'].to_vec()),
+            ],
+        )?;
+        let cyclic_page = pages.append(
+            hyphae_native_pages::PageKind::VersionChain,
+            Some(Csn::new(1)?),
+            Some(PageId::new(1)?),
+            row.encode()?,
+        )?;
+        assert_eq!(cyclic_page, PageId::new(1)?);
+        let pointer = hyphae_native_records::RowVersionPointer {
+            page_id: cyclic_page,
+        }
+        .encode();
+        assert!(matches!(
+            super::decode_relational_chain(
+                &pages,
+                table,
+                primary_key,
+                &pointer,
+                Some(Csn::new(1)?),
+                &blobs,
+            ),
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        ));
         Ok(())
     }
 

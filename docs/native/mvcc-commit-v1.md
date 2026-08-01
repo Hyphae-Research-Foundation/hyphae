@@ -3,8 +3,8 @@
 Status: normative target contract; immutable snapshots, CSN reservation,
 root-set hashing, recovery restore, and serialized all-engine publication are
 implemented experimentally; a point-write conflict table is implemented and
-rebuilt from committed WAL, while concurrent-writer and lock-free publication
-remain pending
+rebuilt from committed WAL, and relational writes retain explicit immutable
+version chains; concurrent-writer and lock-free publication remain pending
 
 V1 provides snapshot isolation across relational, structure, and search
 objects under one global commit sequence.
@@ -35,6 +35,13 @@ begin_csn <= snapshot.visible_csn < end_csn
 
 `end_csn = u64::MAX` is open-ended. Tombstones participate in the same rule.
 Private writes shadow snapshot versions for read-your-writes.
+
+The implemented relational V2 format publishes one open row-version page and
+links immutable closed copies toward older versions. Each older `end_csn`
+equals the next-newer `begin_csn`; recovery validates the entire chain and
+fails closed on cycles or discontinuities. Historical roots retain their
+original pages, so closing a version never mutates bytes reachable through an
+older snapshot. Version retention and vacuum are not yet implemented.
 
 ## Snapshot-isolation conflicts
 
@@ -128,6 +135,8 @@ Current tests cover half-open visibility, retained historical root sets,
 atomic all-engine root publication, dropped-write nonpublication,
 stale-same-key conflict rejection, disjoint-key admission, monotonic
 idempotent conflict replay, WAL reconstruction, read-your-writes, logical TTL,
-and deterministic in-process commit interruptions. True concurrent writers,
-constraints, range intents, serializable execution, and model-checked
-publication ordering remain pending.
+explicit closed relational chains, same-transaction version coalescing,
+version-chain cycle rejection, V1 directory compatibility, and deterministic
+in-process commit interruptions. True concurrent writers, constraints, range
+intents, serializable execution, and model-checked publication ordering remain
+pending.

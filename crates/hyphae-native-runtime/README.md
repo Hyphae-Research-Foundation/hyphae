@@ -15,12 +15,16 @@ recovery.
 Binary SQL UPDATE and DELETE publish new roots while retained snapshots keep
 their historical roots. Values above 8,192 bytes use the Hyphae-owned
 content-addressed blob store, and committed WAL mutations rebuild the
-point-write conflict table during recovery.
+point-write conflict table during recovery. New directories store a fixed
+row-version pointer in the B+tree and retain an immutable, fail-closed chain
+whose superseded records have explicit half-open `end_csn` boundaries.
+Directories written with the earlier inline-row marker remain readable and
+writable without an implicit format conversion.
 
 The implementation remains deliberately bounded: transaction snapshots still
-materialize relation state, the writer is serialized, physical row histories
-do not yet form current-root version chains, structures are binary scalar
-values with TTL, and lexical search uses a deterministic analyzer over small
-copy-on-write collections. It proves the native transaction/recovery
-architecture; it is not the complete SQL, Valkey-class structure, or
-OpenSearch-class search engine.
+materialize relation state, the writer is serialized, version retention and
+vacuum are not implemented, structures are binary scalar values with TTL, and
+lexical search uses a deterministic analyzer over small copy-on-write
+collections. It proves the native transaction/recovery architecture; it is
+not the complete SQL, Valkey-class structure, or OpenSearch-class search
+engine.
