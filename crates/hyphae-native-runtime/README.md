@@ -21,10 +21,14 @@ backfills atomically, inserts maintain every admitted projection, exact-key
 `WHERE` can use composite indexes independent of predicate text order, and
 bounded `EXPLAIN` identifies primary-key or secondary-index lookup. Unique
 non-null collisions fail before publication; null equality retains SQL
-three-valued behavior. The historical two-binary-column shape retains its raw
-bytes and allocation-free prepared lookup. General expressions, scans/ranges,
-typed updates/deletes, joins, grouping, cost planning, and complete `EXPLAIN`
-remain pending.
+three-valued behavior. Bounded primary-key scans/ranges, exact-PK typed
+updates/deletes, and current-root secondary execution are physical native
+operators. Parameterized scalar residual filters support comparison,
+`IS [NOT] NULL`, `NOT`, `AND`, and `OR`; the binder extracts admitted exact or
+range access and applies `LIMIT` after filtering. The historical
+two-binary-column shape retains its raw bytes and allocation-free prepared
+lookup. Literals, casts, arithmetic/functions, joins, grouping, sorting/spill,
+cost planning, and complete `EXPLAIN` remain pending.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
@@ -53,10 +57,10 @@ namespace, and legacy single-page search roots remain compatible.
 
 The implementation remains deliberately bounded: transaction snapshots still
 materialize relation state, version retention and vacuum are not implemented,
-secondary-index SQL execution is not yet a direct pinned physical lookup,
-indexed typed updates/deletes are rejected, structures still lack most
-Valkey-class families, and lexical search still lacks positions, phrases,
-filters, facets, doc values, deletes/updates, segments, and ANN. Detached
+partial/secondary ranges and zero-copy operator cursors remain pending,
+structures still lack most Valkey-class families, and lexical search still
+lacks positions, phrases, filters, facets, doc values, deletes/updates,
+segments, and ANN. Detached
 transactions can prepare concurrently without holding
 writer admission; commit validates their original read CSN and rebases
 disjoint mutations over the admitted current root. Publication and its

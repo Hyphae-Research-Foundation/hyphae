@@ -136,6 +136,16 @@ commit before its tag can be published.
   release observation for direct and prepared-SQL `[1024, 1034)` primary-key
   ranges over a multilevel 2,048-row typed relation. Each range timer sample
   is one complete call; the result remains outside G7.
+- [Native SQL residual-filter evidence —
+  2026-08-01](native-sql-residual-filters-2026-08-01.md) binds parameterized
+  scalar comparison, `IS [NOT] NULL`, SQL three-valued boolean logic and
+  precedence, exact/range access extraction, post-filter `LIMIT`,
+  transaction/materialized/physical/reopen equivalence, and explicit remaining
+  G2/G7 limits to source and benchmark commits.
+- `native-microsecond-smoke-residual-filter-wsl2.json` is its schema-v10 clean
+  release observation for a prepared primary-key range plus alternating
+  boolean residual filter over a multilevel 2,048-row typed relation. It
+  records complete calls that return 10 matches and remains outside G7.
 
 ## Hosted release evidence
 

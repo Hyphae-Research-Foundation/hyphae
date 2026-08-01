@@ -1,0 +1,143 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v10",
+  "status": "observation-not-gate",
+  "commit": "82880276d0c1e0470ae54200c3776cf31c6ee5d2",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "observations_per_operation": 1000000,
+  "operations_per_observation": 32,
+  "warmup_per_operation": 100000,
+  "search_observations": 100000,
+  "search_operations_per_observation": 1,
+  "secondary_observations": 100000,
+  "secondary_operations_per_observation": 1,
+  "scan_limit": 10,
+  "range_lower_row_inclusive": 1024,
+  "range_upper_row_exclusive": 1034,
+  "scan_observations": 100000,
+  "scan_operations_per_observation": 1,
+  "concurrency": 1,
+  "durability": "memory",
+  "warm_state": true,
+  "proofs": false,
+  "primary_relational_rows": 2049,
+  "secondary_index_rows": 2048,
+  "relational_rows": 4097,
+  "relational_tree_height": 2,
+  "structure_keys": 2048,
+  "structure_tree_height": 2,
+  "hash_fields": 2048,
+  "search_documents": 2048,
+  "search_tree_height": 2,
+  "search_query_document_frequency": 1,
+  "dataset_digest_blake3": "1edabacbbb872778034edce5fb9ced1219e4f6398ba3104199f5aee637bc9ea1",
+  "transport_note": "codec plus embedded dispatch; no named-pipe transport",
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.040,
+      "p95_us": 0.047,
+      "p99_us": 0.074,
+      "p99_9_us": 0.473,
+      "throughput_ops_s": 22521477
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.615,
+      "p95_us": 0.786,
+      "p99_us": 1.456,
+      "p99_9_us": 4.184,
+      "throughput_ops_s": 1516072
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.078,
+      "p95_us": 0.089,
+      "p99_us": 0.143,
+      "p99_9_us": 0.887,
+      "throughput_ops_s": 11921169
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 1.039,
+      "p95_us": 1.386,
+      "p99_us": 2.533,
+      "p99_9_us": 6.829,
+      "throughput_ops_s": 904357
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 17.619,
+      "p95_us": 23.866,
+      "p99_us": 42.353,
+      "p99_9_us": 168.935,
+      "throughput_ops_s": 52156
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.035,
+      "p95_us": 0.037,
+      "p99_us": 0.057,
+      "p99_9_us": 0.325,
+      "throughput_ops_s": 27235207
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.037,
+      "p95_us": 1.382,
+      "p99_us": 2.558,
+      "p99_9_us": 7.152,
+      "throughput_ops_s": 901325
+    },
+    "buffered_relational_btree_pk_scan_limit10_multilevel": {
+      "p50_us": 10.596,
+      "p95_us": 13.800,
+      "p99_us": 23.559,
+      "p99_9_us": 106.003,
+      "throughput_ops_s": 87381
+    },
+    "physical_prepared_sql_pk_scan_limit10_multilevel": {
+      "p50_us": 11.437,
+      "p95_us": 15.683,
+      "p99_us": 28.947,
+      "p99_9_us": 122.504,
+      "throughput_ops_s": 79715
+    },
+    "buffered_relational_btree_pk_range_limit10_multilevel": {
+      "p50_us": 10.843,
+      "p95_us": 14.000,
+      "p99_us": 25.680,
+      "p99_9_us": 107.069,
+      "throughput_ops_s": 84862
+    },
+    "physical_prepared_sql_pk_range_limit10_multilevel": {
+      "p50_us": 12.657,
+      "p95_us": 16.864,
+      "p99_us": 32.505,
+      "p99_9_us": 118.805,
+      "throughput_ops_s": 72821
+    },
+    "physical_prepared_sql_pk_range_residual_boolean_limit10_multilevel": {
+      "p50_us": 15.464,
+      "p95_us": 21.237,
+      "p99_us": 40.370,
+      "p99_9_us": 137.250,
+      "throughput_ops_s": 59109
+    },
+    "buffered_relational_btree_secondary_exact_unique_multilevel": {
+      "p50_us": 7.962,
+      "p95_us": 11.522,
+      "p99_us": 20.113,
+      "p99_9_us": 95.161,
+      "throughput_ops_s": 113261
+    },
+    "physical_prepared_sql_secondary_exact_unique_multilevel": {
+      "p50_us": 8.441,
+      "p95_us": 11.813,
+      "p99_us": 21.347,
+      "p99_9_us": 115.685,
+      "throughput_ops_s": 106603
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.065,
+      "p95_us": 0.072,
+      "p99_us": 0.143,
+      "p99_9_us": 0.720,
+      "throughput_ops_s": 14228673
+    }
+  }
+}

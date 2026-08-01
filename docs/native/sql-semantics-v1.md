@@ -5,7 +5,8 @@ Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 direct current-root prepared primary/secondary lookup, exact-primary-key typed
 `UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
-and rollback are implemented experimentally. G2 remains open
+rollback, and the parameterized residual-filter slice below are implemented
+experimentally. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -73,7 +74,39 @@ ascending primary key. Bound parameters occur in predicate text order.
 Inclusive, exclusive, one-sided, inverted, and equal-open ranges have explicit
 semantics: inverted and empty ranges return no rows rather than raising or
 panicking. Equality predicates retain their exact point/index access contract
-and cannot be mixed with this range slice.
+when they cover a complete primary or secondary key.
+
+The residual-filter slice admits parameterized scalar predicates:
+
+```text
+<filter> ::= <filter> OR <term> | <term>
+<term> ::= <term> AND <factor> | <factor>
+<factor> ::= NOT <factor> | ( <filter> ) | <predicate>
+<predicate> ::= <column> { = | <> | != | < | <= | > | >= } ?
+              | <column> IS [NOT] NULL
+```
+
+`NOT` binds tighter than `AND`, and `AND` binds tighter than `OR`. Parentheses
+override that precedence. Complete-primary-key row comparisons remain admitted
+only as top-level `AND` range terms; they are not general row expressions.
+Literals, casts, arithmetic, functions, and column-to-column comparisons remain
+outside this milestone.
+
+The binder may extract complete primary-key equality, one complete
+secondary-index equality, or complete-primary-key lower/upper bounds from
+top-level `AND` terms. Every remaining term is a residual filter. When no
+admitted exact or range access exists, execution uses a bounded primary-key
+scan. `LIMIT` is mandatory for every scan or range plan and is applied to rows
+that evaluate to `TRUE`, not to rows merely examined. Exact primary/secondary
+access retains its existing no-`LIMIT` form. `ORDER BY`, when admitted for a
+scan or range, remains the complete ascending primary key.
+
+All parameter arity and catalog logical-type checks occur before storage
+traversal. A SQL `NULL` parameter is type-admissible in a comparison and makes
+that comparison `UNKNOWN`; it is not an invalid scalar type. Physical current-
+root filtering traverses the bound B+tree visitor and stops after the requested
+number of matching rows without constructing a complete relation or
+`MaterializedState`.
 
 Typed mutation accepts:
 
@@ -113,20 +146,21 @@ any null component exempts the composite key from uniqueness, while ordinary
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`.
 Range kinds are `inclusive`, `exclusive`, or `unbounded`. This is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
-statistics report.
+statistics report. A plan appends `,residual=true` inside the closing
+parenthesis when an access path has non-access predicates; a filtered full scan
+is residual by definition.
 
 The grammar currently recognizes boolean, signed and unsigned fixed-width
 integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
-exists. General expressions, literals, casts, residual filters, partial
-primary-key prefix ranges, secondary ranges, descending scans, offsets, and
-constraints beyond primary key/nullability and the first unique index remain
-pending. Typed mutation does
+exists. General expressions beyond the admitted residual-filter slice,
+literals, casts, partial primary-key prefix ranges, secondary ranges,
+descending scans, offsets, and constraints beyond primary key/nullability and
+the first unique index remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate expressions,
-or update multiple rows. The current equality binder requires the predicate
-column set to equal a complete primary or secondary key. It does not perform
-prefix, residual-filter, bitmap, or cost-based access selection.
+or update multiple rows. Prefix, bitmap, and cost-based access selection remain
+pending.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -149,7 +183,7 @@ primary scan/range. The secondary path scans only the length-delimited exact
 index-key prefix, follows each live entry to its primary-key row in the same
 root, and returns rows in canonical primary-key order. The scan path uses an
 inclusive/exclusive bound-aware physical visitor, prunes separator-disjoint
-subtrees, skips row tombstones, and stops after `LIMIT` visible rows. It does
+subtrees, skips row tombstones, and stops after `LIMIT` matching rows. It does
 not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last

@@ -464,6 +464,11 @@ pub struct RelationalScanRow {
     pub row: Vec<u8>,
 }
 
+pub(crate) enum RelationalVisitError<E> {
+    Runtime(NativeRuntimeError),
+    Visitor(E),
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MaterializedState {
     catalog: CatalogState,
@@ -949,22 +954,10 @@ impl NativeDatabase {
         upper: Bound<&[u8]>,
         limit: usize,
     ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
-        let root = snapshot
-            .roots()
-            .root(SLOT_RELATIONAL)
-            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
-        let tree = BTree::from_root(root);
-        let table_marker = tree
-            .get_cached_pinned(&self.pages, &self.buffer_pool, &relational_table_key(table))?
-            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
-        if !table_marker.bytes().is_empty() {
-            return Err(NativeRuntimeError::InvalidRelationalTree);
-        }
+        let (tree, prefix) = self.relational_table_tree_at(snapshot, table)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let prefix = relational_row_key(table, &[]);
         let lower = map_primary_key_bound(table, lower);
         let upper = map_primary_key_bound(table, upper);
         let context = RelationalReadContext {
@@ -1012,6 +1005,85 @@ impl NativeDatabase {
             return Err(error);
         }
         Ok(rows)
+    }
+
+    fn relational_table_tree_at(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+    ) -> Result<(BTree, Vec<u8>), NativeRuntimeError> {
+        let root = snapshot
+            .roots()
+            .root(SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
+        let tree = BTree::from_root(root);
+        let table_marker = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &relational_table_key(table))?
+            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
+        if !table_marker.bytes().is_empty() {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        let prefix = relational_row_key(table, &[]);
+        Ok((tree, prefix))
+    }
+
+    pub(crate) fn visit_relational_range_at<E>(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), RelationalVisitError<E>> {
+        let (tree, prefix) = self
+            .relational_table_tree_at(snapshot, table)
+            .map_err(RelationalVisitError::Runtime)?;
+        let lower = map_primary_key_bound(table, lower);
+        let upper = map_primary_key_bound(table, upper);
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut failure = None;
+        let _outcome = tree
+            .visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                bound_as_slice(&lower),
+                bound_as_slice(&upper),
+                |physical_key, encoded| {
+                    let Some(primary_key) = physical_key.get(prefix.len()..) else {
+                        failure = Some(RelationalVisitError::Runtime(
+                            NativeRuntimeError::InvalidRelationalTree,
+                        ));
+                        return ControlFlow::Break(());
+                    };
+                    match decode_relational_value_cached(&context, table, primary_key, encoded) {
+                        Ok(Some(row)) => match visitor(primary_key, &row) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                failure = Some(RelationalVisitError::Visitor(error));
+                                ControlFlow::Break(())
+                            }
+                        },
+                        Ok(None) => ControlFlow::Continue(()),
+                        Err(error) => {
+                            failure = Some(RelationalVisitError::Runtime(error));
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Performs an exact current secondary-index lookup through the relational
@@ -7773,6 +7845,234 @@ mod tests {
         assert_eq!(
             reopened.execute_prepared_latest(&reopened_plan, &composite_range_parameters())?,
             expected_composite_range()
+        );
+        Ok(())
+    }
+
+    const RESIDUAL_RANGE_QUERY: &str = "SELECT id, note
+        FROM events
+        WHERE id >= ?
+          AND active = ?
+          AND (note IS NULL OR score > ?)
+        ORDER BY id
+        LIMIT 2";
+
+    fn expected_residual_range() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["id".to_owned(), "note".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(3), SqlValue::Null],
+                vec![SqlValue::Signed(5), SqlValue::Null],
+            ],
+        }
+    }
+
+    fn seed_residual_filter_rows(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(20, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                score BIGINT NOT NULL,
+                note TEXT NULL,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing residual-filter table identity".into());
+        };
+        let rows = [
+            (1_i64, "alpha", 10_i64, SqlValue::Null, false),
+            (2, "alpha", 20, SqlValue::Text("low".to_owned()), false),
+            (3, "alpha", 30, SqlValue::Null, true),
+            (4, "beta", 40, SqlValue::Text("keep".to_owned()), false),
+            (5, "beta", 50, SqlValue::Null, true),
+            (6, "beta", 60, SqlValue::Text("keep".to_owned()), true),
+            (7, "beta", 70, SqlValue::Null, false),
+        ];
+        for (id, tenant, score, note, active) in rows {
+            seed.execute_sql(
+                "INSERT INTO events (id, tenant, score, note, active)
+                 VALUES (?, ?, ?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Signed(score),
+                    note,
+                    SqlValue::Boolean(active),
+                ],
+            )?;
+        }
+        seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?;
+        seed.commit()?;
+        Ok(table)
+    }
+
+    fn residual_range_parameters() -> [SqlValue; 3] {
+        [
+            SqlValue::Signed(2),
+            SqlValue::Boolean(true),
+            SqlValue::Signed(45),
+        ]
+    }
+
+    fn assert_private_residual_filters(
+        database: &mut NativeDatabase,
+        table: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut private = database.begin_sql(21, DurabilityClass::Strict)?;
+        private.execute_sql(
+            "INSERT INTO events (id, tenant, score, note, active)
+             VALUES (?, ?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(8),
+                SqlValue::Text("beta".to_owned()),
+                SqlValue::Signed(80),
+                SqlValue::Null,
+                SqlValue::Boolean(true),
+            ],
+        )?;
+        assert_eq!(
+            private.execute_sql(RESIDUAL_RANGE_QUERY, &residual_range_parameters())?,
+            expected_residual_range()
+        );
+        for (statement, expected) in [
+            (
+                "EXPLAIN SELECT id FROM events
+                 WHERE id >= ? AND active = ?
+                 ORDER BY id LIMIT 2",
+                format!(
+                    "PrimaryKeyRangeScan(table={table},lower=inclusive,\
+                     upper=unbounded,limit=2,residual=true)"
+                ),
+            ),
+            (
+                "EXPLAIN SELECT id FROM events WHERE id = ? AND active = ?",
+                format!("PrimaryKeyLookup(table={table},residual=true)"),
+            ),
+        ] {
+            assert_eq!(
+                private.execute_sql(statement, &[])?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(expected)]],
+                }
+            );
+        }
+        private.rollback();
+        Ok(())
+    }
+
+    fn assert_latest_residual_semantics(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "SELECT id FROM events
+                 WHERE NOT active = ? AND note IS NOT NULL
+                 ORDER BY id LIMIT 2",
+                vec![SqlValue::Boolean(true)],
+                vec![vec![SqlValue::Signed(2)], vec![SqlValue::Signed(4)]],
+            ),
+            (
+                "SELECT id FROM events WHERE note = ? OR note IS NULL LIMIT 10",
+                vec![SqlValue::Null],
+                vec![
+                    vec![SqlValue::Signed(1)],
+                    vec![SqlValue::Signed(3)],
+                    vec![SqlValue::Signed(5)],
+                    vec![SqlValue::Signed(7)],
+                ],
+            ),
+            (
+                "SELECT id FROM events WHERE tenant = ? AND active = ?",
+                vec![SqlValue::Text("alpha".to_owned()), SqlValue::Boolean(true)],
+                vec![vec![SqlValue::Signed(3)]],
+            ),
+            (
+                "SELECT id FROM events WHERE id = ? AND note = ?",
+                vec![SqlValue::Signed(3), SqlValue::Null],
+                Vec::new(),
+            ),
+        ];
+        for (statement, parameters, rows) in cases {
+            let plan = database.prepare_sql_latest(statement)?;
+            assert_eq!(
+                database.execute_prepared_latest(&plan, &parameters)?,
+                SqlResult::Rows {
+                    columns: vec!["id".to_owned()],
+                    rows,
+                }
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_residual_filter_failures(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plan = database.prepare_sql_latest(RESIDUAL_RANGE_QUERY)?;
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &[
+                    SqlValue::Signed(2),
+                    SqlValue::Boolean(true),
+                    SqlValue::Text("wrong".to_owned()),
+                ],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(&plan, &residual_range_parameters()[..2]),
+            Err(SqlError::ParameterMismatch)
+        ));
+        assert!(matches!(
+            database
+                .prepare_sql_latest("SELECT id FROM events WHERE missing = ? ORDER BY id LIMIT 1"),
+            Err(SqlError::UnknownColumn)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_residual_filters_preserve_three_valued_logic_across_executors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_residual_filter_rows(&mut database)?;
+        let parameters = residual_range_parameters();
+        let expected = expected_residual_range();
+
+        assert_private_residual_filters(&mut database, table)?;
+
+        let materialized = database.snapshot(22)?;
+        let materialized_plan = materialized.prepare_sql(RESIDUAL_RANGE_QUERY)?;
+        assert_eq!(
+            materialized.execute_prepared(&materialized_plan, &parameters)?,
+            expected
+        );
+        let latest_plan = database.prepare_sql_latest(RESIDUAL_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            expected
+        );
+        assert_latest_residual_semantics(&database)?;
+        assert_residual_filter_failures(&database)?;
+
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(RESIDUAL_RANGE_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
         );
         Ok(())
     }
