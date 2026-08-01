@@ -33,6 +33,15 @@ commit before its tag can be published.
   `85b7a4d` under WSL2. Commit binding improves reproducibility but the
   batch-average, tiny-corpus, transport, concurrency, and hardware-counter
   gaps still keep it outside the gate.
+- [Native blobs, relational mutations, and conflict substrate evidence —
+  2026-08-01](native-blobs-mutations-conflicts-2026-08-01.md) records the
+  content-addressed blob store, UPDATE/DELETE tombstones, WAL-rebuilt point
+  conflict table, expanded crash matrix, and their explicit concurrency and
+  retention limits.
+- `native-microsecond-smoke-multilevel-wsl2.json` binds a 2,049-row,
+  height-two physical B+tree observation to clean commit `5a73795`. It remains
+  outside G7 because timing is batch-averaged, concurrency is one, and
+  transport/interference/hardware controls are absent.
 
 ## Hosted release evidence
 

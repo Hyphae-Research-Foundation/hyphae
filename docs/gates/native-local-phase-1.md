@@ -76,11 +76,18 @@ MVCC rows, native copy-on-write relational storage, immutable root manifests,
 the four-boundary checkpoint matrix, and a clean physical point-read latency
 observation to one source commit.
 
+The [blob, mutation, and conflict
+evidence](evidence/native-blobs-mutations-conflicts-2026-08-01.md) adds the
+immutable content-addressed blob store, SQL UPDATE/DELETE with copy-on-write
+roots and tombstones, a WAL-rebuilt point conflict table, two blob crash
+boundaries, and a clean height-two B+tree latency observation.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
-key storage now uses the native B+tree and canonical MVCC rows. Catalog,
-structure, and search state remain bounded single-page scaffolding; secondary
-indexes, version-chain updates/deletes, scalable structures, postings,
-segments, and ANN remain required by G2–G4.
+key storage now uses the native B+tree and canonical MVCC rows, and large row
+values use native immutable blobs. Catalog, structure, and search state remain
+bounded single-page scaffolding; current-root version chains, concurrent
+writers, secondary indexes, scalable structures, postings, segments, and ANN
+remain required by G1–G4.
 
 ## G1 substrate exit
 

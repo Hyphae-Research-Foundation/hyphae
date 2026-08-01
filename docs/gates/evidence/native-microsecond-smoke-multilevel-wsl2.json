@@ -1,0 +1,109 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v3",
+  "measured_at": "2026-08-01T11:42:00.2672025-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "5a7379527a7207142de81d84a52699d2f0de92c1",
+    "tree": "0c64a2a3416be24a1906c6e850e5e20e9a4fb4a9",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "Commit binding makes the source reproducible but does not satisfy the missing performance-gate controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502112256,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "dataset_digest_blake3": "847c327dcb42eeafb9561513bd8b1ecb90386ff8ea2c9433468d7f6c6ce86692",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "relational_path_note": "The direct relational operation traverses one internal and one leaf page through the native buffer pool, decodes the canonical MVCC row, and returns an owned value.",
+    "prepared_path_note": "The prepared SQL operation reads the transaction snapshot's materialized in-memory relation map; it is not the physical B+tree executor path."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.003,
+      "p95_us": 0.003,
+      "p99_us": 0.003,
+      "p99_9_us": 0.008,
+      "throughput_ops_s": 241287733
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.040,
+      "p95_us": 0.042,
+      "p99_us": 0.055,
+      "p99_9_us": 0.565,
+      "throughput_ops_s": 22803206
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 2.983,
+      "p95_us": 4.108,
+      "p99_us": 6.858,
+      "p99_9_us": 12.156,
+      "throughput_ops_s": 317504
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.023,
+      "p95_us": 0.024,
+      "p99_us": 0.037,
+      "p99_9_us": 0.257,
+      "throughput_ops_s": 39414724
+    }
+  },
+  "interpretation": {
+    "microsecond_hot_path_observed": true,
+    "millisecond_internal_hop_observed": false,
+    "phase_1_performance_gate_passed": false,
+    "comparison_to_one_leaf_observation": {
+      "prior_commit": "868bc4370ac40c573ca8d37058dd92076e06bb79",
+      "prior_p50_us": 0.255,
+      "current_p50_us": 2.983,
+      "note": "The corpora and benchmark source differ, so this is a diagnostic comparison rather than a controlled regression result."
+    },
+    "likely_hot_path_costs_from_source_inspection": [
+      "a fresh cycle-detection BTreeSet per lookup",
+      "complete owned node decoding at each traversed level",
+      "owned row and value copies on the direct point-read API"
+    ],
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "2,049-row corpus and tree height two only",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}
