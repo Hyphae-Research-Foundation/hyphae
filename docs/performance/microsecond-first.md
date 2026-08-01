@@ -109,9 +109,14 @@ named-pipe/UDS transport are absent, and the clean run is virtualized.
 
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5
-adds one explicitly typed hash with 2,048 independent 64-byte fields and
-reports both materialized and direct buffered `HGET`; cross-schema latency is
-not a controlled comparison.
+added one explicitly typed hash with 2,048 independent 64-byte fields and
+reported both materialized and direct buffered `HGET`. Schema v6 adds 2,048
+documents in a height-two native inverted index. Its rare-term physical
+`MATCH` uses 100,000 single-call observations rather than a 32-call batch and
+observed p50 `20.926 us` and p99 `71.596 us` in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-search-wsl2.json).
+Cross-schema latency is not a controlled comparison, and none of these
+observations passes G7.
 
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50

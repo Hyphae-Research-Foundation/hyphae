@@ -75,6 +75,14 @@ commit before its tag can be published.
 - `native-microsecond-smoke-hash-wsl2.json` is its schema-v5 clean physical
   `HGET` observation over 2,048 fields. It does not time mutations and remains
   outside G7.
+- [Native inverted-search evidence —
+  2026-08-01](native-inverted-search-2026-08-01.md) binds the first physical
+  collection/document/term/posting namespaces, prefix-pruned `MATCH`, exact
+  reference-BM25 equivalence, multilevel recovery, corruption rejection, and
+  explicit remaining G4 limits.
+- `native-microsecond-smoke-search-wsl2.json` is its schema-v6 clean physical
+  `MATCH` observation over 2,048 documents. Search uses one complete call per
+  timer observation; the rare-term baseline remains outside G7.
 
 ## Hosted release evidence
 

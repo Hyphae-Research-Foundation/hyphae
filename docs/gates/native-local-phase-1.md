@@ -114,12 +114,13 @@ cardinality metadata, field tombstones, field-granular conflict/rebase,
 multilevel scale, corruption rejection, crash recovery, and direct `HGET`
 latency to one source commit.
 
-The native lexical-search implementation now replaces the bounded search page
-for new directories with collection/document/term/posting B+tree namespaces,
-separator-pruned posting scans, exact reference-BM25 equivalence, shared large
-text blobs, multilevel restart and corruption tests, and a legacy inline
-compatibility path. Its clean benchmark receipt and source-bound evidence are
-the next evidence publication step.
+The [native inverted-search
+evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
+of the bounded search page for new directories with
+collection/document/term/posting B+tree namespaces, separator-pruned posting
+scans, exact reference-BM25 equivalence, shared large text blobs, multilevel
+restart/corruption tests, legacy inline compatibility, and the first clean
+physical `MATCH` latency baseline.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row

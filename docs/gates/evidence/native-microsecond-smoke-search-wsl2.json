@@ -1,0 +1,148 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v6",
+  "measured_at": "2026-08-01T13:26:07.5355210-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "35a58cd02a1764a2052ab6cbf67a514eae38fc55",
+    "tree": "e28ecccc6a00a2e229844a3d15e23ad9650d1e5b",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "This is one clean local observation without affinity, background-load, allocation, or hardware-counter controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502120448,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_non_search_operation": 1000000,
+    "operations_per_non_search_observation": 32,
+    "non_search_latency_value": "integer nanosecond average of a 32-operation batch",
+    "search_observations": 100000,
+    "search_operations_per_observation": 1,
+    "search_latency_value": "one complete MATCH call per timer observation",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "structure_value_bytes": 64,
+    "hash_fields": 2048,
+    "hash_field_value_bytes": 64,
+    "search_documents": 2048,
+    "search_tree_height": 2,
+    "search_query": "needle",
+    "search_query_terms": 1,
+    "search_query_document_frequency": 1,
+    "search_limit": 1,
+    "dataset_digest_blake3": "962196d80ca8b3866e333675a4f9f2eea01607167a59e8011fe0eb92851d8adf",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "search_path_note": "The physical MATCH validates collection and term metadata through pinned B+tree lookups, prunes to one term posting prefix, validates one HYPOST01 frequency, reads one HYDOCS01 document length, computes BM25, sorts the one candidate, and returns one owned hit.",
+    "timed_mutations": false
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.047,
+      "p95_us": 0.050,
+      "p99_us": 0.067,
+      "p99_9_us": 0.822,
+      "throughput_ops_s": 19318852
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.772,
+      "p95_us": 1.140,
+      "p99_us": 2.478,
+      "p99_9_us": 6.560,
+      "throughput_ops_s": 1144358
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.081,
+      "p95_us": 0.086,
+      "p99_us": 0.121,
+      "p99_9_us": 1.221,
+      "throughput_ops_s": 11655678
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 1.181,
+      "p95_us": 1.788,
+      "p99_us": 3.177,
+      "p99_9_us": 7.207,
+      "throughput_ops_s": 776831
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 20.926,
+      "p95_us": 28.933,
+      "p99_us": 71.596,
+      "p99_9_us": 183.029,
+      "throughput_ops_s": 43414
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.048,
+      "p95_us": 0.060,
+      "p99_us": 0.066,
+      "p99_9_us": 0.977,
+      "throughput_ops_s": 18527681
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.109,
+      "p95_us": 1.470,
+      "p99_us": 2.897,
+      "p99_9_us": 5.945,
+      "throughput_ops_s": 836790
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.075,
+      "p95_us": 0.080,
+      "p99_us": 0.099,
+      "p99_9_us": 1.082,
+      "throughput_ops_s": 12390750
+    }
+  },
+  "comparison": {
+    "direct_physical_search_baseline_available": false,
+    "reason": "Schema v6 introduces the first native inverted-index corpus and direct physical BM25 MATCH operation. V5 has no physical search operation and a different dataset digest.",
+    "hash_sanity_receipt": "native-microsecond-smoke-hash-wsl2.json",
+    "hash_sanity_note": "The hash and point-read routes remained in the same microsecond regime, but cross-schema timing deltas are not treated as a controlled comparison."
+  },
+  "interpretation": {
+    "microsecond_inverted_match_observed": true,
+    "single_call_search_latency_measured": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "single concurrency only",
+      "2,048-document corpus, one rare query term, one candidate, and tree height two only",
+      "no broad-term, multi-term, phrase, filter, facet, aggregation, segment, or ANN workload",
+      "no indexing, WAL, checkpoint, merge, delete, update, or fsync latency measurement",
+      "the physical query path still allocates owned query tokens, postings, score maps, and hits",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}
