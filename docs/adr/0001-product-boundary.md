@@ -1,6 +1,6 @@
 # ADR-0001: Hyphae is an autonomous data engine
 
-- Status: Accepted
+- Status: Superseded in product scope by ADR-0020
 - Date: 2026-07-14
 - Owners: Celiums Solutions LLC
 

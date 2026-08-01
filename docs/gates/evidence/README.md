@@ -21,6 +21,122 @@ Environment details and command parameters live inside each report when the
 producer supports them. A final hosted run must be tied to the exact release
 commit before its tag can be published.
 
+## Native phase-1 observations
+
+- [Native phase-1 kernel evidence — 2026-08-01](native-phase1-kernel-2026-08-01.md)
+  records the first page/WAL/MVCC/catalog convergence vertical and its explicit
+  remaining gates.
+- `native-microsecond-smoke-windows.json` is a dirty-worktree, concurrency-one,
+  batch-averaged observation. It is not named-pipe evidence and does not pass
+  the microsecond performance gate.
+- `native-microsecond-smoke-wsl2.json` repeats the same smoke on clean commit
+  `85b7a4d` under WSL2. Commit binding improves reproducibility but the
+  batch-average, tiny-corpus, transport, concurrency, and hardware-counter
+  gaps still keep it outside the gate.
+- [Native blobs, relational mutations, and conflict substrate evidence —
+  2026-08-01](native-blobs-mutations-conflicts-2026-08-01.md) records the
+  content-addressed blob store, UPDATE/DELETE tombstones, WAL-rebuilt point
+  conflict table, expanded crash matrix, and their explicit concurrency and
+  retention limits.
+- `native-microsecond-smoke-multilevel-wsl2.json` binds a 2,049-row,
+  height-two physical B+tree observation to clean commit `5a73795`. It remains
+  outside G7 because timing is batch-averaged, concurrency is one, and
+  transport/interference/hardware controls are absent.
+- [Native borrowed point-read evidence —
+  2026-08-01](native-borrowed-point-read-2026-08-01.md) removes owned
+  per-node decoding from that height-two route and binds the matched
+  sub-microsecond batch-average p50 observation to clean commit `7b0053c`.
+- `native-microsecond-smoke-borrowed-read-wsl2.json` is the machine-readable
+  matched receipt. It still does not pass G7 because individual-operation,
+  concurrency, transport, interference, allocation, and hardware-counter
+  controls remain absent.
+- [Native relational version-chain evidence —
+  2026-08-01](native-relational-version-chains-2026-08-01.md) binds immutable
+  closed row histories and legacy V1 compatibility to one source commit.
+- [Native optimistic-writer evidence —
+  2026-08-01](native-optimistic-writers-2026-08-01.md) binds detached
+  concurrent preparation, admitted-root rebase, first-committer-wins, and
+  recovery to one source commit.
+- [Native structure B+tree evidence —
+  2026-08-01](native-structure-btree-2026-08-01.md) binds the first scalable
+  scalar keyspace, direct buffered reads, TTL/blob envelopes, and legacy
+  compatibility to one source commit.
+- [Native scalar structure mutation evidence —
+  2026-08-01](native-scalar-structure-mutations-2026-08-01.md) binds physical
+  tombstones, `DELETE`, `EXPIRE`, `NX`/`XX`, signed counters, recovery, and
+  their explicit remaining G3 limits.
+- `native-microsecond-smoke-scalar-mutations-wsl2.json` is the matched clean
+  read-path observation for that scalar-mutation source commit. It does not
+  time mutations and remains outside G7.
+- [Native hash structure evidence —
+  2026-08-01](native-hash-structure-2026-08-01.md) binds the first compound
+  structure family, field-granular storage/conflicts, cardinality validation,
+  multilevel recovery, and explicit remaining G3 limits.
+- `native-microsecond-smoke-hash-wsl2.json` is its schema-v5 clean physical
+  `HGET` observation over 2,048 fields. It does not time mutations and remains
+  outside G7.
+- [Native inverted-search evidence —
+  2026-08-01](native-inverted-search-2026-08-01.md) binds the first physical
+  collection/document/term/posting namespaces, prefix-pruned `MATCH`, exact
+  reference-BM25 equivalence, multilevel recovery, corruption rejection, and
+  explicit remaining G4 limits.
+- `native-microsecond-smoke-search-wsl2.json` is its schema-v6 clean physical
+  `MATCH` observation over 2,048 documents. Search uses one complete call per
+  timer observation; the rare-term baseline remains outside G7.
+- [Native canonical type-codec evidence —
+  2026-08-01](native-type-codecs-2026-08-01.md) binds recursive type
+  descriptors, checked primitive row payloads, memcomparable ordered-index
+  components, explicit unsupported nested codecs, and cross-platform
+  validation to one source commit.
+- [Native catalog-definition evidence —
+  2026-08-01](native-catalog-definitions-2026-08-01.md) binds canonical
+  relation/structure/search definitions, full-definition WAL and `HYCAT002`
+  persistence, legacy reconstruction, snapshot/reopen proof, and explicit
+  single-page limits to one source commit.
+- [Native typed SQL-row evidence —
+  2026-08-01](native-typed-sql-rows-2026-08-01.md) binds catalog-typed DDL,
+  canonical `HYTUPL01` rows, primitive and composite primary-key binding,
+  typed prepared point reads, recovery, and historical binary compatibility
+  to one source commit.
+- [Native secondary-index evidence —
+  2026-08-01](native-secondary-indexes-2026-08-01.md) binds canonical catalog
+  definitions, physical relational B+tree namespaces, exact and composite SQL
+  lookup, uniqueness, both optimistic index/row commit orders, recovery
+  validation, and explicit remaining G2/G7 limits to one source commit.
+- [Native direct secondary-index execution evidence —
+  2026-08-01](native-direct-secondary-index-2026-08-01.md) binds catalog-only
+  latest-plan preparation, current-root physical index-to-row execution,
+  materialized/historical equivalence, stale-plan and corruption failures,
+  reopen proof, and explicit remaining G2/G7 limits to one source commit.
+- `native-microsecond-smoke-secondary-sql-wsl2.json` is its schema-v7 clean
+  exact physical and prepared-SQL observation over a 2,048-row unique index.
+  Each secondary timer sample is one complete call; the result remains outside
+  G7.
+- [Native typed indexed-mutation evidence —
+  2026-08-01](native-typed-indexed-mutations-2026-08-01.md) binds typed
+  exact-PK update/delete, atomic old/new projection maintenance, unique rebase,
+  retained history, V1 compatibility, reopen, and a seven-boundary crash
+  matrix to one source commit.
+- [Native bounded relational-scan evidence —
+  2026-08-01](native-bounded-relational-scan-2026-08-01.md) binds exclusive
+  buffered prefix visitation, bounded current-root primary-key scan,
+  transaction/materialized/physical SQL equivalence, V1/V2 reopen, typed
+  failure paths, and explicit remaining G2/G7 limits to one source commit.
+- `native-microsecond-smoke-relational-scan-wsl2.json` is its schema-v8 clean
+  release observation for direct and prepared-SQL `LIMIT 10` scans over a
+  multilevel 2,048-row typed relation. Each scan timer sample is one complete
+  call; the result remains outside G7.
+- [Native primary-key range evidence —
+  2026-08-01](native-primary-key-ranges-2026-08-01.md) binds inclusive,
+  exclusive and unbounded prefix-range visitation, public current-root
+  primary-key bounds, composite SQL row comparisons, three-executor
+  equivalence, empty-range safety, reopen/failure coverage, and explicit
+  remaining G2/G7 limits to one source commit.
+- `native-microsecond-smoke-primary-range-wsl2.json` is its schema-v9 clean
+  release observation for direct and prepared-SQL `[1024, 1034)` primary-key
+  ranges over a multilevel 2,048-row typed relation. Each range timer sample
+  is one complete call; the result remains outside G7.
+
 ## Hosted release evidence
 
 The release workflow generates

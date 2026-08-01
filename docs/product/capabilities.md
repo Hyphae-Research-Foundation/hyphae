@@ -226,3 +226,10 @@ but complete backup verification and restore do not expose one shared
 end-to-end deadline. Restore still uses legacy verification/reopen/snapshot
 paths, and filesystem calls or `sync_all` are not preemptible; operators must
 provide an external timeout when required.
+
+This section is a release-specific statement, not the forward product
+constitution. The accepted
+[native local ecosystem](../architecture/native-local-ecosystem.md) targets
+Hyphae-owned relational, structure, and search engines in a later release
+program while retaining offline operation and no mandatory model or external
+database.

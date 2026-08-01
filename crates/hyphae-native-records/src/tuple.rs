@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use super::{ColumnValueRef, RecordError};
+
+/// Fixed typed-row tuple header before null bits and offsets.
+pub const ROW_TUPLE_HEADER_SIZE: usize = 16;
+
+const ROW_TUPLE_MAGIC: &[u8; 8] = b"HYTUPL01";
+
+/// One owned catalog-ordered typed row tuple without per-column type tags.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowTuple {
+    values: Vec<Option<Vec<u8>>>,
+}
+
+impl RowTuple {
+    /// Constructs one tuple from catalog-ordered canonical scalar bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for no columns or a count above `u16::MAX`.
+    pub fn new(values: Vec<Option<Vec<u8>>>) -> Result<Self, RecordError> {
+        if values.is_empty() {
+            return Err(RecordError::EmptyRegularRow);
+        }
+        u16::try_from(values.len()).map_err(|_| RecordError::ColumnCountOverflow)?;
+        Ok(Self { values })
+    }
+
+    /// Returns the catalog column count.
+    pub fn column_count(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns one catalog-ordered column.
+    pub fn value(&self, index: usize) -> Option<ColumnValueRef<'_>> {
+        self.values.get(index).map(|value| {
+            value
+                .as_deref()
+                .map_or(ColumnValueRef::Null, ColumnValueRef::Bytes)
+        })
+    }
+
+    /// Encodes one exact self-delimiting tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when its column count or byte length exceeds the
+    /// canonical integer fields.
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let column_count =
+            u16::try_from(self.values.len()).map_err(|_| RecordError::ColumnCountOverflow)?;
+        let null_bytes = null_bitmap_length(self.values.len());
+        let offsets_bytes = self
+            .values
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or(RecordError::LengthOverflow)?;
+        let value_start = ROW_TUPLE_HEADER_SIZE
+            .checked_add(null_bytes)
+            .and_then(|size| size.checked_add(offsets_bytes))
+            .ok_or(RecordError::LengthOverflow)?;
+        let value_bytes = self.values.iter().try_fold(0_usize, |total, value| {
+            total
+                .checked_add(value.as_ref().map_or(0, Vec::len))
+                .ok_or(RecordError::LengthOverflow)
+        })?;
+        let total_length = value_start
+            .checked_add(value_bytes)
+            .ok_or(RecordError::LengthOverflow)?;
+        let total_u32 = u32::try_from(total_length).map_err(|_| RecordError::LengthOverflow)?;
+        let mut encoded = vec![0_u8; total_length];
+        encoded[0..8].copy_from_slice(ROW_TUPLE_MAGIC);
+        encoded[8..12].copy_from_slice(&total_u32.to_le_bytes());
+        encoded[12..14].copy_from_slice(&column_count.to_le_bytes());
+
+        let null_start = ROW_TUPLE_HEADER_SIZE;
+        let offsets_start = null_start + null_bytes;
+        let mut value_offset = value_start;
+        write_u32(&mut encoded[offsets_start..offsets_start + 4], value_offset)?;
+        for (index, value) in self.values.iter().enumerate() {
+            if let Some(value) = value {
+                let end = value_offset
+                    .checked_add(value.len())
+                    .ok_or(RecordError::LengthOverflow)?;
+                encoded[value_offset..end].copy_from_slice(value);
+                value_offset = end;
+            } else {
+                encoded[null_start + index / 8] |= 1_u8 << (index % 8);
+            }
+            let offset_position = offsets_start + (index + 1) * 4;
+            write_u32(
+                &mut encoded[offset_position..offset_position + 4],
+                value_offset,
+            )?;
+        }
+        Ok(encoded)
+    }
+
+    /// Decodes and owns one canonical tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed headers, lengths, null bits, offsets,
+    /// or trailing bytes.
+    pub fn decode(encoded: &[u8]) -> Result<Self, RecordError> {
+        let view = RowTupleView::decode(encoded)?;
+        let mut values = Vec::with_capacity(view.column_count());
+        for index in 0..view.column_count() {
+            match view.value(index).ok_or(RecordError::InvalidOffsets)? {
+                ColumnValueRef::Null => values.push(None),
+                ColumnValueRef::Bytes(value) => values.push(Some(value.to_vec())),
+            }
+        }
+        Ok(Self { values })
+    }
+}
+
+/// Borrowed validated view over one typed row tuple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowTupleView<'tuple> {
+    encoded: &'tuple [u8],
+    column_count: usize,
+    offsets_start: usize,
+}
+
+impl<'tuple> RowTupleView<'tuple> {
+    /// Decodes and validates a tuple without allocating column values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any malformed header, count, null bit, offset,
+    /// length, or trailing representation.
+    pub fn decode(encoded: &'tuple [u8]) -> Result<Self, RecordError> {
+        if encoded.len() < ROW_TUPLE_HEADER_SIZE {
+            return Err(RecordError::Truncated);
+        }
+        if encoded.get(..8) != Some(ROW_TUPLE_MAGIC.as_slice()) || encoded[14..16] != [0, 0] {
+            return Err(RecordError::InvalidTupleHeader);
+        }
+        let total_length =
+            usize::try_from(read_u32(&encoded[8..12])).map_err(|_| RecordError::LengthOverflow)?;
+        if total_length != encoded.len() {
+            return Err(RecordError::LengthMismatch);
+        }
+        let column_count = usize::from(read_u16(&encoded[12..14]));
+        if column_count == 0 {
+            return Err(RecordError::EmptyRegularRow);
+        }
+        let offsets_start = validate_layout(encoded, column_count)?;
+        Ok(Self {
+            encoded,
+            column_count,
+            offsets_start,
+        })
+    }
+
+    /// Returns the catalog column count.
+    pub const fn column_count(self) -> usize {
+        self.column_count
+    }
+
+    /// Returns one borrowed catalog-ordered column.
+    pub fn value(self, index: usize) -> Option<ColumnValueRef<'tuple>> {
+        if index >= self.column_count {
+            return None;
+        }
+        let is_null = self.encoded[ROW_TUPLE_HEADER_SIZE + index / 8] & (1_u8 << (index % 8)) != 0;
+        if is_null {
+            return Some(ColumnValueRef::Null);
+        }
+        let offset = |position: usize| -> Option<usize> {
+            let start = self.offsets_start + position * 4;
+            usize::try_from(read_u32(self.encoded.get(start..start + 4)?)).ok()
+        };
+        self.encoded
+            .get(offset(index)?..offset(index + 1)?)
+            .map(ColumnValueRef::Bytes)
+    }
+
+    /// Returns the exact validated bytes.
+    pub const fn bytes(self) -> &'tuple [u8] {
+        self.encoded
+    }
+}
+
+fn validate_layout(encoded: &[u8], column_count: usize) -> Result<usize, RecordError> {
+    let null_bytes = null_bitmap_length(column_count);
+    let offsets_bytes = column_count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or(RecordError::LengthOverflow)?;
+    let offsets_start = ROW_TUPLE_HEADER_SIZE
+        .checked_add(null_bytes)
+        .ok_or(RecordError::LengthOverflow)?;
+    let value_start = offsets_start
+        .checked_add(offsets_bytes)
+        .ok_or(RecordError::LengthOverflow)?;
+    if value_start > encoded.len() {
+        return Err(RecordError::Truncated);
+    }
+    if !column_count.is_multiple_of(8) {
+        let used_bits = column_count % 8;
+        let invalid_mask = !((1_u8 << used_bits) - 1);
+        if encoded[ROW_TUPLE_HEADER_SIZE + null_bytes - 1] & invalid_mask != 0 {
+            return Err(RecordError::NoncanonicalNullBitmap);
+        }
+    }
+
+    let mut previous_offset = None;
+    for offset_index in 0..=column_count {
+        let start = offsets_start
+            .checked_add(
+                offset_index
+                    .checked_mul(4)
+                    .ok_or(RecordError::LengthOverflow)?,
+            )
+            .ok_or(RecordError::LengthOverflow)?;
+        let offset = usize::try_from(read_u32(
+            encoded
+                .get(start..start + 4)
+                .ok_or(RecordError::Truncated)?,
+        ))
+        .map_err(|_| RecordError::LengthOverflow)?;
+        if offset < value_start || offset > encoded.len() {
+            return Err(RecordError::InvalidOffsets);
+        }
+        if offset_index == 0 && offset != value_start {
+            return Err(RecordError::InvalidOffsets);
+        }
+        if let Some(previous) = previous_offset {
+            if previous > offset {
+                return Err(RecordError::InvalidOffsets);
+            }
+            let column = offset_index - 1;
+            let is_null = encoded[ROW_TUPLE_HEADER_SIZE + column / 8] & (1_u8 << (column % 8)) != 0;
+            if is_null && previous != offset {
+                return Err(RecordError::NullHasBytes);
+            }
+        }
+        previous_offset = Some(offset);
+    }
+    if previous_offset != Some(encoded.len()) {
+        return Err(RecordError::InvalidOffsets);
+    }
+    Ok(offsets_start)
+}
+
+fn null_bitmap_length(column_count: usize) -> usize {
+    column_count.saturating_add(7) / 8
+}
+
+fn write_u32(target: &mut [u8], value: usize) -> Result<(), RecordError> {
+    let value = u32::try_from(value).map_err(|_| RecordError::LengthOverflow)?;
+    target.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn read_u16(encoded: &[u8]) -> u16 {
+    u16::from_le_bytes([encoded[0], encoded[1]])
+}
+
+fn read_u32(encoded: &[u8]) -> u32 {
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(encoded);
+    u32::from_le_bytes(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROW_TUPLE_HEADER_SIZE, ROW_TUPLE_MAGIC, RecordError, RowTuple, RowTupleView};
+    use crate::ColumnValueRef;
+
+    #[test]
+    fn typed_tuple_round_trips_null_empty_and_binary() -> Result<(), Box<dyn std::error::Error>> {
+        let tuple = RowTuple::new(vec![
+            Some(7_i64.to_le_bytes().to_vec()),
+            None,
+            Some(Vec::new()),
+            Some(vec![0, 0xff]),
+        ])?;
+        let encoded = tuple.encode()?;
+        assert_eq!(&encoded[..8], ROW_TUPLE_MAGIC);
+        assert_eq!(RowTuple::decode(&encoded)?, tuple);
+        let view = RowTupleView::decode(&encoded)?;
+        assert_eq!(view.column_count(), 4);
+        assert_eq!(
+            view.value(0),
+            Some(ColumnValueRef::Bytes(&7_i64.to_le_bytes()))
+        );
+        assert_eq!(view.value(1), Some(ColumnValueRef::Null));
+        assert_eq!(view.value(2), Some(ColumnValueRef::Bytes(b"")));
+        assert_eq!(view.value(3), Some(ColumnValueRef::Bytes(&[0, 0xff])));
+        assert_eq!(view.bytes(), encoded);
+        assert_eq!(
+            blake3::hash(&encoded).to_hex().as_str(),
+            "302a6901cd99efcb3a122805f6c52909864839e317247cfadaf717db76df5fef"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tuple_rejects_header_length_and_unused_null_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = RowTuple::new(vec![None])?.encode()?;
+
+        let mut invalid_header = encoded.clone();
+        invalid_header[15] = 1;
+        assert_eq!(
+            RowTupleView::decode(&invalid_header),
+            Err(RecordError::InvalidTupleHeader)
+        );
+
+        let mut invalid_length = encoded.clone();
+        invalid_length[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            RowTupleView::decode(&invalid_length),
+            Err(RecordError::LengthMismatch)
+        );
+
+        let mut invalid_null = encoded;
+        invalid_null[ROW_TUPLE_HEADER_SIZE] |= 0x80;
+        assert_eq!(
+            RowTupleView::decode(&invalid_null),
+            Err(RecordError::NoncanonicalNullBitmap)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_tuple_rejects_invalid_offsets_and_trailing_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = RowTuple::new(vec![None, Some(b"value".to_vec())])?.encode()?;
+        let offsets_start = ROW_TUPLE_HEADER_SIZE + 1;
+
+        let mut null_has_bytes = encoded.clone();
+        let first =
+            u32::from_le_bytes(null_has_bytes[offsets_start..offsets_start + 4].try_into()?);
+        null_has_bytes[offsets_start + 4..offsets_start + 8]
+            .copy_from_slice(&(first + 1).to_le_bytes());
+        assert_eq!(
+            RowTupleView::decode(&null_has_bytes),
+            Err(RecordError::NullHasBytes)
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            RowTupleView::decode(&trailing),
+            Err(RecordError::LengthMismatch)
+        );
+        Ok(())
+    }
+}

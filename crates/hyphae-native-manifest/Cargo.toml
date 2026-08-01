@@ -1,0 +1,21 @@
+[package]
+name = "hyphae-native-manifest"
+description = "Immutable root manifests and checkpoint publication for Hyphae"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+crc32c.workspace = true
+hyphae-native-mvcc.workspace = true
+hyphae-native-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

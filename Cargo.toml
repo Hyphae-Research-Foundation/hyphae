@@ -9,6 +9,16 @@ members = [
     "crates/hyphae-contracts",
     "crates/hyphae-core",
     "crates/hyphae-engine",
+    "crates/hyphae-native-blobs",
+    "crates/hyphae-native-catalog",
+    "crates/hyphae-native-btree",
+    "crates/hyphae-native-mvcc",
+    "crates/hyphae-native-manifest",
+    "crates/hyphae-native-pages",
+    "crates/hyphae-native-records",
+    "crates/hyphae-native-runtime",
+    "crates/hyphae-native-types",
+    "crates/hyphae-native-wal",
     "crates/hyphae-query",
     "crates/hyphae-retrieval",
     "crates/hyphae-server",
@@ -42,6 +52,16 @@ hyphae-contracts = { path = "crates/hyphae-contracts", version = "=0.2.1" }
 hyphae-client = { path = "crates/hyphae-client", version = "=0.2.1" }
 hyphae-core = { path = "crates/hyphae-core", version = "=0.2.1" }
 hyphae-engine = { path = "crates/hyphae-engine", version = "=0.2.1" }
+hyphae-native-blobs = { path = "crates/hyphae-native-blobs", version = "=0.2.1" }
+hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=0.2.1" }
+hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=0.2.1" }
+hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=0.2.1" }
+hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=0.2.1" }
+hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=0.2.1" }
+hyphae-native-records = { path = "crates/hyphae-native-records", version = "=0.2.1" }
+hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=0.2.1" }
+hyphae-native-types = { path = "crates/hyphae-native-types", version = "=0.2.1" }
+hyphae-native-wal = { path = "crates/hyphae-native-wal", version = "=0.2.1" }
 hyphae-query = { path = "crates/hyphae-query", version = "=0.2.1" }
 hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=0.2.1" }
 hyphae-server = { path = "crates/hyphae-server", version = "=0.2.1" }

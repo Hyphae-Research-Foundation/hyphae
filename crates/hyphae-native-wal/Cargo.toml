@@ -1,0 +1,21 @@
+[package]
+name = "hyphae-native-wal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Block-framed authoritative WAL codec and file for native Hyphae."
+publish = false
+
+[dependencies]
+blake3.workspace = true
+crc32c.workspace = true
+hyphae-native-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

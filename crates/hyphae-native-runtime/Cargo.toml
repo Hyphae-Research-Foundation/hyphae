@@ -1,0 +1,28 @@
+[package]
+name = "hyphae-native-runtime"
+description = "Experimental native transactional runtime joining Hyphae's relational, structure, and search kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+crc32c.workspace = true
+hyphae-native-blobs.workspace = true
+hyphae-native-btree.workspace = true
+hyphae-native-catalog.workspace = true
+hyphae-native-manifest.workspace = true
+hyphae-native-mvcc.workspace = true
+hyphae-native-pages.workspace = true
+hyphae-native-records.workspace = true
+hyphae-native-types.workspace = true
+hyphae-native-wal.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

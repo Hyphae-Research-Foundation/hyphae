@@ -36,6 +36,15 @@ signatures, exhaustive error surfaces, and compatibility behavior. See the
 [`0.2.1` publication receipt](docs/release/receipts/0.2.1.md) for exact source,
 tag, workflow, artifact, and registry identities.
 
+**Forward architecture:** Hyphae is now targeting a fully native local data
+ecosystem with its own relational/SQL, keyspace/structure, and lexical/vector
+search engines. They will share one Hyphae-owned transaction, memory,
+durability, recovery, and proof substrate without embedding PostgreSQL,
+Valkey, OpenSearch, or another database engine. This is an accepted target,
+not shipped `0.2.1` behavior. See the
+[native architecture](docs/architecture/native-local-ecosystem.md) and its
+[ordered phase-1 gate](docs/gates/native-local-phase-1.md).
+
 ## What Hyphae does
 
 - Atomically stores and deletes structured records under binary keys.
@@ -176,6 +185,8 @@ Start at the [documentation index](docs/README.md). Key guides:
 - [Public clients](docs/clients/v1.md)
 - [Operations and troubleshooting](docs/operations/troubleshooting.md)
 - [Security model](docs/security/threat-model.md)
+- [Native local ecosystem target](docs/architecture/native-local-ecosystem.md)
+- [Microsecond-first target](docs/performance/microsecond-first.md)
 - [Release verification](docs/release/verification.md)
 - [0.2.1 publication receipt](docs/release/receipts/0.2.1.md)
 - [crates.io release procedure](docs/release/crates-io.md)
@@ -183,9 +194,15 @@ Start at the [documentation index](docs/README.md). Key guides:
 ## Product boundary
 
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
-runtime, a hosted SaaS, or a framework-specific data layer. It does not ship
-SQL, replication, clustering, built-in TLS, at-rest encryption, multitenancy,
-billing, a control plane, an embedding model, or an LLM.
+runtime, a hosted SaaS, or a framework-specific data layer. Release `0.2.1`
+does not ship SQL, replication, clustering, built-in TLS, at-rest encryption,
+multitenancy, billing, a control plane, an embedding model, or an LLM.
+
+The phase-1 target deliberately adds Hyphae-owned relational SQL, native
+keyspace structures, and native lexical/vector search inside the same local
+process. It does not add an external database, cache, search service, model, or
+cloud dependency. Hosted, distributed, and model-driven programs remain later
+phases.
 
 Applications own process supervision, remote TLS termination, filesystem
 permissions, backup media policy, and optional embedding providers. Semantic
