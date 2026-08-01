@@ -630,6 +630,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-catalog"
+version = "0.2.1"
+dependencies = [
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
+name = "hyphae-native-mvcc"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
+name = "hyphae-native-pages"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
+name = "hyphae-native-runtime"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "hyphae-native-catalog",
+ "hyphae-native-mvcc",
+ "hyphae-native-pages",
+ "hyphae-native-types",
+ "hyphae-native-wal",
+ "thiserror",
+]
+
+[[package]]
+name = "hyphae-native-types"
+version = "0.2.1"
+
+[[package]]
+name = "hyphae-native-wal"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
 name = "hyphae-pliegors"
 version = "0.2.1"
 dependencies = [

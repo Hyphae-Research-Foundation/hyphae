@@ -1,0 +1,81 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v1",
+  "measured_at": "2026-08-01T10:35:39.6850305-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "base_commit": "acddccc962c9b3b36f1451b6dc7c9f06d6d138be",
+    "worktree": "dirty native-slice implementation",
+    "warning": "This receipt is not commit-bound and cannot establish a release or regression gate."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-windows"
+  },
+  "hardware": {
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "physical_cores": 16,
+    "logical_processors": 16,
+    "reported_max_clock_mhz": 2900,
+    "ram_bytes": 33820106752,
+    "system_model": "83JM",
+    "operating_system": "Microsoft Windows 11 Pro",
+    "os_version": "10.0.26200",
+    "workspace_storage": "KBG60ZNT1T02 LS KIOXIA",
+    "workspace_bus": "NVMe",
+    "workspace_filesystem": "NTFS"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "dataset_digest_blake3": "8e68d0b8a54952dfb5caabf4c9d8257e937b388346a6d61ce5f6aca497945f8c",
+    "transport_note": "Frame codec plus embedded dispatch only; no Windows named-pipe transport was measured."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.003,
+      "p95_us": 0.006,
+      "p99_us": 0.006,
+      "p99_9_us": 0.009,
+      "throughput_ops_s": 234070069
+    },
+    "embedded_prepared_sql_pk": {
+      "p50_us": 0.003,
+      "p95_us": 0.006,
+      "p99_us": 0.006,
+      "p99_9_us": 0.012,
+      "throughput_ops_s": 203459188
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.021,
+      "p95_us": 0.025,
+      "p99_us": 0.031,
+      "p99_9_us": 0.112,
+      "throughput_ops_s": 40528779
+    }
+  },
+  "interpretation": {
+    "microsecond_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "dirty source state",
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "tiny one-row and one-key corpus",
+      "no named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters"
+    ]
+  }
+}

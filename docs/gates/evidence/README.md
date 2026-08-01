@@ -21,6 +21,15 @@ Environment details and command parameters live inside each report when the
 producer supports them. A final hosted run must be tied to the exact release
 commit before its tag can be published.
 
+## Native phase-1 observations
+
+- [Native phase-1 kernel evidence — 2026-08-01](native-phase1-kernel-2026-08-01.md)
+  records the first page/WAL/MVCC/catalog convergence vertical and its explicit
+  remaining gates.
+- `native-microsecond-smoke-windows.json` is a dirty-worktree, concurrency-one,
+  batch-averaged observation. It is not named-pipe evidence and does not pass
+  the microsecond performance gate.
+
 ## Hosted release evidence
 
 The release workflow generates

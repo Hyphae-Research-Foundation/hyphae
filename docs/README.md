@@ -19,6 +19,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Configuration reference](configuration.md)
 - [Data model](concepts/data-model.md)
 - [Architecture overview](architecture/overview.md)
+- [Native local ecosystem target](architecture/native-local-ecosystem.md)
 
 ## Build and embed
 
@@ -43,12 +44,24 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Understand correctness
 
+- [Native canonical types v1](native/types-v1.md)
+- [Native page, row, and blob format v1](native/page-row-blob-format-v1.md)
+- [Native WAL format v1](native/wal-format-v1.md)
+- [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
+- [Native catalog v1](native/catalog-v1.md)
+- [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
+- [Native structure-engine semantics v1](native/structures-semantics-v1.md)
+- [Native search-engine semantics v1](native/search-semantics-v1.md)
+- [Native ANN semantics v1](native/ann-semantics-v1.md)
+- [Native local protocol v1](native/local-protocol-v1.md)
+- [Native clean-room and dependency inventory](native/dependency-inventory.md)
 - [Structured query semantics v1](query/reference-semantics-v1.md)
 - [Exact retrieval semantics v1](retrieval/reference-semantics-v1.md)
 - [Durable exact retrieval semantics v2](retrieval/exact-reference-semantics-v2.md)
 - [Lexical retrieval semantics v1](retrieval/lexical-reference-semantics-v1.md)
 - [Hybrid retrieval semantics v1](retrieval/hybrid-reference-semantics-v1.md)
 - [0.2 retrieval benchmark methodology](performance/retrieval-benchmark-0.2.md)
+- [Microsecond-first performance contract](performance/microsecond-first.md)
 - [Result proof format v1](provenance/result-proof-v1.md)
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
 - [Baseline threat model](security/threat-model.md)
@@ -74,6 +87,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [0.1.0 release gate](gates/0.1.0.md)
 - [0.2.0 release gate](gates/0.2.0.md)
 - [0.2.1 release gate](gates/0.2.1.md)
+- [Native local ecosystem phase-1 gate](gates/native-local-phase-1.md)
+- [Native phase-1 kernel evidence — 2026-08-01](gates/evidence/native-phase1-kernel-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),
@@ -83,7 +98,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 ### Architecture decision records
 
 - [ADR template](adr/0000-template.md)
-- [ADR-0001: Product boundary](adr/0001-product-boundary.md)
+- [ADR-0001: Product boundary (superseded in scope)](adr/0001-product-boundary.md)
 - [ADR-0002: License and porting](adr/0002-license-and-porting.md)
 - [ADR-0003: Public contracts](adr/0003-public-contracts.md)
 - [ADR-0004: Durable authority](adr/0004-durable-authority.md)
@@ -102,6 +117,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0017: Provider-free lexical retrieval](adr/0017-provider-free-lexical-retrieval.md)
 - [ADR-0018: Deterministic hybrid retrieval](adr/0018-deterministic-hybrid-retrieval.md)
 - [ADR-0019: Finite resource policies](adr/0019-finite-resource-policies.md)
+- [ADR-0020: Native local data ecosystem](adr/0020-native-local-data-ecosystem.md)
 
 ## Documentation contract
 
