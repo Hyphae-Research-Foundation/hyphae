@@ -1,0 +1,149 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v3",
+  "measured_at": "2026-08-01T12:18:16.7528875-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "a91538fdc99d434c380b07b2c76c5eaca374220f",
+    "tree": "92bad04e95ea8ec9e352e2eb01a282753572ad83",
+    "branch": "main",
+    "worktree": "clean at measurement",
+    "warning": "The two immediate repeats expose scheduler and environment variation. Commit binding is exact, but neither affinity nor background services were controlled."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502120448,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "relational_rows": 2049,
+    "relational_tree_height": 2,
+    "relational_value_bytes": 96,
+    "dataset_digest_blake3": "847c327dcb42eeafb9561513bd8b1ecb90386ff8ea2c9433468d7f6c6ce86692",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "writer_note": "This read-path smoke does not measure optimistic preparation, conflict validation, rebase, WAL append, or commit publication latency."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.002,
+      "p95_us": 0.003,
+      "p99_us": 0.004,
+      "p99_9_us": 0.010,
+      "throughput_ops_s": 285499857
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.030,
+      "p95_us": 0.032,
+      "p99_us": 0.042,
+      "p99_9_us": 0.391,
+      "throughput_ops_s": 30582918
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 0.843,
+      "p95_us": 1.107,
+      "p99_us": 2.414,
+      "p99_9_us": 5.790,
+      "throughput_ops_s": 1098722
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.023,
+      "p95_us": 0.025,
+      "p99_us": 0.033,
+      "p99_9_us": 0.300,
+      "throughput_ops_s": 38593526
+    }
+  },
+  "immediate_repeat": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.003,
+      "p95_us": 0.004,
+      "p99_us": 0.004,
+      "p99_9_us": 0.009,
+      "throughput_ops_s": 205281229
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.041,
+      "p95_us": 0.042,
+      "p99_us": 0.056,
+      "p99_9_us": 0.574,
+      "throughput_ops_s": 22324617
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.036,
+      "p95_us": 1.350,
+      "p99_us": 2.574,
+      "p99_9_us": 5.558,
+      "throughput_ops_s": 924432
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.023,
+      "p95_us": 0.024,
+      "p99_us": 0.048,
+      "p99_9_us": 0.236,
+      "throughput_ops_s": 38891401
+    }
+  },
+  "comparison": {
+    "baseline_commit": "c1c9874f39473b67c81461e63302bb424a622b90",
+    "baseline_receipt": "native-microsecond-smoke-version-chains-wsl2.json",
+    "same_schema_dataset_height_and_operation_counts": true,
+    "primary_repeat_physical_point_read": {
+      "baseline_p50_us": 0.841,
+      "current_p50_us": 0.843,
+      "p50_increase_percent": 0.24,
+      "baseline_p99_us": 2.422,
+      "current_p99_us": 2.414,
+      "p99_reduction_percent": 0.33,
+      "baseline_p99_9_us": 4.942,
+      "current_p99_9_us": 5.790,
+      "p99_9_increase_percent": 17.16,
+      "baseline_throughput_ops_s": 1088895,
+      "current_throughput_ops_s": 1098722,
+      "throughput_increase_percent": 0.90
+    },
+    "caveat": "The first current run observed 1.036 us p50 while the immediate repeat observed 0.843 us; uncontrolled run-to-run variation is larger than the median delta against baseline."
+  },
+  "interpretation": {
+    "sub_microsecond_batch_average_p50_observed_in_primary_repeat": true,
+    "microsecond_hot_path_observed_in_both_repeats": true,
+    "optimistic_writer_latency_measured": false,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single read concurrency only",
+      "writer preparation and publication were not timed",
+      "2,049-row corpus and tree height two only",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

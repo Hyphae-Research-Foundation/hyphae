@@ -88,6 +88,12 @@ row pointer, immutable closed histories, V1 compatibility, fail-closed chain
 recovery, and the measured cost of the additional version-page lookup to one
 source commit.
 
+The [optimistic-writer
+evidence](evidence/native-optimistic-writers-2026-08-01.md) binds concurrent
+detached preparation, admitted-root rebase across all three engines,
+first-committer-wins, lagging-read-CSN recovery, and the optimistic crash
+matrix to one source commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
