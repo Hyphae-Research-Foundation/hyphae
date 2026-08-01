@@ -112,6 +112,11 @@ commit before its tag can be published.
   exact physical and prepared-SQL observation over a 2,048-row unique index.
   Each secondary timer sample is one complete call; the result remains outside
   G7.
+- [Native typed indexed-mutation evidence —
+  2026-08-01](native-typed-indexed-mutations-2026-08-01.md) binds typed
+  exact-PK update/delete, atomic old/new projection maintenance, unique rebase,
+  retained history, V1 compatibility, reopen, and a seven-boundary crash
+  matrix to one source commit.
 
 ## Hosted release evidence
 

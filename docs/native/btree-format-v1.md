@@ -200,8 +200,10 @@ uniqueness, both optimistic index/row commit orders, catalog/root reopen, and
 missing-projection rejection. Direct exact lookup coverage uses a multilevel
 tree, compares physical and materialized prepared results, checks deterministic
 non-unique order, null short-circuit, stale-plan rejection, reopen equivalence,
-unknown metadata, and a forged invalid live marker. The runtime benchmark
-refuses to run unless its relational, structure, and search trees are
-multilevel. Fuzzing, randomized model equivalence, crash power-loss tests,
-fanout/fill-factor tuning, streaming cursors, and concurrent writer publication
-remain required gate evidence.
+unknown metadata, and a forged invalid live marker. Indexed update/delete
+coverage checks old/new markers, unique/null semantics, optimistic admission,
+retained roots, V1/V2 reopen, and all seven commit interruption boundaries.
+The runtime benchmark refuses to run unless its relational, structure, and
+search trees are multilevel. Fuzzing, randomized model equivalence,
+sector/filesystem power-loss tests, fanout/fill-factor tuning, streaming
+cursors, and concurrent writer publication remain required gate evidence.

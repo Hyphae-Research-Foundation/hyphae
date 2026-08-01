@@ -163,6 +163,14 @@ schema-v7 WSL2 observation to one source commit. Streaming/ranges, indexed
 typed updates/deletes, statistics/cost planning, and the remaining G2/G7
 evidence remain open.
 
+The [native typed indexed-mutation
+evidence](evidence/native-typed-indexed-mutations-2026-08-01.md) binds
+exact-primary-key typed update/delete, atomic old/new index projections,
+unique admission recheck, retained history, inline-V1 compatibility, reopen,
+and a seven-boundary crash matrix to one source commit. Primary-key changes,
+multi-row/range mutation, expressions, general constraints/planning, and the
+remaining G2 evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -174,11 +182,12 @@ transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary-index range/streaming
-execution, indexed typed updates/deletes, remaining structure families,
-positional postings, segments, and ANN required by G1–G4. Typed point inserts
-and catalog-bound primary/secondary-key projection now use canonical tuples
-and primitive/composite keys, but do not close G2. The structure keyspace has
-a multilevel native B+tree, direct reads, tombstone/expiry mutations,
+execution, general relational expressions/constraints/planning, remaining
+structure families, positional postings, segments, and ANN required by G1–G4.
+Typed point inserts, exact-PK update/delete, and catalog-bound
+primary/secondary-key projection now use canonical tuples and
+primitive/composite keys, but do not close G2. The structure keyspace has a
+multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, and the first independent-field hash
 layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
 sets, streams, the expiry scheduler, model tests, and amplification evidence
