@@ -122,6 +122,13 @@ scans, exact reference-BM25 equivalence, shared large text blobs, multilevel
 restart/corruption tests, legacy inline compatibility, and the first clean
 physical `MATCH` latency baseline.
 
+The [native type-codec
+evidence](evidence/native-type-codecs-2026-08-01.md) binds recursive logical
+type descriptors, checked primitive row payloads, memcomparable ordered-index
+components, null separation, malformed/noncanonical failure behavior, and
+cross-platform workspace validation to one source commit. Persistent typed
+catalog definitions, typed rows, and physical secondary indexes remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

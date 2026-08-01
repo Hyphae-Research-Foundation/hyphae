@@ -83,6 +83,11 @@ commit before its tag can be published.
 - `native-microsecond-smoke-search-wsl2.json` is its schema-v6 clean physical
   `MATCH` observation over 2,048 documents. Search uses one complete call per
   timer observation; the rare-term baseline remains outside G7.
+- [Native canonical type-codec evidence —
+  2026-08-01](native-type-codecs-2026-08-01.md) binds recursive type
+  descriptors, checked primitive row payloads, memcomparable ordered-index
+  components, explicit unsupported nested codecs, and cross-platform
+  validation to one source commit.
 
 ## Hosted release evidence
 
