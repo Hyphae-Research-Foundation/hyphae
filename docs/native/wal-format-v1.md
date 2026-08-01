@@ -1,8 +1,9 @@
 # Native WAL format v1
 
 Status: normative target contract; block/record framing, append, integrity
-chain, incomplete-tail repair, and the first typed transaction envelope are
-implemented experimentally; checkpoint and group-commit coordination remain
+chain, incomplete-tail repair, the first typed transaction envelope, and
+root-manifest checkpoint anchors are implemented experimentally; bounded
+checkpoint replay, WAL retention, idempotent retries, and group commit remain
 pending
 
 The WAL is the only transaction authority for the three native engines. It
@@ -73,7 +74,7 @@ conflict detection requires it.
 - mutation count and aggregate mutation bytes;
 - logical commit time;
 - BLAKE3 digest of the ordered canonical mutation records; and
-- root-set generation to be published.
+- the four current catalog, relational, structure, and search root page IDs.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 
@@ -101,8 +102,8 @@ All benchmark and API receipts name the durability class.
 
 ## Recovery
 
-1. Verify the last checkpoint and its root manifest.
-2. Scan blocks from the checkpoint LSN.
+1. Verify the checkpoint chain and each referenced root manifest.
+2. Scan blocks from the selected checkpoint LSN.
 3. Truncate only an incomplete physical tail.
 4. Reject every complete corrupt block, record, sequence, digest chain,
    transaction boundary, or content digest.
@@ -110,13 +111,32 @@ All benchmark and API receipts name the durability class.
 6. Replay committed transactions in CSN order.
 7. Verify or rebuild the committed root set before advancing visibility.
 
-Recovery never guesses an opcode or skips an unknown committed mutation.
+Recovery never guesses an opcode or skips an unknown committed mutation. The
+current vertical performs step 1 but deliberately scans the complete WAL;
+bounded replay from the selected checkpoint remains pending.
 
 ## Checkpoints
 
-A `CHECKPOINT` record binds checkpoint CSN, root-manifest generation, complete
-root digest, and prior checkpoint LSN. WAL deletion is allowed only when every
-retained snapshot and replica requirement is newer than the candidate segment.
+A kernel `CHECKPOINT` occurs outside a user transaction and has this exact
+64-byte body:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYCHK001` |
+| 8 | 8 | visible committed CSN |
+| 16 | 8 | root-manifest generation |
+| 24 | 32 | complete root-manifest digest |
+| 56 | 8 | prior checkpoint record LSN; zero for the first |
+
+Recovery verifies the checkpoint sequence against the complete WAL commit and
+immutable manifest chains. A published manifest without a matching record is
+an unanchored suffix and cannot independently become transaction authority.
+See [Native root manifest and checkpoint format
+v1](root-manifest-checkpoint-v1.md).
+
+WAL deletion is allowed only when every retained snapshot and replica
+requirement is newer than the candidate segment. Retention and truncation are
+not implemented by the current vertical.
 
 ## Verification
 
@@ -124,3 +144,8 @@ Required tests cover golden blocks, all record kinds, transaction idempotency,
 cross-engine ordering, torn writes at every byte, complete corruption,
 sequence/digest divergence, unknown opcode rejection, group synchronization
 receipts, checkpoint replay, and bounded recovery.
+
+Current tests cover the block golden, complete transaction envelope, semantic
+mutation count/digest verification, checkpoint encoding/chain validation,
+complete corruption, incomplete physical tail repair, and deterministic
+checkpoint interruption. The broader list above remains gate work.

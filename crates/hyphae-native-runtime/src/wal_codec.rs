@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_types::{
-    CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ObjectId, PageId, TransactionId,
+    CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId, PageId,
+    TransactionId,
 };
 use hyphae_native_wal::{PendingRecord, RecordKind, WalRecord};
 use thiserror::Error;
@@ -10,6 +11,7 @@ const BEGIN_MAGIC: &[u8; 8] = b"HYBGN001";
 const MUTATION_MAGIC: &[u8; 8] = b"HYMUT001";
 const COMMIT_MAGIC: &[u8; 8] = b"HYCMT001";
 const ABORT_MAGIC: &[u8; 8] = b"HYABT001";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"HYCHK001";
 const ROOT_COUNT: usize = 4;
 
 #[derive(Debug, Error)]
@@ -135,6 +137,22 @@ pub(crate) struct RecoveredCommit {
     pub(crate) manifest: CommitManifest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredCheckpoint {
+    pub(crate) transaction_id: TransactionId,
+    pub(crate) checkpoint_lsn: Lsn,
+    pub(crate) visible_csn: Csn,
+    pub(crate) manifest_generation: ManifestGeneration,
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) previous_checkpoint_lsn: Option<Lsn>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RecoveredWal {
+    pub(crate) commits: Vec<RecoveredCommit>,
+    pub(crate) checkpoints: Vec<RecoveredCheckpoint>,
+}
+
 pub(crate) struct TransactionPlan<'mutations> {
     pub(crate) transaction_id: TransactionId,
     pub(crate) read_csn: Option<Csn>,
@@ -215,10 +233,30 @@ pub(crate) fn encode_transaction(
     Ok(records)
 }
 
-pub(crate) fn recover_commits(
-    records: &[WalRecord],
-) -> Result<Vec<RecoveredCommit>, WalSemanticError> {
-    let mut recovered = Vec::new();
+pub(crate) fn encode_checkpoint(
+    transaction_id: TransactionId,
+    visible_csn: Csn,
+    manifest_generation: ManifestGeneration,
+    manifest_digest: [u8; 32],
+    previous_checkpoint_lsn: Option<Lsn>,
+) -> Result<PendingRecord, WalSemanticError> {
+    let mut body = Vec::with_capacity(64);
+    body.extend_from_slice(CHECKPOINT_MAGIC);
+    body.extend_from_slice(&visible_csn.get().to_le_bytes());
+    body.extend_from_slice(&manifest_generation.get().to_le_bytes());
+    body.extend_from_slice(&manifest_digest);
+    body.extend_from_slice(&previous_checkpoint_lsn.map_or(0, Lsn::get).to_le_bytes());
+    Ok(PendingRecord::new(
+        RecordKind::Checkpoint,
+        EngineKind::Kernel,
+        0,
+        transaction_id,
+        body,
+    )?)
+}
+
+pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSemanticError> {
+    let mut recovered = RecoveredWal::default();
     let mut active: Option<ActiveTransaction> = None;
     for record in records {
         match record.kind() {
@@ -251,12 +289,16 @@ pub(crate) fn recover_commits(
                 }
                 let manifest = CommitManifest::decode(record.body())?;
                 transaction.validate(&manifest)?;
-                if recovered.last().is_some_and(|prior: &RecoveredCommit| {
-                    prior.manifest.commit_csn >= manifest.commit_csn
-                }) {
+                if recovered
+                    .commits
+                    .last()
+                    .is_some_and(|prior: &RecoveredCommit| {
+                        prior.manifest.commit_csn >= manifest.commit_csn
+                    })
+                {
                     return Err(WalSemanticError::InvalidSequence);
                 }
-                recovered.push(RecoveredCommit {
+                recovered.commits.push(RecoveredCommit {
                     transaction_id: record.transaction_id(),
                     commit_lsn: record.lsn(),
                     manifest,
@@ -271,12 +313,62 @@ pub(crate) fn recover_commits(
                     return Err(WalSemanticError::InvalidSequence);
                 }
             }
-            RecordKind::Checkpoint | RecordKind::Catalog => {
+            RecordKind::Checkpoint => {
+                if active.is_some() || record.engine() != EngineKind::Kernel || record.flags() != 0
+                {
+                    return Err(WalSemanticError::InvalidSequence);
+                }
+                let checkpoint = decode_checkpoint(record)?;
+                let committed = recovered
+                    .commits
+                    .iter()
+                    .any(|commit| commit.manifest.commit_csn == checkpoint.visible_csn);
+                if !committed {
+                    return Err(WalSemanticError::InvalidSequence);
+                }
+                if let Some(previous) = recovered.checkpoints.last() {
+                    if checkpoint.previous_checkpoint_lsn != Some(previous.checkpoint_lsn)
+                        || checkpoint.manifest_generation <= previous.manifest_generation
+                        || checkpoint.visible_csn < previous.visible_csn
+                    {
+                        return Err(WalSemanticError::InvalidSequence);
+                    }
+                } else if checkpoint.previous_checkpoint_lsn.is_some() {
+                    return Err(WalSemanticError::InvalidSequence);
+                }
+                recovered.checkpoints.push(checkpoint);
+            }
+            RecordKind::Catalog => {
                 return Err(WalSemanticError::InvalidSequence);
             }
         }
     }
     Ok(recovered)
+}
+
+fn decode_checkpoint(record: &WalRecord) -> Result<RecoveredCheckpoint, WalSemanticError> {
+    let body = record.body();
+    if body.len() != 64 || body.get(..8) != Some(CHECKPOINT_MAGIC.as_slice()) {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    let visible_csn =
+        Csn::new(read_u64(&body[8..16])).map_err(|_| WalSemanticError::InvalidIdentity)?;
+    let manifest_generation = ManifestGeneration::new(read_u64(&body[16..24]))
+        .map_err(|_| WalSemanticError::InvalidIdentity)?;
+    let mut manifest_digest = [0_u8; 32];
+    manifest_digest.copy_from_slice(&body[24..56]);
+    if manifest_digest == [0; 32] {
+        return Err(WalSemanticError::InvalidIdentity);
+    }
+    let previous_checkpoint_lsn = optional_lsn(read_u64(&body[56..64]))?;
+    Ok(RecoveredCheckpoint {
+        transaction_id: record.transaction_id(),
+        checkpoint_lsn: record.lsn(),
+        visible_csn,
+        manifest_generation,
+        manifest_digest,
+        previous_checkpoint_lsn,
+    })
 }
 
 fn encode_begin(
@@ -435,6 +527,16 @@ fn optional_csn(value: u64) -> Result<Option<Csn>, WalSemanticError> {
     }
 }
 
+fn optional_lsn(value: u64) -> Result<Option<Lsn>, WalSemanticError> {
+    if value == 0 {
+        Ok(None)
+    } else {
+        Lsn::new(value)
+            .map(Some)
+            .map_err(|_| WalSemanticError::InvalidIdentity)
+    }
+}
+
 fn read_u32(bytes: &[u8]) -> u32 {
     let mut value = [0_u8; 4];
     value.copy_from_slice(bytes);
@@ -456,11 +558,14 @@ fn read_i64(bytes: &[u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use hyphae_native_types::{
-        CatalogVersion, Csn, DurabilityClass, EngineKind, ObjectId, PageId, TransactionId,
+        CatalogVersion, Csn, DurabilityClass, EngineKind, ManifestGeneration, ObjectId, PageId,
+        TransactionId,
     };
     use hyphae_native_wal::WalBlock;
 
-    use super::{Mutation, Opcode, TransactionPlan, encode_transaction, recover_commits};
+    use super::{
+        Mutation, Opcode, TransactionPlan, encode_checkpoint, encode_transaction, recover_wal,
+    };
 
     #[test]
     fn complete_transaction_round_trips_through_physical_wal()
@@ -510,10 +615,66 @@ mod tests {
         })?;
         let block = WalBlock::build(1, [0; 32], pending)?;
         let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
-        let commits = recover_commits(decoded.records())?;
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].manifest.roots, roots);
-        assert_eq!(commits[0].manifest.mutation_count, 3);
+        let recovered = recover_wal(decoded.records())?;
+        assert_eq!(recovered.commits.len(), 1);
+        assert_eq!(recovered.commits[0].manifest.roots, roots);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_record_anchors_one_committed_manifest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let transaction_id = TransactionId::new(1)?;
+        let mutations = vec![Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+        }];
+        let roots = [
+            PageId::new(1)?,
+            PageId::new(2)?,
+            PageId::new(3)?,
+            PageId::new(4)?,
+        ];
+        let mut pending = encode_transaction(&TransactionPlan {
+            transaction_id,
+            read_csn: None,
+            catalog_version: CatalogVersion::new(1)?,
+            logical_time_micros: 10,
+            durability: DurabilityClass::Strict,
+            mutations: &mutations,
+            commit_csn: Csn::new(1)?,
+            roots,
+        })?;
+        let commit_block = WalBlock::build(1, [0; 32], pending)?;
+        let commit_decoded = WalBlock::decode(1, [0; 32], &commit_block.encode()?)?;
+        let commit_lsn = commit_decoded
+            .records()
+            .last()
+            .ok_or("missing commit")?
+            .lsn();
+        let checkpoint = encode_checkpoint(
+            TransactionId::new(2)?,
+            Csn::new(1)?,
+            ManifestGeneration::new(1)?,
+            [7; 32],
+            None,
+        )?;
+        pending = vec![checkpoint];
+        let checkpoint_block = WalBlock::build(2, commit_block.digest(), pending)?;
+        let checkpoint_decoded =
+            WalBlock::decode(2, commit_block.digest(), &checkpoint_block.encode()?)?;
+        let mut records = commit_decoded.records().to_vec();
+        records.extend_from_slice(checkpoint_decoded.records());
+        let recovered = recover_wal(&records)?;
+        assert_eq!(recovered.commits[0].commit_lsn, commit_lsn);
+        assert_eq!(recovered.checkpoints.len(), 1);
+        assert_eq!(recovered.checkpoints[0].manifest_generation.get(), 1);
+        assert_eq!(recovered.checkpoints[0].manifest_digest, [7; 32]);
         Ok(())
     }
 }

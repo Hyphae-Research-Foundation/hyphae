@@ -10,8 +10,11 @@ members = [
     "crates/hyphae-core",
     "crates/hyphae-engine",
     "crates/hyphae-native-catalog",
+    "crates/hyphae-native-btree",
     "crates/hyphae-native-mvcc",
+    "crates/hyphae-native-manifest",
     "crates/hyphae-native-pages",
+    "crates/hyphae-native-records",
     "crates/hyphae-native-runtime",
     "crates/hyphae-native-types",
     "crates/hyphae-native-wal",
@@ -49,8 +52,11 @@ hyphae-client = { path = "crates/hyphae-client", version = "=0.2.1" }
 hyphae-core = { path = "crates/hyphae-core", version = "=0.2.1" }
 hyphae-engine = { path = "crates/hyphae-engine", version = "=0.2.1" }
 hyphae-native-catalog = { path = "crates/hyphae-native-catalog" }
+hyphae-native-btree = { path = "crates/hyphae-native-btree" }
 hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc" }
+hyphae-native-manifest = { path = "crates/hyphae-native-manifest" }
 hyphae-native-pages = { path = "crates/hyphae-native-pages" }
+hyphae-native-records = { path = "crates/hyphae-native-records" }
 hyphae-native-runtime = { path = "crates/hyphae-native-runtime" }
 hyphae-native-types = { path = "crates/hyphae-native-types" }
 hyphae-native-wal = { path = "crates/hyphae-native-wal" }

@@ -6,7 +6,6 @@ use hyphae_native_types::{EngineKind, ObjectId};
 use thiserror::Error;
 
 const CATALOG_MAGIC: [u8; 8] = *b"HYCAT001";
-const RELATIONAL_MAGIC: [u8; 8] = *b"HYREL001";
 const STRUCTURE_MAGIC: [u8; 8] = *b"HYSTR001";
 const SEARCH_MAGIC: [u8; 8] = *b"HYSEA001";
 
@@ -162,44 +161,6 @@ impl RelationState {
             .get(&table)
             .and_then(|rows| rows.get(key))
             .map(Vec::as_slice)
-    }
-
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&RELATIONAL_MAGIC);
-        put_len(&mut bytes, self.tables.len())?;
-        for (table, rows) in &self.tables {
-            bytes.extend_from_slice(&table.get().to_le_bytes());
-            put_len(&mut bytes, rows.len())?;
-            for (key, value) in rows {
-                put_bytes(&mut bytes, key)?;
-                put_bytes(&mut bytes, value)?;
-            }
-        }
-        Ok(bytes)
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        let mut decoder = Decoder::new(bytes, RELATIONAL_MAGIC)?;
-        let count = decoder.len()?;
-        let mut tables = BTreeMap::new();
-        for _ in 0..count {
-            let id = decoder.object_id()?;
-            let row_count = decoder.len()?;
-            let mut rows = BTreeMap::new();
-            for _ in 0..row_count {
-                let key = decoder.bytes()?;
-                let value = decoder.bytes()?;
-                if rows.insert(key, value).is_some() {
-                    return Err(ModelError::DuplicateEncodedEntry);
-                }
-            }
-            if tables.insert(id, rows).is_some() {
-                return Err(ModelError::DuplicateEncodedEntry);
-            }
-        }
-        decoder.finish()?;
-        Ok(Self { tables })
     }
 }
 
@@ -548,7 +509,10 @@ mod tests {
         let mut relational = RelationState::default();
         relational.create_table(table)?;
         relational.insert(table, b"mario".to_vec(), b"active".to_vec())?;
-        assert_eq!(RelationState::decode(&relational.encode()?)?, relational);
+        assert_eq!(
+            relational.select(table, b"mario"),
+            Some(b"active".as_slice())
+        );
 
         let mut structures = StructureState::default();
         structures.set(b"session".to_vec(), b"open".to_vec(), Some(50));

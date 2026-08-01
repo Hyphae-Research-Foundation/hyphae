@@ -1,8 +1,9 @@
 # Native page, row, and blob format v1
 
 Status: normative target contract; page codec, append-only page file, tail
-repair, and partitioned buffer pool are implemented experimentally; row and
-blob formats remain pending
+repair, partitioned buffer pool, canonical MVCC row codec, fixed blob
+reference, and B+tree-backed row persistence are implemented experimentally;
+the content-addressed blob byte store remains pending
 
 The native substrate uses fixed-size copy-on-write pages and separate
 content-addressed blobs. No target-path page is a Redb page.
@@ -79,8 +80,15 @@ Columns are ordered by stable `ColumnId`, not display name. A dropped column
 keeps its physical ID reserved. A row tombstone has the tombstone flag, row
 ID, begin/end CSNs, and no values.
 
-The record length includes every field and padding. Offsets are monotonic,
-inside the record, and end exactly at the record boundary.
+The record length includes every field and has no trailing padding. Offsets
+are absolute from the start of the row, monotonic, inside the record, and end
+exactly at the record boundary. Null columns consume no value bytes; unused
+null-bitmap bits must be zero.
+
+The implemented codec rejects empty regular rows, unknown flags, zero IDs or
+CSNs, empty/inverted version windows, noncanonical null bits, null values with
+physical bytes, malformed offsets, and tombstones with column payloads.
+Tombstones are exactly the 40-byte header.
 
 ## Variable-length and blob values
 
@@ -102,9 +110,13 @@ reference it.
 ## Copy-on-write root publication
 
 A root set contains the catalog root and one root per engine partition plus
-the visible CSN and WAL checkpoint LSN. Page writes and blob promotion happen
-before the root set is installed. The root manifest is immutable; publishing
-a new generation creates a new file and synchronizes its parent directory.
+the visible CSN and committed WAL LSN/digest anchor. Page writes and blob
+promotion happen before the root set is installed. The root manifest is
+immutable; publishing a new generation creates a new file and synchronizes
+its parent directory where the platform implementation supports it.
+The implemented binary formats are specified in
+[Native B+tree format v1](btree-format-v1.md) and
+[Native root manifest and checkpoint format v1](root-manifest-checkpoint-v1.md).
 
 ## Buffer-pool contract
 
@@ -117,9 +129,19 @@ a new generation creates a new file and synchronizes its parent directory.
   explicitly available shared capacity.
 - Admission and eviction never hold a global engine lock.
 
+The experimental pool currently serves one page-file generation, hashes
+`PageId` across bounded mutex partitions, admits only verified immutable pages,
+and evicts the least-recently-used unpinned frame within a partition. Explicit
+file-generation keys, engine reservations, and a shared-capacity policy remain
+pending; they are target requirements, not current claims.
+
 ## Verification
 
-Required evidence includes golden pages, random round trips, truncation and
-bit-flip rejection at every byte range, invalid offset/length fixtures,
-concurrent pin/eviction tests, copy-on-write root atomicity, blob promotion
-interruption tests, and reference-count/retention tests across snapshots.
+Current evidence includes stable page, row, blob-reference, B+tree-leaf, and
+root-manifest encodings; exact row round trips; malformed null/offset/window
+rejection; page tail repair; buffer-pool pin/eviction tests; copy-on-write
+historical roots; and checkpoint interruption tests.
+
+Still required are broad random/property and fuzz corpora, bit flips across
+every byte range, blob promotion interruption, and reference-count/retention
+tests across snapshots.

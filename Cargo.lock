@@ -630,9 +630,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-btree"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "hyphae-native-pages",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
 name = "hyphae-native-catalog"
 version = "0.2.1"
 dependencies = [
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
+name = "hyphae-native-manifest"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "hyphae-native-mvcc",
  "hyphae-native-types",
  "thiserror",
 ]
@@ -657,14 +678,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-records"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
 name = "hyphae-native-runtime"
 version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",
+ "hyphae-native-btree",
  "hyphae-native-catalog",
+ "hyphae-native-manifest",
  "hyphae-native-mvcc",
  "hyphae-native-pages",
+ "hyphae-native-records",
  "hyphae-native-types",
  "hyphae-native-wal",
  "thiserror",

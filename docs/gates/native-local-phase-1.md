@@ -45,6 +45,8 @@ The current reviewable drafts are:
 
 - [canonical types](../native/types-v1.md);
 - [page, row, and blob format](../native/page-row-blob-format-v1.md);
+- [B+tree format](../native/btree-format-v1.md);
+- [root manifest and checkpoint format](../native/root-manifest-checkpoint-v1.md);
 - [WAL format](../native/wal-format-v1.md);
 - [MVCC and commit semantics](../native/mvcc-commit-v1.md);
 - [catalog](../native/catalog-v1.md);
@@ -62,14 +64,17 @@ benchmark corpus, and implementation-facing tests exist.
 
 The [2026-08-01 kernel evidence](evidence/native-phase1-kernel-2026-08-01.md)
 implements the first reviewable vertical. Steps 1 through 4 and the
-reopen-equivalence portion of step 6 below execute in tests. Step 5 currently
-covers five in-process commit boundaries but not checkpoints, blobs, group
-commit, filesystem reordering, or sector-level power loss. Step 7 has an
-embedded and frame-codec smoke only; no named-pipe/UDS transport receipt.
+reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers
+five in-process commit boundaries and four manifest/checkpoint boundaries, but
+not blobs, group commit, filesystem reordering, or sector-level power loss.
+Step 7 has an embedded and frame-codec smoke only; no named-pipe/UDS transport
+receipt.
 
-This evidence advances G0/G1 but closes neither gate. The bounded runtime
-serializes each small engine state into one page and is not the scalable heap,
-tree, postings, segment, or ANN implementation required by G2–G4.
+This evidence advances G0/G1 but closes neither gate. Relational table/primary
+key storage now uses the native B+tree and canonical MVCC rows. Catalog,
+structure, and search state remain bounded single-page scaffolding; secondary
+indexes, version-chain updates/deletes, scalable structures, postings,
+segments, and ANN remain required by G2–G4.
 
 ## G1 substrate exit
 

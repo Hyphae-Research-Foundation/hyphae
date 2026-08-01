@@ -81,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..WARMUP {
         black_box(snapshot.get(black_box(b"session")));
         black_box(snapshot.execute_prepared_binary(&prepared, black_box(b"mario"))?);
+        black_box(database.select_latest_relational(table, black_box(b"mario"))?);
         let decoded = decode_frame(black_box(&frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
         black_box(snapshot.get(black_box(decoded.payload)));
     }
@@ -95,6 +96,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .is_ok(),
         );
     });
+    let relational_btree = measure(|| {
+        black_box(
+            database
+                .select_latest_relational(table, black_box(b"mario"))
+                .is_ok(),
+        );
+    });
     let codec_dispatch = measure(|| {
         if let Ok(decoded) = decode_frame(black_box(&frame), DEFAULT_MAX_FRAME_PAYLOAD) {
             black_box(snapshot.get(black_box(decoded.payload)));
@@ -103,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dataset_digest = blake3::hash(b"accounts:mario=active;session=64x07;notes:doc-1");
 
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v1\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v2\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -125,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"operations\": {{");
     print_stats("embedded_structure_get_64b", structure, true);
     print_stats("embedded_prepared_sql_pk", prepared_sql, true);
+    print_stats("buffered_relational_btree_pk", relational_btree, true);
     print_stats(
         "local_frame_decode_plus_structure_dispatch_64b",
         codec_dispatch,

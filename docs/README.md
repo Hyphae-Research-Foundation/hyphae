@@ -46,6 +46,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 - [Native canonical types v1](native/types-v1.md)
 - [Native page, row, and blob format v1](native/page-row-blob-format-v1.md)
+- [Native B+tree format v1](native/btree-format-v1.md)
+- [Native root manifest and checkpoint format v1](native/root-manifest-checkpoint-v1.md)
 - [Native WAL format v1](native/wal-format-v1.md)
 - [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
 - [Native catalog v1](native/catalog-v1.md)

@@ -85,6 +85,13 @@ nonzero_identity!(
     "Stable identity for one relational row."
 );
 nonzero_identity!(
+    BlobId,
+    u128,
+    NonZeroU128,
+    "blob ID",
+    "Stable identity for one immutable blob."
+);
+nonzero_identity!(
     TransactionId,
     u128,
     NonZeroU128,
@@ -118,6 +125,13 @@ nonzero_identity!(
     NonZeroU64,
     "catalog version",
     "Immutable catalog snapshot identity."
+);
+nonzero_identity!(
+    ManifestGeneration,
+    u64,
+    NonZeroU64,
+    "manifest generation",
+    "Immutable root-manifest generation."
 );
 nonzero_identity!(
     Csn,

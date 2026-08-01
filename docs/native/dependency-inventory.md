@@ -59,7 +59,10 @@ The experimental target path currently consists of:
 - `hyphae-native-pages`;
 - `hyphae-native-wal`;
 - `hyphae-native-catalog`;
-- `hyphae-native-mvcc`; and
+- `hyphae-native-mvcc`;
+- `hyphae-native-records`;
+- `hyphae-native-btree`;
+- `hyphae-native-manifest`; and
 - `hyphae-native-runtime`.
 
 `cargo tree -p hyphae-native-runtime --locked` on 2026-08-01 showed only the
@@ -74,6 +77,11 @@ dependency in those crates. The only product-name match was a crate-level
 non-compatibility disclaimer. Direct native source contains no `unsafe`
 token. This is implementation inventory evidence, not the still-pending
 transitive unsafe and license audit required to close G0.
+
+The records, B+tree, and manifest crates add no new third-party runtime
+dependency category. The runtime reaches them only through workspace path
+dependencies; the B+tree uses the Hyphae page and buffer-pool APIs, and the
+checkpoint path uses the Hyphae WAL and MVCC types.
 
 ## Upstream research
 

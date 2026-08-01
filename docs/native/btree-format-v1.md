@@ -1,0 +1,106 @@
+# Native B+tree format v1
+
+Status: normative experimental format; copy-on-write insertion, replacement,
+recursive splitting, point lookup, ordered scan, complete validation,
+historical roots, and buffer-pool reads are implemented
+
+The native B+tree stores canonical binary keys and values directly in Hyphae
+pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
+Every mutation appends a new leaf-to-root path and returns a new immutable root.
+
+## Common rules
+
+- Node payload version is `1`.
+- Keys are compared as unsigned binary byte strings.
+- Keys within a node are strictly increasing.
+- An empty tree has no root page; a published engine namespace must materialize
+  at least one reserved format entry.
+- Inline keys are limited to 4,096 bytes.
+- One leaf entry must fit in one 16 KiB native page.
+- Published nodes have a nonzero creating CSN.
+- Readers fail closed on a wrong page kind, malformed length, unknown preamble,
+  invalid count, duplicate or unordered key, zero child, cycle, excessive
+  height, invalid separator, or future node.
+
+## Leaf payload
+
+Leaf pages use native page kind `5`.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYBTLF01` |
+| 8 | 2 | format version `1` |
+| 10 | 2 | entry count |
+| 12 | 4 | reserved zero |
+| 16 | variable | ordered entries |
+
+Each entry is:
+
+| Width | Field |
+|---:|---|
+| u32 | key length |
+| u32 | value length |
+| variable | key bytes |
+| variable | value bytes |
+
+The payload ends exactly after the last value. Empty leaves and trailing bytes
+are invalid.
+
+## Internal payload
+
+Internal pages use native page kind `4`.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYBTIN01` |
+| 8 | 2 | format version `1` |
+| 10 | 2 | separator count |
+| 12 | 4 | reserved zero |
+| 16 | 8 | first child page ID |
+| 24 | variable | separator/right-child pairs |
+
+Each pair is `u32 key_length`, key bytes, then one `u64` right-child page ID.
+The child count is exactly the separator count plus one. Every separator equals
+the minimum key in its right child. Complete-tree validation also proves that
+adjacent child ranges do not overlap.
+
+## Copy-on-write mutation
+
+Insertion descends through immutable nodes, rewrites only the affected path,
+and splits nodes when their exact encoded payload exceeds the page capacity.
+A root split appends a new internal root. Insert-only mode rejects an existing
+key; upsert returns the prior value. Old roots remain readable.
+
+No published page is changed in place. Pages appended by an interrupted
+transaction remain unreachable until a WAL-committed root set names the new
+root.
+
+## Current relational namespace
+
+The first relational vertical uses one tree root and these private key
+namespaces:
+
+| Prefix | Key | Value |
+|---:|---|---|
+| `0x00` | exact one-byte format key | ASCII `HYRELBT1` |
+| `0x01` | prefix + 128-bit big-endian table `ObjectId` | empty table marker |
+| `0x02` | prefix + table `ObjectId` + primary-key bytes | canonical MVCC row record |
+
+The table marker preserves an empty table. A row record currently contains the
+primary-key bytes and binary row payload as two catalog-ordered columns. The
+runtime verifies the duplicated primary key, content-derived `RowId`, MVCC
+visibility, and row codec before returning a value.
+
+This namespace is the first physical relational route, not the complete SQL
+storage design. Secondary indexes, version chains for updates/deletes, range
+cursors, prefix compression, bulk load, overflow values, free-space policy,
+and scan-oriented column batches remain pending.
+
+## Verification
+
+Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,
+point reads, ordered scan, retained historical roots, duplicate/upsert
+semantics, buffered lookup, oversized and noncanonical rejection, and
+future-node rejection. Fuzzing, randomized model equivalence, crash power-loss
+tests, fanout/fill-factor tuning, and concurrent writer publication remain
+required gate evidence.
