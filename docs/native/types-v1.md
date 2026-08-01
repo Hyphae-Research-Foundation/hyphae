@@ -1,7 +1,9 @@
 # Native canonical types v1
 
-Status: normative target contract; core identities, logical declarations, and
-canonical floats have a partial implementation in `hyphae-native-types`
+Status: normative target contract; identities, logical-type descriptors,
+primitive scalar storage, and primitive ordered-index components are
+implemented in `hyphae-native-types`. Canonical JSON, arrays, maps, and vectors
+remain target-only value codecs.
 
 This specification defines the types and stable identities shared by the
 native relational, structure, and search engines. Public SQL and local-wire
@@ -9,12 +11,94 @@ encodings may add syntax or framing, but they cannot change these semantics.
 
 ## Encoding rules
 
-- Fixed-width integers use little-endian encoding.
+- Fixed-width integers use little-endian encoding in row/storage payloads.
+- Ordered-index components use the distinct memcomparable encoding defined
+  below; they are never interpreted as row/storage payloads.
 - Lengths are unsigned and checked before allocation.
 - Every encoded value has one canonical byte representation.
 - Decoders reject trailing bytes, invalid discriminants, overlong lengths,
   invalid UTF-8, noncanonical floats, and values outside declared limits.
 - A configurable resource policy may be stricter than the format maximum.
+
+## Logical-type descriptor v1
+
+A descriptor is self-delimiting. It contains exactly one type and no trailing
+bytes.
+
+| Tag | Type | Bytes after tag |
+|---:|---|---|
+| `0x01` | `BOOLEAN` | none |
+| `0x02` | signed integer | width byte: `8`, `16`, `32`, or `64` |
+| `0x03` | unsigned integer | width byte: `8`, `16`, `32`, or `64` |
+| `0x04` | `DECIMAL` | precision byte, scale byte |
+| `0x05` | `FLOAT32` | none |
+| `0x06` | `FLOAT64` | none |
+| `0x07` | `TEXT` | none |
+| `0x08` | `BINARY` | none |
+| `0x09` | `DATE` | none |
+| `0x0a` | `TIME` | none |
+| `0x0b` | `TIMESTAMP` | none |
+| `0x0c` | `INTERVAL` | none |
+| `0x0d` | `UUID` | none |
+| `0x0e` | `JSON` | none |
+| `0x0f` | `ARRAY<T>` | one recursive element descriptor |
+| `0x10` | `MAP<K,V>` | key descriptor, then value descriptor |
+| `0x11` | `VECTOR<F32,N>` | element byte `0x01`, then `N` as little-endian `u16` |
+
+Recursive nesting is at most 64. Unknown tags, invalid parameters, truncation,
+excessive nesting, and trailing bytes fail closed.
+
+## Primitive row/storage payload v1
+
+Row field boundaries are owned by the row directory, so variable-width scalar
+payloads carry no internal length prefix.
+
+| Type | Canonical payload |
+|---|---|
+| `BOOLEAN` | exactly `0x00` or `0x01` |
+| signed/unsigned integer | declared width, little-endian |
+| `DECIMAL` | checked signed `i128` coefficient, little-endian |
+| `FLOAT32` / `FLOAT64` | canonical IEEE bits, little-endian |
+| `TEXT` | raw valid UTF-8 bytes |
+| `BINARY` | raw bytes |
+| `DATE` | signed `i32` days, little-endian |
+| `TIME` | `u64` nanoseconds, little-endian, less than `86,400,000,000,000` |
+| `TIMESTAMP` | signed `i64` microseconds, little-endian |
+| `INTERVAL` | `i32` months, `i32` days, `i64` nanoseconds; each little-endian |
+| `UUID` | 16 bytes in network byte order |
+
+SQL `NULL` is never a scalar payload; it is represented only in the containing
+row's null bitmap. Canonical value codecs for `JSON`, `ARRAY`, `MAP`, and
+`VECTOR` are not defined in this slice and reject use explicitly.
+
+## Ordered-index component v1
+
+Every component is self-delimiting and begins with:
+
+- `0x00` alone for SQL `NULL`;
+- `0x01` followed by one non-null payload.
+
+Non-null payloads compare in logical total order under unsigned lexicographic
+byte comparison:
+
+| Type | Ordered payload |
+|---|---|
+| `BOOLEAN` | `0x00` or `0x01` |
+| signed integer | declared-width big-endian bytes with the high sign bit toggled |
+| unsigned integer | declared-width big-endian bytes |
+| `DECIMAL` | big-endian `i128` coefficient with the high sign bit toggled |
+| floating point | canonical bits; negative encodings bitwise-inverted, non-negative encodings have the high sign bit toggled |
+| `TEXT` / `BINARY` | each zero byte becomes `00 ff`; final terminator is `00 00` |
+| `DATE` / `TIMESTAMP` | big-endian signed value with the high sign bit toggled |
+| `TIME` | big-endian `u64` |
+| `INTERVAL` | ordered months, then days, then nanoseconds |
+| `UUID` | 16 raw bytes |
+
+The text/binary terminator makes both prefixes and embedded zero bytes
+unambiguous. Decoders reject missing terminators, bytes after a terminator,
+invalid escapes, noncanonical float bits, wrong fixed widths, and
+out-of-domain values. Ordered codecs for `JSON`, `ARRAY`, `MAP`, and `VECTOR`
+remain undefined and fail explicitly.
 
 ## Stable identities
 
@@ -62,7 +146,8 @@ it is not a standalone storage type.
 - Negative zero normalizes to positive zero for equality, hashing and storage.
 - Ordinary SQL comparisons involving NaN evaluate to `UNKNOWN`.
 - `IS NAN` and `IS NOT NAN` test NaN explicitly.
-- Index total order is finite values, positive infinity, canonical NaN.
+- Index total order is negative infinity, finite values, positive infinity,
+  canonical NaN.
 
 Vector metrics reject NaN and infinity at index admission even though scalar
 and array values may contain canonical NaN.
@@ -111,9 +196,16 @@ layouts without changing their logical type.
 
 The implementation must provide:
 
-- round-trip and canonical re-encoding tests for every type;
+- round-trip and canonical re-encoding tests for every implemented value type;
 - property tests for ordering, equality and hashing agreement;
 - negative fixtures for every invalid encoding and bound;
 - decimal overflow and rounding fixtures;
 - float NaN/zero canonicalization fixtures; and
 - cross-crate golden bytes consumed by pages, WAL and the local protocol.
+
+The current implementation provides deterministic unit fixtures for descriptor
+round trips, all primitive storage codecs, byte-order agreement for each
+primitive ordered codec, malformed inputs, limits, decimal domains, time
+domains, float NaN/zero canonicalization, and descriptor golden bytes. Broad
+property testing, nested value codecs, and cross-crate golden consumption
+remain required.
