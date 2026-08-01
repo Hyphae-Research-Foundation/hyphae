@@ -21,7 +21,7 @@ pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    ops::{Deref, DerefMut},
+    ops::{ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -212,6 +212,12 @@ pub enum NativeRuntimeError {
     UnknownSecondaryIndex {
         /// Stable catalog identity requested by the caller.
         index: ObjectId,
+    },
+    /// The requested native relation does not exist in the current root.
+    #[error("native relation {table} does not exist")]
+    UnknownRelation {
+        /// Stable catalog identity requested by the caller.
+        table: ObjectId,
     },
     /// The requested data directory already exists.
     #[error("native data directory already exists")]
@@ -442,6 +448,17 @@ pub struct SecondaryIndexRow {
     /// Relation identified by the secondary-index metadata.
     pub table: ObjectId,
     /// Canonical physical primary-key bytes.
+    pub primary_key: Vec<u8>,
+    /// Visible canonical row bytes.
+    pub row: Vec<u8>,
+}
+
+/// One row emitted by a bounded native relational primary-key scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationalScanRow {
+    /// Relation selected by the scan.
+    pub table: ObjectId,
+    /// Canonical physical primary-key bytes and exclusive resume cursor.
     pub primary_key: Vec<u8>,
     /// Visible canonical row bytes.
     pub row: Vec<u8>,
@@ -870,6 +887,96 @@ impl NativeDatabase {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// Scans visible current rows in canonical primary-key order without
+    /// materializing the complete relation.
+    ///
+    /// `start_after` is an exclusive canonical primary-key cursor. A zero
+    /// `limit` validates relation identity and returns no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relation does not exist or when a reached
+    /// physical key, row, page, blob, or version chain is malformed.
+    pub fn scan_latest_relational(
+        &self,
+        table: ObjectId,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.scan_relational_at(&snapshot, table, start_after, limit)
+    }
+
+    fn scan_relational_at(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let root = snapshot
+            .roots()
+            .root(SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
+        let tree = BTree::from_root(root);
+        let table_marker = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &relational_table_key(table))?
+            .ok_or(NativeRuntimeError::UnknownRelation { table })?;
+        if !table_marker.bytes().is_empty() {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let prefix = relational_row_key(table, &[]);
+        let start_after = start_after.map(|primary_key| relational_row_key(table, primary_key));
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut rows = Vec::with_capacity(limit.min(256));
+        let mut scan_error = None;
+        let _outcome = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            start_after.as_deref(),
+            |physical_key, encoded| {
+                let Some(primary_key) = physical_key.get(prefix.len()..) else {
+                    scan_error = Some(NativeRuntimeError::InvalidRelationalTree);
+                    return ControlFlow::Break(());
+                };
+                match decode_relational_value_cached(&context, table, primary_key, encoded) {
+                    Ok(Some(row)) => {
+                        rows.push(RelationalScanRow {
+                            table,
+                            primary_key: primary_key.to_vec(),
+                            row,
+                        });
+                        if rows.len() == limit {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    }
+                    Ok(None) => ControlFlow::Continue(()),
+                    Err(error) => {
+                        scan_error = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = scan_error {
+            return Err(error);
+        }
+        Ok(rows)
     }
 
     /// Performs an exact current secondary-index lookup through the relational
@@ -7080,6 +7187,238 @@ mod tests {
     }
 
     #[test]
+    fn latest_relational_scan_is_bounded_resumable_and_skips_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(77)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "events")?;
+        for index in 0..512_u32 {
+            seed.insert(
+                table,
+                index.to_be_bytes().to_vec(),
+                format!("event-{index:04}").into_bytes(),
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_relational_tree_height()? >= 2);
+
+        let mut mutation = database.begin(11, DurabilityClass::Strict)?;
+        mutation.update(table, 2_u32.to_be_bytes().to_vec(), b"updated".to_vec())?;
+        for index in [1_u32, 3, 7, 8, 9] {
+            mutation.delete(table, index.to_be_bytes().to_vec())?;
+        }
+        mutation.commit()?;
+
+        let first = database.scan_latest_relational(table, None, 5)?;
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.primary_key.clone())
+                .collect::<Vec<_>>(),
+            [0_u32, 2, 4, 5, 6]
+                .iter()
+                .map(|index| index.to_be_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert!(first.iter().all(|row| row.table == table));
+        assert_eq!(first[1].row, b"updated");
+
+        let cursor = first
+            .last()
+            .ok_or("missing first scan page")?
+            .primary_key
+            .clone();
+        let second = database.scan_latest_relational(table, Some(&cursor), 4)?;
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.primary_key.clone())
+                .collect::<Vec<_>>(),
+            [10_u32, 11, 12, 13]
+                .iter()
+                .map(|index| index.to_be_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert!(database.scan_latest_relational(table, None, 0)?.is_empty());
+        assert!(matches!(
+            database.scan_latest_relational(ObjectId::new(9_999)?, None, 1),
+            Err(NativeRuntimeError::UnknownRelation { table: missing })
+                if missing == ObjectId::new(9_999)?
+        ));
+
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.scan_latest_relational(table, None, 5)?, first);
+        assert_eq!(
+            reopened.scan_latest_relational(table, Some(&cursor), 4)?,
+            second
+        );
+        Ok(())
+    }
+
+    fn seed_bounded_sql_scan(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE events (
+                tenant BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (tenant, sequence)
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing events table identity".into());
+        };
+        for sequence in 0_i64..512 {
+            seed.execute_sql(
+                "INSERT INTO events (tenant, sequence, payload) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(sequence),
+                    SqlValue::Text(format!("event-{sequence:04}")),
+                ],
+            )?;
+        }
+        assert_eq!(
+            seed.execute_sql(
+                "SELECT sequence, payload FROM events ORDER BY tenant, sequence LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["sequence".to_owned(), "payload".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(0), SqlValue::Text("event-0000".to_owned()),],
+                    vec![SqlValue::Signed(1), SqlValue::Text("event-0001".to_owned()),],
+                ],
+            }
+        );
+        assert_eq!(
+            seed.execute_sql(
+                "EXPLAIN SELECT payload FROM events ORDER BY tenant, sequence LIMIT 5",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyScan(table={table},limit=5)"
+                ))]],
+            }
+        );
+        seed.commit()?;
+        Ok(table)
+    }
+
+    fn mutate_bounded_sql_scan(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mutation = database.begin_sql(11, DurabilityClass::Strict)?;
+        mutation.execute_sql(
+            "UPDATE events SET payload = ? WHERE tenant = ? AND sequence = ?",
+            &[
+                SqlValue::Text("updated".to_owned()),
+                SqlValue::Signed(1),
+                SqlValue::Signed(2),
+            ],
+        )?;
+        for sequence in [1_i64, 3, 7, 8, 9] {
+            mutation.execute_sql(
+                "DELETE FROM events WHERE tenant = ? AND sequence = ?",
+                &[SqlValue::Signed(1), SqlValue::Signed(sequence)],
+            )?;
+        }
+        mutation.commit()?;
+        Ok(())
+    }
+
+    fn expected_bounded_sql_scan() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["sequence".to_owned(), "payload".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(0), SqlValue::Text("event-0000".to_owned())],
+                vec![SqlValue::Signed(2), SqlValue::Text("updated".to_owned())],
+                vec![SqlValue::Signed(4), SqlValue::Text("event-0004".to_owned())],
+                vec![SqlValue::Signed(5), SqlValue::Text("event-0005".to_owned())],
+                vec![SqlValue::Signed(6), SqlValue::Text("event-0006".to_owned())],
+            ],
+        }
+    }
+
+    #[test]
+    fn bounded_sql_scan_matches_transaction_snapshot_and_physical_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let _table = seed_bounded_sql_scan(&mut database)?;
+        let query = "SELECT sequence, payload FROM events ORDER BY tenant, sequence LIMIT 5";
+        assert!(database.latest_relational_tree_height()? >= 2);
+        mutate_bounded_sql_scan(&mut database)?;
+        let expected = expected_bounded_sql_scan();
+        let materialized = database.snapshot(12)?;
+        let materialized_plan = materialized.prepare_sql(query)?;
+        assert_eq!(
+            materialized.execute_prepared(&materialized_plan, &[])?,
+            expected
+        );
+        let physical_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &[])?,
+            expected
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest("SELECT sequence, payload FROM events LIMIT 5")?,
+                &[],
+            )?,
+            expected
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &database.prepare_sql_latest("SELECT payload FROM events LIMIT 0")?,
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["payload".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        assert!(matches!(
+            database
+                .prepare_sql_latest("SELECT payload FROM events ORDER BY sequence, tenant LIMIT 5"),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(&physical_plan, &[SqlValue::Signed(1)]),
+            Err(SqlError::ParameterMismatch)
+        ));
+
+        let mut catalog_change = database.begin_sql(13, DurabilityClass::Strict)?;
+        catalog_change.execute_sql("CREATE TABLE audit (id BIGINT PRIMARY KEY)", &[])?;
+        catalog_change.commit()?;
+        assert!(matches!(
+            database.execute_prepared_latest(&physical_plan, &[]),
+            Err(SqlError::CatalogChanged)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[])?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn physical_secondary_index_lookup_rejects_malformed_live_marker()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -8210,6 +8549,10 @@ mod tests {
             reopened.select_latest_relational(table, b"key")?,
             Some(b"v1".to_vec())
         );
+        assert_eq!(
+            reopened.scan_latest_relational(table, None, 1)?[0].row,
+            b"v1"
+        );
         let mut update = reopened.begin(11, DurabilityClass::Strict)?;
         update.update(table, b"key".to_vec(), b"v2".to_vec())?;
         update.commit()?;
@@ -8219,6 +8562,10 @@ mod tests {
         assert_eq!(
             recovered.select_latest_relational(table, b"key")?,
             Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            recovered.scan_latest_relational(table, None, 1)?[0].row,
+            b"v2"
         );
         Ok(())
     }

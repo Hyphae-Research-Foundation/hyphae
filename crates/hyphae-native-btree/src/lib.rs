@@ -2,7 +2,11 @@
 
 //! Immutable copy-on-write B+tree over verified Hyphae native pages.
 
-use std::{collections::BTreeSet, ops::Range, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    ops::{ControlFlow, Range},
+    sync::Arc,
+};
 
 use hyphae_native_pages::{
     BufferPool, BufferPoolError, PAGE_PAYLOAD_SIZE, Page, PageFrame, PageKind, PageStore,
@@ -387,6 +391,48 @@ impl BTree {
             return Err(BTreeError::NoncanonicalKeyOrder);
         }
         Ok(output)
+    }
+
+    /// Visits one prefix range in canonical key order through the buffer pool.
+    ///
+    /// `start_after` is an exclusive full-key cursor. Returning
+    /// [`ControlFlow::Break`] from `visitor` stops traversal without reading or
+    /// materializing the remaining range. The returned control flow
+    /// distinguishes an early stop from exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, buffer-pool, codec, key-order, cycle, or
+    /// height failures in every node reached before traversal stops.
+    pub fn visit_prefix_cached<F>(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        mut visitor: F,
+    ) -> Result<ControlFlow<()>, BTreeError>
+    where
+        F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+    {
+        let Some(root) = self.root else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let upper = prefix_upper_bound(prefix);
+        let mut visited = BTreeSet::new();
+        let mut last_key = None;
+        visit_prefix_node_cached(
+            store,
+            pool,
+            root,
+            prefix,
+            upper.as_deref(),
+            start_after,
+            0,
+            &mut visited,
+            &mut last_key,
+            &mut visitor,
+        )
     }
 
     /// Verifies the complete reachable tree and returns its entry count.
@@ -1079,6 +1125,83 @@ fn scan_prefix_node_cached(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn visit_prefix_node_cached<F>(
+    store: &PageStore,
+    pool: &BufferPool,
+    page_id: PageId,
+    prefix: &[u8],
+    upper: Option<&[u8]>,
+    start_after: Option<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    last_key: &mut Option<Vec<u8>>,
+    visitor: &mut F,
+) -> Result<ControlFlow<()>, BTreeError>
+where
+    F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+{
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    let frame = pool.get_or_load(store, page_id)?;
+    match decode_page(frame.page())? {
+        Node::Leaf(entries) => {
+            for entry in entries
+                .into_iter()
+                .skip_while(|entry| entry.key.as_slice() < prefix)
+                .take_while(|entry| entry.key.starts_with(prefix))
+                .filter(|entry| start_after.is_none_or(|cursor| entry.key.as_slice() > cursor))
+            {
+                if last_key
+                    .as_deref()
+                    .is_some_and(|previous| previous >= entry.key.as_slice())
+                {
+                    return Err(BTreeError::NoncanonicalKeyOrder);
+                }
+                last_key.replace(entry.key.clone());
+                if visitor(&entry.key, &entry.value).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                let ends_after_prefix = child_upper.is_none_or(|bound| bound.as_slice() > prefix);
+                let ends_after_cursor = start_after
+                    .is_none_or(|cursor| child_upper.is_none_or(|bound| bound.as_slice() > cursor));
+                let starts_before_upper =
+                    upper.is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                if ends_after_prefix
+                    && ends_after_cursor
+                    && starts_before_upper
+                    && visit_prefix_node_cached(
+                        store,
+                        pool,
+                        child,
+                        prefix,
+                        upper,
+                        start_after,
+                        depth + 1,
+                        visited,
+                        last_key,
+                        visitor,
+                    )?
+                    .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut upper = prefix.to_vec();
     let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
@@ -1177,6 +1300,7 @@ fn validate_node(
 mod tests {
     use std::{
         fs,
+        ops::ControlFlow,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1305,6 +1429,66 @@ mod tests {
         }
         assert_eq!(tree.scan_prefix(&store, &[0xff])?.len(), 4);
         assert_eq!(tree.scan_prefix(&store, &[0xff, 0xff])?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_prefix_visitor_resumes_exclusively_and_stops_early()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for namespace in 0..4_u8 {
+            for index in 0..512_u32 {
+                let mut key = vec![namespace];
+                key.extend_from_slice(&index.to_be_bytes());
+                tree = tree
+                    .insert_unique(
+                        &mut store,
+                        Csn::new(u64::from(namespace) * 512 + u64::from(index) + 1)?,
+                        key,
+                        index.to_be_bytes().to_vec(),
+                    )?
+                    .tree;
+            }
+        }
+        let expected = tree.scan_prefix(&store, &[2])?;
+        let pool = BufferPool::new(64, 4)?;
+        let mut first = Vec::new();
+        let outcome = tree.visit_prefix_cached(&store, &pool, &[2], None, |key, value| {
+            first.push((key.to_vec(), value.to_vec()));
+            if first.len() == 7 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        assert_eq!(outcome, ControlFlow::Break(()));
+        assert_eq!(first, expected[..7]);
+
+        let cursor = first.last().ok_or("missing first page")?.0.clone();
+        let mut second = Vec::new();
+        let outcome =
+            tree.visit_prefix_cached(&store, &pool, &[2], Some(&cursor), |key, value| {
+                second.push((key.to_vec(), value.to_vec()));
+                if second.len() == 5 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })?;
+        assert_eq!(outcome, ControlFlow::Break(()));
+        assert_eq!(second, expected[7..12]);
+
+        let final_cursor = expected.last().ok_or("missing expected rows")?.0.as_slice();
+        let mut exhausted = Vec::new();
+        let outcome =
+            tree.visit_prefix_cached(&store, &pool, &[2], Some(final_cursor), |key, value| {
+                exhausted.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            })?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        assert!(exhausted.is_empty());
         Ok(())
     }
 

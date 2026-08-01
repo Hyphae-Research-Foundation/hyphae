@@ -99,7 +99,7 @@ impl PreparedStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreparedPlan {
-    SelectByPrimaryKey {
+    PrimaryKeyLookup {
         table: ObjectId,
         relation: Box<RelationDefinition>,
         projection: Vec<usize>,
@@ -107,7 +107,7 @@ enum PreparedPlan {
         output_columns: Vec<String>,
         legacy_binary: bool,
     },
-    SelectBySecondaryIndex {
+    SecondaryIndexLookup {
         table: ObjectId,
         index: ObjectId,
         relation: Box<RelationDefinition>,
@@ -115,6 +115,14 @@ enum PreparedPlan {
         projection: Vec<usize>,
         parameter_columns: Vec<usize>,
         output_columns: Vec<String>,
+    },
+    PrimaryKeyScan {
+        table: ObjectId,
+        relation: Box<RelationDefinition>,
+        projection: Vec<usize>,
+        output_columns: Vec<String>,
+        limit: usize,
+        legacy_binary: bool,
     },
 }
 
@@ -148,11 +156,15 @@ enum Statement {
         name: String,
         projection: Projection,
         predicates: Vec<String>,
+        order_by: Vec<String>,
+        limit: Option<usize>,
     },
     ExplainSelect {
         name: String,
         projection: Projection,
         predicates: Vec<String>,
+        order_by: Vec<String>,
+        limit: Option<usize>,
     },
 }
 
@@ -186,6 +198,7 @@ struct BoundSelect {
 enum SelectAccess {
     PrimaryKey { legacy_binary: bool },
     SecondaryIndex { index: ObjectId },
+    PrimaryKeyScan { limit: usize, legacy_binary: bool },
 }
 
 pub(crate) fn prepare(
@@ -208,14 +221,16 @@ pub(crate) fn prepare_catalog(
         name,
         projection,
         predicates,
+        order_by,
+        limit,
     } = parse(statement)?
     else {
         return Err(SqlError::InvalidSyntax);
     };
-    let bound = bind_select(catalog, &name, &projection, &predicates)?;
+    let bound = bind_select(catalog, &name, &projection, &predicates, &order_by, limit)?;
     let relation = relation_by_id(catalog, bound.table)?.clone();
     let plan = match bound.access {
-        SelectAccess::PrimaryKey { legacy_binary } => PreparedPlan::SelectByPrimaryKey {
+        SelectAccess::PrimaryKey { legacy_binary } => PreparedPlan::PrimaryKeyLookup {
             table: bound.table,
             relation: Box::new(relation),
             projection: bound.projection,
@@ -223,7 +238,7 @@ pub(crate) fn prepare_catalog(
             output_columns: bound.output_columns,
             legacy_binary,
         },
-        SelectAccess::SecondaryIndex { index } => PreparedPlan::SelectBySecondaryIndex {
+        SelectAccess::SecondaryIndex { index } => PreparedPlan::SecondaryIndexLookup {
             table: bound.table,
             index,
             relation: Box::new(relation),
@@ -231,6 +246,17 @@ pub(crate) fn prepare_catalog(
             projection: bound.projection,
             parameter_columns: bound.parameter_columns,
             output_columns: bound.output_columns,
+        },
+        SelectAccess::PrimaryKeyScan {
+            limit,
+            legacy_binary,
+        } => PreparedPlan::PrimaryKeyScan {
+            table: bound.table,
+            relation: Box::new(relation),
+            projection: bound.projection,
+            output_columns: bound.output_columns,
+            limit,
+            legacy_binary,
         },
     };
     Ok(PreparedStatement {
@@ -265,7 +291,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
 ) -> Result<Option<&'snapshot [u8]>, SqlError> {
     ensure_catalog_version(snapshot.catalog_version(), prepared)?;
     match &prepared.plan {
-        PreparedPlan::SelectByPrimaryKey {
+        PreparedPlan::PrimaryKeyLookup {
             table,
             projection,
             parameter_columns,
@@ -274,9 +300,9 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         } if projection.as_slice() == [1] && parameter_columns.as_slice() == [0] => {
             Ok(snapshot.select(*table, primary_key))
         }
-        PreparedPlan::SelectByPrimaryKey { .. } | PreparedPlan::SelectBySecondaryIndex { .. } => {
-            Err(SqlError::ParameterMismatch)
-        }
+        PreparedPlan::PrimaryKeyLookup { .. }
+        | PreparedPlan::SecondaryIndexLookup { .. }
+        | PreparedPlan::PrimaryKeyScan { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -312,12 +338,32 @@ pub(crate) fn execute_transaction(
             name,
             projection,
             predicates,
-        } => execute_select(transaction, &name, &projection, &predicates, parameters),
+            order_by,
+            limit,
+        } => execute_select(
+            transaction,
+            &name,
+            &projection,
+            &predicates,
+            &order_by,
+            limit,
+            parameters,
+        ),
         Statement::ExplainSelect {
             name,
             projection,
             predicates,
-        } => execute_explain(transaction, &name, &projection, &predicates, parameters),
+            order_by,
+            limit,
+        } => execute_explain(
+            transaction,
+            &name,
+            &projection,
+            &predicates,
+            &order_by,
+            limit,
+            parameters,
+        ),
     }
 }
 
@@ -327,7 +373,7 @@ fn execute_bound_snapshot(
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     match plan {
-        PreparedPlan::SelectByPrimaryKey {
+        PreparedPlan::PrimaryKeyLookup {
             table,
             relation,
             projection,
@@ -355,7 +401,7 @@ fn execute_bound_snapshot(
                 rows,
             })
         }
-        PreparedPlan::SelectBySecondaryIndex {
+        PreparedPlan::SecondaryIndexLookup {
             table,
             index,
             relation,
@@ -403,6 +449,7 @@ fn execute_bound_snapshot(
                 rows,
             })
         }
+        PreparedPlan::PrimaryKeyScan { .. } => execute_snapshot_scan(snapshot, plan, parameters),
     }
 }
 
@@ -413,7 +460,7 @@ fn execute_bound_latest(
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     match plan {
-        PreparedPlan::SelectByPrimaryKey {
+        PreparedPlan::PrimaryKeyLookup {
             table,
             relation,
             projection,
@@ -443,7 +490,7 @@ fn execute_bound_latest(
                 rows,
             })
         }
-        PreparedPlan::SelectBySecondaryIndex {
+        PreparedPlan::SecondaryIndexLookup {
             table,
             index,
             relation,
@@ -484,7 +531,90 @@ fn execute_bound_latest(
                 rows,
             })
         }
+        PreparedPlan::PrimaryKeyScan { .. } => {
+            execute_latest_scan(database, snapshot, plan, parameters)
+        }
     }
+}
+
+fn execute_snapshot_scan(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyScan {
+        table,
+        relation,
+        projection,
+        output_columns,
+        limit,
+        legacy_binary,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let stored_rows = snapshot
+        .state
+        .relational
+        .tables
+        .get(table)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    let rows = stored_rows
+        .iter()
+        .take(*limit)
+        .map(|(primary_key, stored)| {
+            materialize_scanned_row(relation, projection, *legacy_binary, primary_key, stored)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
+fn execute_latest_scan(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyScan {
+        table,
+        relation,
+        projection,
+        output_columns,
+        limit,
+        legacy_binary,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let matches = database.scan_relational_at(snapshot, *table, None, *limit)?;
+    let rows = matches
+        .into_iter()
+        .map(|matched| {
+            if matched.table != *table {
+                return Err(SqlError::InvalidCatalogObject);
+            }
+            materialize_scanned_row(
+                relation,
+                projection,
+                *legacy_binary,
+                &matched.primary_key,
+                &matched.row,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
 }
 
 fn execute_create_index(
@@ -541,18 +671,30 @@ fn execute_explain(
     name: &str,
     projection: &Projection,
     predicates: &[String],
+    order_by: &[String],
+    limit: Option<usize>,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
     }
-    let bound = bind_select(&transaction.state.catalog, name, projection, predicates)?;
+    let bound = bind_select(
+        &transaction.state.catalog,
+        name,
+        projection,
+        predicates,
+        order_by,
+        limit,
+    )?;
     let plan = match bound.access {
         SelectAccess::PrimaryKey { .. } => {
             format!("PrimaryKeyLookup(table={})", bound.table)
         }
         SelectAccess::SecondaryIndex { index } => {
             format!("SecondaryIndexLookup(table={},index={index})", bound.table)
+        }
+        SelectAccess::PrimaryKeyScan { limit, .. } => {
+            format!("PrimaryKeyScan(table={},limit={limit})", bound.table)
         }
     };
     Ok(SqlResult::Rows {
@@ -723,9 +865,18 @@ fn execute_select(
     name: &str,
     projection: &Projection,
     predicates: &[String],
+    order_by: &[String],
+    limit: Option<usize>,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    let bound = bind_select(&transaction.state.catalog, name, projection, predicates)?;
+    let bound = bind_select(
+        &transaction.state.catalog,
+        name,
+        projection,
+        predicates,
+        order_by,
+        limit,
+    )?;
     let definition = relation_by_id(&transaction.state.catalog, bound.table)?;
     let rows = match bound.access {
         SelectAccess::PrimaryKey { legacy_binary } => {
@@ -783,6 +934,32 @@ fn execute_select(
             }
             rows
         }
+        SelectAccess::PrimaryKeyScan {
+            limit,
+            legacy_binary,
+        } => {
+            if !parameters.is_empty() {
+                return Err(SqlError::ParameterMismatch);
+            }
+            transaction
+                .state
+                .relational
+                .tables
+                .get(&bound.table)
+                .ok_or(SqlError::InvalidStoredRow)?
+                .iter()
+                .take(limit)
+                .map(|(primary_key, stored)| {
+                    materialize_scanned_row(
+                        definition,
+                        &bound.projection,
+                        legacy_binary,
+                        primary_key,
+                        stored,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     Ok(SqlResult::Rows {
         columns: bound.output_columns,
@@ -795,6 +972,8 @@ fn bind_select(
     name: &str,
     projection: &Projection,
     predicates: &[String],
+    order_by: &[String],
+    limit: Option<usize>,
 ) -> Result<BoundSelect, SqlError> {
     let (table, definition) = relation_named(catalog, name)?;
     let projection = match projection {
@@ -813,7 +992,24 @@ fn bind_select(
         parameter_columns.push(column);
     }
     let expected_primary_key = primary_key_indices(definition)?;
-    let access = if same_column_set(&parameter_columns, &expected_primary_key) {
+    let access = if parameter_columns.is_empty() {
+        let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+        if !order_by.is_empty() {
+            let ordered_columns = order_by
+                .iter()
+                .map(|name| column_index(&definition.columns, name))
+                .collect::<Result<Vec<_>, _>>()?;
+            if ordered_columns != expected_primary_key {
+                return Err(SqlError::InvalidPrimaryKey);
+            }
+        }
+        SelectAccess::PrimaryKeyScan {
+            limit,
+            legacy_binary: is_legacy_binary_relation(definition),
+        }
+    } else if !order_by.is_empty() || limit.is_some() {
+        return Err(SqlError::InvalidSyntax);
+    } else if same_column_set(&parameter_columns, &expected_primary_key) {
         SelectAccess::PrimaryKey {
             legacy_binary: is_legacy_binary_relation(definition),
         }
@@ -1090,15 +1286,48 @@ fn materialize_row(
             .zip(parameter_columns)
             .find_map(|(value, column)| (*column == 0).then_some(value))
             .ok_or(SqlError::InvalidPrimaryKey)?;
-        return projection
-            .iter()
-            .map(|index| match index {
-                0 => Ok(primary_key.clone()),
-                1 => Ok(SqlValue::Binary(stored.to_vec())),
-                _ => Err(SqlError::InvalidStoredRow),
-            })
-            .collect();
+        let SqlValue::Binary(primary_key) = primary_key else {
+            return Err(SqlError::InvalidPrimaryKey);
+        };
+        return materialize_legacy_row(projection, primary_key, stored);
     }
+    materialize_typed_row(definition, projection, stored)
+}
+
+fn materialize_scanned_row(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    legacy_binary: bool,
+    primary_key: &[u8],
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
+    if legacy_binary {
+        materialize_legacy_row(projection, primary_key, stored)
+    } else {
+        materialize_typed_row(definition, projection, stored)
+    }
+}
+
+fn materialize_legacy_row(
+    projection: &[usize],
+    primary_key: &[u8],
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
+    projection
+        .iter()
+        .map(|index| match index {
+            0 => Ok(SqlValue::Binary(primary_key.to_vec())),
+            1 => Ok(SqlValue::Binary(stored.to_vec())),
+            _ => Err(SqlError::InvalidStoredRow),
+        })
+        .collect()
+}
+
+fn materialize_typed_row(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
     let tuple = RowTupleView::decode(stored).map_err(|_| SqlError::InvalidStoredRow)?;
     if tuple.column_count() != definition.columns.len() {
         return Err(SqlError::InvalidStoredRow);
@@ -1264,6 +1493,8 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
             name,
             projection,
             predicates,
+            order_by,
+            limit,
         } = parse_select(&mut parser)?
         else {
             return Err(SqlError::InvalidSyntax);
@@ -1272,6 +1503,8 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
             name,
             projection,
             predicates,
+            order_by,
+            limit,
         }
     } else {
         return Err(SqlError::InvalidSyntax);
@@ -1435,12 +1668,39 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     };
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
-    parser.expect_keyword("WHERE")?;
-    let predicates = parse_parameter_predicates(parser)?;
+    let predicates = if parser.consume_keyword("WHERE") {
+        parse_parameter_predicates(parser)?
+    } else {
+        Vec::new()
+    };
+    let order_by = if parser.consume_keyword("ORDER") {
+        parser.expect_keyword("BY")?;
+        let mut columns = vec![parser.identifier()?];
+        while parser.consume_symbol(',') {
+            columns.push(parser.identifier()?);
+        }
+        columns
+    } else {
+        Vec::new()
+    };
+    let limit = if parser.consume_keyword("LIMIT") {
+        Some(parser.number_usize()?)
+    } else {
+        None
+    };
+    if predicates.is_empty() {
+        if limit.is_none() {
+            return Err(SqlError::InvalidSyntax);
+        }
+    } else if !order_by.is_empty() || limit.is_some() {
+        return Err(SqlError::InvalidSyntax);
+    }
     Ok(Statement::Select {
         name,
         projection,
         predicates,
+        order_by,
+        limit,
     })
 }
 
@@ -1576,6 +1836,14 @@ impl Parser {
     }
 
     fn number_u8(&mut self) -> Result<u8, SqlError> {
+        let Some(Token::Number(number)) = self.tokens.get(self.offset) else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        self.offset += 1;
+        number.parse().map_err(|_| SqlError::InvalidSyntax)
+    }
+
+    fn number_usize(&mut self) -> Result<usize, SqlError> {
         let Some(Token::Number(number)) = self.tokens.get(self.offset) else {
             return Err(SqlError::InvalidSyntax);
         };
@@ -1784,6 +2052,50 @@ mod tests {
         assert_eq!(predicates, ["sequence", "tenant"]);
         assert!(matches!(
             parse("SELECT payload FROM events"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_primary_key_scan_parses_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let Statement::Select {
+            projection,
+            predicates,
+            order_by,
+            limit,
+            ..
+        } = parse(
+            "SELECT tenant, sequence, payload
+             FROM events
+             ORDER BY tenant, sequence
+             LIMIT 32",
+        )?
+        else {
+            return Err("expected bounded select".into());
+        };
+        assert_eq!(
+            projection,
+            Projection::Columns(vec![
+                "tenant".to_owned(),
+                "sequence".to_owned(),
+                "payload".to_owned(),
+            ])
+        );
+        assert!(predicates.is_empty());
+        assert_eq!(order_by, ["tenant", "sequence"]);
+        assert_eq!(limit, Some(32));
+        assert!(matches!(
+            parse("SELECT payload FROM events LIMIT 0")?,
+            Statement::Select {
+                predicates,
+                order_by,
+                limit: Some(0),
+                ..
+            } if predicates.is_empty() && order_by.is_empty()
+        ));
+        assert!(matches!(
+            parse("SELECT payload FROM events ORDER BY tenant"),
             Err(SqlError::InvalidSyntax)
         ));
         Ok(())

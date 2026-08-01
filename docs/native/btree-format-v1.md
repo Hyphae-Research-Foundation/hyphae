@@ -2,9 +2,10 @@
 
 Status: normative experimental format; copy-on-write insertion, replacement,
 recursive splitting, point lookup, ordered scan, bounded prefix scan,
-complete validation, balanced-height validation, historical roots, and
-allocation-free buffer-pool point traversal are implemented; relational,
-structure, and lexical-search namespaces now use the native tree
+reentrant buffered prefix visitation, complete validation, balanced-height
+validation, historical roots, and allocation-free buffer-pool point traversal
+are implemented; relational, structure, and lexical-search namespaces now use
+the native tree
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -36,8 +37,11 @@ Prefix scans derive the exclusive binary successor of the requested prefix
 and use internal separator ranges to skip nonintersecting subtrees. A prefix
 ending entirely in `0xff` has no finite upper bound. Both page-store and
 buffer-pool variants preserve canonical key order; only reached nodes are
-decoded during the operation. Returned key/value pairs are currently owned
-allocations rather than a streaming cursor.
+decoded during the operation. The buffered visitor accepts an exclusive
+full-key resume cursor and propagates an early-stop signal without decoding or
+materializing the remaining range. It validates canonical order across the
+keys reached before the stop. The older materializing APIs continue to return
+owned key/value vectors.
 
 ## Leaf payload
 
@@ -149,10 +153,18 @@ rows through the same captured root. Missing metadata has a distinct
 `UnknownSecondaryIndex` failure; malformed entries or dangling live rows fail
 closed. The public result is deterministic primary-key order.
 
+Current-root primary-key scan uses the `0x02 + table ObjectId` prefix and the
+buffered visitor. `scan_latest_relational(table, start_after, limit)` validates
+the table marker, translates the optional exclusive primary-key cursor into a
+full physical key, walks rows in canonical primary-key order, resolves
+HYRELBT1/HYRELBT2 visibility and blobs, skips visible tombstones, and stops
+when the requested live-row count is reached. It returns only that bounded
+owned page and never constructs the complete `RelationState`.
+
 This namespace remains the first physical relational route, not the complete
-SQL storage design. Secondary-key range cursors, prefix compression, bulk load,
-allocation-free streaming, primary-key-changing updates, free-space policy,
-scan-oriented column batches, retention, and vacuum remain pending.
+SQL storage design. Secondary-key range cursors, a stateful zero-copy cursor,
+prefix compression, bulk load, primary-key-changing updates, free-space
+policy, scan-oriented column batches, retention, and vacuum remain pending.
 
 ## Structure namespace
 
@@ -195,6 +207,9 @@ balanced-height verification, point reads, ordered and prefix scans (including
 an all-`0xff` upper range), retained historical roots, duplicate/upsert
 semantics, buffered lookup/scan, oversized and noncanonical rejection,
 complete-node validation after an early key match, and future-node rejection.
+Buffered visitor coverage additionally proves exclusive resume, early stop,
+multilevel traversal, order equivalence with the materialized prefix scan, and
+exhaustion after the final key.
 Runtime coverage additionally proves secondary-index backfill, insert,
 uniqueness, both optimistic index/row commit orders, catalog/root reopen, and
 missing-projection rejection. Direct exact lookup coverage uses a multilevel
@@ -203,7 +218,12 @@ non-unique order, null short-circuit, stale-plan rejection, reopen equivalence,
 unknown metadata, and a forged invalid live marker. Indexed update/delete
 coverage checks old/new markers, unique/null semantics, optimistic admission,
 retained roots, V1/V2 reopen, and all seven commit interruption boundaries.
+Bounded relational scan coverage uses a multilevel tree, tombstoned and updated
+rows, exclusive pagination, zero limit, unknown relation, HYRELBT1/HYRELBT2
+reopen, and equality across transaction, materialized snapshot, and current
+physical SQL execution.
 The runtime benchmark refuses to run unless its relational, structure, and
 search trees are multilevel. Fuzzing, randomized model equivalence,
-sector/filesystem power-loss tests, fanout/fill-factor tuning, streaming
-cursors, and concurrent writer publication remain required gate evidence.
+sector/filesystem power-loss tests, fanout/fill-factor tuning, secondary-range
+and zero-copy cursors, and concurrent writer publication remain required gate
+evidence.

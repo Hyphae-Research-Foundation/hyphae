@@ -24,6 +24,9 @@ const SECONDARY_SCALE_ROWS: u32 = 2_048;
 const SECONDARY_TARGET_ROW: u32 = SECONDARY_SCALE_ROWS / 2;
 const SECONDARY_OBSERVATIONS: u32 = 100_000;
 const SECONDARY_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const SCAN_LIMIT: usize = 10;
+const SCAN_OBSERVATIONS: u32 = 100_000;
+const SCAN_OPERATIONS_PER_OBSERVATION: u32 = 1;
 const STRUCTURE_SCALE_KEYS: u32 = 2_048;
 const STRUCTURE_TARGET_KEY: u32 = STRUCTURE_SCALE_KEYS / 2;
 const HASH_SCALE_FIELDS: u32 = 2_048;
@@ -75,6 +78,8 @@ struct OperationStats {
     search_btree: Stats,
     prepared_sql: Stats,
     relational_btree: Stats,
+    relational_scan: Stats,
+    prepared_sql_scan: Stats,
     secondary_btree: Stats,
     secondary_prepared_sql: Stats,
     codec_dispatch: Stats,
@@ -82,8 +87,10 @@ struct OperationStats {
 
 struct BenchmarkInputs<'a> {
     prepared: &'a PreparedStatement,
+    scan_prepared: &'a PreparedStatement,
     secondary_prepared: &'a PreparedStatement,
     table: ObjectId,
+    scan_table: ObjectId,
     secondary_index: ObjectId,
     search_index: ObjectId,
     relational_target: &'a [u8],
@@ -206,6 +213,12 @@ fn warm_operations(
         black_box(
             database.select_latest_relational(inputs.table, black_box(inputs.relational_target))?,
         );
+        black_box(database.scan_latest_relational(
+            inputs.scan_table,
+            None,
+            black_box(SCAN_LIMIT),
+        )?);
+        black_box(database.execute_prepared_latest(inputs.scan_prepared, &[])?);
         black_box(database.select_latest_secondary_index(
             inputs.secondary_index,
             black_box(inputs.secondary_index_key),
@@ -226,6 +239,7 @@ fn measure_operations(
     inputs: &BenchmarkInputs<'_>,
 ) -> Result<OperationStats, Box<dyn std::error::Error>> {
     warm_operations(database, snapshot, inputs)?;
+    let (relational_scan, prepared_sql_scan) = measure_relational_scans(database, inputs);
     Ok(OperationStats {
         structure: measure(|| {
             black_box(snapshot.get(black_box(b"session")));
@@ -280,6 +294,8 @@ fn measure_operations(
                     .is_ok(),
             );
         }),
+        relational_scan,
+        prepared_sql_scan,
         secondary_btree: measure_counted(
             || {
                 black_box(
@@ -316,6 +332,80 @@ fn measure_operations(
     })
 }
 
+fn measure_relational_scans(
+    database: &NativeDatabase,
+    inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats) {
+    let direct = measure_counted(
+        || {
+            black_box(
+                database
+                    .scan_latest_relational(inputs.scan_table, None, black_box(SCAN_LIMIT))
+                    .is_ok(),
+            );
+        },
+        SCAN_OBSERVATIONS,
+        SCAN_OPERATIONS_PER_OBSERVATION,
+    );
+    let prepared = measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(inputs.scan_prepared, &[])
+                    .is_ok(),
+            );
+        },
+        SCAN_OBSERVATIONS,
+        SCAN_OPERATIONS_PER_OBSERVATION,
+    );
+    (direct, prepared)
+}
+
+fn validate_secondary_routes(
+    database: &NativeDatabase,
+    index: ObjectId,
+    index_key: &[u8],
+    prepared: &PreparedStatement,
+    parameters: &[SqlValue],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if database
+        .select_latest_secondary_index(index, index_key)?
+        .len()
+        != 1
+    {
+        return Err("physical secondary benchmark key did not identify one row".into());
+    }
+    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(prepared, parameters)?
+    else {
+        return Err("physical secondary benchmark SQL did not return rows".into());
+    };
+    if rows.len() != 1 {
+        return Err("physical secondary benchmark SQL did not identify one row".into());
+    }
+    Ok(())
+}
+
+fn validate_scan_routes(
+    database: &NativeDatabase,
+    table: ObjectId,
+    prepared: &PreparedStatement,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if database
+        .scan_latest_relational(table, None, SCAN_LIMIT)?
+        .len()
+        != SCAN_LIMIT
+    {
+        return Err("physical relational scan benchmark did not reach its limit".into());
+    }
+    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(prepared, &[])? else {
+        return Err("physical relational scan benchmark SQL did not return rows".into());
+    };
+    if rows.len() != SCAN_LIMIT {
+        return Err("physical relational scan benchmark SQL did not reach its limit".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit = std::env::args()
         .nth(1)
@@ -332,9 +422,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v7");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v8");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
-    let (_, secondary_index) = seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
+    let (secondary_table, secondary_index) =
+        seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
     transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.commit()?;
     let relational_tree_height = database.latest_relational_tree_height()?;
@@ -356,6 +447,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
+    let scan_prepared = database
+        .prepare_sql_latest("SELECT id, payload FROM benchmark_people ORDER BY id LIMIT 10")?;
     let secondary_prepared =
         database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
@@ -363,21 +456,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secondary_parameters = [SqlValue::Text(secondary_target)];
     let secondary_index_key =
         secondary_parameters[0].encode_ordered_component(&LogicalType::Text)?;
-    if database
-        .select_latest_secondary_index(secondary_index, &secondary_index_key)?
-        .len()
-        != 1
-    {
-        return Err("physical secondary benchmark key did not identify one row".into());
-    }
-    let SqlResult::Rows { rows, .. } =
-        database.execute_prepared_latest(&secondary_prepared, &secondary_parameters)?
-    else {
-        return Err("physical secondary benchmark SQL did not return rows".into());
-    };
-    if rows.len() != 1 {
-        return Err("physical secondary benchmark SQL did not identify one row".into());
-    }
+    validate_secondary_routes(
+        &database,
+        secondary_index,
+        &secondary_index_key,
+        &secondary_prepared,
+        &secondary_parameters,
+    )?;
+    validate_scan_routes(&database, secondary_table, &scan_prepared)?;
     let structure_target = STRUCTURE_TARGET_KEY.to_be_bytes();
     let hash_target = HASH_TARGET_FIELD.to_be_bytes();
     let frame = encode_frame(
@@ -393,8 +479,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &snapshot,
         &BenchmarkInputs {
             prepared: &prepared,
+            scan_prepared: &scan_prepared,
             secondary_prepared: &secondary_prepared,
             table,
+            scan_table: secondary_table,
             secondary_index,
             search_index: index,
             relational_target: &relational_target,
@@ -430,7 +518,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v7\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v8\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -447,6 +535,9 @@ fn print_report(
     println!("  \"search_operations_per_observation\": {SEARCH_OPERATIONS_PER_OBSERVATION},");
     println!("  \"secondary_observations\": {SECONDARY_OBSERVATIONS},");
     println!("  \"secondary_operations_per_observation\": {SECONDARY_OPERATIONS_PER_OBSERVATION},");
+    println!("  \"scan_limit\": {SCAN_LIMIT},");
+    println!("  \"scan_observations\": {SCAN_OBSERVATIONS},");
+    println!("  \"scan_operations_per_observation\": {SCAN_OPERATIONS_PER_OBSERVATION},");
     println!("  \"concurrency\": 1,");
     println!("  \"durability\": \"memory\",");
     println!("  \"warm_state\": true,");
@@ -503,6 +594,7 @@ fn print_report(
         operations.relational_btree,
         true,
     );
+    print_relational_scan_stats(operations);
     print_stats(
         "buffered_relational_btree_secondary_exact_unique_multilevel",
         operations.secondary_btree,
@@ -520,6 +612,19 @@ fn print_report(
     );
     println!("  }}");
     println!("}}");
+}
+
+fn print_relational_scan_stats(operations: &OperationStats) {
+    print_stats(
+        "buffered_relational_btree_pk_scan_limit10_multilevel",
+        operations.relational_scan,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_pk_scan_limit10_multilevel",
+        operations.prepared_sql_scan,
+        true,
+    );
 }
 
 fn measure(mut operation: impl FnMut()) -> Stats {

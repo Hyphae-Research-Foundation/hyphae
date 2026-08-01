@@ -4,8 +4,8 @@ Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 `INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 direct current-root prepared primary/secondary lookup, exact-primary-key typed
-`UPDATE`/`DELETE`, `BEGIN`/`COMMIT`, and rollback are implemented
-experimentally. G2 remains open
+`UPDATE`/`DELETE`, bounded primary-key table scan, `BEGIN`/`COMMIT`, and
+rollback are implemented experimentally. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -35,11 +35,24 @@ The current implementation slice accepts catalog-typed primitive columns,
 inline or table-level ordered primary keys, explicit nullability, named-column
 `INSERT`, `SELECT *` or named projection, conjunctions covering exactly the
 primary key or one complete secondary-index key, and catalog-bound prepared
-point lookup. Predicate text order may differ from catalog key order.
+point lookup. It also accepts bounded no-predicate scans:
+
+```text
+SELECT <projection>
+FROM <table>
+[ORDER BY <complete-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+`LIMIT` is mandatory for this first scan shape. `ORDER BY`, when present, must
+name the complete primary key in catalog order; descending order and
+expressions remain unsupported. Without `ORDER BY`, SQL ordering is
+unspecified even though the current physical operator walks canonical primary
+keys. Predicate text order may differ from catalog key order.
 Primary-key and secondary-index components use the canonical memcomparable
 codec; row values use the catalog-ordered `HYTUPL01` tuple. Type, domain,
-nullability, duplicate-column, missing-column, and incomplete-key failures
-occur before the row mutation.
+nullability, duplicate-column, missing-column, incomplete-key, and invalid
+scan-order failures occur before execution or row mutation.
 
 Typed mutation accepts:
 
@@ -72,9 +85,10 @@ commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
 `column = NULL` remains `UNKNOWN` and returns no rows.
 
-`EXPLAIN SELECT` currently reports only the admitted exact access path:
+`EXPLAIN SELECT` currently reports only the admitted access path:
 `PrimaryKeyLookup(table=<id>)` or
-`SecondaryIndexLookup(table=<id>,index=<id>)`. It is deterministic
+`SecondaryIndexLookup(table=<id>,index=<id>)`, or
+`PrimaryKeyScan(table=<id>,limit=<n>)`. It is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
 statistics report.
 
@@ -82,13 +96,13 @@ The grammar currently recognizes boolean, signed and unsigned fixed-width
 integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
-exists. General expressions, literals, casts, heap/index scans, range access,
-and constraints beyond primary key/nullability and the first unique index
-remain pending. Typed mutation does not yet change primary keys, use a
-secondary access path, evaluate expressions, or update multiple rows. The
-current access binder requires the predicate column set to equal a complete
-primary or secondary key. It does not perform prefix, residual-filter, bitmap,
-or cost-based access selection.
+exists. General expressions, literals, casts, filters over scans, secondary
+ranges, descending scans, offsets, and constraints beyond primary
+key/nullability and the first unique index remain pending. Typed mutation does
+not yet change primary keys, use a secondary access path, evaluate expressions,
+or update multiple rows. The current equality binder requires the predicate
+column set to equal a complete primary or secondary key. It does not perform
+prefix, residual-filter, bitmap, or cost-based access selection.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -106,14 +120,17 @@ for retained historical reads and cross-engine semantics. The separate
 relation/index definitions in the catalog-version-bound plan.
 `execute_prepared_latest` captures one immutable root set, rejects a stale
 catalog version, traverses the buffered relational B+tree directly, and
-materializes only rows reached by the exact primary or secondary key. The
-secondary path scans only the length-delimited exact index-key prefix, follows
-each live entry to its primary-key row in the same root, and returns rows in
-canonical primary-key order. It does not construct `MaterializedState`.
+materializes only rows reached by the exact primary/secondary key or bounded
+primary scan. The secondary path scans only the length-delimited exact
+index-key prefix, follows each live entry to its primary-key row in the same
+root, and returns rows in canonical primary-key order. The scan path uses an
+exclusive physical visitor, skips row tombstones, and stops after `LIMIT`
+visible rows. It does not construct `MaterializedState`.
 
-The current prefix API owns the bounded match vector and row results; it is
-not allocation-free. Streaming range cursors, a request arena, and matched
-allocation evidence remain separate work.
+The public relational scan returns one owned bounded page and exposes its last
+primary key as the caller's next exclusive cursor. A stateful zero-copy cursor,
+secondary-key ranges, offset handling, request arenas, and allocation evidence
+remain separate work.
 
 ## Null and boolean semantics
 
