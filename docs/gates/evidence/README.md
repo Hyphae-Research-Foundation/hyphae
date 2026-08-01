@@ -98,6 +98,11 @@ commit before its tag can be published.
   canonical `HYTUPL01` rows, primitive and composite primary-key binding,
   typed prepared point reads, recovery, and historical binary compatibility
   to one source commit.
+- [Native secondary-index evidence —
+  2026-08-01](native-secondary-indexes-2026-08-01.md) binds canonical catalog
+  definitions, physical relational B+tree namespaces, exact and composite SQL
+  lookup, uniqueness, both optimistic index/row commit orders, recovery
+  validation, and explicit remaining G2/G7 limits to one source commit.
 
 ## Hosted release evidence
 

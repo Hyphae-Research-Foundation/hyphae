@@ -145,6 +145,15 @@ compatibility to one source commit. Scans, secondary indexes, typed
 updates/deletes, expressions, planning, joins, and the remaining G2 evidence
 remain open.
 
+The [native secondary-index
+evidence](evidence/native-secondary-indexes-2026-08-01.md) binds stable
+catalog definitions, `HYRIDX01` metadata and physical entries, exact-key
+single/composite SQL binding, unique/null semantics, bounded `EXPLAIN`, both
+optimistic index/row commit orders, strict reopen, and fail-closed projection
+validation to one source commit. Direct pinned execution, ranges, indexed
+typed updates/deletes, statistics/cost planning, and the remaining G2/G7
+evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -155,15 +164,16 @@ native inverted B+tree while legacy inline roots remain compatible. Detached
 transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
-pending, along with retention/vacuum, secondary indexes, remaining structure
-families, positional postings, segments, and ANN required by G1–G4. Typed
-point inserts and catalog-bound projection now use canonical tuples and
-primitive/composite keys, but do not close G2. The structure keyspace has a
-multilevel native B+tree, direct reads, tombstone/expiry mutations, conditional
-writes, signed counters, and the first independent-field hash layout. It still
-lacks whole-hash lifecycle/iteration, lists, sets, sorted sets, streams, the
-expiry scheduler, model tests, and amplification evidence required to close
-G3.
+pending, along with retention/vacuum, direct secondary-index execution and
+ranges, indexed typed updates/deletes, remaining structure families,
+positional postings, segments, and ANN required by G1–G4. Typed point inserts
+and catalog-bound primary/secondary-key projection now use canonical tuples
+and primitive/composite keys, but do not close G2. The structure keyspace has
+a multilevel native B+tree, direct reads, tombstone/expiry mutations,
+conditional writes, signed counters, and the first independent-field hash
+layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
+sets, streams, the expiry scheduler, model tests, and amplification evidence
+required to close G3.
 
 ## G1 substrate exit
 
