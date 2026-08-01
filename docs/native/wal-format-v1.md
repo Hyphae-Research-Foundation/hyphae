@@ -68,6 +68,31 @@ Record kinds are `BEGIN`, `MUTATION`, `COMMIT`, `ABORT`, `CHECKPOINT`, and
 bytes, canonical value/reference bytes, and the expected prior version when
 conflict detection requires it.
 
+The implemented `HYMUT001` body is:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | magic `HYMUT001` |
+| 8 | 1 | opcode |
+| 9 | 1 | engine |
+| 10 | 1 | flags; bit 0 means expiry is present |
+| 11 | 1 | reserved zero |
+| 12 | 16 | target object ID; zero for the structure keyspace |
+| 28 | 8 | signed absolute expiry; legacy no-expiry sentinel is `i64::MAX` |
+| 36 | 4 | key-byte length |
+| 40 | 4 | value-byte length |
+| 44 | variable | key bytes followed by value bytes |
+
+The expiry-presence flag lets an explicit timestamp of `i64::MAX` round-trip.
+For compatibility, the decoder also accepts an earlier flag-zero body with a
+non-`i64::MAX` expiry as present. Unknown flag bits fail closed.
+
+Current opcodes are relational `CREATE TABLE=1`, `INSERT ROW=2`, `UPDATE
+ROW=6`, `DELETE ROW=7`; structure `SET VALUE=3`, `DELETE VALUE=8`, `EXPIRE
+VALUE=9`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`
+requires an empty value and no expiry. `EXPIRE VALUE` requires an explicit
+expiry and carries the retained logical value.
+
 `COMMIT` contains:
 
 - read CSN and assigned commit CSN;
@@ -93,11 +118,12 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 60 | 32 | ordered mutation-set BLAKE3 digest |
 | 92 | 32 | four little-endian root page IDs |
 
-The current relational and structure mutation bodies store values at or below
-8,192 bytes inline. Larger values are promoted to the shared immutable blob
-namespace first. The WAL stores the relational one-byte envelope or the
-structure `HYSTRV01` envelope with its 56-byte reference instead of duplicating
-large content.
+The current relational and structure `SET`/`EXPIRE` mutation bodies store
+values at or below 8,192 bytes inline. Larger values are promoted to the shared
+immutable blob namespace first. The WAL stores the relational one-byte envelope
+or the structure `HYSTRV01` envelope with its 56-byte reference instead of
+duplicating large content. A structure `DELETE` keeps its WAL value empty; page
+construction publishes the canonical `HYSTRV01` tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 

@@ -74,6 +74,7 @@ const STRUCTURE_ENTRY_PREFIX: u8 = 1;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_VALUE_HEADER_SIZE: usize = 24;
 const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
+const STRUCTURE_VALUE_TOMBSTONE: u8 = 2;
 const STRUCTURE_VALUE_INLINE: u8 = 0;
 const STRUCTURE_VALUE_BLOB: u8 = 1;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
@@ -186,6 +187,12 @@ pub enum NativeRuntimeError {
     /// A detached write mutation cannot be reapplied to the admitted base.
     #[error("native optimistic write batch contains an invalid mutation")]
     InvalidPreparedMutation,
+    /// A structure value is not one canonical signed decimal integer.
+    #[error("native structure value is not a canonical signed 64-bit integer")]
+    StructureValueNotInteger,
+    /// A signed structure counter operation exceeded the i64 domain.
+    #[error("native signed 64-bit structure counter overflow")]
+    StructureIntegerOverflow,
     /// Recovered commit sequences are not contiguous.
     #[error("recovered native commit sequence is not contiguous")]
     NoncontiguousCommitSequence,
@@ -259,6 +266,26 @@ pub enum Ttl {
     Persistent,
     /// The value exists with this nonnegative remaining duration.
     RemainingMicros(i64),
+}
+
+/// Predicate evaluated by one native scalar `SET`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetCondition {
+    /// Always replace the visible value.
+    Always,
+    /// Apply only when no unexpired value exists.
+    IfAbsent,
+    /// Apply only when an unexpired value exists.
+    IfPresent,
+}
+
+/// Result of evaluating one conditional scalar `SET`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOutcome {
+    /// The private write set now contains the mutation.
+    Applied,
+    /// The condition was false and no mutation was added.
+    NotApplied,
 }
 
 /// Reopen evidence for the native data directory.
@@ -702,8 +729,15 @@ impl NativeDatabase {
     ) -> Result<Ttl, NativeRuntimeError> {
         Ok(match self.latest_structure_entry(key)? {
             None => Ttl::Missing,
+            Some(entry)
+                if entry
+                    .expires_at_micros
+                    .is_some_and(|expiry| expiry <= logical_time_micros) =>
+            {
+                Ttl::Missing
+            }
             Some(entry) => entry.expires_at_micros.map_or(Ttl::Persistent, |expiry| {
-                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros).max(0))
+                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
             }),
         })
     }
@@ -724,7 +758,8 @@ impl NativeDatabase {
             StructureFormat::BTreeV1 => BTree::from_root(root)
                 .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
                 .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
-                .transpose(),
+                .transpose()
+                .map(Option::flatten),
         }
     }
 
@@ -1171,8 +1206,37 @@ impl NativeWriteBatch {
         value: impl Into<Vec<u8>>,
         expires_at_micros: Option<i64>,
     ) {
+        let outcome = self.set_conditional(key, value, expires_at_micros, SetCondition::Always);
+        debug_assert_eq!(outcome, SetOutcome::Applied);
+    }
+
+    /// Sets one scalar value only when its snapshot-time predicate is true.
+    ///
+    /// A rejected condition adds no write key and therefore needs no commit.
+    /// Concurrent `IfAbsent` writers over the same missing key may both prepare,
+    /// but first-committer-wins admits only one publication.
+    pub fn set_conditional(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        expires_at_micros: Option<i64>,
+        condition: SetCondition,
+    ) -> SetOutcome {
         let key = key.into();
         let value = value.into();
+        let exists = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros)
+            .is_some();
+        let applies = match condition {
+            SetCondition::Always => true,
+            SetCondition::IfAbsent => !exists,
+            SetCondition::IfPresent => exists,
+        };
+        if !applies {
+            return SetOutcome::NotApplied;
+        }
         self.state
             .structures
             .set(key.clone(), value.clone(), expires_at_micros);
@@ -1185,6 +1249,103 @@ impl NativeWriteBatch {
             expires_at_micros,
         });
         self.dirty[2] = true;
+        SetOutcome::Applied
+    }
+
+    /// Deletes one unexpired scalar value from this transaction.
+    ///
+    /// Returns `false` without adding a mutation when the key is missing or
+    /// expired at the transaction's deterministic logical time.
+    pub fn delete_structure(&mut self, key: impl Into<Vec<u8>>) -> bool {
+        let key = key.into();
+        if self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros)
+            .is_none()
+        {
+            return false;
+        }
+        let removed = self.state.structures.delete(&key);
+        debug_assert!(removed.is_some());
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteValue,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        true
+    }
+
+    /// Replaces one visible scalar value's absolute expiry.
+    ///
+    /// The value bytes are retained in the WAL mutation so recovery can verify
+    /// the exact new physical envelope without consulting an older root.
+    pub fn expire_structure(&mut self, key: impl Into<Vec<u8>>, expires_at_micros: i64) -> bool {
+        let key = key.into();
+        let Some(value) = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros)
+            .map(|entry| entry.value.clone())
+        else {
+            return false;
+        };
+        self.state
+            .structures
+            .set(key.clone(), value.clone(), Some(expires_at_micros));
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::ExpireValue,
+            target: None,
+            key,
+            value,
+            expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        true
+    }
+
+    /// Atomically adds `delta` to one canonical signed-decimal scalar.
+    ///
+    /// Missing or expired keys start at zero. Existing expiry is preserved.
+    /// Noncanonical decimal bytes and signed overflow fail without adding a
+    /// mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::StructureValueNotInteger`] for a
+    /// noncanonical integer and
+    /// [`NativeRuntimeError::StructureIntegerOverflow`] on overflow.
+    pub fn increment_i64(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        delta: i64,
+    ) -> Result<i64, NativeRuntimeError> {
+        let key = key.into();
+        let existing = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros)
+            .cloned();
+        let (base, expires_at_micros) = match existing {
+            None => (0, None),
+            Some(entry) => (parse_canonical_i64(&entry.value)?, entry.expires_at_micros),
+        };
+        let value = base
+            .checked_add(delta)
+            .ok_or(NativeRuntimeError::StructureIntegerOverflow)?;
+        let outcome = self.set_conditional(
+            key,
+            value.to_string().into_bytes(),
+            expires_at_micros,
+            SetCondition::Always,
+        );
+        debug_assert_eq!(outcome, SetOutcome::Applied);
+        Ok(value)
     }
 
     /// Reads a structure value from the snapshot plus private writes.
@@ -1497,6 +1658,28 @@ fn apply_mutations_to_state(
                     mutation.expires_at_micros,
                 );
             }
+            Opcode::DeleteValue => {
+                if mutation.target.is_some()
+                    || !mutation.value.is_empty()
+                    || mutation.expires_at_micros.is_some()
+                    || state.structures.delete(&mutation.key).is_none()
+                {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+            }
+            Opcode::ExpireValue => {
+                if mutation.target.is_some()
+                    || mutation.expires_at_micros.is_none()
+                    || !state.structures.entries.contains_key(&mutation.key)
+                {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                state.structures.set(
+                    mutation.key.clone(),
+                    mutation.value.clone(),
+                    mutation.expires_at_micros,
+                );
+            }
             Opcode::CreateIndex => {
                 let index = mutation
                     .target
@@ -1633,7 +1816,7 @@ fn stage_large_values(
             && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
             && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Structure
-                && mutation.opcode == Opcode::SetValue
+                && matches!(mutation.opcode, Opcode::SetValue | Opcode::ExpireValue)
                 && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
     }) {
         let digest = *blake3::hash(&mutation.value).as_bytes();
@@ -1708,13 +1891,26 @@ fn structure_storage_value(
     Ok(encoded)
 }
 
+fn structure_tombstone_value() -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_VALUE_HEADER_SIZE);
+    encoded.extend_from_slice(STRUCTURE_VALUE_MAGIC);
+    encoded.push(STRUCTURE_VALUE_TOMBSTONE);
+    encoded.push(STRUCTURE_VALUE_INLINE);
+    encoded.extend_from_slice(&[0; 6]);
+    encoded.extend_from_slice(&0_i64.to_le_bytes());
+    encoded
+}
+
 fn decode_structure_value(
     encoded: &[u8],
     blobs: &BlobStore,
-) -> Result<StructureEntry, NativeRuntimeError> {
+) -> Result<Option<StructureEntry>, NativeRuntimeError> {
     if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
         || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
-        || encoded[8] & !STRUCTURE_VALUE_HAS_EXPIRY != 0
+        || !matches!(
+            encoded[8],
+            0 | STRUCTURE_VALUE_HAS_EXPIRY | STRUCTURE_VALUE_TOMBSTONE
+        )
         || encoded[10..16] != [0; 6]
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -1722,6 +1918,13 @@ fn decode_structure_value(
     let mut expiry_bytes = [0_u8; 8];
     expiry_bytes.copy_from_slice(&encoded[16..24]);
     let raw_expiry = i64::from_le_bytes(expiry_bytes);
+    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
+    if encoded[8] == STRUCTURE_VALUE_TOMBSTONE {
+        if encoded[9] != STRUCTURE_VALUE_INLINE || raw_expiry != 0 || !payload.is_empty() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        return Ok(None);
+    }
     let expires_at_micros = if encoded[8] == STRUCTURE_VALUE_HAS_EXPIRY {
         Some(raw_expiry)
     } else if raw_expiry == 0 {
@@ -1729,7 +1932,6 @@ fn decode_structure_value(
     } else {
         return Err(NativeRuntimeError::InvalidStructureTree);
     };
-    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
     let value = match encoded[9] {
         STRUCTURE_VALUE_INLINE if payload.len() <= STRUCTURE_INLINE_VALUE_LIMIT => payload.to_vec(),
         STRUCTURE_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
@@ -1741,10 +1943,10 @@ fn decode_structure_value(
         }
         _ => return Err(NativeRuntimeError::InvalidStructureTree),
     };
-    Ok(StructureEntry {
+    Ok(Some(StructureEntry {
         value,
         expires_at_micros,
-    })
+    }))
 }
 
 fn wal_mutations(
@@ -1760,7 +1962,7 @@ fn wal_mutations(
             {
                 mutation.value = relational_storage_value(&mutation.value, blob_references)?;
             } else if mutation.engine == EngineKind::Structure
-                && mutation.opcode == Opcode::SetValue
+                && matches!(mutation.opcode, Opcode::SetValue | Opcode::ExpireValue)
             {
                 mutation.value = structure_storage_value(
                     &mutation.value,
@@ -1778,6 +1980,18 @@ fn structure_key(key: &[u8]) -> Vec<u8> {
     encoded.push(STRUCTURE_ENTRY_PREFIX);
     encoded.extend_from_slice(key);
     encoded
+}
+
+fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
+    let text =
+        std::str::from_utf8(value).map_err(|_| NativeRuntimeError::StructureValueNotInteger)?;
+    let parsed = text
+        .parse::<i64>()
+        .map_err(|_| NativeRuntimeError::StructureValueNotInteger)?;
+    if parsed.to_string().as_bytes() != value {
+        return Err(NativeRuntimeError::StructureValueNotInteger);
+    }
+    Ok(parsed)
 }
 
 fn structure_tree_after_mutations(
@@ -1802,11 +2016,27 @@ fn structure_tree_after_mutations(
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Structure)
     {
-        if mutation.opcode != Opcode::SetValue || mutation.target.is_some() {
+        if mutation.target.is_some() {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
-        let value =
-            structure_storage_value(&mutation.value, mutation.expires_at_micros, blob_references)?;
+        let value = match mutation.opcode {
+            Opcode::SetValue => structure_storage_value(
+                &mutation.value,
+                mutation.expires_at_micros,
+                blob_references,
+            )?,
+            Opcode::ExpireValue if mutation.expires_at_micros.is_some() => structure_storage_value(
+                &mutation.value,
+                mutation.expires_at_micros,
+                blob_references,
+            )?,
+            Opcode::DeleteValue
+                if mutation.value.is_empty() && mutation.expires_at_micros.is_none() =>
+            {
+                structure_tombstone_value()
+            }
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        };
         tree = tree
             .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
             .tree;
@@ -2444,8 +2674,9 @@ fn load_structure_state(
         if key.first().copied() != Some(STRUCTURE_ENTRY_PREFIX) {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
-        let entry = decode_structure_value(&value, blobs)?;
-        if decoded.insert(key[1..].to_vec(), entry).is_some() {
+        if let Some(entry) = decode_structure_value(&value, blobs)?
+            && decoded.insert(key[1..].to_vec(), entry).is_some()
+        {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
     }
@@ -2563,7 +2794,7 @@ mod tests {
 
     use super::{
         CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, PAGE_FILE,
-        SqlResult, SqlValue,
+        SetCondition, SetOutcome, SqlResult, SqlValue,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -2649,7 +2880,7 @@ mod tests {
         assert_eq!(database.get_latest_structure(b"session", 200)?, None);
         assert_eq!(
             database.ttl_latest_structure(b"session", 200)?,
-            super::Ttl::RemainingMicros(0)
+            super::Ttl::Missing
         );
         Ok(())
     }
@@ -2777,6 +3008,229 @@ mod tests {
         Ok(())
     }
 
+    fn stage_scalar_semantics(
+        database: &mut NativeDatabase,
+    ) -> Result<super::NativeSnapshot, NativeRuntimeError> {
+        let mut seed = database.begin(100, DurabilityClass::Strict)?;
+        assert_eq!(
+            seed.set_conditional(
+                b"condition".to_vec(),
+                b"v1".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            ),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            seed.set_conditional(
+                b"condition".to_vec(),
+                b"rejected".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            ),
+            SetOutcome::NotApplied
+        );
+        assert_eq!(
+            seed.set_conditional(
+                b"condition".to_vec(),
+                b"v2".to_vec(),
+                None,
+                SetCondition::IfPresent,
+            ),
+            SetOutcome::Applied
+        );
+        seed.set(b"delete".to_vec(), b"old".to_vec(), None);
+        seed.set(b"expire".to_vec(), b"alive".to_vec(), None);
+        seed.set(b"max-expiry".to_vec(), b"alive".to_vec(), None);
+        seed.set(b"counter".to_vec(), b"41".to_vec(), Some(1_000));
+        seed.commit()?;
+        database.snapshot(101)
+    }
+
+    fn commit_scalar_semantics(database: &mut NativeDatabase) -> Result<(), NativeRuntimeError> {
+        let mut mutate = database.begin(200, DurabilityClass::Strict)?;
+        assert_eq!(
+            mutate.set_conditional(
+                b"condition".to_vec(),
+                b"still-rejected".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            ),
+            SetOutcome::NotApplied
+        );
+        assert_eq!(
+            mutate.set_conditional(
+                b"condition".to_vec(),
+                b"v3".to_vec(),
+                None,
+                SetCondition::IfPresent,
+            ),
+            SetOutcome::Applied
+        );
+        assert!(mutate.delete_structure(b"delete".to_vec()));
+        assert!(!mutate.delete_structure(b"delete".to_vec()));
+        assert!(mutate.expire_structure(b"expire".to_vec(), 250));
+        assert!(mutate.expire_structure(b"max-expiry".to_vec(), i64::MAX));
+        assert!(!mutate.expire_structure(b"missing".to_vec(), 250));
+        assert_eq!(mutate.increment_i64(b"counter".to_vec(), 1)?, 42);
+        mutate.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_conditions_delete_expire_and_counter_versions_recover()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let historical = stage_scalar_semantics(&mut database)?;
+        commit_scalar_semantics(&mut database)?;
+
+        assert_eq!(historical.get(b"condition"), Some(b"v2".as_slice()));
+        assert_eq!(historical.get(b"delete"), Some(b"old".as_slice()));
+        assert_eq!(historical.get(b"expire"), Some(b"alive".as_slice()));
+        assert_eq!(historical.get(b"counter"), Some(b"41".as_slice()));
+        let current = database.snapshot(201)?;
+        assert_eq!(current.get(b"condition"), Some(b"v3".as_slice()));
+        assert_eq!(current.get(b"delete"), None);
+        assert_eq!(current.get(b"expire"), Some(b"alive".as_slice()));
+        assert_eq!(current.ttl(b"expire"), super::Ttl::RemainingMicros(49));
+        assert_eq!(current.get(b"counter"), Some(b"42".as_slice()));
+        assert_eq!(current.ttl(b"counter"), super::Ttl::RemainingMicros(799));
+        assert_eq!(database.get_latest_structure(b"delete", 201)?, None);
+        assert_eq!(
+            database.ttl_latest_structure(b"delete", 201)?,
+            super::Ttl::Missing
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"expire", 250)?,
+            super::Ttl::Missing
+        );
+
+        let root = database
+            .coordinator
+            .snapshot(201)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tombstone = hyphae_native_btree::BTree::from_root(root)
+            .get(&database.pages, &super::structure_key(b"delete"))?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        assert_eq!(
+            super::decode_structure_value(&tombstone, &database.blobs)?,
+            None
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert_eq!(
+            reopened.get_latest_structure(b"condition", 202)?,
+            Some(b"v3".to_vec())
+        );
+        assert_eq!(reopened.get_latest_structure(b"delete", 202)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"expire", 249)?,
+            Some(b"alive".to_vec())
+        );
+        assert_eq!(reopened.get_latest_structure(b"expire", 250)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"counter", 202)?,
+            Some(b"42".to_vec())
+        );
+        assert_eq!(
+            reopened.ttl_latest_structure(b"max-expiry", 202)?,
+            super::Ttl::RemainingMicros(i64::MAX - 202)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn counters_reject_noncanonical_values_and_overflow_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"noncanonical".to_vec(), b"01".to_vec(), None);
+        seed.set(
+            b"overflow".to_vec(),
+            i64::MAX.to_string().into_bytes(),
+            None,
+        );
+        seed.commit()?;
+
+        let mut rejected = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        assert!(matches!(
+            rejected.increment_i64(b"noncanonical".to_vec(), 1),
+            Err(NativeRuntimeError::StructureValueNotInteger)
+        ));
+        assert!(matches!(
+            rejected.increment_i64(b"overflow".to_vec(), 1),
+            Err(NativeRuntimeError::StructureIntegerOverflow)
+        ));
+        assert_eq!(rejected.get(b"noncanonical"), Some(b"01".as_slice()));
+        assert_eq!(
+            rejected.get(b"overflow"),
+            Some(i64::MAX.to_string().as_bytes())
+        );
+        assert_eq!(
+            rejected.increment_i64(b"minimum".to_vec(), i64::MIN)?,
+            i64::MIN
+        );
+        database.commit_optimistic(rejected)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"noncanonical", 12)?,
+            Some(b"01".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"overflow", 12)?,
+            Some(i64::MAX.to_string().into_bytes())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"minimum", 12)?,
+            Some(i64::MIN.to_string().into_bytes())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn racing_if_absent_batches_admit_one_writer() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut first = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        assert_eq!(
+            first.set_conditional(
+                b"race".to_vec(),
+                b"first".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            ),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            second.set_conditional(
+                b"race".to_vec(),
+                b"second".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            ),
+            SetOutcome::Applied
+        );
+        database.commit_optimistic(first)?;
+        assert!(matches!(
+            database.commit_optimistic(second),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.get_latest_structure(b"race", 11)?,
+            Some(b"first".to_vec())
+        );
+        Ok(())
+    }
+
     #[test]
     fn inline_structure_directories_remain_readable_and_writable()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2825,10 +3279,21 @@ mod tests {
             Some(i64::MAX),
             &std::collections::BTreeMap::new(),
         )?;
-        let decoded = super::decode_structure_value(&encoded, &blobs)?;
+        let decoded = super::decode_structure_value(&encoded, &blobs)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
         assert_eq!(decoded.value, b"value");
         assert_eq!(decoded.expires_at_micros, Some(i64::MAX));
 
+        assert_eq!(
+            super::decode_structure_value(&super::structure_tombstone_value(), &blobs)?,
+            None
+        );
+        let mut noncanonical_tombstone = super::structure_tombstone_value();
+        noncanonical_tombstone.push(0);
+        assert!(matches!(
+            super::decode_structure_value(&noncanonical_tombstone, &blobs),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
         let mut reserved = encoded.clone();
         reserved[10] = 1;
         assert!(matches!(
@@ -3087,10 +3552,14 @@ mod tests {
         ] {
             let temporary = TestDirectory::new();
             let mut database = NativeDatabase::create(temporary.path())?;
-            stage_vertical(&mut database)?.commit()?;
+            let mut seed = stage_vertical(&mut database)?;
+            seed.set(b"remove-on-commit".to_vec(), b"present".to_vec(), None);
+            seed.commit()?;
             let table = ObjectId::new(1)?;
             let mut batch = database.begin_optimistic(151, DurabilityClass::Strict)?;
             batch.update(table, b"mario".to_vec(), b"optimistic".to_vec())?;
+            assert!(batch.delete_structure(b"remove-on-commit".to_vec()));
+            assert!(batch.expire_structure(b"session".to_vec(), 300));
             assert!(matches!(
                 database.commit_optimistic_with_interruption(batch, boundary),
                 Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
@@ -3113,6 +3582,11 @@ mod tests {
                             | CommitBoundary::PageSynchronized
                     ));
                     assert_eq!(snapshot.select(table, b"mario"), Some(b"active".as_slice()));
+                    assert_eq!(
+                        snapshot.get(b"remove-on-commit"),
+                        Some(b"present".as_slice())
+                    );
+                    assert_eq!(snapshot.ttl(b"session"), super::Ttl::RemainingMicros(48));
                 }
                 Some(2) => {
                     assert!(matches!(
@@ -3125,6 +3599,8 @@ mod tests {
                         snapshot.select(table, b"mario"),
                         Some(b"optimistic".as_slice())
                     );
+                    assert_eq!(snapshot.get(b"remove-on-commit"), None);
+                    assert_eq!(snapshot.ttl(b"session"), super::Ttl::RemainingMicros(148));
                 }
                 found => return Err(format!("unexpected recovered CSN: {found:?}").into()),
             }

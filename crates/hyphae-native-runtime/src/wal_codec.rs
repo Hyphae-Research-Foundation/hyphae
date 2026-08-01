@@ -13,6 +13,7 @@ const COMMIT_MAGIC: &[u8; 8] = b"HYCMT001";
 const ABORT_MAGIC: &[u8; 8] = b"HYABT001";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"HYCHK001";
 const ROOT_COUNT: usize = 4;
+const MUTATION_HAS_EXPIRY: u8 = 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum WalSemanticError {
@@ -40,6 +41,8 @@ pub(crate) enum Opcode {
     IndexDocument = 5,
     UpdateRow = 6,
     DeleteRow = 7,
+    DeleteValue = 8,
+    ExpireValue = 9,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,7 +61,8 @@ impl Mutation {
         bytes.extend_from_slice(MUTATION_MAGIC);
         bytes.push(self.opcode as u8);
         bytes.push(self.engine as u8);
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.push(u8::from(self.expires_at_micros.is_some()) * MUTATION_HAS_EXPIRY);
+        bytes.push(0);
         bytes.extend_from_slice(&self.target.map_or(0, ObjectId::get).to_le_bytes());
         bytes.extend_from_slice(&self.expires_at_micros.unwrap_or(i64::MAX).to_le_bytes());
         put_len(&mut bytes, self.key.len())?;
@@ -480,7 +484,8 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     if body.len() < 44
         || body.get(..8) != Some(MUTATION_MAGIC.as_slice())
         || body[9] != engine as u8
-        || body[10..12].iter().any(|byte| *byte != 0)
+        || body[10] & !MUTATION_HAS_EXPIRY != 0
+        || body[11] != 0
     {
         return Err(WalSemanticError::InvalidBody);
     }
@@ -492,6 +497,8 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         value if value == Opcode::UpdateRow as u8 => (Opcode::UpdateRow, EngineKind::Relational),
         value if value == Opcode::DeleteRow as u8 => (Opcode::DeleteRow, EngineKind::Relational),
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
+        value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
+        value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
@@ -518,8 +525,16 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     } else {
         Some(ObjectId::new(raw_target).map_err(|_| WalSemanticError::InvalidIdentity)?)
     };
+    let raw_expiry = read_i64(&body[28..36]);
+    let expires_at_micros = if body[10] == MUTATION_HAS_EXPIRY {
+        Some(raw_expiry)
+    } else {
+        (raw_expiry != i64::MAX).then_some(raw_expiry)
+    };
     match opcode {
-        Opcode::SetValue if target.is_some() => return Err(WalSemanticError::InvalidBody),
+        Opcode::SetValue | Opcode::DeleteValue | Opcode::ExpireValue if target.is_some() => {
+            return Err(WalSemanticError::InvalidBody);
+        }
         Opcode::CreateTable
         | Opcode::InsertRow
         | Opcode::CreateIndex
@@ -531,10 +546,14 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::DeleteRow if value_length != 0 => return Err(WalSemanticError::InvalidBody),
+        Opcode::DeleteValue if value_length != 0 || expires_at_micros.is_some() => {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        Opcode::ExpireValue if expires_at_micros.is_none() => {
+            return Err(WalSemanticError::InvalidBody);
+        }
         _ => {}
     }
-    let raw_expiry = read_i64(&body[28..36]);
-    let expires_at_micros = (raw_expiry != i64::MAX).then_some(raw_expiry);
     let key_start = 44;
     let value_start = key_start + key_length;
     Ok(Mutation {
@@ -645,6 +664,22 @@ mod tests {
                 expires_at_micros: Some(50),
             },
             Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::ExpireValue,
+                target: None,
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                expires_at_micros: Some(i64::MAX),
+            },
+            Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::DeleteValue,
+                target: None,
+                key: b"old-key".to_vec(),
+                value: Vec::new(),
+                expires_at_micros: None,
+            },
+            Mutation {
                 engine: EngineKind::Search,
                 opcode: Opcode::IndexDocument,
                 target: Some(ObjectId::new(2)?),
@@ -675,7 +710,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 3);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 5);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }

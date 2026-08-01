@@ -129,11 +129,11 @@ namespace:
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
 
 The value envelope and legacy single-page compatibility are specified in
-[Native structure-engine semantics v1](structures-semantics-v1.md). A `SET`
-rewrites only its copy-on-write leaf-to-root path; direct current reads traverse
-the buffer pool. The current implementation has no structure tombstone,
-range/prefix cursor, conditional write, expiry index, or collection-family
-layout yet.
+[Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
+`EXPIRE`, and `DELETE` rewrite only their copy-on-write leaf-to-root paths;
+`DELETE` stores the canonical scalar tombstone. Direct current reads traverse
+the buffer pool. The current implementation has no range/prefix cursor, expiry
+index/timing wheel, expected-version response, or collection-family layout yet.
 
 ## Verification
 

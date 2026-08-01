@@ -1,9 +1,10 @@
 # Native structure-engine semantics v1
 
-Status: normative target contract; binary scalar `SET`/`GET`, snapshot-time
-TTL, native multilevel B+tree persistence, direct buffered reads, and large
-immutable blobs are implemented in the convergence slice; the complete
-structure families remain pending
+Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
+independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
+multilevel B+tree persistence, direct buffered reads, and large immutable
+blobs are implemented in the convergence slice; version-bearing responses,
+the expiry scheduler, and complete structure families remain pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -46,15 +47,29 @@ SET(key, value, condition, optional_ttl)
 DELETE(key)
 EXPIRE(key, expires_at)
 TTL(key)
+INCRBY(key, signed_delta)
 ```
 
 `SET` conditions are unconditional, if-absent, if-present, or
 expected-version. The response includes existence, prior/new version CSN and
 expiry.
 
-The implemented slice currently exposes unconditional `SET`, `GET`, and
-`TTL`. `DELETE`, independent `EXPIRE`, conditions, and version-bearing
-responses remain target behavior.
+The implemented slice exposes unconditional, if-absent (`NX`), and if-present
+(`XX`) `SET`. A false predicate adds no mutation. Two detached `NX`
+transactions may both prepare against the same missing snapshot key, but the
+shared first-committer-wins table admits only one publication. Expected-version
+conditions and version-bearing responses remain target behavior.
+
+`DELETE` returns false for a missing or snapshot-expired key and otherwise
+publishes a tombstone. `EXPIRE` returns false under the same absence rule and
+otherwise rewrites the value with an absolute expiry.
+
+`INCRBY` operates on canonical signed decimal bytes in the exact `i64` domain.
+Missing or expired keys start at zero, an existing TTL is preserved, and the
+result is stored as its canonical decimal representation. Empty input,
+whitespace, a leading plus, redundant leading zeroes, `-0`, non-UTF-8 bytes,
+and out-of-range input fail as non-integers. Arithmetic overflow is a separate
+error. Either failure adds no mutation.
 
 ## First physical namespace
 
@@ -71,7 +86,7 @@ The exact value envelope is:
 | Offset | Width | Field |
 |---:|---:|---|
 | 0 | 8 | ASCII magic `HYSTRV01` |
-| 8 | 1 | flags; bit 0 means an expiry is present |
+| 8 | 1 | flags; bit 0 means expiry, bit 1 means tombstone |
 | 9 | 1 | storage: `0` inline, `1` immutable blob reference |
 | 10 | 6 | reserved zero |
 | 16 | 8 | signed little-endian absolute expiry; zero when the flag is clear |
@@ -82,11 +97,16 @@ whose declared logical length is above that threshold. The expiry flag
 distinguishes persistent values from an explicit timestamp of zero or
 `i64::MAX`; there is no sentinel collision.
 
-Every `SET` upserts one key through a new copy-on-write path. Retained roots
-preserve older values and TTLs. Current direct `GET` and `TTL` traverse verified
-pinned pages without materializing the complete structure state, then decode
-only the selected envelope and blob. Recovery scans and validates the complete
-reachable namespace.
+The only canonical tombstone has flags exactly `0x02`, inline storage, zero
+reserved and expiry bytes, and an empty payload. Any flag combination or
+payload on a tombstone fails closed.
+
+Every `SET`, `EXPIRE`, and `DELETE` upserts one key through a new copy-on-write
+path. Retained roots preserve older values, TTLs, and pre-delete visibility.
+Current direct `GET` and `TTL` traverse verified pinned pages without
+materializing the complete structure state, then decode only the selected
+envelope and blob. Recovery scans and validates the complete reachable
+namespace while omitting tombstones from materialized state.
 
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
@@ -111,8 +131,9 @@ version. Reads compare against snapshot logical time. Lazy expiry hides an
 expired version from that snapshot; a bounded timing wheel schedules a
 tombstone transaction.
 
-TTL changes are versioned writes. Restart reconstructs the timing wheel from
-visible versions. Historical proofs pin logical time.
+TTL changes are versioned writes. At or after the exact expiry, both `GET` and
+`TTL` report the key as missing. Historical proofs pin logical time. Restart
+reconstruction of the pending timing wheel remains unimplemented.
 
 ## Eviction
 
@@ -141,7 +162,8 @@ controlled-clock TTL tests, timing-wheel rebuild, blocking cancellation,
 memory-amplification receipts, eviction safety, and cross-engine transactions.
 
 Current experimental tests cover a 2,048-key multilevel tree, historical roots,
-direct TTL and expiry reads, strict reopen, canonical-envelope corruption,
-legacy whole-page compatibility, optimistic disjoint-key rebase, crash
-boundaries, and one blob deduplicated across relational and structure values.
-They do not close the structure gate.
+direct TTL and expiry reads, canonical tombstones, `NX`/`XX`, racing `NX`
+writers, signed counter bounds, strict reopen, canonical-envelope corruption,
+legacy whole-page compatibility, optimistic disjoint-key rebase, all commit
+crash boundaries with `DELETE` plus `EXPIRE`, and one blob deduplicated across
+relational and structure values. They do not close the structure gate.

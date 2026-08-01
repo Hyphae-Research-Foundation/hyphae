@@ -220,24 +220,32 @@ impl StructureState {
     }
 
     pub(crate) fn get(&self, key: &[u8], logical_time_micros: i64) -> Option<&[u8]> {
-        self.entries.get(key).and_then(|entry| {
-            if entry
+        self.visible_entry(key, logical_time_micros)
+            .map(|entry| entry.value.as_slice())
+    }
+
+    pub(crate) fn visible_entry(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<&StructureEntry> {
+        self.entries.get(key).filter(|entry| {
+            entry
                 .expires_at_micros
-                .is_some_and(|expiry| expiry <= logical_time_micros)
-            {
-                None
-            } else {
-                Some(entry.value.as_slice())
-            }
+                .is_none_or(|expiry| expiry > logical_time_micros)
         })
     }
 
+    pub(crate) fn delete(&mut self, key: &[u8]) -> Option<StructureEntry> {
+        self.entries.remove(key)
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
-        self.entries.get(key).map(|entry| {
+        self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
                 .expires_at_micros
                 .map_or(TtlValue::Persistent, |expiry| {
-                    TtlValue::Remaining(expiry.saturating_sub(logical_time_micros).max(0))
+                    TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
                 })
         })
     }
@@ -573,9 +581,6 @@ mod tests {
         assert_eq!(structures.get(b"k", 9), Some(b"v".as_slice()));
         assert_eq!(structures.get(b"k", 10), None);
         assert_eq!(structures.ttl_micros(b"k", 9), Some(TtlValue::Remaining(1)));
-        assert_eq!(
-            structures.ttl_micros(b"k", 10),
-            Some(TtlValue::Remaining(0))
-        );
+        assert_eq!(structures.ttl_micros(b"k", 10), None);
     }
 }
