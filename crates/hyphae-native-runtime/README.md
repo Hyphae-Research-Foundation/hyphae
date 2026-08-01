@@ -15,10 +15,16 @@ Native SQL now binds primitive values and projections to those immutable
 definitions. Typed inserts encode canonical primary-key components and
 `HYTUPL01` catalog-ordered tuples; prepared point selects decode them after
 commit and reopen. Type/domain, nullability, duplicate-column, and incomplete
-primary-key failures occur before mutation. The historical two-binary-column
-shape retains its raw bytes and allocation-free prepared lookup. General
-expressions, scans, typed updates/deletes, secondary indexes, joins, grouping,
-and `EXPLAIN` remain pending.
+key failures occur before mutation. Catalogued secondary indexes own physical
+metadata and entries in the relational B+tree. `CREATE [UNIQUE] INDEX`
+backfills atomically, inserts maintain every admitted projection, exact-key
+`WHERE` can use composite indexes independent of predicate text order, and
+bounded `EXPLAIN` identifies primary-key or secondary-index lookup. Unique
+non-null collisions fail before publication; null equality retains SQL
+three-valued behavior. The historical two-binary-column shape retains its raw
+bytes and allocation-free prepared lookup. General expressions, scans/ranges,
+typed updates/deletes, joins, grouping, cost planning, and complete `EXPLAIN`
+remain pending.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
@@ -47,9 +53,11 @@ namespace, and legacy single-page search roots remain compatible.
 
 The implementation remains deliberately bounded: transaction snapshots still
 materialize relation state, version retention and vacuum are not implemented,
-structures currently expose only unconditional binary scalar `SET`/`GET`/TTL,
-and lexical search still lacks positions, phrases, filters, facets, doc
-values, deletes/updates, segments, and ANN. Detached transactions can prepare concurrently without holding
+secondary-index SQL execution is not yet a direct pinned physical lookup,
+indexed typed updates/deletes are rejected, structures still lack most
+Valkey-class families, and lexical search still lacks positions, phrases,
+filters, facets, doc values, deletes/updates, segments, and ANN. Detached
+transactions can prepare concurrently without holding
 writer admission; commit validates their original read CSN and rebases
 disjoint mutations over the admitted current root. Publication and its
 durability I/O are still serialized and require exclusive access to the

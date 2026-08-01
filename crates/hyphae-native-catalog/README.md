@@ -7,5 +7,7 @@ relational, structure, and search engines. It owns the bounded canonical
 The normative target contract is
 [`docs/native/catalog-v1.md`](../../docs/native/catalog-v1.md). The runtime now
 persists complete definitions in `HYCAT002` and reads legacy `HYCAT001`.
-Catalog B+tree scaling, definition history, dependencies, indexes, constraints,
-and schema evolution remain partial G1/G2 work.
+The current object variants are relation, relational secondary index,
+structure, and search collection. Catalog B+tree scaling, definition history,
+dependencies, constraints, richer index definitions, and schema evolution
+remain partial G1/G2 work.

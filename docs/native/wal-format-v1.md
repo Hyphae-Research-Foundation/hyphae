@@ -88,11 +88,21 @@ For compatibility, the decoder also accepts an earlier flag-zero body with a
 non-`i64::MAX` expiry as present. Unknown flag bits fail closed.
 
 Current opcodes are relational `CREATE TABLE=1`, `INSERT ROW=2`, `UPDATE
-ROW=6`, `DELETE ROW=7`; structure `SET VALUE=3`, `DELETE VALUE=8`, `EXPIRE
-VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`, `DELETE HASH FIELD=12`; and
-search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`, `CREATE HASH`, and
-`DELETE HASH FIELD` require an empty value and no expiry. `EXPIRE VALUE`
-requires an explicit expiry and carries the retained logical value.
+ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
+`DELETE VALUE=8`, `EXPIRE VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`,
+`DELETE HASH FIELD=12`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`.
+`DELETE VALUE`, `CREATE HASH`, and `DELETE HASH FIELD` require an empty value
+and no expiry. `EXPIRE VALUE` requires an explicit expiry and carries the
+retained logical value.
+
+Relational `CREATE TABLE` and `CREATE SECONDARY INDEX` carry one complete
+`HYCOBJ01` definition as their value and the normalized qualified-name
+identity as their key. Secondary-index entry changes are deliberately not
+independent WAL mutations. An admitted index definition plus the canonical row
+mutation is the single projection authority: index creation backfills the
+current admitted rows, and row insertion derives every current catalog index
+entry during optimistic rebase, page construction, and recovery. This prevents
+separate row/index operation streams from diverging.
 
 Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
 field bytes as their mutation key. The decoder rejects truncated identities.

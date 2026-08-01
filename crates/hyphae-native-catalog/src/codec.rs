@@ -9,14 +9,15 @@ use hyphae_native_types::{
 use super::{
     CatalogError, CatalogName, CatalogObject, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
     MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
-    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition, StructureDefinition,
-    StructureKind, StructureOwnership,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership,
 };
 
 const DEFINITION_MAGIC: [u8; 8] = *b"HYCOBJ01";
 const OBJECT_RELATION: u8 = 1;
 const OBJECT_STRUCTURE: u8 = 2;
 const OBJECT_SEARCH: u8 = 3;
+const OBJECT_SECONDARY_INDEX: u8 = 4;
 
 impl CatalogObject {
     /// Encodes one complete canonical catalog object definition.
@@ -29,6 +30,7 @@ impl CatalogObject {
         self.validate()?;
         let tag = match self {
             Self::Relation(_) => OBJECT_RELATION,
+            Self::SecondaryIndex(_) => OBJECT_SECONDARY_INDEX,
             Self::Structure(_) => OBJECT_STRUCTURE,
             Self::Search(_) => OBJECT_SEARCH,
         };
@@ -36,6 +38,7 @@ impl CatalogObject {
         encoder.put_header(self.header())?;
         match self {
             Self::Relation(definition) => encoder.put_relation(definition)?,
+            Self::SecondaryIndex(definition) => encoder.put_secondary_index(definition)?,
             Self::Structure(definition) => encoder.put_structure(definition)?,
             Self::Search(definition) => encoder.put_search(definition)?,
         }
@@ -55,6 +58,7 @@ impl CatalogObject {
         let header = decoder.header()?;
         let object = match tag {
             OBJECT_RELATION => Self::Relation(decoder.relation(header)?),
+            OBJECT_SECONDARY_INDEX => Self::SecondaryIndex(decoder.secondary_index(header)?),
             OBJECT_STRUCTURE => Self::Structure(decoder.structure(header)?),
             OBJECT_SEARCH => Self::Search(decoder.search(header)?),
             _ => return Err(CatalogError::InvalidDefinitionEncoding),
@@ -93,6 +97,19 @@ impl Encoder {
             self.put_fixed(&column.get().to_le_bytes())?;
         }
         Ok(())
+    }
+
+    fn put_secondary_index(
+        &mut self,
+        definition: &SecondaryIndexDefinition,
+    ) -> Result<(), CatalogError> {
+        self.put_fixed(&definition.relation.get().to_le_bytes())?;
+        self.put_item_count(definition.columns.len())?;
+        for column in &definition.columns {
+            self.put_fixed(&column.get().to_le_bytes())?;
+        }
+        self.put_bool(definition.unique)?;
+        self.put_bool(definition.nulls_distinct)
     }
 
     fn put_structure(&mut self, definition: &StructureDefinition) -> Result<(), CatalogError> {
@@ -231,6 +248,25 @@ impl<'encoded> Decoder<'encoded> {
             header,
             columns,
             primary_key,
+        })
+    }
+
+    fn secondary_index(
+        &mut self,
+        header: ObjectHeader,
+    ) -> Result<SecondaryIndexDefinition, CatalogError> {
+        let relation = self.object_id()?;
+        let column_count = self.item_count()?;
+        let mut columns = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            columns.push(self.column_id()?);
+        }
+        Ok(SecondaryIndexDefinition {
+            header,
+            relation,
+            columns,
+            unique: self.boolean()?,
+            nulls_distinct: self.boolean()?,
         })
     }
 
@@ -428,7 +464,8 @@ mod tests {
     use super::{
         CatalogError, CatalogName, CatalogObject, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
         ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-        SearchFieldDefinition, StructureDefinition, StructureKind, StructureOwnership,
+        SearchFieldDefinition, SecondaryIndexDefinition, StructureDefinition, StructureKind,
+        StructureOwnership,
     };
     use crate::MAX_CATALOG_NAME_BYTES;
 
@@ -438,6 +475,12 @@ mod tests {
         "63636f756e7473020000000100000002000000696402000000696402000000034000020000000c00",
         "0000646973706c61795f6e616d650c000000646973706c61795f6e616d650100000007010100000001",
         "000000"
+    );
+    const SECONDARY_INDEX_GOLDEN_HEX: &str = concat!(
+        "4859434f424a3031040400000000000000000000000000000001040000006d61696e040000006d",
+        "61696e060000007075626c6963060000007075626c6963180000006163636f756e74735f62795f",
+        "646973706c61795f6e616d65180000006163636f756e74735f62795f646973706c61795f6e616d",
+        "650100000000000000000000000000000001000000020000000101"
     );
 
     fn hex(encoded: &[u8]) -> Result<String, std::fmt::Error> {
@@ -499,6 +542,16 @@ mod tests {
         }))
     }
 
+    fn secondary_index() -> Result<CatalogObject, Box<dyn std::error::Error>> {
+        Ok(CatalogObject::SecondaryIndex(SecondaryIndexDefinition {
+            header: header(4, EngineKind::Relational, "accounts_by_display_name")?,
+            relation: ObjectId::new(1)?,
+            columns: vec![ColumnId::new(2)?],
+            unique: true,
+            nulls_distinct: true,
+        }))
+    }
+
     fn search() -> Result<CatalogObject, Box<dyn std::error::Error>> {
         Ok(CatalogObject::Search(SearchCollectionDefinition {
             header: header(3, EngineKind::Search, "documents")?,
@@ -525,10 +578,12 @@ mod tests {
     #[test]
     fn every_object_definition_has_one_canonical_round_trip()
     -> Result<(), Box<dyn std::error::Error>> {
-        for object in [relation()?, structure()?, search()?] {
+        for object in [relation()?, structure()?, search()?, secondary_index()?] {
             let encoded = object.encode_definition()?;
             if object.header().id.get() == 1 {
                 assert_eq!(hex(&encoded)?, RELATION_GOLDEN_HEX);
+            } else if object.header().id.get() == 4 {
+                assert_eq!(hex(&encoded)?, SECONDARY_INDEX_GOLDEN_HEX);
             }
             assert_eq!(CatalogObject::decode_definition(&encoded)?, object);
             assert_eq!(
@@ -542,11 +597,14 @@ mod tests {
     #[test]
     fn definition_decoder_rejects_every_truncated_prefix_and_corruption()
     -> Result<(), Box<dyn std::error::Error>> {
-        let encoded = relation()?.encode_definition()?;
-        for length in 0..encoded.len() {
-            assert!(CatalogObject::decode_definition(&encoded[..length]).is_err());
+        for object in [relation()?, structure()?, search()?, secondary_index()?] {
+            let encoded = object.encode_definition()?;
+            for length in 0..encoded.len() {
+                assert!(CatalogObject::decode_definition(&encoded[..length]).is_err());
+            }
         }
 
+        let encoded = relation()?.encode_definition()?;
         let mut wrong_owner = encoded.clone();
         wrong_owner[25] = EngineKind::Search as u8;
         assert_eq!(
@@ -573,6 +631,42 @@ mod tests {
         assert_eq!(
             CatalogObject::decode_definition(&vec![0; MAX_CATALOG_DEFINITION_BYTES + 1]),
             Err(CatalogError::DefinitionTooLarge)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_ambiguous_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let CatalogObject::SecondaryIndex(mut definition) = secondary_index()? else {
+            return Err("expected secondary index".into());
+        };
+        definition.columns.clear();
+        assert_eq!(
+            CatalogObject::SecondaryIndex(definition.clone()).validate(),
+            Err(CatalogError::EmptySecondaryIndex)
+        );
+
+        definition.columns = vec![ColumnId::new(2)?, ColumnId::new(2)?];
+        assert_eq!(
+            CatalogObject::SecondaryIndex(definition.clone()).validate(),
+            Err(CatalogError::DuplicateSecondaryIndexColumn(ColumnId::new(
+                2
+            )?))
+        );
+
+        definition.columns = vec![ColumnId::new(2)?];
+        definition.relation = definition.header.id;
+        assert_eq!(
+            CatalogObject::SecondaryIndex(definition.clone()).validate(),
+            Err(CatalogError::SelfReferentialSecondaryIndex)
+        );
+
+        definition.relation = ObjectId::new(1)?;
+        definition.header.owner = EngineKind::Search;
+        assert_eq!(
+            CatalogObject::SecondaryIndex(definition).validate(),
+            Err(CatalogError::WrongObjectOwner)
         );
         Ok(())
     }

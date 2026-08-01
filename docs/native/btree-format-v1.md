@@ -101,6 +101,8 @@ The relational vertical uses one tree root and these private key namespaces:
 | `0x00` | exact one-byte format key | ASCII `HYRELBT1` or `HYRELBT2` |
 | `0x01` | prefix + 128-bit big-endian table `ObjectId` | empty table marker |
 | `0x02` | prefix + table `ObjectId` + primary-key bytes | format-specific row value |
+| `0x03` | prefix + 128-bit big-endian index `ObjectId` | 32-byte `HYRIDX01` metadata |
+| `0x04` | prefix + index `ObjectId` + secondary-entry identity | live/tombstone byte |
 
 The table marker preserves an empty table. A row record currently contains the
 primary-key bytes and binary row payload as two catalog-ordered columns. The
@@ -120,10 +122,27 @@ only the B+tree pointer under a new copy-on-write root. Superseded copies carry
 closed `end_csn` values and tombstones are ordinary open versions. Historical
 snapshots retain their prior roots.
 
+`HYRIDX01` contains its magic, the 128-bit big-endian relation `ObjectId`,
+one canonical boolean for `unique`, one for `nulls_distinct`, and six reserved
+zero bytes. A secondary-entry identity is:
+
+1. big-endian `u32` secondary-key byte length;
+2. canonical ordered secondary-key bytes; and
+3. canonical primary-key bytes.
+
+The B+tree key remains limited to 4,096 bytes. Entry value `1` is live and `0`
+is a tombstone. Creation writes the metadata marker and backfills the final
+admitted relation state. Row insertion derives every index projection from the
+catalog-bound tuple; optimistic rebase repeats that derivation against the
+currently admitted catalog. Recovery verifies metadata against the catalog,
+recomputes every live entry from its row, enforces uniqueness, rejects
+orphan/malformed entries, and proves that every row has every required
+projection.
+
 This namespace remains the first physical relational route, not the complete
-SQL storage design. Secondary indexes, range cursors, prefix compression, bulk
-load, free-space policy, scan-oriented column batches, retention, and vacuum
-remain pending.
+SQL storage design. Secondary-key range cursors, prefix compression, bulk load,
+direct pinned index query, update/delete maintenance, free-space policy,
+scan-oriented column batches, retention, and vacuum remain pending.
 
 ## Structure namespace
 
@@ -166,7 +185,9 @@ balanced-height verification, point reads, ordered and prefix scans (including
 an all-`0xff` upper range), retained historical roots, duplicate/upsert
 semantics, buffered lookup/scan, oversized and noncanonical rejection,
 complete-node validation after an early key match, and future-node rejection.
-The runtime benchmark refuses to run unless its relational, structure, and
-search trees are multilevel. Fuzzing, randomized model equivalence, crash
-power-loss tests, fanout/fill-factor tuning, streaming cursors, and concurrent
-writer publication remain required gate evidence.
+Runtime coverage additionally proves secondary-index backfill, insert,
+uniqueness, both optimistic index/row commit orders, catalog/root reopen, and
+missing-projection rejection. The runtime benchmark refuses to run unless its
+relational, structure, and search trees are multilevel. Fuzzing, randomized
+model equivalence, crash power-loss tests, fanout/fill-factor tuning, streaming
+cursors, and concurrent writer publication remain required gate evidence.

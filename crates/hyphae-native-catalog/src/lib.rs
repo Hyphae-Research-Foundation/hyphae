@@ -67,6 +67,21 @@ pub enum CatalogError {
     /// A primary-key column was declared nullable.
     #[error("primary-key column {0} cannot be nullable")]
     NullablePrimaryKeyColumn(ColumnId),
+    /// A secondary index has no key columns.
+    #[error("secondary index must contain at least one key column")]
+    EmptySecondaryIndex,
+    /// A secondary-index column was listed more than once.
+    #[error("secondary-index column {0} is duplicated")]
+    DuplicateSecondaryIndexColumn(ColumnId),
+    /// A secondary index names itself as its owning relation.
+    #[error("secondary index cannot reference itself as its relation")]
+    SelfReferentialSecondaryIndex,
+    /// A secondary index references an absent or non-relation object.
+    #[error("secondary index relation {0} does not exist")]
+    MissingSecondaryIndexRelation(ObjectId),
+    /// A secondary-index column is not part of its relation.
+    #[error("secondary-index column {0} does not exist in its relation")]
+    MissingSecondaryIndexColumn(ColumnId),
     /// An object variant names the wrong owning engine.
     #[error("catalog object owner does not match its object kind")]
     WrongObjectOwner,
@@ -295,6 +310,69 @@ impl RelationDefinition {
     }
 }
 
+/// Native relational secondary-index definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecondaryIndexDefinition {
+    /// Shared object metadata.
+    pub header: ObjectHeader,
+    /// Stable relation identity indexed by this object.
+    pub relation: ObjectId,
+    /// Ordered index-key column identities.
+    pub columns: Vec<ColumnId>,
+    /// Whether non-null index keys must identify at most one row.
+    pub unique: bool,
+    /// Whether SQL-null key components remain distinct for uniqueness.
+    pub nulls_distinct: bool,
+}
+
+impl SecondaryIndexDefinition {
+    /// Validates one secondary-index definition independent of its relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or duplicate column list, excessive
+    /// members, or a self-referential relation identity.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.columns.is_empty() {
+            return Err(CatalogError::EmptySecondaryIndex);
+        }
+        if self.columns.len() > MAX_CATALOG_DEFINITION_ITEMS {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        if self.relation == self.header.id {
+            return Err(CatalogError::SelfReferentialSecondaryIndex);
+        }
+        let mut columns = BTreeSet::new();
+        for column in &self.columns {
+            if !columns.insert(*column) {
+                return Err(CatalogError::DuplicateSecondaryIndexColumn(*column));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates stable relation and column references against one definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied relation has the wrong identity or
+    /// does not contain every indexed column.
+    pub fn validate_relation(&self, relation: &RelationDefinition) -> Result<(), CatalogError> {
+        if relation.header.id != self.relation {
+            return Err(CatalogError::MissingSecondaryIndexRelation(self.relation));
+        }
+        if let Some(column) = self.columns.iter().find(|column| {
+            !relation
+                .columns
+                .iter()
+                .any(|definition| definition.id == **column)
+        }) {
+            return Err(CatalogError::MissingSecondaryIndexColumn(*column));
+        }
+        Ok(())
+    }
+}
+
 /// Native structure-object family.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -407,6 +485,8 @@ impl SearchCollectionDefinition {
 pub enum CatalogObject {
     /// Relational relation.
     Relation(RelationDefinition),
+    /// Relational secondary index.
+    SecondaryIndex(SecondaryIndexDefinition),
     /// Keyspace structure.
     Structure(StructureDefinition),
     /// Search collection.
@@ -418,6 +498,7 @@ impl CatalogObject {
     pub const fn header(&self) -> &ObjectHeader {
         match self {
             Self::Relation(definition) => &definition.header,
+            Self::SecondaryIndex(definition) => &definition.header,
             Self::Structure(definition) => &definition.header,
             Self::Search(definition) => &definition.header,
         }
@@ -432,6 +513,12 @@ impl CatalogObject {
     pub fn validate(&self) -> Result<(), CatalogError> {
         match self {
             Self::Relation(definition) => {
+                if definition.header.owner != EngineKind::Relational {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                definition.validate()
+            }
+            Self::SecondaryIndex(definition) => {
                 if definition.header.owner != EngineKind::Relational {
                     return Err(CatalogError::WrongObjectOwner);
                 }
@@ -538,6 +625,19 @@ impl CatalogTransaction {
         {
             return Err(CatalogError::DuplicateName(Box::new(header.name.clone())));
         }
+        if let CatalogObject::SecondaryIndex(definition) = &object {
+            let relation = self
+                .additions
+                .iter()
+                .find(|existing| existing.header().id == definition.relation)
+                .or_else(|| self.base.objects.get(&definition.relation));
+            let Some(CatalogObject::Relation(relation)) = relation else {
+                return Err(CatalogError::MissingSecondaryIndexRelation(
+                    definition.relation,
+                ));
+            };
+            definition.validate_relation(relation)?;
+        }
         self.additions.push(object);
         Ok(())
     }
@@ -579,6 +679,7 @@ mod tests {
     use super::{
         CatalogError, CatalogName, CatalogObject, CatalogSnapshot, CatalogTransaction,
         ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition,
+        SecondaryIndexDefinition,
     };
 
     fn relation(id: u128, name: &str) -> Result<CatalogObject, Box<dyn std::error::Error>> {
@@ -599,6 +700,28 @@ mod tests {
                 nullable: false,
             }],
             primary_key: vec![ColumnId::new(1)?],
+        }))
+    }
+
+    fn secondary_index(
+        id: u128,
+        relation: u128,
+        column: u32,
+    ) -> Result<CatalogObject, Box<dyn std::error::Error>> {
+        Ok(CatalogObject::SecondaryIndex(SecondaryIndexDefinition {
+            header: ObjectHeader {
+                id: ObjectId::new(id)?,
+                owner: EngineKind::Relational,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted("accounts_by_id")?,
+                ),
+            },
+            relation: ObjectId::new(relation)?,
+            columns: vec![ColumnId::new(column)?],
+            unique: true,
+            nulls_distinct: true,
         }))
     }
 
@@ -648,6 +771,28 @@ mod tests {
             invalid.validate(),
             Err(CatalogError::MissingPrimaryKeyColumn(ColumnId::new(2)?))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_index_must_reference_a_staged_or_committed_relation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = CatalogSnapshot::empty(CatalogVersion::new(1)?);
+        let mut transaction = CatalogTransaction::begin(base);
+        assert_eq!(
+            transaction.create(secondary_index(2, 1, 1)?),
+            Err(CatalogError::MissingSecondaryIndexRelation(ObjectId::new(
+                1
+            )?))
+        );
+        transaction.create(relation(1, "accounts")?)?;
+        assert_eq!(
+            transaction.create(secondary_index(2, 1, 2)?),
+            Err(CatalogError::MissingSecondaryIndexColumn(ColumnId::new(2)?))
+        );
+        transaction.create(secondary_index(2, 1, 1)?)?;
+        let committed = transaction.commit()?;
+        assert_eq!(committed.len(), 2);
         Ok(())
     }
 }

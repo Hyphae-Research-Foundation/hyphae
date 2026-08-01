@@ -66,8 +66,9 @@ are referenced from pages and the root set.
 New catalog-root pages carry `HYCAT002`: a checked `u32` object count followed
 by checked length-delimited `HYCOBJ01` definitions ordered by `ObjectId`.
 Definitions retain qualified display/lookup names, stable column/field IDs,
-logical types, nullability, primary keys, structure policy, search mapping,
-and optional vector declaration.
+logical types, nullability, primary keys, secondary-index relation/columns/
+uniqueness policy, structure policy, search mapping, and optional vector
+declaration.
 
 `HYCAT001` name/owner-only payloads remain readable and are reconstructed only
 for their known fixed relation and search shapes. The current catalog root is

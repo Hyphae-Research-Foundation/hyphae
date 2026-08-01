@@ -2,6 +2,7 @@
 
 use hyphae_native_catalog::{
     CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
+    SecondaryIndexDefinition,
 };
 use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
 use hyphae_native_types::{
@@ -67,6 +68,12 @@ pub enum SqlError {
     /// Catalog ownership and object kind disagree.
     #[error("HYSQL010 native SQL catalog object kind is invalid")]
     InvalidCatalogObject,
+    /// No primary or secondary index can satisfy the exact predicates.
+    #[error("HYSQL011 native SQL query has no implemented access path")]
+    NoAccessPath,
+    /// A non-null unique secondary-index key already identifies a row.
+    #[error("HYSQL012 native SQL unique constraint failed")]
+    UniqueViolation,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -95,6 +102,13 @@ enum PreparedPlan {
         output_columns: Vec<String>,
         legacy_binary: bool,
     },
+    SelectBySecondaryIndex {
+        table: ObjectId,
+        index: ObjectId,
+        projection: Vec<usize>,
+        parameter_columns: Vec<usize>,
+        output_columns: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +117,12 @@ enum Statement {
         name: String,
         columns: Vec<ParsedColumn>,
         primary_key: Vec<String>,
+    },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
     },
     Insert {
         name: String,
@@ -115,6 +135,11 @@ enum Statement {
         name: String,
     },
     Select {
+        name: String,
+        projection: Projection,
+        predicates: Vec<String>,
+    },
+    ExplainSelect {
         name: String,
         projection: Projection,
         predicates: Vec<String>,
@@ -140,7 +165,12 @@ struct BoundSelect {
     projection: Vec<usize>,
     parameter_columns: Vec<usize>,
     output_columns: Vec<String>,
-    legacy_binary: bool,
+    access: SelectAccess,
+}
+
+enum SelectAccess {
+    PrimaryKey { legacy_binary: bool },
+    SecondaryIndex { index: ObjectId },
 }
 
 pub(crate) fn prepare(
@@ -156,15 +186,25 @@ pub(crate) fn prepare(
         return Err(SqlError::InvalidSyntax);
     };
     let bound = bind_select(&snapshot.state.catalog, &name, &projection, &predicates)?;
-    Ok(PreparedStatement {
-        catalog_version: snapshot.catalog_version(),
-        plan: PreparedPlan::SelectByPrimaryKey {
+    let plan = match bound.access {
+        SelectAccess::PrimaryKey { legacy_binary } => PreparedPlan::SelectByPrimaryKey {
             table: bound.table,
             projection: bound.projection,
             parameter_columns: bound.parameter_columns,
             output_columns: bound.output_columns,
-            legacy_binary: bound.legacy_binary,
+            legacy_binary,
         },
+        SelectAccess::SecondaryIndex { index } => PreparedPlan::SelectBySecondaryIndex {
+            table: bound.table,
+            index,
+            projection: bound.projection,
+            parameter_columns: bound.parameter_columns,
+            output_columns: bound.output_columns,
+        },
+    };
+    Ok(PreparedStatement {
+        catalog_version: snapshot.catalog_version(),
+        plan,
     })
 }
 
@@ -174,33 +214,7 @@ pub(crate) fn execute_prepared(
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     ensure_catalog_version(snapshot, prepared)?;
-    let PreparedPlan::SelectByPrimaryKey {
-        table,
-        projection,
-        parameter_columns,
-        output_columns,
-        legacy_binary,
-    } = &prepared.plan;
-    let definition = relation_by_id(&snapshot.state.catalog, *table)?;
-    let primary_key = bind_primary_key(definition, parameter_columns, parameters)?;
-    let rows = snapshot.select(*table, &primary_key).map_or_else(
-        || Ok(Vec::new()),
-        |stored| {
-            materialize_row(
-                definition,
-                projection,
-                *legacy_binary,
-                parameters,
-                parameter_columns,
-                stored,
-            )
-            .map(|row| vec![row])
-        },
-    )?;
-    Ok(SqlResult::Rows {
-        columns: output_columns.clone(),
-        rows,
-    })
+    execute_bound_snapshot(snapshot, &prepared.plan, parameters)
 }
 
 pub(crate) fn execute_prepared_binary<'snapshot>(
@@ -219,7 +233,9 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         } if projection.as_slice() == [1] && parameter_columns.as_slice() == [0] => {
             Ok(snapshot.select(*table, primary_key))
         }
-        PreparedPlan::SelectByPrimaryKey { .. } => Err(SqlError::ParameterMismatch),
+        PreparedPlan::SelectByPrimaryKey { .. } | PreparedPlan::SelectBySecondaryIndex { .. } => {
+            Err(SqlError::ParameterMismatch)
+        }
     }
 }
 
@@ -234,6 +250,12 @@ pub(crate) fn execute_transaction(
             columns,
             primary_key,
         } => execute_create(transaction, &name, columns, primary_key, parameters),
+        Statement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => execute_create_index(transaction, &name, &table, &columns, unique, parameters),
         Statement::Insert { name, columns } => {
             execute_insert(transaction, &name, &columns, parameters)
         }
@@ -244,7 +266,171 @@ pub(crate) fn execute_transaction(
             projection,
             predicates,
         } => execute_select(transaction, &name, &projection, &predicates, parameters),
+        Statement::ExplainSelect {
+            name,
+            projection,
+            predicates,
+        } => execute_explain(transaction, &name, &projection, &predicates, parameters),
     }
+}
+
+fn execute_bound_snapshot(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    match plan {
+        PreparedPlan::SelectByPrimaryKey {
+            table,
+            projection,
+            parameter_columns,
+            output_columns,
+            legacy_binary,
+        } => {
+            let definition = relation_by_id(&snapshot.state.catalog, *table)?;
+            let primary_key = bind_primary_key(definition, parameter_columns, parameters)?;
+            let rows = snapshot.select(*table, &primary_key).map_or_else(
+                || Ok(Vec::new()),
+                |stored| {
+                    materialize_row(
+                        definition,
+                        projection,
+                        *legacy_binary,
+                        parameters,
+                        parameter_columns,
+                        stored,
+                    )
+                    .map(|row| vec![row])
+                },
+            )?;
+            Ok(SqlResult::Rows {
+                columns: output_columns.clone(),
+                rows,
+            })
+        }
+        PreparedPlan::SelectBySecondaryIndex {
+            table,
+            index,
+            projection,
+            parameter_columns,
+            output_columns,
+        } => {
+            let definition = relation_by_id(&snapshot.state.catalog, *table)?;
+            let index_definition = secondary_index_by_id(&snapshot.state.catalog, *index)?;
+            let Some(index_key) = bind_secondary_index_key(
+                definition,
+                index_definition,
+                parameter_columns,
+                parameters,
+            )?
+            else {
+                return Ok(SqlResult::Rows {
+                    columns: output_columns.clone(),
+                    rows: Vec::new(),
+                });
+            };
+            let primary_keys = snapshot
+                .state
+                .relational
+                .secondary_index_lookup(*index, &index_key)
+                .map_err(NativeRuntimeError::from)?;
+            let mut rows = Vec::new();
+            if let Some(primary_keys) = primary_keys {
+                rows.reserve(primary_keys.len());
+                for primary_key in primary_keys {
+                    let stored = snapshot
+                        .select(*table, primary_key)
+                        .ok_or(SqlError::InvalidStoredRow)?;
+                    rows.push(materialize_row(
+                        definition,
+                        projection,
+                        false,
+                        parameters,
+                        parameter_columns,
+                        stored,
+                    )?);
+                }
+            }
+            Ok(SqlResult::Rows {
+                columns: output_columns.clone(),
+                rows,
+            })
+        }
+    }
+}
+
+fn execute_create_index(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    table_name: &str,
+    column_names: &[String],
+    unique: bool,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let (relation, table) = relation_named(&transaction.state.catalog, table_name)?;
+    if is_legacy_binary_relation(table) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let mut columns = Vec::with_capacity(column_names.len());
+    for name in column_names {
+        let column = table.columns[column_index(&table.columns, name)?].id;
+        if columns.contains(&column) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        columns.push(column);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .next_object_id()
+        .map_err(NativeRuntimeError::from)?;
+    let definition = SecondaryIndexDefinition {
+        header: ObjectHeader {
+            id,
+            owner: EngineKind::Relational,
+            name: qualified_name(name).map_err(NativeRuntimeError::from)?,
+        },
+        relation,
+        columns,
+        unique,
+        nulls_distinct: true,
+    };
+    definition.validate().map_err(NativeRuntimeError::from)?;
+    transaction
+        .create_secondary_index_definition(&definition)
+        .map_err(map_runtime_error)?;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_explain(
+    transaction: &NativeWriteBatch,
+    name: &str,
+    projection: &Projection,
+    predicates: &[String],
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let bound = bind_select(&transaction.state.catalog, name, projection, predicates)?;
+    let plan = match bound.access {
+        SelectAccess::PrimaryKey { .. } => {
+            format!("PrimaryKeyLookup(table={})", bound.table)
+        }
+        SelectAccess::SecondaryIndex { index } => {
+            format!("SecondaryIndexLookup(table={},index={index})", bound.table)
+        }
+    };
+    Ok(SqlResult::Rows {
+        columns: vec!["plan".to_owned()],
+        rows: vec![vec![SqlValue::Text(plan)]],
+    })
 }
 
 fn execute_create(
@@ -325,11 +511,15 @@ fn execute_insert(
     if is_legacy_binary_relation(&definition) {
         let primary_key = legacy_binary_value(values[0], false)?;
         let row = legacy_binary_value(values[1], false)?;
-        transaction.insert(table, primary_key, row)?;
+        transaction
+            .insert(table, primary_key, row)
+            .map_err(map_runtime_error)?;
     } else {
         let primary_key = encode_primary_key(&definition, &values)?;
         let tuple = encode_tuple(&definition, &values)?;
-        transaction.insert(table, primary_key, tuple)?;
+        transaction
+            .insert(table, primary_key, tuple)
+            .map_err(map_runtime_error)?;
     }
     Ok(SqlResult::Command {
         rows_affected: 1,
@@ -384,21 +574,63 @@ fn execute_select(
 ) -> Result<SqlResult, SqlError> {
     let bound = bind_select(&transaction.state.catalog, name, projection, predicates)?;
     let definition = relation_by_id(&transaction.state.catalog, bound.table)?;
-    let primary_key = bind_primary_key(definition, &bound.parameter_columns, parameters)?;
-    let rows = transaction.select(bound.table, &primary_key).map_or_else(
-        || Ok(Vec::new()),
-        |stored| {
-            materialize_row(
+    let rows = match bound.access {
+        SelectAccess::PrimaryKey { legacy_binary } => {
+            let primary_key = bind_primary_key(definition, &bound.parameter_columns, parameters)?;
+            transaction.select(bound.table, &primary_key).map_or_else(
+                || Ok(Vec::new()),
+                |stored| {
+                    materialize_row(
+                        definition,
+                        &bound.projection,
+                        legacy_binary,
+                        parameters,
+                        &bound.parameter_columns,
+                        stored,
+                    )
+                    .map(|row| vec![row])
+                },
+            )?
+        }
+        SelectAccess::SecondaryIndex { index } => {
+            let index_definition = secondary_index_by_id(&transaction.state.catalog, index)?;
+            let index_key = bind_secondary_index_key(
                 definition,
-                &bound.projection,
-                bound.legacy_binary,
-                parameters,
+                index_definition,
                 &bound.parameter_columns,
-                stored,
-            )
-            .map(|row| vec![row])
-        },
-    )?;
+                parameters,
+            )?;
+            let primary_keys = index_key
+                .as_deref()
+                .map(|index_key| {
+                    transaction
+                        .state
+                        .relational
+                        .secondary_index_lookup(index, index_key)
+                        .map_err(NativeRuntimeError::from)
+                })
+                .transpose()?
+                .flatten();
+            let mut rows = Vec::new();
+            if let Some(primary_keys) = primary_keys {
+                rows.reserve(primary_keys.len());
+                for primary_key in primary_keys {
+                    let stored = transaction
+                        .select(bound.table, primary_key)
+                        .ok_or(SqlError::InvalidStoredRow)?;
+                    rows.push(materialize_row(
+                        definition,
+                        &bound.projection,
+                        false,
+                        parameters,
+                        &bound.parameter_columns,
+                        stored,
+                    )?);
+                }
+            }
+            rows
+        }
+    };
     Ok(SqlResult::Rows {
         columns: bound.output_columns,
         rows,
@@ -428,13 +660,32 @@ fn bind_select(
         parameter_columns.push(column);
     }
     let expected_primary_key = primary_key_indices(definition)?;
-    if parameter_columns.len() != expected_primary_key.len()
-        || expected_primary_key
-            .iter()
-            .any(|column| !parameter_columns.contains(column))
-    {
-        return Err(SqlError::InvalidPrimaryKey);
-    }
+    let access = if same_column_set(&parameter_columns, &expected_primary_key) {
+        SelectAccess::PrimaryKey {
+            legacy_binary: is_legacy_binary_relation(definition),
+        }
+    } else {
+        let secondary_index = catalog.objects.iter().find_map(|(id, object)| {
+            let CatalogObject::SecondaryIndex(index) = object else {
+                return None;
+            };
+            if index.relation != table {
+                return None;
+            }
+            let columns = secondary_index_column_indices(definition, index).ok()?;
+            same_column_set(&parameter_columns, &columns).then_some(*id)
+        });
+        match secondary_index {
+            Some(index) => SelectAccess::SecondaryIndex { index },
+            None if parameter_columns
+                .iter()
+                .any(|column| expected_primary_key.contains(column)) =>
+            {
+                return Err(SqlError::InvalidPrimaryKey);
+            }
+            None => return Err(SqlError::NoAccessPath),
+        }
+    };
     let output_columns = projection
         .iter()
         .map(|index| definition.columns[*index].name.display().to_owned())
@@ -444,8 +695,12 @@ fn bind_select(
         projection,
         parameter_columns,
         output_columns,
-        legacy_binary: is_legacy_binary_relation(definition),
+        access,
     })
+}
+
+fn same_column_set(left: &[usize], right: &[usize]) -> bool {
+    left.len() == right.len() && left.iter().all(|column| right.contains(column))
 }
 
 fn bind_insert_values<'value>(
@@ -532,6 +787,33 @@ fn bind_primary_key(
     encode_primary_key(definition, &values)
 }
 
+fn bind_secondary_index_key(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    parameter_columns: &[usize],
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    if parameter_columns.len() != parameters.len() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let mut values = vec![None; relation.columns.len()];
+    let mut contains_null = false;
+    for (column, value) in parameter_columns.iter().copied().zip(parameters) {
+        contains_null |= matches!(value, SqlValue::Null);
+        values[column] = Some(value);
+    }
+    let mut encoded = Vec::new();
+    for column in secondary_index_column_indices(relation, index)? {
+        let value = values[column].ok_or(SqlError::NoAccessPath)?;
+        encoded.extend_from_slice(
+            &value
+                .encode_ordered_component(&relation.columns[column].logical_type)
+                .map_err(|_| SqlError::TypeMismatch)?,
+        );
+    }
+    Ok((!contains_null).then_some(encoded))
+}
+
 fn materialize_row(
     definition: &RelationDefinition,
     projection: &[usize],
@@ -600,6 +882,23 @@ fn primary_key_indices(definition: &RelationDefinition) -> Result<Vec<usize>, Sq
         .collect()
 }
 
+fn secondary_index_column_indices(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+) -> Result<Vec<usize>, SqlError> {
+    index
+        .columns
+        .iter()
+        .map(|id| {
+            relation
+                .columns
+                .iter()
+                .position(|column| column.id == *id)
+                .ok_or(SqlError::InvalidCatalogObject)
+        })
+        .collect()
+}
+
 fn relation_named<'catalog>(
     catalog: &'catalog crate::model::CatalogState,
     name: &str,
@@ -616,9 +915,32 @@ fn relation_by_id(
 ) -> Result<&RelationDefinition, SqlError> {
     match catalog.object(id) {
         Some(CatalogObject::Relation(definition)) => Ok(definition),
-        Some(CatalogObject::Structure(_) | CatalogObject::Search(_)) | None => {
-            Err(SqlError::InvalidCatalogObject)
-        }
+        Some(
+            CatalogObject::SecondaryIndex(_)
+            | CatalogObject::Structure(_)
+            | CatalogObject::Search(_),
+        )
+        | None => Err(SqlError::InvalidCatalogObject),
+    }
+}
+
+fn secondary_index_by_id(
+    catalog: &crate::model::CatalogState,
+    id: ObjectId,
+) -> Result<&SecondaryIndexDefinition, SqlError> {
+    match catalog.object(id) {
+        Some(CatalogObject::SecondaryIndex(definition)) => Ok(definition),
+        Some(
+            CatalogObject::Relation(_) | CatalogObject::Structure(_) | CatalogObject::Search(_),
+        )
+        | None => Err(SqlError::InvalidCatalogObject),
+    }
+}
+
+fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
+    match error {
+        NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
+        error => SqlError::Runtime(error),
     }
 }
 
@@ -674,6 +996,21 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
         parse_delete(&mut parser)?
     } else if parser.consume_keyword("SELECT") {
         parse_select(&mut parser)?
+    } else if parser.consume_keyword("EXPLAIN") {
+        parser.expect_keyword("SELECT")?;
+        let Statement::Select {
+            name,
+            projection,
+            predicates,
+        } = parse_select(&mut parser)?
+        else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        Statement::ExplainSelect {
+            name,
+            projection,
+            predicates,
+        }
     } else {
         return Err(SqlError::InvalidSyntax);
     };
@@ -683,6 +1020,13 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
 }
 
 fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
+    let unique = parser.consume_keyword("UNIQUE");
+    if parser.consume_keyword("INDEX") {
+        return parse_create_index(parser, unique);
+    }
+    if unique {
+        return Err(SqlError::InvalidSyntax);
+    }
     parser.expect_keyword("TABLE")?;
     let name = parser.identifier()?;
     parser.expect_symbol('(')?;
@@ -758,6 +1102,20 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
         name,
         columns,
         primary_key,
+    })
+}
+
+fn parse_create_index(parser: &mut Parser, unique: bool) -> Result<Statement, SqlError> {
+    let name = parser.identifier()?;
+    parser.expect_keyword("ON")?;
+    let table = parser.identifier()?;
+    parser.expect_symbol('(')?;
+    let columns = parser.identifier_list(')')?;
+    Ok(Statement::CreateIndex {
+        name,
+        table,
+        columns,
+        unique,
     })
 }
 
@@ -1125,6 +1483,34 @@ mod tests {
         assert!(matches!(
             parse("SELECT payload FROM events"),
             Err(SqlError::InvalidSyntax)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_index_and_explain_grammar_parse_exactly() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert!(matches!(
+            parse("CREATE UNIQUE INDEX people_email ON people (email)")?,
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique: true,
+            } if name == "people_email" && table == "people" && columns == ["email"]
+        ));
+        assert!(matches!(
+            parse("CREATE INDEX events_tenant_sequence ON events (tenant, sequence)")?,
+            Statement::CreateIndex {
+                columns,
+                unique: false,
+                ..
+            } if columns == ["tenant", "sequence"]
+        ));
+        assert!(matches!(
+            parse("EXPLAIN SELECT id FROM people WHERE email = ?")?,
+            Statement::ExplainSelect { name, predicates, .. }
+                if name == "people" && predicates == ["email"]
         ));
         Ok(())
     }

@@ -38,10 +38,16 @@ pub(crate) enum ModelError {
     UnknownObject,
     #[error("native catalog object belongs to a different engine")]
     WrongEngine,
+    #[error("native secondary index references an unknown relation")]
+    UnknownSecondaryIndexRelation,
     #[error("native relational primary key already exists")]
     DuplicatePrimaryKey,
     #[error("native relational primary key does not exist")]
     MissingPrimaryKey,
+    #[error("native relational secondary-index entry already exists")]
+    DuplicateSecondaryIndexEntry,
+    #[error("native relational unique secondary index is violated")]
+    UniqueSecondaryIndexViolation,
     #[error("legacy native structure state cannot encode collection families")]
     UnsupportedLegacyStructureFamily,
     #[error("native search document ID already exists")]
@@ -71,6 +77,13 @@ impl CatalogState {
             .any(|entry| entry.header().name == header.name)
         {
             return Err(ModelError::DuplicateObjectName);
+        }
+        if let CatalogObject::SecondaryIndex(definition) = &object {
+            let Some(CatalogObject::Relation(relation)) = self.objects.get(&definition.relation)
+            else {
+                return Err(ModelError::UnknownSecondaryIndexRelation);
+            };
+            definition.validate_relation(relation)?;
         }
         self.objects.insert(id, object);
         Ok(())
@@ -196,6 +209,15 @@ fn legacy_catalog_object(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RelationState {
     pub(crate) tables: BTreeMap<ObjectId, BTreeMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) indexes: BTreeMap<ObjectId, SecondaryIndexState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SecondaryIndexState {
+    pub(crate) relation: ObjectId,
+    pub(crate) unique: bool,
+    pub(crate) nulls_distinct: bool,
+    pub(crate) entries: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
 }
 
 impl RelationState {
@@ -204,6 +226,82 @@ impl RelationState {
             return Err(ModelError::DuplicateObjectId);
         }
         Ok(())
+    }
+
+    pub(crate) fn create_secondary_index(
+        &mut self,
+        id: ObjectId,
+        relation: ObjectId,
+        unique: bool,
+        nulls_distinct: bool,
+    ) -> Result<(), ModelError> {
+        if !self.tables.contains_key(&relation) {
+            return Err(ModelError::UnknownObject);
+        }
+        if self
+            .indexes
+            .insert(
+                id,
+                SecondaryIndexState {
+                    relation,
+                    unique,
+                    nulls_distinct,
+                    entries: BTreeMap::new(),
+                },
+            )
+            .is_some()
+        {
+            return Err(ModelError::DuplicateObjectId);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_secondary_index_insert(
+        &self,
+        index: ObjectId,
+        index_key: &[u8],
+        primary_key: &[u8],
+        contains_null: bool,
+    ) -> Result<(), ModelError> {
+        let index = self.indexes.get(&index).ok_or(ModelError::UnknownObject)?;
+        let entries = index.entries.get(index_key);
+        if entries.is_some_and(|entries| entries.contains(primary_key)) {
+            return Err(ModelError::DuplicateSecondaryIndexEntry);
+        }
+        if index.unique
+            && !(contains_null && index.nulls_distinct)
+            && entries.is_some_and(|entries| !entries.is_empty())
+        {
+            return Err(ModelError::UniqueSecondaryIndexViolation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_secondary_index(
+        &mut self,
+        index: ObjectId,
+        index_key: Vec<u8>,
+        primary_key: Vec<u8>,
+        contains_null: bool,
+    ) -> Result<(), ModelError> {
+        self.validate_secondary_index_insert(index, &index_key, &primary_key, contains_null)?;
+        self.indexes
+            .get_mut(&index)
+            .ok_or(ModelError::UnknownObject)?
+            .entries
+            .entry(index_key)
+            .or_default()
+            .insert(primary_key);
+        Ok(())
+    }
+
+    pub(crate) fn secondary_index_lookup(
+        &self,
+        index: ObjectId,
+        index_key: &[u8],
+    ) -> Result<Option<&BTreeSet<Vec<u8>>>, ModelError> {
+        let index = self.indexes.get(&index).ok_or(ModelError::UnknownObject)?;
+        Ok(index.entries.get(index_key))
     }
 
     pub(crate) fn insert(

@@ -30,6 +30,7 @@ use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
     CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
     RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition,
 };
 use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
 use hyphae_native_mvcc::{
@@ -38,11 +39,12 @@ use hyphae_native_mvcc::{
 };
 use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
 use hyphae_native_records::{
-    BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView, RowVersionPointer,
+    BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView, RowTupleView,
+    RowVersionPointer,
 };
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
-    ManifestGeneration, ObjectId, PageId, RowId, TransactionId,
+    ManifestGeneration, ObjectId, PageId, RowId, ScalarValue, TransactionId,
 };
 use hyphae_native_wal::{WalError, WalFile, WalRecovery};
 use thiserror::Error;
@@ -65,6 +67,12 @@ const RELATIONAL_FORMAT_VALUE_V1: &[u8] = b"HYRELBT1";
 const RELATIONAL_FORMAT_VALUE_V2: &[u8] = b"HYRELBT2";
 const RELATIONAL_TABLE_PREFIX: u8 = 1;
 const RELATIONAL_ROW_PREFIX: u8 = 2;
+const RELATIONAL_SECONDARY_INDEX_PREFIX: u8 = 3;
+const RELATIONAL_SECONDARY_ENTRY_PREFIX: u8 = 4;
+const RELATIONAL_SECONDARY_INDEX_MAGIC: &[u8; 8] = b"HYRIDX01";
+const RELATIONAL_SECONDARY_INDEX_META_SIZE: usize = 32;
+const RELATIONAL_SECONDARY_ENTRY_TOMBSTONE: u8 = 0;
+const RELATIONAL_SECONDARY_ENTRY_LIVE: u8 = 1;
 const RELATIONAL_VALUE_INLINE: u8 = 0;
 const RELATIONAL_VALUE_BLOB: u8 = 1;
 const RELATIONAL_INLINE_VALUE_LIMIT: usize = 8_192;
@@ -196,6 +204,12 @@ pub enum NativeRuntimeError {
     /// Engine-state codec or semantic validation failed.
     #[error("native engine state failed: {0}")]
     Model(String),
+    /// A non-null native unique secondary-index key already identifies a row.
+    #[error("native relational unique secondary index is violated")]
+    UniqueSecondaryIndexViolation,
+    /// Typed update/delete maintenance is not implemented for secondary indexes.
+    #[error("native relational update/delete with secondary indexes is not implemented")]
+    SecondaryIndexMutationUnsupported,
     /// The requested data directory already exists.
     #[error("native data directory already exists")]
     DataDirectoryExists,
@@ -269,7 +283,10 @@ impl From<WalSemanticError> for NativeRuntimeError {
 
 impl From<ModelError> for NativeRuntimeError {
     fn from(source: ModelError) -> Self {
-        Self::Model(source.to_string())
+        match source {
+            ModelError::UniqueSecondaryIndexViolation => Self::UniqueSecondaryIndexViolation,
+            source => Self::Model(source.to_string()),
+        }
     }
 }
 
@@ -1379,10 +1396,12 @@ impl DerefMut for NativeTransaction<'_> {
 }
 
 impl NativeWriteBatch {
-    /// Executes one statement in the exact first native SQL slice.
+    /// Executes one statement in the current native SQL slice.
     ///
-    /// The supported grammar is `CREATE TABLE`, binary primary-key `INSERT`,
-    /// `UPDATE`/`DELETE`, and parameterized primary-key `SELECT`.
+    /// The supported grammar includes typed `CREATE TABLE`, `CREATE INDEX`
+    /// with optional `UNIQUE`, named-column `INSERT`, legacy binary
+    /// `UPDATE`/`DELETE`, exact primary/secondary-key `SELECT`, and bounded
+    /// `EXPLAIN SELECT`.
     ///
     /// # Errors
     ///
@@ -1428,6 +1447,55 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    fn create_secondary_index_definition(
+        &mut self,
+        definition: &SecondaryIndexDefinition,
+    ) -> Result<(), NativeRuntimeError> {
+        let id = definition.header.id;
+        let relation = definition.relation;
+        let object = CatalogObject::SecondaryIndex(definition.clone());
+        let encoded_definition = object.encode_definition()?;
+        let name_identity = catalog_name_identity(object.header())?;
+        let mut catalog = self.state.catalog.clone();
+        let mut relational = self.state.relational.clone();
+        catalog.create(object)?;
+        relational.create_secondary_index(
+            id,
+            relation,
+            definition.unique,
+            definition.nulls_distinct,
+        )?;
+        let rows = relational
+            .tables
+            .get(&relation)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .iter()
+            .map(|(primary_key, row)| (primary_key.clone(), row.clone()))
+            .collect::<Vec<_>>();
+        for (primary_key, row) in rows {
+            let projection = secondary_index_projection(&catalog, definition, &row)?;
+            relational.insert_secondary_index(
+                id,
+                projection.key.clone(),
+                primary_key.clone(),
+                projection.contains_null,
+            )?;
+        }
+        self.state.catalog = catalog;
+        self.state.relational = relational;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Relational,
+            opcode: Opcode::CreateSecondaryIndex,
+            target: Some(id),
+            key: name_identity,
+            value: encoded_definition,
+            expires_at_micros: None,
+        });
+        self.dirty[0] = true;
+        self.dirty[1] = true;
+        Ok(())
+    }
+
     /// Inserts one binary row addressed by its primary key.
     ///
     /// # Errors
@@ -1442,17 +1510,26 @@ impl NativeWriteBatch {
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
-        self.state
-            .relational
-            .insert(table, primary_key.clone(), row.clone())?;
+        let projections = secondary_index_projections(&self.state.catalog, table, &row)?;
+        let mut relational = self.state.relational.clone();
+        relational.insert(table, primary_key.clone(), row.clone())?;
+        for projection in &projections {
+            relational.insert_secondary_index(
+                projection.index,
+                projection.key.clone(),
+                primary_key.clone(),
+                projection.contains_null,
+            )?;
+        }
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::InsertRow,
             target: Some(table),
-            key: primary_key,
+            key: primary_key.clone(),
             value: row,
             expires_at_micros: None,
         });
+        self.state.relational = relational;
         self.dirty[1] = true;
         Ok(())
     }
@@ -1471,17 +1548,27 @@ impl NativeWriteBatch {
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
-        self.state
+        let old_row = self
+            .state
             .relational
-            .update(table, &primary_key, row.clone())?;
+            .select(table, &primary_key)
+            .ok_or(ModelError::MissingPrimaryKey)?
+            .to_vec();
+        let old_projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        if !old_projections.is_empty() {
+            return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
+        }
+        let mut relational = self.state.relational.clone();
+        relational.update(table, &primary_key, row.clone())?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::UpdateRow,
             target: Some(table),
-            key: primary_key,
+            key: primary_key.clone(),
             value: row,
             expires_at_micros: None,
         });
+        self.state.relational = relational;
         self.dirty[1] = true;
         Ok(())
     }
@@ -1498,15 +1585,27 @@ impl NativeWriteBatch {
     ) -> Result<(), NativeRuntimeError> {
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
-        self.state.relational.delete(table, &primary_key)?;
+        let old_row = self
+            .state
+            .relational
+            .select(table, &primary_key)
+            .ok_or(ModelError::MissingPrimaryKey)?
+            .to_vec();
+        let projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        if !projections.is_empty() {
+            return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
+        }
+        let mut relational = self.state.relational.clone();
+        relational.delete(table, &primary_key)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::DeleteRow,
             target: Some(table),
-            key: primary_key,
+            key: primary_key.clone(),
             value: Vec::new(),
             expires_at_micros: None,
         });
+        self.state.relational = relational;
         self.dirty[1] = true;
         Ok(())
     }
@@ -2149,38 +2248,12 @@ fn apply_mutations_to_state(
 ) -> Result<(), NativeRuntimeError> {
     for mutation in mutations {
         match mutation.opcode {
-            Opcode::CreateTable => {
-                let table = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let object = decode_relation_creation(table, mutation)?;
-                state.catalog.create(object)?;
-                state.relational.create_table(table)?;
-            }
-            Opcode::InsertRow => {
-                let table = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                state.catalog.require(table, EngineKind::Relational)?;
-                state
-                    .relational
-                    .insert(table, mutation.key.clone(), mutation.value.clone())?;
-            }
-            Opcode::UpdateRow => {
-                let table = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                state.catalog.require(table, EngineKind::Relational)?;
-                state
-                    .relational
-                    .update(table, &mutation.key, mutation.value.clone())?;
-            }
-            Opcode::DeleteRow => {
-                let table = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                state.catalog.require(table, EngineKind::Relational)?;
-                state.relational.delete(table, &mutation.key)?;
+            Opcode::CreateTable
+            | Opcode::InsertRow
+            | Opcode::UpdateRow
+            | Opcode::DeleteRow
+            | Opcode::CreateSecondaryIndex => {
+                apply_relational_mutation(state, mutation)?;
             }
             Opcode::SetValue
             | Opcode::DeleteValue
@@ -2216,6 +2289,96 @@ fn apply_mutations_to_state(
     Ok(())
 }
 
+fn apply_relational_mutation(
+    state: &mut MaterializedState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    let target = mutation
+        .target
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    match mutation.opcode {
+        Opcode::CreateTable => {
+            let object = decode_relation_creation(target, mutation)?;
+            state.catalog.create(object)?;
+            state.relational.create_table(target)?;
+        }
+        Opcode::InsertRow => {
+            state.catalog.require(target, EngineKind::Relational)?;
+            let projections = secondary_index_projections(&state.catalog, target, &mutation.value)?;
+            state
+                .relational
+                .insert(target, mutation.key.clone(), mutation.value.clone())?;
+            for projection in projections {
+                state.relational.insert_secondary_index(
+                    projection.index,
+                    projection.key,
+                    mutation.key.clone(),
+                    projection.contains_null,
+                )?;
+            }
+        }
+        Opcode::UpdateRow | Opcode::DeleteRow => {
+            state.catalog.require(target, EngineKind::Relational)?;
+            let old_row = state
+                .relational
+                .select(target, &mutation.key)
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            if !secondary_index_projections(&state.catalog, target, old_row)?.is_empty() {
+                return Err(NativeRuntimeError::SecondaryIndexMutationUnsupported);
+            }
+            if mutation.opcode == Opcode::UpdateRow {
+                state
+                    .relational
+                    .update(target, &mutation.key, mutation.value.clone())?;
+            } else {
+                state.relational.delete(target, &mutation.key)?;
+            }
+        }
+        Opcode::CreateSecondaryIndex => {
+            apply_secondary_index_creation(state, target, mutation)?;
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn apply_secondary_index_creation(
+    state: &mut MaterializedState,
+    index: ObjectId,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    let object = decode_secondary_index_creation(index, mutation)?;
+    let CatalogObject::SecondaryIndex(definition) = &object else {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    };
+    let definition = definition.clone();
+    state.catalog.create(object)?;
+    state.relational.create_secondary_index(
+        index,
+        definition.relation,
+        definition.unique,
+        definition.nulls_distinct,
+    )?;
+    let rows = state
+        .relational
+        .tables
+        .get(&definition.relation)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+        .iter()
+        .map(|(primary_key, row)| (primary_key.clone(), row.clone()))
+        .collect::<Vec<_>>();
+    for (primary_key, row) in rows {
+        let projection = secondary_index_projection(&state.catalog, &definition, &row)?;
+        state.relational.insert_secondary_index(
+            index,
+            projection.key,
+            primary_key,
+            projection.contains_null,
+        )?;
+    }
+    Ok(())
+}
+
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
     for mutation in mutations {
@@ -2224,7 +2387,10 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             mutation.target,
             mutation.key.clone(),
         ));
-        if matches!(mutation.opcode, Opcode::CreateTable | Opcode::CreateIndex) {
+        if matches!(
+            mutation.opcode,
+            Opcode::CreateTable | Opcode::CreateSecondaryIndex | Opcode::CreateIndex
+        ) {
             if let Some(object) = mutation.target {
                 let mut object_key = Vec::with_capacity(17);
                 object_key.push(1);
@@ -2343,6 +2509,8 @@ fn commit_engine_roots(
             roots[1],
             relational_format,
             commit_csn,
+            &batch.state.catalog,
+            &batch.state.relational,
             &batch.mutations,
             blob_references,
         )?
@@ -3316,11 +3484,14 @@ fn search_root_after_mutations(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
     format: RelationalFormat,
     creating_csn: Csn,
+    catalog: &CatalogState,
+    relational: &RelationState,
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
@@ -3339,26 +3510,68 @@ fn relational_tree_after_mutations(
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Relational)
     {
-        let table = mutation
+        let target = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
         let key = match mutation.opcode {
             Opcode::CreateTable => {
                 tree = tree
-                    .insert_unique(pages, creating_csn, relational_table_key(table), Vec::new())?
+                    .insert_unique(
+                        pages,
+                        creating_csn,
+                        relational_table_key(target),
+                        Vec::new(),
+                    )?
                     .tree;
                 continue;
             }
+            Opcode::CreateSecondaryIndex => {
+                let object = decode_secondary_index_creation(target, mutation)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+                let CatalogObject::SecondaryIndex(definition) = object else {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                };
+                tree = tree
+                    .insert_unique(
+                        pages,
+                        creating_csn,
+                        relational_secondary_index_key(target),
+                        encode_secondary_index_metadata(&definition).to_vec(),
+                    )?
+                    .tree;
+                let index_state = relational
+                    .indexes
+                    .get(&target)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                for (index_key, primary_keys) in &index_state.entries {
+                    for primary_key in primary_keys {
+                        let identity = secondary_index_entry_identity(index_key, primary_key)?;
+                        tree = tree
+                            .upsert(
+                                pages,
+                                creating_csn,
+                                relational_secondary_entry_key(target, &identity)?,
+                                vec![RELATIONAL_SECONDARY_ENTRY_LIVE],
+                            )?
+                            .tree;
+                    }
+                }
+                continue;
+            }
             Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow => {
-                relational_row_key(table, &mutation.key)
+                relational_row_key(target, &mutation.key)
             }
             _ => return Err(NativeRuntimeError::InvalidRelationalTree),
         };
         let row = if mutation.opcode == Opcode::DeleteRow {
-            RowRecord::tombstone(relational_row_id(table, &mutation.key)?, creating_csn, None)?
+            RowRecord::tombstone(
+                relational_row_id(target, &mutation.key)?,
+                creating_csn,
+                None,
+            )?
         } else {
             RowRecord::new(
-                relational_row_id(table, &mutation.key)?,
+                relational_row_id(target, &mutation.key)?,
                 creating_csn,
                 None,
                 vec![
@@ -3375,6 +3588,19 @@ fn relational_tree_after_mutations(
             }
         };
         tree = tree.upsert(pages, creating_csn, key, value)?.tree;
+        if mutation.opcode == Opcode::InsertRow {
+            for projection in secondary_index_projections(catalog, target, &mutation.value)? {
+                let identity = secondary_index_entry_identity(&projection.key, &mutation.key)?;
+                tree = tree
+                    .upsert(
+                        pages,
+                        creating_csn,
+                        relational_secondary_entry_key(projection.index, &identity)?,
+                        vec![RELATIONAL_SECONDARY_ENTRY_LIVE],
+                    )?
+                    .tree;
+            }
+        }
     }
     Ok(tree)
 }
@@ -3437,6 +3663,184 @@ fn relational_row_key(table: ObjectId, primary_key: &[u8]) -> Vec<u8> {
     key.extend_from_slice(&table.get().to_be_bytes());
     key.extend_from_slice(primary_key);
     key
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SecondaryIndexProjection {
+    index: ObjectId,
+    key: Vec<u8>,
+    contains_null: bool,
+}
+
+fn secondary_index_projections(
+    catalog: &CatalogState,
+    relation: ObjectId,
+    row: &[u8],
+) -> Result<Vec<SecondaryIndexProjection>, NativeRuntimeError> {
+    catalog
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            CatalogObject::SecondaryIndex(definition) if definition.relation == relation => {
+                Some(definition)
+            }
+            CatalogObject::Relation(_)
+            | CatalogObject::SecondaryIndex(_)
+            | CatalogObject::Structure(_)
+            | CatalogObject::Search(_) => None,
+        })
+        .map(|definition| secondary_index_projection(catalog, definition, row))
+        .collect()
+}
+
+fn secondary_index_projection(
+    catalog: &CatalogState,
+    definition: &SecondaryIndexDefinition,
+    row: &[u8],
+) -> Result<SecondaryIndexProjection, NativeRuntimeError> {
+    let Some(CatalogObject::Relation(relation)) = catalog.object(definition.relation) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    let tuple = RowTupleView::decode(row)?;
+    if tuple.column_count() != relation.columns.len() {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let mut key = Vec::new();
+    let mut contains_null = false;
+    for column_id in &definition.columns {
+        let index = relation
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let column = &relation.columns[index];
+        let value = match tuple
+            .value(index)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+        {
+            ColumnValueRef::Null => {
+                contains_null = true;
+                ScalarValue::Null
+            }
+            ColumnValueRef::Bytes(encoded) => {
+                ScalarValue::decode_storage(&column.logical_type, encoded)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?
+            }
+        };
+        key.extend_from_slice(
+            &value
+                .encode_ordered_component(&column.logical_type)
+                .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+        );
+    }
+    Ok(SecondaryIndexProjection {
+        index: definition.header.id,
+        key,
+        contains_null,
+    })
+}
+
+fn secondary_index_entry_identity(
+    index_key: &[u8],
+    primary_key: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let index_length =
+        u32::try_from(index_key.len()).map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+    let capacity = 4_usize
+        .checked_add(index_key.len())
+        .and_then(|length| length.checked_add(primary_key.len()))
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    if capacity
+        .checked_add(17)
+        .is_none_or(|physical| physical > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(&index_length.to_be_bytes());
+    encoded.extend_from_slice(index_key);
+    encoded.extend_from_slice(primary_key);
+    Ok(encoded)
+}
+
+fn decode_secondary_index_entry_identity(
+    encoded: &[u8],
+) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
+    let length = encoded
+        .get(..4)
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let index_length = usize::try_from(u32::from_be_bytes(
+        length
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+    let index_end = 4_usize
+        .checked_add(index_length)
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let index_key = encoded
+        .get(4..index_end)
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let primary_key = encoded
+        .get(index_end..)
+        .filter(|key| !key.is_empty())
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    Ok((index_key, primary_key))
+}
+
+fn relational_secondary_index_key(index: ObjectId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(RELATIONAL_SECONDARY_INDEX_PREFIX);
+    key.extend_from_slice(&index.get().to_be_bytes());
+    key
+}
+
+fn relational_secondary_entry_key(
+    index: ObjectId,
+    identity: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let capacity = 17_usize
+        .checked_add(identity.len())
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    if capacity > BTREE_MAX_KEY_SIZE {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let mut key = Vec::with_capacity(capacity);
+    key.push(RELATIONAL_SECONDARY_ENTRY_PREFIX);
+    key.extend_from_slice(&index.get().to_be_bytes());
+    key.extend_from_slice(identity);
+    Ok(key)
+}
+
+fn encode_secondary_index_metadata(
+    definition: &SecondaryIndexDefinition,
+) -> [u8; RELATIONAL_SECONDARY_INDEX_META_SIZE] {
+    let mut encoded = [0_u8; RELATIONAL_SECONDARY_INDEX_META_SIZE];
+    encoded[..8].copy_from_slice(RELATIONAL_SECONDARY_INDEX_MAGIC);
+    encoded[8..24].copy_from_slice(&definition.relation.get().to_be_bytes());
+    encoded[24] = u8::from(definition.unique);
+    encoded[25] = u8::from(definition.nulls_distinct);
+    encoded
+}
+
+fn decode_secondary_index_metadata(
+    encoded: &[u8],
+) -> Result<(ObjectId, bool, bool), NativeRuntimeError> {
+    if encoded.len() != RELATIONAL_SECONDARY_INDEX_META_SIZE
+        || encoded.get(..8) != Some(RELATIONAL_SECONDARY_INDEX_MAGIC.as_slice())
+        || !matches!(encoded[24], 0 | 1)
+        || !matches!(encoded[25], 0 | 1)
+        || encoded[26..].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let relation = ObjectId::new(u128::from_be_bytes(
+        encoded[8..24]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+    Ok((relation, encoded[24] == 1, encoded[25] == 1))
 }
 
 fn relational_row_id(table: ObjectId, primary_key: &[u8]) -> Result<RowId, NativeRuntimeError> {
@@ -3804,21 +4208,29 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
+    let catalog = load_root(
+        pages,
+        roots,
+        SLOT_CATALOG,
+        PageKind::CatalogRoot,
+        CatalogState::decode,
+    )?
+    .unwrap_or_default();
+    let relational = load_relational_state(pages, blobs, roots, &catalog)?;
     Ok(MaterializedState {
-        catalog: load_root(pages, roots, SLOT_CATALOG, PageKind::CatalogRoot, |bytes| {
-            CatalogState::decode(bytes)
-        })?
-        .unwrap_or_default(),
-        relational: load_relational_state(pages, blobs, roots)?,
+        catalog,
+        relational,
         structures: load_structure_state(pages, blobs, roots)?,
         search: load_search_state(pages, blobs, roots)?,
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn load_relational_state(
     pages: &PageStore,
     blobs: &BlobStore,
     roots: &RootSet,
+    catalog: &CatalogState,
 ) -> Result<RelationState, NativeRuntimeError> {
     let Some(root) = roots.root(SLOT_RELATIONAL) else {
         return Ok(RelationState::default());
@@ -3833,6 +4245,7 @@ fn load_relational_state(
     }
     let format = RelationalFormat::decode(&format_value)?;
     let mut tables = BTreeMap::new();
+    let mut indexes = BTreeMap::new();
     for (key, value) in iterator {
         match key.first().copied() {
             Some(RELATIONAL_TABLE_PREFIX) if key.len() == 17 && value.is_empty() => {
@@ -3871,10 +4284,113 @@ fn load_relational_state(
                     return Err(NativeRuntimeError::InvalidRelationalTree);
                 }
             }
+            Some(RELATIONAL_SECONDARY_INDEX_PREFIX) if key.len() == 17 => {
+                let index = decode_relational_table(&key, RELATIONAL_SECONDARY_INDEX_PREFIX)?;
+                let (relation, unique, nulls_distinct) = decode_secondary_index_metadata(&value)?;
+                let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(index) else {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                };
+                if definition.relation != relation
+                    || definition.unique != unique
+                    || definition.nulls_distinct != nulls_distinct
+                    || !tables.contains_key(&relation)
+                    || indexes
+                        .insert(
+                            index,
+                            model::SecondaryIndexState {
+                                relation,
+                                unique,
+                                nulls_distinct,
+                                entries: BTreeMap::new(),
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                }
+            }
+            Some(RELATIONAL_SECONDARY_ENTRY_PREFIX) if key.len() > 21 => {
+                let index = decode_relational_table(&key, RELATIONAL_SECONDARY_ENTRY_PREFIX)?;
+                let (index_key, primary_key) = decode_secondary_index_entry_identity(&key[17..])?;
+                let marker = match value.as_slice() {
+                    [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => false,
+                    [RELATIONAL_SECONDARY_ENTRY_LIVE] => true,
+                    _ => return Err(NativeRuntimeError::InvalidRelationalTree),
+                };
+                let index_state = indexes
+                    .get(&index)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                if !marker {
+                    continue;
+                }
+                let row = tables
+                    .get(&index_state.relation)
+                    .and_then(|rows| rows.get(primary_key))
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(index) else {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                };
+                let projection = secondary_index_projection(catalog, definition, row)?;
+                if projection.key != index_key {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                }
+                let index_state = indexes
+                    .get_mut(&index)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                let existing = index_state
+                    .entries
+                    .entry(index_key.to_vec())
+                    .or_insert_with(BTreeSet::new);
+                if !existing.insert(primary_key.to_vec())
+                    || (index_state.unique
+                        && !(projection.contains_null && index_state.nulls_distinct)
+                        && existing.len() != 1)
+                {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                }
+            }
             _ => return Err(NativeRuntimeError::InvalidRelationalTree),
         }
     }
-    Ok(RelationState { tables })
+    let state = RelationState { tables, indexes };
+    validate_secondary_index_projection(catalog, &state)?;
+    Ok(state)
+}
+
+fn validate_secondary_index_projection(
+    catalog: &CatalogState,
+    relational: &RelationState,
+) -> Result<(), NativeRuntimeError> {
+    for object in catalog.objects.values() {
+        let CatalogObject::SecondaryIndex(definition) = object else {
+            continue;
+        };
+        let index = relational
+            .indexes
+            .get(&definition.header.id)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        if index.relation != definition.relation
+            || index.unique != definition.unique
+            || index.nulls_distinct != definition.nulls_distinct
+        {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        }
+        let rows = relational
+            .tables
+            .get(&definition.relation)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        for (primary_key, row) in rows {
+            let projection = secondary_index_projection(catalog, definition, row)?;
+            if !index
+                .entries
+                .get(&projection.key)
+                .is_some_and(|entries| entries.contains(primary_key))
+            {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn formats_for_latest_root(
@@ -4220,6 +4736,24 @@ fn decode_relation_creation(
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     if encoded_definition && mutation.key.is_empty() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    validate_catalog_creation_identity(&object, mutation)?;
+    Ok(object)
+}
+
+fn decode_secondary_index_creation(
+    id: ObjectId,
+    mutation: &Mutation,
+) -> Result<CatalogObject, NativeRuntimeError> {
+    if mutation.key.is_empty()
+        || mutation.expires_at_micros.is_some()
+        || !mutation.value.starts_with(b"HYCOBJ01")
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    let object = CatalogObject::decode_definition(&mutation.value)?;
+    if !matches!(&object, CatalogObject::SecondaryIndex(_)) || object.header().id != id {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     validate_catalog_creation_identity(&object, mutation)?;
@@ -6044,6 +6578,490 @@ mod tests {
                 rows: vec![vec![SqlValue::Text("native".to_owned())]],
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_index_backfill_insert_explain_and_recovery_are_equivalent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        for (id, name) in [(1, "Mario"), (2, "Romina")] {
+            transaction.execute_sql(
+                "INSERT INTO people (id, email, name) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text("family@celiums.test".to_owned()),
+                    SqlValue::Text(name.to_owned()),
+                ],
+            )?;
+        }
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing index identity".into());
+        };
+        transaction.execute_sql(
+            "INSERT INTO people (id, email, name) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Signed(3),
+                SqlValue::Text("family@celiums.test".to_owned()),
+                SqlValue::Text("Luciana".to_owned()),
+            ],
+        )?;
+        let expected = SqlResult::Rows {
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(1), SqlValue::Text("Mario".to_owned())],
+                vec![SqlValue::Signed(2), SqlValue::Text("Romina".to_owned())],
+                vec![SqlValue::Signed(3), SqlValue::Text("Luciana".to_owned())],
+            ],
+        };
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT id, name FROM people WHERE email = ?",
+                &[SqlValue::Text("family@celiums.test".to_owned())],
+            )?,
+            expected
+        );
+        assert_eq!(
+            transaction.execute_sql("EXPLAIN SELECT id, name FROM people WHERE email = ?", &[],)?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexLookup(table={table},index={index})"
+                ))]],
+            }
+        );
+        transaction.commit()?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(11)?;
+        let Some(CatalogObject::SecondaryIndex(definition)) = snapshot.catalog_object(index) else {
+            return Err("secondary-index definition did not survive reopen".into());
+        };
+        assert_eq!(definition.relation, table);
+        assert!(!definition.unique);
+        let prepared = snapshot.prepare_sql("SELECT id, name FROM people WHERE email = ?")?;
+        assert_eq!(
+            snapshot.execute_prepared(
+                &prepared,
+                &[SqlValue::Text("family@celiums.test".to_owned())],
+            )?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_secondary_index_binds_predicates_in_catalog_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        transaction.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO events (id, tenant, sequence, payload) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("celiums".to_owned()),
+                SqlValue::Signed(42),
+                SqlValue::Text("native".to_owned()),
+            ],
+        )?;
+        transaction.execute_sql(
+            "CREATE INDEX events_tenant_sequence ON events (tenant, sequence)",
+            &[],
+        )?;
+        let query = "SELECT payload FROM events WHERE sequence = ? AND tenant = ?";
+        let parameters = [SqlValue::Signed(42), SqlValue::Text("celiums".to_owned())];
+        let expected = SqlResult::Rows {
+            columns: vec!["payload".to_owned()],
+            rows: vec![vec![SqlValue::Text("native".to_owned())]],
+        };
+        assert_eq!(transaction.execute_sql(query, &parameters)?, expected);
+        assert!(matches!(
+            transaction.execute_sql(query, &[SqlValue::Null, SqlValue::Signed(7)]),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT payload FROM events WHERE tenant = ?",
+                &[SqlValue::Text("celiums".to_owned())],
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        transaction.commit()?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(11)?;
+        let prepared = snapshot.prepare_sql(query)?;
+        assert_eq!(snapshot.execute_prepared(&prepared, &parameters)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn unique_secondary_index_is_statement_atomic_and_nulls_are_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        transaction.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT
+            )",
+            &[],
+        )?;
+        for id in [1, 2] {
+            transaction.execute_sql(
+                "INSERT INTO users (id, email) VALUES (?, ?)",
+                &[SqlValue::Signed(id), SqlValue::Null],
+            )?;
+        }
+        transaction.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        assert_eq!(
+            transaction.execute_sql("SELECT id FROM users WHERE email = ?", &[SqlValue::Null],)?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        transaction.execute_sql(
+            "INSERT INTO users (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(3),
+                SqlValue::Text("mario@celiums.test".to_owned()),
+            ],
+        )?;
+        assert!(matches!(
+            transaction.execute_sql(
+                "INSERT INTO users (id, email) VALUES (?, ?)",
+                &[
+                    SqlValue::Signed(4),
+                    SqlValue::Text("mario@celiums.test".to_owned()),
+                ],
+            ),
+            Err(SqlError::UniqueViolation)
+        ));
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT id FROM users WHERE email = ?",
+                &[SqlValue::Text("mario@celiums.test".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(3)]],
+            }
+        );
+        transaction.commit()?;
+        drop(database);
+        NativeDatabase::open(temporary.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn unique_secondary_index_backfill_failure_is_statement_atomic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        assert_eq!(table, ObjectId::new(1)?);
+        for id in [1, 2] {
+            transaction.execute_sql(
+                "INSERT INTO users (id, email) VALUES (?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text("duplicate@celiums.test".to_owned()),
+                ],
+            )?;
+        }
+        assert!(matches!(
+            transaction.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[]),
+            Err(SqlError::UniqueViolation)
+        ));
+        assert!(matches!(
+            transaction.execute_sql("EXPLAIN SELECT id FROM users WHERE email = ?", &[]),
+            Err(SqlError::NoAccessPath)
+        ));
+        transaction.commit()?;
+
+        let missing_index = ObjectId::new(2)?;
+        let snapshot = database.snapshot(11)?;
+        assert!(snapshot.catalog_object(missing_index).is_none());
+        assert!(matches!(
+            snapshot.prepare_sql("SELECT id FROM users WHERE email = ?"),
+            Err(SqlError::NoAccessPath)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let recovered = reopened.snapshot(11)?;
+        assert!(recovered.catalog_object(missing_index).is_none());
+        assert!(matches!(
+            recovered.prepare_sql("SELECT id FROM users WHERE email = ?"),
+            Err(SqlError::NoAccessPath)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_unique_secondary_index_rejects_disjoint_primary_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        seed.commit()?;
+
+        let mut winner = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        let mut loser = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        winner.execute_sql(
+            "INSERT INTO users (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("winner@celiums.test".to_owned()),
+            ],
+        )?;
+        loser.execute_sql(
+            "INSERT INTO users (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(2),
+                SqlValue::Text("winner@celiums.test".to_owned()),
+            ],
+        )?;
+        database.commit_optimistic(winner)?;
+        assert!(matches!(
+            database.commit_optimistic(loser),
+            Err(NativeRuntimeError::UniqueSecondaryIndexViolation)
+        ));
+
+        let snapshot = database.snapshot(12)?;
+        let prepared = snapshot.prepare_sql("SELECT id FROM users WHERE email = ?")?;
+        assert_eq!(
+            snapshot.execute_prepared(
+                &prepared,
+                &[SqlValue::Text("winner@celiums.test".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(1)]],
+            }
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_index_creation_and_insert_rebase_preserve_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for index_commits_first in [true, false] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+            seed.execute_sql(
+                "CREATE TABLE people (
+                    id BIGINT PRIMARY KEY,
+                    email TEXT NOT NULL
+                )",
+                &[],
+            )?;
+            seed.commit()?;
+
+            let mut create_index = database.begin_optimistic(11, DurabilityClass::Strict)?;
+            let mut insert = database.begin_optimistic(11, DurabilityClass::Strict)?;
+            create_index.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+            insert.execute_sql(
+                "INSERT INTO people (id, email) VALUES (?, ?)",
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Text("mario@celiums.test".to_owned()),
+                ],
+            )?;
+            if index_commits_first {
+                database.commit_optimistic(create_index)?;
+                database.commit_optimistic(insert)?;
+            } else {
+                database.commit_optimistic(insert)?;
+                database.commit_optimistic(create_index)?;
+            }
+
+            let snapshot = database.snapshot(12)?;
+            let prepared = snapshot.prepare_sql("SELECT id FROM people WHERE email = ?")?;
+            assert_eq!(
+                snapshot.execute_prepared(
+                    &prepared,
+                    &[SqlValue::Text("mario@celiums.test".to_owned())],
+                )?,
+                SqlResult::Rows {
+                    columns: vec!["id".to_owned()],
+                    rows: vec![vec![SqlValue::Signed(1)]],
+                }
+            );
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(reopened.recovery_report().committed_transactions, 3);
+            let recovered = reopened.snapshot(12)?;
+            let recovered_plan = recovered.prepare_sql("SELECT id FROM people WHERE email = ?")?;
+            assert_eq!(
+                recovered.execute_prepared(
+                    &recovered_plan,
+                    &[SqlValue::Text("mario@celiums.test".to_owned())],
+                )?,
+                SqlResult::Rows {
+                    columns: vec!["id".to_owned()],
+                    rows: vec![vec![SqlValue::Signed(1)]],
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_secondary_index_projection_fails_complete_state_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        transaction.execute_sql(
+            "INSERT INTO people (id, email) VALUES (?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("mario@celiums.test".to_owned()),
+            ],
+        )?;
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing index identity".into());
+        };
+        transaction.commit()?;
+
+        let roots = database.coordinator.snapshot(11)?.roots().clone();
+        let state = super::load_state(&database.pages, &database.blobs, &roots)?;
+        let index_state = state
+            .relational
+            .indexes
+            .get(&index)
+            .ok_or("missing materialized secondary index")?;
+        assert_eq!(index_state.relation, table);
+        let (index_key, primary_keys) = index_state
+            .entries
+            .first_key_value()
+            .ok_or("missing secondary-index key")?;
+        let primary_key = primary_keys
+            .first()
+            .ok_or("missing secondary-index primary key")?;
+        let identity = super::secondary_index_entry_identity(index_key, primary_key)?;
+        let physical_key = super::relational_secondary_entry_key(index, &identity)?;
+        let root = roots
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                physical_key,
+                vec![super::RELATIONAL_SECONDARY_ENTRY_TOMBSTONE],
+            )?
+            .tree;
+        let mut forged_roots = roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        forged_roots.insert(
+            super::SLOT_RELATIONAL,
+            forged_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            roots
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots.catalog_version(),
+            roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_roots,
+            roots.blob_generation(),
+        )?;
+        assert!(matches!(
+            super::load_relational_state(&database.pages, &database.blobs, &forged, &state.catalog,),
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        ));
         Ok(())
     }
 

@@ -46,6 +46,7 @@ pub(crate) enum Opcode {
     CreateHash = 10,
     SetHashField = 11,
     DeleteHashField = 12,
+    CreateSecondaryIndex = 13,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -491,6 +492,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::InsertRow as u8 => (Opcode::InsertRow, EngineKind::Relational),
         value if value == Opcode::UpdateRow as u8 => (Opcode::UpdateRow, EngineKind::Relational),
         value if value == Opcode::DeleteRow as u8 => (Opcode::DeleteRow, EngineKind::Relational),
+        value if value == Opcode::CreateSecondaryIndex as u8 => {
+            (Opcode::CreateSecondaryIndex, EngineKind::Relational)
+        }
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
@@ -545,6 +549,8 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     } else {
         (raw_expiry != i64::MAX).then_some(raw_expiry)
     };
+    let key_start = 44;
+    let value_start = key_start + key_length;
     match opcode {
         Opcode::SetValue
         | Opcode::DeleteValue
@@ -558,6 +564,7 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         }
         Opcode::CreateTable
         | Opcode::InsertRow
+        | Opcode::CreateSecondaryIndex
         | Opcode::CreateIndex
         | Opcode::IndexDocument
         | Opcode::UpdateRow
@@ -575,13 +582,18 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::SetHashField if expires_at_micros.is_some() => {
+        Opcode::SetHashField
+        | Opcode::CreateTable
+        | Opcode::InsertRow
+        | Opcode::UpdateRow
+        | Opcode::DeleteRow
+        | Opcode::CreateSecondaryIndex
+            if expires_at_micros.is_some() =>
+        {
             return Err(WalSemanticError::InvalidBody);
         }
         _ => {}
     }
-    let key_start = 44;
-    let value_start = key_start + key_length;
     let key = &body[key_start..value_start];
     if matches!(opcode, Opcode::SetHashField | Opcode::DeleteHashField)
         && !valid_hash_field_identity(key)

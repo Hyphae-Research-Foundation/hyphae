@@ -2,6 +2,7 @@
 
 Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 `INSERT`, projection and parameterized primary-key `SELECT`, prepared binding,
+exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 `BEGIN`/`COMMIT`, and rollback are implemented experimentally. The legacy
 binary shape also supports `UPDATE` and `DELETE`; G2 remains open
 
@@ -32,18 +33,37 @@ column IDs.
 The current implementation slice accepts catalog-typed primitive columns,
 inline or table-level ordered primary keys, explicit nullability, named-column
 `INSERT`, `SELECT *` or named projection, conjunctions covering exactly the
-primary key, and catalog-bound prepared point lookup. Primary-key components
-use the canonical memcomparable codec; row values use the catalog-ordered
-`HYTUPL01` tuple. Type, domain, nullability, duplicate-column, missing-column,
-and incomplete-primary-key failures occur before the row mutation.
+primary key or one complete secondary-index key, and catalog-bound prepared
+point lookup. Predicate text order may differ from catalog key order.
+Primary-key and secondary-index components use the canonical memcomparable
+codec; row values use the catalog-ordered `HYTUPL01` tuple. Type, domain,
+nullability, duplicate-column, missing-column, and incomplete-key failures
+occur before the row mutation.
+
+`CREATE INDEX name ON table (columns)` and `CREATE UNIQUE INDEX` create a
+stable catalog object and a physical relational B+tree namespace. Creation
+backfills admitted rows atomically. Later inserts derive index entries from
+the catalog-bound tuple in the same transaction and WAL/CSN publication.
+Unique indexes reject duplicate non-null composite keys before statement or
+commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
+any null component exempts the composite key from uniqueness, while ordinary
+`column = NULL` remains `UNKNOWN` and returns no rows.
+
+`EXPLAIN SELECT` currently reports only the admitted exact access path:
+`PrimaryKeyLookup(table=<id>)` or
+`SecondaryIndexLookup(table=<id>,index=<id>)`. It is deterministic
+introspection, not yet a logical tree, cost estimate, row estimate, or runtime
+statistics report.
 
 The grammar currently recognizes boolean, signed and unsigned fixed-width
 integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
-exists. General expressions, literals, casts, scans, secondary indexes,
-constraints beyond primary key/nullability, and typed `UPDATE`/`DELETE` remain
-pending.
+exists. General expressions, literals, casts, heap/index scans, range access,
+constraints beyond primary key/nullability and the first unique index, and
+typed `UPDATE`/`DELETE` remain pending. The current access binder requires the
+predicate column set to equal a complete primary or secondary key. It does not
+perform prefix, residual-filter, bitmap, or cost-based access selection.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -53,7 +73,14 @@ tombstone. Retained snapshots continue to resolve their historical roots. New
 directories retain an explicit per-key physical version chain under the
 current root and close each superseded copy's `end_csn`; the earlier inline-row
 directory format remains supported. Retention and vacuum remain pending. This
-slice does not close relational gate G2.
+slice does not close relational gate G2. Typed indexed `UPDATE` and `DELETE`
+are rejected until their old/new physical projection and WAL semantics are
+implemented; the runtime never permits them to leave a stale index.
+
+Secondary-index definitions and entries are durable physical state, but the
+current general `NativeSnapshot` SQL path materializes the bounded relational
+snapshot before executing the lookup. Direct pinned physical secondary-index
+lookup, range cursors, and their microbenchmarks remain separate work.
 
 ## Null and boolean semantics
 
@@ -109,10 +136,11 @@ back that statement's private changes. An explicit transaction remains failed
 until rollback when an error can invalidate later semantics.
 
 Errors have stable Hyphae codes. The current slice implements `HYSQL001`
-through `HYSQL010` for syntax, parameters, stale plans, columns, types,
-nullability, primary-key binding, stored tuples, and catalog-kind mismatch.
-Statement byte spans, optional object/column IDs, retry classification, and
-compatibility SQLSTATE mapping remain target requirements.
+through `HYSQL012` for syntax, parameters, stale plans, columns, types,
+nullability, primary-key binding, stored tuples, catalog-kind mismatch, absent
+implemented access paths, and unique-index violations. Statement byte spans,
+optional object/column IDs, retry classification, and compatibility SQLSTATE
+mapping remain target requirements.
 
 ## Determinism
 

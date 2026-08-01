@@ -1,9 +1,10 @@
 # Native catalog v1
 
-Status: normative target contract; immutable relation/structure/search object
-definitions, their canonical `HYCOBJ01` codec, and full-definition `HYCAT002`
-runtime persistence are implemented experimentally. Scalable catalog pages,
-DDL evolution, indexes/constraints, and dependency tracking remain pending.
+Status: normative target contract; immutable relation/secondary-index/
+structure/search object definitions, their canonical `HYCOBJ01` codec, and
+full-definition `HYCAT002` runtime persistence are implemented experimentally.
+Scalable catalog pages, DDL evolution, constraints, and dependency tracking
+remain pending.
 
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
@@ -55,7 +56,8 @@ repeat name lookup.
 1. object-kind tag;
 2. nonzero `ObjectId`, owner, and fully qualified name;
 3. relation columns and ordered primary-key IDs, structure kind/types/policy,
-   or search fields/analyzers/doc-values/vector declaration; and
+   secondary-index relation/ordered columns/uniqueness policy, or search
+   fields/analyzers/doc-values/vector declaration; and
 4. no trailing bytes.
 
 Each name component stores display and normalized lookup UTF-8 separately.
@@ -69,9 +71,9 @@ columns, wrong owners, invalid types, excessive lists, malformed booleans,
 truncation, and trailing bytes fail closed. One definition is limited to
 16 MiB and one definition list to 100,000 items.
 
-The codec currently covers `Relation`, `Structure`, and `Search` objects.
-Index, constraint, link, view, analyzer, and dependency-edge object variants
-remain to be defined.
+The codec currently covers `Relation`, relational `SecondaryIndex`,
+`Structure`, and `Search` objects. Constraint, link, view, analyzer, and
+dependency-edge object variants remain to be defined.
 
 ## Implemented runtime persistence
 
@@ -83,10 +85,12 @@ New catalog-root payloads use `HYCAT002`:
 | live object count | little-endian `u32` |
 | each object | little-endian `u32` byte length followed by one `HYCOBJ01` definition |
 
-New `CREATE TABLE` and search-collection WAL mutations carry the complete
-definition plus a length-framed normalized qualified-name conflict identity.
-Recovery revalidates the object kind, target ID, owner, definition, and name
-identity before applying it.
+New `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, and search-collection WAL mutations
+carry the complete definition plus a length-framed normalized qualified-name
+conflict identity. Recovery revalidates the object kind, target ID, owner,
+definition, and name identity before applying it. Secondary-index creation
+also verifies that its relation and every stable column ID exist in the
+admitted catalog snapshot.
 
 Legacy `HYCAT001` roots and name-only create mutations remain readable. Their
 known fixed binary relation or single-text-field search shape is reconstructed
@@ -104,6 +108,15 @@ namespace, definition blobs, and per-object history remain required.
 
 Column IDs/types/nullability/defaults, primary and unique keys, check and
 foreign-key constraints, storage options, partition key, and index IDs.
+
+### Relational secondary index
+
+The implemented definition stores a nonzero owning relation ID, one or more
+ordered stable column IDs, uniqueness, and null-distinctness. Catalog and
+runtime admission verify the relation and every column reference. Included
+columns, expressions, predicates, access method options, collation/operator
+classes, definition history, dependency edges, and schema-evolution behavior
+remain target work.
 
 ### Keyspace and structure
 
@@ -145,10 +158,10 @@ snapshots, DDL/data atomicity, dependency enforcement, crash recovery,
 concurrent prepared-plan invalidation, and schema-evolution interruption.
 
 Current executable coverage proves definition golden bytes and canonical
-round trips for all three implemented object kinds; every truncated prefix;
-owner, name, ID/order, PK-nullability, type, length, and trailing-byte
-failures; `HYCAT001` reconstruction and `HYCAT002` rewrite; full-definition
-WAL/root persistence through reopen; and the existing all-engine crash and
-recovery matrices. Non-reuse, drops/evolution, dependency enforcement, and
-prepared-plan invalidation beyond catalog-version mismatch remain target
-requirements.
+round trips for all four implemented object kinds; every truncated prefix;
+owner, name, ID/order, PK-nullability, secondary-index relation/column/
+uniqueness policy, type, length, and trailing-byte failures; `HYCAT001`
+reconstruction and `HYCAT002` rewrite; full-definition WAL/root persistence
+through reopen; and the existing all-engine crash and recovery matrices.
+Non-reuse, drops/evolution, dependency enforcement, and prepared-plan
+invalidation beyond catalog-version mismatch remain target requirements.
