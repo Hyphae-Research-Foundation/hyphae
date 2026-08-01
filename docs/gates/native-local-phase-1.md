@@ -191,6 +191,15 @@ ranges, descending/offset execution, zero-copy operator cursors, joins,
 aggregation, statistics/cost planning, and the remaining G2/G7 evidence
 remain open.
 
+The [native SQL residual-filter
+evidence](evidence/native-sql-residual-filters-2026-08-01.md) binds
+parameterized scalar comparison, `IS [NOT] NULL`, SQL three-valued boolean
+logic and precedence, exact/range access extraction, post-filter `LIMIT`,
+transaction/materialized/current-root/reopen equivalence, and a clean
+schema-v10 WSL2 observation to source and benchmark commits. Literals, casts,
+functions, joins, aggregation, partial/secondary ranges, statistics/cost
+planning, and the remaining G2/G7 evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -203,7 +212,8 @@ under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with retention/vacuum, secondary-index range/streaming
 execution, zero-copy relational operator cursors, general relational
-expressions/constraints/planning, remaining structure families, positional
+expressions beyond the admitted residual slice, constraints/planning,
+remaining structure families, positional
 postings, segments, and ANN required by G1–G4.
 Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and

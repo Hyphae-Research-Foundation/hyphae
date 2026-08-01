@@ -5,9 +5,8 @@ Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key
 exact-key secondary indexes, `CREATE [UNIQUE] INDEX`, bounded `EXPLAIN`,
 direct current-root prepared primary/secondary lookup, exact-primary-key typed
 `UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
-and rollback are implemented experimentally. The residual-filter slice below
-is the next admitted milestone and is not implemented until its gate evidence
-is recorded. G2 remains open
+rollback, and the parameterized residual-filter slice below are implemented
+experimentally. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -75,9 +74,9 @@ ascending primary key. Bound parameters occur in predicate text order.
 Inclusive, exclusive, one-sided, inverted, and equal-open ranges have explicit
 semantics: inverted and empty ranges return no rows rather than raising or
 panicking. Equality predicates retain their exact point/index access contract
-and cannot be mixed with this range slice.
+when they cover a complete primary or secondary key.
 
-The next residual-filter slice admits parameterized scalar predicates:
+The residual-filter slice admits parameterized scalar predicates:
 
 ```text
 <filter> ::= <filter> OR <term> | <term>
@@ -147,9 +146,9 @@ any null component exempts the composite key from uniqueness, while ordinary
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`.
 Range kinds are `inclusive`, `exclusive`, or `unbounded`. This is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
-statistics report. The residual-filter milestone appends `,residual=true`
-inside the closing parenthesis when an access path has non-access predicates;
-a filtered full scan is residual by definition.
+statistics report. A plan appends `,residual=true` inside the closing
+parenthesis when an access path has non-access predicates; a filtered full scan
+is residual by definition.
 
 The grammar currently recognizes boolean, signed and unsigned fixed-width
 integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
@@ -184,8 +183,8 @@ primary scan/range. The secondary path scans only the length-delimited exact
 index-key prefix, follows each live entry to its primary-key row in the same
 root, and returns rows in canonical primary-key order. The scan path uses an
 inclusive/exclusive bound-aware physical visitor, prunes separator-disjoint
-subtrees, skips row tombstones, and stops after `LIMIT` matching rows once the
-residual milestone is implemented. It does not construct `MaterializedState`.
+subtrees, skips row tombstones, and stops after `LIMIT` matching rows. It does
+not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last
 primary key as the caller's next exclusive cursor.

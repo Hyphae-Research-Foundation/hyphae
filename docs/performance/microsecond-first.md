@@ -131,6 +131,17 @@ is narrow, concurrency is one, results allocate, and the required
 transport/saturation/interference/cold-state/allocation/hardware-counter lanes
 are absent.
 
+Schemas v8 and v9 added bounded physical primary-key scan and range routes.
+Schema v10 adds a parameterized boolean residual filter over a primary-key
+range and applies `LIMIT 10` after matching. Over a height-two, 2,048-row
+relation with alternating boolean values, the prepared residual route observed
+p50 `15.464 us` and p99 `40.370 us`; the same-run prepared 10-row range
+observed p50 `12.657 us` and p99 `32.505 us` in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-residual-filter-wsl2.json).
+The residual route visits roughly 19 rows to return 10 matches. This is a
+virtualized, warm, concurrency-one observation outside G7, not a broad SQL
+latency claim.
+
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50
 latencies of approximately 22.9 ms exact, 83.4 ms lexical, and 113.9 ms hybrid
