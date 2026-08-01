@@ -90,6 +90,12 @@ CSNs, empty/inverted version windows, noncanonical null bits, null values with
 physical bytes, malformed offsets, and tombstones with column payloads.
 Tombstones are exactly the 40-byte header.
 
+The codec exposes both an owned `RowRecord` and a validated borrowed
+`RowRecordView`. The borrowed view checks the exact same length, identity,
+window, null-bit, offset, and tombstone invariants without allocating column
+vectors. A pinned B+tree leaf can therefore be decoded and filtered before the
+selected logical value is copied.
+
 ## Variable-length and blob values
 
 Values up to a catalog-configured inline threshold remain in the row or

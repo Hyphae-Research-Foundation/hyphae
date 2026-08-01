@@ -2,8 +2,8 @@
 
 Status: normative experimental format; copy-on-write insertion, replacement,
 recursive splitting, point lookup, ordered scan, complete validation,
-balanced-height validation, historical roots, and buffer-pool reads are
-implemented
+balanced-height validation, historical roots, and allocation-free
+buffer-pool node traversal are implemented
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -22,6 +22,14 @@ Every mutation appends a new leaf-to-root path and returns a new immutable root.
 - Readers fail closed on a wrong page kind, malformed length, unknown preamble,
   invalid count, duplicate or unordered key, zero child, cycle, excessive
   height, invalid separator, or future node.
+
+The cached point route parses verified immutable node bytes in place. It uses
+a fixed 64-entry stack array for path-cycle detection, validates the complete
+visited node even after finding a key, and returns a value range pinned by the
+leaf's buffer-pool frame. It does not allocate key/value vectors for internal
+or leaf entries. The v1 sequential entry layout still requires a linear pass
+within each visited node; a future slotted format may add binary-searchable
+offsets only through a new format version.
 
 ## Leaf payload
 
@@ -106,7 +114,8 @@ remain pending.
 Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,
 balanced-height verification, point reads, ordered scan, retained historical
 roots, duplicate/upsert semantics, buffered lookup, oversized and
-noncanonical rejection, and future-node rejection. The runtime benchmark also
-refuses to run unless its relational tree height is at least two. Fuzzing,
-randomized model equivalence, crash power-loss tests, fanout/fill-factor
-tuning, and concurrent writer publication remain required gate evidence.
+noncanonical rejection, complete-node validation after an early key match, and
+future-node rejection. The runtime benchmark also refuses to run unless its
+relational tree height is at least two. Fuzzing, randomized model equivalence,
+crash power-loss tests, fanout/fill-factor tuning, and concurrent writer
+publication remain required gate evidence.

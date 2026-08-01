@@ -36,7 +36,7 @@ use hyphae_native_mvcc::{
     WalAnchor, WriteConflict, WriteKey,
 };
 use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
-use hyphae_native_records::{BlobReference, ColumnValueRef, RecordError, RowRecord};
+use hyphae_native_records::{BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView};
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
     ManifestGeneration, ObjectId, PageId, RowId, TransactionId,
@@ -591,7 +591,7 @@ impl NativeDatabase {
         let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
             return Ok(None);
         };
-        let encoded = BTree::from_root(root).get_cached(
+        let encoded = BTree::from_root(root).get_cached_pinned(
             &self.pages,
             &self.buffer_pool,
             &relational_row_key(table, primary_key),
@@ -601,7 +601,7 @@ impl NativeDatabase {
                 decode_relational_row(
                     table,
                     primary_key,
-                    &encoded,
+                    encoded.bytes(),
                     snapshot.visible_csn,
                     &self.blobs,
                 )
@@ -1430,7 +1430,7 @@ fn decode_relational_row(
     visible_csn: Option<Csn>,
     blobs: &BlobStore,
 ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-    let row = RowRecord::decode(encoded)?;
+    let row = RowRecordView::decode(encoded)?;
     if row.row_id() != relational_row_id(table, primary_key)? {
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }

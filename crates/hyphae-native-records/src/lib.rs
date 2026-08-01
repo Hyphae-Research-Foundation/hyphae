@@ -76,6 +76,196 @@ pub struct RowRecord {
     values: Vec<Option<Vec<u8>>>,
 }
 
+/// Borrowed validated view over one canonical MVCC row record.
+#[derive(Clone, Copy, Debug)]
+pub struct RowRecordView<'record> {
+    bytes: &'record [u8],
+    row_id: RowId,
+    begin_csn: Csn,
+    end_csn: Option<Csn>,
+    tombstone: bool,
+    column_count: usize,
+    offsets_start: usize,
+}
+
+impl<'record> RowRecordView<'record> {
+    /// Decodes and validates a row without allocating owned column values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any malformed length, flag, identity, MVCC window,
+    /// null bit, offset, or tombstone representation.
+    pub fn decode(bytes: &'record [u8]) -> Result<Self, RecordError> {
+        if bytes.len() < ROW_HEADER_SIZE {
+            return Err(RecordError::Truncated);
+        }
+        let total_length =
+            usize::try_from(read_u32(&bytes[0..4])).map_err(|_| RecordError::LengthOverflow)?;
+        if total_length != bytes.len() {
+            return Err(RecordError::LengthMismatch);
+        }
+        let flags = read_u16(&bytes[4..6]);
+        if flags & !TOMBSTONE_FLAG != 0 {
+            return Err(RecordError::UnknownFlags);
+        }
+        let column_count = usize::from(read_u16(&bytes[6..8]));
+        let row_id = RowId::new(read_u128(&bytes[8..24])).map_err(|_| RecordError::ZeroIdentity)?;
+        let begin_csn =
+            Csn::new(read_u64(&bytes[24..32])).map_err(|_| RecordError::ZeroIdentity)?;
+        let raw_end = read_u64(&bytes[32..40]);
+        let end_csn = if raw_end == OPEN_END_CSN {
+            None
+        } else {
+            Some(Csn::new(raw_end).map_err(|_| RecordError::ZeroIdentity)?)
+        };
+        validate_window(begin_csn, end_csn)?;
+
+        let tombstone = flags & TOMBSTONE_FLAG != 0;
+        if tombstone {
+            if column_count != 0 || bytes.len() != ROW_HEADER_SIZE {
+                return Err(RecordError::InvalidTombstone);
+            }
+            return Ok(Self {
+                bytes,
+                row_id,
+                begin_csn,
+                end_csn,
+                tombstone,
+                column_count,
+                offsets_start: 0,
+            });
+        }
+        if column_count == 0 {
+            return Err(RecordError::EmptyRegularRow);
+        }
+        let offsets_start = validate_regular_layout(bytes, column_count)?;
+
+        Ok(Self {
+            bytes,
+            row_id,
+            begin_csn,
+            end_csn,
+            tombstone,
+            column_count,
+            offsets_start,
+        })
+    }
+
+    /// Returns the stable row identity.
+    pub const fn row_id(self) -> RowId {
+        self.row_id
+    }
+
+    /// Returns the first CSN where this version is visible.
+    pub const fn begin_csn(self) -> Csn {
+        self.begin_csn
+    }
+
+    /// Returns the first CSN where this version is no longer visible.
+    pub const fn end_csn(self) -> Option<Csn> {
+        self.end_csn
+    }
+
+    /// Returns whether this version is a deletion marker.
+    pub const fn is_tombstone(self) -> bool {
+        self.tombstone
+    }
+
+    /// Returns the catalog column count.
+    pub const fn column_count(self) -> usize {
+        self.column_count
+    }
+
+    /// Returns one borrowed catalog-ordered logical column value.
+    pub fn value(self, index: usize) -> Option<ColumnValueRef<'record>> {
+        if self.tombstone || index >= self.column_count {
+            return None;
+        }
+        let is_null = self.bytes[ROW_HEADER_SIZE + index / 8] & (1_u8 << (index % 8)) != 0;
+        if is_null {
+            return Some(ColumnValueRef::Null);
+        }
+        let offset = |position: usize| -> Option<usize> {
+            let start = self.offsets_start + position * 4;
+            usize::try_from(read_u32(self.bytes.get(start..start + 4)?)).ok()
+        };
+        let start = offset(index)?;
+        let end = offset(index + 1)?;
+        self.bytes.get(start..end).map(ColumnValueRef::Bytes)
+    }
+
+    /// Returns whether this version is visible at one snapshot CSN.
+    pub fn is_visible_at(self, visible_csn: Option<Csn>) -> bool {
+        let Some(visible) = visible_csn else {
+            return false;
+        };
+        self.begin_csn <= visible && self.end_csn.is_none_or(|end| visible < end)
+    }
+
+    /// Returns the exact validated canonical bytes.
+    pub const fn bytes(self) -> &'record [u8] {
+        self.bytes
+    }
+}
+
+fn validate_regular_layout(bytes: &[u8], column_count: usize) -> Result<usize, RecordError> {
+    let null_bytes = null_bitmap_length(column_count);
+    let offsets_bytes = column_count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or(RecordError::LengthOverflow)?;
+    let offsets_start = ROW_HEADER_SIZE
+        .checked_add(null_bytes)
+        .ok_or(RecordError::LengthOverflow)?;
+    let value_start = offsets_start
+        .checked_add(offsets_bytes)
+        .ok_or(RecordError::LengthOverflow)?;
+    if value_start > bytes.len() {
+        return Err(RecordError::Truncated);
+    }
+    if !column_count.is_multiple_of(8) {
+        let used_bits = column_count % 8;
+        let invalid_mask = !((1_u8 << used_bits) - 1);
+        if bytes[ROW_HEADER_SIZE + null_bytes - 1] & invalid_mask != 0 {
+            return Err(RecordError::NoncanonicalNullBitmap);
+        }
+    }
+
+    let mut previous_offset = None;
+    for offset_index in 0..=column_count {
+        let start = offsets_start
+            .checked_add(
+                offset_index
+                    .checked_mul(4)
+                    .ok_or(RecordError::LengthOverflow)?,
+            )
+            .ok_or(RecordError::LengthOverflow)?;
+        let encoded = bytes.get(start..start + 4).ok_or(RecordError::Truncated)?;
+        let offset = usize::try_from(read_u32(encoded)).map_err(|_| RecordError::LengthOverflow)?;
+        if offset < value_start || offset > bytes.len() {
+            return Err(RecordError::InvalidOffsets);
+        }
+        if offset_index == 0 && offset != value_start {
+            return Err(RecordError::InvalidOffsets);
+        }
+        if let Some(previous) = previous_offset {
+            if previous > offset {
+                return Err(RecordError::InvalidOffsets);
+            }
+            let column = offset_index - 1;
+            let is_null = bytes[ROW_HEADER_SIZE + column / 8] & (1_u8 << (column % 8)) != 0;
+            if is_null && previous != offset {
+                return Err(RecordError::NullHasBytes);
+            }
+        }
+        previous_offset = Some(offset);
+    }
+    if previous_offset != Some(bytes.len()) {
+        return Err(RecordError::InvalidOffsets);
+    }
+    Ok(offsets_start)
+}
+
 impl RowRecord {
     /// Constructs one regular committed row version.
     ///
@@ -240,113 +430,31 @@ impl RowRecord {
     /// Returns an error for any malformed length, flag, identity, MVCC window,
     /// null bit, offset, or tombstone representation.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
-        if bytes.len() < ROW_HEADER_SIZE {
-            return Err(RecordError::Truncated);
-        }
-        let total_length =
-            usize::try_from(read_u32(&bytes[0..4])).map_err(|_| RecordError::LengthOverflow)?;
-        if total_length != bytes.len() {
-            return Err(RecordError::LengthMismatch);
-        }
-        let flags = read_u16(&bytes[4..6]);
-        if flags & !TOMBSTONE_FLAG != 0 {
-            return Err(RecordError::UnknownFlags);
-        }
-        let column_count = usize::from(read_u16(&bytes[6..8]));
-        let row_id = RowId::new(read_u128(&bytes[8..24])).map_err(|_| RecordError::ZeroIdentity)?;
-        let begin_csn =
-            Csn::new(read_u64(&bytes[24..32])).map_err(|_| RecordError::ZeroIdentity)?;
-        let raw_end = read_u64(&bytes[32..40]);
-        let end_csn = if raw_end == OPEN_END_CSN {
-            None
-        } else {
-            Some(Csn::new(raw_end).map_err(|_| RecordError::ZeroIdentity)?)
-        };
-        validate_window(begin_csn, end_csn)?;
-
-        if flags & TOMBSTONE_FLAG != 0 {
-            if column_count != 0 || bytes.len() != ROW_HEADER_SIZE {
-                return Err(RecordError::InvalidTombstone);
-            }
+        let view = RowRecordView::decode(bytes)?;
+        if view.is_tombstone() {
             return Ok(Self {
-                row_id,
-                begin_csn,
-                end_csn,
+                row_id: view.row_id(),
+                begin_csn: view.begin_csn(),
+                end_csn: view.end_csn(),
                 tombstone: true,
                 values: Vec::new(),
             });
         }
-        if column_count == 0 {
-            return Err(RecordError::EmptyRegularRow);
-        }
-        decode_regular_values(bytes, row_id, begin_csn, end_csn, column_count)
-    }
-}
-
-fn decode_regular_values(
-    bytes: &[u8],
-    row_id: RowId,
-    begin_csn: Csn,
-    end_csn: Option<Csn>,
-    column_count: usize,
-) -> Result<RowRecord, RecordError> {
-    let null_bytes = null_bitmap_length(column_count);
-    let offsets_bytes = column_count
-        .checked_add(1)
-        .and_then(|count| count.checked_mul(4))
-        .ok_or(RecordError::LengthOverflow)?;
-    let value_start = ROW_HEADER_SIZE
-        .checked_add(null_bytes)
-        .and_then(|size| size.checked_add(offsets_bytes))
-        .ok_or(RecordError::LengthOverflow)?;
-    if value_start > bytes.len() {
-        return Err(RecordError::Truncated);
-    }
-    if !column_count.is_multiple_of(8) {
-        let used_bits = column_count % 8;
-        let invalid_mask = !((1_u8 << used_bits) - 1);
-        if bytes[ROW_HEADER_SIZE + null_bytes - 1] & invalid_mask != 0 {
-            return Err(RecordError::NoncanonicalNullBitmap);
-        }
-    }
-    let offsets_start = ROW_HEADER_SIZE + null_bytes;
-    let mut offsets = Vec::with_capacity(column_count + 1);
-    for index in 0..=column_count {
-        let start = offsets_start + index * 4;
-        let offset = usize::try_from(read_u32(&bytes[start..start + 4]))
-            .map_err(|_| RecordError::LengthOverflow)?;
-        offsets.push(offset);
-    }
-    if offsets.first().copied() != Some(value_start)
-        || offsets.last().copied() != Some(bytes.len())
-        || offsets.windows(2).any(|pair| pair[0] > pair[1])
-        || offsets
-            .iter()
-            .any(|offset| *offset < value_start || *offset > bytes.len())
-    {
-        return Err(RecordError::InvalidOffsets);
-    }
-    let mut values = Vec::with_capacity(column_count);
-    for index in 0..column_count {
-        let is_null = bytes[ROW_HEADER_SIZE + index / 8] & (1_u8 << (index % 8)) != 0;
-        let start = offsets[index];
-        let end = offsets[index + 1];
-        if is_null {
-            if start != end {
-                return Err(RecordError::NullHasBytes);
+        let mut values = Vec::with_capacity(view.column_count());
+        for index in 0..view.column_count() {
+            match view.value(index).ok_or(RecordError::InvalidOffsets)? {
+                ColumnValueRef::Null => values.push(None),
+                ColumnValueRef::Bytes(value) => values.push(Some(value.to_vec())),
             }
-            values.push(None);
-        } else {
-            values.push(Some(bytes[start..end].to_vec()));
         }
+        Ok(Self {
+            row_id: view.row_id(),
+            begin_csn: view.begin_csn(),
+            end_csn: view.end_csn(),
+            tombstone: false,
+            values,
+        })
     }
-    Ok(RowRecord {
-        row_id,
-        begin_csn,
-        end_csn,
-        tombstone: false,
-        values,
-    })
 }
 
 fn encode_identity_and_window(bytes: &mut [u8], row: &RowRecord) -> Result<(), RecordError> {
@@ -444,7 +552,8 @@ mod tests {
     use hyphae_native_types::{BlobId, Csn, RowId};
 
     use super::{
-        BLOB_REFERENCE_SIZE, BlobReference, ColumnValueRef, ROW_HEADER_SIZE, RecordError, RowRecord,
+        BLOB_REFERENCE_SIZE, BlobReference, ColumnValueRef, ROW_HEADER_SIZE, RecordError,
+        RowRecord, RowRecordView,
     };
 
     #[test]
@@ -462,6 +571,16 @@ mod tests {
         )?;
         let encoded = row.encode()?;
         assert_eq!(RowRecord::decode(&encoded)?, row);
+        let view = RowRecordView::decode(&encoded)?;
+        assert_eq!(view.row_id(), RowId::new(7)?);
+        assert_eq!(view.begin_csn(), Csn::new(3)?);
+        assert_eq!(view.end_csn(), Some(Csn::new(9)?));
+        assert_eq!(view.column_count(), 4);
+        assert_eq!(view.value(0), Some(ColumnValueRef::Bytes(b"pk")));
+        assert_eq!(view.value(1), Some(ColumnValueRef::Null));
+        assert_eq!(view.value(2), Some(ColumnValueRef::Bytes(b"")));
+        assert_eq!(view.value(3), Some(ColumnValueRef::Bytes(&[0, 255])));
+        assert_eq!(view.bytes(), encoded);
         assert_eq!(row.value(0), Some(ColumnValueRef::Bytes(b"pk")));
         assert_eq!(row.value(1), Some(ColumnValueRef::Null));
         assert_eq!(row.value(2), Some(ColumnValueRef::Bytes(b"")));
@@ -480,6 +599,9 @@ mod tests {
         let encoded = tombstone.encode()?;
         assert_eq!(encoded.len(), ROW_HEADER_SIZE);
         assert_eq!(RowRecord::decode(&encoded)?, tombstone);
+        let view = RowRecordView::decode(&encoded)?;
+        assert!(view.is_tombstone());
+        assert_eq!(view.value(0), None);
         assert!(!tombstone.is_visible_at(Some(Csn::new(4)?)));
         assert!(tombstone.is_visible_at(Some(Csn::new(5)?)));
         Ok(())

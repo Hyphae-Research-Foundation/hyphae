@@ -7,8 +7,11 @@ pages, one WAL transaction, and one published CSN.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
-through the native buffer pool. Immutable root manifests are anchored by
-standalone WAL checkpoint records and cross-validated during recovery.
+through the native buffer pool. That route traverses node bytes without
+materializing node entries, pins the matching leaf value, and validates a
+borrowed row view before copying the selected value. Immutable root manifests
+are anchored by standalone WAL checkpoint records and cross-validated during
+recovery.
 Binary SQL UPDATE and DELETE publish new roots while retained snapshots keep
 their historical roots. Values above 8,192 bytes use the Hyphae-owned
 content-addressed blob store, and committed WAL mutations rebuild the

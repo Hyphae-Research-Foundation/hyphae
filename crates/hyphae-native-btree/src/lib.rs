@@ -2,10 +2,11 @@
 
 //! Immutable copy-on-write B+tree over verified Hyphae native pages.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::Range, sync::Arc};
 
 use hyphae_native_pages::{
-    BufferPool, BufferPoolError, PAGE_PAYLOAD_SIZE, Page, PageKind, PageStore, PageStoreError,
+    BufferPool, BufferPoolError, PAGE_PAYLOAD_SIZE, Page, PageFrame, PageKind, PageStore,
+    PageStoreError,
 };
 use hyphae_native_types::{Csn, PageId};
 use thiserror::Error;
@@ -21,6 +22,20 @@ pub const BTREE_MAX_KEY_SIZE: usize = 4_096;
 
 /// Owned canonical binary key/value pair returned by a materialized scan.
 pub type KeyValue = (Vec<u8>, Vec<u8>);
+
+/// One value range pinned inside a verified immutable buffer-pool frame.
+#[derive(Clone, Debug)]
+pub struct PinnedValue {
+    frame: Arc<PageFrame>,
+    range: Range<usize>,
+}
+
+impl PinnedValue {
+    /// Returns the borrowed canonical value bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.frame.page().payload()[self.range.clone()]
+    }
+}
 
 /// B+tree codec, storage, or semantic failure.
 #[derive(Debug, Error)]
@@ -140,22 +155,18 @@ impl BTree {
         let Some(mut page_id) = self.root else {
             return Ok(None);
         };
-        let mut visited = BTreeSet::new();
-        for _ in 0..MAX_TREE_HEIGHT {
-            if !visited.insert(page_id) {
+        let mut visited = [0_u64; MAX_TREE_HEIGHT];
+        for depth in 0..MAX_TREE_HEIGHT {
+            if visited[..depth].contains(&page_id.get()) {
                 return Err(BTreeError::Cycle);
             }
-            match read_node(store, page_id)? {
-                Node::Leaf(entries) => {
-                    return Ok(entries
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-                        .ok()
-                        .map(|index| entries[index].value.clone()));
+            visited[depth] = page_id.get();
+            let page = store.read(page_id)?;
+            match lookup_page(&page, key)? {
+                LookupStep::Value(range) => {
+                    return Ok(range.map(|range| page.payload()[range].to_vec()));
                 }
-                Node::Internal { keys, children } => {
-                    let child = child_index(&keys, key);
-                    page_id = children[child];
-                }
+                LookupStep::Descend(child) => page_id = child,
             }
         }
         Err(BTreeError::HeightExceeded)
@@ -173,26 +184,41 @@ impl BTree {
         pool: &BufferPool,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, BTreeError> {
+        Ok(self
+            .get_cached_pinned(store, pool, key)?
+            .map(|value| value.bytes().to_vec()))
+    }
+
+    /// Performs an allocation-free node traversal and returns a value pinned
+    /// inside its verified immutable buffer-pool frame.
+    ///
+    /// The returned handle keeps the leaf frame pinned until it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt pages/nodes, I/O, buffer exhaustion,
+    /// cycles, or excessive height.
+    pub fn get_cached_pinned(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        key: &[u8],
+    ) -> Result<Option<PinnedValue>, BTreeError> {
         let Some(mut page_id) = self.root else {
             return Ok(None);
         };
-        let mut visited = BTreeSet::new();
-        for _ in 0..MAX_TREE_HEIGHT {
-            if !visited.insert(page_id) {
+        let mut visited = [0_u64; MAX_TREE_HEIGHT];
+        for depth in 0..MAX_TREE_HEIGHT {
+            if visited[..depth].contains(&page_id.get()) {
                 return Err(BTreeError::Cycle);
             }
+            visited[depth] = page_id.get();
             let frame = pool.get_or_load(store, page_id)?;
-            match decode_page(frame.page())? {
-                Node::Leaf(entries) => {
-                    return Ok(entries
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-                        .ok()
-                        .map(|index| entries[index].value.clone()));
+            match lookup_page(frame.page(), key)? {
+                LookupStep::Value(range) => {
+                    return Ok(range.map(|range| PinnedValue { frame, range }));
                 }
-                Node::Internal { keys, children } => {
-                    let child = child_index(&keys, key);
-                    page_id = children[child];
-                }
+                LookupStep::Descend(child) => page_id = child,
             }
         }
         Err(BTreeError::HeightExceeded)
@@ -367,6 +393,95 @@ enum Rewrite {
         separator: Vec<u8>,
         right: PageId,
     },
+}
+
+enum LookupStep {
+    Descend(PageId),
+    Value(Option<Range<usize>>),
+}
+
+fn lookup_page(page: &Page, target: &[u8]) -> Result<LookupStep, BTreeError> {
+    match page.kind() {
+        PageKind::BTreeLeaf => lookup_leaf(page.payload(), target),
+        PageKind::BTreeInternal => lookup_internal(page.payload(), target),
+        _ => Err(BTreeError::WrongPageKind),
+    }
+}
+
+fn lookup_leaf(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeError> {
+    if payload.len() < LEAF_HEADER_SIZE {
+        return Err(BTreeError::InvalidLength);
+    }
+    if &payload[0..8] != LEAF_MAGIC
+        || read_u16(&payload[8..10]) != FORMAT_VERSION
+        || payload[12..16].iter().any(|byte| *byte != 0)
+    {
+        return Err(BTreeError::InvalidPreamble);
+    }
+    let count = usize::from(read_u16(&payload[10..12]));
+    if count == 0 || count > (payload.len() - LEAF_HEADER_SIZE) / 8 {
+        return Err(BTreeError::InvalidCount);
+    }
+    let mut cursor = Cursor::new(&payload[LEAF_HEADER_SIZE..]);
+    let mut previous_key = None;
+    let mut found = None;
+    for _ in 0..count {
+        let key_length = cursor.length()?;
+        let value_length = cursor.length()?;
+        if key_length > BTREE_MAX_KEY_SIZE {
+            return Err(BTreeError::KeyTooLarge);
+        }
+        let key = cursor.take(key_length)?;
+        if previous_key.is_some_and(|previous| previous >= key) {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        let value_start = cursor.position();
+        cursor.take(value_length)?;
+        if key == target {
+            found =
+                Some(LEAF_HEADER_SIZE + value_start..LEAF_HEADER_SIZE + value_start + value_length);
+        }
+        previous_key = Some(key);
+    }
+    cursor.finish()?;
+    Ok(LookupStep::Value(found))
+}
+
+fn lookup_internal(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeError> {
+    if payload.len() < INTERNAL_HEADER_SIZE {
+        return Err(BTreeError::InvalidLength);
+    }
+    if &payload[0..8] != INTERNAL_MAGIC
+        || read_u16(&payload[8..10]) != FORMAT_VERSION
+        || payload[12..16].iter().any(|byte| *byte != 0)
+    {
+        return Err(BTreeError::InvalidPreamble);
+    }
+    let count = usize::from(read_u16(&payload[10..12]));
+    if count == 0 || count > (payload.len() - INTERNAL_HEADER_SIZE) / 12 + 1 {
+        return Err(BTreeError::InvalidCount);
+    }
+    let first_child = PageId::new(read_u64(&payload[16..24])).map_err(|_| BTreeError::ZeroChild)?;
+    let mut selected = first_child;
+    let mut previous_key = None;
+    let mut cursor = Cursor::new(&payload[INTERNAL_HEADER_SIZE..]);
+    for _ in 0..count {
+        let key_length = cursor.length()?;
+        if key_length > BTREE_MAX_KEY_SIZE {
+            return Err(BTreeError::KeyTooLarge);
+        }
+        let key = cursor.take(key_length)?;
+        if previous_key.is_some_and(|previous| previous >= key) {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        let child = PageId::new(cursor.u64()?).map_err(|_| BTreeError::ZeroChild)?;
+        if target >= key {
+            selected = child;
+        }
+        previous_key = Some(key);
+    }
+    cursor.finish()?;
+    Ok(LookupStep::Descend(selected))
 }
 
 fn rewrite_node(
@@ -748,6 +863,10 @@ impl<'payload> Cursor<'payload> {
             Err(BTreeError::InvalidLength)
         }
     }
+
+    const fn position(&self) -> usize {
+        self.offset
+    }
 }
 
 fn read_u16(bytes: &[u8]) -> u16 {
@@ -886,7 +1005,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use hyphae_native_pages::{BufferPool, PageStore};
+    use hyphae_native_pages::{BufferPool, PageKind, PageStore};
     use hyphae_native_types::Csn;
 
     use super::{BTree, BTreeError, LeafEntry, Node, encode_leaf};
@@ -942,6 +1061,11 @@ mod tests {
                 Some(vec![u8::try_from(index % 251)?; 96])
             );
         }
+        let pool = BufferPool::new(16, 4)?;
+        let pinned = tree
+            .get_cached_pinned(&store, &pool, &499_u32.to_be_bytes())?
+            .ok_or("missing pinned value")?;
+        assert_eq!(pinned.bytes(), vec![u8::try_from(499 % 251)?; 96]);
         let scan = tree.scan(&store)?;
         assert_eq!(scan.len(), 1_000);
         assert!(scan.windows(2).all(|pair| pair[0].0 < pair[1].0));
@@ -1027,6 +1151,31 @@ mod tests {
         ];
         assert!(matches!(
             encode_leaf(&duplicate),
+            Err(BTreeError::NoncanonicalKeyOrder)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_lookup_validates_the_complete_leaf_after_a_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut payload = encode_leaf(&[
+            LeafEntry {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            LeafEntry {
+                key: b"b".to_vec(),
+                value: b"2".to_vec(),
+            },
+        ])?;
+        payload[34] = b'a';
+        let root = store.append(PageKind::BTreeLeaf, Some(Csn::new(1)?), None, payload)?;
+        let pool = BufferPool::new(2, 1)?;
+        assert!(matches!(
+            BTree::from_root(root).get_cached_pinned(&store, &pool, b"a"),
             Err(BTreeError::NoncanonicalKeyOrder)
         ));
         Ok(())
