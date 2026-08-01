@@ -24,6 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use hyphae_native_blobs::{BlobError, BlobStore, StagedBlob};
 use hyphae_native_btree::{BTree, BTreeError};
 use hyphae_native_catalog::{
     CatalogError, CatalogName, ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition,
@@ -31,10 +32,11 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
 use hyphae_native_mvcc::{
-    CommitCoordinator, MvccError, RootSet, RootSlot, RootTransaction, Snapshot, WalAnchor,
+    CommitCoordinator, ConflictTable, MvccError, RootSet, RootSlot, RootTransaction, Snapshot,
+    WalAnchor, WriteConflict, WriteKey,
 };
 use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
-use hyphae_native_records::{ColumnValueRef, RecordError, RowRecord};
+use hyphae_native_records::{BlobReference, ColumnValueRef, RecordError, RowRecord};
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
     ManifestGeneration, ObjectId, PageId, RowId, TransactionId,
@@ -56,6 +58,9 @@ const RELATIONAL_FORMAT_KEY: &[u8] = b"\x00";
 const RELATIONAL_FORMAT_VALUE: &[u8] = b"HYRELBT1";
 const RELATIONAL_TABLE_PREFIX: u8 = 1;
 const RELATIONAL_ROW_PREFIX: u8 = 2;
+const RELATIONAL_VALUE_INLINE: u8 = 0;
+const RELATIONAL_VALUE_BLOB: u8 = 1;
+const RELATIONAL_INLINE_VALUE_LIMIT: usize = 8_192;
 const DEFAULT_BUFFER_POOL_FRAMES: usize = 1_024;
 const DEFAULT_BUFFER_POOL_PARTITIONS: usize = 16;
 const SLOT_CATALOG: RootSlot = RootSlot {
@@ -88,6 +93,9 @@ pub enum NativeRuntimeError {
     /// Native buffer-pool access failed.
     #[error(transparent)]
     BufferPool(#[from] BufferPoolError),
+    /// Native immutable blob storage failed.
+    #[error(transparent)]
+    Blob(#[from] BlobError),
     /// Native relational B+tree storage failed.
     #[error(transparent)]
     BTree(#[from] BTreeError),
@@ -103,6 +111,9 @@ pub enum NativeRuntimeError {
     /// Native MVCC coordination failed.
     #[error(transparent)]
     Mvcc(#[from] MvccError),
+    /// First-committer-wins rejected a stale logical write.
+    #[error(transparent)]
+    WriteConflict(#[from] WriteConflict),
     /// Native immutable root-manifest handling failed.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
@@ -159,6 +170,10 @@ impl From<ModelError> for NativeRuntimeError {
 /// Deterministic commit boundary used by the native crash matrix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitBoundary {
+    /// Large values are synchronized only under temporary blob names.
+    BlobStaged,
+    /// Immutable blobs are promoted but no pages or WAL transaction exist.
+    BlobPromoted,
     /// New copy-on-write pages exist but have not been synchronized.
     PageAppended,
     /// New pages are synchronized but no WAL transaction exists.
@@ -216,6 +231,12 @@ pub struct RecoveryReport {
     pub unanchored_manifest_suffix: usize,
     /// Latest verified checkpoint generation.
     pub latest_checkpoint_generation: Option<ManifestGeneration>,
+    /// Number of verified immutable blob files.
+    pub blob_count: usize,
+    /// Physical blob generation derived from the verified namespace.
+    pub blob_generation: u64,
+    /// Interrupted temporary blob files removed during open.
+    pub recovered_temporary_blobs: usize,
 }
 
 /// Receipt for one cross-engine native commit.
@@ -374,9 +395,11 @@ pub struct NativeDatabase {
     data_directory: PathBuf,
     pages: PageStore,
     buffer_pool: BufferPool,
+    blobs: BlobStore,
     wal: WalFile,
     manifests: RootManifestStore,
     coordinator: CommitCoordinator,
+    conflicts: ConflictTable,
     next_transaction_id: u128,
     last_checkpoint_lsn: Option<Lsn>,
     recovery: RecoveryReport,
@@ -397,6 +420,7 @@ impl NativeDatabase {
         let pages = PageStore::create(path.join(PAGE_FILE))?;
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let blobs = BlobStore::create(path)?;
         let wal = WalFile::create(path.join(WAL_FILE))?;
         let manifests = RootManifestStore::create(path)?;
         let coordinator = CommitCoordinator::new(
@@ -406,9 +430,11 @@ impl NativeDatabase {
             data_directory: path.to_path_buf(),
             pages,
             buffer_pool,
+            blobs,
             wal,
             manifests,
             coordinator,
+            conflicts: ConflictTable::default(),
             next_transaction_id: 1,
             last_checkpoint_lsn: None,
             recovery: RecoveryReport {
@@ -421,6 +447,9 @@ impl NativeDatabase {
                 recovered_temporary_manifests: 0,
                 unanchored_manifest_suffix: 0,
                 latest_checkpoint_generation: None,
+                blob_count: 0,
+                blob_generation: 0,
+                recovered_temporary_blobs: 0,
             },
         })
     }
@@ -436,10 +465,18 @@ impl NativeDatabase {
         let opened_pages = PageStore::open_repair_tail(path.join(PAGE_FILE))?;
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let blobs = BlobStore::open(path)?;
+        let blob_recovery = blobs.recovery()?;
         let opened_wal = WalFile::open(path.join(WAL_FILE))?;
         let recovered_wal = recover_wal(&opened_wal.recovery.records)?;
         let commits = &recovered_wal.commits;
         validate_commit_sequence(commits)?;
+        let mut conflicts = ConflictTable::default();
+        for recovered in commits {
+            let keys = mutation_write_keys(&recovered.mutations);
+            conflicts.validate(recovered.manifest.read_csn, &keys)?;
+            conflicts.publish_committed(recovered.manifest.commit_csn, keys);
+        }
         let manifests = RootManifestStore::open(path)?;
         let manifest_recovery = manifests.recovery();
         let mut latest_root = None;
@@ -452,9 +489,17 @@ impl NativeDatabase {
                 recovered.manifest.catalog_version,
                 WalAnchor::new(recovered.commit_lsn, anchor_digest)?,
                 roots,
-                0,
+                recovered.manifest.blob_generation,
             )?;
-            validate_roots(&opened_pages.store, &root, recovered.manifest.commit_csn)?;
+            if root.blob_generation() > blob_recovery.generation {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+            validate_roots(
+                &opened_pages.store,
+                &blobs,
+                &root,
+                recovered.manifest.commit_csn,
+            )?;
             committed_roots.insert(recovered.manifest.commit_csn, root.clone());
             latest_root = Some(root);
         }
@@ -486,9 +531,11 @@ impl NativeDatabase {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
             buffer_pool,
+            blobs,
             wal: opened_wal.wal,
             manifests,
             coordinator,
+            conflicts,
             next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
             recovery: RecoveryReport {
@@ -501,6 +548,9 @@ impl NativeDatabase {
                 recovered_temporary_manifests: manifest_recovery.ignored_temporary_files,
                 unanchored_manifest_suffix: checkpoint_validation.unanchored_manifest_suffix,
                 latest_checkpoint_generation: checkpoint_validation.latest_generation,
+                blob_count: blob_recovery.blob_count,
+                blob_generation: blob_recovery.generation,
+                recovered_temporary_blobs: blob_recovery.recovered_temporary_files,
             },
         })
     }
@@ -522,7 +572,7 @@ impl NativeDatabase {
     /// Returns an error for synchronization, page, root, or state corruption.
     pub fn snapshot(&self, logical_time_micros: i64) -> Result<NativeSnapshot, NativeRuntimeError> {
         let metadata = self.coordinator.snapshot(logical_time_micros)?;
-        let state = load_state(&self.pages, metadata.roots())?;
+        let state = load_state(&self.pages, &self.blobs, metadata.roots())?;
         Ok(NativeSnapshot { metadata, state })
     }
 
@@ -548,10 +598,30 @@ impl NativeDatabase {
         )?;
         encoded
             .map(|encoded| {
-                decode_relational_row(table, primary_key, &encoded, snapshot.visible_csn)
+                decode_relational_row(
+                    table,
+                    primary_key,
+                    &encoded,
+                    snapshot.visible_csn,
+                    &self.blobs,
+                )
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// Verifies the current relational B+tree and returns its node height.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot coordination, a missing committed root,
+    /// or any reachable B+tree/page corruption.
+    pub fn latest_relational_tree_height(&self) -> Result<usize, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            return Ok(0);
+        };
+        Ok(BTree::from_root(root).height(&self.pages)?)
     }
 
     /// Begins one serialized native write transaction.
@@ -566,13 +636,15 @@ impl NativeDatabase {
         durability: DurabilityClass,
     ) -> Result<NativeTransaction<'_>, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
-        let state = load_state(&self.pages, snapshot.roots())?;
+        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         let transaction_id = TransactionId::new(self.next_transaction_id)
             .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
         let root_transaction = self.coordinator.begin_write()?;
         Ok(NativeTransaction {
             pages: &mut self.pages,
+            blobs: &mut self.blobs,
             wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
             root_transaction,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
@@ -689,7 +761,9 @@ impl NativeDatabase {
 #[derive(Debug)]
 pub struct NativeTransaction<'database> {
     pages: &'database mut PageStore,
+    blobs: &'database mut BlobStore,
     wal: &'database mut WalFile,
+    conflicts: &'database mut ConflictTable,
     root_transaction: RootTransaction<'database>,
     transaction_id: TransactionId,
     next_transaction_id: &'database mut u128,
@@ -704,7 +778,7 @@ impl NativeTransaction<'_> {
     /// Executes one statement in the exact first native SQL slice.
     ///
     /// The supported grammar is `CREATE TABLE`, binary primary-key `INSERT`,
-    /// and parameterized primary-key `SELECT`.
+    /// `UPDATE`/`DELETE`, and parameterized primary-key `SELECT`.
     ///
     /// # Errors
     ///
@@ -765,6 +839,60 @@ impl NativeTransaction<'_> {
             target: Some(table),
             key: primary_key,
             value: row,
+            expires_at_micros: None,
+        });
+        self.dirty[1] = true;
+        Ok(())
+    }
+
+    /// Replaces one binary row addressed by its primary key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown table or missing primary key.
+    pub fn update(
+        &mut self,
+        table: ObjectId,
+        primary_key: impl Into<Vec<u8>>,
+        row: impl Into<Vec<u8>>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.state.catalog.require(table, EngineKind::Relational)?;
+        let primary_key = primary_key.into();
+        let row = row.into();
+        self.state
+            .relational
+            .update(table, &primary_key, row.clone())?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Relational,
+            opcode: Opcode::UpdateRow,
+            target: Some(table),
+            key: primary_key,
+            value: row,
+            expires_at_micros: None,
+        });
+        self.dirty[1] = true;
+        Ok(())
+    }
+
+    /// Deletes one binary row by publishing a canonical tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown table or missing primary key.
+    pub fn delete(
+        &mut self,
+        table: ObjectId,
+        primary_key: impl Into<Vec<u8>>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.state.catalog.require(table, EngineKind::Relational)?;
+        let primary_key = primary_key.into();
+        self.state.relational.delete(table, &primary_key)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Relational,
+            opcode: Opcode::DeleteRow,
+            target: Some(table),
+            key: primary_key,
+            value: Vec::new(),
             expires_at_micros: None,
         });
         self.dirty[1] = true;
@@ -915,6 +1043,24 @@ impl NativeTransaction<'_> {
         self.commit_at(Some(boundary))
     }
 
+    fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
+        let write_keys = mutation_write_keys(&self.mutations);
+        self.conflicts
+            .validate(self.root_transaction.read_csn(), &write_keys)?;
+        Ok(write_keys)
+    }
+
+    fn commit_catalog_version(&self) -> Result<CatalogVersion, CatalogError> {
+        if self.dirty[0] {
+            self.snapshot
+                .catalog_version
+                .checked_next()
+                .ok_or(CatalogError::VersionExhausted)
+        } else {
+            Ok(self.snapshot.catalog_version)
+        }
+    }
+
     fn commit_at(
         mut self,
         interruption: Option<CommitBoundary>,
@@ -923,14 +1069,15 @@ impl NativeTransaction<'_> {
             return Err(WalSemanticError::InvalidSequence.into());
         }
         let commit_csn = self.root_transaction.commit_csn()?;
-        let catalog_version = if self.dirty[0] {
-            self.snapshot
-                .catalog_version
-                .checked_next()
-                .ok_or(CatalogError::VersionExhausted)?
-        } else {
-            self.snapshot.catalog_version
-        };
+        let write_keys = self.validated_write_keys()?;
+        let catalog_version = self.commit_catalog_version()?;
+        let synchronize = self.durability != DurabilityClass::Memory;
+        let staged_blobs = stage_large_relational_values(self.blobs, &self.mutations, synchronize)?;
+        interrupt(interruption, CommitBoundary::BlobStaged)?;
+        let blob_references = publish_staged_blobs(self.blobs, staged_blobs, synchronize)?;
+        let blob_generation = self.blobs.generation()?;
+        interrupt(interruption, CommitBoundary::BlobPromoted)?;
+
         let mut roots = roots_from_snapshot(self.snapshot.roots());
         if self.dirty[0] || roots[0].is_none() {
             roots[0] = Some(self.pages.append(
@@ -941,9 +1088,14 @@ impl NativeTransaction<'_> {
             )?);
         }
         if self.dirty[1] || roots[1].is_none() {
-            roots[1] =
-                relational_tree_after_mutations(self.pages, roots[1], commit_csn, &self.mutations)?
-                    .root();
+            roots[1] = relational_tree_after_mutations(
+                self.pages,
+                roots[1],
+                commit_csn,
+                &self.mutations,
+                &blob_references,
+            )?
+            .root();
         }
         if self.dirty[2] || roots[2].is_none() {
             roots[2] = Some(self.pages.append(
@@ -962,25 +1114,27 @@ impl NativeTransaction<'_> {
             )?);
         }
         interrupt(interruption, CommitBoundary::PageAppended)?;
-        if self.durability != DurabilityClass::Memory {
+        if synchronize {
             self.pages.sync_data()?;
         }
         interrupt(interruption, CommitBoundary::PageSynchronized)?;
 
         let concrete_roots = require_roots(roots)?;
+        let wal_mutations = wal_mutations(&self.mutations, &blob_references)?;
         let pending = encode_transaction(&TransactionPlan {
             transaction_id: self.transaction_id,
             read_csn: self.root_transaction.read_csn(),
             catalog_version,
             logical_time_micros: self.snapshot.logical_time_micros,
             durability: self.durability,
-            mutations: &self.mutations,
+            mutations: &wal_mutations,
             commit_csn,
             roots: concrete_roots,
+            blob_generation,
         })?;
         let receipts = self.wal.append_records(pending, false)?;
         interrupt(interruption, CommitBoundary::WalAppended)?;
-        if self.durability != DurabilityClass::Memory {
+        if synchronize {
             self.wal.sync_data()?;
         }
         interrupt(interruption, CommitBoundary::WalSynchronized)?;
@@ -989,10 +1143,12 @@ impl NativeTransaction<'_> {
         for (slot, page) in ROOT_SLOTS.into_iter().zip(concrete_roots) {
             self.root_transaction.set_root(slot, page);
         }
+        self.root_transaction.set_blob_generation(blob_generation);
         self.root_transaction.commit(
             catalog_version,
             WalAnchor::new(block.last_lsn, block.digest)?,
         )?;
+        self.conflicts.publish_committed(commit_csn, write_keys);
         *self.next_transaction_id = self
             .transaction_id
             .get()
@@ -1008,6 +1164,30 @@ impl NativeTransaction<'_> {
             durability: self.durability,
         })
     }
+}
+
+fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
+    let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
+    for mutation in mutations {
+        keys.push(WriteKey::new(
+            mutation.engine,
+            mutation.target,
+            mutation.key.clone(),
+        ));
+        if matches!(mutation.opcode, Opcode::CreateTable | Opcode::CreateIndex) {
+            if let Some(object) = mutation.target {
+                let mut object_key = Vec::with_capacity(17);
+                object_key.push(1);
+                object_key.extend_from_slice(&object.get().to_be_bytes());
+                keys.push(WriteKey::new(EngineKind::Kernel, None, object_key));
+            }
+            let mut name_key = Vec::with_capacity(mutation.value.len().saturating_add(2));
+            name_key.extend_from_slice(&[2, mutation.engine as u8]);
+            name_key.extend_from_slice(&mutation.value);
+            keys.push(WriteKey::new(EngineKind::Kernel, None, name_key));
+        }
+    }
+    keys
 }
 
 fn interrupt(
@@ -1083,11 +1263,80 @@ fn validate_checkpoints(
     })
 }
 
+fn stage_large_relational_values(
+    blobs: &BlobStore,
+    mutations: &[Mutation],
+    synchronize: bool,
+) -> Result<BTreeMap<[u8; 32], StagedBlob>, NativeRuntimeError> {
+    let mut staged = BTreeMap::new();
+    for mutation in mutations.iter().filter(|mutation| {
+        mutation.engine == EngineKind::Relational
+            && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
+            && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT
+    }) {
+        let digest = *blake3::hash(&mutation.value).as_bytes();
+        if let std::collections::btree_map::Entry::Vacant(entry) = staged.entry(digest) {
+            entry.insert(blobs.stage(&mutation.value, synchronize)?);
+        }
+    }
+    Ok(staged)
+}
+
+fn publish_staged_blobs(
+    blobs: &mut BlobStore,
+    staged: BTreeMap<[u8; 32], StagedBlob>,
+    synchronize: bool,
+) -> Result<BTreeMap<[u8; 32], BlobReference>, NativeRuntimeError> {
+    staged
+        .into_iter()
+        .map(|(digest, staged)| Ok((digest, blobs.publish(staged, synchronize)?)))
+        .collect()
+}
+
+fn relational_storage_value(
+    value: &[u8],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    if value.len() <= RELATIONAL_INLINE_VALUE_LIMIT {
+        let mut encoded = Vec::with_capacity(value.len() + 1);
+        encoded.push(RELATIONAL_VALUE_INLINE);
+        encoded.extend_from_slice(value);
+        return Ok(encoded);
+    }
+    let digest = *blake3::hash(value).as_bytes();
+    let reference = blob_references
+        .get(&digest)
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let mut encoded = Vec::with_capacity(1 + hyphae_native_records::BLOB_REFERENCE_SIZE);
+    encoded.push(RELATIONAL_VALUE_BLOB);
+    encoded.extend_from_slice(&reference.encode());
+    Ok(encoded)
+}
+
+fn wal_mutations(
+    mutations: &[Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Vec<Mutation>, NativeRuntimeError> {
+    mutations
+        .iter()
+        .cloned()
+        .map(|mut mutation| {
+            if mutation.engine == EngineKind::Relational
+                && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
+            {
+                mutation.value = relational_storage_value(&mutation.value, blob_references)?;
+            }
+            Ok(mutation)
+        })
+        .collect()
+}
+
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
     creating_csn: Csn,
     mutations: &[Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
     let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
     if tree.root().is_none() {
@@ -1107,21 +1356,34 @@ fn relational_tree_after_mutations(
         let table = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-        let (key, value) = match mutation.opcode {
-            Opcode::CreateTable => (relational_table_key(table), Vec::new()),
-            Opcode::InsertRow => (
-                relational_row_key(table, &mutation.key),
-                RowRecord::new(
-                    relational_row_id(table, &mutation.key)?,
-                    creating_csn,
-                    None,
-                    vec![Some(mutation.key.clone()), Some(mutation.value.clone())],
-                )?
-                .encode()?,
-            ),
+        let key = match mutation.opcode {
+            Opcode::CreateTable => {
+                tree = tree
+                    .insert_unique(pages, creating_csn, relational_table_key(table), Vec::new())?
+                    .tree;
+                continue;
+            }
+            Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow => {
+                relational_row_key(table, &mutation.key)
+            }
             _ => return Err(NativeRuntimeError::InvalidRelationalTree),
         };
-        tree = tree.insert_unique(pages, creating_csn, key, value)?.tree;
+        let value = if mutation.opcode == Opcode::DeleteRow {
+            RowRecord::tombstone(relational_row_id(table, &mutation.key)?, creating_csn, None)?
+                .encode()?
+        } else {
+            RowRecord::new(
+                relational_row_id(table, &mutation.key)?,
+                creating_csn,
+                None,
+                vec![
+                    Some(mutation.key.clone()),
+                    Some(relational_storage_value(&mutation.value, blob_references)?),
+                ],
+            )?
+            .encode()?
+        };
+        tree = tree.upsert(pages, creating_csn, key, value)?.tree;
     }
     Ok(tree)
 }
@@ -1166,6 +1428,7 @@ fn decode_relational_row(
     primary_key: &[u8],
     encoded: &[u8],
     visible_csn: Option<Csn>,
+    blobs: &BlobStore,
 ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
     let row = RowRecord::decode(encoded)?;
     if row.row_id() != relational_row_id(table, primary_key)? {
@@ -1178,10 +1441,21 @@ fn decode_relational_row(
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }
     match (row.value(0), row.value(1)) {
-        (Some(ColumnValueRef::Bytes(encoded_primary_key)), Some(ColumnValueRef::Bytes(value)))
-            if encoded_primary_key == primary_key =>
-        {
-            Ok(Some(value.to_vec()))
+        (
+            Some(ColumnValueRef::Bytes(encoded_primary_key)),
+            Some(ColumnValueRef::Bytes(stored_value)),
+        ) if encoded_primary_key == primary_key => {
+            let Some((&storage, value)) = stored_value.split_first() else {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            };
+            match storage {
+                RELATIONAL_VALUE_INLINE => Ok(Some(value.to_vec())),
+                RELATIONAL_VALUE_BLOB => {
+                    let reference = BlobReference::decode(value)?;
+                    Ok(Some(blobs.read(reference)?))
+                }
+                _ => Err(NativeRuntimeError::InvalidRelationalTree),
+            }
         }
         _ => Err(NativeRuntimeError::InvalidRelationalTree),
     }
@@ -1249,6 +1523,7 @@ fn digest_for_lsn(
 
 fn validate_roots(
     pages: &PageStore,
+    blobs: &BlobStore,
     roots: &RootSet,
     visible_csn: Csn,
 ) -> Result<(), NativeRuntimeError> {
@@ -1288,17 +1563,21 @@ fn validate_roots(
         return Err(NativeRuntimeError::FuturePage);
     }
     BTree::from_root(relational_root).validate_visible(pages, visible_csn)?;
-    load_state(pages, roots)?;
+    load_state(pages, blobs, roots)?;
     Ok(())
 }
 
-fn load_state(pages: &PageStore, roots: &RootSet) -> Result<MaterializedState, NativeRuntimeError> {
+fn load_state(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+) -> Result<MaterializedState, NativeRuntimeError> {
     Ok(MaterializedState {
         catalog: load_root(pages, roots, SLOT_CATALOG, PageKind::CatalogRoot, |bytes| {
             CatalogState::decode(bytes)
         })?
         .unwrap_or_default(),
-        relational: load_relational_state(pages, roots)?,
+        relational: load_relational_state(pages, blobs, roots)?,
         structures: load_root(
             pages,
             roots,
@@ -1316,6 +1595,7 @@ fn load_state(pages: &PageStore, roots: &RootSet) -> Result<MaterializedState, N
 
 fn load_relational_state(
     pages: &PageStore,
+    blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<RelationState, NativeRuntimeError> {
     let Some(root) = roots.root(SLOT_RELATIONAL) else {
@@ -1345,7 +1625,7 @@ fn load_relational_state(
                     .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
                 let primary_key = &key[17..];
                 let Some(value) =
-                    decode_relational_row(table, primary_key, &value, roots.visible_csn())?
+                    decode_relational_row(table, primary_key, &value, roots.visible_csn(), blobs)?
                 else {
                     continue;
                 };
@@ -1438,6 +1718,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use hyphae_native_mvcc::WriteKey;
     use hyphae_native_types::{DurabilityClass, ManifestGeneration, ObjectId};
 
     use super::{
@@ -1533,6 +1814,76 @@ mod tests {
         let reopened = NativeDatabase::open(temporary.path())?;
         assert_eq!(reopened.recovery_report().committed_transactions, 1);
         assert_vertical(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_relational_value_uses_verified_blob_storage() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(11)?;
+        let value = vec![0x6d; super::RELATIONAL_INLINE_VALUE_LIMIT + 4_096];
+        let mut transaction = database.begin(100, DurabilityClass::Strict)?;
+        transaction.create_relation(table, "large_rows")?;
+        transaction.insert(table, b"blob-row".to_vec(), value.clone())?;
+        transaction.commit()?;
+        assert_eq!(
+            database.select_latest_relational(table, b"blob-row")?,
+            Some(value.clone())
+        );
+        database.checkpoint()?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().blob_count, 1);
+        assert_eq!(reopened.recovery_report().blob_generation, 1);
+        assert_eq!(reopened.recovery_report().checkpoint_count, 1);
+        assert_eq!(
+            reopened.snapshot(101)?.select(table, b"blob-row"),
+            Some(value.as_slice())
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"blob-row")?,
+            Some(value)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blob_stage_and_promotion_interruptions_recover_explicitly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [CommitBoundary::BlobStaged, CommitBoundary::BlobPromoted] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(12)?;
+            let mut transaction = database.begin(100, DurabilityClass::Strict)?;
+            transaction.create_relation(table, "interrupted_blobs")?;
+            transaction.insert(
+                table,
+                b"blob-row".to_vec(),
+                vec![0x5a; super::RELATIONAL_INLINE_VALUE_LIMIT + 1],
+            )?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(reopened.recovery_report().visible_csn, None);
+            match boundary {
+                CommitBoundary::BlobStaged => {
+                    assert_eq!(reopened.recovery_report().blob_count, 0);
+                    assert_eq!(reopened.recovery_report().recovered_temporary_blobs, 1);
+                }
+                CommitBoundary::BlobPromoted => {
+                    assert_eq!(reopened.recovery_report().blob_count, 1);
+                    assert_eq!(reopened.recovery_report().blob_generation, 1);
+                }
+                _ => unreachable!(),
+            }
+        }
         Ok(())
     }
 
@@ -1643,6 +1994,8 @@ mod tests {
     fn every_commit_boundary_recovers_prior_or_complete_state()
     -> Result<(), Box<dyn std::error::Error>> {
         for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
             CommitBoundary::PageAppended,
             CommitBoundary::PageSynchronized,
             CommitBoundary::WalAppended,
@@ -1663,7 +2016,10 @@ mod tests {
                 None => {
                     assert!(matches!(
                         boundary,
-                        CommitBoundary::PageAppended | CommitBoundary::PageSynchronized
+                        CommitBoundary::BlobStaged
+                            | CommitBoundary::BlobPromoted
+                            | CommitBoundary::PageAppended
+                            | CommitBoundary::PageSynchronized
                     ));
                 }
                 Some(csn) => {
@@ -1736,6 +2092,82 @@ mod tests {
                 columns: vec!["row".to_owned()],
                 rows: Vec::new(),
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sql_update_delete_publish_new_roots_and_retain_old_snapshots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = create.execute_sql(
+            "CREATE TABLE accounts (primary_key BINARY PRIMARY KEY, row BINARY)",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        create.execute_sql(
+            "INSERT INTO accounts (primary_key, row) VALUES (?, ?)",
+            &[
+                SqlValue::Binary(b"mario".to_vec()),
+                SqlValue::Binary(b"v1".to_vec()),
+            ],
+        )?;
+        create.commit()?;
+        let version_one = database.snapshot(11)?;
+
+        let mut update = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            update.execute_sql(
+                "UPDATE accounts SET row = ? WHERE primary_key = ?",
+                &[
+                    SqlValue::Binary(b"v2".to_vec()),
+                    SqlValue::Binary(b"mario".to_vec()),
+                ],
+            )?,
+            SqlResult::Command {
+                rows_affected: 1,
+                object_id: None,
+            }
+        );
+        update.commit()?;
+        let version_two = database.snapshot(13)?;
+        assert_eq!(version_one.select(table, b"mario"), Some(b"v1".as_slice()));
+        assert_eq!(version_two.select(table, b"mario"), Some(b"v2".as_slice()));
+
+        let mut delete = database.begin_sql(14, DurabilityClass::Strict)?;
+        delete.execute_sql(
+            "DELETE FROM accounts WHERE primary_key = ?",
+            &[SqlValue::Binary(b"mario".to_vec())],
+        )?;
+        delete.commit()?;
+        assert_eq!(database.snapshot(15)?.select(table, b"mario"), None);
+        assert_eq!(database.select_latest_relational(table, b"mario")?, None);
+        assert_eq!(version_one.select(table, b"mario"), Some(b"v1".as_slice()));
+        assert_eq!(version_two.select(table, b"mario"), Some(b"v2".as_slice()));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 3);
+        assert_eq!(reopened.snapshot(16)?.select(table, b"mario"), None);
+        assert_eq!(reopened.conflicts.len(), 4);
+        assert_eq!(
+            reopened
+                .conflicts
+                .latest_commit(&WriteKey::new(
+                    hyphae_native_types::EngineKind::Relational,
+                    Some(table),
+                    b"mario",
+                ))
+                .map(hyphae_native_types::Csn::get),
+            Some(3)
         );
         Ok(())
     }

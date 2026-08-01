@@ -2,8 +2,9 @@
 
 Status: normative target contract; immutable snapshots, CSN reservation,
 root-set hashing, recovery restore, and serialized all-engine publication are
-implemented experimentally; conflict tables and lock-free publication remain
-pending
+implemented experimentally; a point-write conflict table is implemented and
+rebuilt from committed WAL, while concurrent-writer and lock-free publication
+remain pending
 
 V1 provides snapshot isolation across relational, structure, and search
 objects under one global commit sequence.
@@ -47,6 +48,18 @@ Private writes shadow snapshot versions for read-your-writes.
 
 Serializable execution is a later mode using versioned range intents and
 serializable snapshot isolation. It cannot be claimed by the v1 snapshot mode.
+
+The current conflict table maps canonical `(engine, object, key)` write
+identities to their latest committed CSN. Catalog creates additionally claim
+the global object-ID and engine-qualified name identities. Admission rejects a
+key whose latest writer is newer than the transaction read CSN, and recovery
+reconstructs the table from decoded, digest-verified committed WAL mutations.
+
+The runtime still takes one serialized writer guard for the entire
+transaction and its public write entry point requires exclusive database
+access. Therefore the table and its stale/disjoint-key unit tests establish
+the first-committer-wins substrate, not evidence of two genuinely concurrent
+writers. Concurrent isolation litmus tests remain an exit requirement.
 
 ## Cross-engine commit
 
@@ -110,3 +123,11 @@ Required evidence includes isolation litmus tests, model checking of version
 visibility, write/write conflict tests, constraint races, read-your-writes,
 logical-time/TTL replay, root publication ordering, crash injection at every
 commit step, and cross-engine readers that assert no mixed CSN.
+
+Current tests cover half-open visibility, retained historical root sets,
+atomic all-engine root publication, dropped-write nonpublication,
+stale-same-key conflict rejection, disjoint-key admission, monotonic
+idempotent conflict replay, WAL reconstruction, read-your-writes, logical TTL,
+and deterministic in-process commit interruptions. True concurrent writers,
+constraints, range intents, serializable execution, and model-checked
+publication ordering remain pending.

@@ -2,7 +2,8 @@
 
 Status: normative experimental format; copy-on-write insertion, replacement,
 recursive splitting, point lookup, ordered scan, complete validation,
-historical roots, and buffer-pool reads are implemented
+balanced-height validation, historical roots, and buffer-pool reads are
+implemented
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -88,19 +89,24 @@ namespaces:
 
 The table marker preserves an empty table. A row record currently contains the
 primary-key bytes and binary row payload as two catalog-ordered columns. The
-runtime verifies the duplicated primary key, content-derived `RowId`, MVCC
-visibility, and row codec before returning a value.
+row payload column contains the runtime's inline-or-blob envelope. The runtime
+verifies the duplicated primary key, content-derived `RowId`, MVCC visibility,
+blob reference/content, and row codec before returning a value.
 
 This namespace is the first physical relational route, not the complete SQL
-storage design. Secondary indexes, version chains for updates/deletes, range
-cursors, prefix compression, bulk load, overflow values, free-space policy,
-and scan-oriented column batches remain pending.
+storage design. UPDATE replaces the current key under a new immutable root and
+DELETE installs a canonical row tombstone; historical snapshots retain their
+prior roots. Explicit version-chain pages under the current root, closed
+superseded `end_csn` values, secondary indexes, range cursors, prefix
+compression, bulk load, free-space policy, and scan-oriented column batches
+remain pending.
 
 ## Verification
 
 Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,
-point reads, ordered scan, retained historical roots, duplicate/upsert
-semantics, buffered lookup, oversized and noncanonical rejection, and
-future-node rejection. Fuzzing, randomized model equivalence, crash power-loss
-tests, fanout/fill-factor tuning, and concurrent writer publication remain
-required gate evidence.
+balanced-height verification, point reads, ordered scan, retained historical
+roots, duplicate/upsert semantics, buffered lookup, oversized and
+noncanonical rejection, and future-node rejection. The runtime benchmark also
+refuses to run unless its relational tree height is at least two. Fuzzing,
+randomized model equivalence, crash power-loss tests, fanout/fill-factor
+tuning, and concurrent writer publication remain required gate evidence.

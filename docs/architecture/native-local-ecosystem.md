@@ -223,6 +223,23 @@ Migration from disk format 2 creates a separate target directory, imports a
 logical snapshot, verifies counts and digests, and promotes only after full
 validation. It never rewrites the source directory in place.
 
+The experimental convergence runtime currently materializes:
+
+```text
+data/
+├─ pages.hydb
+├─ wal.hywal
+├─ roots/
+│  ├─ manifest-<generation>-<digest>.hyroot
+│  └─ manifest-<generation>-<digest>.tmp
+├─ blobs/
+└─ tmp/
+   └─ blobs/
+```
+
+This smaller layout is implementation evidence, not a replacement for the
+target directory contract above.
+
 ## Pain points Hyphae must beat
 
 - OpenSearch ingestion commonly requires a separate pipeline or CDC and bulk

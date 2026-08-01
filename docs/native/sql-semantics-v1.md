@@ -1,8 +1,9 @@
 # Hyphae SQL semantics v1
 
 Status: normative target contract; an exact binary first slice for `CREATE
-TABLE`, primary-key `INSERT`, parameterized `SELECT`, prepared binding,
-`BEGIN`/`COMMIT`, and rollback is implemented experimentally; G2 remains open
+TABLE`, primary-key `INSERT`, `UPDATE`, `DELETE`, parameterized `SELECT`,
+prepared binding, `BEGIN`/`COMMIT`, and rollback is implemented
+experimentally; G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -28,9 +29,14 @@ column IDs.
   arithmetic, scalar and aggregate functions; and
 - introspection: `EXPLAIN`, catalog views and execution statistics.
 
-The first implementation slice is `CREATE TABLE`, primary key, `INSERT`,
-prepared parameterized `SELECT`, `BEGIN`, `COMMIT`, and `ROLLBACK`. That slice
-does not close relational gate G2.
+The first implementation slice is one fixed binary table shape, primary-key
+`INSERT`, `UPDATE ... SET row = ? WHERE primary_key = ?`, `DELETE ... WHERE
+primary_key = ?`, prepared parameterized point `SELECT`, `BEGIN`, `COMMIT`,
+and `ROLLBACK`. Updates publish a new copy-on-write root; deletes publish a
+canonical tombstone. Retained snapshots continue to resolve their historical
+roots. The current root does not yet retain an explicit per-key physical
+version chain or close the superseded row's `end_csn`; vacuum and chain
+traversal remain pending. This slice does not close relational gate G2.
 
 ## Null and boolean semantics
 

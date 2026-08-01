@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 blake3.workspace = true
 crc32c.workspace = true
+hyphae-native-blobs.workspace = true
 hyphae-native-btree.workspace = true
 hyphae-native-catalog.workspace = true
 hyphae-native-manifest.workspace = true

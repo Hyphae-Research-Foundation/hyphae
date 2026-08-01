@@ -2,7 +2,8 @@
 
 Status: normative target contract; block/record framing, append, integrity
 chain, incomplete-tail repair, the first typed transaction envelope, and
-root-manifest checkpoint anchors are implemented experimentally; bounded
+root-manifest checkpoint anchors are implemented experimentally; committed
+mutation decoding now reconstructs the write-conflict table, while bounded
 checkpoint replay, WAL retention, idempotent retries, and group commit remain
 pending
 
@@ -71,10 +72,30 @@ conflict detection requires it.
 
 - read CSN and assigned commit CSN;
 - catalog version;
+- immutable blob generation;
 - mutation count and aggregate mutation bytes;
 - logical commit time;
 - BLAKE3 digest of the ordered canonical mutation records; and
 - the four current catalog, relational, structure, and search root page IDs.
+
+The implemented `HYCMT001` body is exactly 124 bytes:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | magic `HYCMT001` |
+| 8 | 8 | read CSN; zero means genesis |
+| 16 | 8 | commit CSN |
+| 24 | 8 | catalog version |
+| 32 | 8 | blob generation |
+| 40 | 4 | mutation count |
+| 44 | 8 | aggregate mutation-body bytes |
+| 52 | 8 | logical UTC microseconds |
+| 60 | 32 | ordered mutation-set BLAKE3 digest |
+| 92 | 32 | four little-endian root page IDs |
+
+The current relational mutation body stores values at or below 8,192 bytes
+inline. Larger values are promoted to the immutable blob namespace first and
+the WAL stores only the one-byte blob envelope plus its 56-byte reference.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 
@@ -112,8 +133,10 @@ All benchmark and API receipts name the durability class.
 7. Verify or rebuild the committed root set before advancing visibility.
 
 Recovery never guesses an opcode or skips an unknown committed mutation. The
-current vertical performs step 1 but deliberately scans the complete WAL;
-bounded replay from the selected checkpoint remains pending.
+current vertical verifies checkpoint/manifest chains but deliberately scans
+the complete WAL, decodes every committed mutation, rebuilds point-write
+conflict state, and validates every committed root generation. Bounded replay
+from the selected checkpoint remains pending.
 
 ## Checkpoints
 
@@ -146,6 +169,7 @@ sequence/digest divergence, unknown opcode rejection, group synchronization
 receipts, checkpoint replay, and bounded recovery.
 
 Current tests cover the block golden, complete transaction envelope, semantic
-mutation count/digest verification, checkpoint encoding/chain validation,
-complete corruption, incomplete physical tail repair, and deterministic
-checkpoint interruption. The broader list above remains gate work.
+mutation round-trip and count/digest verification, checkpoint encoding/chain
+validation, blob-reference commits, complete corruption, incomplete physical
+tail repair, and deterministic blob/page/WAL/root/checkpoint interruptions.
+The broader list above remains gate work.

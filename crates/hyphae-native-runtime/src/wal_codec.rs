@@ -38,6 +38,8 @@ pub(crate) enum Opcode {
     SetValue = 3,
     CreateIndex = 4,
     IndexDocument = 5,
+    UpdateRow = 6,
+    DeleteRow = 7,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +74,7 @@ pub(crate) struct CommitManifest {
     pub(crate) read_csn: Option<Csn>,
     pub(crate) commit_csn: Csn,
     pub(crate) catalog_version: CatalogVersion,
+    pub(crate) blob_generation: u64,
     pub(crate) mutation_count: u32,
     pub(crate) mutation_bytes: u64,
     pub(crate) logical_time_micros: i64,
@@ -81,11 +84,12 @@ pub(crate) struct CommitManifest {
 
 impl CommitManifest {
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(116);
+        let mut bytes = Vec::with_capacity(124);
         bytes.extend_from_slice(COMMIT_MAGIC);
         bytes.extend_from_slice(&self.read_csn.map_or(0, Csn::get).to_le_bytes());
         bytes.extend_from_slice(&self.commit_csn.get().to_le_bytes());
         bytes.extend_from_slice(&self.catalog_version.get().to_le_bytes());
+        bytes.extend_from_slice(&self.blob_generation.to_le_bytes());
         bytes.extend_from_slice(&self.mutation_count.to_le_bytes());
         bytes.extend_from_slice(&self.mutation_bytes.to_le_bytes());
         bytes.extend_from_slice(&self.logical_time_micros.to_le_bytes());
@@ -97,7 +101,7 @@ impl CommitManifest {
     }
 
     fn decode(body: &[u8]) -> Result<Self, WalSemanticError> {
-        if body.len() != 116 || body.get(..8) != Some(COMMIT_MAGIC.as_slice()) {
+        if body.len() != 124 || body.get(..8) != Some(COMMIT_MAGIC.as_slice()) {
             return Err(WalSemanticError::InvalidBody);
         }
         let read_csn = optional_csn(read_u64(&body[8..16]))?;
@@ -105,15 +109,16 @@ impl CommitManifest {
             Csn::new(read_u64(&body[16..24])).map_err(|_| WalSemanticError::InvalidIdentity)?;
         let catalog_version = CatalogVersion::new(read_u64(&body[24..32]))
             .map_err(|_| WalSemanticError::InvalidIdentity)?;
-        let mutation_count = read_u32(&body[32..36]);
-        let mutation_bytes = read_u64(&body[36..44]);
-        let logical_time_micros = read_i64(&body[44..52]);
+        let blob_generation = read_u64(&body[32..40]);
+        let mutation_count = read_u32(&body[40..44]);
+        let mutation_bytes = read_u64(&body[44..52]);
+        let logical_time_micros = read_i64(&body[52..60]);
         let mut mutation_digest = [0_u8; 32];
-        mutation_digest.copy_from_slice(&body[52..84]);
+        mutation_digest.copy_from_slice(&body[60..92]);
         let mut roots =
             [PageId::new(1).map_err(|_| WalSemanticError::InvalidIdentity)?; ROOT_COUNT];
         for (index, root) in roots.iter_mut().enumerate() {
-            let start = 84 + index * 8;
+            let start = 92 + index * 8;
             *root = PageId::new(read_u64(&body[start..start + 8]))
                 .map_err(|_| WalSemanticError::InvalidIdentity)?;
         }
@@ -121,6 +126,7 @@ impl CommitManifest {
             read_csn,
             commit_csn,
             catalog_version,
+            blob_generation,
             mutation_count,
             mutation_bytes,
             logical_time_micros,
@@ -135,6 +141,7 @@ pub(crate) struct RecoveredCommit {
     pub(crate) transaction_id: TransactionId,
     pub(crate) commit_lsn: Lsn,
     pub(crate) manifest: CommitManifest,
+    pub(crate) mutations: Vec<Mutation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +169,7 @@ pub(crate) struct TransactionPlan<'mutations> {
     pub(crate) mutations: &'mutations [Mutation],
     pub(crate) commit_csn: Csn,
     pub(crate) roots: [PageId; ROOT_COUNT],
+    pub(crate) blob_generation: u64,
 }
 
 pub(crate) fn encode_transaction(
@@ -200,6 +208,7 @@ pub(crate) fn encode_transaction(
         read_csn: plan.read_csn,
         commit_csn: plan.commit_csn,
         catalog_version: plan.catalog_version,
+        blob_generation: plan.blob_generation,
         mutation_count,
         mutation_bytes,
         logical_time_micros: plan.logical_time_micros,
@@ -275,10 +284,10 @@ pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSema
                 if transaction.transaction_id != record.transaction_id() {
                     return Err(WalSemanticError::InvalidSequence);
                 }
-                validate_mutation(record.engine(), record.body())?;
+                let mutation = decode_mutation(record.engine(), record.body())?;
                 transaction
                     .mutations
-                    .push((record.engine(), record.body().to_vec()));
+                    .push((mutation, record.body().to_vec()));
             }
             RecordKind::Commit => {
                 let transaction = active.take().ok_or(WalSemanticError::InvalidSequence)?;
@@ -302,6 +311,11 @@ pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSema
                     transaction_id: record.transaction_id(),
                     commit_lsn: record.lsn(),
                     manifest,
+                    mutations: transaction
+                        .mutations
+                        .into_iter()
+                        .map(|(mutation, _)| mutation)
+                        .collect(),
                 });
             }
             RecordKind::Abort => {
@@ -439,7 +453,7 @@ impl ActiveTransaction {
         let digest = mutation_digest(
             self.mutations
                 .iter()
-                .map(|(engine, body)| (*engine, body.as_slice())),
+                .map(|(mutation, body)| (mutation.engine, body.as_slice())),
         )?;
         if self.begin.read_csn != commit.read_csn
             || self.begin.catalog_version != commit.catalog_version
@@ -459,10 +473,10 @@ impl ActiveTransaction {
 struct ActiveTransaction {
     transaction_id: TransactionId,
     begin: Begin,
-    mutations: Vec<(EngineKind, Vec<u8>)>,
+    mutations: Vec<(Mutation, Vec<u8>)>,
 }
 
-fn validate_mutation(engine: EngineKind, body: &[u8]) -> Result<(), WalSemanticError> {
+fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSemanticError> {
     if body.len() < 44
         || body.get(..8) != Some(MUTATION_MAGIC.as_slice())
         || body[9] != engine as u8
@@ -470,13 +484,17 @@ fn validate_mutation(engine: EngineKind, body: &[u8]) -> Result<(), WalSemanticE
     {
         return Err(WalSemanticError::InvalidBody);
     }
-    let opcode_engine = match body[8] {
-        value if value == Opcode::CreateTable as u8 || value == Opcode::InsertRow as u8 => {
-            EngineKind::Relational
+    let (opcode, opcode_engine) = match body[8] {
+        value if value == Opcode::CreateTable as u8 => {
+            (Opcode::CreateTable, EngineKind::Relational)
         }
-        value if value == Opcode::SetValue as u8 => EngineKind::Structure,
-        value if value == Opcode::CreateIndex as u8 || value == Opcode::IndexDocument as u8 => {
-            EngineKind::Search
+        value if value == Opcode::InsertRow as u8 => (Opcode::InsertRow, EngineKind::Relational),
+        value if value == Opcode::UpdateRow as u8 => (Opcode::UpdateRow, EngineKind::Relational),
+        value if value == Opcode::DeleteRow as u8 => (Opcode::DeleteRow, EngineKind::Relational),
+        value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
+        value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
+        value if value == Opcode::IndexDocument as u8 => {
+            (Opcode::IndexDocument, EngineKind::Search)
         }
         _ => return Err(WalSemanticError::InvalidBody),
     };
@@ -494,7 +512,39 @@ fn validate_mutation(engine: EngineKind, body: &[u8]) -> Result<(), WalSemanticE
     if expected != body.len() {
         return Err(WalSemanticError::InvalidBody);
     }
-    Ok(())
+    let raw_target = read_u128(&body[12..28]);
+    let target = if raw_target == 0 {
+        None
+    } else {
+        Some(ObjectId::new(raw_target).map_err(|_| WalSemanticError::InvalidIdentity)?)
+    };
+    match opcode {
+        Opcode::SetValue if target.is_some() => return Err(WalSemanticError::InvalidBody),
+        Opcode::CreateTable
+        | Opcode::InsertRow
+        | Opcode::CreateIndex
+        | Opcode::IndexDocument
+        | Opcode::UpdateRow
+        | Opcode::DeleteRow
+            if target.is_none() =>
+        {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        Opcode::DeleteRow if value_length != 0 => return Err(WalSemanticError::InvalidBody),
+        _ => {}
+    }
+    let raw_expiry = read_i64(&body[28..36]);
+    let expires_at_micros = (raw_expiry != i64::MAX).then_some(raw_expiry);
+    let key_start = 44;
+    let value_start = key_start + key_length;
+    Ok(Mutation {
+        engine,
+        opcode,
+        target,
+        key: body[key_start..value_start].to_vec(),
+        value: body[value_start..expected].to_vec(),
+        expires_at_micros,
+    })
 }
 
 fn mutation_digest<'body>(
@@ -547,6 +597,12 @@ fn read_u64(bytes: &[u8]) -> u64 {
     let mut value = [0_u8; 8];
     value.copy_from_slice(bytes);
     u64::from_le_bytes(value)
+}
+
+fn read_u128(bytes: &[u8]) -> u128 {
+    let mut value = [0_u8; 16];
+    value.copy_from_slice(bytes);
+    u128::from_le_bytes(value)
 }
 
 fn read_i64(bytes: &[u8]) -> i64 {
@@ -612,6 +668,7 @@ mod tests {
             mutations: &mutations,
             commit_csn: Csn::new(1)?,
             roots,
+            blob_generation: 0,
         })?;
         let block = WalBlock::build(1, [0; 32], pending)?;
         let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
@@ -619,6 +676,7 @@ mod tests {
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
         assert_eq!(recovered.commits[0].manifest.mutation_count, 3);
+        assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
 
@@ -649,6 +707,7 @@ mod tests {
             mutations: &mutations,
             commit_csn: Csn::new(1)?,
             roots,
+            blob_generation: 0,
         })?;
         let commit_block = WalBlock::build(1, [0; 32], pending)?;
         let commit_decoded = WalBlock::decode(1, [0; 32], &commit_block.encode()?)?;

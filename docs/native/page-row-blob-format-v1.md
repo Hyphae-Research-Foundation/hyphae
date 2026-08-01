@@ -2,8 +2,8 @@
 
 Status: normative target contract; page codec, append-only page file, tail
 repair, partitioned buffer pool, canonical MVCC row codec, fixed blob
-reference, and B+tree-backed row persistence are implemented experimentally;
-the content-addressed blob byte store remains pending
+reference, B+tree-backed row persistence, and the first immutable
+content-addressed blob byte store are implemented experimentally
 
 The native substrate uses fixed-size copy-on-write pages and separate
 content-addressed blobs. No target-path page is a Redb page.
@@ -107,6 +107,37 @@ verified, and promoted before a root referencing it becomes visible. Garbage
 collection may remove a blob only after no retained root or snapshot can
 reference it.
 
+The first relational route uses an 8,192-byte threshold and stores a one-byte
+value envelope inside the row column: `0` followed by inline bytes, or `1`
+followed by the fixed 56-byte blob reference. Blob files are named
+`blobs/<lowercase BLAKE3 digest>.hyblob`; canonical stages are
+`tmp/blobs/<digest>.tmp`.
+
+The exact blob file is:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYBLOB01` |
+| 8 | 2 | format version `1` |
+| 10 | 2 | header length `80` |
+| 12 | 4 | flags/reserved zero |
+| 16 | 16 | content-derived `BlobId`, little-endian |
+| 32 | 8 | logical content length |
+| 40 | 4 | CRC32C with this field zeroed |
+| 44 | 4 | reserved zero |
+| 48 | 32 | BLAKE3 digest of content bytes |
+| 80 | variable | exact content bytes; no trailing padding |
+
+The first implementation bounds one blob at 1 GiB, verifies every complete
+blob during open, removes canonical interrupted stages, deduplicates identical
+content, and derives `blob_generation` from the verified immutable-file count.
+The root set and WAL commit bind that generation. A blob promoted before a
+failed transaction can remain as an unreferenced immutable orphan until
+retention tracing and garbage collection exist; it never makes a logical row
+visible. Safe parent-directory synchronization is implemented on Unix. The
+Windows implementation reports that strict parent-directory synchronization
+is unsupported rather than claiming that guarantee.
+
 ## Copy-on-write root publication
 
 A root set contains the catalog root and one root per engine partition plus
@@ -137,11 +168,13 @@ pending; they are target requirements, not current claims.
 
 ## Verification
 
-Current evidence includes stable page, row, blob-reference, B+tree-leaf, and
-root-manifest encodings; exact row round trips; malformed null/offset/window
-rejection; page tail repair; buffer-pool pin/eviction tests; copy-on-write
-historical roots; and checkpoint interruption tests.
+Current evidence includes stable page, row, blob-reference, complete blob-file,
+B+tree-leaf, and root-manifest encodings; exact row and blob round trips;
+malformed null/offset/window rejection; complete-blob corruption rejection;
+page tail repair; buffer-pool pin/eviction tests; copy-on-write historical
+roots; deduplication; and blob-promotion and checkpoint interruption tests.
 
 Still required are broad random/property and fuzz corpora, bit flips across
-every byte range, blob promotion interruption, and reference-count/retention
-tests across snapshots.
+every byte range, streaming/chunked values, compression, encryption,
+reference-count/retention tests across snapshots, orphan reclamation, and
+large-corpus garbage collection.

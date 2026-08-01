@@ -35,6 +35,8 @@ pub(crate) enum ModelError {
     WrongEngine,
     #[error("native relational primary key already exists")]
     DuplicatePrimaryKey,
+    #[error("native relational primary key does not exist")]
+    MissingPrimaryKey,
     #[error("native search document ID already exists")]
     DuplicateDocumentId,
     #[error("native state payload contains a duplicate canonical entry")]
@@ -161,6 +163,31 @@ impl RelationState {
             .get(&table)
             .and_then(|rows| rows.get(key))
             .map(Vec::as_slice)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        table: ObjectId,
+        key: &[u8],
+        value: Vec<u8>,
+    ) -> Result<(), ModelError> {
+        let row = self
+            .tables
+            .get_mut(&table)
+            .ok_or(ModelError::UnknownObject)?
+            .get_mut(key)
+            .ok_or(ModelError::MissingPrimaryKey)?;
+        *row = value;
+        Ok(())
+    }
+
+    pub(crate) fn delete(&mut self, table: ObjectId, key: &[u8]) -> Result<(), ModelError> {
+        let rows = self
+            .tables
+            .get_mut(&table)
+            .ok_or(ModelError::UnknownObject)?;
+        rows.remove(key).ok_or(ModelError::MissingPrimaryKey)?;
+        Ok(())
     }
 }
 

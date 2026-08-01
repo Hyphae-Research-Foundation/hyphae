@@ -62,6 +62,7 @@ The experimental target path currently consists of:
 - `hyphae-native-mvcc`;
 - `hyphae-native-records`;
 - `hyphae-native-btree`;
+- `hyphae-native-blobs`;
 - `hyphae-native-manifest`; and
 - `hyphae-native-runtime`.
 
@@ -78,10 +79,11 @@ non-compatibility disclaimer. Direct native source contains no `unsafe`
 token. This is implementation inventory evidence, not the still-pending
 transitive unsafe and license audit required to close G0.
 
-The records, B+tree, and manifest crates add no new third-party runtime
+The records, B+tree, blob, and manifest crates add no new third-party runtime
 dependency category. The runtime reaches them only through workspace path
-dependencies; the B+tree uses the Hyphae page and buffer-pool APIs, and the
-checkpoint path uses the Hyphae WAL and MVCC types.
+dependencies; the B+tree uses the Hyphae page and buffer-pool APIs, the blob
+store uses the permitted CRC32C/BLAKE3 primitives, and the checkpoint path
+uses the Hyphae WAL and MVCC types.
 
 ## Upstream research
 

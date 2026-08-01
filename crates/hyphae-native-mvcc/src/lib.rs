@@ -10,6 +10,125 @@ use std::{
 use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, PageId};
 use thiserror::Error;
 
+/// One logical write-conflict namespace entry.
+///
+/// The engine identifies the owning subsystem, `object` narrows the namespace
+/// to one catalog object when applicable, and `key` is the engine-defined
+/// canonical storage key.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WriteKey {
+    engine: EngineKind,
+    object: Option<hyphae_native_types::ObjectId>,
+    key: Vec<u8>,
+}
+
+impl WriteKey {
+    /// Constructs one canonical conflict key.
+    pub fn new(
+        engine: EngineKind,
+        object: Option<hyphae_native_types::ObjectId>,
+        key: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            engine,
+            object,
+            key: key.into(),
+        }
+    }
+
+    /// Returns the engine owning this key.
+    pub const fn engine(&self) -> EngineKind {
+        self.engine
+    }
+
+    /// Returns the optional catalog object namespace.
+    pub const fn object(&self) -> Option<hyphae_native_types::ObjectId> {
+        self.object
+    }
+
+    /// Returns the canonical engine key.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
+/// First-committer-wins validation failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "native write conflict: key was committed at CSN {latest_commit} after transaction snapshot {read_csn:?}"
+)]
+pub struct WriteConflict {
+    /// Conflicting logical key.
+    pub key: WriteKey,
+    /// Latest commit that changed the key.
+    pub latest_commit: Csn,
+    /// Snapshot observed by the rejected transaction.
+    pub read_csn: Option<Csn>,
+}
+
+/// In-memory latest-writer table reconstructed from committed WAL.
+///
+/// The table is an admission index, not durability authority. Every accepted
+/// write must already be represented by a committed WAL transaction before it
+/// is published here, and recovery rebuilds it from those transactions.
+#[derive(Clone, Debug, Default)]
+pub struct ConflictTable {
+    latest: BTreeMap<WriteKey, Csn>,
+}
+
+impl ConflictTable {
+    /// Validates a write set using first-committer-wins semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first canonical key whose latest committed writer is newer
+    /// than the transaction's read snapshot.
+    pub fn validate(&self, read_csn: Option<Csn>, keys: &[WriteKey]) -> Result<(), WriteConflict> {
+        for key in keys {
+            let Some(latest_commit) = self.latest.get(key).copied() else {
+                continue;
+            };
+            if read_csn.is_none_or(|read| latest_commit > read) {
+                return Err(WriteConflict {
+                    key: key.clone(),
+                    latest_commit,
+                    read_csn,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a WAL-committed write set.
+    ///
+    /// Repeated keys within one transaction and recovery replays are
+    /// idempotent. An older commit can never move a key's latest writer
+    /// backwards.
+    pub fn publish_committed(&mut self, commit_csn: Csn, keys: impl IntoIterator<Item = WriteKey>) {
+        for key in keys {
+            self.latest
+                .entry(key)
+                .and_modify(|latest| *latest = (*latest).max(commit_csn))
+                .or_insert(commit_csn);
+        }
+    }
+
+    /// Returns the latest committed writer for one key.
+    pub fn latest_commit(&self, key: &WriteKey) -> Option<Csn> {
+        self.latest.get(key).copied()
+    }
+
+    /// Returns the number of distinct conflict keys retained.
+    pub fn len(&self) -> usize {
+        self.latest.len()
+    }
+
+    /// Returns whether no committed conflict keys are retained.
+    pub fn is_empty(&self) -> bool {
+        self.latest.is_empty()
+    }
+}
+
 /// MVCC coordinator or publication failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum MvccError {
@@ -367,9 +486,9 @@ impl RootTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, PageId};
+    use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, ObjectId, PageId};
 
-    use super::{CommitCoordinator, RootSlot, VersionWindow, WalAnchor};
+    use super::{CommitCoordinator, ConflictTable, RootSlot, VersionWindow, WalAnchor, WriteKey};
 
     fn wal_anchor(lsn: u64, marker: u8) -> Result<WalAnchor, Box<dyn std::error::Error>> {
         WalAnchor::new(Lsn::new(lsn)?, [marker; 32]).map_err(Into::into)
@@ -466,6 +585,48 @@ mod tests {
         assert!(window.is_visible_at(Some(Csn::new(3)?)));
         assert!(!window.is_visible_at(Some(Csn::new(4)?)));
         assert!(!window.is_visible_at(None));
+        Ok(())
+    }
+
+    #[test]
+    fn conflict_table_rejects_stale_same_key_and_accepts_disjoint_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let row = WriteKey::new(
+            EngineKind::Relational,
+            Some(ObjectId::new(7)?),
+            b"account-1",
+        );
+        let other_row = WriteKey::new(
+            EngineKind::Relational,
+            Some(ObjectId::new(7)?),
+            b"account-2",
+        );
+        let mut table = ConflictTable::default();
+        table.publish_committed(Csn::new(2)?, [row.clone()]);
+
+        let conflict = match table.validate(Some(Csn::new(1)?), std::slice::from_ref(&row)) {
+            Ok(()) => return Err("stale writer was accepted".into()),
+            Err(conflict) => conflict,
+        };
+        assert_eq!(conflict.key, row);
+        assert_eq!(conflict.latest_commit.get(), 2);
+        assert_eq!(conflict.read_csn.map(Csn::get), Some(1));
+        table.validate(Some(Csn::new(1)?), &[other_row])?;
+        table.validate(Some(Csn::new(2)?), std::slice::from_ref(&row))?;
+        Ok(())
+    }
+
+    #[test]
+    fn conflict_table_replay_is_monotonic_and_idempotent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let key = WriteKey::new(EngineKind::Structure, None, b"session");
+        let mut table = ConflictTable::default();
+        table.publish_committed(Csn::new(3)?, [key.clone(), key.clone()]);
+        table.publish_committed(Csn::new(2)?, [key.clone()]);
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.latest_commit(&key).map(Csn::get), Some(3));
+        assert!(table.validate(Some(Csn::new(2)?), &[key]).is_err());
         Ok(())
     }
 }

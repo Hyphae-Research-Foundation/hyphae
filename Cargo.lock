@@ -630,6 +630,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-blobs"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "hyphae-native-records",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
 name = "hyphae-native-btree"
 version = "0.2.1"
 dependencies = [
@@ -692,6 +703,7 @@ version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",
+ "hyphae-native-blobs",
  "hyphae-native-btree",
  "hyphae-native-catalog",
  "hyphae-native-manifest",

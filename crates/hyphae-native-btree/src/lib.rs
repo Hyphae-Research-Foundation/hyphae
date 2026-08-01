@@ -73,6 +73,9 @@ pub enum BTreeError {
     /// Traversal reached the same page twice.
     #[error("native B+tree contains a cycle or duplicate child reference")]
     Cycle,
+    /// Leaves do not occur at one common tree depth.
+    #[error("native B+tree leaves are not balanced at one depth")]
+    Unbalanced,
     /// A reachable node was created after the root's visible commit.
     #[error("native B+tree contains a node from a future commit")]
     FuturePage,
@@ -109,6 +112,22 @@ impl BTree {
     /// Returns the immutable physical root, or `None` for an empty tree.
     pub const fn root(self) -> Option<PageId> {
         self.root
+    }
+
+    /// Verifies the complete tree and returns its node height.
+    ///
+    /// An empty tree has height zero and a single leaf has height one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any corruption, cycle, unbalanced leaf depth, or
+    /// excessive height.
+    pub fn height(self, store: &PageStore) -> Result<usize, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(0);
+        };
+        let mut visited = BTreeSet::new();
+        Ok(validate_node(store, root, None, 0, &mut visited)?.height)
     }
 
     /// Performs a binary point lookup.
@@ -777,6 +796,7 @@ struct ValidationSummary {
     minimum: Vec<u8>,
     maximum: Vec<u8>,
     count: usize,
+    height: usize,
 }
 
 fn validate_node(
@@ -807,6 +827,7 @@ fn validate_node(
                 minimum,
                 maximum,
                 count: entries.len(),
+                height: 1,
             })
         }
         Node::Internal { keys, children } => {
@@ -831,6 +852,12 @@ fn validate_node(
             {
                 return Err(BTreeError::NoncanonicalKeyOrder);
             }
+            if summaries
+                .windows(2)
+                .any(|pair| pair[0].height != pair[1].height)
+            {
+                return Err(BTreeError::Unbalanced);
+            }
             let first = summaries.first().ok_or(BTreeError::InvalidCount)?;
             let last = summaries.last().ok_or(BTreeError::InvalidCount)?;
             let count = summaries.iter().try_fold(0_usize, |total, summary| {
@@ -842,6 +869,10 @@ fn validate_node(
                 minimum: first.minimum.clone(),
                 maximum: last.maximum.clone(),
                 count,
+                height: first
+                    .height
+                    .checked_add(1)
+                    .ok_or(BTreeError::HeightExceeded)?,
             })
         }
     }
@@ -904,6 +935,7 @@ mod tests {
         }
         assert!(store.page_count() > 1_000);
         assert_eq!(tree.validate(&store)?, 1_000);
+        assert!(tree.height(&store)? >= 2);
         for index in [0_u32, 1, 499, 999] {
             assert_eq!(
                 tree.get(&store, &index.to_be_bytes())?,

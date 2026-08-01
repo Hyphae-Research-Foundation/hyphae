@@ -70,6 +70,8 @@ enum PreparedPlan {
 enum Statement {
     CreateTable { name: String },
     Insert { name: String },
+    Update { name: String },
+    Delete { name: String },
     Select { name: String },
 }
 
@@ -156,6 +158,36 @@ pub(crate) fn execute_transaction(
                 object_id: None,
             })
         }
+        Statement::Update { name } => {
+            let [SqlValue::Binary(row), SqlValue::Binary(primary_key)] = parameters else {
+                return Err(SqlError::ParameterMismatch);
+            };
+            let table = transaction
+                .state
+                .catalog
+                .id_named(&name, EngineKind::Relational)
+                .map_err(NativeRuntimeError::from)?;
+            transaction.update(table, primary_key.clone(), row.clone())?;
+            Ok(SqlResult::Command {
+                rows_affected: 1,
+                object_id: None,
+            })
+        }
+        Statement::Delete { name } => {
+            let [SqlValue::Binary(primary_key)] = parameters else {
+                return Err(SqlError::ParameterMismatch);
+            };
+            let table = transaction
+                .state
+                .catalog
+                .id_named(&name, EngineKind::Relational)
+                .map_err(NativeRuntimeError::from)?;
+            transaction.delete(table, primary_key.clone())?;
+            Ok(SqlResult::Command {
+                rows_affected: 1,
+                object_id: None,
+            })
+        }
         Statement::Select { name } => {
             let [SqlValue::Binary(primary_key)] = parameters else {
                 return Err(SqlError::ParameterMismatch);
@@ -206,6 +238,25 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
         parser.expect_symbol("?")?;
         parser.expect_symbol(")")?;
         Statement::Insert { name }
+    } else if parser.consume_keyword("UPDATE") {
+        let name = parser.identifier()?;
+        parser.expect_keyword("SET")?;
+        parser.expect_keyword("ROW")?;
+        parser.expect_symbol("=")?;
+        parser.expect_symbol("?")?;
+        parser.expect_keyword("WHERE")?;
+        parser.expect_keyword("PRIMARY_KEY")?;
+        parser.expect_symbol("=")?;
+        parser.expect_symbol("?")?;
+        Statement::Update { name }
+    } else if parser.consume_keyword("DELETE") {
+        parser.expect_keyword("FROM")?;
+        let name = parser.identifier()?;
+        parser.expect_keyword("WHERE")?;
+        parser.expect_keyword("PRIMARY_KEY")?;
+        parser.expect_symbol("=")?;
+        parser.expect_symbol("?")?;
+        Statement::Delete { name }
     } else if parser.consume_keyword("SELECT") {
         parser.expect_keyword("ROW")?;
         parser.expect_keyword("FROM")?;
@@ -358,6 +409,14 @@ mod tests {
         assert!(matches!(
             parse("INSERT INTO accounts (primary_key, row) VALUES (?, ?)")?,
             Statement::Insert { name } if name == "accounts"
+        ));
+        assert!(matches!(
+            parse("UPDATE accounts SET row = ? WHERE primary_key = ?")?,
+            Statement::Update { name } if name == "accounts"
+        ));
+        assert!(matches!(
+            parse("DELETE FROM accounts WHERE primary_key = ?")?,
+            Statement::Delete { name } if name == "accounts"
         ));
         assert!(matches!(
             parse("SELECT row FROM accounts WHERE primary_key = ?")?,

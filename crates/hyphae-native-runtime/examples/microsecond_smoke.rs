@@ -17,6 +17,8 @@ use hyphae_native_types::{DurabilityClass, ObjectId};
 const OBSERVATIONS: u32 = 1_000_000;
 const WARMUP: u32 = 100_000;
 const OPERATIONS_PER_OBSERVATION: u32 = 32;
+const RELATIONAL_SCALE_ROWS: u32 = 2_048;
+const RELATIONAL_TARGET_ROW: u32 = RELATIONAL_SCALE_ROWS / 2;
 
 struct TemporaryDirectory(PathBuf);
 
@@ -50,6 +52,13 @@ struct Stats {
     throughput_per_second: f64,
 }
 
+struct OperationStats {
+    structure: Stats,
+    prepared_sql: Stats,
+    relational_btree: Stats,
+    codec_dispatch: Stats,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit = std::env::args()
         .nth(1)
@@ -64,12 +73,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transaction = database.begin(100, DurabilityClass::Memory)?;
     transaction.create_relation(table, "accounts")?;
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
+    let mut dataset_hasher = blake3::Hasher::new();
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v3");
+    for row in 0..RELATIONAL_SCALE_ROWS {
+        let key = row.to_be_bytes();
+        let value = vec![u8::try_from(row % 251)?; 96];
+        dataset_hasher.update(&key);
+        dataset_hasher.update(&value);
+        transaction.insert(table, key.to_vec(), value)?;
+    }
     transaction.set(b"session".to_vec(), vec![7_u8; 64], None);
     transaction.create_search_index(index, "notes")?;
     transaction.index_document(index, b"doc-1".to_vec(), "native rust search")?;
     transaction.commit()?;
+    let relational_tree_height = database.latest_relational_tree_height()?;
+    if relational_tree_height < 2 {
+        return Err("relational benchmark dataset did not produce a multilevel B+tree".into());
+    }
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
+    let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
     let frame = encode_frame(
         FrameKind::Structure,
         1,
@@ -80,8 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..WARMUP {
         black_box(snapshot.get(black_box(b"session")));
-        black_box(snapshot.execute_prepared_binary(&prepared, black_box(b"mario"))?);
-        black_box(database.select_latest_relational(table, black_box(b"mario"))?);
+        black_box(snapshot.execute_prepared_binary(&prepared, black_box(&relational_target))?);
+        black_box(database.select_latest_relational(table, black_box(&relational_target))?);
         let decoded = decode_frame(black_box(&frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
         black_box(snapshot.get(black_box(decoded.payload)));
     }
@@ -92,14 +115,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prepared_sql = measure(|| {
         black_box(
             snapshot
-                .execute_prepared_binary(&prepared, black_box(b"mario"))
+                .execute_prepared_binary(&prepared, black_box(&relational_target))
                 .is_ok(),
         );
     });
     let relational_btree = measure(|| {
         black_box(
             database
-                .select_latest_relational(table, black_box(b"mario"))
+                .select_latest_relational(table, black_box(&relational_target))
                 .is_ok(),
         );
     });
@@ -108,10 +131,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             black_box(snapshot.get(black_box(decoded.payload)));
         }
     });
-    let dataset_digest = blake3::hash(b"accounts:mario=active;session=64x07;notes:doc-1");
+    dataset_hasher.update(b"accounts:mario=active;session=64x07;notes:doc-1");
+    let dataset_digest = dataset_hasher.finalize();
 
+    print_report(
+        &commit,
+        &rustc,
+        dataset_digest,
+        relational_tree_height,
+        &OperationStats {
+            structure,
+            prepared_sql,
+            relational_btree,
+            codec_dispatch,
+        },
+    );
+    Ok(())
+}
+
+fn print_report(
+    commit: &str,
+    rustc: &str,
+    dataset_digest: blake3::Hash,
+    relational_tree_height: usize,
+    operations: &OperationStats,
+) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v2\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v3\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -128,20 +174,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"durability\": \"memory\",");
     println!("  \"warm_state\": true,");
     println!("  \"proofs\": false,");
+    println!(
+        "  \"relational_rows\": {},",
+        RELATIONAL_SCALE_ROWS.saturating_add(1)
+    );
+    println!("  \"relational_tree_height\": {relational_tree_height},");
     println!("  \"dataset_digest_blake3\": \"{dataset_digest}\",");
     println!("  \"transport_note\": \"codec plus embedded dispatch; no named-pipe transport\",");
     println!("  \"operations\": {{");
-    print_stats("embedded_structure_get_64b", structure, true);
-    print_stats("embedded_prepared_sql_pk", prepared_sql, true);
-    print_stats("buffered_relational_btree_pk", relational_btree, true);
+    print_stats("embedded_structure_get_64b", operations.structure, true);
+    print_stats(
+        "embedded_prepared_sql_pk_materialized_scaled_snapshot",
+        operations.prepared_sql,
+        true,
+    );
+    print_stats(
+        "buffered_relational_btree_pk_multilevel",
+        operations.relational_btree,
+        true,
+    );
     print_stats(
         "local_frame_decode_plus_structure_dispatch_64b",
-        codec_dispatch,
+        operations.codec_dispatch,
         false,
     );
     println!("  }}");
     println!("}}");
-    Ok(())
 }
 
 fn measure(mut operation: impl FnMut()) -> Stats {

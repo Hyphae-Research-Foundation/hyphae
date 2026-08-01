@@ -1,0 +1,21 @@
+[package]
+name = "hyphae-native-blobs"
+description = "Immutable content-addressed blob storage for Hyphae native data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+crc32c.workspace = true
+hyphae-native-records.workspace = true
+hyphae-native-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
