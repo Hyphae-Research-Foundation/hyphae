@@ -91,6 +91,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [0.2.1 release gate](gates/0.2.1.md)
 - [Native local ecosystem phase-1 gate](gates/native-local-phase-1.md)
 - [Native phase-1 kernel evidence — 2026-08-01](gates/evidence/native-phase1-kernel-2026-08-01.md)
+- [Native row, B+tree, and checkpoint evidence — 2026-08-01](gates/evidence/native-row-tree-checkpoint-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),

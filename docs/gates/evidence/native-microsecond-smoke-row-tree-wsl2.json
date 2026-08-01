@@ -1,0 +1,91 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v2",
+  "measured_at": "2026-08-01T11:13:59.1128599-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "868bc4370ac40c573ca8d37058dd92076e06bb79",
+    "worktree": "clean at measurement",
+    "warning": "Commit binding makes the source reproducible but does not satisfy the missing performance-gate controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502112256,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "dataset_digest_blake3": "8e68d0b8a54952dfb5caabf4c9d8257e937b388346a6d61ce5f6aca497945f8c",
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "relational_path_note": "The buffered relational operation traverses the native B+tree root, obtains a verified page through the partitioned buffer pool, decodes the node and canonical MVCC row, and returns an owned value."
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.002,
+      "p95_us": 0.003,
+      "p99_us": 0.004,
+      "p99_9_us": 0.006,
+      "throughput_ops_s": 254505068
+    },
+    "embedded_prepared_sql_pk": {
+      "p50_us": 0.004,
+      "p95_us": 0.005,
+      "p99_us": 0.006,
+      "p99_9_us": 0.013,
+      "throughput_ops_s": 172214206
+    },
+    "buffered_relational_btree_pk": {
+      "p50_us": 0.255,
+      "p95_us": 0.278,
+      "p99_us": 0.639,
+      "p99_9_us": 2.780,
+      "throughput_ops_s": 3696387
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.026,
+      "p95_us": 0.029,
+      "p99_us": 0.035,
+      "p99_9_us": 0.402,
+      "throughput_ops_s": 33972474
+    }
+  },
+  "interpretation": {
+    "microsecond_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "tiny one-row, one-key, and one-document corpus",
+      "the measured tree has one leaf and no internal-node traversal",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

@@ -70,6 +70,12 @@ not blobs, group commit, filesystem reordering, or sector-level power loss.
 Step 7 has an embedded and frame-codec smoke only; no named-pipe/UDS transport
 receipt.
 
+The follow-on [row, B+tree, and checkpoint
+evidence](evidence/native-row-tree-checkpoint-2026-08-01.md) binds canonical
+MVCC rows, native copy-on-write relational storage, immutable root manifests,
+the four-boundary checkpoint matrix, and a clean physical point-read latency
+observation to one source commit.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows. Catalog,
 structure, and search state remain bounded single-page scaffolding; secondary
