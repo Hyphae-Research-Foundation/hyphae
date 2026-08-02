@@ -2892,6 +2892,49 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Inserts or replaces a duplicate-free vector batch through one
+    /// canonical graph rebuild.
+    ///
+    /// An empty batch is a no-op. The complete batch is admitted before the
+    /// transaction-private generation or WAL mutation set changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, duplicate object ID, invalid
+    /// vector, dimension mismatch, or metric-specific admission failure.
+    pub fn upsert_vectors(
+        &mut self,
+        index: ObjectId,
+        vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
+    ) -> Result<usize, NativeRuntimeError> {
+        let vectors = vectors.into_iter().collect::<Vec<_>>();
+        if vectors.is_empty() {
+            return Ok(0);
+        }
+        let mut identities = BTreeSet::new();
+        if vectors
+            .iter()
+            .any(|(object_id, _)| !identities.insert(*object_id))
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        self.state
+            .ann
+            .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)?;
+        let count = vectors.len();
+        self.mutations
+            .extend(vectors.into_iter().map(|(object_id, vector)| Mutation {
+                engine: EngineKind::Search,
+                opcode: Opcode::UpsertVector,
+                target: Some(index),
+                key: ann_store::encode_object_identity(object_id),
+                value: ann_store::encode_vector_mutation(&vector),
+                expires_at_micros: None,
+            }));
+        self.dirty[3] = true;
+        Ok(count)
+    }
+
     /// Deletes one vector from the transaction-private ANN generation.
     ///
     /// Returns `true` only when the object currently has a visible vector.
@@ -11029,8 +11072,16 @@ mod tests {
             VectorMetric::Cosine,
             ann_config()?,
         )?;
-        create.upsert_vector(vectors, mario, Vector::new([1.0, 0.0, 0.0])?)?;
-        create.upsert_vector(vectors, romina, Vector::new([0.0, 1.0, 0.0])?)?;
+        assert_eq!(
+            create.upsert_vectors(
+                vectors,
+                [
+                    (mario, Vector::new([1.0, 0.0, 0.0])?),
+                    (romina, Vector::new([0.0, 1.0, 0.0])?),
+                ],
+            )?,
+            2
+        );
         let first = create.commit()?;
         assert_eq!(first.commit_csn, Csn::new(1)?);
 
@@ -11087,6 +11138,58 @@ mod tests {
                 .map(|hit| hit.object_id)
                 .collect::<Vec<_>>(),
             vec![luciana, mario]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ann_batch_ingest_rejects_the_complete_invalid_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let first = ObjectId::new(100)?;
+        let second = ObjectId::new(200)?;
+        let mut transaction = database.begin(1, DurabilityClass::Strict)?;
+        transaction.create_vector_index(
+            index,
+            "embeddings",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        assert_eq!(
+            transaction.upsert_vectors(
+                index,
+                [
+                    (first, Vector::new([1.0, 0.0, 0.0])?),
+                    (second, Vector::new([0.0, 1.0, 0.0])?),
+                ],
+            )?,
+            2
+        );
+        let before =
+            transaction.search_ann(index, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?;
+        assert!(
+            transaction
+                .upsert_vectors(
+                    index,
+                    [
+                        (first, Vector::new([0.0, 0.0, 1.0])?),
+                        (first, Vector::new([0.0, 1.0, 1.0])?),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(
+            transaction
+                .upsert_vectors(index, [(first, Vector::new([1.0, 0.0])?)])
+                .is_err()
+        );
+        assert_eq!(transaction.upsert_vectors(index, std::iter::empty())?, 0);
+        assert_eq!(
+            transaction.search_ann(index, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?,
+            before
         );
         Ok(())
     }

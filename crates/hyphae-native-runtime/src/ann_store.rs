@@ -65,6 +65,21 @@ impl AnnState {
         Ok(())
     }
 
+    pub(crate) fn upsert_many(
+        &mut self,
+        index: ObjectId,
+        creating_csn: Csn,
+        vectors: &[(ObjectId, Vector)],
+    ) -> Result<(), NativeRuntimeError> {
+        self.apply_batch(
+            index,
+            creating_csn,
+            vectors
+                .iter()
+                .map(|(object_id, vector)| AnnMutation::Upsert(*object_id, vector.clone())),
+        )
+    }
+
     pub(crate) fn delete(
         &mut self,
         index: ObjectId,
@@ -102,6 +117,67 @@ impl AnnState {
             .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
             .search_exact(query, k)?)
     }
+
+    fn apply_batch(
+        &mut self,
+        index: ObjectId,
+        creating_csn: Csn,
+        mutations: impl IntoIterator<Item = AnnMutation>,
+    ) -> Result<(), NativeRuntimeError> {
+        let mut definition = self.indexes.get(&index).map(HnswIndex::definition);
+        let mut vectors = self
+            .indexes
+            .get(&index)
+            .map(|current| {
+                current
+                    .export_snapshot()
+                    .vectors
+                    .into_iter()
+                    .map(|record| (record.object_id, record))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for mutation in mutations {
+            match mutation {
+                AnnMutation::Create(created) => {
+                    if created.index_id() != index || definition.replace(created).is_some() {
+                        return Err(NativeRuntimeError::InvalidPreparedMutation);
+                    }
+                }
+                AnnMutation::Upsert(object_id, vector) => {
+                    if definition.is_none() {
+                        return Err(NativeRuntimeError::UnknownVectorIndex { index });
+                    }
+                    vectors.insert(
+                        object_id,
+                        VectorRecord {
+                            object_id,
+                            creating_csn,
+                            vector,
+                        },
+                    );
+                }
+                AnnMutation::Delete(object_id) => {
+                    if definition.is_none() {
+                        return Err(NativeRuntimeError::UnknownVectorIndex { index });
+                    }
+                    if vectors.remove(&object_id).is_none() {
+                        return Err(NativeRuntimeError::InvalidPreparedMutation);
+                    }
+                }
+            }
+        }
+        let definition = definition.ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let replacement = HnswIndex::build(definition, vectors.into_values())?;
+        self.indexes.insert(index, replacement);
+        Ok(())
+    }
+}
+
+enum AnnMutation {
+    Create(VectorIndexDefinition),
+    Upsert(ObjectId, Vector),
+    Delete(ObjectId),
 }
 
 #[derive(Clone, Copy)]
@@ -204,12 +280,12 @@ pub(crate) fn apply_tree_mutations(
     }
 
     let mut state = load_from_tree(pages, tree.root(), catalog, false)?;
-    let mut touched = BTreeSet::new();
+    let mut grouped = BTreeMap::<ObjectId, Vec<AnnMutation>>::new();
     for mutation in ann_mutations {
         let index = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-        match mutation.opcode {
+        let operation = match mutation.opcode {
             Opcode::CreateAnnIndex => {
                 let object = CatalogObject::decode_definition(&mutation.value)?;
                 let CatalogObject::Search(definition) = object else {
@@ -218,31 +294,27 @@ pub(crate) fn apply_tree_mutations(
                 if definition.header.id != index {
                     return Err(NativeRuntimeError::InvalidPreparedMutation);
                 }
-                state.create(definition_from_search(&definition)?)?;
+                AnnMutation::Create(definition_from_search(&definition)?)
             }
-            Opcode::UpsertVector => {
-                state.upsert(
-                    index,
-                    decode_object_identity(&mutation.key)?,
-                    creating_csn,
-                    decode_vector_mutation(&mutation.value)?,
-                )?;
-            }
-            Opcode::DeleteVector => {
-                if !state.delete(index, decode_object_identity(&mutation.key)?)? {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
-            }
+            Opcode::UpsertVector => AnnMutation::Upsert(
+                decode_object_identity(&mutation.key)?,
+                decode_vector_mutation(&mutation.value)?,
+            ),
+            Opcode::DeleteVector => AnnMutation::Delete(decode_object_identity(&mutation.key)?),
             _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
-        }
-        touched.insert(index);
+        };
+        grouped.entry(index).or_default().push(operation);
+    }
+
+    for (index, mutations) in &mut grouped {
+        state.apply_batch(*index, creating_csn, std::mem::take(mutations))?;
     }
 
     validate_catalog_coverage(catalog, &state)?;
-    for index in touched {
+    for index in grouped.keys() {
         let snapshot = state
             .indexes
-            .get(&index)
+            .get(index)
             .ok_or(NativeRuntimeError::InvalidAnnTree)?
             .export_snapshot();
         tree = persist_generation(pages, tree, creating_csn, &snapshot)?;
