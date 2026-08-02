@@ -189,6 +189,10 @@ namespace:
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
 | `0x02` | prefix + binary hash key | `HYHSHM01` live-field count |
 | `0x03` | prefix + length-delimited hash key + field | persistent `HYSTRV01` field envelope |
+| `0x04` | prefix + binary set key | `HYSETM01` live-member count |
+| `0x05` | prefix + length-delimited set key + member | persistent empty `HYSTRV01` marker |
+| `0x06` | prefix + binary list key | `HYLSTM01` length and end-chunk IDs |
+| `0x07` | prefix + length-delimited list key + ordered chunk ID | `HYLSTC01` packed element envelopes |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
@@ -198,7 +202,9 @@ the buffer pool. Hash field changes rewrite their own field path plus the small
 hash metadata path rather than a whole serialized map. The current
 implementation has no general range/streaming cursor, expiry index/timing wheel,
 expected-version response, whole-hash deletion, or layouts for the remaining
-collection families.
+collection families. The admitted list layout rewrites metadata plus one
+packed end chunk per push/pop; its exact metadata, chunk, tombstone, and
+corruption rules are specified in the structure contract.
 
 ## Lexical-search namespace
 

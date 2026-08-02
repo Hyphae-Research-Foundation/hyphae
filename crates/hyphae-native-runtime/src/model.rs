@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hyphae_native_catalog::{
     CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
@@ -396,6 +396,14 @@ pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
     pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ListPop {
+    Missing,
+    Empty,
+    Value(Vec<u8>),
 }
 
 impl StructureState {
@@ -434,6 +442,7 @@ impl StructureState {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
+            || self.lists.contains_key(&key)
         {
             return false;
         }
@@ -468,6 +477,7 @@ impl StructureState {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
+            || self.lists.contains_key(&key)
         {
             return false;
         }
@@ -491,6 +501,63 @@ impl StructureState {
         self.sets.get(key).map(BTreeSet::len)
     }
 
+    pub(crate) fn create_list(&mut self, key: Vec<u8>) -> bool {
+        if self.entries.contains_key(&key)
+            || self.hashes.contains_key(&key)
+            || self.sets.contains_key(&key)
+            || self.lists.contains_key(&key)
+        {
+            return false;
+        }
+        self.lists.insert(key, VecDeque::new());
+        true
+    }
+
+    pub(crate) fn lpush(&mut self, key: &[u8], value: Vec<u8>) -> Option<usize> {
+        self.lists.get_mut(key).map(|values| {
+            values.push_front(value);
+            values.len()
+        })
+    }
+
+    pub(crate) fn rpush(&mut self, key: &[u8], value: Vec<u8>) -> Option<usize> {
+        self.lists.get_mut(key).map(|values| {
+            values.push_back(value);
+            values.len()
+        })
+    }
+
+    pub(crate) fn lpop(&mut self, key: &[u8]) -> ListPop {
+        match self.lists.get_mut(key) {
+            None => ListPop::Missing,
+            Some(values) => values.pop_front().map_or(ListPop::Empty, ListPop::Value),
+        }
+    }
+
+    pub(crate) fn rpop(&mut self, key: &[u8]) -> ListPop {
+        match self.lists.get_mut(key) {
+            None => ListPop::Missing,
+            Some(values) => values.pop_back().map_or(ListPop::Empty, ListPop::Value),
+        }
+    }
+
+    pub(crate) fn llen(&self, key: &[u8]) -> Option<usize> {
+        self.lists.get(key).map(VecDeque::len)
+    }
+
+    pub(crate) fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Option<Vec<Vec<u8>>> {
+        let values = self.lists.get(key)?;
+        let Some((start, stop)) = normalize_list_range(values.len(), start, stop) else {
+            return Some(Vec::new());
+        };
+        Some(
+            values
+                .range(start..=stop)
+                .cloned()
+                .collect::<Vec<Vec<u8>>>(),
+        )
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
         self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
@@ -502,7 +569,7 @@ impl StructureState {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
-        if !self.hashes.is_empty() || !self.sets.is_empty() {
+        if !self.hashes.is_empty() || !self.sets.is_empty() || !self.lists.is_empty() {
             return Err(ModelError::UnsupportedLegacyStructureFamily);
         }
         let mut bytes = Vec::new();
@@ -537,8 +604,26 @@ impl StructureState {
             entries,
             hashes: BTreeMap::new(),
             sets: BTreeMap::new(),
+            lists: BTreeMap::new(),
         })
     }
+}
+
+pub(crate) fn normalize_list_range(length: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
+    if length == 0 {
+        return None;
+    }
+    let length = i128::try_from(length).ok()?;
+    let normalize = |index: i64| {
+        let index = i128::from(index);
+        if index < 0 { length + index } else { index }
+    };
+    let start = normalize(start).max(0);
+    let stop = normalize(stop).min(length - 1);
+    if start >= length || stop < 0 || start > stop {
+        return None;
+    }
+    Some((usize::try_from(start).ok()?, usize::try_from(stop).ok()?))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

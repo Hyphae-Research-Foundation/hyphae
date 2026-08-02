@@ -92,7 +92,9 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE VALUE=8`, `EXPIRE VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`,
 `DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
 MEMBER=16`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN
-INDEX=17`, `UPSERT VECTOR=18`, `DELETE VECTOR=19`. `DELETE VALUE`, collection
+INDEX=17`, `UPSERT VECTOR=18`, `DELETE VECTOR=19`. The admitted list opcodes
+are structure `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`,
+`POP LIST HEAD=23`, and `POP LIST TAIL=24`. `DELETE VALUE`, collection
 creation, hash-field deletion, both set-member mutations, and vector deletion
 require an empty value and no expiry. `EXPIRE VALUE` requires an explicit
 expiry and carries the retained logical value.
@@ -118,6 +120,15 @@ by the member bytes. Conflict identities add disjoint scalar/collection,
 hash-field, and set-member domains, so arbitrary binary user keys cannot alias
 a member mutation. Set creation shares the scalar/collection ownership domain;
 different set members retain first-committer-wins independently.
+
+List mutation keys are the exact binary list key. Creation carries an empty
+value; pushes carry the inserted logical bytes; pops carry the exact removed
+logical bytes, including an allowed empty value. Expiry and target IDs are
+forbidden. WAL publication replaces each push/pop logical value with the same
+persistent `HYSTRV01` inline/blob envelope used by the physical chunk, making
+end-value verification content-bound without duplicating a large payload.
+Creation and every end mutation share the scalar/collection ownership conflict
+identity, so concurrent list writers retain first-committer-wins semantics.
 
 `CREATE ANN INDEX` carries the complete catalog `HYCOBJ01` search definition
 and normalized name identity. `UPSERT VECTOR` and `DELETE VECTOR` require a
