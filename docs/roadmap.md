@@ -29,6 +29,8 @@ Redb, or another database engine, and they are not projections of one another.
 The governing documents are:
 
 - [ADR-0020](adr/0020-native-local-data-ecosystem.md);
+- [ADR-0021](adr/0021-native-cutover-and-format-evolution.md);
+- [ADR-0022](adr/0022-cloud-ready-local-primitives.md);
 - [native local ecosystem architecture](architecture/native-local-ecosystem.md);
 - [microsecond-first performance contract](performance/microsecond-first.md);
   and

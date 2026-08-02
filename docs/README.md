@@ -174,6 +174,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0018: Deterministic hybrid retrieval](adr/0018-deterministic-hybrid-retrieval.md)
 - [ADR-0019: Finite resource policies](adr/0019-finite-resource-policies.md)
 - [ADR-0020: Native local data ecosystem](adr/0020-native-local-data-ecosystem.md)
+- [ADR-0021: Native cutover and format evolution](adr/0021-native-cutover-and-format-evolution.md)
+- [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 
 ## Documentation contract
 
