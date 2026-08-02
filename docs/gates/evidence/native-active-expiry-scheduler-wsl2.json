@@ -1,0 +1,89 @@
+{
+  "benchmark": "hyphae-native-active-expiry-scheduler-v1",
+  "source_commit": "cdc54068014f8f1e0dcd025715653622f2c0a8b5",
+  "source_tree": "32c13048069578cdb55278e747e75c62da764ca6",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "profile": "release",
+  "os": "linux",
+  "arch": "x86_64",
+  "kernel": "Linux 6.18.33.1-microsoft-standard-WSL2",
+  "source_mount": "/mnt/e",
+  "target_directory": "/tmp/hyphae-active-expiry-target",
+  "data_directory_parent": "/tmp",
+  "data_filesystem": "tmpfs",
+  "expiring_keys": 512,
+  "expiry_batch_keys": 64,
+  "expiry_interval_micros": 100,
+  "foreground_producers": 4,
+  "rounds_per_producer": 64,
+  "foreground_budget": 16,
+  "disabled": {
+    "foreground_commits": 256,
+    "foreground_wall_nanos": 180316867,
+    "foreground_commits_per_second": 1419.723,
+    "cleanup_nanos": null,
+    "cleanup_keys_per_second": null,
+    "final_fence_csn": 258,
+    "reopen_verified": true,
+    "foreground_latency": {
+      "end_to_end": {
+        "p50_nanos": 2194048,
+        "p95_nanos": 2642294,
+        "p99_nanos": 2927520,
+        "max_nanos": 2970708
+      },
+      "queue_wait": {
+        "p50_nanos": 310327,
+        "p95_nanos": 387504,
+        "p99_nanos": 520493,
+        "max_nanos": 595834
+      },
+      "execution": {
+        "p50_nanos": 1742989,
+        "p95_nanos": 2164512,
+        "p99_nanos": 2444820,
+        "max_nanos": 2444820
+      }
+    },
+    "active_expiry": null
+  },
+  "enabled": {
+    "foreground_commits": 256,
+    "foreground_wall_nanos": 165515570,
+    "foreground_commits_per_second": 1546.682,
+    "cleanup_nanos": 165515994,
+    "cleanup_keys_per_second": 3093.357,
+    "final_fence_csn": 266,
+    "reopen_verified": true,
+    "foreground_latency": {
+      "end_to_end": {
+        "p50_nanos": 1679265,
+        "p95_nanos": 4502609,
+        "p99_nanos": 5054276,
+        "max_nanos": 5068404
+      },
+      "queue_wait": {
+        "p50_nanos": 264660,
+        "p95_nanos": 3124687,
+        "p99_nanos": 3418702,
+        "max_nanos": 3423735
+      },
+      "execution": {
+        "p50_nanos": 1352760,
+        "p95_nanos": 1621622,
+        "p99_nanos": 1934187,
+        "max_nanos": 1934187
+      }
+    },
+    "active_expiry": {
+      "attempted_sweeps": 127,
+      "committed_sweeps": 8,
+      "expired_keys": 512,
+      "empty_sweeps": 119,
+      "failures": 0,
+      "latest_logical_time_micros": 1785677172844237,
+      "latest_sweep_nanos": 93276,
+      "max_foreground_after_due": 0
+    }
+  }
+}

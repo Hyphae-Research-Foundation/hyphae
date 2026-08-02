@@ -413,3 +413,15 @@ detectable.
 - `native-group-commit-wsl2.json` records the clean WSL2/v9fs comparison:
   1.654654 times strict throughput. Its sub-microsecond sync observations are
   explicitly not native-ext4 or physical power-loss evidence.
+
+## Native active expiry
+
+- `native-active-expiry-scheduler-2026-08-02.md` binds the optional
+  engine-owned timer, injected clock, bounded foreground fairness, strict and
+  memory cleanup, terminal failure, shutdown ordering, and recovery matrix to
+  exact source.
+- `native-active-expiry-scheduler-windows.json` records one optimized
+  Windows/NTFS enabled-versus-disabled observation over 512 due keys and 256
+  foreground commits.
+- `native-active-expiry-scheduler-wsl2.json` records the matched WSL2/tmpfs
+  observation. It is not native-ext4 or power-loss durability evidence.

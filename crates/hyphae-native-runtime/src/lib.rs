@@ -15,9 +15,12 @@ mod sql;
 mod wal_codec;
 
 pub use group_commit::{
+    ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
     CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
-    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitCancellation,
-    NativeCommitClient, NativeCommitControl, NativeCommitScheduler, ScheduledCommitReceipt,
+    MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET, MAX_ACTIVE_EXPIRY_INTERVAL,
+    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, MIN_ACTIVE_EXPIRY_INTERVAL,
+    NativeCommitCancellation, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
+    NativeSchedulerClock, ScheduledCommitReceipt,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -12263,7 +12266,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Barrier,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicI64, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -12279,13 +12282,14 @@ mod tests {
     use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
-        AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
-        CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
-        CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
-        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        CommitCancellationOutcome, EngineKind, GroupCommitBoundary, GroupCommitConfig,
-        GroupCommitOutcome, GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError,
-        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
+        ActiveExpiryConfig, ActiveExpiryFailure, AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY,
+        CATALOG_FORMAT_VALUE_V3, CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX,
+        CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE,
+        CATALOG_VALUE_MAGIC, CatalogName, CatalogObject, CatalogState, CheckpointBoundary,
+        ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
+        GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
+        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
+        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeSchedulerClock,
         NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
         RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
         SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
@@ -12297,6 +12301,24 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestSchedulerClock(AtomicI64);
+
+    impl TestSchedulerClock {
+        fn new(logical_time_micros: i64) -> Self {
+            Self(AtomicI64::new(logical_time_micros))
+        }
+
+        fn set(&self, logical_time_micros: i64) {
+            self.0.store(logical_time_micros, Ordering::Release);
+        }
+    }
+
+    impl NativeSchedulerClock for TestSchedulerClock {
+        fn logical_time_micros(&self) -> i64 {
+            self.0.load(Ordering::Acquire)
+        }
+    }
 
     fn recovered_commit(
         csn: u64,
@@ -17027,6 +17049,311 @@ mod tests {
             reopened.get_latest_structure(b"committed", 154)?,
             Some(b"yes".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_uses_one_csn_clamps_clock_and_leaves_empty_sweeps_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(b"active-expiry".to_vec(), b"value".to_vec(), Some(10))?;
+        let seed = seed.commit()?;
+        assert_eq!(seed.transaction_id, TransactionId::new(1)?);
+        assert_eq!(seed.commit_csn, Csn::new(1)?);
+        assert_eq!(database.get_latest_structure(b"active-expiry", 10)?, None);
+
+        let clock = Arc::new(TestSchedulerClock::new(10));
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
+            database,
+            GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
+            ActiveExpiryConfig::new(Duration::from_micros(100), 1, DurabilityClass::Memory, 1)?,
+            clock.clone(),
+        )?;
+        let first_deadline = Instant::now() + Duration::from_secs(2);
+        let first_stats = loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.expired_keys == 1 && stats.committed_sweeps == 1 {
+                break stats;
+            }
+            if Instant::now() >= first_deadline {
+                return Err("active expiry did not tombstone the due key".into());
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(first_stats.committed_sweeps, 1);
+        assert_eq!(first_stats.failures, 0);
+        assert_eq!(first_stats.latest_logical_time_micros, 10);
+
+        clock.set(5);
+        let regression_deadline = Instant::now() + Duration::from_secs(2);
+        let regression_stats = loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.attempted_sweeps > first_stats.attempted_sweeps && stats.empty_sweeps >= 1 {
+                break stats;
+            }
+            if Instant::now() >= regression_deadline {
+                return Err("active expiry did not attempt an empty sweep".into());
+            }
+            std::thread::yield_now();
+        };
+        assert!(regression_stats.empty_sweeps >= 1);
+        assert_eq!(regression_stats.latest_logical_time_micros, 10);
+
+        let mut later = scheduler.begin_optimistic(11, DurabilityClass::Strict)?;
+        later.set(b"after-active-expiry".to_vec(), b"visible".to_vec(), None)?;
+        let later = scheduler.submit(later)?;
+        assert_eq!(later.transaction_id, TransactionId::new(3)?);
+        assert_eq!(later.commit_csn, Csn::new(3)?);
+        scheduler.shutdown()?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.get_latest_structure(b"active-expiry", 11)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"after-active-expiry", 11)?,
+            Some(b"visible".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_bounds_continuous_group_load_and_recovers_strict_sweeps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const EXPIRED_KEYS: usize = 8;
+        const FOREGROUND_REQUESTS: usize = 12;
+        const FOREGROUND_BUDGET: usize = 4;
+
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        for key_index in 0..EXPIRED_KEYS {
+            seed.set(
+                format!("active-expiry-due-{key_index}").into_bytes(),
+                b"expired".to_vec(),
+                Some(10),
+            )?;
+        }
+        seed.commit()?;
+
+        let clock = Arc::new(TestSchedulerClock::new(10));
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
+            database,
+            GroupCommitConfig::new(4, Duration::from_millis(10), 32)?,
+            ActiveExpiryConfig::new(
+                Duration::from_millis(10),
+                2,
+                DurabilityClass::Strict,
+                FOREGROUND_BUDGET,
+            )?,
+            clock,
+        )?;
+        let client = scheduler.client();
+        let mut foreground_batches = Vec::with_capacity(FOREGROUND_REQUESTS);
+        for request_index in 0..FOREGROUND_REQUESTS {
+            let mut batch = client.begin_optimistic(10, DurabilityClass::Group)?;
+            batch.set(
+                format!("active-expiry-foreground-{request_index}").into_bytes(),
+                b"visible".to_vec(),
+                None,
+            )?;
+            foreground_batches.push(batch);
+        }
+        let worker_guard = client.block_worker_for_test()?;
+        let mut foreground = Vec::with_capacity(FOREGROUND_REQUESTS);
+        for batch in foreground_batches {
+            foreground.push(client.enqueue_for_test(batch)?);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        drop(worker_guard);
+
+        for outcome in foreground {
+            outcome.recv_timeout(Duration::from_secs(2))??;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stats = loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.expired_keys == u64::try_from(EXPIRED_KEYS)? && stats.committed_sweeps == 4 {
+                break stats;
+            }
+            if Instant::now() >= deadline {
+                return Err("strict active expiry did not drain bounded batches".into());
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(stats.committed_sweeps, 4);
+        assert!(stats.max_foreground_after_due > 0);
+        assert!(stats.max_foreground_after_due <= FOREGROUND_BUDGET);
+        scheduler.shutdown()?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        for key_index in 0..EXPIRED_KEYS {
+            assert_eq!(
+                reopened.get_latest_structure(
+                    format!("active-expiry-due-{key_index}").as_bytes(),
+                    11,
+                )?,
+                None
+            );
+        }
+        for request_index in 0..FOREGROUND_REQUESTS {
+            assert_eq!(
+                reopened.get_latest_structure(
+                    format!("active-expiry-foreground-{request_index}").as_bytes(),
+                    11,
+                )?,
+                Some(b"visible".to_vec())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_retains_terminal_failure_and_stops_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(b"active-expiry-failure".to_vec(), b"due".to_vec(), Some(10))?;
+        seed.commit()?;
+        let mut future = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        future.set(
+            b"active-expiry-after-failure".to_vec(),
+            b"rejected".to_vec(),
+            None,
+        )?;
+
+        let clock = Arc::new(TestSchedulerClock::new(10));
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock_at(
+            database,
+            GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
+            ActiveExpiryConfig::new(Duration::from_micros(100), 1, DurabilityClass::Strict, 1)?,
+            clock,
+            CommitBoundary::WalAppended,
+        )?;
+        let client = scheduler.client();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.failures == 1 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("active expiry failure did not stop the scheduler".into());
+            }
+            std::thread::yield_now();
+        }
+        let failure = scheduler
+            .active_expiry_failure()
+            .ok_or("active expiry terminal failure missing")?;
+        assert!(matches!(
+            failure,
+            ActiveExpiryFailure::Runtime { ref source }
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::InjectedCrash(CommitBoundary::WalAppended)
+                )
+        ));
+        assert!(matches!(
+            client.submit(future),
+            Err(GroupCommitSubmitError::Unavailable)
+        ));
+        assert!(matches!(
+            scheduler.shutdown(),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::InjectedCrash(CommitBoundary::WalAppended)
+                )
+        ));
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        let mut recovery = reopened.begin(11, DurabilityClass::Strict)?;
+        recovery.set(
+            b"active-expiry-recovered".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        recovery.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_marker_drains_foreground_without_starting_a_due_sweep()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(
+            b"active-expiry-shutdown-due".to_vec(),
+            b"expired".to_vec(),
+            Some(10),
+        )?;
+        seed.commit()?;
+        let mut foreground = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        foreground.set(
+            b"active-expiry-shutdown-foreground".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
+            database,
+            GroupCommitConfig::new(4, Duration::from_millis(10), 8)?,
+            ActiveExpiryConfig::new(Duration::from_secs(1), 1, DurabilityClass::Memory, 1)?,
+            Arc::new(TestSchedulerClock::new(10)),
+        )?;
+        let client = scheduler.client();
+        let worker_guard = client.block_worker_for_test()?;
+        assert_eq!(
+            scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing before shutdown")?
+                .attempted_sweeps,
+            0
+        );
+        let foreground = client.enqueue_for_test(foreground)?;
+        std::thread::sleep(Duration::from_millis(1_100));
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let shutdown = scope.spawn(move || scheduler.shutdown());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while client.accepting_for_test()? {
+                if Instant::now() >= deadline {
+                    return Err("shutdown did not stop admission before its marker".into());
+                }
+                std::thread::yield_now();
+            }
+            drop(worker_guard);
+            let foreground = foreground.recv_timeout(Duration::from_secs(2))??;
+            assert_eq!(foreground.transaction_id, TransactionId::new(2)?);
+            shutdown
+                .join()
+                .map_err(|_| "active expiry shutdown thread panicked")??;
+            Ok(())
+        })?;
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"active-expiry-shutdown-foreground", 11)?,
+            Some(b"visible".to_vec())
+        );
+        let mut after = reopened.begin(11, DurabilityClass::Strict)?;
+        after.set(
+            b"active-expiry-after-shutdown".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        let after = after.commit()?;
+        assert_eq!(after.transaction_id, TransactionId::new(3)?);
+        assert_eq!(after.commit_csn, Csn::new(3)?);
         Ok(())
     }
 
