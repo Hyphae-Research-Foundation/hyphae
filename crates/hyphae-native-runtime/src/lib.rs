@@ -573,6 +573,10 @@ pub struct StructureCompactionReceipt {
     pub retained_entries: usize,
     /// Canonical tombstone entries omitted from the replacement root.
     pub dropped_tombstones: usize,
+    /// B+tree node pages reachable from the captured root.
+    pub reachable_pages_before: usize,
+    /// B+tree node pages reachable from the resulting current root.
+    pub reachable_pages_after: usize,
     /// New B+tree pages appended for the replacement root.
     pub pages_appended: u64,
     /// Native maintenance commit, absent when no tombstone existed.
@@ -1805,16 +1809,21 @@ impl NativeDatabase {
                 scanned_entries: 0,
                 retained_entries: 0,
                 dropped_tombstones: 0,
+                reachable_pages_before: 0,
+                reachable_pages_after: 0,
                 pages_appended: 0,
                 commit: None,
             });
         };
         let plan = plan_structure_compaction(&self.pages, &self.blobs, root)?;
+        let reachable_pages_before = BTree::from_root(root).reachable_page_count(&self.pages)?;
         if plan.dropped_tombstones == 0 {
             return Ok(StructureCompactionReceipt {
                 scanned_entries: plan.scanned_entries,
                 retained_entries: plan.retained_entries.len(),
                 dropped_tombstones: 0,
+                reachable_pages_before,
+                reachable_pages_after: reachable_pages_before,
                 pages_appended: 0,
                 commit: None,
             });
@@ -1866,10 +1875,20 @@ impl NativeDatabase {
             .page_count()
             .checked_sub(pages_before)
             .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let compacted_root = self
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let reachable_pages_after =
+            BTree::from_root(compacted_root).reachable_page_count(&self.pages)?;
         Ok(StructureCompactionReceipt {
             scanned_entries: plan.scanned_entries,
             retained_entries: plan.retained_entries.len(),
             dropped_tombstones: plan.dropped_tombstones,
+            reachable_pages_before,
+            reachable_pages_after,
             pages_appended,
             commit: Some(commit),
         })
@@ -10336,6 +10355,8 @@ mod tests {
             receipt.retained_entries,
             before_entries.len() - before_tombstones
         );
+        assert!(receipt.reachable_pages_before >= receipt.reachable_pages_after);
+        assert!(receipt.reachable_pages_after > 0);
         assert!(receipt.pages_appended > 0);
         assert!(receipt.commit.is_some());
         let after_snapshot = database.snapshot(100)?;
@@ -10405,6 +10426,8 @@ mod tests {
                 scanned_entries: 0,
                 retained_entries: 0,
                 dropped_tombstones: 0,
+                reachable_pages_before: 0,
+                reachable_pages_after: 0,
                 pages_appended: 0,
                 commit: None,
             }

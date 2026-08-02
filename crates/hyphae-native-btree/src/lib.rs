@@ -158,6 +158,24 @@ impl BTree {
         Ok(validate_node(store, root, None, 0, &mut visited)?.height)
     }
 
+    /// Verifies the complete tree and returns its reachable node-page count.
+    ///
+    /// Superseded copy-on-write pages that are no longer reachable from this
+    /// root are deliberately excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any corruption, cycle, unbalanced leaf depth, or
+    /// excessive height.
+    pub fn reachable_page_count(self, store: &PageStore) -> Result<usize, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(0);
+        };
+        let mut visited = BTreeSet::new();
+        validate_node(store, root, None, 0, &mut visited)?;
+        Ok(visited.len())
+    }
+
     /// Performs a binary point lookup.
     ///
     /// # Errors
@@ -2146,6 +2164,10 @@ mod tests {
 
         assert_eq!(u64::try_from(batch.pages_written)?, store.page_count());
         assert!(batch.tree.height(&store)? >= 2);
+        assert_eq!(
+            batch.tree.reachable_page_count(&store)?,
+            batch.pages_written
+        );
         assert_eq!(batch.tree.validate(&store)?, 4_096);
         for index in [0_u32, 1, 2_047, 4_095] {
             assert_eq!(

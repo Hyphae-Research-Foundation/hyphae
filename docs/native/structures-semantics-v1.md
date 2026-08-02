@@ -430,11 +430,11 @@ published under one new global CSN. Writer admission requires the captured
 root set to remain current; otherwise the operation fails for retry instead of
 compacting stale state.
 
-The receipt reports scanned, retained, and dropped physical entries, appended
-pages, and the optional commit receipt. The pre-compaction snapshot and root
-remain readable and reconstruct the same logical structure state as the new
-root. Every commit interruption recovers either the prior root or the complete
-replacement root.
+The receipt reports scanned, retained, and dropped physical entries, reachable
+node pages before and after, appended pages, and the optional commit receipt.
+The pre-compaction snapshot and root remain readable and reconstruct the same
+logical structure state as the new root. Every commit interruption recovers
+either the prior root or the complete replacement root.
 
 This operation removes tombstones from the current reachable tree but does not
 shrink the append-only `pages.hydb` file. Older roots and immutable manifests
