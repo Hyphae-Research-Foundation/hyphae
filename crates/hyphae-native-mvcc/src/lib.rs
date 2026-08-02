@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, RwLock},
 };
 
-use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, PageId};
+use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, PageGeneration, PageId};
 use thiserror::Error;
 
 /// One logical write-conflict namespace entry.
@@ -144,6 +144,9 @@ pub enum MvccError {
     /// A recovered root set is not anchored to a committed WAL record.
     #[error("native MVCC recovered root set is not committed")]
     UncommittedRootSet,
+    /// Page generation or retention-floor publication is invalid.
+    #[error("native MVCC page generation or retention floor is invalid")]
+    InvalidStorageTransition,
 }
 
 /// WAL identity required before a root set can be published.
@@ -186,6 +189,8 @@ pub struct RootSet {
     wal_anchor: Option<WalAnchor>,
     roots: BTreeMap<RootSlot, PageId>,
     blob_generation: u64,
+    page_generation: PageGeneration,
+    retention_floor_csn: Option<Csn>,
     digest: [u8; 32],
 }
 
@@ -198,6 +203,8 @@ impl RootSet {
             wal_anchor: None,
             roots: BTreeMap::new(),
             blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: None,
             digest: [0; 32],
         };
         root.digest = root.compute_digest();
@@ -216,8 +223,38 @@ impl RootSet {
         roots: BTreeMap<RootSlot, PageId>,
         blob_generation: u64,
     ) -> Result<Self, MvccError> {
+        Self::committed_with_storage(
+            visible_csn,
+            catalog_version,
+            wal_anchor,
+            roots,
+            blob_generation,
+            PageGeneration::FIRST,
+            Csn::FIRST,
+        )
+    }
+
+    /// Constructs a recovered committed root set with explicit page storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid WAL anchor or a retention floor newer
+    /// than the visible commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn committed_with_storage(
+        visible_csn: Csn,
+        catalog_version: CatalogVersion,
+        wal_anchor: WalAnchor,
+        roots: BTreeMap<RootSlot, PageId>,
+        blob_generation: u64,
+        page_generation: PageGeneration,
+        retention_floor_csn: Csn,
+    ) -> Result<Self, MvccError> {
         if wal_anchor.digest == [0; 32] {
             return Err(MvccError::InvalidWalAnchor);
+        }
+        if retention_floor_csn > visible_csn {
+            return Err(MvccError::InvalidStorageTransition);
         }
         let mut root = Self {
             visible_csn: Some(visible_csn),
@@ -225,6 +262,8 @@ impl RootSet {
             wal_anchor: Some(wal_anchor),
             roots,
             blob_generation,
+            page_generation,
+            retention_floor_csn: Some(retention_floor_csn),
             digest: [0; 32],
         };
         root.digest = root.compute_digest();
@@ -261,6 +300,16 @@ impl RootSet {
         self.blob_generation
     }
 
+    /// Returns the immutable page-file generation.
+    pub const fn page_generation(&self) -> PageGeneration {
+        self.page_generation
+    }
+
+    /// Returns the oldest physical root that remains reopenable.
+    pub const fn retention_floor_csn(&self) -> Option<Csn> {
+        self.retention_floor_csn
+    }
+
     /// Returns the complete canonical root-set digest.
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
@@ -283,6 +332,15 @@ impl RootSet {
             hasher.update(&[slot.engine as u8]);
             hasher.update(&slot.partition.to_le_bytes());
             hasher.update(&page.get().to_le_bytes());
+        }
+        if self.page_generation != PageGeneration::FIRST
+            || self
+                .retention_floor_csn
+                .is_some_and(|floor| floor != Csn::FIRST)
+        {
+            hasher.update(b"hyphae-native-page-storage-v1");
+            hasher.update(&self.page_generation.get().to_le_bytes());
+            hasher.update(&self.retention_floor_csn.map_or(0, Csn::get).to_le_bytes());
         }
         *hasher.finalize().as_bytes()
     }
@@ -401,6 +459,8 @@ impl CommitCoordinator {
             base,
             roots,
             blob_generation: None,
+            page_generation: None,
+            retention_floor_csn: None,
         })
     }
 }
@@ -413,6 +473,8 @@ pub struct RootTransaction<'coordinator> {
     base: Arc<RootSet>,
     roots: BTreeMap<RootSlot, PageId>,
     blob_generation: Option<u64>,
+    page_generation: Option<PageGeneration>,
+    retention_floor_csn: Option<Csn>,
 }
 
 impl RootTransaction<'_> {
@@ -463,6 +525,16 @@ impl RootTransaction<'_> {
         self.blob_generation = Some(generation);
     }
 
+    /// Stages one page-file generation replacement.
+    pub fn set_page_generation(&mut self, generation: PageGeneration) {
+        self.page_generation = Some(generation);
+    }
+
+    /// Stages the oldest physical commit retained after publication.
+    pub fn set_retention_floor(&mut self, floor: Csn) {
+        self.retention_floor_csn = Some(floor);
+    }
+
     /// Publishes every staged root under one commit sequence.
     ///
     /// The caller must supply an already durable WAL anchor according to the
@@ -486,12 +558,32 @@ impl RootTransaction<'_> {
             .next_csn
             .checked_add(1)
             .ok_or(MvccError::CsnExhausted)?;
-        let root = RootSet::committed(
+        let page_generation = self.page_generation.unwrap_or(self.base.page_generation());
+        let base_floor = self.base.retention_floor_csn();
+        let retention_floor_csn = self
+            .retention_floor_csn
+            .or(base_floor)
+            .unwrap_or(commit_csn);
+        let generation_changed = page_generation != self.base.page_generation();
+        let valid_transition = if self.base.visible_csn().is_none() {
+            page_generation == PageGeneration::FIRST && retention_floor_csn == commit_csn
+        } else if generation_changed {
+            self.base.page_generation().checked_next() == Some(page_generation)
+                && retention_floor_csn == commit_csn
+        } else {
+            base_floor == Some(retention_floor_csn)
+        };
+        if !valid_transition {
+            return Err(MvccError::InvalidStorageTransition);
+        }
+        let root = RootSet::committed_with_storage(
             commit_csn,
             catalog_version,
             wal_anchor,
             self.roots,
             self.blob_generation.unwrap_or(self.base.blob_generation()),
+            page_generation,
+            retention_floor_csn,
         )?;
         let published = Arc::new(root);
         *self
@@ -506,9 +598,13 @@ impl RootTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, ObjectId, PageId};
+    use hyphae_native_types::{
+        CatalogVersion, Csn, EngineKind, Lsn, ObjectId, PageGeneration, PageId,
+    };
 
-    use super::{CommitCoordinator, ConflictTable, RootSlot, VersionWindow, WalAnchor, WriteKey};
+    use super::{
+        CommitCoordinator, ConflictTable, MvccError, RootSlot, VersionWindow, WalAnchor, WriteKey,
+    };
 
     fn wal_anchor(lsn: u64, marker: u8) -> Result<WalAnchor, Box<dyn std::error::Error>> {
         WalAnchor::new(Lsn::new(lsn)?, [marker; 32]).map_err(Into::into)
@@ -560,6 +656,76 @@ mod tests {
             assert!(published.root(slot).is_some());
         }
         assert_eq!(published.visible_csn().map(Csn::get), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn page_generation_transition_advances_retention_floor_with_one_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let coordinator = CommitCoordinator::new(CatalogVersion::new(1)?);
+        let mut initial = coordinator.begin_write()?;
+        initial.set_root(
+            RootSlot {
+                engine: EngineKind::Relational,
+                partition: 0,
+            },
+            PageId::new(7)?,
+        );
+        initial.commit(CatalogVersion::new(1)?, wal_anchor(112, 4)?)?;
+
+        let mut vacuum = coordinator.begin_write()?;
+        let vacuum_csn = vacuum.commit_csn()?;
+        vacuum.set_root(
+            RootSlot {
+                engine: EngineKind::Relational,
+                partition: 0,
+            },
+            PageId::new(1)?,
+        );
+        vacuum.set_page_generation(PageGeneration::new(2)?);
+        vacuum.set_retention_floor(vacuum_csn);
+        let published = vacuum.commit(CatalogVersion::new(1)?, wal_anchor(224, 5)?)?;
+
+        assert_eq!(published.visible_csn(), Some(vacuum_csn));
+        assert_eq!(published.page_generation().get(), 2);
+        assert_eq!(published.retention_floor_csn(), Some(vacuum_csn));
+        Ok(())
+    }
+
+    #[test]
+    fn page_generation_transition_rejects_skips_and_floor_only_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn committed_coordinator() -> Result<CommitCoordinator, Box<dyn std::error::Error>> {
+            let coordinator = CommitCoordinator::new(CatalogVersion::new(1)?);
+            let mut initial = coordinator.begin_write()?;
+            initial.set_root(
+                RootSlot {
+                    engine: EngineKind::Relational,
+                    partition: 0,
+                },
+                PageId::new(7)?,
+            );
+            initial.commit(CatalogVersion::new(1)?, wal_anchor(112, 6)?)?;
+            Ok(coordinator)
+        }
+
+        let skipped = committed_coordinator()?;
+        let mut transaction = skipped.begin_write()?;
+        let commit_csn = transaction.commit_csn()?;
+        transaction.set_page_generation(PageGeneration::new(3)?);
+        transaction.set_retention_floor(commit_csn);
+        assert_eq!(
+            transaction.commit(CatalogVersion::new(1)?, wal_anchor(224, 7)?),
+            Err(MvccError::InvalidStorageTransition)
+        );
+
+        let floor_only = committed_coordinator()?;
+        let mut transaction = floor_only.begin_write()?;
+        transaction.set_retention_floor(transaction.commit_csn()?);
+        assert_eq!(
+            transaction.commit(CatalogVersion::new(1)?, wal_anchor(224, 8)?),
+            Err(MvccError::InvalidStorageTransition)
+        );
         Ok(())
     }
 
