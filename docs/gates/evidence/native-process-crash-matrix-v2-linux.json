@@ -1,0 +1,94 @@
+{
+  "schema": "hyphae.native.process-crash-matrix.v2",
+  "status": "process-crash-not-power-loss",
+  "source_commit": "6446baab44844a7d03c5e2878bcc1e8d780000de",
+  "environment": "aws-m6i.2xlarge-ext4-ebs",
+  "target": "x86_64-linux",
+  "durability": "strict",
+  "all_engine_csn": 1,
+  "commit_boundaries": [
+    {
+      "boundary": "blob-staged",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "blob-promoted",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-appended",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-synchronized",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-appended",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-synchronized",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "root-published",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    }
+  ],
+  "checkpoint_boundaries": [
+    {
+      "boundary": "manifest-staged",
+      "manifest_count": 0,
+      "checkpoint_count": 0,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "manifest-published",
+      "manifest_count": 1,
+      "checkpoint_count": 0,
+      "unanchored_manifest_suffix": 1,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-appended",
+      "manifest_count": 1,
+      "checkpoint_count": 1,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-synchronized",
+      "manifest_count": 1,
+      "checkpoint_count": 1,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    }
+  ]
+}

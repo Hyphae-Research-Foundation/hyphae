@@ -501,3 +501,12 @@ detectable.
 - `native-process-crash-matrix-linux.json` is the exact release receipt from
   AWS Linux/ext4. It is process-crash evidence, not sector, filesystem
   reordering, device-cache, EC2-stop, or physical power-loss evidence.
+
+## Native checkpoint process crash matrix on Linux
+
+- `native-checkpoint-process-crash-linux-2026-08-02.md` extends the live
+  writer-lock/`SIGKILL` harness to staged manifest, published manifest,
+  appended checkpoint WAL, and synchronized checkpoint WAL boundaries.
+- `native-process-crash-matrix-v2-linux.json` preserves the prior seven
+  singleton results and records four checkpoint authority outcomes. It
+  remains process-crash evidence, not physical power-loss evidence.

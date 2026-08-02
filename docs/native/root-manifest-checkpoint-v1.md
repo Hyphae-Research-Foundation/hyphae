@@ -150,6 +150,10 @@ Deterministic tests reopen after:
 - checkpoint-record synchronization.
 
 The first state removes one temporary stage. The second reports one unanchored
-manifest suffix. The latter two recover the checkpoint in the in-process test
-harness. Sector-level power loss, filesystem reordering, and device-cache
-behavior require a separate physical crash harness.
+manifest suffix. The latter two recover the checkpoint. In addition to the
+deterministic in-process tests, the direct-Linux process-crash harness now
+holds the writer lock until the parent sends `SIGKILL` at each of these four
+boundaries, then verifies the exact manifest/checkpoint authority counts and
+complete all-engine CSN after reopen. Sector-level power loss, filesystem
+reordering, and device-cache behavior still require a separate physical crash
+harness.

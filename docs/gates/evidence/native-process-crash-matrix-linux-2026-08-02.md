@@ -130,8 +130,8 @@ This result therefore does not establish behavior under:
 
 - lost device-cache writes, torn sectors, or filesystem reordering;
 - EC2 stop, host failure, EBS failure, or detached-volume recovery;
-- process kill during checkpoint, retention, vacuum, blob collection, group
-  commit, or migration;
+- process kill during retention, vacuum, blob collection, group commit, or
+  migration;
 - resource exhaustion, read-only remount, I/O error injection, or disk full;
   or
 - multi-process readers, UDS transport, backup/restore, or independent restore.
@@ -139,3 +139,7 @@ This result therefore does not establish behavior under:
 This closes neither G1 nor G8. It advances the singleton commit portion of the
 G1 crash lane and replaces an in-process-only claim with exact process-level
 evidence on the current Linux development host.
+
+A later [schema-v2 follow-up](native-checkpoint-process-crash-linux-2026-08-02.md)
+adds four live checkpoint-process kills while preserving these seven singleton
+results.
