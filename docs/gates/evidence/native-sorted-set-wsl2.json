@@ -1,0 +1,45 @@
+{
+  "schema": "hyphae-native-sorted-set-smoke-v1",
+  "status": "observation-not-gate",
+  "source_commit": "ae1af265b7c879a65874a47c2438860b60c820cb",
+  "source_tree": "13c1c20f701806147d58873a09228bb63c7e2fd5",
+  "environment": "WSL2 Debian 13; Linux 6.18.33.1; Intel Core Ultra 9 285H; 16 vCPUs; rustc 1.96.0; single-thread warm-state",
+  "profile": "release",
+  "durability": "strict-seed-and-reopen",
+  "warm_state": true,
+  "concurrency": 1,
+  "observations_per_route": 100000,
+  "warmup_per_route": 10000,
+  "point_operations_per_observation": 16,
+  "range_operations_per_observation": 1,
+  "members": 2048,
+  "member_bytes": 64,
+  "dataset_digest_blake3": "b9dd892604bceb9c03720bf0f0322a1b18148ae3cc6cbf4c8d988697da2b71ab",
+  "structure_tree_height": 2,
+  "routes": {
+    "physical_zcard": {
+      "p50_ns": 502,
+      "p95_ns": 571,
+      "p99_ns": 1290,
+      "p99_9_ns": 5111,
+      "maximum_ns": 72248,
+      "throughput_ops_s": 1843462.245
+    },
+    "physical_zscore_middle": {
+      "p50_ns": 1044,
+      "p95_ns": 1195,
+      "p99_ns": 2516,
+      "p99_9_ns": 7297,
+      "maximum_ns": 195446,
+      "throughput_ops_s": 897449.750
+    },
+    "physical_zrange_head_10": {
+      "p50_ns": 12057,
+      "p95_ns": 14845,
+      "p99_ns": 29731,
+      "p99_9_ns": 107586,
+      "maximum_ns": 356815,
+      "throughput_ops_s": 77023.105
+    }
+  }
+}

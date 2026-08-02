@@ -228,6 +228,14 @@ commit before its tag can be published.
 - `native-list-wsl2.json` is its clean release observation for physical
   `LLEN` and ten-element ranges from both ends of a 2,048-element list. It
   remains outside G3 and G7.
+- [Native dual-index sorted-set evidence —
+  2026-08-01](native-sorted-set-2026-08-01.md) binds canonical binary64
+  ordering, exact member and ordered physical indexes, member-level FCW,
+  retained snapshots, corruption rejection, and all seven crash boundaries
+  to one source commit.
+- `native-sorted-set-wsl2.json` is its clean release observation for physical
+  `ZCARD`, middle-member `ZSCORE`, and ten-entry head `ZRANGE` over 2,048
+  members. It remains outside G3 and G7.
 
 ## Hosted release evidence
 
