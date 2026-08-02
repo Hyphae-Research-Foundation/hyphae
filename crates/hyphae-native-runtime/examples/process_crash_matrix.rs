@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-level crash matrix for the first all-engine native commit.
+//! Process-level crash matrix for native singleton commit and checkpoint paths.
 //!
-//! The parent starts one child per commit boundary. The child reaches the
-//! deterministic boundary while retaining the database handle and writer lock,
-//! signals readiness through stdout, and parks. The parent then hard-kills the
-//! child, reopens the directory, and requires either the complete prior state
-//! or the complete committed CSN across relational, structure, and lexical
-//! reads.
+//! The parent starts one child per boundary. The child reaches the deterministic
+//! interruption while retaining the database handle and writer lock, signals
+//! readiness through stdout, and parks. The parent then hard-kills the child,
+//! reopens the directory, and validates transaction atomicity plus checkpoint
+//! manifest/WAL authority.
 
 use std::{
     error::Error,
@@ -21,18 +20,20 @@ use std::{
 };
 
 use hyphae_native_runtime::{
-    CommitBoundary, NativeDatabase, NativeRuntimeError, NativeTransaction, Ttl,
+    CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, NativeTransaction, Ttl,
 };
 use hyphae_native_types::{Csn, DurabilityClass, ObjectId};
 
 const CHILD_MODE: &str = "--child";
 const READY_PREFIX: &str = "hyphae-native-crash-ready:";
+const COMMIT_FAMILY: &str = "commit";
+const CHECKPOINT_FAMILY: &str = "checkpoint";
 const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
 const TABLE_ID: u128 = 1;
 const SEARCH_INDEX_ID: u128 = 2;
 
-const BOUNDARIES: [(&str, CommitBoundary); 7] = [
+const COMMIT_BOUNDARIES: [(&str, CommitBoundary); 7] = [
     ("blob-staged", CommitBoundary::BlobStaged),
     ("blob-promoted", CommitBoundary::BlobPromoted),
     ("page-appended", CommitBoundary::PageAppended),
@@ -40,6 +41,13 @@ const BOUNDARIES: [(&str, CommitBoundary); 7] = [
     ("wal-appended", CommitBoundary::WalAppended),
     ("wal-synchronized", CommitBoundary::WalSynchronized),
     ("root-published", CommitBoundary::RootPublished),
+];
+
+const CHECKPOINT_BOUNDARIES: [(&str, CheckpointBoundary); 4] = [
+    ("manifest-staged", CheckpointBoundary::ManifestStaged),
+    ("manifest-published", CheckpointBoundary::ManifestPublished),
+    ("wal-appended", CheckpointBoundary::WalAppended),
+    ("wal-synchronized", CheckpointBoundary::WalSynchronized),
 ];
 
 struct TemporaryDirectory(PathBuf);
@@ -64,11 +72,20 @@ impl Drop for TemporaryDirectory {
     }
 }
 
-struct BoundaryObservation {
+struct CommitObservation {
     name: &'static str,
     expected_state: &'static str,
     recovered_csn: Option<u64>,
     recovered_blob_count: usize,
+    termination: String,
+}
+
+struct CheckpointObservation {
+    name: &'static str,
+    manifest_count: usize,
+    checkpoint_count: usize,
+    unanchored_manifest_suffix: usize,
+    recovered_temporary_manifests: usize,
     termination: String,
 }
 
@@ -79,6 +96,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .ok_or_else(|| failure("missing source commit or child mode"))?;
     if first == CHILD_MODE {
+        let family = arguments
+            .next()
+            .ok_or_else(|| failure("child mode requires a boundary family"))?
+            .into_string()
+            .map_err(|_| failure("boundary family is not valid UTF-8"))?;
         let directory = arguments
             .next()
             .ok_or_else(|| failure("child mode requires a data directory"))?;
@@ -88,7 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into_string()
             .map_err(|_| failure("boundary is not valid UTF-8"))?;
         require_no_remaining(arguments)?;
-        return run_child(Path::new(&directory), &boundary);
+        return run_child(&family, Path::new(&directory), &boundary);
     }
 
     let source_commit = first
@@ -114,8 +136,22 @@ fn require_no_remaining(
     Ok(())
 }
 
-fn run_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
-    let boundary = parse_boundary(boundary_name)
+fn run_child(family: &str, directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
+    match family {
+        COMMIT_FAMILY => run_commit_child(directory, boundary_name)?,
+        CHECKPOINT_FAMILY => run_checkpoint_child(directory, boundary_name)?,
+        other => return Err(failure(format!("unknown boundary family: {other}"))),
+    }
+
+    println!("{READY_PREFIX}{family}:{boundary_name}");
+    io::stdout().flush()?;
+    loop {
+        thread::park();
+    }
+}
+
+fn run_commit_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
+    let boundary = parse_commit_boundary(boundary_name)
         .ok_or_else(|| failure(format!("unknown commit boundary: {boundary_name}")))?;
     let mut database = NativeDatabase::create(directory)?;
     let transaction = stage_vertical(&mut database)?;
@@ -127,46 +163,51 @@ fn run_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>
             )));
         }
     }
+    Ok(())
+}
 
-    println!("{READY_PREFIX}{boundary_name}");
-    io::stdout().flush()?;
-    loop {
-        thread::park();
+fn run_checkpoint_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
+    let boundary = parse_checkpoint_boundary(boundary_name)
+        .ok_or_else(|| failure(format!("unknown checkpoint boundary: {boundary_name}")))?;
+    let mut database = NativeDatabase::open(directory)?;
+    match database.checkpoint_with_interruption(boundary) {
+        Err(NativeRuntimeError::InjectedCheckpointCrash(found)) if found == boundary => {}
+        other => {
+            return Err(failure(format!(
+                "checkpoint boundary {boundary_name} returned an unexpected result: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 fn run_parent(source_commit: &str, environment: &str) -> Result<(), Box<dyn Error>> {
     let executable = std::env::current_exe()?;
     let temporary = TemporaryDirectory::create()?;
     fs::create_dir_all(temporary.path())?;
-    let mut observations = Vec::with_capacity(BOUNDARIES.len());
+    let commit_observations = run_commit_matrix(&executable, temporary.path())?;
+    let checkpoint_observations = run_checkpoint_matrix(&executable, temporary.path())?;
+    print_receipt(
+        source_commit,
+        environment,
+        &commit_observations,
+        &checkpoint_observations,
+    );
+    Ok(())
+}
 
-    for (name, boundary) in BOUNDARIES {
-        let directory = temporary.path().join(name);
-        let mut child = Command::new(&executable)
-            .arg(CHILD_MODE)
-            .arg(&directory)
-            .arg(name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let ready = wait_for_child_ready(&mut child)?;
-        let expected_ready = format!("{READY_PREFIX}{name}");
-        if ready.trim_end() != expected_ready {
-            stop_child(&mut child);
-            return Err(failure(format!(
-                "boundary {name} emitted unexpected readiness: {ready:?}"
-            )));
-        }
-
-        child.kill()?;
-        let status = child.wait()?;
-        let termination = validate_hard_kill(name, status)?;
+fn run_commit_matrix(
+    executable: &Path,
+    root: &Path,
+) -> Result<Vec<CommitObservation>, Box<dyn Error>> {
+    let mut observations = Vec::with_capacity(COMMIT_BOUNDARIES.len());
+    for (name, boundary) in COMMIT_BOUNDARIES {
+        let directory = root.join(format!("{COMMIT_FAMILY}-{name}"));
+        let termination = kill_child_at_boundary(executable, COMMIT_FAMILY, &directory, name)?;
         let database = NativeDatabase::open(&directory)?;
         let expected_complete = expects_complete_state(boundary);
         validate_recovered_state(&database, expected_complete)?;
-        observations.push(BoundaryObservation {
+        observations.push(CommitObservation {
             name,
             expected_state: if expected_complete {
                 "complete-csn-1"
@@ -178,9 +219,67 @@ fn run_parent(source_commit: &str, environment: &str) -> Result<(), Box<dyn Erro
             termination,
         });
     }
+    Ok(observations)
+}
 
-    print_receipt(source_commit, environment, &observations);
+fn run_checkpoint_matrix(
+    executable: &Path,
+    root: &Path,
+) -> Result<Vec<CheckpointObservation>, Box<dyn Error>> {
+    let mut observations = Vec::with_capacity(CHECKPOINT_BOUNDARIES.len());
+    for (name, boundary) in CHECKPOINT_BOUNDARIES {
+        let directory = root.join(format!("{CHECKPOINT_FAMILY}-{name}"));
+        seed_checkpoint_directory(&directory)?;
+        let termination = kill_child_at_boundary(executable, CHECKPOINT_FAMILY, &directory, name)?;
+        let database = NativeDatabase::open(&directory)?;
+        validate_recovered_state(&database, true)?;
+        validate_checkpoint_recovery(&database, boundary)?;
+        let report = database.recovery_report();
+        observations.push(CheckpointObservation {
+            name,
+            manifest_count: report.manifest_count,
+            checkpoint_count: report.checkpoint_count,
+            unanchored_manifest_suffix: report.unanchored_manifest_suffix,
+            recovered_temporary_manifests: report.recovered_temporary_manifests,
+            termination,
+        });
+    }
+    Ok(observations)
+}
+
+fn seed_checkpoint_directory(directory: &Path) -> Result<(), Box<dyn Error>> {
+    let mut database = NativeDatabase::create(directory)?;
+    stage_vertical(&mut database)?.commit()?;
     Ok(())
+}
+
+fn kill_child_at_boundary(
+    executable: &Path,
+    family: &str,
+    directory: &Path,
+    name: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut child = Command::new(executable)
+        .arg(CHILD_MODE)
+        .arg(family)
+        .arg(directory)
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let ready = wait_for_child_ready(&mut child)?;
+    let expected_ready = format!("{READY_PREFIX}{family}:{name}");
+    if ready.trim_end() != expected_ready {
+        stop_child(&mut child);
+        return Err(failure(format!(
+            "{family} boundary {name} emitted unexpected readiness: {ready:?}"
+        )));
+    }
+
+    child.kill()?;
+    let status = child.wait()?;
+    validate_hard_kill(&format!("{family}:{name}"), status)
 }
 
 fn stage_vertical(database: &mut NativeDatabase) -> Result<NativeTransaction<'_>, Box<dyn Error>> {
@@ -245,6 +344,30 @@ fn validate_recovered_state(
     Ok(())
 }
 
+fn validate_checkpoint_recovery(
+    database: &NativeDatabase,
+    boundary: CheckpointBoundary,
+) -> Result<(), Box<dyn Error>> {
+    let report = database.recovery_report();
+    let expected = match boundary {
+        CheckpointBoundary::ManifestStaged => (0, 0, 0, 1),
+        CheckpointBoundary::ManifestPublished => (1, 0, 1, 0),
+        CheckpointBoundary::WalAppended | CheckpointBoundary::WalSynchronized => (1, 1, 0, 0),
+    };
+    require_equal("manifest count", &report.manifest_count, &expected.0)?;
+    require_equal("checkpoint count", &report.checkpoint_count, &expected.1)?;
+    require_equal(
+        "unanchored manifest suffix",
+        &report.unanchored_manifest_suffix,
+        &expected.2,
+    )?;
+    require_equal(
+        "recovered temporary manifests",
+        &report.recovered_temporary_manifests,
+        &expected.3,
+    )
+}
+
 fn wait_for_child_ready(child: &mut Child) -> Result<String, Box<dyn Error>> {
     let stdout = child
         .stdout
@@ -305,9 +428,14 @@ fn validate_hard_kill(name: &str, status: ExitStatus) -> Result<String, Box<dyn 
     })
 }
 
-fn print_receipt(source_commit: &str, environment: &str, observations: &[BoundaryObservation]) {
+fn print_receipt(
+    source_commit: &str,
+    environment: &str,
+    commit_observations: &[CommitObservation],
+    checkpoint_observations: &[CheckpointObservation],
+) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v1\",");
+    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v2\",");
     println!("  \"status\": \"process-crash-not-power-loss\",");
     println!("  \"source_commit\": \"{source_commit}\",");
     println!("  \"environment\": \"{environment}\",");
@@ -318,9 +446,9 @@ fn print_receipt(source_commit: &str, environment: &str, observations: &[Boundar
     );
     println!("  \"durability\": \"strict\",");
     println!("  \"all_engine_csn\": 1,");
-    println!("  \"boundaries\": [");
-    for (index, observation) in observations.iter().enumerate() {
-        let suffix = if index + 1 == observations.len() {
+    println!("  \"commit_boundaries\": [");
+    for (index, observation) in commit_observations.iter().enumerate() {
+        let suffix = if index + 1 == commit_observations.len() {
             ""
         } else {
             ","
@@ -342,12 +470,44 @@ fn print_receipt(source_commit: &str, environment: &str, observations: &[Boundar
         println!("      \"termination\": \"{}\"", observation.termination);
         println!("    }}{suffix}");
     }
+    println!("  ],");
+    println!("  \"checkpoint_boundaries\": [");
+    for (index, observation) in checkpoint_observations.iter().enumerate() {
+        let suffix = if index + 1 == checkpoint_observations.len() {
+            ""
+        } else {
+            ","
+        };
+        println!("    {{");
+        println!("      \"boundary\": \"{}\",", observation.name);
+        println!("      \"manifest_count\": {},", observation.manifest_count);
+        println!(
+            "      \"checkpoint_count\": {},",
+            observation.checkpoint_count
+        );
+        println!(
+            "      \"unanchored_manifest_suffix\": {},",
+            observation.unanchored_manifest_suffix
+        );
+        println!(
+            "      \"recovered_temporary_manifests\": {},",
+            observation.recovered_temporary_manifests
+        );
+        println!("      \"termination\": \"{}\"", observation.termination);
+        println!("    }}{suffix}");
+    }
     println!("  ]");
     println!("}}");
 }
 
-fn parse_boundary(name: &str) -> Option<CommitBoundary> {
-    BOUNDARIES
+fn parse_commit_boundary(name: &str) -> Option<CommitBoundary> {
+    COMMIT_BOUNDARIES
+        .iter()
+        .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
+}
+
+fn parse_checkpoint_boundary(name: &str) -> Option<CheckpointBoundary> {
+    CHECKPOINT_BOUNDARIES
         .iter()
         .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
 }
