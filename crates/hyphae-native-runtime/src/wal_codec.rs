@@ -53,6 +53,11 @@ pub(crate) enum Opcode {
     CreateAnnIndex = 17,
     UpsertVector = 18,
     DeleteVector = 19,
+    CreateList = 20,
+    PushListHead = 21,
+    PushListTail = 22,
+    PopListHead = 23,
+    PopListTail = 24,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -518,6 +523,15 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteSetMember as u8 => {
             (Opcode::DeleteSetMember, EngineKind::Structure)
         }
+        value if value == Opcode::CreateList as u8 => (Opcode::CreateList, EngineKind::Structure),
+        value if value == Opcode::PushListHead as u8 => {
+            (Opcode::PushListHead, EngineKind::Structure)
+        }
+        value if value == Opcode::PushListTail as u8 => {
+            (Opcode::PushListTail, EngineKind::Structure)
+        }
+        value if value == Opcode::PopListHead as u8 => (Opcode::PopListHead, EngineKind::Structure),
+        value if value == Opcode::PopListTail as u8 => (Opcode::PopListTail, EngineKind::Structure),
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
@@ -604,6 +618,11 @@ fn validate_mutation_shape(
         | Opcode::CreateSet
         | Opcode::AddSetMember
         | Opcode::DeleteSetMember
+        | Opcode::CreateList
+        | Opcode::PushListHead
+        | Opcode::PushListTail
+        | Opcode::PopListHead
+        | Opcode::PopListTail
             if has_target =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -631,6 +650,7 @@ fn validate_mutation_shape(
         | Opcode::CreateSet
         | Opcode::AddSetMember
         | Opcode::DeleteSetMember
+        | Opcode::CreateList
             if value_length != 0 || expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -638,7 +658,11 @@ fn validate_mutation_shape(
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::SetHashField
+        Opcode::PushListHead
+        | Opcode::PushListTail
+        | Opcode::PopListHead
+        | Opcode::PopListTail
+        | Opcode::SetHashField
         | Opcode::CreateTable
         | Opcode::InsertRow
         | Opcode::UpdateRow
@@ -760,7 +784,7 @@ mod tests {
 
     use super::{
         Mutation, Opcode, TransactionPlan, WalSemanticError, encode_checkpoint, encode_transaction,
-        recover_wal,
+        recover_wal, validate_mutation_shape,
     };
 
     fn mutation(
@@ -823,6 +847,11 @@ mod tests {
             structure_mutation(Opcode::CreateSet, b"set", b"", None),
             structure_mutation(Opcode::AddSetMember, &set_member, b"", None),
             structure_mutation(Opcode::DeleteSetMember, &set_member, b"", None),
+            structure_mutation(Opcode::CreateList, b"list", b"", None),
+            structure_mutation(Opcode::PushListHead, b"list", b"head", None),
+            structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
+            structure_mutation(Opcode::PopListHead, b"list", b"head", None),
+            structure_mutation(Opcode::PopListTail, b"list", b"tail", None),
             mutation(
                 EngineKind::Search,
                 Opcode::IndexDocument,
@@ -878,9 +907,29 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 14);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 19);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
+    }
+
+    #[test]
+    fn list_mutations_reject_targets_expiry_and_nonempty_creation() {
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CreateList, false, 1, None, b"list"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CreateList, true, 0, None, b"list"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::PushListHead, false, 1, Some(10), b"list"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::PopListTail, true, 0, None, b"list"),
+            Err(WalSemanticError::InvalidBody)
+        ));
     }
 
     #[test]

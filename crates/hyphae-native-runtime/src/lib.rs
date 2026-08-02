@@ -23,7 +23,7 @@ pub use local_protocol::{
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
@@ -56,8 +56,8 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        CatalogState, ModelError, RelationState, SearchState, StructureEntry, StructureState,
-        TtlValue, analyze, bm25_idf, bm25_term_score,
+        CatalogState, ListPop, ModelError, RelationState, SearchState, StructureEntry,
+        StructureState, TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
     },
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_checkpoint,
@@ -88,11 +88,19 @@ const STRUCTURE_HASH_META_PREFIX: u8 = 2;
 const STRUCTURE_HASH_FIELD_PREFIX: u8 = 3;
 const STRUCTURE_SET_META_PREFIX: u8 = 4;
 const STRUCTURE_SET_MEMBER_PREFIX: u8 = 5;
+const STRUCTURE_LIST_META_PREFIX: u8 = 6;
+const STRUCTURE_LIST_CHUNK_PREFIX: u8 = 7;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_SET_META_MAGIC: &[u8; 8] = b"HYSETM01";
+const STRUCTURE_LIST_META_MAGIC: &[u8; 8] = b"HYLSTM01";
+const STRUCTURE_LIST_CHUNK_MAGIC: &[u8; 8] = b"HYLSTC01";
 const STRUCTURE_HASH_META_SIZE: usize = 16;
 const STRUCTURE_SET_META_SIZE: usize = 16;
+const STRUCTURE_LIST_META_SIZE: usize = 32;
+const STRUCTURE_LIST_CHUNK_HEADER_SIZE: usize = 16;
+const STRUCTURE_LIST_CHUNK_MAX_ELEMENTS: usize = 64;
+const STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES: usize = 10_000;
 const STRUCTURE_VALUE_HEADER_SIZE: usize = 24;
 const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
 const STRUCTURE_VALUE_TOMBSTONE: u8 = 2;
@@ -276,6 +284,12 @@ pub enum NativeRuntimeError {
     /// The requested native set does not exist.
     #[error("native structure set does not exist")]
     UnknownStructureSet,
+    /// The requested native list does not exist.
+    #[error("native structure list does not exist")]
+    UnknownStructureList,
+    /// A native list cannot allocate another signed chunk identity.
+    #[error("native structure list chunk identity space is exhausted")]
+    StructureListIndexExhausted,
     /// The requested structure key already exists.
     #[error("native structure key already exists")]
     StructureKeyExists,
@@ -584,6 +598,7 @@ impl NativeSnapshot {
     pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<&[u8]>, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -601,6 +616,7 @@ impl NativeSnapshot {
     pub fn hlen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -618,6 +634,7 @@ impl NativeSnapshot {
     pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -635,6 +652,7 @@ impl NativeSnapshot {
     pub fn scard(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -642,6 +660,47 @@ impl NativeSnapshot {
             .structures
             .scard(key)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Returns one native list's element count in this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing list.
+    pub fn llen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .llen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureList)
+    }
+
+    /// Returns an inclusive signed-index range from one native list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing list.
+    pub fn lrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .lrange(key, start, stop)
+            .ok_or(NativeRuntimeError::UnknownStructureList)
     }
 
     /// Executes deterministic native lexical matching.
@@ -1470,6 +1529,13 @@ impl NativeDatabase {
                         &structure_set_meta_key(key),
                     )?
                     .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_list_meta_key(key)?,
+                    )?
+                    .is_some()
             {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
@@ -1521,6 +1587,13 @@ impl NativeDatabase {
                         &structure_set_meta_key(key),
                     )?
                     .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_list_meta_key(key)?,
+                    )?
+                    .is_some()
             {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
@@ -1566,7 +1639,14 @@ impl NativeDatabase {
                     &structure_hash_meta_key(key),
                 )?
                 .is_some();
-            if scalar_exists || hash_exists {
+            let list_exists = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &structure_list_meta_key(key)?,
+                )?
+                .is_some();
+            if scalar_exists || hash_exists || list_exists {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
             return Err(NativeRuntimeError::UnknownStructureSet);
@@ -1614,13 +1694,132 @@ impl NativeDatabase {
                     &structure_hash_meta_key(key),
                 )?
                 .is_some();
-            if scalar_exists || hash_exists {
+            let list_exists = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &structure_list_meta_key(key)?,
+                )?
+                .is_some();
+            if scalar_exists || hash_exists || list_exists {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
             return Err(NativeRuntimeError::UnknownStructureSet);
         };
         usize::try_from(decode_set_metadata(metadata.bytes())?)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Reads one list cardinality directly from its physical metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing list, or
+    /// malformed metadata.
+    pub fn llen_latest_list(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_list_meta_key(key)?,
+        )?
+        else {
+            if tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+                .transpose()?
+                .flatten()
+                .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_hash_meta_key(key),
+                    )?
+                    .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_set_meta_key(key),
+                    )?
+                    .is_some()
+            {
+                return Err(NativeRuntimeError::StructureKindMismatch);
+            }
+            return Err(NativeRuntimeError::UnknownStructureList);
+        };
+        usize::try_from(decode_list_metadata(metadata.bytes())?.length)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Reads an inclusive signed-index range through physical list chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing list, or
+    /// malformed metadata, chunk, envelope, page, or blob state.
+    pub fn lrange_latest_list(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata_key = structure_list_meta_key(key)?;
+        let Some(encoded_metadata) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return match self.llen_latest_list(key) {
+                Err(error) => Err(error),
+                Ok(_) => Err(NativeRuntimeError::InvalidStructureTree),
+            };
+        };
+        let metadata = decode_list_metadata(encoded_metadata.bytes())?;
+        let length = usize::try_from(metadata.length)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let Some((range_start, range_stop)) = normalize_list_range(length, start, stop) else {
+            return Ok(Vec::new());
+        };
+        let mut values = Vec::with_capacity(length);
+        let mut chunk_id = metadata.head_chunk;
+        loop {
+            let chunk_key = structure_list_chunk_key(key, chunk_id)?;
+            let encoded_chunk = tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &chunk_key)?
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            let elements = decode_list_chunk_storage(encoded_chunk.bytes())?
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            for element in elements {
+                values.push(decode_list_element(&element, &self.blobs)?);
+            }
+            if chunk_id == metadata.tail_chunk {
+                break;
+            }
+            chunk_id = chunk_id
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        }
+        if values.len() != length {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(values[range_start..=range_stop].to_vec())
     }
 
     /// Executes BM25 matching through the current physical inverted index.
@@ -2351,6 +2550,7 @@ impl NativeWriteBatch {
         let value = value.into();
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2397,6 +2597,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2438,6 +2639,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2483,6 +2685,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2559,6 +2762,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2593,6 +2797,7 @@ impl NativeWriteBatch {
     pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<&[u8]>, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2618,6 +2823,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2650,6 +2856,7 @@ impl NativeWriteBatch {
     pub fn hlen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2705,6 +2912,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2737,6 +2945,7 @@ impl NativeWriteBatch {
     pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2765,6 +2974,7 @@ impl NativeWriteBatch {
         let key = key.into();
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2797,6 +3007,7 @@ impl NativeWriteBatch {
     pub fn scard(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2804,6 +3015,188 @@ impl NativeWriteBatch {
             .structures
             .scard(key)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Creates one explicitly typed empty native list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or an existing structure key.
+    pub fn create_list(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        structure_list_meta_key(&key)?;
+        if !self.state.structures.create_list(key.clone()) {
+            return Err(NativeRuntimeError::StructureKeyExists);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::CreateList,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(())
+    }
+
+    /// Pushes one binary value at the head and returns the new list length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing list.
+    pub fn lpush(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<usize, NativeRuntimeError> {
+        self.push_list(key.into(), value.into(), Opcode::PushListHead)
+    }
+
+    /// Pushes one binary value at the tail and returns the new list length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing list.
+    pub fn rpush(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<usize, NativeRuntimeError> {
+        self.push_list(key.into(), value.into(), Opcode::PushListTail)
+    }
+
+    fn push_list(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        opcode: Opcode,
+    ) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        structure_list_meta_key(&key)?;
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let length = match opcode {
+            Opcode::PushListHead => self.state.structures.lpush(&key, value.clone()),
+            Opcode::PushListTail => self.state.structures.rpush(&key, value.clone()),
+            _ => None,
+        }
+        .ok_or(NativeRuntimeError::UnknownStructureList)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode,
+            target: None,
+            key,
+            value,
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(length)
+    }
+
+    /// Removes and returns the head element, or absence for an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing list.
+    pub fn lpop(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.pop_list(key.into(), Opcode::PopListHead)
+    }
+
+    /// Removes and returns the tail element, or absence for an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing list.
+    pub fn rpop(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.pop_list(key.into(), Opcode::PopListTail)
+    }
+
+    fn pop_list(
+        &mut self,
+        key: Vec<u8>,
+        opcode: Opcode,
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        structure_list_meta_key(&key)?;
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let outcome = match opcode {
+            Opcode::PopListHead => self.state.structures.lpop(&key),
+            Opcode::PopListTail => self.state.structures.rpop(&key),
+            _ => ListPop::Missing,
+        };
+        let value = match outcome {
+            ListPop::Missing => return Err(NativeRuntimeError::UnknownStructureList),
+            ListPop::Empty => return Ok(None),
+            ListPop::Value(value) => value,
+        };
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode,
+            target: None,
+            key,
+            value: value.clone(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(Some(value))
+    }
+
+    /// Returns the current private element count of one native list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing list.
+    pub fn llen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .llen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureList)
+    }
+
+    /// Returns an inclusive signed-index range from the private list state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing list.
+    pub fn lrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .lrange(key, start, stop)
+            .ok_or(NativeRuntimeError::UnknownStructureList)
     }
 
     /// Creates one native text search collection.
@@ -3205,6 +3598,7 @@ fn apply_structure_mutation(
             if mutation.target.is_some()
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
+                || state.lists.contains_key(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
@@ -3220,6 +3614,7 @@ fn apply_structure_mutation(
                 || mutation.expires_at_micros.is_some()
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
+                || state.lists.contains_key(&mutation.key)
                 || state.delete(&mutation.key).is_none()
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -3230,6 +3625,7 @@ fn apply_structure_mutation(
                 || mutation.expires_at_micros.is_none()
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
+                || state.lists.contains_key(&mutation.key)
                 || !state.entries.contains_key(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -3275,6 +3671,49 @@ fn apply_structure_mutation(
         }
         Opcode::CreateSet | Opcode::AddSetMember | Opcode::DeleteSetMember => {
             apply_set_mutation(state, mutation)?;
+        }
+        Opcode::CreateList
+        | Opcode::PushListHead
+        | Opcode::PushListTail
+        | Opcode::PopListHead
+        | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn apply_list_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    if mutation.target.is_some() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    match mutation.opcode {
+        Opcode::CreateList => {
+            if !mutation.value.is_empty() || !state.create_list(mutation.key.clone()) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::PushListHead => {
+            if state.lpush(&mutation.key, mutation.value.clone()).is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::PushListTail => {
+            if state.rpush(&mutation.key, mutation.value.clone()).is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::PopListHead => {
+            if state.lpop(&mutation.key) != ListPop::Value(mutation.value.clone()) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::PopListTail => {
+            if state.rpop(&mutation.key) != ListPop::Value(mutation.value.clone()) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
         }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
@@ -3345,7 +3784,12 @@ fn apply_mutations_to_state(
             | Opcode::DeleteHashField
             | Opcode::CreateSet
             | Opcode::AddSetMember
-            | Opcode::DeleteSetMember => {
+            | Opcode::DeleteSetMember
+            | Opcode::CreateList
+            | Opcode::PushListHead
+            | Opcode::PushListTail
+            | Opcode::PopListHead
+            | Opcode::PopListTail => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CreateIndex => {
@@ -3520,7 +3964,12 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::DeleteValue
             | Opcode::ExpireValue
             | Opcode::CreateHash
-            | Opcode::CreateSet => {
+            | Opcode::CreateSet
+            | Opcode::CreateList
+            | Opcode::PushListHead
+            | Opcode::PushListTail
+            | Opcode::PopListHead
+            | Opcode::PopListTail => {
                 let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
                 identity.push(0);
                 identity.extend_from_slice(&mutation.key);
@@ -3722,7 +4171,13 @@ fn stage_large_values(
             || (mutation.engine == EngineKind::Structure
                 && matches!(
                     mutation.opcode,
-                    Opcode::SetValue | Opcode::ExpireValue | Opcode::SetHashField
+                    Opcode::SetValue
+                        | Opcode::ExpireValue
+                        | Opcode::SetHashField
+                        | Opcode::PushListHead
+                        | Opcode::PushListTail
+                        | Opcode::PopListHead
+                        | Opcode::PopListTail
                 )
                 && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Search
@@ -3914,7 +4369,13 @@ fn wal_mutations(
             } else if mutation.engine == EngineKind::Structure
                 && matches!(
                     mutation.opcode,
-                    Opcode::SetValue | Opcode::ExpireValue | Opcode::SetHashField
+                    Opcode::SetValue
+                        | Opcode::ExpireValue
+                        | Opcode::SetHashField
+                        | Opcode::PushListHead
+                        | Opcode::PushListTail
+                        | Opcode::PopListHead
+                        | Opcode::PopListTail
                 )
             {
                 mutation.value = structure_storage_value(
@@ -3958,6 +4419,65 @@ fn structure_set_meta_key(key: &[u8]) -> Vec<u8> {
     encoded.push(STRUCTURE_SET_META_PREFIX);
     encoded.extend_from_slice(key);
     encoded
+}
+
+fn structure_list_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if key
+        .len()
+        .checked_add(13)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(1));
+    encoded.push(STRUCTURE_LIST_META_PREFIX);
+    encoded.extend_from_slice(key);
+    Ok(encoded)
+}
+
+fn list_chunk_identity(key: &[u8], chunk_id: i64) -> Result<Vec<u8>, NativeRuntimeError> {
+    let key_length =
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+    let mut encoded = Vec::with_capacity(12_usize.saturating_add(key.len()));
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(key);
+    encoded.extend_from_slice(&(chunk_id.cast_unsigned() ^ (1_u64 << 63)).to_be_bytes());
+    if encoded
+        .len()
+        .checked_add(1)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    Ok(encoded)
+}
+
+fn decode_list_chunk_identity(encoded: &[u8]) -> Result<(&[u8], i64), NativeRuntimeError> {
+    let key_length_bytes = encoded
+        .get(..4)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut key_length = [0_u8; 4];
+    key_length.copy_from_slice(key_length_bytes);
+    let key_length = usize::try_from(u32::from_be_bytes(key_length))
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    let chunk_start = 4_usize
+        .checked_add(key_length)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if encoded.len() != chunk_start.saturating_add(8) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut chunk_id = [0_u8; 8];
+    chunk_id.copy_from_slice(&encoded[chunk_start..]);
+    let chunk_id = (u64::from_be_bytes(chunk_id) ^ (1_u64 << 63)).cast_signed();
+    Ok((&encoded[4..chunk_start], chunk_id))
+}
+
+fn structure_list_chunk_key(key: &[u8], chunk_id: i64) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = list_chunk_identity(key, chunk_id)?;
+    let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
+    encoded.push(STRUCTURE_LIST_CHUNK_PREFIX);
+    encoded.extend_from_slice(&identity);
+    Ok(encoded)
 }
 
 fn collection_member_identity(key: &[u8], member: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
@@ -4086,6 +4606,183 @@ fn decode_set_member_value(encoded: &[u8]) -> Result<bool, NativeRuntimeError> {
         Ok(true)
     } else {
         Err(NativeRuntimeError::InvalidStructureTree)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ListMetadata {
+    length: u64,
+    head_chunk: i64,
+    tail_chunk: i64,
+}
+
+impl ListMetadata {
+    const fn empty() -> Self {
+        Self {
+            length: 0,
+            head_chunk: 0,
+            tail_chunk: 0,
+        }
+    }
+}
+
+fn encode_list_metadata(metadata: ListMetadata) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_LIST_META_SIZE);
+    encoded.extend_from_slice(STRUCTURE_LIST_META_MAGIC);
+    encoded.extend_from_slice(&metadata.length.to_le_bytes());
+    encoded.extend_from_slice(&metadata.head_chunk.to_le_bytes());
+    encoded.extend_from_slice(&metadata.tail_chunk.to_le_bytes());
+    encoded
+}
+
+fn decode_list_metadata(encoded: &[u8]) -> Result<ListMetadata, NativeRuntimeError> {
+    if encoded.len() != STRUCTURE_LIST_META_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_LIST_META_MAGIC.as_slice())
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut length = [0_u8; 8];
+    length.copy_from_slice(&encoded[8..16]);
+    let mut head_chunk = [0_u8; 8];
+    head_chunk.copy_from_slice(&encoded[16..24]);
+    let mut tail_chunk = [0_u8; 8];
+    tail_chunk.copy_from_slice(&encoded[24..32]);
+    let metadata = ListMetadata {
+        length: u64::from_le_bytes(length),
+        head_chunk: i64::from_le_bytes(head_chunk),
+        tail_chunk: i64::from_le_bytes(tail_chunk),
+    };
+    if metadata.length == 0 {
+        if metadata.head_chunk != 0 || metadata.tail_chunk != 0 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    } else if metadata.head_chunk > metadata.tail_chunk {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(metadata)
+}
+
+fn validate_list_element_envelope(encoded: &[u8]) -> Result<(), NativeRuntimeError> {
+    if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        || encoded[8] != 0
+        || encoded[10..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
+    match encoded[9] {
+        STRUCTURE_VALUE_INLINE if payload.len() <= STRUCTURE_INLINE_VALUE_LIMIT => Ok(()),
+        STRUCTURE_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= STRUCTURE_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            Ok(())
+        }
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
+}
+
+fn encode_list_chunk_storage(elements: &[Vec<u8>]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if elements.is_empty() || elements.len() > STRUCTURE_LIST_CHUNK_MAX_ELEMENTS {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut encoded = Vec::with_capacity(STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES);
+    encoded.extend_from_slice(STRUCTURE_LIST_CHUNK_MAGIC);
+    encoded.extend_from_slice(
+        &u16::try_from(elements.len())
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&[0; 6]);
+    for element in elements {
+        validate_list_element_envelope(element)?;
+        encoded.extend_from_slice(
+            &u32::try_from(element.len())
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(element);
+    }
+    if encoded.len() > STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(encoded)
+}
+
+fn decode_list_chunk_storage(encoded: &[u8]) -> Result<Option<Vec<Vec<u8>>>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        return Ok(None);
+    }
+    if encoded.len() < STRUCTURE_LIST_CHUNK_HEADER_SIZE
+        || encoded.len() > STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES
+        || encoded.get(..8) != Some(STRUCTURE_LIST_CHUNK_MAGIC.as_slice())
+        || encoded[10..16].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut count = [0_u8; 2];
+    count.copy_from_slice(&encoded[8..10]);
+    let count = usize::from(u16::from_le_bytes(count));
+    if count == 0 || count > STRUCTURE_LIST_CHUNK_MAX_ELEMENTS {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut cursor = STRUCTURE_LIST_CHUNK_HEADER_SIZE;
+    let mut elements = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_end = cursor
+            .checked_add(4)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let length_bytes = encoded
+            .get(cursor..length_end)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let mut length = [0_u8; 4];
+        length.copy_from_slice(length_bytes);
+        cursor = length_end;
+        let element_end = cursor
+            .checked_add(
+                usize::try_from(u32::from_le_bytes(length))
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let element = encoded
+            .get(cursor..element_end)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        validate_list_element_envelope(element)?;
+        elements.push(element.to_vec());
+        cursor = element_end;
+    }
+    if cursor != encoded.len() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(Some(elements))
+}
+
+fn decode_list_element(encoded: &[u8], blobs: &BlobStore) -> Result<Vec<u8>, NativeRuntimeError> {
+    match decode_structure_value(encoded, blobs)? {
+        Some(entry) if entry.expires_at_micros.is_none() => Ok(entry.value),
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
+}
+
+fn list_chunk_with_push(
+    mut elements: Vec<Vec<u8>>,
+    value: Vec<u8>,
+    at_head: bool,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    if elements.len() >= STRUCTURE_LIST_CHUNK_MAX_ELEMENTS {
+        return Ok(None);
+    }
+    if at_head {
+        elements.insert(0, value);
+    } else {
+        elements.push(value);
+    }
+    match encode_list_chunk_storage(&elements) {
+        Ok(encoded) => Ok(Some(encoded)),
+        Err(NativeRuntimeError::InvalidStructureTree) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -4349,6 +5046,9 @@ fn create_hash_in_tree(
         || tree
             .get(pages, &structure_set_meta_key(&mutation.key))?
             .is_some()
+        || tree
+            .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
@@ -4376,6 +5076,9 @@ fn create_set_in_tree(
     if tree.get(pages, &metadata_key)?.is_some()
         || tree
             .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_list_meta_key(&mutation.key)?)?
             .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -4542,6 +5245,222 @@ fn delete_set_member_in_tree(
         .tree)
 }
 
+fn create_list_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_list_meta_key(&mutation.key)?;
+    if tree.get(pages, &metadata_key)?.is_some()
+        || tree
+            .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_set_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_key(&mutation.key))?
+            .is_some_and(|value| !is_structure_tombstone(&value))
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .insert_unique(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_list_metadata(ListMetadata::empty()),
+        )?
+        .tree)
+}
+
+fn push_list_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+    at_head: bool,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    if mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_list_meta_key(&mutation.key)?;
+    let encoded_metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut metadata = decode_list_metadata(&encoded_metadata)?;
+    let element = structure_storage_value(&mutation.value, None, blob_references)?;
+    if metadata.length == 0 {
+        let chunk_key = structure_list_chunk_key(&mutation.key, 0)?;
+        if tree
+            .get(pages, &chunk_key)?
+            .is_some_and(|encoded| !is_structure_tombstone(&encoded))
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                chunk_key,
+                encode_list_chunk_storage(&[element])?,
+            )?
+            .tree;
+        metadata = ListMetadata {
+            length: 1,
+            head_chunk: 0,
+            tail_chunk: 0,
+        };
+    } else {
+        let boundary = if at_head {
+            metadata.head_chunk
+        } else {
+            metadata.tail_chunk
+        };
+        let chunk_key = structure_list_chunk_key(&mutation.key, boundary)?;
+        let elements = tree
+            .get(pages, &chunk_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let elements = decode_list_chunk_storage(&elements)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if let Some(encoded) = list_chunk_with_push(elements, element.clone(), at_head)? {
+            tree = tree.upsert(pages, creating_csn, chunk_key, encoded)?.tree;
+        } else {
+            let next = if at_head {
+                boundary
+                    .checked_sub(1)
+                    .ok_or(NativeRuntimeError::StructureListIndexExhausted)?
+            } else {
+                boundary
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::StructureListIndexExhausted)?
+            };
+            let next_key = structure_list_chunk_key(&mutation.key, next)?;
+            if tree
+                .get(pages, &next_key)?
+                .is_some_and(|encoded| !is_structure_tombstone(&encoded))
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            tree = tree
+                .upsert(
+                    pages,
+                    creating_csn,
+                    next_key,
+                    encode_list_chunk_storage(&[element])?,
+                )?
+                .tree;
+            if at_head {
+                metadata.head_chunk = next;
+            } else {
+                metadata.tail_chunk = next;
+            }
+        }
+        metadata.length = metadata
+            .length
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_list_metadata(metadata),
+        )?
+        .tree)
+}
+
+fn pop_list_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+    at_head: bool,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    if mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_list_meta_key(&mutation.key)?;
+    let encoded_metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut metadata = decode_list_metadata(&encoded_metadata)?;
+    if metadata.length == 0 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let boundary = if at_head {
+        metadata.head_chunk
+    } else {
+        metadata.tail_chunk
+    };
+    let chunk_key = structure_list_chunk_key(&mutation.key, boundary)?;
+    let encoded_chunk = tree
+        .get(pages, &chunk_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut elements = decode_list_chunk_storage(&encoded_chunk)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let removed = if at_head {
+        elements.remove(0)
+    } else {
+        elements
+            .pop()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
+    };
+    let expected = structure_storage_value(&mutation.value, None, blob_references)?;
+    if removed != expected {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    metadata.length = metadata
+        .length
+        .checked_sub(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if elements.is_empty() {
+        tree = tree
+            .upsert(pages, creating_csn, chunk_key, structure_tombstone_value())?
+            .tree;
+        if metadata.length == 0 {
+            metadata = ListMetadata::empty();
+        } else if at_head {
+            metadata.head_chunk = metadata
+                .head_chunk
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::StructureListIndexExhausted)?;
+        } else {
+            metadata.tail_chunk = metadata
+                .tail_chunk
+                .checked_sub(1)
+                .ok_or(NativeRuntimeError::StructureListIndexExhausted)?;
+        }
+    } else {
+        if metadata.length == 0 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                chunk_key,
+                encode_list_chunk_storage(&elements)?,
+            )?
+            .tree;
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_list_metadata(metadata),
+        )?
+        .tree)
+}
+
 fn structure_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
@@ -4564,66 +5483,90 @@ fn structure_tree_after_mutations(
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Structure)
     {
-        if mutation.target.is_some() {
-            return Err(NativeRuntimeError::InvalidStructureTree);
-        }
-        let value = match mutation.opcode {
-            Opcode::SetValue => structure_storage_value(
-                &mutation.value,
-                mutation.expires_at_micros,
-                blob_references,
-            )?,
-            Opcode::ExpireValue if mutation.expires_at_micros.is_some() => structure_storage_value(
-                &mutation.value,
-                mutation.expires_at_micros,
-                blob_references,
-            )?,
-            Opcode::DeleteValue
-                if mutation.value.is_empty() && mutation.expires_at_micros.is_none() =>
-            {
-                structure_tombstone_value()
-            }
-            Opcode::CreateHash => {
-                tree = create_hash_in_tree(pages, tree, creating_csn, mutation)?;
-                continue;
-            }
-            Opcode::SetHashField => {
-                tree =
-                    set_hash_field_in_tree(pages, tree, creating_csn, mutation, blob_references)?;
-                continue;
-            }
-            Opcode::DeleteHashField => {
-                tree = delete_hash_field_in_tree(pages, tree, creating_csn, mutation)?;
-                continue;
-            }
-            Opcode::CreateSet => {
-                tree = create_set_in_tree(pages, tree, creating_csn, mutation)?;
-                continue;
-            }
-            Opcode::AddSetMember => {
-                tree = add_set_member_in_tree(pages, tree, creating_csn, mutation)?;
-                continue;
-            }
-            Opcode::DeleteSetMember => {
-                tree = delete_set_member_in_tree(pages, tree, creating_csn, mutation)?;
-                continue;
-            }
-            _ => return Err(NativeRuntimeError::InvalidStructureTree),
-        };
-        if tree
-            .get(pages, &structure_hash_meta_key(&mutation.key))?
-            .is_some()
-            || tree
-                .get(pages, &structure_set_meta_key(&mutation.key))?
-                .is_some()
-        {
-            return Err(NativeRuntimeError::InvalidStructureTree);
-        }
-        tree = tree
-            .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
-            .tree;
+        tree = apply_structure_tree_mutation(pages, tree, creating_csn, mutation, blob_references)?;
     }
     Ok(tree)
+}
+
+fn apply_structure_tree_mutation(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    if mutation.target.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    match mutation.opcode {
+        Opcode::CreateHash => create_hash_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::SetHashField => {
+            set_hash_field_in_tree(pages, tree, creating_csn, mutation, blob_references)
+        }
+        Opcode::DeleteHashField => delete_hash_field_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::CreateSet => create_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::AddSetMember => add_set_member_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteSetMember => delete_set_member_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::CreateList => create_list_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::PushListHead | Opcode::PushListTail => push_list_in_tree(
+            pages,
+            tree,
+            creating_csn,
+            mutation,
+            mutation.opcode == Opcode::PushListHead,
+            blob_references,
+        ),
+        Opcode::PopListHead | Opcode::PopListTail => pop_list_in_tree(
+            pages,
+            tree,
+            creating_csn,
+            mutation,
+            mutation.opcode == Opcode::PopListHead,
+            blob_references,
+        ),
+        Opcode::SetValue | Opcode::ExpireValue | Opcode::DeleteValue => {
+            upsert_scalar_structure_mutation(pages, tree, creating_csn, mutation, blob_references)
+        }
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
+}
+
+fn upsert_scalar_structure_mutation(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let value = match mutation.opcode {
+        Opcode::SetValue => {
+            structure_storage_value(&mutation.value, mutation.expires_at_micros, blob_references)?
+        }
+        Opcode::ExpireValue if mutation.expires_at_micros.is_some() => {
+            structure_storage_value(&mutation.value, mutation.expires_at_micros, blob_references)?
+        }
+        Opcode::DeleteValue
+            if mutation.value.is_empty() && mutation.expires_at_micros.is_none() =>
+        {
+            structure_tombstone_value()
+        }
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    if tree
+        .get(pages, &structure_hash_meta_key(&mutation.key))?
+        .is_some()
+        || tree
+            .get(pages, &structure_set_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .is_some()
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
+        .tree)
 }
 
 fn structure_root_after_mutations(
@@ -5971,26 +6914,46 @@ fn load_structure_state(
     if format_key != STRUCTURE_FORMAT_KEY || format_value != STRUCTURE_FORMAT_VALUE_V1 {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
-    let mut decoded = BTreeMap::new();
-    let mut hashes = BTreeMap::new();
-    let mut hash_counts = BTreeMap::new();
-    let mut sets = BTreeMap::new();
-    let mut set_counts = BTreeMap::new();
+    let mut decoder = StructureTreeDecoder::default();
     for (key, value) in iterator {
+        decoder.consume(&key, &value, blobs)?;
+    }
+    decoder.finish(blobs)
+}
+
+#[derive(Default)]
+struct StructureTreeDecoder {
+    entries: BTreeMap<Vec<u8>, StructureEntry>,
+    hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
+    hash_counts: BTreeMap<Vec<u8>, u64>,
+    sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_counts: BTreeMap<Vec<u8>, u64>,
+    list_metadata: BTreeMap<Vec<u8>, ListMetadata>,
+    list_chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
+}
+
+impl StructureTreeDecoder {
+    fn consume(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        blobs: &BlobStore,
+    ) -> Result<(), NativeRuntimeError> {
         match key.first().copied() {
             Some(STRUCTURE_ENTRY_PREFIX) => {
-                if let Some(entry) = decode_structure_value(&value, blobs)?
-                    && decoded.insert(key[1..].to_vec(), entry).is_some()
+                if let Some(entry) = decode_structure_value(value, blobs)?
+                    && self.entries.insert(key[1..].to_vec(), entry).is_some()
                 {
                     return Err(NativeRuntimeError::InvalidStructureTree);
                 }
             }
             Some(STRUCTURE_HASH_META_PREFIX) => {
                 let hash = key[1..].to_vec();
-                if decoded.contains_key(&hash)
-                    || hashes.insert(hash.clone(), BTreeMap::new()).is_some()
-                    || hash_counts
-                        .insert(hash, decode_hash_metadata(&value)?)
+                if self.entries.contains_key(&hash)
+                    || self.hashes.insert(hash.clone(), BTreeMap::new()).is_some()
+                    || self
+                        .hash_counts
+                        .insert(hash, decode_hash_metadata(value)?)
                         .is_some()
                 {
                     return Err(NativeRuntimeError::InvalidStructureTree);
@@ -5999,47 +6962,163 @@ fn load_structure_state(
             Some(STRUCTURE_HASH_FIELD_PREFIX) => {
                 let (hash, field) = decode_hash_field_identity(&key[1..])
                     .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-                let fields = hashes
+                let fields = self
+                    .hashes
                     .get_mut(hash)
                     .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                if let Some(value) = decode_hash_field_value(&value, blobs)?
+                if let Some(value) = decode_hash_field_value(value, blobs)?
                     && fields.insert(field.to_vec(), value).is_some()
                 {
                     return Err(NativeRuntimeError::InvalidStructureTree);
                 }
             }
-            Some(STRUCTURE_SET_META_PREFIX) => {
-                let set = key[1..].to_vec();
-                if decoded.contains_key(&set)
-                    || hashes.contains_key(&set)
-                    || sets.insert(set.clone(), BTreeSet::new()).is_some()
-                    || set_counts
-                        .insert(set, decode_set_metadata(&value)?)
-                        .is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
-            }
-            Some(STRUCTURE_SET_MEMBER_PREFIX) => {
-                let (set, member) = decode_set_member_identity(&key[1..])
-                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-                let members = sets
-                    .get_mut(set)
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                if decode_set_member_value(&value)? && !members.insert(member.to_vec()) {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
-            }
+            Some(STRUCTURE_SET_META_PREFIX) => self.consume_set_metadata(&key[1..], value)?,
+            Some(STRUCTURE_SET_MEMBER_PREFIX) => self.consume_set_member(&key[1..], value)?,
+            Some(STRUCTURE_LIST_META_PREFIX) => self.consume_list_metadata(&key[1..], value)?,
+            Some(STRUCTURE_LIST_CHUNK_PREFIX) => self.consume_list_chunk(&key[1..], value)?,
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
         }
+        Ok(())
     }
-    validate_hash_counts(&hashes, hash_counts)?;
-    validate_set_counts(&sets, set_counts)?;
-    Ok(StructureState {
-        entries: decoded,
-        hashes,
-        sets,
-    })
+
+    fn consume_set_metadata(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        let set = key.to_vec();
+        if self.entries.contains_key(&set)
+            || self.hashes.contains_key(&set)
+            || self.sets.insert(set.clone(), BTreeSet::new()).is_some()
+            || self
+                .set_counts
+                .insert(set, decode_set_metadata(value)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_set_member(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let (set, member) = decode_set_member_identity(identity)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let members = self
+            .sets
+            .get_mut(set)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if decode_set_member_value(value)? && !members.insert(member.to_vec()) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_list_metadata(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let list = key.to_vec();
+        if self.entries.contains_key(&list)
+            || self.hashes.contains_key(&list)
+            || self.sets.contains_key(&list)
+            || self
+                .list_metadata
+                .insert(list, decode_list_metadata(value)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_list_chunk(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let (list, chunk_id) = decode_list_chunk_identity(identity)?;
+        if !self.list_metadata.contains_key(list) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if let Some(elements) = decode_list_chunk_storage(value)?
+            && self
+                .list_chunks
+                .entry(list.to_vec())
+                .or_default()
+                .insert(chunk_id, elements)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn finish(self, blobs: &BlobStore) -> Result<StructureState, NativeRuntimeError> {
+        let Self {
+            entries,
+            hashes,
+            hash_counts,
+            sets,
+            set_counts,
+            list_metadata,
+            list_chunks,
+        } = self;
+        validate_hash_counts(&hashes, hash_counts)?;
+        validate_set_counts(&sets, set_counts)?;
+        let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
+        Ok(StructureState {
+            entries,
+            hashes,
+            sets,
+            lists,
+        })
+    }
+}
+
+fn materialize_lists(
+    metadata: BTreeMap<Vec<u8>, ListMetadata>,
+    mut chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
+    blobs: &BlobStore,
+) -> Result<BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>, NativeRuntimeError> {
+    let mut lists = BTreeMap::new();
+    for (key, metadata) in metadata {
+        let mut values = VecDeque::new();
+        let mut list_chunks = chunks.remove(&key).unwrap_or_default();
+        if metadata.length == 0 {
+            if !list_chunks.is_empty() {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        } else {
+            let mut chunk_id = metadata.head_chunk;
+            loop {
+                let elements = list_chunks
+                    .remove(&chunk_id)
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                for element in elements {
+                    values.push_back(decode_list_element(&element, blobs)?);
+                }
+                if chunk_id == metadata.tail_chunk {
+                    break;
+                }
+                chunk_id = chunk_id
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            }
+            if !list_chunks.is_empty()
+                || u64::try_from(values.len())
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?
+                    != metadata.length
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        }
+        lists.insert(key, values);
+    }
+    if !chunks.is_empty() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(lists)
 }
 
 fn validate_hash_counts(
@@ -7463,6 +8542,343 @@ mod tests {
     }
 
     #[test]
+    fn native_list_end_operations_ranges_history_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_list(b"queue".to_vec())?;
+        assert_eq!(seed.rpush(b"queue".to_vec(), b"one".to_vec())?, 1);
+        assert_eq!(seed.lpush(b"queue".to_vec(), b"zero".to_vec())?, 2);
+        assert_eq!(seed.rpush(b"queue".to_vec(), b"two".to_vec())?, 3);
+        assert_eq!(
+            seed.lrange(b"queue", 0, -1)?,
+            [b"zero".to_vec(), b"one".to_vec(), b"two".to_vec()]
+        );
+        assert_eq!(
+            seed.lrange(b"queue", -2, -1)?,
+            [b"one".to_vec(), b"two".to_vec()]
+        );
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert_eq!(mutate.lpop(b"queue".to_vec())?, Some(b"zero".to_vec()));
+        assert_eq!(mutate.rpop(b"queue".to_vec())?, Some(b"two".to_vec()));
+        assert_eq!(mutate.rpush(b"queue".to_vec(), b"three".to_vec())?, 2);
+        assert_eq!(mutate.llen(b"queue")?, 2);
+        assert_eq!(
+            mutate.lrange(b"queue", 0, -1)?,
+            [b"one".to_vec(), b"three".to_vec()]
+        );
+        mutate.commit()?;
+
+        assert_eq!(
+            historical.lrange(b"queue", 0, -1)?,
+            [b"zero".to_vec(), b"one".to_vec(), b"two".to_vec()]
+        );
+        assert_eq!(historical.llen(b"queue")?, 3);
+        assert_eq!(database.llen_latest_list(b"queue")?, 2);
+        assert_eq!(
+            database.lrange_latest_list(b"queue", 0, -1)?,
+            [b"one".to_vec(), b"three".to_vec()]
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert_eq!(reopened.llen_latest_list(b"queue")?, 2);
+        assert_eq!(
+            reopened.lrange_latest_list(b"queue", 0, -1)?,
+            [b"one".to_vec(), b"three".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_lists_enforce_empty_ranges_types_and_identity_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin(10, DurabilityClass::Strict)?;
+        transaction.create_list(b"typed-list".to_vec())?;
+        assert_eq!(transaction.lpop(b"typed-list".to_vec())?, None);
+        assert_eq!(transaction.rpop(b"typed-list".to_vec())?, None);
+        assert!(transaction.lrange(b"typed-list", 0, -1)?.is_empty());
+        assert!(transaction.lrange(b"typed-list", 4, 1)?.is_empty());
+        assert_eq!(transaction.rpush(b"typed-list".to_vec(), b"a".to_vec())?, 1);
+        assert_eq!(transaction.rpush(b"typed-list".to_vec(), b"b".to_vec())?, 2);
+        assert_eq!(transaction.rpush(b"typed-list".to_vec(), b"c".to_vec())?, 3);
+        assert_eq!(
+            transaction.lrange(b"typed-list", -100, 100)?,
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert!(transaction.lrange(b"typed-list", -100, -4)?.is_empty());
+        assert!(matches!(
+            transaction.set(b"typed-list".to_vec(), b"scalar".to_vec(), None),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.hset(b"typed-list".to_vec(), b"field".to_vec(), b"value".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.sadd(b"typed-list".to_vec(), b"member".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        transaction.commit()?;
+
+        assert!(matches!(
+            database.hlen_latest_hash(b"typed-list"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.scard_latest_set(b"typed-list"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.llen_latest_list(b"missing"),
+            Err(NativeRuntimeError::UnknownStructureList)
+        ));
+
+        let mut oversized = database.begin(11, DurabilityClass::Strict)?;
+        assert!(matches!(
+            oversized.create_list(vec![b'x'; hyphae_native_btree::BTREE_MAX_KEY_SIZE]),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        oversized.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn native_list_chunks_large_values_and_tombstoned_ends_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let large = vec![0x5a; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+        let mut seed = database.begin(100, DurabilityClass::Strict)?;
+        seed.create_list(b"chunked".to_vec())?;
+        assert_eq!(seed.lpush(b"chunked".to_vec(), large.clone())?, 1);
+        for index in 0..130_u32 {
+            assert_eq!(
+                seed.rpush(b"chunked".to_vec(), index.to_be_bytes().to_vec())?,
+                usize::try_from(index)? + 2
+            );
+        }
+        seed.commit()?;
+        let historical = database.snapshot(101)?;
+        assert_eq!(historical.llen(b"chunked")?, 131);
+        let historical_head = historical.lrange(b"chunked", 0, 0)?;
+        assert_eq!(historical_head.first(), Some(&large));
+
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert_eq!(
+            mutate.rpop(b"chunked".to_vec())?,
+            Some(129_u32.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            mutate.rpop(b"chunked".to_vec())?,
+            Some(128_u32.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            mutate.rpop(b"chunked".to_vec())?,
+            Some(127_u32.to_be_bytes().to_vec())
+        );
+        mutate.commit()?;
+        assert_eq!(historical.llen(b"chunked")?, 131);
+        assert_eq!(database.llen_latest_list(b"chunked")?, 128);
+        let latest_head = database.lrange_latest_list(b"chunked", 0, 0)?;
+        assert_eq!(latest_head.first(), Some(&large));
+        assert_eq!(
+            database.lrange_latest_list(b"chunked", -2, -1)?,
+            [
+                125_u32.to_be_bytes().to_vec(),
+                126_u32.to_be_bytes().to_vec()
+            ]
+        );
+
+        let root = database
+            .coordinator
+            .snapshot(103)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let metadata = hyphae_native_btree::BTree::from_root(root)
+            .get(
+                &database.pages,
+                &super::structure_list_meta_key(b"chunked")?,
+            )?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let metadata = super::decode_list_metadata(&metadata)?;
+        let tombstoned_tail = super::structure_list_chunk_key(b"chunked", metadata.tail_chunk + 1)?;
+        let tombstone = hyphae_native_btree::BTree::from_root(root)
+            .get(&database.pages, &tombstoned_tail)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        assert!(super::is_structure_tombstone(&tombstone));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().blob_count, 1);
+        assert_eq!(reopened.llen_latest_list(b"chunked")?, 128);
+        assert_eq!(reopened.lrange_latest_list(b"chunked", 0, 0)?, [large]);
+        assert_eq!(
+            reopened.lrange_latest_list(b"chunked", -1, -1)?,
+            [126_u32.to_be_bytes().to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_list_writers_conflict_on_the_whole_list() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_list(b"race".to_vec())?;
+        seed.rpush(b"race".to_vec(), b"seed".to_vec())?;
+        seed.commit()?;
+
+        let mut head = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        let mut tail = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        head.lpush(b"race".to_vec(), b"head".to_vec())?;
+        tail.rpush(b"race".to_vec(), b"tail".to_vec())?;
+        database.commit_optimistic(head)?;
+        assert!(matches!(
+            database.commit_optimistic(tail),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.lrange_latest_list(b"race", 0, -1)?,
+            [b"head".to_vec(), b"seed".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_list_metadata_and_chunk_gaps_fail_complete_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_list(b"corrupt".to_vec())?;
+        for index in 0..70_u32 {
+            seed.rpush(b"corrupt".to_vec(), index.to_be_bytes().to_vec())?;
+        }
+        seed.commit()?;
+
+        let roots = database.coordinator.snapshot(11)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = hyphae_native_btree::BTree::from_root(root);
+        let metadata_key = super::structure_list_meta_key(b"corrupt")?;
+        let encoded_metadata = tree
+            .get(&database.pages, &metadata_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let metadata = super::decode_list_metadata(&encoded_metadata)?;
+        let forgeries = [
+            (
+                metadata_key,
+                super::encode_list_metadata(super::ListMetadata {
+                    length: metadata.length + 1,
+                    ..metadata
+                }),
+            ),
+            (
+                super::structure_list_chunk_key(b"corrupt", metadata.head_chunk)?,
+                super::structure_tombstone_value(),
+            ),
+        ];
+        for (key, value) in forgeries {
+            let forged_tree = hyphae_native_btree::BTree::from_root(root)
+                .upsert(&mut database.pages, Csn::new(1)?, key, value)?
+                .tree;
+            let mut forged_roots = roots
+                .iter_roots()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            forged_roots.insert(
+                super::SLOT_STRUCTURE,
+                forged_tree
+                    .root()
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+            );
+            let forged = hyphae_native_mvcc::RootSet::committed(
+                roots
+                    .visible_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                roots.catalog_version(),
+                roots
+                    .wal_anchor()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                forged_roots,
+                roots.blob_generation(),
+            )?;
+            assert!(matches!(
+                super::load_structure_state(&database.pages, &database.blobs, &forged),
+                Err(NativeRuntimeError::InvalidStructureTree)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_list_commit_boundary_recovers_prior_or_complete_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_list(b"crash-list".to_vec())?;
+            seed.rpush(b"crash-list".to_vec(), b"prior".to_vec())?;
+            seed.commit()?;
+
+            let complete = vec![0x6c; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+            let mut mutate = database.begin(11, DurabilityClass::Strict)?;
+            mutate.rpush(b"crash-list".to_vec(), complete.clone())?;
+            assert_eq!(
+                mutate.lpop(b"crash-list".to_vec())?,
+                Some(b"prior".to_vec())
+            );
+            let result = mutate.commit_with_interruption(boundary);
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(
+                    reopened.lrange_latest_list(b"crash-list", 0, -1)?,
+                    [b"prior".to_vec()]
+                ),
+                Some(2) => assert_eq!(
+                    reopened.lrange_latest_list(b"crash-list", 0, -1)?,
+                    [complete]
+                ),
+                other => {
+                    return Err(
+                        format!("unexpected recovered list CSN {other:?} at {boundary:?}").into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn optimistic_set_writers_rebase_disjoint_members_and_conflict_per_member()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -7642,17 +9058,19 @@ mod tests {
     }
 
     #[test]
-    fn scalar_hash_and_set_creation_race_on_one_typed_key() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn scalar_hash_set_and_list_creation_race_on_one_typed_key()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         let mut scalar = database.begin_optimistic(10, DurabilityClass::Strict)?;
         let mut hash = database.begin_optimistic(10, DurabilityClass::Strict)?;
         let mut set = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        let mut list = database.begin_optimistic(10, DurabilityClass::Strict)?;
         scalar.set(b"typed".to_vec(), b"scalar".to_vec(), None)?;
         hash.create_hash(b"typed".to_vec())?;
         set.create_set(b"typed".to_vec())?;
-        database.commit_optimistic(set)?;
+        list.create_list(b"typed".to_vec())?;
+        database.commit_optimistic(list)?;
         assert!(matches!(
             database.commit_optimistic(scalar),
             Err(NativeRuntimeError::WriteConflict(_))
@@ -7661,9 +9079,17 @@ mod tests {
             database.commit_optimistic(hash),
             Err(NativeRuntimeError::WriteConflict(_))
         ));
-        assert_eq!(database.scard_latest_set(b"typed")?, 0);
+        assert!(matches!(
+            database.commit_optimistic(set),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(database.llen_latest_list(b"typed")?, 0);
         assert!(matches!(
             database.hlen_latest_hash(b"typed"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.scard_latest_set(b"typed"),
             Err(NativeRuntimeError::StructureKindMismatch)
         ));
         assert!(database.get_latest_structure(b"typed", 11)?.is_none());
@@ -7697,6 +9123,10 @@ mod tests {
         ));
         assert!(matches!(
             update.create_set(b"legacy-set".to_vec()),
+            Err(NativeRuntimeError::LegacyStructureFamilyUnsupported)
+        ));
+        assert!(matches!(
+            update.create_list(b"legacy-list".to_vec()),
             Err(NativeRuntimeError::LegacyStructureFamilyUnsupported)
         ));
         update.set(b"legacy".to_vec(), b"v2".to_vec(), None)?;
