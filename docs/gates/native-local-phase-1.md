@@ -44,6 +44,7 @@ relevant G0 contract is reviewable.
 The current reviewable drafts are:
 
 - [canonical types](../native/types-v1.md);
+- [directory format marker](../native/directory-format-v1.md);
 - [page, row, and blob format](../native/page-row-blob-format-v1.md);
 - [current-root page-generation vacuum](../native/page-vacuum-v1.md);
 - [B+tree format](../native/btree-format-v1.md);

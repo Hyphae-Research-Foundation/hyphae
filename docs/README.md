@@ -45,6 +45,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 ## Understand correctness
 
 - [Native canonical types v1](native/types-v1.md)
+- [Native directory format v1](native/directory-format-v1.md)
 - [Native page, row, and blob format v1](native/page-row-blob-format-v1.md)
 - [Native B+tree format v1](native/btree-format-v1.md)
 - [Native root manifest and checkpoint format v1](native/root-manifest-checkpoint-v1.md)
