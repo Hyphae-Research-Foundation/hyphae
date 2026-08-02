@@ -1,8 +1,8 @@
 {
   "schema": "hyphae.native.page-vacuum.v1",
   "status": "observation-not-gate",
-  "source_commit": "e764857bd8157ec43b9202592f621eeeb188e53e",
-  "source_tree": "0dcb24c979a7cad4e16512ae9a227e9ca4da9c00",
+  "source_commit": "f5d10e7db0db2ae384e12bb18532a9bb50995ffb",
+  "source_tree": "c1c4e6c4cef7a24ef9928e62618e3b76a160c590",
   "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
   "target": "x86_64-windows",
   "profile": "release",
@@ -13,9 +13,9 @@
   "search_documents": 64,
   "ann_vectors": 64,
   "vacuum_durability": "strict",
-  "vacuum_latency_ns": 29791200,
-  "no_op_vacuum_latency_ns": 12638000,
-  "isolated_file_sync_probe_ns": 1170600,
+  "vacuum_latency_ns": 29658100,
+  "no_op_vacuum_latency_ns": 12672300,
+  "isolated_file_sync_probe_ns": 1294700,
   "point_read_observations": 10000,
   "point_read_before_ns": {
     "p50": 1000,
@@ -24,8 +24,8 @@
   },
   "point_read_after_ns": {
     "p50": 1000,
-    "p95": 1200,
-    "p99": 1300
+    "p95": 1100,
+    "p99": 1200
   },
   "page_size_bytes": 16384,
   "pages_before": 3580,

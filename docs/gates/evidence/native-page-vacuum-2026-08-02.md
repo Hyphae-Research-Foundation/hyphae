@@ -6,10 +6,10 @@ Status: implemented and measured current-root physical reclamation; broader
 retention, background scheduling, G1, and G7 remain open
 
 Measured source commit:
-`e764857bd8157ec43b9202592f621eeeb188e53e`
+`f5d10e7db0db2ae384e12bb18532a9bb50995ffb`
 
 Measured source tree:
-`0dcb24c979a7cad4e16512ae9a227e9ca4da9c00`
+`c1c4e6c4cef7a24ef9928e62618e3b76a160c590`
 
 Branch at measurement: `codex/native-page-vacuum`
 
@@ -26,8 +26,10 @@ CSN. Generation-one commits and checkpoints retain their exact V1 encodings.
 The strict vacuum transaction uses one empty kernel maintenance mutation,
 publishes the candidate through the WAL, advances one global CSN, resets the
 generation-keyed buffer pool, and removes the prior page file only after WAL
-synchronization. A candidate that is not smaller is removed without a WAL
-record, CSN, or generation change.
+synchronization. Candidate publication, prior-generation removal, recovery
+cleanup, and no-op cleanup synchronize the data directory on platforms that
+support directory synchronization. A candidate that is not smaller is removed
+without a WAL record, CSN, or generation change.
 
 Recovery authenticates the WAL before selecting a page file. A surviving WAL
 precommit without a terminal commit receives a synchronized abort record.
@@ -72,11 +74,11 @@ corpus contains 64 relational rows with nine versions each, 64 structure keys,
 | File bytes | 58,654,720 → 1,179,648 |
 | Physically reclaimed | 3,508 pages / 57,475,072 bytes |
 | Reclamation ratio | 97.989% |
-| Strict vacuum latency | 29.791 ms |
-| Immediate no-op vacuum latency | 12.638 ms |
-| Isolated 4 KiB `sync_data` probe | 1.171 ms |
+| Strict vacuum latency | 29.658 ms |
+| Immediate no-op vacuum latency | 12.672 ms |
+| Isolated 4 KiB `sync_data` probe | 1.295 ms |
 | Warm point read p50, before / after | 1.000 µs / 1.000 µs |
-| Warm point read p99, before / after | 1.200 µs / 1.300 µs |
+| Warm point read p99, before / after | 1.200 µs / 1.200 µs |
 | Reopen verification | passed |
 
 The vacuum and no-op are measured maintenance operations in milliseconds, not
