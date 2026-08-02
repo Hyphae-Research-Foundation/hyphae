@@ -399,17 +399,32 @@ fn run_scheduler(
     config: GroupCommitConfig,
 ) {
     let mut shutdown = false;
+    let mut pending = None;
     while !shutdown {
-        let first = match receiver.recv() {
+        let first = match pending.take().map_or_else(|| receiver.recv(), Ok) {
             Ok(SchedulerCommand::Commit(request)) => *request,
             Ok(SchedulerCommand::Shutdown) | Err(_) => break,
         };
+        if first.batch.durability != DurabilityClass::Group {
+            if !execute_single_request(database, first) {
+                break;
+            }
+            continue;
+        }
         let mut requests = vec![first];
         let deadline = Instant::now() + config.max_wait;
         while requests.len() < config.max_batch_size {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match receiver.recv_timeout(remaining) {
-                Ok(SchedulerCommand::Commit(request)) => requests.push(*request),
+                Ok(SchedulerCommand::Commit(request))
+                    if request.batch.durability == DurabilityClass::Group =>
+                {
+                    requests.push(*request);
+                }
+                Ok(command @ SchedulerCommand::Commit(_)) => {
+                    pending = Some(command);
+                    break;
+                }
                 Ok(SchedulerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     shutdown = true;
                     break;
@@ -417,7 +432,7 @@ fn run_scheduler(
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }
-        if !execute_requests(database, requests) {
+        if !execute_group_requests(database, requests) {
             shutdown = true;
         }
     }
@@ -425,7 +440,48 @@ fn run_scheduler(
     close_database(database);
 }
 
-fn execute_requests(
+fn execute_single_request(
+    database: &RwLock<Option<NativeDatabase>>,
+    request: CommitRequest,
+) -> bool {
+    let execution_started = Instant::now();
+    let CommitRequest {
+        batch,
+        submitted_at,
+        response,
+    } = request;
+    let Ok(mut database) = database.write() else {
+        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+        return false;
+    };
+    let Some(database) = database.as_mut() else {
+        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+        return false;
+    };
+    match database.commit_optimistic_scheduled(batch) {
+        Ok(report) => {
+            deliver(
+                &response,
+                Ok(ScheduledCommitReceipt {
+                    commit: report.commit,
+                    queue_wait: execution_started.saturating_duration_since(submitted_at),
+                    cohort_execution: report.execution_time,
+                    page_synchronization: report.page_synchronization_time,
+                    wal_synchronization: report.wal_synchronization_time,
+                    end_to_end: Duration::ZERO,
+                }),
+            );
+            true
+        }
+        Err(source) => {
+            let request_local = scheduler_request_local(&source);
+            deliver(&response, Err(GroupCommitSubmitError::runtime(source)));
+            request_local
+        }
+    }
+}
+
+fn execute_group_requests(
     database: &RwLock<Option<NativeDatabase>>,
     requests: Vec<CommitRequest>,
 ) -> bool {
@@ -475,6 +531,37 @@ fn execute_requests(
             false
         }
     }
+}
+
+fn scheduler_request_local(source: &NativeRuntimeError) -> bool {
+    matches!(
+        source,
+        NativeRuntimeError::Ann(_)
+            | NativeRuntimeError::WalSemantic(_)
+            | NativeRuntimeError::WriteConflict(_)
+            | NativeRuntimeError::Catalog(_)
+            | NativeRuntimeError::Model(_)
+            | NativeRuntimeError::UniqueSecondaryIndexViolation
+            | NativeRuntimeError::UnknownSecondaryIndex { .. }
+            | NativeRuntimeError::UnknownRelation { .. }
+            | NativeRuntimeError::UnknownVectorIndex { .. }
+            | NativeRuntimeError::InvalidPreparedMutation
+            | NativeRuntimeError::StructureValueNotInteger
+            | NativeRuntimeError::StructureIntegerOverflow
+            | NativeRuntimeError::StructureKindMismatch
+            | NativeRuntimeError::UnknownStructureHash
+            | NativeRuntimeError::UnknownStructureSet
+            | NativeRuntimeError::UnknownStructureList
+            | NativeRuntimeError::UnknownStructureSortedSet
+            | NativeRuntimeError::StructureScoreNotCanonical
+            | NativeRuntimeError::StructureListIndexExhausted
+            | NativeRuntimeError::StructureKeyExists
+            | NativeRuntimeError::LegacyStructureFamilyUnsupported
+            | NativeRuntimeError::StructureIdentityTooLarge
+            | NativeRuntimeError::SearchIdentityTooLarge
+            | NativeRuntimeError::SnapshotBelowRetentionFloor { .. }
+            | NativeRuntimeError::GroupCommitRequiresGroupDurability
+    )
 }
 
 fn deliver_all_unavailable(

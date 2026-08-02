@@ -808,6 +808,13 @@ pub struct CommitReceipt {
     pub durability_cohort_position: usize,
 }
 
+struct SingletonCommitReport {
+    commit: CommitReceipt,
+    execution_time: Duration,
+    page_synchronization_time: Duration,
+    wal_synchronization_time: Duration,
+}
+
 /// Independent result for one request submitted in a group-commit cohort.
 #[derive(Debug)]
 pub enum GroupCommitOutcome {
@@ -3356,9 +3363,25 @@ impl NativeDatabase {
 
     fn commit_optimistic_at(
         &mut self,
-        mut batch: NativeWriteBatch,
+        batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.commit_optimistic_report_at(batch, interruption)
+            .map(|report| report.commit)
+    }
+
+    fn commit_optimistic_scheduled(
+        &mut self,
+        batch: NativeWriteBatch,
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
+        self.commit_optimistic_report_at(batch, None)
+    }
+
+    fn commit_optimistic_report_at(
+        &mut self,
+        mut batch: NativeWriteBatch,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
         if batch.mode != NativeWriteBatchMode::Materialized {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
@@ -3401,7 +3424,7 @@ impl NativeDatabase {
             next_transaction_id: &mut self.next_transaction_id,
             batch,
         }
-        .commit_at(interruption)
+        .commit_report_at(interruption)
     }
 
     /// Commits independent group-durability batches with one page and WAL sync.
@@ -5922,7 +5945,7 @@ impl NativeTransaction<'_> {
     /// Returns an error for an empty write set, persistence, synchronization,
     /// codec, or MVCC publication failure.
     pub fn commit(self) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_at(None)
+        self.commit_report_at(None).map(|report| report.commit)
     }
 
     /// Explicitly rolls back all private engine and catalog changes.
@@ -5943,7 +5966,8 @@ impl NativeTransaction<'_> {
         self,
         boundary: CommitBoundary,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_at(Some(boundary))
+        self.commit_report_at(Some(boundary))
+            .map(|report| report.commit)
     }
 
     fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
@@ -5965,10 +5989,11 @@ impl NativeTransaction<'_> {
         }
     }
 
-    fn commit_at(
+    fn commit_report_at(
         mut self,
         interruption: Option<CommitBoundary>,
-    ) -> Result<CommitReceipt, NativeRuntimeError> {
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
+        let execution_started = Instant::now();
         if self.batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
         }
@@ -5997,9 +6022,8 @@ impl NativeTransaction<'_> {
             &blob_references,
         )?;
         interrupt(interruption, CommitBoundary::PageAppended)?;
-        if synchronize {
-            self.pages.sync_data()?;
-        }
+        let page_synchronization_time =
+            measure_optional_synchronization(synchronize, || self.pages.sync_data())?;
         interrupt(interruption, CommitBoundary::PageSynchronized)?;
 
         let concrete_roots = require_roots(roots)?;
@@ -6025,9 +6049,8 @@ impl NativeTransaction<'_> {
         })?;
         let receipts = self.wal.append_records(pending, false)?;
         interrupt(interruption, CommitBoundary::WalAppended)?;
-        if synchronize {
-            self.wal.sync_data()?;
-        }
+        let wal_synchronization_time =
+            measure_optional_synchronization(synchronize, || self.wal.sync_data())?;
         interrupt(interruption, CommitBoundary::WalSynchronized)?;
 
         let block = receipts.last().ok_or(WalError::EmptyBlock)?;
@@ -6046,15 +6069,20 @@ impl NativeTransaction<'_> {
             .checked_add(1)
             .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
         interrupt(interruption, CommitBoundary::RootPublished)?;
-        Ok(CommitReceipt {
-            transaction_id: self.transaction_id,
-            commit_csn,
-            catalog_version,
-            commit_lsn: block.last_lsn,
-            wal_block_digest: block.digest,
-            durability: batch.durability,
-            durability_cohort_size: 1,
-            durability_cohort_position: 0,
+        Ok(SingletonCommitReport {
+            commit: CommitReceipt {
+                transaction_id: self.transaction_id,
+                commit_csn,
+                catalog_version,
+                commit_lsn: block.last_lsn,
+                wal_block_digest: block.digest,
+                durability: batch.durability,
+                durability_cohort_size: 1,
+                durability_cohort_position: 0,
+            },
+            execution_time: execution_started.elapsed(),
+            page_synchronization_time,
+            wal_synchronization_time,
         })
     }
 }
@@ -6720,6 +6748,18 @@ fn interrupt(
     } else {
         Ok(())
     }
+}
+
+fn measure_optional_synchronization<E>(
+    synchronize: bool,
+    operation: impl FnOnce() -> Result<(), E>,
+) -> Result<Duration, E> {
+    if !synchronize {
+        return Ok(Duration::ZERO);
+    }
+    let started = Instant::now();
+    operation()?;
+    Ok(started.elapsed())
 }
 
 fn interrupt_group(
@@ -16836,8 +16876,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_scheduler_serializes_all_durability_classes()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn commit_scheduler_serializes_all_durability_classes() -> Result<(), Box<dyn std::error::Error>>
+    {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         stage_vertical(&mut database)?.commit()?;
