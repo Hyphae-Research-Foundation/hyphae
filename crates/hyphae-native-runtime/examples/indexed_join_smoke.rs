@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hyphae_native_runtime::{NativeDatabase, SqlResult, SqlValue};
+use hyphae_native_runtime::{
+    NativeDatabase, NativeSnapshot, PreparedStatement, SqlResult, SqlValue,
+};
 use hyphae_native_types::DurabilityClass;
 
 const ROWS: u32 = 2_048;
@@ -21,6 +23,7 @@ const P50_TARGET_MICROS: f64 = 75.0;
 const P99_TARGET_MICROS: f64 = 400.0;
 const BOUNDED_LIMIT: usize = 10;
 const BOUNDED_PARAMETER_COUNT: u32 = ROWS - 10 + 1;
+const SECONDARY_GROUPS: u32 = 16;
 const BOUNDED_P50_TARGET_MICROS: f64 = 500.0;
 const BOUNDED_P99_TARGET_MICROS: f64 = 2_000.0;
 const QUERY: &str = "SELECT users.id, users.payload, profiles.city
@@ -33,6 +36,12 @@ const BOUNDED_QUERY: &str = "SELECT users.id, users.payload, profiles.city
                              WHERE id >= ?
                              ORDER BY id
                              LIMIT 10";
+const SECONDARY_QUERY: &str = "SELECT users.id, users.payload, profiles.city
+                               FROM users
+                               INNER JOIN profiles ON users.profile_id = profiles.id
+                               WHERE cohort = ?
+                               ORDER BY id
+                               LIMIT 10";
 
 struct TemporaryDirectory(PathBuf);
 
@@ -74,10 +83,38 @@ struct Receipt<'receipt> {
     strict_commit_duration: Duration,
     reopen_duration: Duration,
     snapshot_materialization_duration: Duration,
+    routes: RouteMeasurements,
+}
+
+struct PreparedRoutes {
+    physical: PreparedStatement,
+    materialized: PreparedStatement,
+    bounded_physical: PreparedStatement,
+    bounded_materialized: PreparedStatement,
+    secondary_physical: PreparedStatement,
+    secondary_materialized: PreparedStatement,
+}
+
+struct RouteParameters {
+    exact: Vec<[SqlValue; 1]>,
+    bounded: Vec<[SqlValue; 1]>,
+    secondary: Vec<[SqlValue; 1]>,
+}
+
+struct RouteMeasurements {
     physical: LatencySummary,
     materialized: LatencySummary,
     bounded_physical: LatencySummary,
     bounded_materialized: LatencySummary,
+    secondary_physical: LatencySummary,
+    secondary_materialized: LatencySummary,
+}
+
+struct Benchmark<'benchmark> {
+    database: &'benchmark NativeDatabase,
+    snapshot: &'benchmark NativeSnapshot,
+    plans: PreparedRoutes,
+    parameters: RouteParameters,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -96,72 +133,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let snapshot_started = Instant::now();
     let snapshot = database.snapshot(2)?;
     let snapshot_materialization_duration = snapshot_started.elapsed();
-    let physical_plan = database.prepare_sql_latest(QUERY)?;
-    let materialized_plan = snapshot.prepare_sql(QUERY)?;
-    let bounded_physical_plan = database.prepare_sql_latest(BOUNDED_QUERY)?;
-    let bounded_materialized_plan = snapshot.prepare_sql(BOUNDED_QUERY)?;
-    let parameters = exact_query_parameters();
-    let bounded_parameters = bounded_query_parameters();
-    validate_result(
-        database
-            .execute_prepared_latest(&physical_plan, &parameters[usize::try_from(ROWS - 1)?])?,
-        1,
-    )?;
-    validate_result(
-        snapshot.execute_prepared(&materialized_plan, &parameters[usize::try_from(ROWS - 1)?])?,
-        1,
-    )?;
-    validate_result(
-        database.execute_prepared_latest(
-            &bounded_physical_plan,
-            &bounded_parameters[usize::try_from(ROWS - 10)?],
-        )?,
-        BOUNDED_LIMIT,
-    )?;
-    validate_result(
-        snapshot.execute_prepared(
-            &bounded_materialized_plan,
-            &bounded_parameters[usize::try_from(ROWS - 10)?],
-        )?,
-        BOUNDED_LIMIT,
-    )?;
-
-    for observation in 0..WARMUP {
-        let parameter = &parameters[usize::try_from(observation % ROWS)?];
-        let bounded_parameter =
-            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
-        black_box(database.execute_prepared_latest(&physical_plan, black_box(parameter))?);
-        black_box(snapshot.execute_prepared(&materialized_plan, black_box(parameter))?);
-        black_box(
-            database
-                .execute_prepared_latest(&bounded_physical_plan, black_box(bounded_parameter))?,
-        );
-        black_box(
-            snapshot.execute_prepared(&bounded_materialized_plan, black_box(bounded_parameter))?,
-        );
-    }
-    let physical = measure_latency(OBSERVATIONS, |observation| {
-        let parameter = &parameters[usize::try_from(observation % ROWS)?];
-        black_box(database.execute_prepared_latest(&physical_plan, black_box(parameter))?);
-        Ok(())
-    })?;
-    let materialized = measure_latency(OBSERVATIONS, |observation| {
-        let parameter = &parameters[usize::try_from(observation % ROWS)?];
-        black_box(snapshot.execute_prepared(&materialized_plan, black_box(parameter))?);
-        Ok(())
-    })?;
-    let bounded_physical = measure_latency(OBSERVATIONS, |observation| {
-        let parameter =
-            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
-        black_box(database.execute_prepared_latest(&bounded_physical_plan, black_box(parameter))?);
-        Ok(())
-    })?;
-    let bounded_materialized = measure_latency(OBSERVATIONS, |observation| {
-        let parameter =
-            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
-        black_box(snapshot.execute_prepared(&bounded_materialized_plan, black_box(parameter))?);
-        Ok(())
-    })?;
+    let benchmark = Benchmark::prepare(&database, &snapshot)?;
+    benchmark.validate()?;
+    benchmark.warm()?;
+    let routes = benchmark.measure()?;
     print_receipt(&Receipt {
         source_commit: &source_commit,
         environment: &environment,
@@ -171,12 +146,178 @@ fn main() -> Result<(), Box<dyn Error>> {
         strict_commit_duration,
         reopen_duration,
         snapshot_materialization_duration,
-        physical,
-        materialized,
-        bounded_physical,
-        bounded_materialized,
+        routes,
     })?;
     Ok(())
+}
+
+impl<'benchmark> Benchmark<'benchmark> {
+    fn prepare(
+        database: &'benchmark NativeDatabase,
+        snapshot: &'benchmark NativeSnapshot,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            database,
+            snapshot,
+            plans: PreparedRoutes {
+                physical: database.prepare_sql_latest(QUERY)?,
+                materialized: snapshot.prepare_sql(QUERY)?,
+                bounded_physical: database.prepare_sql_latest(BOUNDED_QUERY)?,
+                bounded_materialized: snapshot.prepare_sql(BOUNDED_QUERY)?,
+                secondary_physical: database.prepare_sql_latest(SECONDARY_QUERY)?,
+                secondary_materialized: snapshot.prepare_sql(SECONDARY_QUERY)?,
+            },
+            parameters: RouteParameters {
+                exact: exact_query_parameters(),
+                bounded: bounded_query_parameters(),
+                secondary: secondary_query_parameters(),
+            },
+        })
+    }
+
+    fn validate(&self) -> Result<(), Box<dyn Error>> {
+        let exact = &self.parameters.exact[usize::try_from(ROWS - 1)?];
+        let bounded = &self.parameters.bounded[usize::try_from(ROWS - 10)?];
+        let secondary = &self.parameters.secondary[0];
+        validate_result(
+            self.database
+                .execute_prepared_latest(&self.plans.physical, exact)?,
+            1,
+        )?;
+        validate_result(
+            self.snapshot
+                .execute_prepared(&self.plans.materialized, exact)?,
+            1,
+        )?;
+        validate_result(
+            self.database
+                .execute_prepared_latest(&self.plans.bounded_physical, bounded)?,
+            BOUNDED_LIMIT,
+        )?;
+        validate_result(
+            self.snapshot
+                .execute_prepared(&self.plans.bounded_materialized, bounded)?,
+            BOUNDED_LIMIT,
+        )?;
+        validate_result(
+            self.database
+                .execute_prepared_latest(&self.plans.secondary_physical, secondary)?,
+            BOUNDED_LIMIT,
+        )?;
+        validate_result(
+            self.snapshot
+                .execute_prepared(&self.plans.secondary_materialized, secondary)?,
+            BOUNDED_LIMIT,
+        )
+    }
+
+    fn warm(&self) -> Result<(), Box<dyn Error>> {
+        for observation in 0..WARMUP {
+            let exact = &self.parameters.exact[usize::try_from(observation % ROWS)?];
+            let bounded =
+                &self.parameters.bounded[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
+            let secondary =
+                &self.parameters.secondary[usize::try_from(observation % SECONDARY_GROUPS)?];
+            black_box(
+                self.database
+                    .execute_prepared_latest(&self.plans.physical, black_box(exact))?,
+            );
+            black_box(
+                self.snapshot
+                    .execute_prepared(&self.plans.materialized, black_box(exact))?,
+            );
+            black_box(
+                self.database
+                    .execute_prepared_latest(&self.plans.bounded_physical, black_box(bounded))?,
+            );
+            black_box(
+                self.snapshot
+                    .execute_prepared(&self.plans.bounded_materialized, black_box(bounded))?,
+            );
+            black_box(
+                self.database.execute_prepared_latest(
+                    &self.plans.secondary_physical,
+                    black_box(secondary),
+                )?,
+            );
+            black_box(
+                self.snapshot
+                    .execute_prepared(&self.plans.secondary_materialized, black_box(secondary))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn measure(&self) -> Result<RouteMeasurements, Box<dyn Error>> {
+        Ok(RouteMeasurements {
+            physical: self.measure_exact(true)?,
+            materialized: self.measure_exact(false)?,
+            bounded_physical: self.measure_bounded(true)?,
+            bounded_materialized: self.measure_bounded(false)?,
+            secondary_physical: self.measure_secondary(true)?,
+            secondary_materialized: self.measure_secondary(false)?,
+        })
+    }
+
+    fn measure_exact(&self, physical: bool) -> Result<LatencySummary, Box<dyn Error>> {
+        measure_latency(OBSERVATIONS, |observation| {
+            let parameter = &self.parameters.exact[usize::try_from(observation % ROWS)?];
+            if physical {
+                black_box(
+                    self.database
+                        .execute_prepared_latest(&self.plans.physical, black_box(parameter))?,
+                );
+            } else {
+                black_box(
+                    self.snapshot
+                        .execute_prepared(&self.plans.materialized, black_box(parameter))?,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn measure_bounded(&self, physical: bool) -> Result<LatencySummary, Box<dyn Error>> {
+        measure_latency(OBSERVATIONS, |observation| {
+            let parameter =
+                &self.parameters.bounded[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
+            if physical {
+                black_box(
+                    self.database.execute_prepared_latest(
+                        &self.plans.bounded_physical,
+                        black_box(parameter),
+                    )?,
+                );
+            } else {
+                black_box(
+                    self.snapshot
+                        .execute_prepared(&self.plans.bounded_materialized, black_box(parameter))?,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn measure_secondary(&self, physical: bool) -> Result<LatencySummary, Box<dyn Error>> {
+        measure_latency(OBSERVATIONS, |observation| {
+            let parameter =
+                &self.parameters.secondary[usize::try_from(observation % SECONDARY_GROUPS)?];
+            if physical {
+                black_box(self.database.execute_prepared_latest(
+                    &self.plans.secondary_physical,
+                    black_box(parameter),
+                )?);
+            } else {
+                black_box(
+                    self.snapshot.execute_prepared(
+                        &self.plans.secondary_materialized,
+                        black_box(parameter),
+                    )?,
+                );
+            }
+            Ok(())
+        })
+    }
 }
 
 fn create_dataset(path: &Path) -> Result<(blake3::Hash, Duration, u64), Box<dyn Error>> {
@@ -187,6 +328,7 @@ fn create_dataset(path: &Path) -> Result<(blake3::Hash, Duration, u64), Box<dyn 
             id BIGINT PRIMARY KEY,
             email TEXT NOT NULL,
             profile_id BIGINT NOT NULL,
+            cohort TEXT NOT NULL,
             payload BINARY NOT NULL
         )",
         &[],
@@ -199,19 +341,22 @@ fn create_dataset(path: &Path) -> Result<(blake3::Hash, Duration, u64), Box<dyn 
         &[],
     )?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"hyphae-native-indexed-inner-join-corpus-v1");
+    hasher.update(b"hyphae-native-indexed-inner-join-corpus-v2");
     for row in 0..ROWS {
         let id = i64::from(row) + 1;
         let profile_id = id + 10_000;
         let email = format!("person-{row:04}@hyphae.local");
+        let cohort = format!("cohort-{:02}", row % SECONDARY_GROUPS);
         let city = format!("city-{row:04}");
         let payload = deterministic_payload(row);
         transaction.execute_sql(
-            "INSERT INTO users (id, email, profile_id, payload) VALUES (?, ?, ?, ?)",
+            "INSERT INTO users (id, email, profile_id, cohort, payload)
+             VALUES (?, ?, ?, ?, ?)",
             &[
                 SqlValue::Signed(id),
                 SqlValue::Text(email.clone()),
                 SqlValue::Signed(profile_id),
+                SqlValue::Text(cohort.clone()),
                 SqlValue::Binary(payload.clone()),
             ],
         )?;
@@ -222,10 +367,12 @@ fn create_dataset(path: &Path) -> Result<(blake3::Hash, Duration, u64), Box<dyn 
         hasher.update(&id.to_le_bytes());
         hasher.update(email.as_bytes());
         hasher.update(&profile_id.to_le_bytes());
+        hasher.update(cohort.as_bytes());
         hasher.update(&payload);
         hasher.update(city.as_bytes());
     }
     transaction.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+    transaction.execute_sql("CREATE INDEX users_cohort ON users (cohort)", &[])?;
     let commit_started = Instant::now();
     let outcome = transaction.commit()?;
     Ok((
@@ -257,6 +404,12 @@ fn exact_query_parameters() -> Vec<[SqlValue; 1]> {
 fn bounded_query_parameters() -> Vec<[SqlValue; 1]> {
     (1..=BOUNDED_PARAMETER_COUNT)
         .map(|id| [SqlValue::Signed(i64::from(id))])
+        .collect()
+}
+
+fn secondary_query_parameters() -> Vec<[SqlValue; 1]> {
+    (0..SECONDARY_GROUPS)
+        .map(|group| [SqlValue::Text(format!("cohort-{group:02}"))])
         .collect()
 }
 
@@ -297,7 +450,7 @@ fn measure_latency(
 
 fn print_receipt(receipt: &Receipt<'_>) -> Result<(), Box<dyn Error>> {
     println!("{{");
-    println!("  \"schema\": \"hyphae-native-indexed-inner-join-smoke-v2\",");
+    println!("  \"schema\": \"hyphae-native-indexed-inner-join-smoke-v3\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!(
         "  \"source_commit\": {},",
@@ -337,31 +490,46 @@ fn print_receipt(receipt: &Receipt<'_>) -> Result<(), Box<dyn Error>> {
     println!("  }},");
     println!("  \"exact_query\": {},", json_string(QUERY)?);
     println!("  \"bounded_query\": {},", json_string(BOUNDED_QUERY)?);
+    println!("  \"secondary_query\": {},", json_string(SECONDARY_QUERY)?);
     println!("  \"routes\": {{");
     print_latency(
         "physical_latest_exact",
-        &receipt.physical,
+        &receipt.routes.physical,
         P50_TARGET_MICROS,
         P99_TARGET_MICROS,
         true,
     );
     print_latency(
         "materialized_snapshot_exact",
-        &receipt.materialized,
+        &receipt.routes.materialized,
         P50_TARGET_MICROS,
         P99_TARGET_MICROS,
         true,
     );
     print_latency(
         "physical_latest_bounded_limit_10",
-        &receipt.bounded_physical,
+        &receipt.routes.bounded_physical,
         BOUNDED_P50_TARGET_MICROS,
         BOUNDED_P99_TARGET_MICROS,
         true,
     );
     print_latency(
         "materialized_snapshot_bounded_limit_10",
-        &receipt.bounded_materialized,
+        &receipt.routes.bounded_materialized,
+        BOUNDED_P50_TARGET_MICROS,
+        BOUNDED_P99_TARGET_MICROS,
+        true,
+    );
+    print_latency(
+        "physical_latest_secondary_limit_10",
+        &receipt.routes.secondary_physical,
+        BOUNDED_P50_TARGET_MICROS,
+        BOUNDED_P99_TARGET_MICROS,
+        true,
+    );
+    print_latency(
+        "materialized_snapshot_secondary_limit_10",
+        &receipt.routes.secondary_materialized,
         BOUNDED_P50_TARGET_MICROS,
         BOUNDED_P99_TARGET_MICROS,
         false,
