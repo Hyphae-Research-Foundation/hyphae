@@ -1,0 +1,834 @@
+{
+  "closure": {
+    "dependency_kinds": {
+      "arrayref": [
+        "normal"
+      ],
+      "arrayvec": [
+        "normal"
+      ],
+      "blake3": [
+        "normal"
+      ],
+      "cc": [
+        "build"
+      ],
+      "cfg-if": [
+        "normal"
+      ],
+      "constant_time_eq": [
+        "normal"
+      ],
+      "cpufeatures": [
+        "normal"
+      ],
+      "crc32c": [
+        "normal"
+      ],
+      "find-msvc-tools": [
+        "normal"
+      ],
+      "hyphae-native-ann": [
+        "normal"
+      ],
+      "hyphae-native-blobs": [
+        "normal"
+      ],
+      "hyphae-native-btree": [
+        "normal"
+      ],
+      "hyphae-native-catalog": [
+        "normal"
+      ],
+      "hyphae-native-manifest": [
+        "normal"
+      ],
+      "hyphae-native-mvcc": [
+        "normal"
+      ],
+      "hyphae-native-pages": [
+        "normal"
+      ],
+      "hyphae-native-records": [
+        "normal"
+      ],
+      "hyphae-native-runtime": [
+        "root"
+      ],
+      "hyphae-native-types": [
+        "normal"
+      ],
+      "hyphae-native-wal": [
+        "normal"
+      ],
+      "libc": [
+        "normal"
+      ],
+      "proc-macro2": [
+        "normal"
+      ],
+      "quote": [
+        "normal"
+      ],
+      "rustc_version": [
+        "build"
+      ],
+      "semver": [
+        "normal"
+      ],
+      "shlex": [
+        "normal"
+      ],
+      "syn": [
+        "normal"
+      ],
+      "thiserror": [
+        "normal"
+      ],
+      "thiserror-impl": [
+        "normal"
+      ],
+      "unicode-ident": [
+        "normal"
+      ]
+    },
+    "external_package_count": 19,
+    "forbidden_packages_present": [],
+    "package_count": 30,
+    "packages": [
+      {
+        "category": "BLAKE3 support primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "BSD-2-Clause",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayref-0.3.9/Cargo.toml",
+        "name": "arrayref",
+        "rationale": "Fixed-size array reference helpers used transitively by BLAKE3.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.3.9",
+        "workspace": false
+      },
+      {
+        "category": "BLAKE3 support primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.8/Cargo.toml",
+        "name": "arrayvec",
+        "rationale": "Bounded inline array storage used transitively by BLAKE3.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.7.8",
+        "workspace": false
+      },
+      {
+        "category": "integrity primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/Cargo.toml",
+        "name": "blake3",
+        "rationale": "Content identity and authenticated page, WAL, manifest, and root digests.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.8.5",
+        "workspace": false
+      },
+      {
+        "category": "build primitive",
+        "dependency_kinds": [
+          "build"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cc-1.2.67/Cargo.toml",
+        "name": "cc",
+        "rationale": "Build-time compiler driver used by BLAKE3 platform acceleration.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.2.67",
+        "workspace": false
+      },
+      {
+        "category": "platform primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/Cargo.toml",
+        "name": "cfg-if",
+        "rationale": "Compile-time target selection used transitively by BLAKE3.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.4",
+        "workspace": false
+      },
+      {
+        "category": "integrity primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "CC0-1.0 OR MIT-0 OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/constant_time_eq-0.4.2/Cargo.toml",
+        "name": "constant_time_eq",
+        "rationale": "Constant-time digest comparison used transitively by BLAKE3.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.4.2",
+        "workspace": false
+      },
+      {
+        "category": "platform primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.3.0/Cargo.toml",
+        "name": "cpufeatures",
+        "rationale": "Runtime CPU feature detection used transitively by BLAKE3.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.3.0",
+        "workspace": false
+      },
+      {
+        "category": "integrity primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0/MIT",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/crc32c-0.6.8/Cargo.toml",
+        "name": "crc32c",
+        "rationale": "Fast accidental-corruption detection for native pages, WAL, blobs, and manifests.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.6.8",
+        "workspace": false
+      },
+      {
+        "category": "build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/find-msvc-tools-0.1.9/Cargo.toml",
+        "name": "find-msvc-tools",
+        "rationale": "MSVC discovery used transitively by the cc build primitive.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.1.9",
+        "workspace": false
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-ann/Cargo.toml",
+        "name": "hyphae-native-ann",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-blobs/Cargo.toml",
+        "name": "hyphae-native-blobs",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-btree/Cargo.toml",
+        "name": "hyphae-native-btree",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-catalog/Cargo.toml",
+        "name": "hyphae-native-catalog",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-manifest/Cargo.toml",
+        "name": "hyphae-native-manifest",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-mvcc/Cargo.toml",
+        "name": "hyphae-native-mvcc",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-pages/Cargo.toml",
+        "name": "hyphae-native-pages",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-records/Cargo.toml",
+        "name": "hyphae-native-records",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "root"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-runtime/Cargo.toml",
+        "name": "hyphae-native-runtime",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-types/Cargo.toml",
+        "name": "hyphae-native-types",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "Apache-2.0",
+        "manifest_path": "<repo>/crates/hyphae-native-wal/Cargo.toml",
+        "name": "hyphae-native-wal",
+        "source": null,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "category": "platform primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.186/Cargo.toml",
+        "name": "libc",
+        "rationale": "Target-conditioned CPU feature support outside Hyphae-owned semantics.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.2.186",
+        "workspace": false
+      },
+      {
+        "category": "derive build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/Cargo.toml",
+        "name": "proc-macro2",
+        "rationale": "Compiler token representation used by the thiserror derive path.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.106",
+        "workspace": false
+      },
+      {
+        "category": "derive build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.46/Cargo.toml",
+        "name": "quote",
+        "rationale": "Compiler token generation used by the thiserror derive path.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.46",
+        "workspace": false
+      },
+      {
+        "category": "build primitive",
+        "dependency_kinds": [
+          "build"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/rustc_version-0.4.1/Cargo.toml",
+        "name": "rustc_version",
+        "rationale": "Compiler-version detection used by crc32c at build time.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.4.1",
+        "workspace": false
+      },
+      {
+        "category": "build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/semver-1.0.28/Cargo.toml",
+        "name": "semver",
+        "rationale": "Version parsing used transitively by rustc_version.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.28",
+        "workspace": false
+      },
+      {
+        "category": "build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/shlex-2.0.1/Cargo.toml",
+        "name": "shlex",
+        "rationale": "Command-line tokenization used transitively by the cc build primitive.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.1",
+        "workspace": false
+      },
+      {
+        "category": "derive build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.2/Cargo.toml",
+        "name": "syn",
+        "rationale": "Rust syntax parsing used by the thiserror derive path.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "3.0.2",
+        "workspace": false
+      },
+      {
+        "category": "error primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/Cargo.toml",
+        "name": "thiserror",
+        "rationale": "Typed error derivation without database, query, or storage semantics.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.19",
+        "workspace": false
+      },
+      {
+        "category": "derive build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "MIT OR Apache-2.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/Cargo.toml",
+        "name": "thiserror-impl",
+        "rationale": "Procedural macro implementation for thiserror.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "2.0.19",
+        "workspace": false
+      },
+      {
+        "category": "derive build primitive",
+        "dependency_kinds": [
+          "normal"
+        ],
+        "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+        "manifest_path": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/Cargo.toml",
+        "name": "unicode-ident",
+        "rationale": "Unicode identifier tables used by proc-macro2 and syn.",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.0.24",
+        "workspace": false
+      }
+    ],
+    "root_package": "hyphae-native-runtime",
+    "workspace_package_count": 11
+  },
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1"
+      ],
+      "exit_status": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "cc4f783b2e0657f3755a87a0e0507aa68fdf6953e439f6d6d73a68ecc8d02e03"
+    },
+    {
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "exit_status": 0,
+      "stderr_sha256": "519cb2f75b3d2cd86f4d8c863e542ddc3b1ac21cf4e2824c40f3458d74feb6c5",
+      "stdout_sha256": "f1a0fca39d4280363937aabd77783990ea6480bd9ca257816de3b68fc8efa845"
+    },
+    {
+      "command": [
+        "cargo",
+        "geiger",
+        "--manifest-path",
+        "<repo>/crates/hyphae-native-runtime/Cargo.toml",
+        "--all-features",
+        "--build-dependencies",
+        "--locked",
+        "--output-format",
+        "Json",
+        "--color",
+        "never",
+        "--quiet"
+      ],
+      "environment": {
+        "CARGO_TARGET_DIR": "<repo>/target/native-dependency-geiger/linux-x86_64"
+      },
+      "exit_status": 0,
+      "stderr_sha256": "c8ec61db47266bcafa3fd11b257401ecd7f495e883139dcaed333cb8f07bb46e",
+      "stdout_sha256": "8cb01d800c612d98b71228a50f5cf9909ea11ff1c7616cf093d2c1cf39eedca4"
+    }
+  ],
+  "gate_version": 1,
+  "generated_at_utc": "2026-08-02T07:31:03.211493+00:00",
+  "git": {
+    "commit": "fc8dbc9f1f849e8a10302d4595b383168331281b",
+    "tree": "2ef9efcbe8c1e6df1458c941bb8e9e25df27e121",
+    "worktree_clean_before_receipt": true
+  },
+  "host": {
+    "machine": "x86_64",
+    "python": "3.13.5",
+    "release": "6.18.33.1-microsoft-standard-WSL2",
+    "system": "Linux"
+  },
+  "policy": {
+    "path": "config/native-dependency-policy.json",
+    "sha256": "46eca78378a0bfc6f08f59379da362a3892aa6dd6c1e9c1444b89449866d25e0"
+  },
+  "result": "pass",
+  "schema": "hyphae-native-dependency-audit-v1",
+  "tools": {
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "cargo_deny": "cargo-deny 0.20.2",
+    "cargo_geiger": "cargo-geiger 0.13.0",
+    "git": "git version 2.47.3",
+    "git_executable": "/usr/bin/git",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2"
+  },
+  "unsafe": {
+    "external_unsafe_count_on_host": 6488,
+    "external_used_unsafe_count_on_host": 873,
+    "native_unsafe_count": 0,
+    "out_of_closure_parse_failures": [
+      "signal-hook-registry@1.4.8",
+      "unicode-casefold@0.2.0"
+    ],
+    "packages": [
+      {
+        "name": "arrayref",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.3.9",
+        "workspace": false
+      },
+      {
+        "name": "arrayvec",
+        "status": "scanned",
+        "unsafe_count": 353,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 353,
+        "version": "0.7.8",
+        "workspace": false
+      },
+      {
+        "name": "blake3",
+        "status": "scanned",
+        "unsafe_count": 4449,
+        "unused_unsafe_count": 4361,
+        "used_unsafe_count": 88,
+        "version": "1.8.5",
+        "workspace": false
+      },
+      {
+        "name": "cc",
+        "status": "scanned",
+        "unsafe_count": 41,
+        "unused_unsafe_count": 23,
+        "used_unsafe_count": 18,
+        "version": "1.2.67",
+        "workspace": false
+      },
+      {
+        "name": "cfg-if",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "1.0.4",
+        "workspace": false
+      },
+      {
+        "name": "constant_time_eq",
+        "status": "scanned",
+        "unsafe_count": 100,
+        "unused_unsafe_count": 51,
+        "used_unsafe_count": 49,
+        "version": "0.4.2",
+        "workspace": false
+      },
+      {
+        "name": "cpufeatures",
+        "status": "scanned",
+        "unsafe_count": 13,
+        "unused_unsafe_count": 13,
+        "used_unsafe_count": 0,
+        "version": "0.3.0",
+        "workspace": false
+      },
+      {
+        "name": "crc32c",
+        "status": "scanned",
+        "unsafe_count": 170,
+        "unused_unsafe_count": 75,
+        "used_unsafe_count": 95,
+        "version": "0.6.8",
+        "workspace": false
+      },
+      {
+        "name": "find-msvc-tools",
+        "status": "scanned",
+        "unsafe_count": 191,
+        "unused_unsafe_count": 172,
+        "used_unsafe_count": 19,
+        "version": "0.1.9",
+        "workspace": false
+      },
+      {
+        "name": "hyphae-native-ann",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-blobs",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-btree",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-catalog",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-manifest",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-mvcc",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-pages",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-records",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-runtime",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-types",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "hyphae-native-wal",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.2.1",
+        "workspace": true
+      },
+      {
+        "name": "libc",
+        "status": "scanned",
+        "unsafe_count": 920,
+        "unused_unsafe_count": 920,
+        "used_unsafe_count": 0,
+        "version": "0.2.186",
+        "workspace": false
+      },
+      {
+        "name": "proc-macro2",
+        "status": "scanned",
+        "unsafe_count": 17,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 17,
+        "version": "1.0.106",
+        "workspace": false
+      },
+      {
+        "name": "quote",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "1.0.46",
+        "workspace": false
+      },
+      {
+        "name": "rustc_version",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "0.4.1",
+        "workspace": false
+      },
+      {
+        "name": "semver",
+        "status": "scanned",
+        "unsafe_count": 128,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 128,
+        "version": "1.0.28",
+        "workspace": false
+      },
+      {
+        "name": "shlex",
+        "status": "scanned",
+        "unsafe_count": 9,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 9,
+        "version": "2.0.1",
+        "workspace": false
+      },
+      {
+        "name": "syn",
+        "status": "scanned",
+        "unsafe_count": 93,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 93,
+        "version": "3.0.2",
+        "workspace": false
+      },
+      {
+        "name": "thiserror",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "2.0.19",
+        "workspace": false
+      },
+      {
+        "name": "thiserror-impl",
+        "status": "scanned",
+        "unsafe_count": 0,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 0,
+        "version": "2.0.19",
+        "workspace": false
+      },
+      {
+        "name": "unicode-ident",
+        "status": "scanned",
+        "unsafe_count": 4,
+        "unused_unsafe_count": 0,
+        "used_unsafe_count": 4,
+        "version": "1.0.24",
+        "workspace": false
+      }
+    ],
+    "packages_without_metrics": [],
+    "used_but_not_scanned_files": [
+      "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cc-1.2.67/src/detect_compiler_family.c",
+      "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.3.0/README.md",
+      "<repo>/target/native-dependency-geiger/linux-x86_64/debug/build/crc32c-ca10954bbd7caff5/out/hw.long.table",
+      "<repo>/target/native-dependency-geiger/linux-x86_64/debug/build/crc32c-ca10954bbd7caff5/out/hw.short.table",
+      "<repo>/target/native-dependency-geiger/linux-x86_64/debug/build/crc32c-ca10954bbd7caff5/out/sw.table",
+      "<repo>/target/native-dependency-geiger/linux-x86_64/debug/build/thiserror-a8043f4f9b54b511/out/private.rs"
+    ]
+  }
+}

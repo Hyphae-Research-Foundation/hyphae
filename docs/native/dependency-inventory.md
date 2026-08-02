@@ -1,8 +1,8 @@
 # Native clean-room and dependency inventory
 
 Status: normative G0 policy; the exact native-closure gate, machine-readable
-policy, unit tests, and pull-request CI are implemented; a clean-commit receipt
-and semantic review of reported third-party unsafe use remain pending
+policy, unit tests, pull-request CI, and a clean WSL2 receipt are implemented;
+semantic review of reported third-party unsafe use remains pending
 
 Hyphae owns database, transaction, SQL, structure, lexical and ANN semantics.
 This document distinguishes permitted primitives from forbidden target-engine
@@ -153,6 +153,9 @@ Unsafe counts in reviewed third-party primitives are reported by package and
 may be nonzero. Unsafe counts in Hyphae-owned native crates must be zero. Parse
 diagnostics for packages outside the metadata closure are retained in the
 receipt but cannot silently expand or invalidate the audited package set.
+The first clean capture is the
+[2026-08-02 native dependency-closure
+evidence](../gates/evidence/native-dependency-closure-2026-08-02.md).
 
 The JSON receipt must bind:
 

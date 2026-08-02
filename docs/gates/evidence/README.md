@@ -262,6 +262,15 @@ commit before its tag can be published.
 - `native-structure-compaction-wsl2.json` records a 41-to-10 reduction in
   reachable pages and a 93.133% empty-expiry-scan p50 improvement while also
   recording append-only file growth. Physical page-file vacuum remains open.
+- [Native dependency-closure evidence —
+  2026-08-02](native-dependency-closure-2026-08-02.md) binds the exact
+  non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
+  sources/licenses, forbidden-engine rejection, workspace lint inheritance,
+  and host-observed unsafe metrics to one source commit.
+- `native-dependency-closure-wsl2.json` records 11 native workspace packages,
+  19 external primitives/build dependencies, zero native unsafe findings, and
+  every external parser/exclusion residual. Semantic third-party unsafe review
+  and the remaining G0 corpus/conformance work stay open.
 
 ## Hosted release evidence
 

@@ -106,6 +106,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native ordered B+tree batch COW evidence — 2026-08-02](gates/evidence/native-btree-batch-cow-2026-08-02.md)
 - [Native structure reachability-compaction evidence — 2026-08-02](gates/evidence/native-structure-compaction-2026-08-02.md)
+- [Native dependency-closure evidence — 2026-08-02](gates/evidence/native-dependency-closure-2026-08-02.md)
 - [Native inverted-search evidence — 2026-08-01](gates/evidence/native-inverted-search-2026-08-01.md)
 - [Native ANN kernel evidence — 2026-08-01](gates/evidence/native-ann-kernel-2026-08-01.md)
 - [Native ANN durability evidence — 2026-08-01](gates/evidence/native-ann-durability-2026-08-01.md)
