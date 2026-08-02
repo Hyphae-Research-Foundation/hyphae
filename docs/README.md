@@ -89,6 +89,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Decisions and governance
 
+- [Fable 5 native-ecosystem handoff — 2026-08-02](handoffs/fable-5-native-ecosystem-2026-08-02.md)
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)
 - [Porting ledger](porting/ledger.md)
