@@ -2,8 +2,8 @@
 
 This unpublished crate is the first executable convergence slice for Hyphae's
 native data ecosystem. It owns a single data directory and coordinates native
-catalog, relational, structure, and lexical-search state through copy-on-write
-pages, one WAL transaction, and one published CSN.
+catalog, relational, structure, lexical-search, and ANN state through
+copy-on-write pages, one WAL transaction, and one published CSN.
 
 Catalog create mutations and `HYCAT002` roots retain complete canonical
 relation/search definitions instead of discarding them after validation.
@@ -55,12 +55,24 @@ range, loads only candidate document lengths, and produces the same BM25
 scores as the materialized reference. Large UTF-8 source text shares the blob
 namespace, and legacy single-page search roots remain compatible.
 
+The same search B+tree now stores catalog-bound vector-index metadata,
+immutable canonical `f32` vectors, and HNSW neighbor layers under a
+content-bound generation identity. `CREATE ANN INDEX`, `UPSERT VECTOR`, and
+`DELETE VECTOR` are WAL operations under the global CSN. Duplicate-free batch
+upsert performs one atomic private rebuild, and commit groups every target
+index into one canonical persisted replacement. Retained roots preserve
+historical vector results; reopen validates and restores the complete graph
+before serving exact or explicitly approximate search.
+
 The implementation remains deliberately bounded: transaction snapshots still
 materialize relation state, version retention and vacuum are not implemented,
 partial/secondary ranges and zero-copy operator cursors remain pending,
 structures still lack most Valkey-class families, and lexical search still
 lacks positions, phrases, filters, facets, doc values, deletes/updates,
-segments, and ANN. Detached
+segments, and hybrid fusion. ANN still materializes the validated generation
+at open/snapshot time; direct buffer-pool graph traversal, snapshot filters,
+delta/tombstone merge, background build publication, and reclamation remain
+pending. Detached
 transactions can prepare concurrently without holding
 writer admission; commit validates their original read CSN and rebases
 disjoint mutations over the admitted current root. Publication and its

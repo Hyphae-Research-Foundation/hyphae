@@ -98,6 +98,15 @@ commit before its tag can be published.
   100-query WSL2 observation. Recall@10 passed the bounded 0.95 floor at
   0.970, but HNSW remained slower than exact search and the receipt does not
   pass G4 or G7.
+- [Native ANN durability evidence —
+  2026-08-01](native-ann-durability-2026-08-01.md) binds catalog, WAL,
+  search-B+tree generations, batch rebuild, all-engine MVCC snapshots,
+  optimistic conflicts, recovery/corruption behavior and the seven commit
+  interruption boundaries to one source commit.
+- `native-ann-durability-wsl2.json` is its 512-vector, 32-dimensional,
+  10,000-observation-per-route WSL2 receipt. It measures a validated
+  materialized snapshot at concurrency one, not direct buffered traversal, and
+  therefore passes neither G4 nor G7.
 - [Native canonical type-codec evidence —
   2026-08-01](native-type-codecs-2026-08-01.md) binds recursive type
   descriptors, checked primitive row payloads, memcomparable ordered-index

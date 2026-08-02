@@ -8,6 +8,8 @@ The normative target contract is
 [`docs/native/catalog-v1.md`](../../docs/native/catalog-v1.md). The runtime now
 persists complete definitions in `HYCAT002` and reads legacy `HYCAT001`.
 The current object variants are relation, relational secondary index,
-structure, and search collection. Catalog B+tree scaling, definition history,
-dependencies, constraints, richer index definitions, and schema evolution
-remain partial G1/G2 work.
+structure, and search collection. Search definitions preserve the legacy exact
+vector encoding and add checked cosine/negative-dot/squared-L2 plus HNSW
+construction/search bounds under an explicit ANN tag. Catalog B+tree scaling,
+definition history, dependencies, constraints, richer index definitions, and
+schema evolution remain partial G1/G2 work.

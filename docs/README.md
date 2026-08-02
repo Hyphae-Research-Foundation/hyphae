@@ -102,6 +102,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native set structure evidence — 2026-08-01](gates/evidence/native-set-structure-2026-08-01.md)
 - [Native inverted-search evidence — 2026-08-01](gates/evidence/native-inverted-search-2026-08-01.md)
 - [Native ANN kernel evidence — 2026-08-01](gates/evidence/native-ann-kernel-2026-08-01.md)
+- [Native ANN durability evidence — 2026-08-01](gates/evidence/native-ann-durability-2026-08-01.md)
 - [Native canonical type-codec evidence — 2026-08-01](gates/evidence/native-type-codecs-2026-08-01.md)
 - [Native catalog-definition evidence — 2026-08-01](gates/evidence/native-catalog-definitions-2026-08-01.md)
 - [Native typed SQL-row evidence — 2026-08-01](gates/evidence/native-typed-sql-rows-2026-08-01.md)
