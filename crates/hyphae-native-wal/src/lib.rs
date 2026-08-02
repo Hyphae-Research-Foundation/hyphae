@@ -915,7 +915,7 @@ fn retention_anchor_digest(encoded: &[u8]) -> [u8; 32] {
 pub struct StagedWalRetentionAnchor {
     anchor: WalRetentionAnchor,
     temporary_path: PathBuf,
-    final_path: PathBuf,
+    candidate_path: PathBuf,
 }
 
 /// Verified retention-anchor directory state.
@@ -923,6 +923,8 @@ pub struct StagedWalRetentionAnchor {
 pub struct WalRetentionRecovery {
     /// Stable anchors in increasing epoch order.
     pub anchors: Vec<WalRetentionAnchor>,
+    /// Synchronized candidate that authorizes an in-progress WAL reset.
+    pub candidate: Option<WalRetentionAnchor>,
     /// Abandoned canonical create-new stages removed during open.
     pub ignored_temporary_files: usize,
     /// Whether strict parent-directory synchronization is supported.
@@ -934,6 +936,7 @@ pub struct WalRetentionRecovery {
 pub struct WalRetentionStore {
     directory: PathBuf,
     anchors: Vec<WalRetentionAnchor>,
+    candidate: Option<WalRetentionAnchor>,
     ignored_temporary_files: usize,
 }
 
@@ -958,6 +961,7 @@ impl WalRetentionStore {
         Ok(Self {
             directory: directory.to_path_buf(),
             anchors: Vec::new(),
+            candidate: None,
             ignored_temporary_files: 0,
         })
     }
@@ -971,6 +975,7 @@ impl WalRetentionStore {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, WalError> {
         let directory = data_directory.as_ref();
         let mut finals = Vec::new();
+        let mut candidates = Vec::new();
         let mut temporary_paths = Vec::new();
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -988,12 +993,15 @@ impl WalRetentionStore {
                 finals.push((epoch, entry.path()));
             } else if parse_retention_anchor_temporary_filename(&name).is_some() {
                 temporary_paths.push(entry.path());
+            } else if let Some(epoch) = parse_retention_anchor_candidate_filename(&name) {
+                candidates.push((epoch, entry.path()));
             } else {
                 return Err(WalError::UnexpectedRetentionEntry);
             }
         }
         finals.sort_by_key(|(epoch, _)| *epoch);
-        if finals.len() > 2 {
+        if finals.len() > 2 || candidates.len() > 1 || (finals.len() == 2 && !candidates.is_empty())
+        {
             return Err(WalError::InvalidRetentionAnchorChain);
         }
         let mut anchors = Vec::with_capacity(finals.len());
@@ -1004,6 +1012,28 @@ impl WalRetentionStore {
             }
             anchors.push(anchor);
         }
+        let candidate = if let Some((epoch, path)) = candidates.pop() {
+            let candidate = WalRetentionAnchor::decode(&fs::read(path)?)?;
+            let expected = anchors.last().map_or(Ok((1, [0; 32])), |prior| {
+                prior
+                    .fields()
+                    .epoch
+                    .checked_add(1)
+                    .map(|next| (next, prior.digest()))
+                    .ok_or(WalError::InvalidRetentionAnchorChain)
+            })?;
+            if candidate.fields().epoch != epoch
+                || (
+                    candidate.fields().epoch,
+                    candidate.fields().previous_anchor_digest,
+                ) != expected
+            {
+                return Err(WalError::InvalidRetentionAnchorChain);
+            }
+            Some(candidate)
+        } else {
+            None
+        };
         if let [prior, candidate] = anchors.as_slice()
             && (prior.fields().epoch.checked_add(1) != Some(candidate.fields().epoch)
                 || candidate.fields().previous_anchor_digest != prior.digest())
@@ -1019,6 +1049,7 @@ impl WalRetentionStore {
         Ok(Self {
             directory: directory.to_path_buf(),
             anchors,
+            candidate,
             ignored_temporary_files: temporary_paths.len(),
         })
     }
@@ -1027,6 +1058,7 @@ impl WalRetentionStore {
     pub fn recovery(&self) -> WalRetentionRecovery {
         WalRetentionRecovery {
             anchors: self.anchors.clone(),
+            candidate: self.candidate,
             ignored_temporary_files: self.ignored_temporary_files,
             parent_sync_supported: parent_sync_supported(),
         }
@@ -1051,8 +1083,9 @@ impl WalRetentionStore {
         self.validate_next(&anchor)?;
         let stem = retention_anchor_stem(anchor.fields().epoch);
         let temporary_path = self.directory.join(format!("{stem}.hywa.tmp"));
+        let candidate_path = self.directory.join(format!("{stem}.hywa.pending"));
         let final_path = self.directory.join(format!("{stem}.hywa"));
-        if temporary_path.exists() || final_path.exists() {
+        if temporary_path.exists() || candidate_path.exists() || final_path.exists() {
             return Err(WalError::RetentionPublicationTargetExists);
         }
         let mut file = OpenOptions::new()
@@ -1067,17 +1100,17 @@ impl WalRetentionStore {
         Ok(StagedWalRetentionAnchor {
             anchor,
             temporary_path,
-            final_path,
+            candidate_path,
         })
     }
 
-    /// Publishes one staged immutable anchor.
+    /// Publishes one staged candidate before the destructive WAL reset.
     ///
     /// # Errors
     ///
     /// Returns an error for chain races, target collision, rename, or
     /// directory synchronization failure.
-    pub fn publish(
+    pub fn publish_candidate(
         &mut self,
         staged: StagedWalRetentionAnchor,
         synchronize: bool,
@@ -1085,18 +1118,48 @@ impl WalRetentionStore {
         let StagedWalRetentionAnchor {
             anchor,
             temporary_path,
-            final_path,
+            candidate_path,
         } = staged;
         self.validate_next(&anchor)?;
-        if final_path.exists() {
+        if candidate_path.exists() {
             return Err(WalError::RetentionPublicationTargetExists);
         }
-        fs::rename(temporary_path, final_path)?;
+        fs::rename(temporary_path, candidate_path)?;
         if synchronize {
             sync_directory(&self.directory)?;
         }
-        self.anchors.push(anchor);
+        self.candidate = Some(anchor);
         Ok(anchor)
+    }
+
+    /// Promotes a published candidate after the WAL reset is synchronized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate identity diverges, a final target
+    /// exists, or rename/directory synchronization fails.
+    pub fn stabilize_candidate(
+        &mut self,
+        epoch: u64,
+        synchronize: bool,
+    ) -> Result<WalRetentionAnchor, WalError> {
+        let candidate = self
+            .candidate
+            .filter(|candidate| candidate.fields().epoch == epoch)
+            .ok_or(WalError::InvalidRetentionAnchorChain)?;
+        let stem = retention_anchor_stem(epoch);
+        let candidate_path = self.directory.join(format!("{stem}.hywa.pending"));
+        let final_path = self.directory.join(format!("{stem}.hywa"));
+        if final_path.exists() {
+            return Err(WalError::RetentionPublicationTargetExists);
+        }
+        fs::rename(candidate_path, final_path)?;
+        if synchronize {
+            sync_directory(&self.directory)?;
+        }
+        self.anchors.push(candidate);
+        self.candidate = None;
+        Ok(candidate)
     }
 
     /// Removes stable anchors older than the retained epoch.
@@ -1138,7 +1201,7 @@ impl WalRetentionStore {
     }
 
     fn validate_next(&self, anchor: &WalRetentionAnchor) -> Result<(), WalError> {
-        if self.anchors.len() >= 2 {
+        if self.anchors.len() >= 2 || self.candidate.is_some() {
             return Err(WalError::InvalidRetentionAnchorChain);
         }
         let (expected_epoch, expected_previous_digest) = if let Some(current) = self.current() {
@@ -1175,6 +1238,13 @@ fn parse_retention_anchor_temporary_filename(name: &str) -> Option<u64> {
     let value = name
         .strip_prefix("wal-anchor-")?
         .strip_suffix(".hywa.tmp")?;
+    parse_retention_anchor_epoch(value)
+}
+
+fn parse_retention_anchor_candidate_filename(name: &str) -> Option<u64> {
+    let value = name
+        .strip_prefix("wal-anchor-")?
+        .strip_suffix(".hywa.pending")?;
     parse_retention_anchor_epoch(value)
 }
 
@@ -1679,13 +1749,25 @@ mod tests {
         let mut reopened = WalRetentionStore::open(temporary.path())?;
         assert!(reopened.current().is_none());
         assert_eq!(reopened.recovery().ignored_temporary_files, 1);
-        let first = reopened.publish(reopened.stage(first, true)?, true)?;
+        let first = reopened.publish_candidate(reopened.stage(first, true)?, true)?;
+        assert_eq!(reopened.recovery().candidate, Some(first));
+        drop(reopened);
+
+        let mut reopened = WalRetentionStore::open(temporary.path())?;
+        assert!(reopened.current().is_none());
+        assert_eq!(reopened.recovery().candidate, Some(first));
+        reopened.stabilize_candidate(first.fields().epoch, true)?;
+        assert_eq!(reopened.recovery().candidate, None);
 
         let mut second_fields = retention_anchor_fields()?;
         second_fields.previous_anchor_digest = first.digest();
         let second = WalRetentionAnchor::new(second_fields)?;
-        let second = reopened.publish(reopened.stage(second, true)?, true)?;
+        let second = reopened.publish_candidate(reopened.stage(second, true)?, true)?;
+        assert_eq!(reopened.recovery().anchors, vec![first]);
+        assert_eq!(reopened.recovery().candidate, Some(second));
+        reopened.stabilize_candidate(second.fields().epoch, true)?;
         assert_eq!(reopened.recovery().anchors, vec![first, second]);
+        assert_eq!(reopened.recovery().candidate, None);
 
         assert_eq!(reopened.remove_before(second.fields().epoch, true)?, 1);
         drop(reopened);

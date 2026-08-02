@@ -91,13 +91,16 @@ cross-validation and reporting boundary.
 
 Canonical final names are
 `wal-anchor-NNNNNNNNNNNNNNNNNNNN.hywa`, where the decimal component is the
-anchor epoch. Create-new stages append `.tmp`. Unknown lookalike names,
-noncanonical widths, duplicate epochs, zero fields, digest divergence, and
-noncontiguous anchor transitions fail closed.
+anchor epoch. Create-new stages append `.tmp`; a synchronized destructive
+transition renames that stage to `.hywa.pending`; only after WAL reset
+synchronization does it become `.hywa`. Unknown lookalike names, noncanonical
+widths, duplicate epochs, zero fields, digest divergence, and noncontiguous
+anchor transitions fail closed.
 
 Only the latest stable anchor is required after cleanup. During publication,
-the immediately prior anchor may coexist with the candidate so recovery can
-determine whether the old WAL prefix or the new empty/suffix WAL is present.
+the immediately prior stable anchor may coexist with one `.pending` candidate.
+The explicit candidate state authorizes completion of a destructive reset
+without allowing a corrupt retained suffix to masquerade as an old prefix.
 
 ## Eligibility
 
@@ -128,15 +131,17 @@ Under exclusive writer and maintenance admission:
    generation, blobs, and conflict boundary;
 2. construct the next anchor using the final checkpoint block;
 3. write and synchronize the create-new anchor stage;
-4. rename the stage to its immutable final name and synchronize the data
-   directory where supported;
+4. rename the stage to its `.pending` name and synchronize the data directory
+   where supported;
 5. poison the current WAL writer against further append;
 6. reset `wal.hylog` to zero bytes and synchronize the file;
 7. reopen the WAL writer at absolute sequence
    `retired_through_sequence + 1` with the retired block digest as its prior
    digest;
-8. remove the prior stable anchor, if any, and synchronize the directory; and
-9. publish the new in-memory recovery base and return the receipt.
+8. rename the `.pending` candidate to its immutable `.hywa` name and
+   synchronize the directory;
+9. remove the prior stable anchor, if any, and synchronize the directory; and
+10. publish the new in-memory recovery base and return the receipt.
 
 Any uncertain anchor publication, truncation, synchronization, or reopen
 failure poisons the handle. The caller must drop it and reopen the data
@@ -146,7 +151,7 @@ directory.
 
 With no anchor, recovery starts from implicit sequence zero and digest zero.
 
-With one stable anchor, recovery:
+With one stable `.hywa` anchor, recovery:
 
 1. verifies the anchor checksum and digest;
 2. opens and verifies the complete root-manifest chain;
@@ -164,17 +169,21 @@ An empty WAL is valid after anchor publication. The next append still uses the
 absolute next block sequence and therefore produces absolute LSNs greater than
 every retired LSN.
 
-If a new and prior anchor coexist, recovery uses the physical WAL shape to
-finish the interrupted transition:
+One `.pending` anchor means reset publication was interrupted. Recovery first
+verifies the candidate, referenced manifest, and its link to the prior stable
+anchor or genesis. That explicit state authorizes discarding bytes at or below
+the candidate's retired sequence, synchronizing the empty WAL, promoting the
+candidate to `.hywa`, and removing the prior stable anchor.
 
-- a WAL beginning at the prior anchor's next sequence is old-prefix state;
-- an empty WAL or one beginning at the new anchor's next sequence is
-  new-anchor state; and
-- residual bytes wholly at or below the new retired-through sequence may be
-  discarded only after the new anchor and referenced manifest verify.
+Two stable `.hywa` anchors mean promotion completed but prior-anchor cleanup
+was interrupted. The newer anchor must be the exact next epoch and bind the
+older digest; recovery removes the older anchor only after the retained WAL
+verifies from the newer base.
 
-A WAL containing both pre-anchor residual bytes and a post-anchor suffix is
-impossible under the publication protocol and fails closed.
+A stable anchor never authorizes ignoring its retained suffix. Any complete
+first-block sequence, previous-digest, checksum, or content corruption fails
+closed. A WAL containing both pre-anchor residual bytes and a post-anchor
+suffix is impossible under the publication protocol and also fails closed.
 
 ## Bounded semantic replay
 
@@ -203,10 +212,10 @@ work and must be reported independently.
 The test-only truncation path interrupts after:
 
 1. the candidate anchor stage is synchronized;
-2. the candidate anchor is published while the old WAL remains complete;
+2. the `.pending` candidate is published while the old WAL remains complete;
 3. the old WAL length is reset but not explicitly synchronized;
 4. the empty WAL is synchronized;
-5. the anchored writer is reopened; and
+5. the candidate is promoted to stable `.hywa`; and
 6. the prior anchor is removed.
 
 Every boundary must reopen to the same complete all-engine logical state. It
