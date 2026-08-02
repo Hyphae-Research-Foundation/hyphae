@@ -221,6 +221,13 @@ pub(crate) struct RecoveredWal {
     pub(crate) dangling_transaction: Option<TransactionId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalSemanticBase {
+    pub(crate) visible_csn: Csn,
+    pub(crate) checkpoint_lsn: Lsn,
+    pub(crate) manifest_generation: ManifestGeneration,
+}
+
 pub(crate) struct TransactionPlan<'mutations> {
     pub(crate) transaction_id: TransactionId,
     pub(crate) read_csn: Option<Csn>,
@@ -359,7 +366,15 @@ pub(crate) fn encode_abort(
     )?)
 }
 
+#[cfg(test)]
 pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSemanticError> {
+    recover_wal_after(records, None)
+}
+
+pub(crate) fn recover_wal_after(
+    records: &[WalRecord],
+    base: Option<WalSemanticBase>,
+) -> Result<RecoveredWal, WalSemanticError> {
     let mut recovered = RecoveredWal::default();
     let mut active: Option<ActiveTransaction> = None;
     for record in records {
@@ -423,29 +438,7 @@ pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSema
                 }
             }
             RecordKind::Checkpoint => {
-                if active.is_some() || record.engine() != EngineKind::Kernel || record.flags() != 0
-                {
-                    return Err(WalSemanticError::InvalidSequence);
-                }
-                let checkpoint = decode_checkpoint(record)?;
-                let committed = recovered
-                    .commits
-                    .iter()
-                    .any(|commit| commit.manifest.commit_csn == checkpoint.visible_csn);
-                if !committed {
-                    return Err(WalSemanticError::InvalidSequence);
-                }
-                if let Some(previous) = recovered.checkpoints.last() {
-                    if checkpoint.previous_checkpoint_lsn != Some(previous.checkpoint_lsn)
-                        || checkpoint.manifest_generation <= previous.manifest_generation
-                        || checkpoint.visible_csn < previous.visible_csn
-                    {
-                        return Err(WalSemanticError::InvalidSequence);
-                    }
-                } else if checkpoint.previous_checkpoint_lsn.is_some() {
-                    return Err(WalSemanticError::InvalidSequence);
-                }
-                recovered.checkpoints.push(checkpoint);
+                recover_checkpoint(record, active.is_some(), &mut recovered, base)?;
             }
             RecordKind::Catalog => {
                 return Err(WalSemanticError::InvalidSequence);
@@ -454,6 +447,45 @@ pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSema
     }
     recovered.dangling_transaction = active.map(|transaction| transaction.transaction_id);
     Ok(recovered)
+}
+
+fn recover_checkpoint(
+    record: &WalRecord,
+    transaction_active: bool,
+    recovered: &mut RecoveredWal,
+    base: Option<WalSemanticBase>,
+) -> Result<(), WalSemanticError> {
+    if transaction_active || record.engine() != EngineKind::Kernel || record.flags() != 0 {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    let checkpoint = decode_checkpoint(record)?;
+    let committed = recovered
+        .commits
+        .iter()
+        .any(|commit| commit.manifest.commit_csn == checkpoint.visible_csn)
+        || base.is_some_and(|base| base.visible_csn == checkpoint.visible_csn);
+    if !committed {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    if let Some(previous) = recovered.checkpoints.last() {
+        if checkpoint.previous_checkpoint_lsn != Some(previous.checkpoint_lsn)
+            || checkpoint.manifest_generation <= previous.manifest_generation
+            || checkpoint.visible_csn < previous.visible_csn
+        {
+            return Err(WalSemanticError::InvalidSequence);
+        }
+    } else if let Some(base) = base {
+        if checkpoint.previous_checkpoint_lsn != Some(base.checkpoint_lsn)
+            || checkpoint.manifest_generation <= base.manifest_generation
+            || checkpoint.visible_csn < base.visible_csn
+        {
+            return Err(WalSemanticError::InvalidSequence);
+        }
+    } else if checkpoint.previous_checkpoint_lsn.is_some() {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    recovered.checkpoints.push(checkpoint);
+    Ok(())
 }
 
 fn decode_checkpoint(record: &WalRecord) -> Result<RecoveredCheckpoint, WalSemanticError> {

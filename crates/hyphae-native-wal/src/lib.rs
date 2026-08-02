@@ -1321,6 +1321,16 @@ pub struct WalFile {
 }
 
 impl WalFile {
+    /// Returns the last absolute block sequence known by this writer.
+    pub const fn last_sequence(&self) -> u64 {
+        self.next_sequence - 1
+    }
+
+    /// Returns the digest preceding the next block append.
+    pub const fn last_digest(&self) -> [u8; 32] {
+        self.previous_digest
+    }
+
     /// Creates a new empty WAL file.
     ///
     /// # Errors

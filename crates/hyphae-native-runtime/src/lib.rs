@@ -58,7 +58,10 @@ use hyphae_native_types::{
     ManifestGeneration, ObjectId, PageGeneration, PageId, RowId, ScalarValue, TransactionId,
     VectorElement, VectorType,
 };
-use hyphae_native_wal::{WalError, WalFile, WalRecovery};
+use hyphae_native_wal::{
+    WAL_BLOCK_SIZE, WalError, WalFile, WalRecovery, WalRetentionAnchor, WalRetentionAnchorFields,
+    WalRetentionStore,
+};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -73,8 +76,8 @@ use crate::{
         bm25_term_score, normalize_list_range,
     },
     wal_codec::{
-        Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_abort,
-        encode_checkpoint, encode_transaction, recover_wal,
+        Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticBase, WalSemanticError,
+        encode_abort, encode_checkpoint, encode_transaction, recover_wal_after,
     },
 };
 
@@ -423,6 +426,12 @@ pub enum NativeRuntimeError {
     /// A deterministic page-vacuum interruption was requested.
     #[error("native page vacuum interrupted at {0:?}; reopen the data directory")]
     InjectedVacuumCrash(VacuumBoundary),
+    /// WAL retention requires a current-root checkpoint at the retention floor.
+    #[error("native WAL retention requires the latest checkpoint at the current retention floor")]
+    WalRetentionIneligible,
+    /// A deterministic WAL-retention interruption was requested.
+    #[error("native WAL retention interrupted at {0:?}; reopen the data directory")]
+    InjectedWalRetentionCrash(WalRetentionBoundary),
     /// Test-only guard proving a path does not materialize all engine state.
     #[cfg(test)]
     #[error("unexpected complete native state materialization")]
@@ -489,6 +498,23 @@ pub enum CheckpointBoundary {
     WalAppended,
     /// The manifest and its WAL checkpoint record are synchronized.
     WalSynchronized,
+}
+
+/// Deterministic WAL-retention boundary used by the crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalRetentionBoundary {
+    /// A synchronized create-new anchor exists only under its temporary name.
+    AnchorStaged,
+    /// A synchronized `.pending` anchor exists while the old WAL remains.
+    AnchorPending,
+    /// The old WAL length is reset but not explicitly synchronized.
+    WalReset,
+    /// The empty WAL is synchronized and the writer uses the absolute base.
+    WalSynchronized,
+    /// The candidate anchor has its stable immutable filename.
+    AnchorStabilized,
+    /// Any prior stable anchor has been removed.
+    PriorAnchorRemoved,
 }
 
 /// Deterministic page-generation vacuum boundary used by the crash matrix.
@@ -599,6 +625,16 @@ pub struct RecoveryReport {
     pub wal_tail_bytes_removed: u64,
     /// Number of semantically verified committed transactions.
     pub committed_transactions: usize,
+    /// Visible CSN reconstructed from a compacted WAL prefix.
+    pub wal_base_csn: Option<Csn>,
+    /// Absolute number of WAL blocks retired through the base anchor.
+    pub retired_wal_blocks: u64,
+    /// Complete physical WAL blocks verified after the base anchor.
+    pub retained_wal_blocks: usize,
+    /// Retained physical WAL bytes verified after the base anchor.
+    pub retained_wal_bytes: u64,
+    /// Committed suffix transactions semantically replayed during open.
+    pub replayed_transactions: usize,
     /// Latest recovered visible CSN.
     pub visible_csn: Option<Csn>,
     /// Page-file generation selected by the latest committed WAL record.
@@ -623,6 +659,8 @@ pub struct RecoveryReport {
     pub blob_generation: u64,
     /// Interrupted temporary blob files removed during open.
     pub recovered_temporary_blobs: usize,
+    /// Interrupted temporary WAL-anchor stages removed during open.
+    pub recovered_temporary_wal_anchors: usize,
 }
 
 /// Receipt for one cross-engine native commit.
@@ -737,6 +775,27 @@ pub struct CheckpointReceipt {
     /// Physical LSN of the checkpoint record.
     pub checkpoint_lsn: Lsn,
     /// Whether this platform implements strict parent-directory synchronization.
+    pub parent_directory_sync_supported: bool,
+}
+
+/// Receipt for one identity-preserving native WAL prefix retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalRetentionReceipt {
+    /// New stable anchor epoch.
+    pub anchor_epoch: u64,
+    /// Complete all-engine CSN reconstructed without retired WAL bytes.
+    pub base_visible_csn: Csn,
+    /// Absolute blocks retired through the checkpoint.
+    pub retired_wal_blocks: u64,
+    /// Physical bytes removed from `wal.hywal`.
+    pub retired_wal_bytes: u64,
+    /// LSN of the checkpoint closing the retired prefix.
+    pub checkpoint_lsn: Lsn,
+    /// Complete new retention-anchor digest.
+    pub anchor_digest: [u8; 32],
+    /// Prior stable anchors removed after publication.
+    pub prior_anchors_removed: usize,
+    /// Whether strict data-directory synchronization is implemented here.
     pub parent_directory_sync_supported: bool,
 }
 /// One lexical match result ordered by descending BM25 score.
@@ -1162,6 +1221,7 @@ pub struct NativeDatabase {
     buffer_pool: BufferPool,
     blobs: BlobStore,
     wal: WalFile,
+    wal_retention: WalRetentionStore,
     manifests: RootManifestStore,
     coordinator: CommitCoordinator,
     conflicts: ConflictTable,
@@ -1190,6 +1250,7 @@ impl NativeDatabase {
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
         let blobs = BlobStore::create(path)?;
         let wal = WalFile::create(path.join(WAL_FILE))?;
+        let wal_retention = WalRetentionStore::create(path)?;
         let manifests = RootManifestStore::create(path)?;
         let coordinator = CommitCoordinator::new(
             CatalogVersion::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
@@ -1200,6 +1261,7 @@ impl NativeDatabase {
             buffer_pool,
             blobs,
             wal,
+            wal_retention,
             manifests,
             coordinator,
             conflicts: ConflictTable::default(),
@@ -1212,6 +1274,11 @@ impl NativeDatabase {
                 page_tail_bytes_removed: 0,
                 wal_tail_bytes_removed: 0,
                 committed_transactions: 0,
+                wal_base_csn: None,
+                retired_wal_blocks: 0,
+                retained_wal_blocks: 0,
+                retained_wal_bytes: 0,
+                replayed_transactions: 0,
                 visible_csn: None,
                 active_page_generation: PageGeneration::FIRST,
                 retention_floor_csn: None,
@@ -1224,6 +1291,7 @@ impl NativeDatabase {
                 blob_count: 0,
                 blob_generation: 0,
                 recovered_temporary_blobs: 0,
+                recovered_temporary_wal_anchors: 0,
             },
         })
     }
@@ -1238,30 +1306,26 @@ impl NativeDatabase {
         let path = path.as_ref();
         let blobs = BlobStore::open(path)?;
         let blob_recovery = blobs.recovery()?;
-        let mut opened_wal = WalFile::open(path.join(WAL_FILE))?;
-        let recovered_wal = recover_wal_and_close_dangling(&mut opened_wal)?;
+        let WalOpenState {
+            manifests,
+            manifest_recovery,
+            mut wal_retention,
+            recovered_temporary_wal_anchors,
+            retention_anchor,
+            base_root,
+            opened_wal,
+            recovered_wal,
+            active_page_generation,
+            retention_floor_csn,
+        } = open_wal_state(path)?;
         let commits = &recovered_wal.commits;
-        validate_commit_sequence(commits)?;
-        let active_page_generation = commits.last().map_or(PageGeneration::FIRST, |commit| {
-            commit.manifest.page_generation
-        });
-        let retention_floor_csn = commits
-            .last()
-            .map_or(Csn::FIRST, |commit| commit.manifest.retention_floor_csn);
         let opened_pages = PageStore::open_repair_tail_generation(
             page_generation_path(path, active_page_generation),
             active_page_generation,
         )?;
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
-        let mut conflicts = ConflictTable::default();
-        for recovered in commits {
-            let keys = mutation_write_keys(&recovered.mutations);
-            conflicts.validate(recovered.manifest.read_csn, &keys)?;
-            conflicts.publish_committed(recovered.manifest.commit_csn, keys);
-        }
-        let manifests = RootManifestStore::open(path)?;
-        let manifest_recovery = manifests.recovery();
+        let conflicts = replay_conflicts(commits)?;
         let (committed_roots, latest_root) = recover_committed_roots(
             commits,
             &opened_wal.recovery,
@@ -1272,11 +1336,13 @@ impl NativeDatabase {
                 active_generation: active_page_generation,
                 retention_floor_csn,
             },
+            base_root,
         )?;
         let checkpoint_validation = validate_checkpoints(
             &recovered_wal,
             &manifest_recovery.manifests,
             &committed_roots,
+            retention_anchor.as_ref(),
         )?;
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
@@ -1289,50 +1355,51 @@ impl NativeDatabase {
                 CatalogVersion::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
             )
         };
-        let next_transaction_id = opened_wal
-            .recovery
-            .records
-            .iter()
-            .map(|record| record.transaction_id().get())
-            .max()
-            .map_or(Ok(1_u128), |transaction_id| {
-                transaction_id
-                    .checked_add(1)
-                    .ok_or(NativeRuntimeError::TransactionIdExhausted)
-            })?;
-        let visible_csn = commits.last().map(|commit| commit.manifest.commit_csn);
+        let metadata =
+            wal_recovery_metadata(path, retention_anchor, &opened_wal.recovery, &recovered_wal)?;
+        if let Some(anchor) = retention_anchor
+            && wal_retention.recovery().anchors.len() > 1
+        {
+            wal_retention.remove_before(anchor.fields().epoch, true)?;
+        }
         Ok(Self {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
             buffer_pool,
             blobs,
             wal: opened_wal.wal,
+            wal_retention,
             manifests,
             coordinator,
             conflicts,
             relational_format,
             structure_format,
             search_format,
-            next_transaction_id,
+            next_transaction_id: metadata.next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
             recovery: RecoveryReport {
                 page_tail_bytes_removed: opened_pages.truncated_tail_bytes,
                 wal_tail_bytes_removed: opened_wal.recovery.truncated_tail_bytes,
-                committed_transactions: commits.len(),
-                visible_csn,
+                committed_transactions: metadata.committed_transactions,
+                wal_base_csn: retention_anchor.map(|anchor| anchor.fields().base_visible_csn),
+                retired_wal_blocks: retention_anchor
+                    .map_or(0, |anchor| anchor.fields().retired_through_sequence),
+                retained_wal_blocks: opened_wal.recovery.blocks.len(),
+                retained_wal_bytes: metadata.retained_wal_bytes,
+                replayed_transactions: commits.len(),
+                visible_csn: metadata.visible_csn,
                 active_page_generation,
-                retention_floor_csn: commits
-                    .last()
-                    .map(|commit| commit.manifest.retention_floor_csn),
+                retention_floor_csn: metadata.visible_csn.map(|_| retention_floor_csn),
                 recovered_page_generation_files,
                 manifest_count: manifest_recovery.manifests.len(),
-                checkpoint_count: recovered_wal.checkpoints.len(),
+                checkpoint_count: metadata.checkpoint_count,
                 recovered_temporary_manifests: manifest_recovery.ignored_temporary_files,
                 unanchored_manifest_suffix: checkpoint_validation.unanchored_manifest_suffix,
                 latest_checkpoint_generation: checkpoint_validation.latest_generation,
                 blob_count: blob_recovery.blob_count,
                 blob_generation: blob_recovery.generation,
                 recovered_temporary_blobs: blob_recovery.recovered_temporary_files,
+                recovered_temporary_wal_anchors,
             },
         })
     }
@@ -3471,6 +3538,193 @@ impl NativeDatabase {
             parent_directory_sync_supported: hyphae_native_manifest::parent_sync_supported(),
         })
     }
+
+    /// Retires the complete WAL prefix through the latest retention-floor
+    /// checkpoint without renumbering blocks or LSNs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the latest synchronized checkpoint captures a
+    /// root whose visible CSN equals its retention floor, or when anchor/WAL
+    /// publication and synchronization fail.
+    pub fn truncate_wal_at_retention_checkpoint(
+        &mut self,
+    ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        self.truncate_wal_at_retention_checkpoint_at(None)
+    }
+
+    /// Executes WAL retention with one deterministic crash interruption.
+    ///
+    /// The caller must drop this handle and reopen the data directory after an
+    /// injected interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedWalRetentionCrash`] at the
+    /// requested boundary, or the same errors as
+    /// [`Self::truncate_wal_at_retention_checkpoint`].
+    pub fn truncate_wal_at_retention_checkpoint_with_interruption(
+        &mut self,
+        boundary: WalRetentionBoundary,
+    ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        self.truncate_wal_at_retention_checkpoint_at(Some(boundary))
+    }
+
+    fn truncate_wal_at_retention_checkpoint_at(
+        &mut self,
+        interruption: Option<WalRetentionBoundary>,
+    ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        let (anchor, retired_wal_bytes) = match self.prepare_wal_retention()? {
+            PreparedWalRetention::Existing(receipt) => return Ok(receipt),
+            PreparedWalRetention::Publish {
+                anchor,
+                retired_wal_bytes,
+            } => (anchor, retired_wal_bytes),
+        };
+        let fields = anchor.fields();
+        let staged = self.wal_retention.stage(anchor, true)?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorStaged)?;
+        self.wal_retention.publish_candidate(staged, true)?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorPending)?;
+        self.wal.reset_after(
+            fields.retired_through_sequence,
+            fields.retired_block_digest,
+            false,
+        )?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::WalReset)?;
+        self.wal.sync_data()?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::WalSynchronized)?;
+        self.wal_retention.stabilize_candidate(fields.epoch, true)?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorStabilized)?;
+        let prior_anchors_removed = self.wal_retention.remove_before(fields.epoch, true)?;
+        interrupt_wal_retention(interruption, WalRetentionBoundary::PriorAnchorRemoved)?;
+        self.record_wal_retention(fields)?;
+        Ok(WalRetentionReceipt {
+            anchor_epoch: fields.epoch,
+            base_visible_csn: fields.base_visible_csn,
+            retired_wal_blocks: fields.retired_through_sequence,
+            retired_wal_bytes,
+            checkpoint_lsn: fields.retired_checkpoint_lsn,
+            anchor_digest: anchor.digest(),
+            prior_anchors_removed,
+            parent_directory_sync_supported: self.wal_retention.recovery().parent_sync_supported,
+        })
+    }
+
+    fn prepare_wal_retention(&self) -> Result<PreparedWalRetention, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let visible_csn = snapshot
+            .visible_csn
+            .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
+        if snapshot.roots().retention_floor_csn() != Some(visible_csn) {
+            return Err(NativeRuntimeError::WalRetentionIneligible);
+        }
+        let manifest = self
+            .manifests
+            .current()
+            .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
+        let checkpoint_lsn = self
+            .last_checkpoint_lsn
+            .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
+        let checkpoint_sequence = checkpoint_lsn
+            .get()
+            .checked_div(
+                u64::try_from(WAL_BLOCK_SIZE)
+                    .map_err(|_| NativeRuntimeError::WalRetentionIneligible)?,
+            )
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
+        let retired_through_sequence = self.wal.last_sequence();
+        if manifest.visible_csn() != visible_csn
+            || manifest.retention_floor_csn() != visible_csn
+            || !manifest.to_root_set()?.eq(snapshot.roots())
+            || checkpoint_sequence != retired_through_sequence
+        {
+            return Err(NativeRuntimeError::WalRetentionIneligible);
+        }
+        let prior_anchor = self.wal_retention.current().copied();
+        if self.wal_retention.recovery().candidate.is_some()
+            || self.wal_retention.recovery().anchors.len() > 1
+        {
+            return Err(NativeRuntimeError::WalRetentionIneligible);
+        }
+        let current_wal_bytes = fs::metadata(self.data_directory.join(WAL_FILE))?.len();
+        if let Some(anchor) = prior_anchor
+            && anchor.fields().retired_checkpoint_lsn == checkpoint_lsn
+            && anchor.fields().manifest_digest == manifest.digest()
+            && anchor.fields().retired_through_sequence == retired_through_sequence
+            && current_wal_bytes == 0
+        {
+            return Ok(PreparedWalRetention::Existing(WalRetentionReceipt {
+                anchor_epoch: anchor.fields().epoch,
+                base_visible_csn: visible_csn,
+                retired_wal_blocks: retired_through_sequence,
+                retired_wal_bytes: 0,
+                checkpoint_lsn,
+                anchor_digest: anchor.digest(),
+                prior_anchors_removed: 0,
+                parent_directory_sync_supported: self
+                    .wal_retention
+                    .recovery()
+                    .parent_sync_supported,
+            }));
+        }
+        let (anchor_epoch, previous_anchor_digest) =
+            prior_anchor.map_or(Ok((1, [0; 32])), |anchor| {
+                anchor
+                    .fields()
+                    .epoch
+                    .checked_add(1)
+                    .map(|epoch| (epoch, anchor.digest()))
+                    .ok_or(NativeRuntimeError::WalRetentionIneligible)
+            })?;
+        let root_anchor = manifest.wal_anchor();
+        let anchor = WalRetentionAnchor::new(WalRetentionAnchorFields {
+            epoch: anchor_epoch,
+            retired_through_sequence,
+            retired_checkpoint_lsn: checkpoint_lsn,
+            retired_block_digest: self.wal.last_digest(),
+            base_visible_csn: visible_csn,
+            manifest_generation: manifest.generation(),
+            manifest_digest: manifest.digest(),
+            root_commit_lsn: root_anchor.lsn,
+            root_commit_block_digest: root_anchor.digest,
+            next_transaction_id: self.next_transaction_id,
+            checkpoint_count: manifest.generation().get(),
+            committed_transaction_count: visible_csn.get(),
+            previous_anchor_digest,
+        })?;
+        Ok(PreparedWalRetention::Publish {
+            anchor,
+            retired_wal_bytes: current_wal_bytes,
+        })
+    }
+
+    fn record_wal_retention(
+        &mut self,
+        fields: WalRetentionAnchorFields,
+    ) -> Result<(), NativeRuntimeError> {
+        self.recovery.committed_transactions = usize::try_from(fields.base_visible_csn.get())
+            .map_err(|_| NativeRuntimeError::NoncontiguousCommitSequence)?;
+        self.recovery.wal_base_csn = Some(fields.base_visible_csn);
+        self.recovery.retired_wal_blocks = fields.retired_through_sequence;
+        self.recovery.retained_wal_blocks = 0;
+        self.recovery.retained_wal_bytes = 0;
+        self.recovery.replayed_transactions = 0;
+        self.recovery.checkpoint_count = usize::try_from(fields.manifest_generation.get())
+            .map_err(|_| NativeRuntimeError::InvalidCheckpoint)?;
+        self.recovery.latest_checkpoint_generation = Some(fields.manifest_generation);
+        self.recovery.unanchored_manifest_suffix = 0;
+        Ok(())
+    }
+}
+
+enum PreparedWalRetention {
+    Existing(WalRetentionReceipt),
+    Publish {
+        anchor: WalRetentionAnchor,
+        retired_wal_bytes: u64,
+    },
 }
 
 fn read_physical_list_chunk(
@@ -6032,6 +6286,17 @@ fn interrupt_checkpoint(
     }
 }
 
+fn interrupt_wal_retention(
+    requested: Option<WalRetentionBoundary>,
+    current: WalRetentionBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedWalRetentionCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
 fn interrupt_vacuum(
     requested: Option<VacuumBoundary>,
     current: VacuumBoundary,
@@ -6049,10 +6314,41 @@ struct CheckpointValidation {
     unanchored_manifest_suffix: usize,
 }
 
+fn validate_retention_anchor(
+    anchor: &WalRetentionAnchor,
+    manifests: &[RootManifest],
+) -> Result<RootSet, NativeRuntimeError> {
+    let fields = anchor.fields();
+    let manifest_index = fields
+        .manifest_generation
+        .get()
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
+    let manifest = manifests
+        .get(manifest_index)
+        .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
+    let root = manifest.to_root_set()?;
+    if manifest.generation() != fields.manifest_generation
+        || manifest.generation().get() != fields.checkpoint_count
+        || manifest.digest() != fields.manifest_digest
+        || manifest.visible_csn() != fields.base_visible_csn
+        || manifest.retention_floor_csn() != fields.base_visible_csn
+        || manifest.wal_anchor().lsn != fields.root_commit_lsn
+        || manifest.wal_anchor().digest != fields.root_commit_block_digest
+        || root.visible_csn() != Some(fields.base_visible_csn)
+        || root.retention_floor_csn() != Some(fields.base_visible_csn)
+    {
+        return Err(NativeRuntimeError::InvalidCheckpoint);
+    }
+    Ok(root)
+}
+
 fn validate_checkpoints(
     recovered: &RecoveredWal,
     manifests: &[RootManifest],
     committed_roots: &BTreeMap<Csn, RootSet>,
+    base_anchor: Option<&WalRetentionAnchor>,
 ) -> Result<CheckpointValidation, NativeRuntimeError> {
     for checkpoint in &recovered.checkpoints {
         let generation_index = checkpoint
@@ -6077,9 +6373,10 @@ fn validate_checkpoints(
     }
     let latest = recovered.checkpoints.last();
     let anchored_manifest_count = latest
-        .map(|checkpoint| {
-            usize::try_from(checkpoint.manifest_generation.get())
-                .map_err(|_| NativeRuntimeError::InvalidCheckpoint)
+        .map(|checkpoint| checkpoint.manifest_generation)
+        .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_generation))
+        .map(|generation| {
+            usize::try_from(generation.get()).map_err(|_| NativeRuntimeError::InvalidCheckpoint)
         })
         .transpose()?
         .unwrap_or(0);
@@ -6088,8 +6385,12 @@ fn validate_checkpoints(
         .checked_sub(anchored_manifest_count)
         .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
     Ok(CheckpointValidation {
-        last_checkpoint_lsn: latest.map(|checkpoint| checkpoint.checkpoint_lsn),
-        latest_generation: latest.map(|checkpoint| checkpoint.manifest_generation),
+        last_checkpoint_lsn: latest
+            .map(|checkpoint| checkpoint.checkpoint_lsn)
+            .or_else(|| base_anchor.map(|anchor| anchor.fields().retired_checkpoint_lsn)),
+        latest_generation: latest
+            .map(|checkpoint| checkpoint.manifest_generation)
+            .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_generation)),
         unanchored_manifest_suffix,
     })
 }
@@ -9793,6 +10094,177 @@ fn parse_page_generation_filename(name: &str, suffix: &str) -> Option<PageGenera
         .and_then(|generation| PageGeneration::new(generation).ok())
 }
 
+struct WalOpenState {
+    manifests: RootManifestStore,
+    manifest_recovery: hyphae_native_manifest::ManifestRecovery,
+    wal_retention: WalRetentionStore,
+    recovered_temporary_wal_anchors: usize,
+    retention_anchor: Option<WalRetentionAnchor>,
+    base_root: Option<RootSet>,
+    opened_wal: hyphae_native_wal::OpenedWal,
+    recovered_wal: RecoveredWal,
+    active_page_generation: PageGeneration,
+    retention_floor_csn: Csn,
+}
+
+fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
+    let manifests = RootManifestStore::open(path)?;
+    let manifest_recovery = manifests.recovery();
+    let mut wal_retention = WalRetentionStore::open(path)?;
+    let retention_recovery = wal_retention.recovery();
+    if let Some(candidate) = retention_recovery.candidate {
+        complete_pending_wal_retention(
+            path,
+            &mut wal_retention,
+            candidate,
+            &manifest_recovery.manifests,
+        )?;
+    }
+    let retention_anchor = wal_retention.current().copied();
+    let base_root = retention_anchor
+        .as_ref()
+        .map(|anchor| validate_retention_anchor(anchor, &manifest_recovery.manifests))
+        .transpose()?;
+    let mut opened_wal = open_retained_wal(path, retention_anchor)?;
+    let semantic_base = retention_anchor.map(|anchor| WalSemanticBase {
+        visible_csn: anchor.fields().base_visible_csn,
+        checkpoint_lsn: anchor.fields().retired_checkpoint_lsn,
+        manifest_generation: anchor.fields().manifest_generation,
+    });
+    let recovered_wal = recover_wal_and_close_dangling(&mut opened_wal, semantic_base)?;
+    validate_commit_sequence_after(&recovered_wal.commits, base_root.as_ref())?;
+    let active_page_generation = recovered_wal.commits.last().map_or_else(
+        || {
+            base_root
+                .as_ref()
+                .map_or(PageGeneration::FIRST, RootSet::page_generation)
+        },
+        |commit| commit.manifest.page_generation,
+    );
+    let retention_floor_csn = recovered_wal.commits.last().map_or_else(
+        || {
+            base_root
+                .as_ref()
+                .and_then(RootSet::retention_floor_csn)
+                .unwrap_or(Csn::FIRST)
+        },
+        |commit| commit.manifest.retention_floor_csn,
+    );
+    Ok(WalOpenState {
+        manifests,
+        manifest_recovery,
+        wal_retention,
+        recovered_temporary_wal_anchors: retention_recovery.ignored_temporary_files,
+        retention_anchor,
+        base_root,
+        opened_wal,
+        recovered_wal,
+        active_page_generation,
+        retention_floor_csn,
+    })
+}
+
+fn complete_pending_wal_retention(
+    path: &Path,
+    wal_retention: &mut WalRetentionStore,
+    candidate: WalRetentionAnchor,
+    manifests: &[RootManifest],
+) -> Result<(), NativeRuntimeError> {
+    validate_retention_anchor(&candidate, manifests)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join(WAL_FILE))?;
+    file.set_len(0)?;
+    file.sync_data()?;
+    drop(file);
+    wal_retention.stabilize_candidate(candidate.fields().epoch, true)?;
+    wal_retention.remove_before(candidate.fields().epoch, true)?;
+    Ok(())
+}
+
+fn open_retained_wal(
+    path: &Path,
+    anchor: Option<WalRetentionAnchor>,
+) -> Result<hyphae_native_wal::OpenedWal, WalError> {
+    if let Some(anchor) = anchor {
+        WalFile::open_after(
+            path.join(WAL_FILE),
+            anchor.fields().retired_through_sequence,
+            anchor.fields().retired_block_digest,
+        )
+    } else {
+        WalFile::open(path.join(WAL_FILE))
+    }
+}
+
+struct WalRecoveryMetadata {
+    next_transaction_id: u128,
+    visible_csn: Option<Csn>,
+    committed_transactions: usize,
+    retained_wal_bytes: u64,
+    checkpoint_count: usize,
+}
+
+fn wal_recovery_metadata(
+    path: &Path,
+    anchor: Option<WalRetentionAnchor>,
+    physical: &WalRecovery,
+    semantic: &RecoveredWal,
+) -> Result<WalRecoveryMetadata, NativeRuntimeError> {
+    let suffix_next_transaction_id = physical
+        .records
+        .iter()
+        .map(|record| record.transaction_id().get())
+        .max()
+        .map_or(Ok(1_u128), |transaction_id| {
+            transaction_id
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::TransactionIdExhausted)
+        })?;
+    let next_transaction_id = anchor.map_or(suffix_next_transaction_id, |anchor| {
+        anchor
+            .fields()
+            .next_transaction_id
+            .max(suffix_next_transaction_id)
+    });
+    let visible_csn = semantic
+        .commits
+        .last()
+        .map(|commit| commit.manifest.commit_csn)
+        .or_else(|| anchor.map(|anchor| anchor.fields().base_visible_csn));
+    let base_commits = anchor.map_or(0_u64, |anchor| anchor.fields().committed_transaction_count);
+    let committed_transactions = checked_recovery_total(base_commits, semantic.commits.len())
+        .ok_or(NativeRuntimeError::NoncontiguousCommitSequence)?;
+    let base_checkpoints = anchor.map_or(0_u64, |anchor| anchor.fields().checkpoint_count);
+    let checkpoint_count = checked_recovery_total(base_checkpoints, semantic.checkpoints.len())
+        .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
+    Ok(WalRecoveryMetadata {
+        next_transaction_id,
+        visible_csn,
+        committed_transactions,
+        retained_wal_bytes: fs::metadata(path.join(WAL_FILE))?.len(),
+        checkpoint_count,
+    })
+}
+
+fn checked_recovery_total(base: u64, suffix: usize) -> Option<usize> {
+    base.checked_add(u64::try_from(suffix).ok()?)
+        .and_then(|total| usize::try_from(total).ok())
+}
+
+fn replay_conflicts(
+    commits: &[wal_codec::RecoveredCommit],
+) -> Result<ConflictTable, NativeRuntimeError> {
+    let mut conflicts = ConflictTable::default();
+    for recovered in commits {
+        let keys = mutation_write_keys(&recovered.mutations);
+        conflicts.validate(recovered.manifest.read_csn, &keys)?;
+        conflicts.publish_committed(recovered.manifest.commit_csn, keys);
+    }
+    Ok(conflicts)
+}
+
 struct RetainedPageState<'database> {
     pages: &'database PageStore,
     blobs: &'database BlobStore,
@@ -9803,8 +10275,9 @@ struct RetainedPageState<'database> {
 
 fn recover_wal_and_close_dangling(
     opened: &mut hyphae_native_wal::OpenedWal,
+    base: Option<WalSemanticBase>,
 ) -> Result<RecoveredWal, NativeRuntimeError> {
-    let recovered = recover_wal(&opened.recovery.records)?;
+    let recovered = recover_wal_after(&opened.recovery.records, base)?;
     if let Some(transaction_id) = recovered.dangling_transaction {
         opened
             .wal
@@ -9817,9 +10290,23 @@ fn recover_committed_roots(
     commits: &[wal_codec::RecoveredCommit],
     wal_recovery: &WalRecovery,
     storage: &RetainedPageState<'_>,
+    base_root: Option<RootSet>,
 ) -> Result<(BTreeMap<Csn, RootSet>, Option<RootSet>), NativeRuntimeError> {
     let mut committed_roots = BTreeMap::new();
-    let mut latest_root = None;
+    let mut latest_root = base_root;
+    if let Some(root) = latest_root.as_ref() {
+        let visible_csn = root
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if root.blob_generation() > storage.blob_generation
+            || root.page_generation() != storage.active_generation
+            || root.retention_floor_csn() != Some(storage.retention_floor_csn)
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+        committed_roots.insert(visible_csn, root.clone());
+    }
     for recovered in commits {
         let anchor_digest = digest_for_lsn(wal_recovery, recovered.commit_lsn)?;
         let root = RootSet::committed_with_storage(
@@ -9851,13 +10338,27 @@ fn recover_committed_roots(
     Ok((committed_roots, latest_root))
 }
 
+#[cfg(test)]
 fn validate_commit_sequence(
     commits: &[wal_codec::RecoveredCommit],
 ) -> Result<(), NativeRuntimeError> {
-    let mut expected = 1_u64;
-    let mut prior = None;
-    let mut prior_page_generation = None;
-    let mut prior_retention_floor = None;
+    validate_commit_sequence_after(commits, None)
+}
+
+fn validate_commit_sequence_after(
+    commits: &[wal_codec::RecoveredCommit],
+    base_root: Option<&RootSet>,
+) -> Result<(), NativeRuntimeError> {
+    let mut expected = if let Some(root) = base_root {
+        root.visible_csn()
+            .and_then(|visible| visible.get().checked_add(1))
+            .ok_or(NativeRuntimeError::NoncontiguousCommitSequence)?
+    } else {
+        1
+    };
+    let mut prior = base_root.and_then(RootSet::visible_csn);
+    let mut prior_page_generation = base_root.map(RootSet::page_generation);
+    let mut prior_retention_floor = base_root.and_then(RootSet::retention_floor_csn);
     for commit in commits {
         let page_generation = commit.manifest.page_generation;
         let retention_floor_csn = commit.manifest.retention_floor_csn;
@@ -11208,11 +11709,11 @@ mod tests {
         NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
         PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
         SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
-        ZAddOutcome, binary_relation_definition, catalog_definition_storage_value,
-        catalog_name_identity, catalog_name_key, catalog_object_key, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
-        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
+        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
+        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
+        rebuild_page_generation, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -14841,6 +15342,245 @@ mod tests {
             Some(2)
         );
         assert_vertical(&recovered)?;
+        Ok(())
+    }
+
+    fn prepare_wal_retention_checkpoint(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId, Csn), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "retention_crash_rows")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.set(b"session".to_vec(), b"value-0".to_vec(), None)?;
+        seed.create_search_index(search, "retention_crash_search")?;
+        seed.index_document(search, b"seed-doc".to_vec(), "retention base")?;
+        seed.commit()?;
+        for version in 1..=6 {
+            let value = format!("value-{version}").into_bytes();
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(table, b"key".to_vec(), value.clone())?;
+            update.set(b"session".to_vec(), value, None)?;
+            update.commit()?;
+        }
+        let vacuum = database.vacuum_pages()?;
+        if !vacuum.applied {
+            return Err("retention crash corpus did not produce a page vacuum".into());
+        }
+        let checkpoint = database.checkpoint()?;
+        Ok((table, search, checkpoint.visible_csn))
+    }
+
+    #[test]
+    fn retention_checkpoint_bounds_wal_replay_without_renumbering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "retained_rows")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.set(b"session".to_vec(), b"value-0".to_vec(), None)?;
+        seed.create_search_index(search, "retained_search")?;
+        seed.index_document(search, b"doc".to_vec(), "version zero")?;
+        seed.commit()?;
+        for version in 1..=8 {
+            let value = format!("value-{version}");
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(table, b"key".to_vec(), value.clone().into_bytes())?;
+            update.set(b"session".to_vec(), value.into_bytes(), None)?;
+            update.index_document(
+                search,
+                format!("doc-{version}").into_bytes(),
+                format!("version {version} retained"),
+            )?;
+            update.commit()?;
+        }
+        let original_wal_bytes = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+        let vacuum = database.vacuum_pages()?;
+        assert!(vacuum.applied);
+        let Some(vacuum_commit) = vacuum.commit.as_ref() else {
+            return Err("applied vacuum did not return a commit".into());
+        };
+        let checkpoint = database.checkpoint()?;
+        assert_eq!(checkpoint.visible_csn, vacuum_commit.commit_csn);
+        let retired_file_bytes = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+
+        let retention = database.truncate_wal_at_retention_checkpoint()?;
+        assert_eq!(retention.base_visible_csn, checkpoint.visible_csn);
+        assert!(retention.retired_wal_blocks > 0);
+        assert_eq!(retention.retired_wal_bytes, retired_file_bytes);
+        assert!(retention.retired_wal_bytes > original_wal_bytes);
+        assert_eq!(fs::metadata(temporary.path().join(WAL_FILE))?.len(), 0);
+
+        let mut suffix = database.begin(30, DurabilityClass::Strict)?;
+        suffix.update(table, b"key".to_vec(), b"value-after".to_vec())?;
+        suffix.set(b"session".to_vec(), b"value-after".to_vec(), None)?;
+        suffix.index_document(search, b"doc-after".to_vec(), "after retention")?;
+        let suffix_receipt = suffix.commit()?;
+        assert!(suffix_receipt.commit_lsn > checkpoint.checkpoint_lsn);
+        assert!(suffix_receipt.transaction_id.get() > checkpoint.transaction_id.get());
+        let suffix_checkpoint = database.checkpoint()?;
+        assert!(suffix_checkpoint.checkpoint_lsn > suffix_receipt.commit_lsn);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let recovery = reopened.recovery_report();
+        assert_eq!(recovery.wal_base_csn, Some(checkpoint.visible_csn));
+        assert_eq!(recovery.retired_wal_blocks, retention.retired_wal_blocks);
+        assert_eq!(recovery.replayed_transactions, 1);
+        assert_eq!(recovery.checkpoint_count, 2);
+        assert_eq!(
+            recovery.committed_transactions,
+            usize::try_from(suffix_receipt.commit_csn.get())?
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"value-after".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"session", 30)?,
+            Some(b"value-after".to_vec())
+        );
+        assert_eq!(
+            reopened.match_latest_text(search, "retention", 1)?[0].document_id,
+            b"doc-after"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_wal_retention_boundary_reopens_one_complete_base()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            WalRetentionBoundary::AnchorStaged,
+            WalRetentionBoundary::AnchorPending,
+            WalRetentionBoundary::WalReset,
+            WalRetentionBoundary::WalSynchronized,
+            WalRetentionBoundary::AnchorStabilized,
+            WalRetentionBoundary::PriorAnchorRemoved,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let (table, search, checkpoint_csn) = prepare_wal_retention_checkpoint(&mut database)?;
+            assert!(matches!(
+                database.truncate_wal_at_retention_checkpoint_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedWalRetentionCrash(actual)) if actual == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened.select_latest_relational(table, b"key")?,
+                Some(b"value-6".to_vec())
+            );
+            assert_eq!(
+                reopened.get_latest_structure(b"session", 30)?,
+                Some(b"value-6".to_vec())
+            );
+            assert_eq!(
+                reopened.match_latest_text(search, "retention", 1)?[0].document_id,
+                b"seed-doc"
+            );
+            if boundary == WalRetentionBoundary::AnchorStaged {
+                assert_eq!(reopened.recovery_report().wal_base_csn, None);
+            } else {
+                assert_eq!(
+                    reopened.recovery_report().wal_base_csn,
+                    Some(checkpoint_csn)
+                );
+            }
+
+            let first_retry = reopened.truncate_wal_at_retention_checkpoint()?;
+            let second_retry = reopened.truncate_wal_at_retention_checkpoint()?;
+            assert_eq!(first_retry.anchor_epoch, second_retry.anchor_epoch);
+            assert_eq!(second_retry.retired_wal_bytes, 0);
+            drop(reopened);
+
+            let stable = NativeDatabase::open(temporary.path())?;
+            assert_eq!(stable.recovery_report().wal_base_csn, Some(checkpoint_csn));
+            assert_eq!(stable.recovery_report().replayed_transactions, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wal_retention_rejects_a_checkpoint_newer_than_the_physical_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut first = database.begin(10, DurabilityClass::Strict)?;
+        first.set(b"key".to_vec(), b"first".to_vec(), None)?;
+        first.commit()?;
+        database.checkpoint()?;
+        let mut second = database.begin(11, DurabilityClass::Strict)?;
+        second.set(b"key".to_vec(), b"second".to_vec(), None)?;
+        second.commit()?;
+        database.checkpoint()?;
+
+        assert!(matches!(
+            database.truncate_wal_at_retention_checkpoint(),
+            Err(NativeRuntimeError::WalRetentionIneligible)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stable_wal_retention_never_masks_anchor_or_suffix_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let suffix_directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(suffix_directory.path())?;
+        prepare_wal_retention_checkpoint(&mut database)?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        let mut suffix = database.begin(40, DurabilityClass::Strict)?;
+        suffix.set(b"after".to_vec(), b"retained".to_vec(), None)?;
+        suffix.commit()?;
+        drop(database);
+
+        let wal_path = suffix_directory.path().join(WAL_FILE);
+        let mut wal_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)?;
+        let mut byte = [0_u8; 1];
+        wal_file.read_exact(&mut byte)?;
+        wal_file.seek(SeekFrom::Start(0))?;
+        byte[0] ^= 1;
+        wal_file.write_all(&byte)?;
+        wal_file.sync_data()?;
+        drop(wal_file);
+        assert!(matches!(
+            NativeDatabase::open(suffix_directory.path()),
+            Err(NativeRuntimeError::Wal(WalError::InvalidMagic))
+        ));
+
+        let anchor_directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(anchor_directory.path())?;
+        prepare_wal_retention_checkpoint(&mut database)?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        drop(database);
+        let anchor_path = anchor_directory
+            .path()
+            .join("wal-anchor-00000000000000000001.hywa");
+        let mut anchor_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(anchor_path)?;
+        anchor_file.seek(SeekFrom::Start(88))?;
+        anchor_file.read_exact(&mut byte)?;
+        anchor_file.seek(SeekFrom::Start(88))?;
+        byte[0] ^= 1;
+        anchor_file.write_all(&byte)?;
+        anchor_file.sync_data()?;
+        drop(anchor_file);
+        assert!(matches!(
+            NativeDatabase::open(anchor_directory.path()),
+            Err(NativeRuntimeError::Wal(
+                WalError::RetentionAnchorChecksumMismatch
+            ))
+        ));
         Ok(())
     }
 
