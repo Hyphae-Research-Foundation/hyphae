@@ -4515,4 +4515,50 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[test]
+    fn indexed_inner_join_grammar_is_exact_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let query = "SELECT users.id, profiles.city
+                     FROM users
+                     INNER JOIN profiles ON users.profile_id = profiles.id
+                     WHERE email = ?";
+        let Statement::SelectJoin(join) = parse(query)? else {
+            return Err("expected indexed inner join".into());
+        };
+        assert_eq!(join.left_name, "users");
+        assert_eq!(join.right_name, "profiles");
+        assert_eq!(join.projection, ["users.id", "profiles.city"]);
+        assert_eq!(join.left_join_column, "users.profile_id");
+        assert_eq!(join.right_join_column, "profiles.id");
+        assert_eq!(
+            join.filter,
+            FilterExpression::Comparison {
+                columns: vec!["email".to_owned()],
+                operator: ComparisonOperator::Equal,
+                operands: vec![ScalarOperand::Parameter(0)],
+            }
+        );
+        assert_eq!(join.parameter_count, 1);
+        assert!(matches!(
+            parse(&format!("EXPLAIN {query}"))?,
+            Statement::ExplainSelectJoin(_)
+        ));
+        for unsupported in [
+            "SELECT * FROM users INNER JOIN profiles ON users.profile_id = profiles.id WHERE email = ?",
+            "SELECT users.id FROM users INNER JOIN profiles ON users.profile_id = profiles.id",
+            "SELECT users.id FROM users LEFT JOIN profiles ON users.profile_id = profiles.id WHERE email = ?",
+        ] {
+            assert!(matches!(parse(unsupported), Err(SqlError::InvalidSyntax)));
+        }
+        assert!(matches!(
+            parse(
+                "SELECT users.id FROM users
+                 INNER JOIN profiles ON profile_id = profiles.id
+                 WHERE email = ?"
+            )?,
+            Statement::SelectJoin(_)
+        ));
+        Ok(())
+    }
 }

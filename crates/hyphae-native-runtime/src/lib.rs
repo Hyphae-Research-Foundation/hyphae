@@ -10463,6 +10463,94 @@ mod tests {
     }
 
     #[test]
+    fn indexed_inner_join_explains_and_rejects_unsupported_access_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let mut transaction = database.begin_sql(11, DurabilityClass::Strict)?;
+        assert_eq!(
+            transaction.execute_sql(&format!("EXPLAIN {}", indexed_join_query()), &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=unique-secondary(index=3),right_table=2,right_access=primary-key)"
+                        .to_owned()
+                )]]
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT users.name, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE id = ?",
+                &[SqlValue::Signed(1)],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.name".to_owned(), "profiles.city".to_owned()],
+                rows: vec![vec![
+                    SqlValue::Text("Mario".to_owned()),
+                    SqlValue::Text("Medellin".to_owned()),
+                ]]
+            }
+        );
+        transaction.execute_sql("CREATE INDEX users_name ON users (name)", &[])?;
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE name = ?",
+                &[SqlValue::Text("Mario".to_owned())],
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        let mario = [SqlValue::Text("one@hyphae.local".to_owned())];
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.name = profiles.city
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.email = profiles.id
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                indexed_join_query(),
+                &[
+                    SqlValue::Text("one@hyphae.local".to_owned()),
+                    SqlValue::Signed(1)
+                ]
+            ),
+            Err(SqlError::ParameterMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn indexed_updates_preserve_unique_nulls_distinct() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
