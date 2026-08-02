@@ -50,6 +50,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native root manifest and checkpoint format v1](native/root-manifest-checkpoint-v1.md)
 - [Native WAL format v1](native/wal-format-v1.md)
 - [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
+- [Native group commit v1](native/group-commit-v1.md)
 - [Native catalog v1](native/catalog-v1.md)
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)

@@ -50,6 +50,7 @@ The current reviewable drafts are:
 - [root manifest and checkpoint format](../native/root-manifest-checkpoint-v1.md);
 - [WAL format](../native/wal-format-v1.md);
 - [MVCC and commit semantics](../native/mvcc-commit-v1.md);
+- [native group commit](../native/group-commit-v1.md);
 - [catalog](../native/catalog-v1.md);
 - [Hyphae SQL](../native/sql-semantics-v1.md);
 - [structures](../native/structures-semantics-v1.md);
