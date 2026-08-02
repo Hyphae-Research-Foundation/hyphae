@@ -1143,6 +1143,32 @@ mod tests {
     }
 
     #[test]
+    fn lineage_manifest_v3_rejects_every_truncated_prefix_and_single_byte_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let manifest = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(1)?,
+            [0; 32],
+            &root_set(1, 0xa5)?,
+            lineage,
+        )?;
+        let encoded = manifest.encode()?;
+
+        for truncated_length in 0..encoded.len() {
+            assert!(RootManifest::decode(&encoded[..truncated_length]).is_err());
+        }
+        for offset in 0..encoded.len() {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert!(RootManifest::decode(&corrupt).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn manifest_chain_rejects_mixed_or_unbound_lineage() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::create()?;
         let mut store = RootManifestStore::create(temporary.path())?;
