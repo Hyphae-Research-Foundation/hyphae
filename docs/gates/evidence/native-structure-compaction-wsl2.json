@@ -1,0 +1,68 @@
+{
+  "schema": "hyphae-native-structure-compaction-v1",
+  "status": "observation-not-gate",
+  "source_commit": "72039da331c39d54854bf07ca53a3cddcae654b9",
+  "source_tree": "07884149183fe816c0bdac6a71e151e419a9d1c7",
+  "environment": "WSL2; Linux 6.18.33.1-microsoft-standard-WSL2; Intel Core Ultra 9 285H; 16 vCPUs; rustc 1.96.0; single-thread warm-state",
+  "profile": "release",
+  "seed_durability": "strict-and-reopen",
+  "cleanup_durability": "strict-and-reopen",
+  "concurrency": 1,
+  "scan_warmup": 100,
+  "scan_observations": 1000,
+  "memory_expired_keys": 2048,
+  "memory_live_keys": 2048,
+  "strict_expired_keys": 256,
+  "strict_live_keys": 256,
+  "memory_dataset_blake3": "f86accf25d162cb890387301a10f1633417558df75da420ef1881fe64e9631fc",
+  "strict_dataset_blake3": "886e597c382a8e607b0bffb88db1ae208d7cc87b47c1582cf0998f207757003f",
+  "metrics": {
+    "pre_compaction_empty_due_scan": {
+      "p50_ns": 124945,
+      "p95_ns": 151930,
+      "p99_ns": 282599,
+      "maximum_ns": 448399,
+      "operations_per_second": 7547.905
+    },
+    "post_compaction_empty_due_scan": {
+      "p50_ns": 8580,
+      "p95_ns": 9280,
+      "p99_ns": 18930,
+      "maximum_ns": 85335,
+      "operations_per_second": 112610.558,
+      "p50_change_percent": -93.133,
+      "p95_change_percent": -93.892,
+      "p99_change_percent": -93.301,
+      "operations_per_second_change_percent": 1391.945
+    },
+    "memory_compaction": {
+      "durability": "memory",
+      "latency_ns": 5620058,
+      "scanned_entries": 6145,
+      "retained_entries": 2049,
+      "dropped_tombstones": 4096,
+      "reachable_pages_before": 41,
+      "reachable_pages_after": 10,
+      "reachable_pages_change_percent": -75.610,
+      "pages_appended": 10,
+      "file_bytes_before": 198246400,
+      "file_bytes_after": 198410240,
+      "file_bytes_growth": 163840
+    },
+    "strict_compaction": {
+      "durability": "strict",
+      "latency_ns": 860286,
+      "scanned_entries": 769,
+      "retained_entries": 257,
+      "dropped_tombstones": 512,
+      "reachable_pages_before": 6,
+      "reachable_pages_after": 3,
+      "reachable_pages_change_percent": -50.000,
+      "pages_appended": 3,
+      "file_bytes_before": 19808256,
+      "file_bytes_after": 19857408,
+      "file_bytes_growth": 49152,
+      "reopen_verified": true
+    }
+  }
+}

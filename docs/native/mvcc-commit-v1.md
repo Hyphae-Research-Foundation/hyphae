@@ -133,6 +133,14 @@ consolidation creates a new physical generation for the same logical state and
 publishes it atomically. A reader retains its original generation until the
 snapshot is released.
 
+Structure reachability compaction follows the same snapshot rule but publishes
+a replacement B+tree root under a new CSN because the WAL commit manifest is
+the root authority. It requires the captured all-engine root set to remain
+current, retains the other roots exactly, and preserves the prior structure
+root for historical readers. It changes physical reachability, not logical
+structure state. Page-file reclamation cannot discard that prior root until a
+separate retention policy proves no retained snapshot or manifest owns it.
+
 ## Read-only and prepared transactions
 
 Read-only transactions never enter the WAL. Prepared plans are not prepared

@@ -298,8 +298,17 @@ unaffected subtree page IDs, and coalesces `HYSTRBT2` scalar plus expiry
 tombstones. The same warm-state datasets improved `Memory` and `Strict` p50
 latency by 80.533% and 79.674%, while appending 0.054199 and 0.191406 pages per
 key. `Memory` remains millisecond-scale and `Strict` p99 remains above one
-millisecond. Tombstone compaction, general mutation integration, scheduling,
-and the complete G7 matrix remain open.
+millisecond. At that source, tombstone compaction, general mutation
+integration, scheduling, and the complete G7 matrix remained open.
+
+The [native structure reachability-compaction
+evidence](evidence/native-structure-compaction-2026-08-02.md) adds an explicit
+`HYSTRBT2` maintenance commit that validates the complete current tree, drops
+only canonical tombstones, preserves logical state and prior roots, and
+recovers prior-or-complete at every commit boundary. On the measured
+2,048-expired/2,048-live corpus it reduced reachable node pages from 41 to 10
+and empty-expiry-scan p50 by 93.133%. The append-only file still grew by the
+ten replacement pages, so retention-aware physical vacuum remains open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
@@ -326,9 +335,9 @@ sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
 algebra/TTL, score/reverse/rank sorted-set operations, streams, an engine-owned
 background timer around the implemented scalar expiry primitive, model tests,
-and compaction evidence required to close G3. The ordered cleanup receipt
-provides a first exact amplification measurement, not the complete
-memory-amplification gate.
+and retention-aware physical vacuum required to close G3. The ordered cleanup
+and current-root compaction receipts provide exact first amplification
+measurements, not the complete memory-amplification gate.
 
 ## G1 substrate exit
 

@@ -61,6 +61,7 @@ pub(crate) enum Opcode {
     CreateSortedSet = 25,
     UpsertSortedSetMember = 26,
     DeleteSortedSetMember = 27,
+    CompactStructure = 28,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,6 +545,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteSortedSetMember as u8 => {
             (Opcode::DeleteSortedSetMember, EngineKind::Structure)
         }
+        value if value == Opcode::CompactStructure as u8 => {
+            (Opcode::CompactStructure, EngineKind::Structure)
+        }
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
@@ -620,6 +624,14 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
+    if opcode == Opcode::CompactStructure {
+        return validate_structure_compaction_shape(
+            has_target,
+            value_length,
+            expires_at_micros,
+            key,
+        );
+    }
     match opcode {
         Opcode::SetValue
         | Opcode::DeleteValue
@@ -695,6 +707,14 @@ fn validate_mutation_shape(
         }
         _ => {}
     }
+    validate_mutation_identity(opcode, value_length, key)
+}
+
+fn validate_mutation_identity(
+    opcode: Opcode,
+    value_length: usize,
+    key: &[u8],
+) -> Result<(), WalSemanticError> {
     if matches!(
         opcode,
         Opcode::SetHashField
@@ -717,6 +737,19 @@ fn validate_mutation_shape(
         return Err(WalSemanticError::InvalidBody);
     }
     Ok(())
+}
+
+fn validate_structure_compaction_shape(
+    has_target: bool,
+    value_length: usize,
+    expires_at_micros: Option<i64>,
+    key: &[u8],
+) -> Result<(), WalSemanticError> {
+    if has_target || !key.is_empty() || value_length != 0 || expires_at_micros.is_some() {
+        Err(WalSemanticError::InvalidBody)
+    } else {
+        Ok(())
+    }
 }
 
 fn valid_collection_member_identity(encoded: &[u8]) -> bool {
@@ -885,6 +918,7 @@ mod tests {
                 None,
             ),
             structure_mutation(Opcode::DeleteSortedSetMember, &sorted_set_member, b"", None),
+            structure_mutation(Opcode::CompactStructure, b"", b"", None),
             mutation(
                 EngineKind::Search,
                 Opcode::IndexDocument,
@@ -940,7 +974,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 22);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 23);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -987,6 +1021,27 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutation_shape(Opcode::DeleteSortedSetMember, true, 0, None, &member),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn structure_compaction_requires_an_empty_structure_maintenance_body() {
+        assert!(validate_mutation_shape(Opcode::CompactStructure, false, 0, None, b"").is_ok());
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactStructure, true, 0, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactStructure, false, 0, None, b"key"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactStructure, false, 1, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactStructure, false, 0, Some(10), b""),
             Err(WalSemanticError::InvalidBody)
         ));
     }

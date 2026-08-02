@@ -407,6 +407,42 @@ uses the scalar write identity, so a concurrent renewal of the same key wins
 or conflicts under first-committer-wins; cleanup cannot delete the renewed
 value.
 
+### Reachability compaction
+
+`COMPACT STRUCTURE` is an explicit physical-maintenance operation admitted
+only for `HYSTRBT2`. It captures the complete current root set, validates the
+entire structure tree and all cross-entry invariants, and scans the current
+physical entries in canonical order before appending any page.
+
+The rebuild retains the format marker and every live physical entry
+byte-for-byte. It drops only canonical tombstones from scalar, hash-field, set
+member, list-chunk, sorted-set member/order, and expiry-index namespaces. Any
+unknown namespace, malformed value, orphan live entry, count mismatch, or
+scalar/expiry mismatch fails before the replacement tree is built. An empty
+tombstone set is a no-op: it appends no page, writes no WAL record, and advances
+no CSN.
+
+When work exists, one `COMPACT STRUCTURE=28` maintenance mutation with no
+target, key, value, or expiry binds the physical rewrite to the WAL. A fresh
+balanced B+tree is built through the ordered batch primitive, the other three
+engine roots remain byte-identical, and the replacement structure root is
+published under one new global CSN. Writer admission requires the captured
+root set to remain current; otherwise the operation fails for retry instead of
+compacting stale state.
+
+The receipt reports scanned, retained, and dropped physical entries, reachable
+node pages before and after, appended pages, and the optional commit receipt.
+The pre-compaction snapshot and root remain readable and reconstruct the same
+logical structure state as the new root. Every commit interruption recovers
+either the prior root or the complete replacement root.
+
+This operation removes tombstones from the current reachable tree but does not
+shrink the append-only `pages.hydb` file. Older roots and immutable manifests
+still own the superseded pages. Physical file reclamation requires an explicit
+retention floor, complete cross-engine reachability tracing, a new page-file
+generation, and atomic generation publication; those remain separate vacuum
+work.
+
 ## Eviction
 
 Canonical objects reject memory pressure or spill to their declared page/blob
