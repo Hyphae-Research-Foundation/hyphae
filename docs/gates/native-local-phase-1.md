@@ -51,6 +51,7 @@ The current reviewable drafts are:
 - [WAL format](../native/wal-format-v1.md);
 - [MVCC and commit semantics](../native/mvcc-commit-v1.md);
 - [native group commit](../native/group-commit-v1.md);
+- [native mixed-durability scheduler](../native/mixed-durability-scheduler-v1.md);
 - [catalog](../native/catalog-v1.md);
 - [Hyphae SQL](../native/sql-semantics-v1.md);
 - [structures](../native/structures-semantics-v1.md);
@@ -359,6 +360,17 @@ remained in the microsecond domain; cohort execution remained millisecond
 work. Mixed-durability scheduling, native-ext4/power-loss evidence and the
 complete G1/G7 matrices remain open.
 
+The [native mixed-durability scheduler
+evidence](evidence/native-mixed-scheduler-2026-08-02.md) puts strict, group,
+and memory commits behind one bounded FIFO writer policy. It adds exact queued
+cancellation/deadlines, immediate saturation, non-blocking admission locking,
+durability barriers, and separate admission/queue/execution/sync timing. Under
+six group producers plus one strict and one memory producer, all 256 requests
+completed and reopened behind strict fence CSN 257. End-to-end p50 remained
+millisecond-scale on Windows debug and WSL2 release; queue wait is now the
+dominant measured pain point. Sustained fairness, maintenance scheduling,
+native-ext4/power-loss evidence and the complete G1/G7 matrices remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
@@ -404,8 +416,9 @@ publication. Bounded simultaneous `group` submission now shares page/WAL
 flushes, and current-root retention bounds WAL verification/replay to the
 retained suffix. Explicit single-root maintenance now collects blobs
 unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
-policy and concurrency/saturation evidence remain pending, along with
-multi-generation pin-aware retention, secondary-index range/streaming execution,
+policy now has bounded-load concurrency and saturation evidence; sustained
+fairness remains pending, along with multi-generation pin-aware retention,
+secondary-index range/streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid

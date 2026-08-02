@@ -55,6 +55,7 @@ struct Observation {
     strict_latency: LatencyStats,
     group_wall_nanos: u64,
     group_end_to_end: LatencyStats,
+    group_admission_wait: LatencyStats,
     group_queue_wait: LatencyStats,
     cohort_execution: LatencyStats,
     cohort_page_sync: LatencyStats,
@@ -284,6 +285,11 @@ fn print_observation(observation: &Observation) -> Result<(), BenchmarkError> {
         group_throughput / strict_throughput
     );
     print_latency("group_end_to_end", observation.group_end_to_end, true);
+    print_latency(
+        "group_admission_wait",
+        observation.group_admission_wait,
+        true,
+    );
     print_latency("group_queue_wait", observation.group_queue_wait, true);
     print_latency("cohort_execution", observation.cohort_execution, true);
     print_latency("cohort_page_sync", observation.cohort_page_sync, true);
@@ -328,6 +334,12 @@ fn main() -> Result<(), BenchmarkError> {
             receipts
                 .iter()
                 .map(|receipt| u64::try_from(receipt.end_to_end.as_nanos()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        group_admission_wait: latency_stats(
+            receipts
+                .iter()
+                .map(|receipt| u64::try_from(receipt.admission_wait.as_nanos()))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         group_queue_wait: latency_stats(

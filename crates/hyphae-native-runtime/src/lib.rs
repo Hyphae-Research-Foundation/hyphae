@@ -15,9 +15,9 @@ mod sql;
 mod wal_codec;
 
 pub use group_commit::{
-    GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
-    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitClient,
-    NativeCommitScheduler, ScheduledCommitReceipt,
+    CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
+    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitCancellation,
+    NativeCommitClient, NativeCommitControl, NativeCommitScheduler, ScheduledCommitReceipt,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -806,6 +806,13 @@ pub struct CommitReceipt {
     pub durability_cohort_size: usize,
     /// Zero-based position of this transaction in its durability cohort.
     pub durability_cohort_position: usize,
+}
+
+struct SingletonCommitReport {
+    commit: CommitReceipt,
+    execution_time: Duration,
+    page_synchronization_time: Duration,
+    wal_synchronization_time: Duration,
 }
 
 /// Independent result for one request submitted in a group-commit cohort.
@@ -3356,9 +3363,25 @@ impl NativeDatabase {
 
     fn commit_optimistic_at(
         &mut self,
-        mut batch: NativeWriteBatch,
+        batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.commit_optimistic_report_at(batch, interruption)
+            .map(|report| report.commit)
+    }
+
+    fn commit_optimistic_scheduled(
+        &mut self,
+        batch: NativeWriteBatch,
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
+        self.commit_optimistic_report_at(batch, None)
+    }
+
+    fn commit_optimistic_report_at(
+        &mut self,
+        mut batch: NativeWriteBatch,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
         if batch.mode != NativeWriteBatchMode::Materialized {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
@@ -3401,7 +3424,7 @@ impl NativeDatabase {
             next_transaction_id: &mut self.next_transaction_id,
             batch,
         }
-        .commit_at(interruption)
+        .commit_report_at(interruption)
     }
 
     /// Commits independent group-durability batches with one page and WAL sync.
@@ -5922,7 +5945,7 @@ impl NativeTransaction<'_> {
     /// Returns an error for an empty write set, persistence, synchronization,
     /// codec, or MVCC publication failure.
     pub fn commit(self) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_at(None)
+        self.commit_report_at(None).map(|report| report.commit)
     }
 
     /// Explicitly rolls back all private engine and catalog changes.
@@ -5943,7 +5966,8 @@ impl NativeTransaction<'_> {
         self,
         boundary: CommitBoundary,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_at(Some(boundary))
+        self.commit_report_at(Some(boundary))
+            .map(|report| report.commit)
     }
 
     fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
@@ -5965,10 +5989,11 @@ impl NativeTransaction<'_> {
         }
     }
 
-    fn commit_at(
+    fn commit_report_at(
         mut self,
         interruption: Option<CommitBoundary>,
-    ) -> Result<CommitReceipt, NativeRuntimeError> {
+    ) -> Result<SingletonCommitReport, NativeRuntimeError> {
+        let execution_started = Instant::now();
         if self.batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
         }
@@ -5997,9 +6022,8 @@ impl NativeTransaction<'_> {
             &blob_references,
         )?;
         interrupt(interruption, CommitBoundary::PageAppended)?;
-        if synchronize {
-            self.pages.sync_data()?;
-        }
+        let page_synchronization_time =
+            measure_optional_synchronization(synchronize, || self.pages.sync_data())?;
         interrupt(interruption, CommitBoundary::PageSynchronized)?;
 
         let concrete_roots = require_roots(roots)?;
@@ -6025,9 +6049,8 @@ impl NativeTransaction<'_> {
         })?;
         let receipts = self.wal.append_records(pending, false)?;
         interrupt(interruption, CommitBoundary::WalAppended)?;
-        if synchronize {
-            self.wal.sync_data()?;
-        }
+        let wal_synchronization_time =
+            measure_optional_synchronization(synchronize, || self.wal.sync_data())?;
         interrupt(interruption, CommitBoundary::WalSynchronized)?;
 
         let block = receipts.last().ok_or(WalError::EmptyBlock)?;
@@ -6046,15 +6069,20 @@ impl NativeTransaction<'_> {
             .checked_add(1)
             .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
         interrupt(interruption, CommitBoundary::RootPublished)?;
-        Ok(CommitReceipt {
-            transaction_id: self.transaction_id,
-            commit_csn,
-            catalog_version,
-            commit_lsn: block.last_lsn,
-            wal_block_digest: block.digest,
-            durability: batch.durability,
-            durability_cohort_size: 1,
-            durability_cohort_position: 0,
+        Ok(SingletonCommitReport {
+            commit: CommitReceipt {
+                transaction_id: self.transaction_id,
+                commit_csn,
+                catalog_version,
+                commit_lsn: block.last_lsn,
+                wal_block_digest: block.digest,
+                durability: batch.durability,
+                durability_cohort_size: 1,
+                durability_cohort_position: 0,
+            },
+            execution_time: execution_started.elapsed(),
+            page_synchronization_time,
+            wal_synchronization_time,
         })
     }
 }
@@ -6720,6 +6748,18 @@ fn interrupt(
     } else {
         Ok(())
     }
+}
+
+fn measure_optional_synchronization<E>(
+    synchronize: bool,
+    operation: impl FnOnce() -> Result<(), E>,
+) -> Result<Duration, E> {
+    if !synchronize {
+        return Ok(Duration::ZERO);
+    }
+    let started = Instant::now();
+    operation()?;
+    Ok(started.elapsed())
 }
 
 fn interrupt_group(
@@ -12225,7 +12265,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicU64, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use hyphae_native_btree::BTree;
@@ -12243,17 +12283,17 @@ mod tests {
         CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
         CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        EngineKind, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
-        GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError, Mutation,
-        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader,
-        Opcode, PAGE_FILE, PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG,
-        SetCondition, SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary,
-        Vector, VectorMetric, WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome,
-        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
-        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
-        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        CommitCancellationOutcome, EngineKind, GroupCommitBoundary, GroupCommitConfig,
+        GroupCommitOutcome, GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError,
+        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
+        NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
+        RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
+        WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
+        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
+        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
+        rebuild_page_generation, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -16832,6 +16872,161 @@ mod tests {
             Some(b"two".to_vec())
         );
         assert_eq!(reopened.get_latest_structure(b"too-late", 153)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_scheduler_serializes_all_durability_classes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
+        )?;
+
+        let mut strict = scheduler.begin_optimistic(151, DurabilityClass::Strict)?;
+        strict.set(b"mixed-strict".to_vec(), b"one".to_vec(), None)?;
+        let strict = scheduler.submit(strict)?;
+
+        let mut memory = scheduler.begin_optimistic(152, DurabilityClass::Memory)?;
+        memory.set(b"mixed-memory".to_vec(), b"two".to_vec(), None)?;
+        let memory = scheduler.submit(memory)?;
+
+        let mut group = scheduler.begin_optimistic(153, DurabilityClass::Group)?;
+        group.set(b"mixed-group".to_vec(), b"three".to_vec(), None)?;
+        let group = scheduler.submit(group)?;
+
+        assert_eq!(strict.durability, DurabilityClass::Strict);
+        assert_eq!(memory.durability, DurabilityClass::Memory);
+        assert_eq!(group.durability, DurabilityClass::Group);
+        assert_eq!(
+            [
+                strict.commit_csn.get(),
+                memory.commit_csn.get(),
+                group.commit_csn.get()
+            ],
+            [2, 3, 4]
+        );
+        for receipt in [strict, memory, group] {
+            assert_eq!(receipt.durability_cohort_size, 1);
+            assert_eq!(receipt.durability_cohort_position, 0);
+            assert!(receipt.end_to_end >= receipt.queue_wait);
+            assert!(receipt.end_to_end >= receipt.cohort_execution);
+        }
+        assert!(strict.page_synchronization > Duration::ZERO);
+        assert!(strict.wal_synchronization > Duration::ZERO);
+        assert_eq!(memory.page_synchronization, Duration::ZERO);
+        assert_eq!(memory.wal_synchronization, Duration::ZERO);
+
+        scheduler.shutdown()?;
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-strict", 154)?,
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-memory", 154)?,
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-group", 154)?,
+            Some(b"three".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_scheduler_preserves_group_strict_group_fifo_barriers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(4, Duration::from_millis(10), 8)?,
+        )?;
+        let client = scheduler.client();
+
+        let mut first_group = client.begin_optimistic(151, DurabilityClass::Group)?;
+        first_group.set(b"barrier-first".to_vec(), b"group".to_vec(), None)?;
+        let mut strict = client.begin_optimistic(151, DurabilityClass::Strict)?;
+        strict.set(b"barrier-middle".to_vec(), b"strict".to_vec(), None)?;
+        let mut second_group = client.begin_optimistic(151, DurabilityClass::Group)?;
+        second_group.set(b"barrier-last".to_vec(), b"group".to_vec(), None)?;
+
+        let worker_guard = client.block_worker_for_test()?;
+        let first = client.enqueue_for_test(first_group)?;
+        let middle = client.enqueue_for_test(strict)?;
+        let last = client.enqueue_for_test(second_group)?;
+        drop(worker_guard);
+
+        let first = first.recv()??;
+        let middle = middle.recv()??;
+        let last = last.recv()??;
+        assert_eq!(
+            [
+                first.commit_csn.get(),
+                middle.commit_csn.get(),
+                last.commit_csn.get()
+            ],
+            [2, 3, 4]
+        );
+        assert_eq!(first.durability, DurabilityClass::Group);
+        assert_eq!(middle.durability, DurabilityClass::Strict);
+        assert_eq!(last.durability, DurabilityClass::Group);
+        for receipt in [first, middle, last] {
+            assert_eq!(receipt.durability_cohort_size, 1);
+            assert_eq!(receipt.durability_cohort_position, 0);
+        }
+
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn commit_scheduler_cancels_only_queued_work_without_consuming_csn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler =
+            NativeCommitScheduler::start(database, GroupCommitConfig::new(2, Duration::ZERO, 2)?)?;
+
+        let mut cancelled = scheduler.begin_optimistic(151, DurabilityClass::Strict)?;
+        cancelled.set(b"cancelled".to_vec(), b"never".to_vec(), None)?;
+        let control = NativeCommitControl::new();
+        assert_eq!(
+            control.cancellation().cancel(),
+            CommitCancellationOutcome::Cancelled
+        );
+        assert!(matches!(
+            scheduler.submit_controlled(cancelled, control, None),
+            Err(GroupCommitSubmitError::Cancelled)
+        ));
+
+        let mut expired = scheduler.begin_optimistic(152, DurabilityClass::Strict)?;
+        expired.set(b"expired".to_vec(), b"never".to_vec(), None)?;
+        assert!(matches!(
+            scheduler.submit_controlled(expired, NativeCommitControl::new(), Some(Instant::now())),
+            Err(GroupCommitSubmitError::DeadlineExceeded)
+        ));
+
+        let mut committed = scheduler.begin_optimistic(153, DurabilityClass::Strict)?;
+        committed.set(b"committed".to_vec(), b"yes".to_vec(), None)?;
+        let receipt = scheduler.submit(committed)?;
+        assert_eq!(receipt.transaction_id, TransactionId::new(2)?);
+        assert_eq!(receipt.commit_csn, Csn::new(2)?);
+
+        scheduler.shutdown()?;
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.get_latest_structure(b"cancelled", 154)?, None);
+        assert_eq!(reopened.get_latest_structure(b"expired", 154)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"committed", 154)?,
+            Some(b"yes".to_vec())
+        );
         Ok(())
     }
 
