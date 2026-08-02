@@ -425,3 +425,14 @@ detectable.
   foreground commits.
 - `native-active-expiry-scheduler-wsl2.json` records the matched WSL2/tmpfs
   observation. It is not native-ext4 or power-loss durability evidence.
+
+## Native SQL primary-key left prefixes
+
+- `native-primary-key-prefix-scans-2026-08-02.md` binds strict composite
+  primary-key left-prefix planning, canonical half-open physical bounds,
+  residual-before-limit semantics, transaction/snapshot/current/reopen
+  equivalence, adjacent text-prefix isolation, and fail-closed corruption to
+  exact source.
+- `native-microsecond-smoke-primary-prefix-wsl2.json` is its clean schema-v13
+  WSL2 release observation. It reports pure prefix and prefix-plus-residual
+  calls separately and remains outside G7.

@@ -139,6 +139,17 @@ enum PreparedPlan {
         limit: usize,
         legacy_binary: bool,
     },
+    PrimaryKeyPrefixScan {
+        table: ObjectId,
+        relation: Box<RelationDefinition>,
+        projection: Vec<usize>,
+        filter: BoundFilterExpression,
+        parameter_count: usize,
+        residual: bool,
+        output_columns: Vec<String>,
+        prefix: KeyBinding,
+        limit: usize,
+    },
     PrimaryKeyRangeScan {
         table: ObjectId,
         relation: Box<RelationDefinition>,
@@ -421,6 +432,10 @@ enum SelectAccess {
         limit: usize,
         legacy_binary: bool,
     },
+    PrimaryKeyPrefixScan {
+        prefix: KeyBinding,
+        limit: usize,
+    },
     PrimaryKeyRangeScan {
         range: PrimaryKeyRange,
         limit: usize,
@@ -528,6 +543,19 @@ fn prepare_select_plan(
             limit,
             legacy_binary,
         },
+        SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => {
+            PreparedPlan::PrimaryKeyPrefixScan {
+                table: bound.table,
+                relation: Box::new(relation),
+                projection: bound.projection,
+                filter: bound.filter.ok_or(SqlError::InvalidSyntax)?,
+                parameter_count: bound.parameter_count,
+                residual: bound.residual,
+                output_columns: bound.output_columns,
+                prefix,
+                limit,
+            }
+        }
         SelectAccess::PrimaryKeyRangeScan {
             range,
             limit,
@@ -591,6 +619,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         PreparedPlan::PrimaryKeyLookup { .. }
         | PreparedPlan::SecondaryIndexLookup { .. }
         | PreparedPlan::PrimaryKeyScan { .. }
+        | PreparedPlan::PrimaryKeyPrefixScan { .. }
         | PreparedPlan::PrimaryKeyRangeScan { .. }
         | PreparedPlan::IndexedInnerJoin { .. } => Err(SqlError::ParameterMismatch),
     }
@@ -733,6 +762,9 @@ fn execute_bound_snapshot(
             execute_secondary_index_snapshot(snapshot, plan, parameters)
         }
         PreparedPlan::PrimaryKeyScan { .. } => execute_snapshot_scan(snapshot, plan, parameters),
+        PreparedPlan::PrimaryKeyPrefixScan { .. } => {
+            execute_snapshot_prefix_scan(snapshot, plan, parameters)
+        }
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_snapshot_range_scan(snapshot, plan, parameters)
         }
@@ -795,6 +827,9 @@ fn execute_bound_latest(
         }
         PreparedPlan::PrimaryKeyScan { .. } => {
             execute_latest_scan(database, snapshot, plan, parameters)
+        }
+        PreparedPlan::PrimaryKeyPrefixScan { .. } => {
+            execute_latest_prefix_scan(database, snapshot, plan, parameters)
         }
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_latest_range_scan(database, snapshot, plan, parameters)
@@ -2122,6 +2157,116 @@ fn execute_latest_scan(
     })
 }
 
+fn execute_snapshot_prefix_scan(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyPrefixScan {
+        table,
+        relation,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        prefix,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some(prefix) = bind_primary_key_prefix(relation, prefix, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    if *limit == 0 {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let bounds = primary_key_prefix_bounds(prefix);
+    let stored_rows = snapshot
+        .state
+        .relational
+        .tables
+        .get(table)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    for (primary_key, stored) in stored_rows.range(bounds) {
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            false,
+            primary_key,
+            stored,
+            Some(filter),
+            parameters,
+        )? {
+            rows.push(row);
+            if rows.len() == *limit {
+                break;
+            }
+        }
+    }
+    Ok(rows_result(output_columns, rows))
+}
+
+fn execute_latest_prefix_scan(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyPrefixScan {
+        table,
+        relation,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        prefix,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some(prefix) = bind_primary_key_prefix(relation, prefix, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    let (lower, upper) = primary_key_prefix_bounds(prefix);
+    if *limit == 0 {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    database
+        .visit_relational_range_at(
+            snapshot,
+            *table,
+            crate::bound_as_slice(&lower),
+            crate::bound_as_slice(&upper),
+            |primary_key, stored| {
+                if let Some(row) = materialize_filtered_row(
+                    relation,
+                    projection,
+                    false,
+                    primary_key,
+                    stored,
+                    Some(filter),
+                    parameters,
+                )? {
+                    rows.push(row);
+                    if rows.len() == *limit {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .map_err(map_relational_visit_error)?;
+    Ok(rows_result(output_columns, rows))
+}
+
 fn execute_snapshot_range_scan(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,
@@ -2353,6 +2498,12 @@ fn execute_explain(
                 explain_suffix(bound.residual)
             )
         }
+        SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => format!(
+            "PrimaryKeyPrefixScan(table={},columns={},limit={limit}{}",
+            bound.table,
+            prefix.columns.len(),
+            explain_suffix(bound.residual),
+        ),
         SelectAccess::PrimaryKeyRangeScan { range, limit, .. } => format!(
             "PrimaryKeyRangeScan(table={},lower={},upper={},limit={limit}{}",
             bound.table,
@@ -2629,6 +2780,9 @@ fn execute_select(
             limit,
             legacy_binary,
         } => context.scan_rows(limit, legacy_binary)?,
+        SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => {
+            context.prefix_rows(&prefix, limit)?
+        }
         SelectAccess::PrimaryKeyRangeScan {
             range,
             limit,
@@ -2747,6 +2901,32 @@ impl TransactionSelectContext<'_> {
         self.collect_rows(stored_rows, limit, legacy_binary)
     }
 
+    fn prefix_rows(
+        &self,
+        prefix: &KeyBinding,
+        limit: usize,
+    ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+        let Some(prefix) = bind_primary_key_prefix(self.definition, prefix, self.parameters)?
+        else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stored_rows = self
+            .transaction
+            .state
+            .relational
+            .tables
+            .get(&self.table)
+            .ok_or(SqlError::InvalidStoredRow)?;
+        self.collect_rows(
+            stored_rows.range(primary_key_prefix_bounds(prefix)),
+            limit,
+            false,
+        )
+    }
+
     fn range_rows(
         &self,
         range: &PrimaryKeyRange,
@@ -2807,13 +2987,7 @@ fn bind_select(
     limit: Option<usize>,
 ) -> Result<BoundSelect, SqlError> {
     let (table, definition) = relation_named(catalog, name)?;
-    let projection = match projection {
-        Projection::All => (0..definition.columns.len()).collect(),
-        Projection::Columns(names) => names
-            .iter()
-            .map(|name| column_index(&definition.columns, name))
-            .collect::<Result<Vec<_>, _>>()?,
-    };
+    let projection = bind_projection(definition, projection)?;
     let filter = filter
         .map(|expression| bind_filter_expression(definition, expression))
         .transpose()?;
@@ -2835,7 +3009,7 @@ fn bind_select(
             },
             0,
         )
-    } else if let Some(key) = find_equality_key(&comparisons, &expected_primary_key)? {
+    } else if let Some(key) = find_equality_key(&comparisons, &expected_primary_key) {
         if !order_by.is_empty() || limit.is_some() {
             return Err(SqlError::InvalidSyntax);
         }
@@ -2862,6 +3036,14 @@ fn bind_select(
                 legacy_binary,
             },
             range_terms,
+        )
+    } else if let Some(prefix) = find_primary_key_prefix(&comparisons, &expected_primary_key) {
+        let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
+        let used_terms = prefix.columns.len();
+        (
+            SelectAccess::PrimaryKeyPrefixScan { prefix, limit },
+            used_terms,
         )
     } else {
         let Some(limit) = limit else {
@@ -2900,6 +3082,19 @@ fn bind_select(
         output_columns,
         access,
     })
+}
+
+fn bind_projection(
+    definition: &RelationDefinition,
+    projection: &Projection,
+) -> Result<Vec<usize>, SqlError> {
+    match projection {
+        Projection::All => Ok((0..definition.columns.len()).collect()),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| column_index(&definition.columns, name))
+            .collect(),
+    }
 }
 
 fn bind_indexed_inner_join(
@@ -2945,6 +3140,9 @@ fn bind_indexed_inner_join(
             limit,
             legacy_binary: false,
         } => JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit },
+        SelectAccess::PrimaryKeyPrefixScan { limit, .. } => {
+            JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit }
+        }
         SelectAccess::PrimaryKeyRangeScan {
             range,
             limit,
@@ -3288,7 +3486,7 @@ fn filter_term_count(expression: &BoundFilterExpression) -> usize {
 fn find_equality_key(
     comparisons: &[&BoundFilterExpression],
     key_columns: &[usize],
-) -> Result<Option<KeyBinding>, SqlError> {
+) -> Option<KeyBinding> {
     let mut operands = Vec::with_capacity(key_columns.len());
     for key_column in key_columns {
         let matching = comparisons
@@ -3302,19 +3500,59 @@ fn find_equality_key(
                 else {
                     return None;
                 };
-                (columns.as_slice() == [*key_column]).then(|| operands[0].clone())
+                (columns.as_slice() == [*key_column])
+                    .then_some(operands.as_slice())
+                    .and_then(|operands| match operands {
+                        [operand] => Some(operand.clone()),
+                        _ => None,
+                    })
             })
             .collect::<Vec<_>>();
-        match matching.as_slice() {
-            [] => return Ok(None),
-            [operand] => operands.push(operand.clone()),
-            _ => return Err(SqlError::DuplicateColumn),
-        }
+        let [operand] = matching.as_slice() else {
+            return None;
+        };
+        operands.push(operand.clone());
     }
-    Ok(Some(KeyBinding {
+    Some(KeyBinding {
         columns: key_columns.to_vec(),
         operands,
-    }))
+    })
+}
+
+fn find_primary_key_prefix(
+    comparisons: &[&BoundFilterExpression],
+    primary_key: &[usize],
+) -> Option<KeyBinding> {
+    let mut columns = Vec::with_capacity(primary_key.len().saturating_sub(1));
+    let mut operands = Vec::with_capacity(primary_key.len().saturating_sub(1));
+    for key_column in primary_key {
+        let matching = comparisons
+            .iter()
+            .filter_map(|comparison| {
+                let BoundFilterExpression::Comparison {
+                    columns,
+                    operator: ComparisonOperator::Equal,
+                    operands,
+                } = comparison
+                else {
+                    return None;
+                };
+                (columns.as_slice() == [*key_column])
+                    .then_some(operands.as_slice())
+                    .and_then(|operands| match operands {
+                        [operand] => Some(operand.clone()),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [operand] = matching.as_slice() else {
+            break;
+        };
+        columns.push(*key_column);
+        operands.push(operand.clone());
+    }
+    (!columns.is_empty() && columns.len() < primary_key.len())
+        .then_some(KeyBinding { columns, operands })
 }
 
 fn find_secondary_equality_key(
@@ -3331,7 +3569,7 @@ fn find_secondary_equality_key(
             continue;
         }
         let columns = secondary_index_column_indices(definition, index)?;
-        if let Some(key) = find_equality_key(comparisons, &columns)? {
+        if let Some(key) = find_equality_key(comparisons, &columns) {
             return Ok(Some((*id, key)));
         }
     }
@@ -3629,6 +3867,56 @@ fn bind_primary_key(
         values[column] = Some(value);
     }
     encode_primary_key(definition, &values)
+}
+
+fn bind_primary_key_prefix(
+    definition: &RelationDefinition,
+    prefix: &KeyBinding,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    if prefix.columns.len() != prefix.operands.len() || prefix.columns.is_empty() {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    let primary_key = primary_key_indices(definition)?;
+    if prefix.columns.len() >= primary_key.len()
+        || prefix.columns.as_slice() != &primary_key[..prefix.columns.len()]
+    {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    let mut encoded = Vec::new();
+    for (column, operand) in prefix.columns.iter().zip(&prefix.operands) {
+        let value = resolve_operand(operand, parameters)?;
+        if matches!(value, SqlValue::Null) {
+            return Ok(None);
+        }
+        let logical_type = &definition
+            .columns
+            .get(*column)
+            .ok_or(SqlError::InvalidCatalogObject)?
+            .logical_type;
+        encoded.extend_from_slice(
+            &value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::TypeMismatch)?,
+        );
+    }
+    Ok(Some(encoded))
+}
+
+fn primary_key_prefix_bounds(prefix: Vec<u8>) -> PrimaryKeyBounds {
+    let upper = binary_prefix_successor(&prefix);
+    (
+        Bound::Included(prefix),
+        upper.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+fn binary_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper[index] += 1;
+    upper.truncate(index + 1);
+    Some(upper)
 }
 
 fn bind_primary_key_range(
@@ -4929,7 +5217,8 @@ mod tests {
 
     use super::{
         ColumnOperand, ComparisonOperator, FilterExpression, ParsedJoinEquality, Projection,
-        ScalarOperand, SqlError, Statement, TruthValue, parse, primary_key_range_is_empty,
+        ScalarOperand, SqlError, Statement, TruthValue, binary_prefix_successor, parse,
+        primary_key_range_is_empty,
     };
 
     #[test]
@@ -5409,6 +5698,17 @@ mod tests {
             &Bound::Unbounded,
             &Bound::Unbounded,
         ));
+    }
+
+    #[test]
+    fn binary_prefix_successor_is_minimal_and_handles_terminal_ff_bytes() {
+        assert_eq!(
+            binary_prefix_successor(&[0x01, 0x02]),
+            Some(vec![0x01, 0x03])
+        );
+        assert_eq!(binary_prefix_successor(&[0x01, 0xff]), Some(vec![0x02]));
+        assert_eq!(binary_prefix_successor(&[0xff]), None);
+        assert_eq!(binary_prefix_successor(&[]), None);
     }
 
     #[test]

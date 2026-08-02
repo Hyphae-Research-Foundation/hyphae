@@ -133,6 +133,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native typed indexed-mutation evidence — 2026-08-01](gates/evidence/native-typed-indexed-mutations-2026-08-01.md)
 - [Native bounded relational-scan evidence — 2026-08-01](gates/evidence/native-bounded-relational-scan-2026-08-01.md)
 - [Native primary-key range evidence — 2026-08-01](gates/evidence/native-primary-key-ranges-2026-08-01.md)
+- [Native primary-key left-prefix scan evidence — 2026-08-02](gates/evidence/native-primary-key-prefix-scans-2026-08-02.md)
 - [Native SQL residual-filter evidence — 2026-08-01](gates/evidence/native-sql-residual-filters-2026-08-01.md)
 - [Native SQL scalar-literal evidence — 2026-08-01](gates/evidence/native-sql-scalar-literals-2026-08-01.md)
 - [Native SQL mutation-literal evidence — 2026-08-01](gates/evidence/native-sql-mutation-literals-2026-08-01.md)

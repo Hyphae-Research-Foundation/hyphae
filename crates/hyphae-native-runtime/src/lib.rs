@@ -17699,7 +17699,7 @@ mod tests {
                 "SELECT payload FROM events WHERE tenant = ?",
                 &[SqlValue::Text("celiums".to_owned())],
             ),
-            Err(SqlError::InvalidPrimaryKey)
+            Err(SqlError::InvalidSyntax)
         ));
         transaction.commit()?;
 
@@ -18467,6 +18467,306 @@ mod tests {
         assert_eq!(
             reopened.execute_prepared_latest(&reopened_plan, &composite_range_parameters())?,
             expected_composite_range()
+        );
+        Ok(())
+    }
+
+    const PRIMARY_KEY_PREFIX_QUERY: &str = "SELECT sequence, payload
+        FROM ledger
+        WHERE sequence >= ? AND tenant = ?
+        ORDER BY tenant, sequence
+        LIMIT 3";
+
+    fn seed_primary_key_prefix_ledger(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE ledger (
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (tenant, sequence)
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing ledger table identity".into());
+        };
+        for tenant in ["a", "aa", "b"] {
+            for sequence in 0_i64..128 {
+                seed.execute_sql(
+                    "INSERT INTO ledger (tenant, sequence, payload) VALUES (?, ?, ?)",
+                    &[
+                        SqlValue::Text(tenant.to_owned()),
+                        SqlValue::Signed(sequence),
+                        SqlValue::Text(format!("{tenant}-{sequence:03}")),
+                    ],
+                )?;
+            }
+        }
+        seed.commit()?;
+        assert!(database.latest_relational_tree_height()? >= 2);
+        Ok(table)
+    }
+
+    fn prefix_rows(rows: &[(i64, &str)]) -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["sequence".to_owned(), "payload".to_owned()],
+            rows: rows
+                .iter()
+                .map(|(sequence, payload)| {
+                    vec![
+                        SqlValue::Signed(*sequence),
+                        SqlValue::Text((*payload).to_owned()),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_private_primary_key_prefix(
+        database: &mut NativeDatabase,
+        table: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut private = database.begin_sql(11, DurabilityClass::Strict)?;
+        private.execute_sql(
+            "INSERT INTO ledger (tenant, sequence, payload) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Text("aa".to_owned()),
+                SqlValue::Signed(128),
+                SqlValue::Text("aa-private".to_owned()),
+            ],
+        )?;
+        assert_eq!(
+            private.execute_sql(
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE sequence >= ? AND tenant = ?
+                 ORDER BY tenant, sequence
+                 LIMIT 3",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyPrefixScan(table={table},columns=1,limit=3,residual=true)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            private.execute_sql(
+                PRIMARY_KEY_PREFIX_QUERY,
+                &[SqlValue::Signed(126), SqlValue::Text("aa".to_owned())],
+            )?,
+            prefix_rows(&[(126, "aa-126"), (127, "aa-127"), (128, "aa-private")])
+        );
+        for (statement, expected) in [
+            (
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE sequence = ?
+                 ORDER BY tenant, sequence LIMIT 1",
+                format!("PrimaryKeyScan(table={table},limit=1,residual=true)"),
+            ),
+            (
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE tenant = ? AND tenant = ?
+                 ORDER BY tenant, sequence LIMIT 1",
+                format!("PrimaryKeyScan(table={table},limit=1,residual=true)"),
+            ),
+            (
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE tenant = ? AND sequence = ?",
+                format!("PrimaryKeyLookup(table={table})"),
+            ),
+        ] {
+            assert_eq!(
+                private.execute_sql(statement, &[])?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(expected)]],
+                }
+            );
+        }
+        private.rollback();
+        Ok(())
+    }
+
+    fn assert_primary_key_prefix_parameter_failures(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prepared = database.prepare_sql_latest(PRIMARY_KEY_PREFIX_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&prepared, &[SqlValue::Signed(0), SqlValue::Null],)?,
+            prefix_rows(&[])
+        );
+        assert!(matches!(
+            database
+                .execute_prepared_latest(&prepared, &[SqlValue::Signed(0), SqlValue::Signed(7)],),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(&prepared, &[SqlValue::Signed(0)]),
+            Err(SqlError::ParameterMismatch)
+        ));
+        let zero = database.prepare_sql_latest(
+            "SELECT sequence FROM ledger
+             WHERE tenant = ?
+             ORDER BY tenant, sequence LIMIT 0",
+        )?;
+        assert!(matches!(
+            database.execute_prepared_latest(&zero, &[SqlValue::Signed(7)]),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT sequence FROM ledger WHERE tenant = ?"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        Ok(())
+    }
+
+    fn mutate_primary_key_prefix_ledger(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mutation = database.begin_sql(13, DurabilityClass::Strict)?;
+        mutation.execute_sql(
+            "DELETE FROM ledger WHERE tenant = ? AND sequence = ?",
+            &[SqlValue::Text("aa".to_owned()), SqlValue::Signed(125)],
+        )?;
+        mutation.execute_sql(
+            "INSERT INTO ledger (tenant, sequence, payload) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Text("aa".to_owned()),
+                SqlValue::Signed(128),
+                SqlValue::Text("aa-128".to_owned()),
+            ],
+        )?;
+        mutation.commit()?;
+        Ok(())
+    }
+
+    fn assert_primary_key_prefix_boundaries(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let query = database.prepare_sql_latest(
+            "SELECT tenant, sequence FROM ledger
+             WHERE tenant = ?
+             ORDER BY tenant, sequence LIMIT 256",
+        )?;
+        let SqlResult::Rows { rows, .. } =
+            database.execute_prepared_latest(&query, &[SqlValue::Text("a".to_owned())])?
+        else {
+            return Err("expected prefix rows".into());
+        };
+        assert_eq!(rows.len(), 128);
+        assert!(
+            rows.iter()
+                .all(|row| row.first() == Some(&SqlValue::Text("a".to_owned())))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_primary_key_left_prefix_matches_every_executor_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_primary_key_prefix_ledger(&mut database)?;
+        assert_private_primary_key_prefix(&mut database, table)?;
+        let retained = database.snapshot(12)?;
+        let retained_plan = retained.prepare_sql(PRIMARY_KEY_PREFIX_QUERY)?;
+        mutate_primary_key_prefix_ledger(&mut database)?;
+        let parameters = [SqlValue::Signed(125), SqlValue::Text("aa".to_owned())];
+        assert_eq!(
+            retained.execute_prepared(&retained_plan, &parameters)?,
+            prefix_rows(&[(125, "aa-125"), (126, "aa-126"), (127, "aa-127")])
+        );
+        let latest_plan = database.prepare_sql_latest(PRIMARY_KEY_PREFIX_QUERY)?;
+        let current = prefix_rows(&[(126, "aa-126"), (127, "aa-127"), (128, "aa-128")]);
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            current
+        );
+        assert_primary_key_prefix_boundaries(&database)?;
+        assert_primary_key_prefix_parameter_failures(&database)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(PRIMARY_KEY_PREFIX_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            current
+        );
+        Ok(())
+    }
+
+    fn forge_primary_key_prefix_row(
+        database: &mut NativeDatabase,
+        table: ObjectId,
+        primary_key: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let roots = database.coordinator.snapshot(14)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let visible_csn = roots
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                visible_csn,
+                super::relational_row_key(table, primary_key),
+                vec![0xff],
+            )?
+            .tree;
+        let mut forged_roots = roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        forged_roots.insert(
+            super::SLOT_RELATIONAL,
+            forged_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            visible_csn,
+            roots.catalog_version(),
+            roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_roots,
+            roots.blob_generation(),
+        )?;
+        database.coordinator = hyphae_native_mvcc::CommitCoordinator::restore(forged)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physical_primary_key_prefix_scan_rejects_a_malformed_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_primary_key_prefix_ledger(&mut database)?;
+        let plan = database.prepare_sql_latest(
+            "SELECT sequence FROM ledger
+             WHERE tenant = ?
+             ORDER BY tenant, sequence LIMIT 1",
+        )?;
+        let mut primary_key =
+            SqlValue::Text("a".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        primary_key.extend_from_slice(
+            &SqlValue::Signed(0)
+                .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?,
+        );
+        forge_primary_key_prefix_row(&mut database, table, &primary_key)?;
+        let result = database.execute_prepared_latest(&plan, &[SqlValue::Text("a".to_owned())]);
+        assert!(
+            matches!(&result, Err(SqlError::Runtime(_))),
+            "unexpected prefix corruption result: {result:?}"
         );
         Ok(())
     }
