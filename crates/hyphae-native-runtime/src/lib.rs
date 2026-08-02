@@ -1277,6 +1277,120 @@ impl NativeDatabase {
         &self.recovery
     }
 
+    /// Looks up one current catalog definition by stable object identity.
+    ///
+    /// `HYCAT003` directories traverse the native catalog B+tree through the
+    /// partitioned buffer pool. Legacy inline catalog roots remain readable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot coordination, page, B+tree, definition,
+    /// blob, or catalog-namespace corruption.
+    pub fn catalog_object_latest(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_CATALOG) else {
+            return Ok(None);
+        };
+        self.catalog_object_at_root(root, id)
+    }
+
+    /// Looks up one current catalog definition by normalized qualified name.
+    ///
+    /// The name namespace resolves to a stable ID and the object namespace is
+    /// checked on the same immutable root before returning the definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same storage and corruption failures as
+    /// [`Self::catalog_object_latest`].
+    pub fn catalog_object_named_latest(
+        &self,
+        name: &QualifiedName,
+    ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_CATALOG) else {
+            return Ok(None);
+        };
+        let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
+        if frame.page().kind() == PageKind::CatalogRoot {
+            let catalog = CatalogState::decode(frame.page().payload())?;
+            let identity = catalog_name_identity_from_qualified(name)?;
+            return Ok(catalog
+                .objects
+                .values()
+                .find(|object| {
+                    catalog_name_identity(object.header())
+                        .is_ok_and(|candidate| candidate == identity)
+                })
+                .cloned());
+        }
+        if !matches!(
+            frame.page().kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ) {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        let name_key = catalog_name_key_from_qualified(name)?;
+        let tree = BTree::from_root(root);
+        let Some(encoded_id) = tree.get_cached_pinned(&self.pages, &self.buffer_pool, &name_key)?
+        else {
+            return Ok(None);
+        };
+        if encoded_id.bytes().len() != 16 {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        let id = ObjectId::new(u128::from_be_bytes(
+            encoded_id
+                .bytes()
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+        ))
+        .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+        let object = self
+            .catalog_object_at_root(root, id)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if catalog_name_key(object.header())? != name_key {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        Ok(Some(object))
+    }
+
+    fn catalog_object_at_root(
+        &self,
+        root: PageId,
+        id: ObjectId,
+    ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+        let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
+        if frame.page().kind() == PageKind::CatalogRoot {
+            return Ok(CatalogState::decode(frame.page().payload())?
+                .object(id)
+                .cloned());
+        }
+        if !matches!(
+            frame.page().kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ) {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        let Some(stored) = BTree::from_root(root).get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &catalog_object_key(id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let definition = decode_catalog_definition_storage_value(stored.bytes(), &self.blobs)?;
+        let object = CatalogObject::decode_definition(&definition)?;
+        if object.header().id != id {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        Ok(Some(object))
+    }
+
     /// Materializes one immutable all-engine read snapshot.
     ///
     /// # Errors
@@ -5703,7 +5817,11 @@ fn catalog_object_key(id: ObjectId) -> Vec<u8> {
 }
 
 fn catalog_name_key(header: &ObjectHeader) -> Result<Vec<u8>, NativeRuntimeError> {
-    let identity = catalog_name_identity(header)?;
+    catalog_name_key_from_qualified(&header.name)
+}
+
+fn catalog_name_key_from_qualified(name: &QualifiedName) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = catalog_name_identity_from_qualified(name)?;
     let mut key = Vec::with_capacity(
         identity
             .len()
@@ -10457,12 +10575,12 @@ fn validate_catalog_creation_identity(
 }
 
 fn catalog_name_identity(header: &ObjectHeader) -> Result<Vec<u8>, CatalogError> {
+    catalog_name_identity_from_qualified(&header.name)
+}
+
+fn catalog_name_identity_from_qualified(name: &QualifiedName) -> Result<Vec<u8>, CatalogError> {
     let mut encoded = Vec::new();
-    for component in [
-        &header.name.database,
-        &header.name.schema,
-        &header.name.object,
-    ] {
+    for component in [&name.database, &name.schema, &name.object] {
         let lookup = component.lookup().as_bytes();
         let length = u32::try_from(lookup.len()).map_err(|_| CatalogError::NameTooLong)?;
         encoded.extend_from_slice(&length.to_le_bytes());
@@ -10777,6 +10895,11 @@ mod tests {
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
             let definition = decode_catalog_definition_storage_value(&stored, &database.blobs)?;
             assert_eq!(CatalogObject::decode_definition(&definition)?, object);
+            assert_eq!(database.catalog_object_latest(id)?, Some(object.clone()));
+            assert_eq!(
+                database.catalog_object_named_latest(&object.header().name)?,
+                Some(object)
+            );
         }
         let retained = database.snapshot(0)?;
         assert_eq!(retained.state.catalog.objects.len(), 256);
@@ -10802,7 +10925,15 @@ mod tests {
         let snapshot = reopened.snapshot(0)?;
         assert_eq!(snapshot.state.catalog.objects.len(), 257);
         for sequence in [1, RELATION_COUNT / 2, RELATION_COUNT + 1] {
-            assert!(snapshot.catalog_object(ObjectId::new(sequence)?).is_some());
+            let id = ObjectId::new(sequence)?;
+            let object = snapshot
+                .catalog_object(id)
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            assert_eq!(reopened.catalog_object_latest(id)?, Some(object.clone()));
+            assert_eq!(
+                reopened.catalog_object_named_latest(&object.header().name)?,
+                Some(object.clone())
+            );
         }
         Ok(())
     }
