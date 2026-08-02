@@ -1,6 +1,8 @@
 # Native clean-room and dependency inventory
 
-Status: normative G0 policy; implementation inventory in progress
+Status: normative G0 policy; the exact native-closure gate, machine-readable
+policy, unit tests, pull-request CI, and a clean WSL2 receipt are implemented;
+semantic review of reported third-party unsafe use remains pending
 
 Hyphae owns database, transaction, SQL, structure, lexical and ANN semantics.
 This document distinguishes permitted primitives from forbidden target-engine
@@ -115,3 +117,59 @@ Before G0 closes:
 4. target crates are proven free of forbidden engines;
 5. direct and transitive unsafe use is reported; and
 6. the porting ledger confirms that no source was silently copied.
+
+## Exact native-closure gate
+
+The G0 dependency gate is rooted at the `hyphae-native-runtime` package. It
+uses `cargo metadata --locked --format-version 1` and follows every non-dev
+normal and build edge, including target-conditioned edges. Development-only
+dependencies are outside this runtime closure and require their existing
+workspace security gates instead.
+
+The gate must fail when:
+
+- the root package is missing or ambiguous;
+- a reachable workspace package is outside the reviewed native package set;
+- a reachable external package is absent from the machine-readable inventory;
+- an inventoried external package is no longer reachable;
+- a package version, registry source, or declared license differs from its
+  reviewed inventory record;
+- a forbidden database, structure, query, search, or vector engine appears
+  anywhere in the closure;
+- the workspace no longer sets `unsafe_code = "forbid"` or a reachable native
+  crate stops inheriting workspace lints;
+- `cargo-geiger` omits metrics for a reachable native package, reports direct
+  unsafe usage in one, or cannot parse a file belonging to the closure; or
+- a clean evidence run is requested from a dirty worktree.
+
+The machine-readable inventory records the review category and rationale for
+every external package. It is an exact allowlist, not a permissive prefix or
+license-only filter. Package updates therefore require an intentional policy
+change and review. The canonical allowlist is
+[`config/native-dependency-policy.json`](../../config/native-dependency-policy.json).
+
+`cargo-geiger` is evidence rather than an authority over package semantics.
+Unsafe counts in reviewed third-party primitives are reported by package and
+may be nonzero. Unsafe counts in Hyphae-owned native crates must be zero. Parse
+diagnostics for packages outside the metadata closure are retained in the
+receipt but cannot silently expand or invalidate the audited package set.
+The first clean capture is the
+[2026-08-02 native dependency-closure
+evidence](../gates/evidence/native-dependency-closure-2026-08-02.md).
+
+The JSON receipt must bind:
+
+- schema version and gate implementation version;
+- Git commit, source tree, and clean-worktree state;
+- Rust, Cargo, `cargo-deny`, and `cargo-geiger` versions;
+- the exact root and complete ordered package closure;
+- source, license, dependency kind, and review rationale for each external
+  package;
+- direct and transitive unsafe counts plus any scan exclusions;
+- forbidden-package and workspace-lint results; and
+- the exact commands and exit status used for metadata, policy, license, and
+  unsafe analysis.
+
+The receipt closes only this dependency-inventory portion of G0. It does not
+substitute for golden encodings, the benchmark/quality corpus, implementation
+conformance, or the remaining phase gates.

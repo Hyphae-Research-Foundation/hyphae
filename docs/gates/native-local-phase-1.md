@@ -310,6 +310,15 @@ recovers prior-or-complete at every commit boundary. On the measured
 and empty-expiry-scan p50 by 93.133%. The append-only file still grew by the
 ten replacement pages, so retention-aware physical vacuum remains open.
 
+The [native dependency-closure
+evidence](evidence/native-dependency-closure-2026-08-02.md) makes the non-dev
+normal/build graph rooted at `hyphae-native-runtime` an exact fail-closed
+allowlist. Its clean WSL2 receipt contains 11 Hyphae-owned packages, 19
+reviewed external primitive/build packages, no forbidden engine, and zero
+native unsafe findings. Reported third-party unsafe syntax still requires
+semantic review, and the remaining golden/corpus/conformance requirements keep
+G0 open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

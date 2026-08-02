@@ -34,6 +34,10 @@ jobs:
           git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/merge"
           test "$(git rev-parse FETCH_HEAD)" = "$PR_MERGE_COMMIT"
           test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')"
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
@@ -42,6 +46,24 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+      - name: Install pinned receipt tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-geiger --version 0.13.0 --locked
+      - name: Audit the exact native runtime closure
+        run: |
+          python -m unittest tools/test_check_native_dependencies.py -v
+          python tools/check_native_dependencies.py \
+            --require-clean \
+            --output native-dependency-audit.json
+      - name: Upload native dependency evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-dependency-audit
+          path: native-dependency-audit.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Scan repository history for secrets
         uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
         with:

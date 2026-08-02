@@ -1,0 +1,202 @@
+{
+  "schema": "hyphae-native-dependency-policy-v1",
+  "root_package": "hyphae-native-runtime",
+  "workspace_packages": [
+    "hyphae-native-ann",
+    "hyphae-native-blobs",
+    "hyphae-native-btree",
+    "hyphae-native-catalog",
+    "hyphae-native-manifest",
+    "hyphae-native-mvcc",
+    "hyphae-native-pages",
+    "hyphae-native-records",
+    "hyphae-native-runtime",
+    "hyphae-native-types",
+    "hyphae-native-wal"
+  ],
+  "forbidden_packages": [
+    "datafusion",
+    "duckdb",
+    "elasticsearch",
+    "faiss",
+    "fred",
+    "heed",
+    "hnsw",
+    "hnsw_rs",
+    "lancedb",
+    "librocksdb-sys",
+    "libsqlite3-sys",
+    "lmdb",
+    "lucene",
+    "milvus",
+    "mysql",
+    "mysql_common",
+    "opensearch",
+    "polars",
+    "postgres",
+    "qdrant-client",
+    "redis",
+    "redb",
+    "rocksdb",
+    "rusqlite",
+    "sqlx",
+    "surrealdb",
+    "tantivy",
+    "tokio-postgres",
+    "usearch"
+  ],
+  "external_packages": [
+    {
+      "name": "arrayref",
+      "version": "0.3.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "BSD-2-Clause",
+      "category": "BLAKE3 support primitive",
+      "rationale": "Fixed-size array reference helpers used transitively by BLAKE3."
+    },
+    {
+      "name": "arrayvec",
+      "version": "0.7.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "BLAKE3 support primitive",
+      "rationale": "Bounded inline array storage used transitively by BLAKE3."
+    },
+    {
+      "name": "blake3",
+      "version": "1.8.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+      "category": "integrity primitive",
+      "rationale": "Content identity and authenticated page, WAL, manifest, and root digests."
+    },
+    {
+      "name": "cc",
+      "version": "1.2.67",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "build primitive",
+      "rationale": "Build-time compiler driver used by BLAKE3 platform acceleration."
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "platform primitive",
+      "rationale": "Compile-time target selection used transitively by BLAKE3."
+    },
+    {
+      "name": "constant_time_eq",
+      "version": "0.4.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "CC0-1.0 OR MIT-0 OR Apache-2.0",
+      "category": "integrity primitive",
+      "rationale": "Constant-time digest comparison used transitively by BLAKE3."
+    },
+    {
+      "name": "cpufeatures",
+      "version": "0.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "platform primitive",
+      "rationale": "Runtime CPU feature detection used transitively by BLAKE3."
+    },
+    {
+      "name": "crc32c",
+      "version": "0.6.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0/MIT",
+      "category": "integrity primitive",
+      "rationale": "Fast accidental-corruption detection for native pages, WAL, blobs, and manifests."
+    },
+    {
+      "name": "find-msvc-tools",
+      "version": "0.1.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "build primitive",
+      "rationale": "MSVC discovery used transitively by the cc build primitive."
+    },
+    {
+      "name": "libc",
+      "version": "0.2.186",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "platform primitive",
+      "rationale": "Target-conditioned CPU feature support outside Hyphae-owned semantics."
+    },
+    {
+      "name": "proc-macro2",
+      "version": "1.0.106",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Compiler token representation used by the thiserror derive path."
+    },
+    {
+      "name": "quote",
+      "version": "1.0.46",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Compiler token generation used by the thiserror derive path."
+    },
+    {
+      "name": "rustc_version",
+      "version": "0.4.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "build primitive",
+      "rationale": "Compiler-version detection used by crc32c at build time."
+    },
+    {
+      "name": "semver",
+      "version": "1.0.28",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "build primitive",
+      "rationale": "Version parsing used transitively by rustc_version."
+    },
+    {
+      "name": "shlex",
+      "version": "2.0.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "build primitive",
+      "rationale": "Command-line tokenization used transitively by the cc build primitive."
+    },
+    {
+      "name": "syn",
+      "version": "3.0.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Rust syntax parsing used by the thiserror derive path."
+    },
+    {
+      "name": "thiserror",
+      "version": "2.0.19",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "error primitive",
+      "rationale": "Typed error derivation without database, query, or storage semantics."
+    },
+    {
+      "name": "thiserror-impl",
+      "version": "2.0.19",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Procedural macro implementation for thiserror."
+    },
+    {
+      "name": "unicode-ident",
+      "version": "1.0.24",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "category": "derive build primitive",
+      "rationale": "Unicode identifier tables used by proc-macro2 and syn."
+    }
+  ]
+}
