@@ -122,6 +122,14 @@ scans, exact reference-BM25 equivalence, shared large text blobs, multilevel
 restart/corruption tests, legacy inline compatibility, and the first clean
 physical `MATCH` latency baseline.
 
+The [native ANN kernel
+evidence](evidence/native-ann-kernel-2026-08-01.md) binds the first
+Hyphae-owned deterministic HNSW implementation, three exact metric semantics,
+canonical mutation rebuild, exact oracle, content-bound build identity,
+fail-closed restore and a bounded quality observation to one source commit.
+It is not yet connected to the native search B+tree, WAL or MVCC roots, so G1,
+G4 and G7 remain open.
+
 The [native type-codec
 evidence](evidence/native-type-codecs-2026-08-01.md) binds recursive logical
 type descriptors, checked primitive row payloads, memcomparable ordered-index
@@ -236,8 +244,9 @@ primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, and the first independent-field hash
-layout. It still lacks whole-hash lifecycle/iteration, lists, sets, sorted
-sets, streams, the expiry scheduler, model tests, and amplification evidence
+layout plus exact binary sets with member-granular conflicts. It still lacks
+whole-hash lifecycle/iteration, set iteration/algebra/TTL, lists, sorted sets,
+streams, the expiry scheduler, model tests, and amplification evidence
 required to close G3.
 
 ## G1 substrate exit

@@ -1,0 +1,36 @@
+{
+  "schema": "hyphae-native-ann-quality-v1",
+  "source_commit": "3e353c089344e47e650caa85408421423a5e5608",
+  "environment": "Debian 13 WSL2; Linux 6.18.33.1; x86_64; Intel Core Ultra 9 285H; 16 CPUs; 16115352 kB RAM; rustc 1.96.0",
+  "dataset_digest": "d88fb2e356dcdc5b861a3d56d7c99e82298b9270f3be7a16493b7e8c7a1f768c",
+  "vector_count": 10000,
+  "dimension": 32,
+  "query_count": 100,
+  "k": 10,
+  "m": 16,
+  "ef_construction": 128,
+  "ef_search": 128,
+  "max_level": 3,
+  "directed_edges": 170912,
+  "build_identity": "c201cc6e3e237a63b456e2d1833f14db4a04085483dfaf559d2c1c858ee2a432",
+  "build_duration_millis": 7026.173,
+  "recall_at_10": 0.970000,
+  "recall_at_10_floor": 0.950000,
+  "recall_floor_met": true,
+  "minimum_query_recall_at_10": 7,
+  "p50_query_recall_at_10": 10,
+  "mean_visited_nodes": 1501.070,
+  "mean_candidate_count": 128.000,
+  "exact_latency_micros": {
+    "p50": 639.333,
+    "p95": 689.556,
+    "p99": 846.339,
+    "maximum": 1081.439
+  },
+  "hnsw_latency_micros": {
+    "p50": 716.048,
+    "p95": 823.839,
+    "p99": 1270.667,
+    "maximum": 1280.603
+  }
+}

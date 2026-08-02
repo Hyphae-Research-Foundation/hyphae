@@ -90,6 +90,14 @@ commit before its tag can be published.
 - `native-microsecond-smoke-search-wsl2.json` is its schema-v6 clean physical
   `MATCH` observation over 2,048 documents. Search uses one complete call per
   timer observation; the rare-term baseline remains outside G7.
+- [Native ANN kernel evidence —
+  2026-08-01](native-ann-kernel-2026-08-01.md) binds the first Hyphae-owned
+  deterministic HNSW implementation, exact oracle, canonical rebuild,
+  fail-closed restore and explicit persistence boundary to one source commit.
+- `native-ann-kernel-wsl2.json` is its 10,000-vector, 32-dimensional,
+  100-query WSL2 observation. Recall@10 passed the bounded 0.95 floor at
+  0.970, but HNSW remained slower than exact search and the receipt does not
+  pass G4 or G7.
 - [Native canonical type-codec evidence —
   2026-08-01](native-type-codecs-2026-08-01.md) binds recursive type
   descriptors, checked primitive row payloads, memcomparable ordered-index

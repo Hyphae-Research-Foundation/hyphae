@@ -149,3 +149,13 @@ in the checked
 [benchmark receipt](../gates/evidence/0.2-retrieval-benchmark-wsl2-x86_64.json).
 The native architecture must replace full scans and global serialization
 before any microsecond claim is credible.
+
+The first
+[native HNSW kernel observation](../gates/evidence/native-ann-kernel-wsl2.json)
+uses 10,000 vectors, 32 dimensions, 100 independent queries and top 10 under
+WSL2. With `M=16` and construction/search breadth 128, recall@10 was `0.970`.
+HNSW observed p50 `716.048 us` while the exact oracle observed p50
+`639.333 us`; approximation was slower at this corpus size. The graph is not
+yet page/WAL/MVCC-backed, and this run lacks the one-million-vector,
+384-dimensional corpus, concurrency, p99.9, allocations, hardware counters
+and interference lanes. It is a quality/latency observation, not G4 or G7.
