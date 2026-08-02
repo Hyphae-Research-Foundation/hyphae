@@ -212,6 +212,14 @@ commit before its tag can be published.
 - `native-right-secondary-inner-join-wsl2.json` is its schema-v4 clean release
   comparison of primary-key and unique-secondary right lookups over 2,048
   rows and 100,000 calls per route. It remains outside G2 and G7.
+- [Native composite inner-join evidence —
+  2026-08-01](native-composite-inner-join-2026-08-01.md) binds exact composite
+  primary and `UNIQUE` secondary right keys, catalog-order alignment,
+  private/retained/physical/reopened equivalence, null semantics, and typed
+  fail-closed behavior to one source commit.
+- `native-composite-inner-join-wsl2.json` is its schema-v5 clean release
+  comparison of one-column and two-column unique-secondary right lookups over
+  2,048 rows and 100,000 calls per route. It remains outside G2 and G7.
 
 ## Hosted release evidence
 
