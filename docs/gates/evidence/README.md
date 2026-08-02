@@ -245,6 +245,15 @@ commit before its tag can be published.
   due scan plus memory- and strict-durability cleanup batches. It records
   microsecond empty scans and millisecond cleanup batches, and remains
   outside G3 and G7.
+- [Native ordered B+tree batch copy-on-write evidence —
+  2026-08-02](native-btree-batch-cow-2026-08-02.md) binds complete pre-write
+  validation, one rewrite per affected node and level, unchanged-subtree page
+  retention, old-root readability, and `HYSTRBT2` physical cleanup
+  integration to one source commit.
+- `native-btree-batch-cow-wsl2.json` records latency and exact appended-page
+  amplification for the same expiry datasets. It improves cleanup p50 by
+  about 80% while leaving compaction, background scheduling, and the G3/G7
+  matrices open.
 
 ## Hosted release evidence
 

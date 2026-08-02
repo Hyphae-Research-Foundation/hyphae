@@ -286,9 +286,20 @@ expiry namespace, bounded deterministic cleanup, `HYSTRBT1` compatibility,
 first-committer-wins renewal safety, fail-closed reconstruction, all seven
 cleanup crash boundaries, and the first scheduler/cleanup latency
 observations to one clean source commit. The empty hot scan is measured in
-microseconds; current multi-key cleanup batches remain millisecond operations
-and expose complete-state materialization plus per-key copy-on-write
-publication as open performance work.
+microseconds; its initial multi-key cleanup batches remained millisecond
+operations and exposed complete-state materialization plus per-key
+copy-on-write publication as measured performance work.
+
+The [native ordered B+tree batch copy-on-write
+evidence](evidence/native-btree-batch-cow-2026-08-02.md) removes both measured
+cleanup bottlenecks. The batch primitive validates complete ordered input
+before writing, rewrites each affected node and internal level once, preserves
+unaffected subtree page IDs, and coalesces `HYSTRBT2` scalar plus expiry
+tombstones. The same warm-state datasets improved `Memory` and `Strict` p50
+latency by 80.533% and 79.674%, while appending 0.054199 and 0.191406 pages per
+key. `Memory` remains millisecond-scale and `Strict` p99 remains above one
+millisecond. Tombstone compaction, general mutation integration, scheduling,
+and the complete G7 matrix remain open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
@@ -315,7 +326,9 @@ sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
 algebra/TTL, score/reverse/rank sorted-set operations, streams, an engine-owned
 background timer around the implemented scalar expiry primitive, model tests,
-and amplification/compaction evidence required to close G3.
+and compaction evidence required to close G3. The ordered cleanup receipt
+provides a first exact amplification measurement, not the complete
+memory-amplification gate.
 
 ## G1 substrate exit
 
