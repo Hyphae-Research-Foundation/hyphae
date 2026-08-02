@@ -45,7 +45,10 @@ jobs:
       - name: Run bounded concurrent load gate
         run: python tools/run_load_gate.py
       - name: Unit-test block power-loss harness safety
-        run: python -m unittest tools/test_run_native_power_loss_gate.py -v
+        run: |
+          python -m unittest tools/test_run_native_power_loss_gate.py -v
+          cargo test --locked -p hyphae-native-runtime \
+            --example process_crash_matrix
       - name: Run native process-kill crash matrix
         run: |
           cargo run --locked -p hyphae-native-runtime \
