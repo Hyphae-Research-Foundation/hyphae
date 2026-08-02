@@ -348,6 +348,9 @@ pub enum NativeRuntimeError {
         /// Rejected caller-supplied key bound.
         requested: usize,
     },
+    /// Structure reachability compaction requires the indexed V2 format.
+    #[error("native structure compaction requires HYSTRBT2")]
+    StructureCompactionUnsupported,
     /// A search document or analyzed term cannot fit one canonical B+tree key.
     #[error("native search identity exceeds the canonical B+tree key limit")]
     SearchIdentityTooLarge,
@@ -558,6 +561,21 @@ pub struct ExpirySweepReceipt {
     /// Whether one additional due live identity was observed.
     pub more_due: bool,
     /// Native commit receipt, absent when no key was due.
+    pub commit: Option<CommitReceipt>,
+}
+
+/// Result of one current-root structure reachability compaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureCompactionReceipt {
+    /// Complete physical entries inspected in the captured structure root.
+    pub scanned_entries: usize,
+    /// Live entries copied byte-for-byte into the replacement root.
+    pub retained_entries: usize,
+    /// Canonical tombstone entries omitted from the replacement root.
+    pub dropped_tombstones: usize,
+    /// New B+tree pages appended for the replacement root.
+    pub pages_appended: u64,
+    /// Native maintenance commit, absent when no tombstone existed.
     pub commit: Option<CommitReceipt>,
 }
 
@@ -1754,6 +1772,109 @@ impl NativeDatabase {
         })
     }
 
+    /// Rebuilds the current `HYSTRBT2` root without reachable tombstones.
+    ///
+    /// Live physical entries are retained byte-for-byte. A root containing no
+    /// tombstones is a no-op and advances neither the WAL nor the global CSN.
+    /// Superseded pages remain in the append-only page file for historical
+    /// roots; this operation is not physical file vacuum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::StructureCompactionUnsupported`] for a
+    /// legacy structure format, or a storage, corruption, synchronization,
+    /// transaction, or durability error.
+    pub fn compact_structure(
+        &mut self,
+        durability: DurabilityClass,
+    ) -> Result<StructureCompactionReceipt, NativeRuntimeError> {
+        self.compact_structure_at(durability, None)
+    }
+
+    fn compact_structure_at(
+        &mut self,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<StructureCompactionReceipt, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV2 {
+            return Err(NativeRuntimeError::StructureCompactionUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+            return Ok(StructureCompactionReceipt {
+                scanned_entries: 0,
+                retained_entries: 0,
+                dropped_tombstones: 0,
+                pages_appended: 0,
+                commit: None,
+            });
+        };
+        let plan = plan_structure_compaction(&self.pages, &self.blobs, root)?;
+        if plan.dropped_tombstones == 0 {
+            return Ok(StructureCompactionReceipt {
+                scanned_entries: plan.scanned_entries,
+                retained_entries: plan.retained_entries.len(),
+                dropped_tombstones: 0,
+                pages_appended: 0,
+                commit: None,
+            });
+        }
+
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        if root_transaction.base_roots() != snapshot.roots() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let pages_before = self.pages.page_count();
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState::default(),
+                mutations: vec![Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::CompactStructure,
+                    target: None,
+                    key: Vec::new(),
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, true, false],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalStructureCompaction,
+            },
+        };
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+        let pages_appended = self
+            .pages
+            .page_count()
+            .checked_sub(pages_before)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        Ok(StructureCompactionReceipt {
+            scanned_entries: plan.scanned_entries,
+            retained_entries: plan.retained_entries.len(),
+            dropped_tombstones: plan.dropped_tombstones,
+            pages_appended,
+            commit: Some(commit),
+        })
+    }
+
     fn due_structure_keys(
         &self,
         snapshot: &Snapshot,
@@ -2941,6 +3062,7 @@ pub struct NativeWriteBatch {
 enum NativeWriteBatchMode {
     Materialized,
     PhysicalStructureExpiry,
+    PhysicalStructureCompaction,
 }
 
 /// Legacy serialized transaction retaining writer admission for its lifetime.
@@ -4770,6 +4892,16 @@ fn apply_mutations_to_state(
             | Opcode::DeleteSortedSetMember => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
+            Opcode::CompactStructure => {
+                if mutation.engine != EngineKind::Structure
+                    || mutation.target.is_some()
+                    || !mutation.key.is_empty()
+                    || !mutation.value.is_empty()
+                    || mutation.expires_at_micros.is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+            }
             Opcode::CreateIndex => {
                 let index = mutation
                     .target
@@ -4978,6 +5110,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 identity.extend_from_slice(&mutation.key);
                 identity
             }
+            Opcode::CompactStructure => vec![5],
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
@@ -5122,6 +5255,7 @@ fn commit_engine_roots(
             roots[2],
             commit_csn,
             &StructureMutationContext {
+                blobs,
                 format: structure_format,
                 mode: batch.mode,
                 logical_time_micros: batch.snapshot.logical_time_micros,
@@ -5170,6 +5304,34 @@ fn validate_write_batch_shape(
                         && mutation.value.is_empty()
                         && mutation.expires_at_micros.is_none()
                 });
+            if valid_roots
+                && valid_formats
+                && valid_state
+                && batch.dirty == [false, false, true, false]
+                && valid_mutations
+            {
+                Ok(())
+            } else {
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            }
+        }
+        NativeWriteBatchMode::PhysicalStructureCompaction => {
+            let valid_roots = roots.iter().all(Option::is_some);
+            let valid_formats = structure_format == StructureFormat::BTreeV2
+                && batch.structure_format == StructureFormat::BTreeV2
+                && batch.search_format == search_format;
+            let valid_state = batch.state == MaterializedState::default();
+            let valid_mutations = matches!(
+                batch.mutations.as_slice(),
+                [Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::CompactStructure,
+                    target: None,
+                    key,
+                    value,
+                    expires_at_micros: None,
+                }] if key.is_empty() && value.is_empty()
+            );
             if valid_roots
                 && valid_formats
                 && valid_state
@@ -5330,6 +5492,68 @@ fn is_structure_tombstone(encoded: &[u8]) -> bool {
         && encoded[8] == STRUCTURE_VALUE_TOMBSTONE
         && encoded[9] == STRUCTURE_VALUE_INLINE
         && encoded[10..24].iter().all(|byte| *byte == 0)
+}
+
+struct StructureCompactionPlan {
+    state: StructureState,
+    scanned_entries: usize,
+    retained_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    dropped_tombstones: usize,
+}
+
+fn plan_structure_compaction(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<StructureCompactionPlan, NativeRuntimeError> {
+    let state = load_structure_state_root(pages, blobs, root)?;
+    let entries = BTree::from_root(root).scan(pages)?;
+    let scanned_entries = entries.len();
+    let mut retained_entries = Vec::with_capacity(scanned_entries);
+    let mut dropped_tombstones = 0_usize;
+    for (key, value) in entries {
+        if compactable_structure_tombstone(&key, &value)? {
+            dropped_tombstones = dropped_tombstones
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        } else {
+            retained_entries.push((key, value));
+        }
+    }
+    Ok(StructureCompactionPlan {
+        state,
+        scanned_entries,
+        retained_entries,
+        dropped_tombstones,
+    })
+}
+
+fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, NativeRuntimeError> {
+    if key == STRUCTURE_FORMAT_KEY {
+        return Ok(false);
+    }
+    match key.first().copied() {
+        Some(
+            STRUCTURE_ENTRY_PREFIX
+            | STRUCTURE_HASH_FIELD_PREFIX
+            | STRUCTURE_SET_MEMBER_PREFIX
+            | STRUCTURE_LIST_CHUNK_PREFIX
+            | STRUCTURE_SORTED_SET_MEMBER_PREFIX
+            | STRUCTURE_SORTED_SET_ORDER_PREFIX,
+        ) => Ok(is_structure_tombstone(value)),
+        Some(STRUCTURE_EXPIRY_PREFIX) => match value {
+            [STRUCTURE_EXPIRY_TOMBSTONE] => Ok(true),
+            [STRUCTURE_EXPIRY_LIVE] => Ok(false),
+            _ => Err(NativeRuntimeError::InvalidStructureTree),
+        },
+        Some(
+            STRUCTURE_HASH_META_PREFIX
+            | STRUCTURE_SET_META_PREFIX
+            | STRUCTURE_LIST_META_PREFIX
+            | STRUCTURE_SORTED_SET_META_PREFIX,
+        ) => Ok(false),
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
 }
 
 fn decode_structure_value(
@@ -7056,6 +7280,7 @@ fn upsert_scalar_structure_mutation(
 }
 
 struct StructureMutationContext<'a> {
+    blobs: &'a BlobStore,
     format: StructureFormat,
     mode: NativeWriteBatchMode,
     logical_time_micros: i64,
@@ -7082,6 +7307,12 @@ fn structure_root_after_mutations(
             context.mutations,
         )?
         .root());
+    }
+    if context.mode == NativeWriteBatchMode::PhysicalStructureCompaction {
+        if context.format != StructureFormat::BTreeV2 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        return Ok(compact_structure_tree(pages, context.blobs, root, creating_csn)?.root());
     }
     match context.format {
         StructureFormat::InlineStateV1 => Ok(Some(pages.append(
@@ -7149,6 +7380,30 @@ fn physical_expiry_tree_after_mutations(
     Ok(tree
         .upsert_sorted_batch(pages, creating_csn, physical_entries)?
         .tree)
+}
+
+fn compact_structure_tree(
+    pages: &mut PageStore,
+    blobs: &BlobStore,
+    root: Option<PageId>,
+    creating_csn: Csn,
+) -> Result<BTree, NativeRuntimeError> {
+    let root = root.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let plan = plan_structure_compaction(pages, blobs, root)?;
+    if plan.dropped_tombstones == 0 {
+        return Ok(BTree::from_root(root));
+    }
+    let compacted = BTree::empty()
+        .upsert_sorted_batch(pages, creating_csn, plan.retained_entries)?
+        .tree;
+    let compacted_root = compacted
+        .root()
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let compacted_state = load_structure_state_root(pages, blobs, compacted_root)?;
+    if compacted_state != plan.state {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(compacted)
 }
 
 fn search_tree_after_mutations(
@@ -8458,6 +8713,14 @@ fn load_structure_state(
     let Some(root) = roots.root(SLOT_STRUCTURE) else {
         return Ok(StructureState::default());
     };
+    load_structure_state_root(pages, blobs, root)
+}
+
+fn load_structure_state_root(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<StructureState, NativeRuntimeError> {
     let page = pages.read(root)?;
     if page.kind() == PageKind::StructureNode {
         return Ok(StructureState::decode(page.payload())?);
@@ -9406,6 +9669,21 @@ mod tests {
         Ok(())
     }
 
+    fn is_compactable_structure_tombstone(key: &[u8], value: &[u8]) -> bool {
+        match key.first().copied() {
+            Some(
+                super::STRUCTURE_ENTRY_PREFIX
+                | super::STRUCTURE_HASH_FIELD_PREFIX
+                | super::STRUCTURE_SET_MEMBER_PREFIX
+                | super::STRUCTURE_LIST_CHUNK_PREFIX
+                | super::STRUCTURE_SORTED_SET_MEMBER_PREFIX
+                | super::STRUCTURE_SORTED_SET_ORDER_PREFIX,
+            ) => super::is_structure_tombstone(value),
+            Some(super::STRUCTURE_EXPIRY_PREFIX) => value == [super::STRUCTURE_EXPIRY_TOMBSTONE],
+            _ => false,
+        }
+    }
+
     fn assert_typed_sql_insert_rejections(transaction: &mut super::NativeTransaction<'_>) {
         assert!(matches!(
             transaction.execute_sql(
@@ -10003,6 +10281,113 @@ mod tests {
             pages_appended < u64::try_from(cleanup.expired_keys)?,
             "cleanup appended {pages_appended} pages for {} keys",
             cleanup.expired_keys
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structure_compaction_drops_only_current_tombstones_and_retains_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"expired".to_vec(), b"gone".to_vec(), Some(10))?;
+        seed.set(b"persistent".to_vec(), b"kept".to_vec(), None)?;
+        seed.create_hash(b"profile".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"live".to_vec(), b"yes".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"dead".to_vec(), b"no".to_vec())?;
+        seed.create_set(b"members".to_vec())?;
+        seed.sadd(b"members".to_vec(), b"live".to_vec())?;
+        seed.sadd(b"members".to_vec(), b"dead".to_vec())?;
+        seed.create_list(b"queue".to_vec())?;
+        seed.lpush(b"queue".to_vec(), b"gone".to_vec())?;
+        seed.create_sorted_set(b"rank".to_vec())?;
+        seed.zadd(b"rank".to_vec(), 1.0, b"live".to_vec())?;
+        seed.zadd(b"rank".to_vec(), 2.0, b"dead".to_vec())?;
+        seed.commit()?;
+
+        let mut deletes = database.begin(2, DurabilityClass::Strict)?;
+        assert!(deletes.hdelete(b"profile".to_vec(), b"dead".to_vec())?);
+        assert!(deletes.srem(b"members".to_vec(), b"dead".to_vec())?);
+        assert_eq!(deletes.lpop(b"queue".to_vec())?, Some(b"gone".to_vec()));
+        assert!(deletes.zrem(b"rank".to_vec(), b"dead".to_vec())?);
+        deletes.commit()?;
+        database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+
+        let before_snapshot = database.snapshot(100)?;
+        let before_roots = before_snapshot.metadata.roots().clone();
+        let before_structure_root = before_roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let before_entries =
+            hyphae_native_btree::BTree::from_root(before_structure_root).scan(&database.pages)?;
+        let before_tombstones = before_entries
+            .iter()
+            .filter(|(key, value)| is_compactable_structure_tombstone(key, value))
+            .count();
+        assert_eq!(before_tombstones, 7);
+        let file_bytes_before = fs::metadata(temporary.path().join(PAGE_FILE))?.len();
+
+        let receipt = database.compact_structure(DurabilityClass::Strict)?;
+
+        assert_eq!(receipt.scanned_entries, before_entries.len());
+        assert_eq!(receipt.dropped_tombstones, before_tombstones);
+        assert_eq!(
+            receipt.retained_entries,
+            before_entries.len() - before_tombstones
+        );
+        assert!(receipt.pages_appended > 0);
+        assert!(receipt.commit.is_some());
+        let after_snapshot = database.snapshot(100)?;
+        assert_eq!(after_snapshot.state, before_snapshot.state);
+        let after_roots = after_snapshot.metadata.roots();
+        for slot in super::ROOT_SLOTS {
+            if slot == super::SLOT_STRUCTURE {
+                assert_ne!(after_roots.root(slot), before_roots.root(slot));
+            } else {
+                assert_eq!(after_roots.root(slot), before_roots.root(slot));
+            }
+        }
+        let after_structure_root = after_roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let after_entries =
+            hyphae_native_btree::BTree::from_root(after_structure_root).scan(&database.pages)?;
+        assert_eq!(after_entries.len(), receipt.retained_entries);
+        assert!(
+            after_entries
+                .iter()
+                .all(|(key, value)| !is_compactable_structure_tombstone(key, value))
+        );
+        assert_eq!(
+            hyphae_native_btree::BTree::from_root(before_structure_root).scan(&database.pages)?,
+            before_entries
+        );
+        assert!(fs::metadata(temporary.path().join(PAGE_FILE))?.len() > file_bytes_before);
+
+        let csn_after_first = after_snapshot.visible_csn();
+        let pages_after_first = database.pages.page_count();
+        let no_op = database.compact_structure(DurabilityClass::Strict)?;
+        assert_eq!(no_op.dropped_tombstones, 0);
+        assert_eq!(no_op.pages_appended, 0);
+        assert!(no_op.commit.is_none());
+        assert_eq!(database.pages.page_count(), pages_after_first);
+        assert_eq!(database.snapshot(100)?.visible_csn(), csn_after_first);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.snapshot(100)?.state, before_snapshot.state);
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(100)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(
+            hyphae_native_btree::BTree::from_root(reopened_root)
+                .scan(&reopened.pages)?
+                .iter()
+                .all(|(key, value)| !is_compactable_structure_tombstone(key, value))
         );
         Ok(())
     }
