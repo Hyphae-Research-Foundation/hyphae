@@ -279,6 +279,15 @@ commit before its tag can be published.
   19 external primitives/build dependencies, zero native unsafe findings, and
   every external parser/exclusion residual. Semantic third-party unsafe review
   and the remaining G0 corpus/conformance work stay open.
+- [Native bounded-WAL-replay evidence —
+  2026-08-02](native-wal-replay-2026-08-02.md) binds fixed-size retention
+  anchors, identity-preserving prefix retirement, suffix-only recovery, six
+  interruption boundaries, and fail-closed suffix validation to one source
+  commit.
+- `native-wal-replay-windows.json` and `native-wal-replay-wsl2.json` are
+  matched release observations for a 402-commit prefix and four-commit suffix.
+  They record 98.7775% fewer WAL bytes and faster warm reopen, but neither
+  native-ext4 nor physical power-loss evidence.
 
 ## Hosted release evidence
 

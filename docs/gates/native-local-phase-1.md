@@ -359,6 +359,16 @@ remained in the microsecond domain; cohort execution remained millisecond
 work. Mixed-durability scheduling, native-ext4/power-loss evidence and the
 complete G1/G7 matrices remain open.
 
+The [native bounded-WAL-replay
+evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
+`HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
+stage/pending/stable publication, six-boundary recovery, suffix-only semantic
+replay, and fail-closed anchor/suffix validation. On the matched 402-commit
+prefix plus four-commit suffix corpus it removed 98.7775% of WAL bytes and
+reduced warm reopen p50 by 13.293409 times on Windows and 15.461882 times under
+WSL2/v9fs. Manifest-chain pruning, pin registration, native-ext4/power-loss
+evidence and the complete G1/G7 matrices remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -369,14 +379,13 @@ namespaces and definition blobs; new search roots use a native inverted
 B+tree while legacy inline roots remain compatible. Detached transactions now
 prepare concurrently and rebase disjoint all-engine writes under serialized
 publication. Bounded simultaneous `group` submission now shares page/WAL
-flushes; mixed strict/group/memory policy and concurrency/saturation evidence
-remain pending, along with multi-generation retention, blob/WAL collection,
-secondary-index range/streaming
-execution, zero-copy relational operator cursors, general relational
-expressions beyond the admitted residual slice, constraints/planning,
-remaining structure families, positional
-postings, segments, buffered/filtered ANN, and hybrid fusion required by
-G1–G4.
+flushes, and current-root retention bounds WAL verification/replay to the
+retained suffix. Mixed strict/group/memory policy and concurrency/saturation
+evidence remain pending, along with multi-generation retention, manifest/blob
+collection, secondary-index range/streaming execution, zero-copy relational
+operator cursors, general relational expressions beyond the admitted residual
+slice, constraints/planning, remaining structure families, positional
+postings, segments, buffered/filtered ANN, and hybrid fusion required by G1–G4.
 Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a

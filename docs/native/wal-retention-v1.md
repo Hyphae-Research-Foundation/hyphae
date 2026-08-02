@@ -1,7 +1,8 @@
 # Native WAL retention and bounded replay v1
 
-Status: normative target contract; implementation and exit evidence are
-pending
+Status: normative contract; current-root anchors, identity-preserving prefix
+retirement, bounded suffix replay, interruption recovery, fail-closed
+validation, and local Windows/WSL2 observations are implemented
 
 This protocol bounds native restart work without renumbering the authoritative
 WAL or weakening its digest chain. It removes only a prefix made obsolete by a
@@ -134,7 +135,7 @@ Under exclusive writer and maintenance admission:
 4. rename the stage to its `.pending` name and synchronize the data directory
    where supported;
 5. poison the current WAL writer against further append;
-6. reset `wal.hylog` to zero bytes and synchronize the file;
+6. reset `wal.hywal` to zero bytes and synchronize the file;
 7. reopen the WAL writer at absolute sequence
    `retired_through_sequence + 1` with the retired block digest as its prior
    digest;
