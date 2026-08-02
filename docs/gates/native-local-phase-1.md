@@ -257,9 +257,18 @@ non-unique secondary equality as a canonical left input. It proves
 output-level early stop across private, retained, physical and reopened
 execution, plus exact planning and typed rejection paths. Its clean release
 observation measures 100,000 `LIMIT 10` calls through a 128-row secondary
-cohort. Secondary ranges, composite/right-secondary access, general join
-ordering and algorithms, spill, the complete G2 correctness suites, and the
-G7 matrix remain open.
+cohort. At that source commit, secondary ranges, composite/right-secondary
+access, general join ordering and algorithms, spill, the complete G2
+correctness suites, and the G7 matrix remained open.
+
+The [native right secondary-index inner-join
+evidence](evidence/native-right-secondary-inner-join-2026-08-01.md) makes the
+right access path explicit and adds exact lookup through a single-column
+`UNIQUE` secondary index. Private index rewrites, historical/current/reopened
+equivalence, typed rejection of a non-unique right index, and 100,000 clean
+release calls are proven. Composite equality/keys, non-unique or ranged right
+access, general join ordering and algorithms, spill, the complete G2
+correctness suites, and the G7 matrix remain open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
