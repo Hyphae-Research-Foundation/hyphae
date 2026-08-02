@@ -508,6 +508,16 @@ physical power loss: the kernel page cache survives, and checkpoint,
 retention, maintenance, migration, resource-exhaustion, and storage-fault
 lanes remain open.
 
+The [native checkpoint process crash
+evidence](evidence/native-checkpoint-process-crash-linux-2026-08-02.md)
+extends that live-writer `SIGKILL` harness to all four checkpoint boundaries.
+Recovery removes the staged temporary manifest, preserves a published
+manifest as a non-authoritative suffix, and recognizes the complete
+checkpoint record after either WAL boundary. All four reopen the same
+complete all-engine CSN 1. Group commit, retention, maintenance, migration,
+resource-exhaustion, filesystem-reordering, and physical power-loss lanes
+remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
