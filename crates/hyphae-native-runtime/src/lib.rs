@@ -3190,16 +3190,16 @@ impl NativeDatabase {
         let execution_started = Instant::now();
 
         let root_group = self.coordinator.begin_group_write()?;
-        let admission = admit_group_commits(
-            &root_group,
-            &self.pages,
-            &self.blobs,
-            &self.conflicts,
-            self.next_transaction_id,
-            self.structure_format,
-            self.search_format,
-            batches,
-        )?;
+        let admission = GroupCommitAdmissionContext {
+            root_group: &root_group,
+            pages: &self.pages,
+            blobs: &self.blobs,
+            conflicts: &self.conflicts,
+            next_transaction_id: self.next_transaction_id,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+        }
+        .admit(batches)?;
         let GroupCommitAdmission {
             accepted,
             mut outcomes,
@@ -5860,86 +5860,100 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     keys
 }
 
-#[allow(clippy::too_many_arguments)]
-fn admit_group_commits(
-    root_group: &RootGroupTransaction<'_>,
-    pages: &PageStore,
-    blobs: &BlobStore,
-    conflicts: &ConflictTable,
+struct GroupCommitAdmissionContext<'a, 'coordinator> {
+    root_group: &'a RootGroupTransaction<'coordinator>,
+    pages: &'a PageStore,
+    blobs: &'a BlobStore,
+    conflicts: &'a ConflictTable,
     next_transaction_id: u128,
     structure_format: StructureFormat,
     search_format: SearchFormat,
-    batches: Vec<NativeWriteBatch>,
-) -> Result<GroupCommitAdmission, NativeRuntimeError> {
-    let initial_state = load_state(pages, blobs, root_group.base_roots())?;
-    let mut admission_state = initial_state.clone();
-    let mut catalog_version = root_group.base_roots().catalog_version();
-    let mut conflicts_after_commit = conflicts.clone();
-    let mut next_transaction_id = next_transaction_id;
-    let mut accepted = Vec::with_capacity(batches.len());
-    let mut outcomes = std::iter::repeat_with(|| None)
-        .take(batches.len())
-        .collect::<Vec<_>>();
+}
 
-    for (request_index, batch) in batches.into_iter().enumerate() {
-        let rejection = group_admission_rejection(
+impl GroupCommitAdmissionContext<'_, '_> {
+    fn admit(
+        self,
+        batches: Vec<NativeWriteBatch>,
+    ) -> Result<GroupCommitAdmission, NativeRuntimeError> {
+        let Self {
             root_group,
-            &conflicts_after_commit,
+            pages,
+            blobs,
+            conflicts,
+            next_transaction_id,
             structure_format,
             search_format,
-            &batch,
-        );
-        let write_keys = match rejection {
-            Ok(write_keys) => write_keys,
-            Err(error) => {
+        } = self;
+        let initial_state = load_state(pages, blobs, root_group.base_roots())?;
+        let mut admission_state = initial_state.clone();
+        let mut catalog_version = root_group.base_roots().catalog_version();
+        let mut conflicts_after_commit = conflicts.clone();
+        let mut next_transaction_id = next_transaction_id;
+        let mut accepted = Vec::with_capacity(batches.len());
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(batches.len())
+            .collect::<Vec<_>>();
+
+        for (request_index, batch) in batches.into_iter().enumerate() {
+            let rejection = group_admission_rejection(
+                root_group,
+                &conflicts_after_commit,
+                structure_format,
+                search_format,
+                &batch,
+            );
+            let write_keys = match rejection {
+                Ok(write_keys) => write_keys,
+                Err(error) => {
+                    outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+                    continue;
+                }
+            };
+
+            let mut candidate_state = admission_state.clone();
+            if let Err(error) = apply_mutations_to_state(&mut candidate_state, &batch.mutations) {
                 outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
                 continue;
             }
-        };
-
-        let mut candidate_state = admission_state.clone();
-        if let Err(error) = apply_mutations_to_state(&mut candidate_state, &batch.mutations) {
-            outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
-            continue;
-        }
-        let candidate_catalog_version = if batch.dirty[0] {
-            if let Some(version) = catalog_version.checked_next() {
-                version
+            let candidate_catalog_version = if batch.dirty[0] {
+                if let Some(version) = catalog_version.checked_next() {
+                    version
+                } else {
+                    outcomes[request_index] = Some(GroupCommitOutcome::Rejected(
+                        CatalogError::VersionExhausted.into(),
+                    ));
+                    continue;
+                }
             } else {
-                outcomes[request_index] = Some(GroupCommitOutcome::Rejected(
-                    CatalogError::VersionExhausted.into(),
-                ));
-                continue;
-            }
-        } else {
-            catalog_version
-        };
-        let commit_csn = root_group.commit_csn_at_offset(accepted.len())?;
-        let transaction_id = TransactionId::new(next_transaction_id)
-            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
-        next_transaction_id = next_transaction_id
-            .checked_add(1)
-            .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
-        conflicts_after_commit.publish_committed(commit_csn, write_keys.clone());
-        admission_state = candidate_state;
-        catalog_version = candidate_catalog_version;
-        accepted.push(AdmittedGroupCommit {
-            request_index,
-            transaction_id,
-            conflict_read_csn: batch.snapshot.visible_csn,
-            commit_csn,
-            catalog_version,
-            batch,
-        });
-    }
+                catalog_version
+            };
+            let commit_csn = root_group.commit_csn_at_offset(accepted.len())?;
+            let transaction_id = TransactionId::new(next_transaction_id)
+                .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+            next_transaction_id = next_transaction_id
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
+            conflicts_after_commit.publish_committed(commit_csn, write_keys.clone());
+            admission_state = candidate_state;
+            catalog_version = candidate_catalog_version;
+            accepted.push(AdmittedGroupCommit {
+                request_index,
+                transaction_id,
+                conflict_read_csn: batch.snapshot.visible_csn,
+                commit_csn,
+                catalog_version,
+                batch,
+            });
+        }
 
-    Ok(GroupCommitAdmission {
-        accepted,
-        outcomes,
-        conflicts_after_commit,
-        next_transaction_id,
-        initial_state,
-    })
+        Ok(GroupCommitAdmission {
+            accepted,
+            outcomes,
+            conflicts_after_commit,
+            next_transaction_id,
+            initial_state,
+        })
+    }
 }
 
 fn group_admission_rejection(
