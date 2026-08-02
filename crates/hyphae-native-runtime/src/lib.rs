@@ -17308,13 +17308,20 @@ mod tests {
         let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
             database,
             GroupCommitConfig::new(4, Duration::from_millis(10), 8)?,
-            ActiveExpiryConfig::new(Duration::from_millis(10), 1, DurabilityClass::Memory, 1)?,
+            ActiveExpiryConfig::new(Duration::from_secs(1), 1, DurabilityClass::Memory, 1)?,
             Arc::new(TestSchedulerClock::new(10)),
         )?;
         let client = scheduler.client();
         let worker_guard = client.block_worker_for_test()?;
+        assert_eq!(
+            scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing before shutdown")?
+                .attempted_sweeps,
+            0
+        );
         let foreground = client.enqueue_for_test(foreground)?;
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(1_100));
         std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
             let shutdown = scope.spawn(move || scheduler.shutdown());
             let deadline = Instant::now() + Duration::from_secs(2);

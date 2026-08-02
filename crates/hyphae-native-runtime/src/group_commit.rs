@@ -1241,8 +1241,8 @@ fn execute_active_expiry(
             true
         }
         Err(failure) => {
-            atomic_saturating_add(&active_expiry.metrics.failures, 1);
             let _ = active_expiry.metrics.terminal_failure.set(failure);
+            atomic_saturating_add(&active_expiry.metrics.failures, 1);
             false
         }
     };
