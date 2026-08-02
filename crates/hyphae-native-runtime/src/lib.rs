@@ -17,7 +17,7 @@ mod wal_codec;
 pub use group_commit::{
     GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
     MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitClient,
-    NativeCommitScheduler,
+    NativeCommitScheduler, ScheduledCommitReceipt,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -33,6 +33,7 @@ use std::{
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use hyphae_native_blobs::{BlobError, BlobStore, StagedBlob};
@@ -665,6 +666,12 @@ pub struct GroupCommitReport {
     pub page_synchronizations: usize,
     /// Physical WAL synchronizations performed for this cohort.
     pub wal_synchronizations: usize,
+    /// Complete admission, execution, durability, and publication time.
+    pub execution_time: Duration,
+    /// Time spent in the cohort's one page-file synchronization.
+    pub page_synchronization_time: Duration,
+    /// Time spent in the cohort's one WAL synchronization.
+    pub wal_synchronization_time: Duration,
 }
 
 /// Result of one bounded durable scalar-expiry cleanup.
@@ -3180,6 +3187,7 @@ impl NativeDatabase {
                 requested: batches.len(),
             });
         }
+        let execution_started = Instant::now();
 
         let root_group = self.coordinator.begin_group_write()?;
         let admission = admit_group_commits(
@@ -3206,10 +3214,13 @@ impl NativeDatabase {
                 accepted_commits: 0,
                 page_synchronizations: 0,
                 wal_synchronizations: 0,
+                execution_time: execution_started.elapsed(),
+                page_synchronization_time: Duration::ZERO,
+                wal_synchronization_time: Duration::ZERO,
             });
         }
 
-        let committed = GroupCommitStorage {
+        let storage_receipt = GroupCommitStorage {
             pages: &mut self.pages,
             blobs: &mut self.blobs,
             wal: &mut self.wal,
@@ -3221,7 +3232,7 @@ impl NativeDatabase {
         .commit(accepted, initial_state, interruption)?;
         self.conflicts = conflicts_after_commit;
         self.next_transaction_id = next_transaction_id;
-        for (request_index, receipt) in committed {
+        for (request_index, receipt) in storage_receipt.committed {
             outcomes[request_index] = Some(GroupCommitOutcome::Committed(receipt));
         }
         interrupt_group(interruption, GroupCommitBoundary::RootPublished)?;
@@ -3230,6 +3241,9 @@ impl NativeDatabase {
             accepted_commits,
             page_synchronizations: 1,
             wal_synchronizations: 1,
+            execution_time: execution_started.elapsed(),
+            page_synchronization_time: storage_receipt.page_synchronization_time,
+            wal_synchronization_time: storage_receipt.wal_synchronization_time,
         })
     }
 
@@ -3612,13 +3626,19 @@ struct GroupCommitStorage<'database, 'coordinator> {
     search_format: SearchFormat,
 }
 
+struct GroupCommitStorageReceipt {
+    committed: Vec<(usize, CommitReceipt)>,
+    page_synchronization_time: Duration,
+    wal_synchronization_time: Duration,
+}
+
 impl GroupCommitStorage<'_, '_> {
     fn commit(
         mut self,
         accepted: Vec<AdmittedGroupCommit>,
         mut physical_state: MaterializedState,
         interruption: Option<GroupCommitBoundary>,
-    ) -> Result<Vec<(usize, CommitReceipt)>, NativeRuntimeError> {
+    ) -> Result<GroupCommitStorageReceipt, NativeRuntimeError> {
         let cohort_size = accepted.len();
         let mut committed = Vec::with_capacity(cohort_size);
         for (cohort_position, admitted) in accepted.into_iter().enumerate() {
@@ -3633,12 +3653,20 @@ impl GroupCommitStorage<'_, '_> {
             }
         }
         interrupt_group(interruption, GroupCommitBoundary::CohortAppended)?;
+        let page_sync_started = Instant::now();
         self.pages.sync_data()?;
+        let page_synchronization_time = page_sync_started.elapsed();
         interrupt_group(interruption, GroupCommitBoundary::PageSynchronized)?;
+        let wal_sync_started = Instant::now();
         self.wal.sync_data()?;
+        let wal_synchronization_time = wal_sync_started.elapsed();
         interrupt_group(interruption, GroupCommitBoundary::WalSynchronized)?;
         drop(self.root_group.publish()?);
-        Ok(committed)
+        Ok(GroupCommitStorageReceipt {
+            committed,
+            page_synchronization_time,
+            wal_synchronization_time,
+        })
     }
 
     fn stage_one(
@@ -15151,6 +15179,26 @@ mod tests {
         })?;
         assert_eq!(first_receipt.durability_cohort_size, 2);
         assert_eq!(second_receipt.durability_cohort_size, 2);
+        assert_eq!(
+            first_receipt.cohort_execution,
+            second_receipt.cohort_execution
+        );
+        assert_eq!(
+            first_receipt.page_synchronization,
+            second_receipt.page_synchronization
+        );
+        assert_eq!(
+            first_receipt.wal_synchronization,
+            second_receipt.wal_synchronization
+        );
+        for receipt in [first_receipt, second_receipt] {
+            assert!(
+                receipt.cohort_execution
+                    >= receipt.page_synchronization + receipt.wal_synchronization
+            );
+            assert!(receipt.end_to_end >= receipt.queue_wait);
+            assert!(receipt.end_to_end >= receipt.cohort_execution);
+        }
         let mut positions = [
             first_receipt.durability_cohort_position,
             second_receipt.durability_cohort_position,

@@ -3,6 +3,7 @@
 //! Bounded multi-producer scheduler for native group durability.
 
 use std::{
+    ops::Deref,
     sync::{
         Arc, Mutex, RwLock,
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
@@ -142,6 +143,31 @@ pub enum GroupCommitSubmitError {
     },
 }
 
+/// Per-request timing and durability receipt produced by the scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledCommitReceipt {
+    /// Independent native transaction receipt.
+    pub commit: CommitReceipt,
+    /// Time between queue admission and cohort execution.
+    pub queue_wait: Duration,
+    /// Complete database-side cohort execution time.
+    pub cohort_execution: Duration,
+    /// Time spent in the cohort's shared page-file synchronization.
+    pub page_synchronization: Duration,
+    /// Time spent in the cohort's shared WAL synchronization.
+    pub wal_synchronization: Duration,
+    /// Caller-observed submission-to-response time.
+    pub end_to_end: Duration,
+}
+
+impl Deref for ScheduledCommitReceipt {
+    type Target = CommitReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.commit
+    }
+}
+
 impl GroupCommitSubmitError {
     fn runtime(source: NativeRuntimeError) -> Self {
         Self::Runtime {
@@ -160,7 +186,8 @@ impl GroupCommitSubmitError {
 
 struct CommitRequest {
     batch: NativeWriteBatch,
-    response: SyncSender<Result<CommitReceipt, GroupCommitSubmitError>>,
+    submitted_at: Instant,
+    response: SyncSender<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
 }
 
 enum SchedulerCommand {
@@ -215,7 +242,11 @@ impl NativeCommitClient {
     ///
     /// Returns unavailable for a stopped worker or the request's typed native
     /// admission/persistence failure.
-    pub fn submit(&self, batch: NativeWriteBatch) -> Result<CommitReceipt, GroupCommitSubmitError> {
+    pub fn submit(
+        &self,
+        batch: NativeWriteBatch,
+    ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
+        let submitted_at = Instant::now();
         let (response, receiver) = mpsc::sync_channel(1);
         {
             let gate = self
@@ -228,13 +259,18 @@ impl NativeCommitClient {
             gate.sender
                 .send(SchedulerCommand::Commit(Box::new(CommitRequest {
                     batch,
+                    submitted_at,
                     response,
                 })))
                 .map_err(|_| GroupCommitSubmitError::Unavailable)?;
         }
-        receiver
+        let mut result = receiver
             .recv()
-            .map_err(|_| GroupCommitSubmitError::Unavailable)?
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        if let Ok(receipt) = &mut result {
+            receipt.end_to_end = submitted_at.elapsed();
+        }
+        result
     }
 
     fn accepting(&self) -> Result<bool, GroupCommitSubmitError> {
@@ -305,7 +341,10 @@ impl NativeCommitScheduler {
     /// # Errors
     ///
     /// Returns the same errors as [`NativeCommitClient::submit`].
-    pub fn submit(&self, batch: NativeWriteBatch) -> Result<CommitReceipt, GroupCommitSubmitError> {
+    pub fn submit(
+        &self,
+        batch: NativeWriteBatch,
+    ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
         self.client.submit(batch)
     }
 
@@ -390,24 +429,32 @@ fn execute_requests(
     database: &RwLock<Option<NativeDatabase>>,
     requests: Vec<CommitRequest>,
 ) -> bool {
-    let (batches, responses): (Vec<_>, Vec<_>) = requests
+    let execution_started = Instant::now();
+    let (batches, waiters): (Vec<_>, Vec<_>) = requests
         .into_iter()
-        .map(|request| (request.batch, request.response))
+        .map(|request| (request.batch, (request.submitted_at, request.response)))
         .unzip();
     let Ok(mut database) = database.write() else {
-        deliver_all_unavailable(responses);
+        deliver_all_unavailable(waiters);
         return false;
     };
     let Some(database) = database.as_mut() else {
-        deliver_all_unavailable(responses);
+        deliver_all_unavailable(waiters);
         return false;
     };
     let report = database.commit_group(batches);
     match report {
-        Ok(report) if report.outcomes.len() == responses.len() => {
-            for (response, outcome) in responses.into_iter().zip(report.outcomes) {
+        Ok(report) if report.outcomes.len() == waiters.len() => {
+            for ((submitted_at, response), outcome) in waiters.into_iter().zip(report.outcomes) {
                 let result = match outcome {
-                    GroupCommitOutcome::Committed(receipt) => Ok(receipt),
+                    GroupCommitOutcome::Committed(commit) => Ok(ScheduledCommitReceipt {
+                        commit,
+                        queue_wait: execution_started.saturating_duration_since(submitted_at),
+                        cohort_execution: report.execution_time,
+                        page_synchronization: report.page_synchronization_time,
+                        wal_synchronization: report.wal_synchronization_time,
+                        end_to_end: Duration::ZERO,
+                    }),
                     GroupCommitOutcome::Rejected(source) => {
                         Err(GroupCommitSubmitError::runtime(source))
                     }
@@ -417,12 +464,12 @@ fn execute_requests(
             true
         }
         Ok(_) => {
-            deliver_all_unavailable(responses);
+            deliver_all_unavailable(waiters);
             false
         }
         Err(source) => {
             let failure = GroupCommitSubmitError::runtime(source);
-            for response in responses {
+            for (_submitted_at, response) in waiters {
                 deliver(&response, Err(failure.clone()));
             }
             false
@@ -431,16 +478,19 @@ fn execute_requests(
 }
 
 fn deliver_all_unavailable(
-    responses: Vec<SyncSender<Result<CommitReceipt, GroupCommitSubmitError>>>,
+    waiters: Vec<(
+        Instant,
+        SyncSender<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
+    )>,
 ) {
-    for response in responses {
+    for (_submitted_at, response) in waiters {
         deliver(&response, Err(GroupCommitSubmitError::Unavailable));
     }
 }
 
 fn deliver(
-    response: &SyncSender<Result<CommitReceipt, GroupCommitSubmitError>>,
-    result: Result<CommitReceipt, GroupCommitSubmitError>,
+    response: &SyncSender<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
+    result: Result<ScheduledCommitReceipt, GroupCommitSubmitError>,
 ) {
     // A caller may abandon its wait after the transaction already has a durable
     // outcome; that cannot roll the database decision back.
