@@ -13,7 +13,7 @@ use std::{
     },
 };
 
-use hyphae_native_types::{Csn, PageId};
+use hyphae_native_types::{Csn, PageGeneration, PageId};
 use thiserror::Error;
 
 /// Fixed native page size.
@@ -362,6 +362,7 @@ pub struct OpenedPageStore {
 #[derive(Debug)]
 pub struct PageStore {
     file: File,
+    generation: PageGeneration,
     next_page_id: u64,
     poisoned: bool,
 }
@@ -373,6 +374,18 @@ impl PageStore {
     ///
     /// Returns an error if the path exists or cannot be created.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, PageStoreError> {
+        Self::create_generation(path, PageGeneration::FIRST)
+    }
+
+    /// Creates one empty page-file generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path exists or cannot be created.
+    pub fn create_generation(
+        path: impl AsRef<Path>,
+        generation: PageGeneration,
+    ) -> Result<Self, PageStoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -380,6 +393,7 @@ impl PageStore {
             .open(path)?;
         Ok(Self {
             file,
+            generation,
             next_page_id: 1,
             poisoned: false,
         })
@@ -391,6 +405,18 @@ impl PageStore {
     ///
     /// Returns an error when its length is not page aligned.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PageStoreError> {
+        Self::open_generation(path, PageGeneration::FIRST)
+    }
+
+    /// Opens one existing canonical page-file generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when its length is not page aligned.
+    pub fn open_generation(
+        path: impl AsRef<Path>,
+        generation: PageGeneration,
+    ) -> Result<Self, PageStoreError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let length = file.metadata()?.len();
         if length % PAGE_SIZE_U64 != 0 {
@@ -402,6 +428,7 @@ impl PageStore {
             .ok_or(PageStoreError::PageIdExhausted)?;
         Ok(Self {
             file,
+            generation,
             next_page_id,
             poisoned: false,
         })
@@ -416,6 +443,18 @@ impl PageStore {
     ///
     /// Returns an error for filesystem or address-space failures.
     pub fn open_repair_tail(path: impl AsRef<Path>) -> Result<OpenedPageStore, PageStoreError> {
+        Self::open_repair_tail_generation(path, PageGeneration::FIRST)
+    }
+
+    /// Opens one page-file generation and removes an incomplete final page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for filesystem or address-space failures.
+    pub fn open_repair_tail_generation(
+        path: impl AsRef<Path>,
+        generation: PageGeneration,
+    ) -> Result<OpenedPageStore, PageStoreError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let length = file.metadata()?.len();
         let truncated_tail_bytes = length % PAGE_SIZE_U64;
@@ -431,6 +470,7 @@ impl PageStore {
         Ok(OpenedPageStore {
             store: Self {
                 file,
+                generation,
                 next_page_id,
                 poisoned: false,
             },
@@ -441,6 +481,11 @@ impl PageStore {
     /// Returns the number of complete physical pages.
     pub const fn page_count(&self) -> u64 {
         self.next_page_id - 1
+    }
+
+    /// Returns this immutable page-file generation.
+    pub const fn generation(&self) -> PageGeneration {
+        self.generation
     }
 
     /// Appends one unpublished or committed copy-on-write page.
@@ -585,7 +630,7 @@ impl PageFrame {
 #[derive(Debug)]
 struct PoolPartition {
     capacity: usize,
-    frames: HashMap<PageId, Arc<PageFrame>>,
+    frames: HashMap<(PageGeneration, PageId), Arc<PageFrame>>,
 }
 
 /// Bounded partitioned cache for verified immutable pages.
@@ -635,13 +680,14 @@ impl BufferPool {
         store: &PageStore,
         page_id: PageId,
     ) -> Result<Arc<PageFrame>, BufferPoolError> {
-        let partition_index = self.partition_index(page_id);
+        let key = (store.generation(), page_id);
+        let partition_index = self.partition_index(key);
         let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
         {
             let partition = self.partitions[partition_index]
                 .lock()
                 .map_err(|_| BufferPoolError::Poisoned)?;
-            if let Some(frame) = partition.frames.get(&page_id) {
+            if let Some(frame) = partition.frames.get(&key) {
                 frame.last_used.store(stamp, Ordering::Relaxed);
                 return Ok(Arc::clone(frame));
             }
@@ -651,7 +697,7 @@ impl BufferPool {
         let mut partition = self.partitions[partition_index]
             .lock()
             .map_err(|_| BufferPoolError::Poisoned)?;
-        if let Some(frame) = partition.frames.get(&page_id) {
+        if let Some(frame) = partition.frames.get(&key) {
             frame.last_used.store(stamp, Ordering::Relaxed);
             return Ok(Arc::clone(frame));
         }
@@ -669,13 +715,14 @@ impl BufferPool {
             page,
             last_used: AtomicU64::new(stamp),
         });
-        partition.frames.insert(page_id, Arc::clone(&frame));
+        partition.frames.insert(key, Arc::clone(&frame));
         Ok(frame)
     }
 
-    fn partition_index(&self, page_id: PageId) -> usize {
+    fn partition_index(&self, key: (PageGeneration, PageId)) -> usize {
         let count = self.partitions.len();
-        usize::try_from(page_id.get() % u64::try_from(count).unwrap_or(u64::MAX)).unwrap_or(0)
+        let mixed = key.0.get().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ key.1.get();
+        usize::try_from(mixed % u64::try_from(count).unwrap_or(u64::MAX)).unwrap_or(0)
     }
 }
 
@@ -685,10 +732,13 @@ mod tests {
         fs,
         io::Write,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
-    use hyphae_native_types::{Csn, PageId};
+    use hyphae_native_types::{Csn, PageGeneration, PageId};
 
     use super::{
         BufferPool, BufferPoolError, PAGE_SIZE, Page, PageError, PageKind, PageStore,
@@ -840,6 +890,31 @@ mod tests {
         ));
         drop(pinned);
         assert_eq!(pool.get_or_load(&store, second)?.page().payload(), b"two");
+        Ok(())
+    }
+
+    #[test]
+    fn buffer_pool_never_aliases_equal_page_ids_across_generations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let mut first = PageStore::create_generation(
+            temporary.path().join("pages-1.hydb"),
+            PageGeneration::new(1)?,
+        )?;
+        let mut second = PageStore::create_generation(
+            temporary.path().join("pages-2.hydb"),
+            PageGeneration::new(2)?,
+        )?;
+        let first_id = first.append(PageKind::HeapLeaf, None, None, b"old".to_vec())?;
+        let second_id = second.append(PageKind::HeapLeaf, None, None, b"new".to_vec())?;
+        assert_eq!(first_id, second_id);
+
+        let pool = BufferPool::new(2, 1)?;
+        let old = pool.get_or_load(&first, first_id)?;
+        let new = pool.get_or_load(&second, second_id)?;
+        assert_eq!(old.page().payload(), b"old");
+        assert_eq!(new.page().payload(), b"new");
+        assert!(!Arc::ptr_eq(&old, &new));
         Ok(())
     }
 }

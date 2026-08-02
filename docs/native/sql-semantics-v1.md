@@ -241,8 +241,10 @@ behavior. Updates publish a new copy-on-write root; deletes publish a canonical
 tombstone. Retained snapshots continue to resolve their historical roots. New
 directories retain an explicit per-key physical version chain under the
 current root and close each superseded copy's `end_csn`; the earlier inline-row
-directory format remains supported. Retention and vacuum remain pending. This
-slice does not close relational gate G2.
+directory format remains supported. Current-root page-generation vacuum can
+retire closed row history after validating identical current results;
+restartable historical retention remains pending. This slice does not close
+relational gate G2.
 
 `NativeSnapshot` remains the complete materialized all-engine snapshot used
 for retained historical reads and cross-engine semantics. The separate

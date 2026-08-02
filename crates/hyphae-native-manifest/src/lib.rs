@@ -10,17 +10,24 @@ use std::{
 };
 
 use hyphae_native_mvcc::{MvccError, RootSet, RootSlot, WalAnchor};
-use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageId};
+use hyphae_native_types::{
+    CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageGeneration, PageId,
+};
 use thiserror::Error;
 
 /// Fixed root-manifest header size.
 pub const MANIFEST_HEADER_SIZE: usize = 176;
+/// Root-manifest header size when page-retention state is present.
+pub const MANIFEST_V2_HEADER_SIZE: usize = 192;
 /// Maximum root slots in one manifest.
 pub const MAX_MANIFEST_ROOTS: usize = 4_096;
 
-const MAGIC: &[u8; 8] = b"HYROOT01";
-const FORMAT_VERSION: u16 = 1;
-const HEADER_SIZE_U16: u16 = 176;
+const MAGIC_V1: &[u8; 8] = b"HYROOT01";
+const MAGIC_V2: &[u8; 8] = b"HYROOT02";
+const FORMAT_VERSION_V1: u16 = 1;
+const FORMAT_VERSION_V2: u16 = 2;
+const HEADER_SIZE_V1_U16: u16 = 176;
+const HEADER_SIZE_V2_U16: u16 = 192;
 const ROOT_ENTRY_SIZE: usize = 12;
 const CHECKSUM_START: usize = 64;
 const CHECKSUM_END: usize = 68;
@@ -55,6 +62,9 @@ pub enum ManifestError {
     /// Stable identity is zero or an engine value is unknown.
     #[error("native root manifest contains an invalid identity")]
     InvalidIdentity,
+    /// Page generation and retention floor are not a valid storage state.
+    #[error("native root manifest contains an invalid page retention state")]
+    InvalidStorageState,
     /// Root slots are duplicated or not in canonical order.
     #[error("native root manifest slots are not strictly ordered")]
     NoncanonicalRoots,
@@ -77,6 +87,8 @@ pub struct RootManifest {
     catalog_version: CatalogVersion,
     wal_anchor: WalAnchor,
     blob_generation: u64,
+    page_generation: PageGeneration,
+    retention_floor_csn: Csn,
     roots: BTreeMap<RootSlot, PageId>,
     previous_digest: [u8; 32],
     digest: [u8; 32],
@@ -110,6 +122,10 @@ impl RootManifest {
             catalog_version: root_set.catalog_version(),
             wal_anchor,
             blob_generation: root_set.blob_generation(),
+            page_generation: root_set.page_generation(),
+            retention_floor_csn: root_set
+                .retention_floor_csn()
+                .ok_or(ManifestError::UncommittedRootSet)?,
             roots,
             previous_digest,
             digest: [0; 32],
@@ -138,6 +154,16 @@ impl RootManifest {
         self.wal_anchor
     }
 
+    /// Returns the immutable page-file generation.
+    pub const fn page_generation(&self) -> PageGeneration {
+        self.page_generation
+    }
+
+    /// Returns the earliest CSN whose physical roots remain retained.
+    pub const fn retention_floor_csn(&self) -> Csn {
+        self.retention_floor_csn
+    }
+
     /// Returns the prior manifest digest, or zero for generation one.
     pub const fn previous_digest(&self) -> [u8; 32] {
         self.previous_digest
@@ -159,12 +185,14 @@ impl RootManifest {
     ///
     /// Returns an error if the WAL anchor is invalid.
     pub fn to_root_set(&self) -> Result<RootSet, ManifestError> {
-        Ok(RootSet::committed(
+        Ok(RootSet::committed_with_storage(
             self.visible_csn,
             self.catalog_version,
             self.wal_anchor,
             self.roots.clone(),
             self.blob_generation,
+            self.page_generation,
+            self.retention_floor_csn,
         )?)
     }
 
@@ -191,10 +219,29 @@ impl RootManifest {
         if encoded.len() < MANIFEST_HEADER_SIZE {
             return Err(ManifestError::InvalidLength);
         }
-        if &encoded[0..8] != MAGIC
-            || read_u16(&encoded[8..10]) != FORMAT_VERSION
-            || read_u16(&encoded[10..12]) != HEADER_SIZE_U16
-            || encoded[12..16].iter().any(|byte| *byte != 0)
+        let (header_size, page_generation, retention_floor_csn) = match (
+            &encoded[0..8],
+            read_u16(&encoded[8..10]),
+            read_u16(&encoded[10..12]),
+        ) {
+            (magic, FORMAT_VERSION_V1, HEADER_SIZE_V1_U16) if magic == MAGIC_V1 => {
+                (MANIFEST_HEADER_SIZE, PageGeneration::FIRST, Csn::FIRST)
+            }
+            (magic, FORMAT_VERSION_V2, HEADER_SIZE_V2_U16) if magic == MAGIC_V2 => {
+                if encoded.len() < MANIFEST_V2_HEADER_SIZE {
+                    return Err(ManifestError::InvalidLength);
+                }
+                (
+                    MANIFEST_V2_HEADER_SIZE,
+                    PageGeneration::new(read_u64(&encoded[176..184]))
+                        .map_err(|_| ManifestError::InvalidIdentity)?,
+                    Csn::new(read_u64(&encoded[184..192]))
+                        .map_err(|_| ManifestError::InvalidIdentity)?,
+                )
+            }
+            _ => return Err(ManifestError::InvalidPreamble),
+        };
+        if encoded[12..16].iter().any(|byte| *byte != 0)
             || encoded[68..80].iter().any(|byte| *byte != 0)
         {
             return Err(ManifestError::InvalidPreamble);
@@ -206,7 +253,7 @@ impl RootManifest {
         if root_count == 0
             || root_count > MAX_MANIFEST_ROOTS
             || payload_length != root_count * ROOT_ENTRY_SIZE
-            || encoded.len() != MANIFEST_HEADER_SIZE + payload_length
+            || encoded.len() != header_size + payload_length
         {
             return Err(ManifestError::InvalidLength);
         }
@@ -222,6 +269,7 @@ impl RootManifest {
             .map_err(|_| ManifestError::InvalidIdentity)?;
         let visible_csn =
             Csn::new(read_u64(&encoded[24..32])).map_err(|_| ManifestError::InvalidIdentity)?;
+        validate_storage_state(page_generation, retention_floor_csn, visible_csn)?;
         let catalog_version = CatalogVersion::new(read_u64(&encoded[32..40]))
             .map_err(|_| ManifestError::InvalidIdentity)?;
         let wal_lsn =
@@ -232,13 +280,15 @@ impl RootManifest {
         let wal_anchor = WalAnchor::new(wal_lsn, wal_digest)?;
         let mut previous_digest = [0_u8; 32];
         previous_digest.copy_from_slice(&encoded[112..144]);
-        let roots = decode_roots(&encoded[MANIFEST_HEADER_SIZE..], root_count)?;
+        let roots = decode_roots(&encoded[header_size..], root_count)?;
         Ok(Self {
             generation,
             visible_csn,
             catalog_version,
             wal_anchor,
             blob_generation,
+            page_generation,
+            retention_floor_csn,
             roots,
             previous_digest,
             digest,
@@ -254,13 +304,39 @@ impl RootManifest {
             .len()
             .checked_mul(ROOT_ENTRY_SIZE)
             .ok_or(ManifestError::InvalidLength)?;
-        let total_length = MANIFEST_HEADER_SIZE
+        validate_storage_state(
+            self.page_generation,
+            self.retention_floor_csn,
+            self.visible_csn,
+        )?;
+        let is_v1 =
+            self.page_generation == PageGeneration::FIRST && self.retention_floor_csn == Csn::FIRST;
+        let header_size = if is_v1 {
+            MANIFEST_HEADER_SIZE
+        } else {
+            MANIFEST_V2_HEADER_SIZE
+        };
+        let total_length = header_size
             .checked_add(payload_length)
             .ok_or(ManifestError::InvalidLength)?;
         let mut encoded = vec![0_u8; total_length];
-        encoded[0..8].copy_from_slice(MAGIC);
-        encoded[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        encoded[10..12].copy_from_slice(&HEADER_SIZE_U16.to_le_bytes());
+        encoded[0..8].copy_from_slice(if is_v1 { MAGIC_V1 } else { MAGIC_V2 });
+        encoded[8..10].copy_from_slice(
+            &(if is_v1 {
+                FORMAT_VERSION_V1
+            } else {
+                FORMAT_VERSION_V2
+            })
+            .to_le_bytes(),
+        );
+        encoded[10..12].copy_from_slice(
+            &(if is_v1 {
+                HEADER_SIZE_V1_U16
+            } else {
+                HEADER_SIZE_V2_U16
+            })
+            .to_le_bytes(),
+        );
         encoded[16..24].copy_from_slice(&self.generation.get().to_le_bytes());
         encoded[24..32].copy_from_slice(&self.visible_csn.get().to_le_bytes());
         encoded[32..40].copy_from_slice(&self.catalog_version.get().to_le_bytes());
@@ -278,7 +354,11 @@ impl RootManifest {
         );
         encoded[80..112].copy_from_slice(&self.wal_anchor.digest);
         encoded[112..144].copy_from_slice(&self.previous_digest);
-        let mut offset = MANIFEST_HEADER_SIZE;
+        if !is_v1 {
+            encoded[176..184].copy_from_slice(&self.page_generation.get().to_le_bytes());
+            encoded[184..192].copy_from_slice(&self.retention_floor_csn.get().to_le_bytes());
+        }
+        let mut offset = header_size;
         for (slot, page) in &self.roots {
             encoded[offset] = slot.engine as u8;
             encoded[offset + 2..offset + 4].copy_from_slice(&slot.partition.to_le_bytes());
@@ -294,6 +374,19 @@ impl RootManifest {
         encoded[CHECKSUM_START..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
         Ok(manifest_digest(&encoded))
     }
+}
+
+fn validate_storage_state(
+    page_generation: PageGeneration,
+    retention_floor_csn: Csn,
+    visible_csn: Csn,
+) -> Result<(), ManifestError> {
+    let first_generation = page_generation == PageGeneration::FIRST;
+    let first_floor = retention_floor_csn == Csn::FIRST;
+    if retention_floor_csn > visible_csn || first_generation != first_floor {
+        return Err(ManifestError::InvalidStorageState);
+    }
+    Ok(())
 }
 
 fn decode_roots(
@@ -636,7 +729,9 @@ mod tests {
     };
 
     use hyphae_native_mvcc::{RootSet, RootSlot, WalAnchor};
-    use hyphae_native_types::{CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageId};
+    use hyphae_native_types::{
+        CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageGeneration, PageId,
+    };
 
     use super::{ManifestError, RootManifest, RootManifestStore};
 
@@ -667,6 +762,15 @@ mod tests {
     }
 
     fn root_set(csn: u64, marker: u8) -> Result<RootSet, Box<dyn std::error::Error>> {
+        root_set_with_storage(csn, marker, PageGeneration::FIRST, Csn::FIRST)
+    }
+
+    fn root_set_with_storage(
+        csn: u64,
+        marker: u8,
+        page_generation: PageGeneration,
+        retention_floor_csn: Csn,
+    ) -> Result<RootSet, Box<dyn std::error::Error>> {
         let roots = [
             (EngineKind::Kernel, 1_u64),
             (EngineKind::Relational, 2),
@@ -684,12 +788,14 @@ mod tests {
             ))
         })
         .collect::<Result<BTreeMap<_, _>, hyphae_native_types::NativeTypeError>>()?;
-        Ok(RootSet::committed(
+        Ok(RootSet::committed_with_storage(
             Csn::new(csn)?,
             CatalogVersion::new(2)?,
             WalAnchor::new(Lsn::new(112 + (csn - 1) * 65_536)?, [marker; 32])?,
             roots,
             0,
+            page_generation,
+            retention_floor_csn,
         )?)
     }
 
@@ -705,6 +811,56 @@ mod tests {
             blake3::hash(&encoded).to_hex().as_str(),
             "b6211d9d373a4d01f5768126895aaaa4281bbba128929992259f9da7a4df047a"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_manifest_round_trips_v2_and_continues_a_v1_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = RootManifestStore::create(temporary.path())?;
+        let first =
+            RootManifest::from_root_set(ManifestGeneration::new(1)?, [0; 32], &root_set(1, 1)?)?;
+        store.append(first.clone(), true)?;
+
+        let vacuum_roots = root_set_with_storage(2, 2, PageGeneration::new(2)?, Csn::new(2)?)?;
+        let vacuum = RootManifest::from_root_set(
+            ManifestGeneration::new(2)?,
+            first.digest(),
+            &vacuum_roots,
+        )?;
+        let encoded = vacuum.encode()?;
+        assert_eq!(encoded.len(), 240);
+        assert_eq!(&encoded[..8], b"HYROOT02");
+        assert_eq!(&encoded[176..184], &2_u64.to_le_bytes());
+        assert_eq!(&encoded[184..192], &2_u64.to_le_bytes());
+        assert_eq!(RootManifest::decode(&encoded)?, vacuum);
+        assert_eq!(vacuum.to_root_set()?, vacuum_roots);
+        store.append(vacuum.clone(), true)?;
+        drop(store);
+
+        let reopened = RootManifestStore::open(temporary.path())?;
+        assert_eq!(reopened.recovery().manifests, vec![first, vacuum.clone()]);
+        assert_eq!(reopened.current(), Some(&vacuum));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_v2_storage_state_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let roots = root_set_with_storage(2, 2, PageGeneration::new(2)?, Csn::new(2)?)?;
+        let manifest = RootManifest::from_root_set(ManifestGeneration::new(1)?, [0; 32], &roots)?;
+        let mut encoded = manifest.encode()?;
+        encoded.truncate(191);
+        assert!(matches!(
+            RootManifest::decode(&encoded),
+            Err(ManifestError::InvalidLength)
+        ));
+
+        let invalid_roots = root_set_with_storage(2, 2, PageGeneration::FIRST, Csn::new(2)?)?;
+        assert!(matches!(
+            RootManifest::from_root_set(ManifestGeneration::new(1)?, [0; 32], &invalid_roots),
+            Err(ManifestError::InvalidStorageState)
+        ));
         Ok(())
     }
 

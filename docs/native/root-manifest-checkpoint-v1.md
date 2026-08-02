@@ -2,7 +2,8 @@
 
 Status: normative experimental format; immutable manifest publication,
 digest-chain recovery, WAL checkpoint records, cross-validation, temporary
-stage recovery, and deterministic interruption tests are implemented
+stage recovery, page-generation V2 metadata, and deterministic interruption
+tests are implemented
 
 The WAL remains transaction authority. A root manifest is an immutable,
 content-authenticated snapshot of one already committed all-engine `RootSet`.

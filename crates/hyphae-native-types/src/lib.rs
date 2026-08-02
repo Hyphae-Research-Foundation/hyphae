@@ -165,6 +165,26 @@ nonzero_identity!(
     "Physical page slot identity."
 );
 nonzero_identity!(
+    PageGeneration,
+    u64,
+    NonZeroU64,
+    "page generation",
+    "Immutable page-file generation."
+);
+
+impl PageGeneration {
+    /// Historical first page-file generation.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    /// Returns the next immutable page-file generation.
+    pub fn checked_next(self) -> Option<Self> {
+        self.get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+}
+nonzero_identity!(
     CatalogVersion,
     u64,
     NonZeroU64,
@@ -188,6 +208,9 @@ nonzero_identity!(
 nonzero_identity!(Lsn, u64, NonZeroU64, "LSN", "WAL record byte position.");
 
 impl Csn {
+    /// First committed transaction sequence.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
     /// Returns the next commit sequence number.
     pub fn checked_next(self) -> Option<Self> {
         self.get()
