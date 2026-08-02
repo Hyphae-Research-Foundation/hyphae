@@ -29,6 +29,8 @@ const SECONDARY_RANGE_OBSERVATIONS: u32 = 10_000;
 const SECONDARY_RANGE_OPERATIONS_PER_OBSERVATION: u32 = 1;
 const SECONDARY_RANGE_LOWER_ROW: u32 = SECONDARY_TARGET_ROW;
 const SECONDARY_RANGE_UPPER_ROW: u32 = SECONDARY_RANGE_LOWER_ROW + 10;
+const SECONDARY_RANGE_LOWER_KEY: &str = "a";
+const SECONDARY_RANGE_UPPER_KEY: &str = "b";
 const SCAN_LIMIT: usize = 10;
 const SCAN_OBSERVATIONS: u32 = 100_000;
 const SCAN_OPERATIONS_PER_OBSERVATION: u32 = 1;
@@ -265,7 +267,7 @@ fn seed_secondary_sql_data(
         return Err("secondary benchmark table identity was not returned".into());
     };
     for row in 0..SECONDARY_SCALE_ROWS {
-        let email = format!("person-{row}!hyphae.local");
+        let email = benchmark_email(row)?;
         let active = row % 2 == 0;
         let payload = vec![u8::try_from(row % 251)?; 96];
         dataset_hasher.update(&row.to_be_bytes());
@@ -297,6 +299,14 @@ fn seed_secondary_sql_data(
         return Err("secondary benchmark index identity was not returned".into());
     };
     Ok((table, index))
+}
+
+fn benchmark_email(row: u32) -> Result<String, std::num::TryFromIntError> {
+    if (SECONDARY_RANGE_LOWER_ROW..SECONDARY_RANGE_UPPER_ROW).contains(&row) {
+        Ok("a".repeat(usize::try_from(row - SECONDARY_RANGE_LOWER_ROW + 1)?))
+    } else {
+        Ok(format!("z-person-{row:04}!hyphae.local"))
+    }
 }
 
 fn warm_operations(
@@ -802,8 +812,8 @@ fn prepare_secondary_range_benchmark(
          LIMIT 10",
     )?;
     let parameters = [
-        SqlValue::Text(format!("person-{SECONDARY_RANGE_LOWER_ROW}!hyphae.local")),
-        SqlValue::Text(format!("person-{SECONDARY_RANGE_UPPER_ROW}!hyphae.local")),
+        SqlValue::Text(SECONDARY_RANGE_LOWER_KEY.to_owned()),
+        SqlValue::Text(SECONDARY_RANGE_UPPER_KEY.to_owned()),
     ];
     let scan = database.execute_prepared_latest(&scan_prepared, &parameters)?;
     let physical = database.execute_prepared_latest(&physical_prepared, &parameters)?;
@@ -826,9 +836,7 @@ fn prepare_secondary_exact_benchmark(
 ) -> Result<SecondaryExactBenchmarkInput, Box<dyn std::error::Error>> {
     let prepared =
         database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
-    let parameters = [SqlValue::Text(format!(
-        "person-{SECONDARY_TARGET_ROW}!hyphae.local"
-    ))];
+    let parameters = [SqlValue::Text(benchmark_email(SECONDARY_TARGET_ROW)?)];
     let index_key = parameters[0].encode_ordered_component(&LogicalType::Text)?;
     validate_secondary_routes(database, index, &index_key, &prepared, &parameters)?;
     Ok(SecondaryExactBenchmarkInput {
@@ -1035,6 +1043,8 @@ fn print_report(
     );
     println!("  \"secondary_range_lower_row_inclusive\": {SECONDARY_RANGE_LOWER_ROW},");
     println!("  \"secondary_range_upper_row_exclusive\": {SECONDARY_RANGE_UPPER_ROW},");
+    println!("  \"secondary_range_lower_key_inclusive\": \"{SECONDARY_RANGE_LOWER_KEY}\",");
+    println!("  \"secondary_range_upper_key_exclusive\": \"{SECONDARY_RANGE_UPPER_KEY}\",");
     println!("  \"scan_limit\": {SCAN_LIMIT},");
     println!("  \"range_lower_row_inclusive\": {RANGE_LOWER_ROW},");
     println!("  \"range_upper_row_exclusive\": {RANGE_UPPER_ROW},");
