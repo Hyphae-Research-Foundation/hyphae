@@ -95,6 +95,7 @@ struct OperationStats {
     prepared_sql_range: Stats,
     prepared_sql_residual_range: Stats,
     prepared_sql_prefix: Stats,
+    prepared_sql_prefix_residual: Stats,
     secondary_btree: Stats,
     secondary_prepared_sql: Stats,
     codec_dispatch: Stats,
@@ -106,6 +107,7 @@ struct BenchmarkInputs<'a> {
     range_prepared: &'a PreparedStatement,
     residual_prepared: &'a PreparedStatement,
     prefix_prepared: &'a PreparedStatement,
+    prefix_residual_prepared: &'a PreparedStatement,
     secondary_prepared: &'a PreparedStatement,
     table: ObjectId,
     scan_table: ObjectId,
@@ -119,6 +121,7 @@ struct BenchmarkInputs<'a> {
     range_parameters: &'a [SqlValue],
     residual_parameters: &'a [SqlValue],
     prefix_parameters: &'a [SqlValue],
+    prefix_residual_parameters: &'a [SqlValue],
     structure_target: &'a [u8],
     hash_target: &'a [u8],
     set_target: &'a [u8],
@@ -130,6 +133,13 @@ struct RangeBenchmarkInput {
     lower: Vec<u8>,
     upper: Vec<u8>,
     parameters: [SqlValue; 2],
+}
+
+struct PrefixBenchmarkInput {
+    prepared: PreparedStatement,
+    parameters: [SqlValue; 1],
+    residual_prepared: PreparedStatement,
+    residual_parameters: [SqlValue; 2],
 }
 
 fn seed_prefix_sql_data(
@@ -314,6 +324,10 @@ fn warm_operations(
             inputs.prefix_prepared,
             black_box(inputs.prefix_parameters),
         )?);
+        black_box(database.execute_prepared_latest(
+            inputs.prefix_residual_prepared,
+            black_box(inputs.prefix_residual_parameters),
+        )?);
         black_box(database.select_latest_secondary_index(
             inputs.secondary_index,
             black_box(inputs.secondary_index_key),
@@ -340,6 +354,7 @@ fn measure_operations(
         measure_relational_scans(database, inputs);
     let prepared_sql_residual_range = measure_residual_filter(database, inputs);
     let prepared_sql_prefix = measure_prefix_scan(database, inputs);
+    let prepared_sql_prefix_residual = measure_prefix_residual_scan(database, inputs);
     Ok(OperationStats {
         structure,
         structure_btree,
@@ -382,6 +397,7 @@ fn measure_operations(
         prepared_sql_range,
         prepared_sql_residual_range,
         prepared_sql_prefix,
+        prepared_sql_prefix_residual,
         secondary_btree: measure_counted(
             || {
                 black_box(
@@ -557,6 +573,23 @@ fn measure_prefix_scan(database: &NativeDatabase, inputs: &BenchmarkInputs<'_>) 
     )
 }
 
+fn measure_prefix_residual_scan(database: &NativeDatabase, inputs: &BenchmarkInputs<'_>) -> Stats {
+    measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(
+                        inputs.prefix_residual_prepared,
+                        black_box(inputs.prefix_residual_parameters),
+                    )
+                    .is_ok(),
+            );
+        },
+        SCAN_OBSERVATIONS,
+        SCAN_OPERATIONS_PER_OBSERVATION,
+    )
+}
+
 fn validate_secondary_routes(
     database: &NativeDatabase,
     index: ObjectId,
@@ -683,25 +716,47 @@ fn prepare_residual_benchmark(
 
 fn prepare_prefix_benchmark(
     database: &NativeDatabase,
-) -> Result<(PreparedStatement, [SqlValue; 2]), Box<dyn std::error::Error>> {
+) -> Result<PrefixBenchmarkInput, Box<dyn std::error::Error>> {
     let prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_ledger
+         WHERE tenant = ?
+         ORDER BY tenant, id
+         LIMIT 10",
+    )?;
+    let parameters = [SqlValue::Text(PREFIX_TARGET_TENANT.to_owned())];
+    validate_prefix_benchmark(database, &prepared, &parameters)?;
+    let residual_prepared = database.prepare_sql_latest(
         "SELECT id, payload FROM benchmark_ledger
          WHERE id >= ? AND tenant = ?
          ORDER BY tenant, id
          LIMIT 10",
     )?;
-    let parameters = [
+    let residual_parameters = [
         SqlValue::Signed(i64::from(PREFIX_LOWER_ROW)),
         SqlValue::Text(PREFIX_TARGET_TENANT.to_owned()),
     ];
-    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(&prepared, &parameters)?
+    validate_prefix_benchmark(database, &residual_prepared, &residual_parameters)?;
+    Ok(PrefixBenchmarkInput {
+        prepared,
+        parameters,
+        residual_prepared,
+        residual_parameters,
+    })
+}
+
+fn validate_prefix_benchmark(
+    database: &NativeDatabase,
+    prepared: &PreparedStatement,
+    parameters: &[SqlValue],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(prepared, parameters)?
     else {
         return Err("prefix benchmark SQL did not return rows".into());
     };
     if rows.len() != SCAN_LIMIT {
         return Err("prefix benchmark SQL did not reach its post-filter limit".into());
     }
-    Ok((prepared, parameters))
+    Ok(())
 }
 
 fn validate_multilevel_dataset(
@@ -743,7 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v12");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v13");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
     let (secondary_table, secondary_index) =
         seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
@@ -758,7 +813,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .prepare_sql_latest("SELECT id, payload FROM benchmark_people ORDER BY id LIMIT 10")?;
     let range = prepare_range_benchmark(&database, secondary_table)?;
     let (residual_prepared, residual_parameters) = prepare_residual_benchmark(&database)?;
-    let (prefix_prepared, prefix_parameters) = prepare_prefix_benchmark(&database)?;
+    let prefix = prepare_prefix_benchmark(&database)?;
     let secondary_prepared =
         database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
@@ -793,7 +848,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_prepared: &scan_prepared,
             range_prepared: &range.prepared,
             residual_prepared: &residual_prepared,
-            prefix_prepared: &prefix_prepared,
+            prefix_prepared: &prefix.prepared,
+            prefix_residual_prepared: &prefix.residual_prepared,
             secondary_prepared: &secondary_prepared,
             table,
             scan_table: secondary_table,
@@ -806,7 +862,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             range_upper: &range.upper,
             range_parameters: &range.parameters,
             residual_parameters: &residual_parameters,
-            prefix_parameters: &prefix_parameters,
+            prefix_parameters: &prefix.parameters,
+            prefix_residual_parameters: &prefix.residual_parameters,
             structure_target: &structure_target,
             hash_target: &hash_target,
             set_target: &set_target,
@@ -838,7 +895,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v12\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v13\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -986,8 +1043,13 @@ fn print_relational_scan_stats(operations: &OperationStats) {
         true,
     );
     print_stats(
-        "physical_prepared_sql_pk_prefix_residual_limit10_multilevel",
+        "physical_prepared_sql_pk_prefix_limit10_multilevel",
         operations.prepared_sql_prefix,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_pk_prefix_residual_limit10_multilevel",
+        operations.prepared_sql_prefix_residual,
         true,
     );
 }
