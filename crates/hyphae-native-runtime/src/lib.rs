@@ -48,8 +48,8 @@ use hyphae_native_records::{
 };
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
-    ManifestGeneration, ObjectId, PageId, RowId, ScalarValue, TransactionId, VectorElement,
-    VectorType,
+    ManifestGeneration, ObjectId, PageGeneration, PageId, RowId, ScalarValue, TransactionId,
+    VectorElement, VectorType,
 };
 use hyphae_native_wal::{WalError, WalFile, WalRecovery};
 use thiserror::Error;
@@ -1093,15 +1093,24 @@ impl NativeDatabase {
     /// transaction, missing referenced page, or noncontiguous CSN.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
         let path = path.as_ref();
-        let opened_pages = PageStore::open_repair_tail(path.join(PAGE_FILE))?;
-        let buffer_pool =
-            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
         let blobs = BlobStore::open(path)?;
         let blob_recovery = blobs.recovery()?;
         let opened_wal = WalFile::open(path.join(WAL_FILE))?;
         let recovered_wal = recover_wal(&opened_wal.recovery.records)?;
         let commits = &recovered_wal.commits;
         validate_commit_sequence(commits)?;
+        let active_page_generation = commits.last().map_or(PageGeneration::FIRST, |commit| {
+            commit.manifest.page_generation
+        });
+        let retention_floor_csn = commits
+            .last()
+            .map_or(Csn::FIRST, |commit| commit.manifest.retention_floor_csn);
+        let opened_pages = PageStore::open_repair_tail_generation(
+            page_generation_path(path, active_page_generation),
+            active_page_generation,
+        )?;
+        let buffer_pool =
+            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
         let mut conflicts = ConflictTable::default();
         for recovered in commits {
             let keys = mutation_write_keys(&recovered.mutations);
@@ -1110,30 +1119,17 @@ impl NativeDatabase {
         }
         let manifests = RootManifestStore::open(path)?;
         let manifest_recovery = manifests.recovery();
-        let mut latest_root = None;
-        let mut committed_roots = BTreeMap::new();
-        for recovered in commits {
-            let anchor_digest = digest_for_lsn(&opened_wal.recovery, recovered.commit_lsn)?;
-            let roots = root_map(recovered.manifest.roots);
-            let root = RootSet::committed(
-                recovered.manifest.commit_csn,
-                recovered.manifest.catalog_version,
-                WalAnchor::new(recovered.commit_lsn, anchor_digest)?,
-                roots,
-                recovered.manifest.blob_generation,
-            )?;
-            if root.blob_generation() > blob_recovery.generation {
-                return Err(NativeRuntimeError::InvalidCommittedRoot);
-            }
-            validate_roots(
-                &opened_pages.store,
-                &blobs,
-                &root,
-                recovered.manifest.commit_csn,
-            )?;
-            committed_roots.insert(recovered.manifest.commit_csn, root.clone());
-            latest_root = Some(root);
-        }
+        let (committed_roots, latest_root) = recover_committed_roots(
+            commits,
+            &opened_wal.recovery,
+            &RetainedPageState {
+                pages: &opened_pages.store,
+                blobs: &blobs,
+                blob_generation: blob_recovery.generation,
+                active_generation: active_page_generation,
+                retention_floor_csn,
+            },
+        )?;
         let checkpoint_validation = validate_checkpoints(
             &recovered_wal,
             &manifest_recovery.manifests,
@@ -8376,21 +8372,95 @@ fn root_map(roots: [PageId; 4]) -> BTreeMap<RootSlot, PageId> {
     ROOT_SLOTS.into_iter().zip(roots).collect()
 }
 
+fn page_generation_path(data_directory: &Path, generation: PageGeneration) -> PathBuf {
+    if generation == PageGeneration::FIRST {
+        data_directory.join(PAGE_FILE)
+    } else {
+        data_directory.join(format!("pages-{:020}.hydb", generation.get()))
+    }
+}
+
+struct RetainedPageState<'database> {
+    pages: &'database PageStore,
+    blobs: &'database BlobStore,
+    blob_generation: u64,
+    active_generation: PageGeneration,
+    retention_floor_csn: Csn,
+}
+
+fn recover_committed_roots(
+    commits: &[wal_codec::RecoveredCommit],
+    wal_recovery: &WalRecovery,
+    storage: &RetainedPageState<'_>,
+) -> Result<(BTreeMap<Csn, RootSet>, Option<RootSet>), NativeRuntimeError> {
+    let mut committed_roots = BTreeMap::new();
+    let mut latest_root = None;
+    for recovered in commits {
+        let anchor_digest = digest_for_lsn(wal_recovery, recovered.commit_lsn)?;
+        let root = RootSet::committed_with_storage(
+            recovered.manifest.commit_csn,
+            recovered.manifest.catalog_version,
+            WalAnchor::new(recovered.commit_lsn, anchor_digest)?,
+            root_map(recovered.manifest.roots),
+            recovered.manifest.blob_generation,
+            recovered.manifest.page_generation,
+            recovered.manifest.retention_floor_csn,
+        )?;
+        if root.blob_generation() > storage.blob_generation {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        if recovered.manifest.commit_csn >= storage.retention_floor_csn {
+            if recovered.manifest.page_generation != storage.active_generation {
+                return Err(NativeRuntimeError::NoncontiguousCommitSequence);
+            }
+            validate_roots(
+                storage.pages,
+                storage.blobs,
+                &root,
+                recovered.manifest.commit_csn,
+            )?;
+        }
+        committed_roots.insert(recovered.manifest.commit_csn, root.clone());
+        latest_root = Some(root);
+    }
+    Ok((committed_roots, latest_root))
+}
+
 fn validate_commit_sequence(
     commits: &[wal_codec::RecoveredCommit],
 ) -> Result<(), NativeRuntimeError> {
     let mut expected = 1_u64;
     let mut prior = None;
+    let mut prior_page_generation = None;
+    let mut prior_retention_floor = None;
     for commit in commits {
+        let page_generation = commit.manifest.page_generation;
+        let retention_floor_csn = commit.manifest.retention_floor_csn;
+        let storage_transition_valid = match (prior_page_generation, prior_retention_floor) {
+            (None, None) => {
+                page_generation == PageGeneration::FIRST && retention_floor_csn == Csn::FIRST
+            }
+            (Some(prior_generation), Some(prior_floor)) if page_generation == prior_generation => {
+                retention_floor_csn == prior_floor
+            }
+            (Some(prior_generation), Some(_)) => {
+                prior_generation.checked_next() == Some(page_generation)
+                    && retention_floor_csn == commit.manifest.commit_csn
+            }
+            _ => false,
+        };
         if commit.manifest.commit_csn.get() != expected
             || commit
                 .manifest
                 .read_csn
                 .is_some_and(|read| prior.is_none_or(|published| read > published))
+            || !storage_transition_valid
         {
             return Err(NativeRuntimeError::NoncontiguousCommitSequence);
         }
         prior = Some(commit.manifest.commit_csn);
+        prior_page_generation = Some(page_generation);
+        prior_retention_floor = Some(retention_floor_csn);
         expected = expected
             .checked_add(1)
             .ok_or(NativeRuntimeError::NoncontiguousCommitSequence)?;
@@ -9592,19 +9662,90 @@ mod tests {
 
     use hyphae_native_mvcc::WriteKey;
     use hyphae_native_types::{
-        CanonicalF64, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
-        ManifestGeneration, ObjectId, PageId,
+        CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
+        Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
     };
+
+    use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
         AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, EngineKind,
         HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError, NativeWriteBatch,
         Opcode, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, Vector, VectorMetric, ZAddOutcome,
-        physical_expiry_tree_after_mutations,
+        SqlResult, SqlValue, Vector, VectorMetric, ZAddOutcome, page_generation_path,
+        physical_expiry_tree_after_mutations, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn recovered_commit(
+        csn: u64,
+        page_generation: u64,
+        retention_floor_csn: u64,
+    ) -> Result<RecoveredCommit, Box<dyn std::error::Error>> {
+        Ok(RecoveredCommit {
+            transaction_id: TransactionId::new(u128::from(csn))?,
+            commit_lsn: Lsn::new(csn)?,
+            manifest: CommitManifest {
+                read_csn: (csn > 1).then(|| Csn::new(csn - 1)).transpose()?,
+                commit_csn: Csn::new(csn)?,
+                catalog_version: CatalogVersion::new(1)?,
+                blob_generation: 0,
+                mutation_count: 1,
+                mutation_bytes: 1,
+                logical_time_micros: 0,
+                mutation_digest: [1; 32],
+                roots: [
+                    PageId::new(1)?,
+                    PageId::new(2)?,
+                    PageId::new(3)?,
+                    PageId::new(4)?,
+                ],
+                page_generation: PageGeneration::new(page_generation)?,
+                retention_floor_csn: Csn::new(retention_floor_csn)?,
+            },
+            mutations: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn recovery_accepts_only_contiguous_page_generation_transitions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let valid = [
+            recovered_commit(1, 1, 1)?,
+            recovered_commit(2, 1, 1)?,
+            recovered_commit(3, 2, 3)?,
+            recovered_commit(4, 2, 3)?,
+        ];
+        validate_commit_sequence(&valid)?;
+
+        let skipped = [recovered_commit(1, 1, 1)?, recovered_commit(2, 3, 2)?];
+        assert!(matches!(
+            validate_commit_sequence(&skipped),
+            Err(NativeRuntimeError::NoncontiguousCommitSequence)
+        ));
+        let drifting_floor = [recovered_commit(1, 1, 1)?, recovered_commit(2, 1, 2)?];
+        assert!(matches!(
+            validate_commit_sequence(&drifting_floor),
+            Err(NativeRuntimeError::NoncontiguousCommitSequence)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn page_generation_paths_preserve_the_historical_filename()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = Path::new("data");
+        assert_eq!(
+            page_generation_path(directory, PageGeneration::FIRST),
+            directory.join("pages.hydb")
+        );
+        assert_eq!(
+            page_generation_path(directory, PageGeneration::new(42)?),
+            directory.join("pages-00000000000000000042.hydb")
+        );
+        Ok(())
+    }
 
     struct TestDirectory {
         path: PathBuf,
