@@ -104,6 +104,7 @@ class DependencyReviewTests(unittest.TestCase):
 
     def test_native_crate_manifests_are_registered(self) -> None:
         native_manifests = {
+            "crates/hyphae-native-ann/Cargo.toml",
             "crates/hyphae-native-blobs/Cargo.toml",
             "crates/hyphae-native-btree/Cargo.toml",
             "crates/hyphae-native-catalog/Cargo.toml",

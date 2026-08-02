@@ -27,6 +27,7 @@ CARGO_MANIFESTS = (
     "crates/hyphae-contracts/Cargo.toml",
     "crates/hyphae-core/Cargo.toml",
     "crates/hyphae-engine/Cargo.toml",
+    "crates/hyphae-native-ann/Cargo.toml",
     "crates/hyphae-native-blobs/Cargo.toml",
     "crates/hyphae-native-btree/Cargo.toml",
     "crates/hyphae-native-catalog/Cargo.toml",

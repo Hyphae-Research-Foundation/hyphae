@@ -55,6 +55,7 @@ dependency, performance and replacement-cost review.
 
 The experimental target path currently consists of:
 
+- `hyphae-native-ann`;
 - `hyphae-native-types`;
 - `hyphae-native-pages`;
 - `hyphae-native-wal`;
@@ -79,11 +80,12 @@ non-compatibility disclaimer. Direct native source contains no `unsafe`
 token. This is implementation inventory evidence, not the still-pending
 transitive unsafe and license audit required to close G0.
 
-The records, B+tree, blob, and manifest crates add no new third-party runtime
-dependency category. The runtime reaches them only through workspace path
-dependencies; the B+tree uses the Hyphae page and buffer-pool APIs, the blob
-store uses the permitted CRC32C/BLAKE3 primitives, and the checkpoint path
-uses the Hyphae WAL and MVCC types.
+The ANN, records, B+tree, blob, and manifest crates add no new third-party
+runtime dependency category. The runtime reaches the integrated crates only
+through workspace path dependencies; the standalone ANN kernel currently
+uses the permitted BLAKE3 primitive, the B+tree uses the Hyphae page and
+buffer-pool APIs, the blob store uses the permitted CRC32C/BLAKE3 primitives,
+and the checkpoint path uses the Hyphae WAL and MVCC types.
 
 ## Upstream research
 
