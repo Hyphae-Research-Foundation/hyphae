@@ -77,7 +77,7 @@ impl CatalogState {
         if self
             .objects
             .values()
-            .any(|entry| entry.header().name == header.name)
+            .any(|entry| same_catalog_lookup(&entry.header().name, &header.name))
         {
             return Err(ModelError::DuplicateObjectName);
         }
@@ -122,6 +122,7 @@ impl CatalogState {
         ObjectId::new(next).map_err(|_| ModelError::ZeroObjectId)
     }
 
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&CATALOG_MAGIC_V2);
@@ -159,6 +160,12 @@ impl CatalogState {
         decoder.finish()?;
         Ok(state)
     }
+}
+
+fn same_catalog_lookup(left: &QualifiedName, right: &QualifiedName) -> bool {
+    left.database.lookup() == right.database.lookup()
+        && left.schema.lookup() == right.schema.lookup()
+        && left.object.lookup() == right.object.lookup()
 }
 
 fn legacy_catalog_object(
@@ -1100,6 +1107,26 @@ mod tests {
         assert_eq!(search.fields.len(), 1);
         assert_eq!(search.header.name.object.lookup(), "notes");
         assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V2));
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_rejects_names_with_the_same_normalized_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = CatalogState::default();
+        catalog.create(legacy_catalog_object(
+            ObjectId::new(1)?,
+            EngineKind::Relational,
+            "Accounts",
+        )?)?;
+        assert_eq!(
+            catalog.create(legacy_catalog_object(
+                ObjectId::new(2)?,
+                EngineKind::Relational,
+                "accounts",
+            )?),
+            Err(ModelError::DuplicateObjectName)
+        );
         Ok(())
     }
 

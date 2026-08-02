@@ -117,6 +117,14 @@ commit before its tag can be published.
   relation/structure/search definitions, full-definition WAL and `HYCAT002`
   persistence, legacy reconstruction, snapshot/reopen proof, and explicit
   single-page limits to one source commit.
+- [Native scalable catalog B+tree evidence —
+  2026-08-02](native-catalog-btree-2026-08-02.md) binds `HYCAT003` ID/name
+  namespaces, definition blobs, V1/V2 migration, buffered lookup,
+  copy-on-write DDL, corruption rejection and reopen to one source commit.
+- `native-catalog-btree-windows.json` and
+  `native-catalog-btree-wsl2.json` are matched release observations over
+  1,024 objects and 50,000 calls per lookup route. They record microsecond
+  point lookup and millisecond strict DDL, not a complete G7 gate.
 - [Native typed SQL-row evidence —
   2026-08-01](native-typed-sql-rows-2026-08-01.md) binds catalog-typed DDL,
   canonical `HYTUPL01` rows, primitive and composite primary-key binding,

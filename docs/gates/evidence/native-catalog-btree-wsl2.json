@@ -1,0 +1,32 @@
+{
+  "schema": "hyphae.native.catalog-btree.v1",
+  "status": "observation-not-gate",
+  "source_commit": "105fc0fa37281924d689a4837ab78b88630ed2d7",
+  "source_tree": "4435923f3112d27a88b08a0f211b97e47fe0c992",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "initial_objects": 1024,
+  "objects_after_incremental": 1025,
+  "bulk_prepare_latency_ns": 9819189,
+  "bulk_strict_commit_latency_ns": 59196435,
+  "incremental_strict_commit_latency_ns": 8254014,
+  "lookup_observations": 50000,
+  "id_lookup_ns": {
+    "p50": 1056,
+    "p95": 1356,
+    "p99": 1715
+  },
+  "name_lookup_ns": {
+    "p50": 2437,
+    "p95": 3316,
+    "p99": 4668
+  },
+  "page_size_bytes": 16384,
+  "page_bytes_after_bulk": 23314432,
+  "pages_after_bulk": 1423,
+  "incremental_page_bytes_appended": 98304,
+  "incremental_pages_appended": 6,
+  "reopen_verified": true
+}
