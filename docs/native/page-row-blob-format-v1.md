@@ -220,14 +220,16 @@ The exact blob file is:
 | 80 | variable | exact content bytes; no trailing padding |
 
 The first implementation bounds one blob at 1 GiB, verifies every complete
-blob during open, removes canonical interrupted stages, deduplicates identical
-content, and derives `blob_generation` from the verified immutable-file count.
-The root set and WAL commit bind that generation. A blob promoted before a
-failed transaction can remain as an unreferenced immutable orphan until
-retention tracing and garbage collection exist; it never makes a logical row
-visible. Safe parent-directory synchronization is implemented on Unix. The
-Windows implementation reports that strict parent-directory synchronization
-is unsupported rather than claiming that guarantee.
+blob during open, removes canonical interrupted stages, and deduplicates
+identical content. Existing format-1 roots bind the verified immutable-file
+count observed at commit as `blob_generation`. The
+[immutable-blob collection contract](blob-collection-v1.md) preserves those
+bytes and turns the field into a committed generation floor when physical
+orphans are removed. A blob promoted before a failed transaction can remain as
+an unreferenced immutable orphan until eligible collection; it never makes a
+logical row visible. Safe parent-directory synchronization is implemented on
+Unix. The Windows implementation reports that strict parent-directory
+synchronization is unsupported rather than claiming that guarantee.
 
 ## Copy-on-write root publication
 
@@ -272,5 +274,7 @@ Still required are broad random/property and fuzz corpora, bit flips across
 every byte range, streaming/chunked values, compression, encryption,
 reference-count/retention tests across snapshots, orphan reclamation, and
 large-corpus blob garbage collection. Current-root page-generation vacuum now
-has an implementation, crash matrix, and one measured corpus, but broader
-multi-generation retention remains pending.
+has an implementation, crash matrix, and one measured corpus. The first
+single-retained-root blob-collection contract now has an implementation,
+process-interruption matrix, and one measured corpus; broader multi-generation
+retention remains pending.

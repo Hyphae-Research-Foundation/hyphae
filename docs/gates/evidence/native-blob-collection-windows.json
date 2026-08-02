@@ -1,0 +1,93 @@
+{
+  "benchmark": "hyphae-native-blob-collection-v1",
+  "source_commit": "53396099256e54b01a5ba81a83150e72f733179e",
+  "source_tree": "dccbd4aa3e7eebab76a40fb6a69aafb73015f252",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "filesystem": "NTFS (Windows TEMP on C drive)",
+  "dead_blobs": 128,
+  "open_rounds": 25,
+  "blobs_before_collection": 130,
+  "blob_bytes_before_collection": 1200106,
+  "uncollected_final_blob_files": 130,
+  "uncollected_final_blob_bytes": 1200106,
+  "collected_final_blob_files": 2,
+  "collected_final_blob_bytes": 35928,
+  "blob_byte_reduction": 0.970063,
+  "blob_verification_speedup": 26.467297,
+  "warm_reopen_speedup": 4.556676,
+  "collection": {
+    "root_visible_csn": 131,
+    "generation_floor": 130,
+    "live_files": 2,
+    "live_bytes": 35928,
+    "candidate_files": 128,
+    "candidate_bytes": 1164178,
+    "removed_files": 128,
+    "removed_bytes": 1164178,
+    "retained_files": 2,
+    "retained_bytes": 35928,
+    "reference_trace_nanos": 1840900,
+    "candidate_deletion_nanos": 15103400,
+    "directory_synchronization_nanos": 78300,
+    "parent_directory_sync_supported": false,
+    "total_nanos": 17050700
+  },
+  "uncollected_open": {
+    "first_external_nanos": 9147600,
+    "blob_files": 130,
+    "blob_bytes": 1200106,
+    "generation_floor": 130,
+    "effective_generation": 130,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 8582500,
+      "p95_nanos": 11845900,
+      "p99_nanos": 14223000
+    },
+    "warm_internal": {
+      "p50_nanos": 8579500,
+      "p95_nanos": 11843100,
+      "p99_nanos": 14220900
+    },
+    "warm_blob_verification": {
+      "p50_nanos": 6434200,
+      "p95_nanos": 9069800,
+      "p99_nanos": 12218400
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1493600,
+      "p95_nanos": 1913600,
+      "p99_nanos": 1920000
+    }
+  },
+  "collected_open": {
+    "first_external_nanos": 2065700,
+    "blob_files": 2,
+    "blob_bytes": 35928,
+    "generation_floor": 130,
+    "effective_generation": 130,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 1883500,
+      "p95_nanos": 2518400,
+      "p99_nanos": 2519300
+    },
+    "warm_internal": {
+      "p50_nanos": 1881100,
+      "p95_nanos": 2516800,
+      "p99_nanos": 2517700
+    },
+    "warm_blob_verification": {
+      "p50_nanos": 243100,
+      "p95_nanos": 417600,
+      "p99_nanos": 544400
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1273400,
+      "p95_nanos": 1692500,
+      "p99_nanos": 1753100
+    }
+  }
+}

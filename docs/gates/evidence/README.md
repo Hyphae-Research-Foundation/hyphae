@@ -296,6 +296,15 @@ commit before its tag can be published.
   `native-manifest-retention-wsl2.json` are matched generation-131
   observations. They record 131-to-3 manifests and 97.5504% fewer bytes; the
   WSL2 data directory was `tmpfs`, not persistent ext4.
+- [Native immutable-blob collection evidence —
+  2026-08-02](native-blob-collection-2026-08-02.md) binds authoritative
+  all-engine reference tracing, committed generation floors, exact
+  digest-ordered pruning, four interruption boundaries, and idempotent
+  recovery to one source commit.
+- `native-blob-collection-windows.json` and
+  `native-blob-collection-wsl2.json` are matched 130-file observations. They
+  record 128 removed files and 97.0063% fewer bytes; Windows reports directory
+  synchronization unsupported and WSL2 used `tmpfs`, not persistent ext4.
 
 ## Hosted release evidence
 
