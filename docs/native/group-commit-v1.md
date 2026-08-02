@@ -17,7 +17,9 @@ exposes a bounded multi-producer submission queue. Preparation remains detached
 from writer admission.
 
 `strict` and `memory` transactions do not enter a group cohort. Existing direct
-commit paths remain singleton operations.
+commit paths remain singleton operations in this first vertical. The unified
+FIFO admission policy is specified separately by
+[Native mixed-durability scheduler v1](mixed-durability-scheduler-v1.md).
 
 ## Bounded scheduler
 
@@ -127,4 +129,5 @@ Required executable evidence covers:
 
 This vertical advances G1 and G7. It does not close either gate, bounded WAL
 replay, WAL retention, background expiry, or the complete scheduler/resource
-policy.
+policy. The remaining shared resource policy is narrowed by
+[Native mixed-durability scheduler v1](mixed-durability-scheduler-v1.md).
