@@ -233,6 +233,15 @@ binding, secondary-index maintenance, and reopen. General mutation
 expressions, multi-row/range mutation, joins, aggregation, planning, and the
 remaining G2 evidence remain open.
 
+The [native indexed inner-join
+evidence](evidence/native-indexed-inner-join-2026-08-01.md) binds the first
+qualified `INNER JOIN` to exact primary/unique-secondary left access and a
+single-column right primary key. It proves private, retained, physical and
+reopened execution, typed fail-closed binding, and a clean 100,000-call WSL2
+observation. Multi-row and composite joins, aliases and expressions,
+statistics/cardinality estimation, join ordering, hash/merge/outer operators,
+spill, SQLLogicTest, TPC-H/TPC-C, and the full G2/G7 evidence remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

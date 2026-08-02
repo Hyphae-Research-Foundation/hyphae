@@ -7,7 +7,8 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 `UPDATE`/`DELETE`, bounded primary-key table/range scan, `BEGIN`/`COMMIT`,
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
-implemented for `SELECT` filters and exact-primary-key DML. G2 remains open
+implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
+`INNER JOIN` shape is implemented as described below. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -153,11 +154,41 @@ commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
 `column = NULL` remains `UNKNOWN` and returns no rows.
 
+The first native join shape is:
+
+```text
+SELECT <qualified-column> [, ...]
+FROM <left-table>
+INNER JOIN <right-table>
+  ON <left-table>.<column> = <right-table>.<single-column-primary-key>
+WHERE <exact-left-key-filter>
+```
+
+The projection must contain explicit qualified columns; `SELECT *`, aliases,
+ordering, and limits are not admitted for this shape. The left filter must
+expose a complete primary-key equality or a complete unique-secondary-index
+equality, so at most one left row is reached. Residual predicates may further
+filter that row. The qualified right join column must be the relation's
+complete single-column primary key, and both join columns must have the same
+catalog logical type.
+
+Execution performs an indexed nested lookup inside one captured root set and
+visible CSN. SQL `NULL` on the left join column produces no match. An absent
+right primary key also produces no match. Transaction execution sees private
+row changes, a retained snapshot remains historical, and
+`execute_prepared_latest` performs both physical lookups without constructing
+`MaterializedState`. Non-unique left access, composite/right-secondary access,
+multi-row inputs, aliases, general column expressions, join reordering,
+hash/merge algorithms, outer/semi/anti joins, and cross-engine table-valued
+sources remain pending.
+
 `EXPLAIN SELECT` currently reports only the admitted access path:
 `PrimaryKeyLookup(table=<id>)` or
 `SecondaryIndexLookup(table=<id>,index=<id>)`, or
 `PrimaryKeyScan(table=<id>,limit=<n>)`, or
-`PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`.
+`PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`, or
+`IndexedInnerJoin(left_table=<id>,left_access=<access>,right_table=<id>,right_access=primary-key)`.
+Join left access is `primary-key` or `unique-secondary(index=<id>)`.
 Range kinds are `inclusive`, `exclusive`, or `unbounded`. This is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
 statistics report. A plan appends `,residual=true` inside the closing

@@ -1,0 +1,46 @@
+{
+  "schema": "hyphae-native-indexed-inner-join-smoke-v1",
+  "status": "observation-not-gate",
+  "source_commit": "cbb58aa787b7e89eafd85e45bed74ae313ccc297",
+  "environment": "WSL2 Ubuntu 24.04; Linux 6.18.33.1; x86_64; Intel Core Ultra 9 285H; rustc 1.96.0",
+  "profile": "release",
+  "durability": "strict",
+  "warm_state": true,
+  "concurrency": 1,
+  "rows_per_relation": 2048,
+  "observations_per_route": 100000,
+  "warmup_per_route": 10000,
+  "commit_csn": 1,
+  "dataset_digest_blake3": "086986403a1f59c272e2a938cb18a8a61c6df971decd963770dfcbf5424f6ae8",
+  "data_directory_bytes": 332382208,
+  "strict_commit_duration_millis": 552.776,
+  "reopen_duration_millis": 57.085,
+  "snapshot_materialization_duration_millis": 48.103,
+  "provisional_targets_micros": {
+    "p50": 75.000,
+    "p99": 400.000
+  },
+  "query": "SELECT users.id, users.payload, profiles.city\n                     FROM users\n                     INNER JOIN profiles ON users.profile_id = profiles.id\n                     WHERE email = ?",
+  "routes": {
+    "physical_latest": {
+      "p50_us": 31.177,
+      "p95_us": 45.363,
+      "p99_us": 84.364,
+      "p99_9_us": 180.409,
+      "maximum_us": 1043.098,
+      "throughput_ops_s": 29465.040,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot": {
+      "p50_us": 0.575,
+      "p95_us": 0.852,
+      "p99_us": 1.328,
+      "p99_9_us": 2.951,
+      "maximum_us": 977.681,
+      "throughput_ops_s": 1526763.943,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    }
+  }
+}

@@ -27,8 +27,12 @@ operators. Parameterized scalar residual filters support comparison,
 `IS [NOT] NULL`, `NOT`, `AND`, and `OR`; the binder extracts admitted exact or
 range access and applies `LIMIT` after filtering. The historical
 two-binary-column shape retains its raw bytes and allocation-free prepared
-lookup. Literals, casts, arithmetic/functions, joins, grouping, sorting/spill,
-cost planning, and complete `EXPLAIN` remain pending.
+lookup. The first qualified `INNER JOIN` plan resolves at most one left row
+through a primary key or unique secondary index, then resolves a
+single-column right primary key against the same transaction or snapshot.
+General multi-row joins, composite/right-secondary access, outer joins,
+literals beyond the admitted scalar families, casts, arithmetic/functions,
+grouping, sorting/spill, cost planning, and complete `EXPLAIN` remain pending.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
