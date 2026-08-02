@@ -6460,8 +6460,9 @@ mod tests {
 
     use super::{
         AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome,
-        HnswConfig, NativeDatabase, NativeRuntimeError, PAGE_FILE, RelationalScanRow, SetCondition,
-        SetOutcome, SqlError, SqlResult, SqlValue, Vector, VectorMetric,
+        HnswConfig, NativeDatabase, NativeRuntimeError, NativeWriteBatch, PAGE_FILE,
+        RelationalScanRow, SetCondition, SetOutcome, SqlError, SqlResult, SqlValue, Vector,
+        VectorMetric,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -10376,6 +10377,8 @@ mod tests {
             "(1, 'one@hyphae.local', 'Mario', 100)",
             "(2, 'two@hyphae.local', 'Romina', NULL)",
             "(3, 'three@hyphae.local', 'Luciana', 999)",
+            "(4, 'four@hyphae.local', 'Genesis', 400)",
+            "(5, 'five@hyphae.local', 'Suli', 500)",
         ] {
             seed.execute_sql(
                 &format!("INSERT INTO users (id, email, name, profile_id) VALUES {values}"),
@@ -10384,6 +10387,14 @@ mod tests {
         }
         seed.execute_sql(
             "INSERT INTO profiles (id, city) VALUES (100, 'Medellin')",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO profiles (id, city) VALUES (400, 'Caracas')",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO profiles (id, city) VALUES (500, 'San Cristobal')",
             &[],
         )?;
         seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
@@ -10459,6 +10470,164 @@ mod tests {
             reopened.execute_prepared_latest(&reopened_plan, &mario)?,
             expected_envigado
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_inner_join_applies_limit_after_missing_right_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let query = "SELECT users.id, profiles.city
+                     FROM users
+                     INNER JOIN profiles ON users.profile_id = profiles.id
+                     WHERE id >= ?
+                     ORDER BY id
+                     LIMIT 2";
+        let parameters = [SqlValue::Signed(1)];
+        let expected = SqlResult::Rows {
+            columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(1), SqlValue::Text("Medellin".to_owned())],
+                vec![SqlValue::Signed(4), SqlValue::Text("Caracas".to_owned())],
+            ],
+        };
+        let snapshot = database.snapshot(11)?;
+        let snapshot_plan = snapshot.prepare_sql(query)?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &parameters)?,
+            expected
+        );
+        let latest_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            expected
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        Ok(())
+    }
+
+    fn assert_bounded_join_plan_and_full_scan(
+        transaction: &mut NativeWriteBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE id >= ?
+                 ORDER BY id
+                 LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=primary-key-range(lower=inclusive,upper=unbounded,limit=2),right_table=2,right_access=primary-key)"
+                        .to_owned(),
+                )]],
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 ORDER BY id
+                 LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("Medellin".to_owned()),],
+                    vec![SqlValue::Signed(4), SqlValue::Text("Caracas".to_owned()),],
+                ],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_inner_join_reads_private_rows_and_explains_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let mut transaction = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_bounded_join_plan_and_full_scan(&mut transaction)?;
+        let range_query = "SELECT users.id, profiles.city
+                           FROM users
+                           INNER JOIN profiles ON users.profile_id = profiles.id
+                           WHERE id >= ?
+                           ORDER BY id
+                           LIMIT 3";
+        transaction.execute_sql(
+            "INSERT INTO profiles (id, city) VALUES (600, 'Maracaibo')",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO users (id, email, name, profile_id)
+             VALUES (6, 'six@hyphae.local', 'Danny', 600)",
+            &[],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(range_query, &[SqlValue::Signed(4)])?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(4), SqlValue::Text("Caracas".to_owned()),],
+                    vec![
+                        SqlValue::Signed(5),
+                        SqlValue::Text("San Cristobal".to_owned()),
+                    ],
+                    vec![SqlValue::Signed(6), SqlValue::Text("Maracaibo".to_owned()),],
+                ],
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 ORDER BY id
+                 LIMIT 0",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE id >= ?",
+                &[SqlValue::Signed(1)],
+            ),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 ORDER BY profile_id
+                 LIMIT 2",
+                &[],
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
         Ok(())
     }
 

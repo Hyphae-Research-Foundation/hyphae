@@ -30,9 +30,12 @@ two-binary-column shape retains its raw bytes and allocation-free prepared
 lookup. The first qualified `INNER JOIN` plan resolves at most one left row
 through a primary key or unique secondary index, then resolves a
 single-column right primary key against the same transaction or snapshot.
-General multi-row joins, composite/right-secondary access, outer joins,
-literals beyond the admitted scalar families, casts, arithmetic/functions,
-grouping, sorting/spill, cost planning, and complete `EXPLAIN` remain pending.
+The next bounded form walks a full or ranged left primary-key input and stops
+after `LIMIT` joined output rows; null join keys and missing right rows do not
+consume that limit. Non-unique secondary inputs, composite/right-secondary
+access, join reordering, hash/merge and outer joins, literals beyond the
+admitted scalar families, casts, arithmetic/functions, grouping,
+sorting/spill, cost planning, and complete `EXPLAIN` remain pending.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads

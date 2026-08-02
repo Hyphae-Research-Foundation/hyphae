@@ -19,10 +19,20 @@ const OBSERVATIONS: u32 = 100_000;
 const WARMUP: u32 = 10_000;
 const P50_TARGET_MICROS: f64 = 75.0;
 const P99_TARGET_MICROS: f64 = 400.0;
+const BOUNDED_LIMIT: usize = 10;
+const BOUNDED_PARAMETER_COUNT: u32 = ROWS - 10 + 1;
+const BOUNDED_P50_TARGET_MICROS: f64 = 500.0;
+const BOUNDED_P99_TARGET_MICROS: f64 = 2_000.0;
 const QUERY: &str = "SELECT users.id, users.payload, profiles.city
                      FROM users
                      INNER JOIN profiles ON users.profile_id = profiles.id
                      WHERE email = ?";
+const BOUNDED_QUERY: &str = "SELECT users.id, users.payload, profiles.city
+                             FROM users
+                             INNER JOIN profiles ON users.profile_id = profiles.id
+                             WHERE id >= ?
+                             ORDER BY id
+                             LIMIT 10";
 
 struct TemporaryDirectory(PathBuf);
 
@@ -66,6 +76,8 @@ struct Receipt<'receipt> {
     snapshot_materialization_duration: Duration,
     physical: LatencySummary,
     materialized: LatencySummary,
+    bounded_physical: LatencySummary,
+    bounded_materialized: LatencySummary,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -86,19 +98,47 @@ fn main() -> Result<(), Box<dyn Error>> {
     let snapshot_materialization_duration = snapshot_started.elapsed();
     let physical_plan = database.prepare_sql_latest(QUERY)?;
     let materialized_plan = snapshot.prepare_sql(QUERY)?;
-    let parameters = query_parameters();
+    let bounded_physical_plan = database.prepare_sql_latest(BOUNDED_QUERY)?;
+    let bounded_materialized_plan = snapshot.prepare_sql(BOUNDED_QUERY)?;
+    let parameters = exact_query_parameters();
+    let bounded_parameters = bounded_query_parameters();
     validate_result(
         database
             .execute_prepared_latest(&physical_plan, &parameters[usize::try_from(ROWS - 1)?])?,
+        1,
     )?;
     validate_result(
         snapshot.execute_prepared(&materialized_plan, &parameters[usize::try_from(ROWS - 1)?])?,
+        1,
+    )?;
+    validate_result(
+        database.execute_prepared_latest(
+            &bounded_physical_plan,
+            &bounded_parameters[usize::try_from(ROWS - 10)?],
+        )?,
+        BOUNDED_LIMIT,
+    )?;
+    validate_result(
+        snapshot.execute_prepared(
+            &bounded_materialized_plan,
+            &bounded_parameters[usize::try_from(ROWS - 10)?],
+        )?,
+        BOUNDED_LIMIT,
     )?;
 
     for observation in 0..WARMUP {
         let parameter = &parameters[usize::try_from(observation % ROWS)?];
+        let bounded_parameter =
+            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
         black_box(database.execute_prepared_latest(&physical_plan, black_box(parameter))?);
         black_box(snapshot.execute_prepared(&materialized_plan, black_box(parameter))?);
+        black_box(
+            database
+                .execute_prepared_latest(&bounded_physical_plan, black_box(bounded_parameter))?,
+        );
+        black_box(
+            snapshot.execute_prepared(&bounded_materialized_plan, black_box(bounded_parameter))?,
+        );
     }
     let physical = measure_latency(OBSERVATIONS, |observation| {
         let parameter = &parameters[usize::try_from(observation % ROWS)?];
@@ -108,6 +148,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let materialized = measure_latency(OBSERVATIONS, |observation| {
         let parameter = &parameters[usize::try_from(observation % ROWS)?];
         black_box(snapshot.execute_prepared(&materialized_plan, black_box(parameter))?);
+        Ok(())
+    })?;
+    let bounded_physical = measure_latency(OBSERVATIONS, |observation| {
+        let parameter =
+            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
+        black_box(database.execute_prepared_latest(&bounded_physical_plan, black_box(parameter))?);
+        Ok(())
+    })?;
+    let bounded_materialized = measure_latency(OBSERVATIONS, |observation| {
+        let parameter =
+            &bounded_parameters[usize::try_from(observation % BOUNDED_PARAMETER_COUNT)?];
+        black_box(snapshot.execute_prepared(&bounded_materialized_plan, black_box(parameter))?);
         Ok(())
     })?;
     print_receipt(&Receipt {
@@ -121,6 +173,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         snapshot_materialization_duration,
         physical,
         materialized,
+        bounded_physical,
+        bounded_materialized,
     })?;
     Ok(())
 }
@@ -194,16 +248,23 @@ fn deterministic_payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn query_parameters() -> Vec<[SqlValue; 1]> {
+fn exact_query_parameters() -> Vec<[SqlValue; 1]> {
     (0..ROWS)
         .map(|row| [SqlValue::Text(format!("person-{row:04}@hyphae.local"))])
         .collect()
 }
 
-fn validate_result(result: SqlResult) -> Result<(), Box<dyn Error>> {
+fn bounded_query_parameters() -> Vec<[SqlValue; 1]> {
+    (1..=BOUNDED_PARAMETER_COUNT)
+        .map(|id| [SqlValue::Signed(i64::from(id))])
+        .collect()
+}
+
+fn validate_result(result: SqlResult, expected_rows: usize) -> Result<(), Box<dyn Error>> {
     match result {
         SqlResult::Rows { columns, rows }
-            if columns == ["users.id", "users.payload", "profiles.city"] && rows.len() == 1 =>
+            if columns == ["users.id", "users.payload", "profiles.city"]
+                && rows.len() == expected_rows =>
         {
             Ok(())
         }
@@ -236,7 +297,7 @@ fn measure_latency(
 
 fn print_receipt(receipt: &Receipt<'_>) -> Result<(), Box<dyn Error>> {
     println!("{{");
-    println!("  \"schema\": \"hyphae-native-indexed-inner-join-smoke-v1\",");
+    println!("  \"schema\": \"hyphae-native-indexed-inner-join-smoke-v2\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!(
         "  \"source_commit\": {},",
@@ -269,13 +330,42 @@ fn print_receipt(receipt: &Receipt<'_>) -> Result<(), Box<dyn Error>> {
         receipt.snapshot_materialization_duration,
     );
     println!("  \"provisional_targets_micros\": {{");
-    println!("    \"p50\": {P50_TARGET_MICROS:.3},");
-    println!("    \"p99\": {P99_TARGET_MICROS:.3}");
+    println!("    \"exact_p50\": {P50_TARGET_MICROS:.3},");
+    println!("    \"exact_p99\": {P99_TARGET_MICROS:.3},");
+    println!("    \"bounded_limit_10_p50\": {BOUNDED_P50_TARGET_MICROS:.3},");
+    println!("    \"bounded_limit_10_p99\": {BOUNDED_P99_TARGET_MICROS:.3}");
     println!("  }},");
-    println!("  \"query\": {},", json_string(QUERY)?);
+    println!("  \"exact_query\": {},", json_string(QUERY)?);
+    println!("  \"bounded_query\": {},", json_string(BOUNDED_QUERY)?);
     println!("  \"routes\": {{");
-    print_latency("physical_latest", &receipt.physical, true);
-    print_latency("materialized_snapshot", &receipt.materialized, false);
+    print_latency(
+        "physical_latest_exact",
+        &receipt.physical,
+        P50_TARGET_MICROS,
+        P99_TARGET_MICROS,
+        true,
+    );
+    print_latency(
+        "materialized_snapshot_exact",
+        &receipt.materialized,
+        P50_TARGET_MICROS,
+        P99_TARGET_MICROS,
+        true,
+    );
+    print_latency(
+        "physical_latest_bounded_limit_10",
+        &receipt.bounded_physical,
+        BOUNDED_P50_TARGET_MICROS,
+        BOUNDED_P99_TARGET_MICROS,
+        true,
+    );
+    print_latency(
+        "materialized_snapshot_bounded_limit_10",
+        &receipt.bounded_materialized,
+        BOUNDED_P50_TARGET_MICROS,
+        BOUNDED_P99_TARGET_MICROS,
+        false,
+    );
     println!("  }}");
     println!("}}");
     Ok(())
@@ -285,7 +375,13 @@ fn print_duration(name: &str, duration: Duration) {
     println!("  \"{name}\": {:.3},", duration_micros(duration) / 1_000.0);
 }
 
-fn print_latency(name: &str, summary: &LatencySummary, trailing_comma: bool) {
+fn print_latency(
+    name: &str,
+    summary: &LatencySummary,
+    p50_target: f64,
+    p99_target: f64,
+    trailing_comma: bool,
+) {
     println!("    \"{name}\": {{");
     println!("      \"p50_us\": {:.3},", summary.p50);
     println!("      \"p95_us\": {:.3},", summary.p95);
@@ -298,11 +394,11 @@ fn print_latency(name: &str, summary: &LatencySummary, trailing_comma: bool) {
     );
     println!(
         "      \"provisional_p50_met\": {},",
-        summary.p50 <= P50_TARGET_MICROS
+        summary.p50 <= p50_target
     );
     println!(
         "      \"provisional_p99_met\": {}",
-        summary.p99 <= P99_TARGET_MICROS
+        summary.p99 <= p99_target
     );
     println!("    }}{}", if trailing_comma { "," } else { "" });
 }
