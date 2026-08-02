@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -495,7 +496,8 @@ def build_receipt(
         for entry in closure["packages"]
         if entry["name"] == closure["root_package"]
     )
-    geiger_target = root / "target" / "native-dependency-geiger"
+    host_identity = f"{sys.platform}-{platform.machine().lower()}"
+    geiger_target = root / "target" / "native-dependency-geiger" / host_identity
     geiger_environment = {"CARGO_TARGET_DIR": str(geiger_target.absolute())}
     geiger_command = [
         "cargo",
