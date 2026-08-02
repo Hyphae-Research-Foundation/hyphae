@@ -480,9 +480,11 @@ evidence](evidence/native-lineage-threading-linux-2026-08-02.md) makes the
 directory UUIDv7 plus history epoch part of `HYROOT03` manifests and
 `HYWAR002` retention anchors. Direct Linux tests preserve historical codec
 bytes while rejecting legacy, mixed, and marker-divergent recovery authority
-before retained WAL state can be selected or reset. Offline promotion, a
-sanctioned epoch transition, physical power-loss evidence, hosted CI, and the
-complete G1 matrix remain open.
+before retained WAL state can be selected or reset. A follow-up exhausts all
+truncated prefixes and single-byte corruptions in both lineage-bearing
+authority fixtures, for 1,088 deterministic corrupt inputs. Offline
+promotion, a sanctioned epoch transition, physical power-loss evidence, and
+the broader G1 matrix remain open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
