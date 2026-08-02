@@ -220,6 +220,14 @@ commit before its tag can be published.
 - `native-composite-inner-join-wsl2.json` is its schema-v5 clean release
   comparison of one-column and two-column unique-secondary right lookups over
   2,048 rows and 100,000 calls per route. It remains outside G2 and G7.
+- [Native chunked-list evidence —
+  2026-08-01](native-list-2026-08-01.md) binds typed deque semantics, packed
+  end chunks, blob-backed elements, MVCC history, strict reopen, whole-list
+  FCW, corruption rejection, and all seven crash boundaries to one source
+  commit.
+- `native-list-wsl2.json` is its clean release observation for physical
+  `LLEN` and ten-element ranges from both ends of a 2,048-element list. It
+  remains outside G3 and G7.
 
 ## Hosted release evidence
 
