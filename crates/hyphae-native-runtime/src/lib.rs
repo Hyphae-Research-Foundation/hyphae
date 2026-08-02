@@ -12263,7 +12263,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Barrier,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicI64, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -12279,13 +12279,14 @@ mod tests {
     use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
-        AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
-        CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
-        CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
-        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        CommitCancellationOutcome, EngineKind, GroupCommitBoundary, GroupCommitConfig,
-        GroupCommitOutcome, GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError,
-        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
+        ActiveExpiryConfig, ActiveExpiryStats, AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY,
+        CATALOG_FORMAT_VALUE_V3, CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX,
+        CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE,
+        CATALOG_VALUE_MAGIC, CatalogName, CatalogObject, CatalogState, CheckpointBoundary,
+        ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
+        GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
+        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
+        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeSchedulerClock,
         NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
         RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
         SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
@@ -12297,6 +12298,24 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestSchedulerClock(AtomicI64);
+
+    impl TestSchedulerClock {
+        fn new(logical_time_micros: i64) -> Self {
+            Self(AtomicI64::new(logical_time_micros))
+        }
+
+        fn set(&self, logical_time_micros: i64) {
+            self.0.store(logical_time_micros, Ordering::Release);
+        }
+    }
+
+    impl NativeSchedulerClock for TestSchedulerClock {
+        fn logical_time_micros(&self) -> i64 {
+            self.0.load(Ordering::Acquire)
+        }
+    }
 
     fn recovered_commit(
         csn: u64,
@@ -17026,6 +17045,86 @@ mod tests {
         assert_eq!(
             reopened.get_latest_structure(b"committed", 154)?,
             Some(b"yes".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_uses_one_csn_clamps_clock_and_leaves_empty_sweeps_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(b"active-expiry".to_vec(), b"value".to_vec(), Some(10))?;
+        let seed = seed.commit()?;
+        assert_eq!(seed.transaction_id, TransactionId::new(1)?);
+        assert_eq!(seed.commit_csn, Csn::new(1)?);
+        assert_eq!(
+            database.get_latest_structure(b"active-expiry", 10)?,
+            None
+        );
+
+        let clock = Arc::new(TestSchedulerClock::new(10));
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
+            database,
+            GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
+            ActiveExpiryConfig::new(
+                Duration::from_micros(100),
+                1,
+                DurabilityClass::Memory,
+                1,
+            )?,
+            clock.clone(),
+        )?;
+        let first_deadline = Instant::now() + Duration::from_secs(2);
+        let first_stats = loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.expired_keys == 1 {
+                break stats;
+            }
+            if Instant::now() >= first_deadline {
+                return Err("active expiry did not tombstone the due key".into());
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(first_stats.committed_sweeps, 1);
+        assert_eq!(first_stats.failures, 0);
+        assert_eq!(first_stats.latest_logical_time_micros, 10);
+
+        clock.set(5);
+        let regression_deadline = Instant::now() + Duration::from_secs(2);
+        let regression_stats = loop {
+            let stats = scheduler
+                .active_expiry_stats()
+                .ok_or("active expiry stats missing")?;
+            if stats.attempted_sweeps > first_stats.attempted_sweeps {
+                break stats;
+            }
+            if Instant::now() >= regression_deadline {
+                return Err("active expiry did not attempt an empty sweep".into());
+            }
+            std::thread::yield_now();
+        };
+        assert!(regression_stats.empty_sweeps >= 1);
+        assert_eq!(regression_stats.latest_logical_time_micros, 10);
+
+        let mut later = scheduler.begin_optimistic(11, DurabilityClass::Strict)?;
+        later.set(b"after-active-expiry".to_vec(), b"visible".to_vec(), None)?;
+        let later = scheduler.submit(later)?;
+        assert_eq!(later.transaction_id, TransactionId::new(3)?);
+        assert_eq!(later.commit_csn, Csn::new(3)?);
+        scheduler.shutdown()?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"active-expiry", 11)?,
+            None
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"after-active-expiry", 11)?,
+            Some(b"visible".to_vec())
         );
         Ok(())
     }

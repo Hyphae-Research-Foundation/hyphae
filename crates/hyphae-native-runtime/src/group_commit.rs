@@ -933,11 +933,13 @@ fn close_database(database: &RwLock<Option<NativeDatabase>>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError,
-        GroupCommitSubmitError, MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT,
-        NativeCommitControl, REQUEST_QUEUED, SchedulerCommand, SubmissionGate, admit_command,
+        ActiveExpiryConfig, ActiveExpiryConfigError, CommitCancellationOutcome,
+        GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
+        MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitControl,
+        REQUEST_QUEUED, SchedulerCommand, SubmissionGate, admit_command,
     };
     use crate::MAX_GROUP_COMMIT_BATCH_SIZE;
+    use hyphae_native_types::DurabilityClass;
     use std::{
         sync::{Mutex, atomic::AtomicU8, mpsc},
         time::Duration,
@@ -1017,5 +1019,47 @@ mod tests {
             Err(GroupCommitSubmitError::Saturated)
         ));
         assert!(gate.try_lock().is_ok());
+    }
+
+    #[test]
+    fn active_expiry_bounds_fail_closed() {
+        assert!(matches!(
+            ActiveExpiryConfig::new(
+                Duration::from_micros(99),
+                1,
+                DurabilityClass::Memory,
+                1
+            ),
+            Err(ActiveExpiryConfigError::Interval { .. })
+        ));
+        assert_eq!(
+            ActiveExpiryConfig::new(
+                Duration::from_micros(100),
+                0,
+                DurabilityClass::Memory,
+                1
+            ),
+            Err(ActiveExpiryConfigError::BatchSize { requested: 0 })
+        );
+        assert_eq!(
+            ActiveExpiryConfig::new(
+                Duration::from_micros(100),
+                1,
+                DurabilityClass::Group,
+                1
+            ),
+            Err(ActiveExpiryConfigError::Durability {
+                requested: DurabilityClass::Group
+            })
+        );
+        assert_eq!(
+            ActiveExpiryConfig::new(
+                Duration::from_micros(100),
+                1,
+                DurabilityClass::Memory,
+                0
+            ),
+            Err(ActiveExpiryConfigError::ForegroundBudget { requested: 0 })
+        );
     }
 }
