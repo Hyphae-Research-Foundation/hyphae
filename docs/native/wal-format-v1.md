@@ -5,8 +5,12 @@ chain, incomplete-tail repair, typed transaction envelopes, root-manifest
 checkpoint anchors, and page-generation commit metadata are implemented
 experimentally; committed mutation decoding reconstructs the write-conflict
 table and the first bounded group-commit scheduler shares page/WAL flushes,
-while bounded checkpoint replay, WAL retention, and idempotent retries remain
-pending
+while current-root WAL retention, bounded suffix replay, and idempotent
+retention retries are implemented
+
+The identity-preserving current-root design for bounded replay and prefix
+deletion is fixed separately by [Native WAL retention and bounded replay
+v1](wal-retention-v1.md).
 
 The WAL is the only transaction authority for the three native engines. It
 records one cross-engine transaction, not three engine-specific commits.
@@ -231,11 +235,12 @@ super-transaction.
 6. Replay committed transactions in CSN order.
 7. Verify or rebuild the committed root set before advancing visibility.
 
-Recovery never guesses an opcode or skips an unknown committed mutation. The
-current vertical verifies checkpoint/manifest chains but deliberately scans
-the complete WAL, decodes every committed mutation, rebuilds point-write
-conflict state, and validates every committed root generation. Bounded replay
-from the selected checkpoint remains pending.
+Recovery never guesses an opcode or skips an unknown committed mutation.
+Without a retention anchor, the current vertical still scans the complete WAL.
+With a verified `HYWAR001` anchor, it reconstructs the base roots from the
+bound immutable manifest, verifies and decodes only the identity-preserving WAL
+suffix, and rebuilds point-write conflict state from that suffix. The manifest
+chain is not yet pruned and remains separate unbounded recovery work.
 
 ## Checkpoints
 
@@ -256,9 +261,11 @@ an unanchored suffix and cannot independently become transaction authority.
 See [Native root manifest and checkpoint format
 v1](root-manifest-checkpoint-v1.md).
 
-WAL deletion is allowed only when every retained snapshot and replica
-requirement is newer than the candidate segment. Retention and truncation are
-not implemented by the current vertical.
+The implemented v1 maintenance path retires only the prefix through a
+current-root checkpoint whose visible CSN equals its retention floor. It
+rejects an ineligible checkpoint and preserves absolute block, LSN, digest,
+CSN, and transaction identities. Replica, backup, archive, and
+multi-generation pin registration remain outside v1.
 
 ## Verification
 

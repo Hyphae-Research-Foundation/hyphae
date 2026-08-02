@@ -1,0 +1,90 @@
+{
+  "benchmark": "hyphae-native-wal-replay-v1",
+  "source_commit": "a74e35523977f319d29cfc5c9688b14793ebbbcb",
+  "source_tree": "271e65606b6369ee2e8d6ed530c02fd1632c34c8",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "os": "linux",
+  "arch": "x86_64",
+  "historical_updates": 400,
+  "pre_floor_commits": 402,
+  "suffix_commits": 4,
+  "open_rounds": 25,
+  "full_wal_bytes": 26804224,
+  "retained_wal_bytes": 327680,
+  "wal_byte_reduction": 0.987775,
+  "warm_reopen_speedup": 15.461882,
+  "retention": {
+    "anchor_epoch": 1,
+    "base_visible_csn": 402,
+    "retired_wal_blocks": 404,
+    "retired_wal_bytes": 26476544,
+    "anchor_publication_nanos": 18829,
+    "wal_reset_synchronization_nanos": 1103137,
+    "anchor_stabilization_nanos": 7063,
+    "total_nanos": 1134254
+  },
+  "full_history_open": {
+    "first_external_nanos": 24684765,
+    "retained_wal_blocks": 409,
+    "replayed_transactions": 406,
+    "committed_transactions": 406,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 22800369,
+      "p95_nanos": 23820900,
+      "p99_nanos": 24094041
+    },
+    "warm_internal": {
+      "p50_nanos": 22730131,
+      "p95_nanos": 23750832,
+      "p99_nanos": 23990416
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 20883035,
+      "p95_nanos": 21643142,
+      "p99_nanos": 21965085
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 159158,
+      "p95_nanos": 217823,
+      "p99_nanos": 440214
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1422424,
+      "p95_nanos": 1937493,
+      "p99_nanos": 1984477
+    }
+  },
+  "retained_suffix_open": {
+    "first_external_nanos": 1583979,
+    "retained_wal_blocks": 5,
+    "replayed_transactions": 4,
+    "committed_transactions": 406,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 1474618,
+      "p95_nanos": 1796040,
+      "p99_nanos": 1909554
+    },
+    "warm_internal": {
+      "p50_nanos": 1473335,
+      "p95_nanos": 1793520,
+      "p99_nanos": 1907014
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 223948,
+      "p95_nanos": 271824,
+      "p99_nanos": 300424
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 3016,
+      "p95_nanos": 4034,
+      "p99_nanos": 4396
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1151760,
+      "p95_nanos": 1397540,
+      "p99_nanos": 1515867
+    }
+  }
+}

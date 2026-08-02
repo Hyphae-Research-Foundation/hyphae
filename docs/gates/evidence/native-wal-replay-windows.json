@@ -1,0 +1,90 @@
+{
+  "benchmark": "hyphae-native-wal-replay-v1",
+  "source_commit": "a74e35523977f319d29cfc5c9688b14793ebbbcb",
+  "source_tree": "271e65606b6369ee2e8d6ed530c02fd1632c34c8",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "historical_updates": 400,
+  "pre_floor_commits": 402,
+  "suffix_commits": 4,
+  "open_rounds": 25,
+  "full_wal_bytes": 26804224,
+  "retained_wal_bytes": 327680,
+  "wal_byte_reduction": 0.987775,
+  "warm_reopen_speedup": 13.293409,
+  "retention": {
+    "anchor_epoch": 1,
+    "base_visible_csn": 402,
+    "retired_wal_blocks": 404,
+    "retired_wal_bytes": 26476544,
+    "anchor_publication_nanos": 1487700,
+    "wal_reset_synchronization_nanos": 3828800,
+    "anchor_stabilization_nanos": 349800,
+    "total_nanos": 5784600
+  },
+  "full_history_open": {
+    "first_external_nanos": 42640800,
+    "retained_wal_blocks": 409,
+    "replayed_transactions": 406,
+    "committed_transactions": 406,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 27714100,
+      "p95_nanos": 31500800,
+      "p99_nanos": 36829200
+    },
+    "warm_internal": {
+      "p50_nanos": 27468100,
+      "p95_nanos": 31292700,
+      "p99_nanos": 36612600
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 24686700,
+      "p95_nanos": 28668700,
+      "p99_nanos": 33970800
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 326200,
+      "p95_nanos": 384700,
+      "p99_nanos": 390000
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1581900,
+      "p95_nanos": 1923100,
+      "p99_nanos": 2027700
+    }
+  },
+  "retained_suffix_open": {
+    "first_external_nanos": 2636900,
+    "retained_wal_blocks": 5,
+    "replayed_transactions": 4,
+    "committed_transactions": 406,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 2084800,
+      "p95_nanos": 3081400,
+      "p99_nanos": 3122000
+    },
+    "warm_internal": {
+      "p50_nanos": 2082700,
+      "p95_nanos": 3077700,
+      "p99_nanos": 3118700
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 309600,
+      "p95_nanos": 389100,
+      "p99_nanos": 510400
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 4400,
+      "p95_nanos": 8400,
+      "p99_nanos": 10500
+    },
+    "warm_root_validation": {
+      "p50_nanos": 1277000,
+      "p95_nanos": 1878600,
+      "p99_nanos": 2188000
+    }
+  }
+}
