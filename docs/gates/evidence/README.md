@@ -354,3 +354,15 @@ review, and last-push approval, a writer can weaken a workflow before producing
 new successful checks. Preventing that authority also requires protected tags
 and immutable releases; the signed artifacts only make later substitution
 detectable.
+
+## Native page-generation vacuum
+
+- `native-page-vacuum-2026-08-02.md` binds current-root physical page-file
+  reclamation, V2 WAL/root metadata, retention-floor writer rejection, mixed
+  manifest checkpoints, ANN identity preservation, orphan handling, and the
+  six-boundary crash matrix to exact source.
+- `native-page-vacuum-windows.json` is its clean release-mode,
+  concurrency-one Windows observation. It records 3,580 to 72 pages,
+  57,475,072 reclaimed bytes, strict/no-op maintenance latency, separate warm
+  point-read percentiles, an isolated same-filesystem sync probe, and reopen
+  verification. It is an observation, not a G7 gate.

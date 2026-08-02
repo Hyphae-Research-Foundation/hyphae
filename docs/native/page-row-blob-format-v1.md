@@ -251,12 +251,12 @@ The implemented binary formats are specified in
   explicitly available shared capacity.
 - Admission and eviction never hold a global engine lock.
 
-The experimental pool currently serves one page-file generation, hashes
-`PageId` across bounded mutex partitions, admits only verified immutable pages,
-and evicts the least-recently-used unpinned frame within a partition. The
-[page-generation vacuum contract](page-vacuum-v1.md) specifies generation-keyed
-frames and current-root retirement; implementation, engine reservations, and a
-shared-capacity policy remain pending.
+The experimental pool keys `(PageGeneration, PageId)` across bounded mutex
+partitions, admits only verified immutable pages, and evicts the
+least-recently-used unpinned frame within a partition. The
+[page-generation vacuum contract](page-vacuum-v1.md) now implements
+current-root retirement and resets the pool at publication. Engine
+reservations and a shared-capacity policy remain pending.
 
 ## Verification
 
@@ -271,6 +271,6 @@ checkpoint interruption tests.
 Still required are broad random/property and fuzz corpora, bit flips across
 every byte range, streaming/chunked values, compression, encryption,
 reference-count/retention tests across snapshots, orphan reclamation, and
-large-corpus garbage collection. Current-root page-generation vacuum now has a
-normative contract, but its implementation and broader multi-generation
-retention policy remain pending.
+large-corpus blob garbage collection. Current-root page-generation vacuum now
+has an implementation, crash matrix, and one measured corpus, but broader
+multi-generation retention remains pending.

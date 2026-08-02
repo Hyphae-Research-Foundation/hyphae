@@ -1,6 +1,9 @@
 # Native page-generation vacuum v1
 
-Status: normative target contract; implementation and evidence remain pending
+Status: normative experimental contract; current-root implementation, codec
+coverage, crash matrix, and one Windows release observation are complete;
+multi-generation retention, blob/WAL collection, scheduling, and G7 remain
+pending
 
 This protocol reclaims superseded native page bytes without weakening WAL
 authority or pretending that logical reachability compaction shrinks the
@@ -135,8 +138,9 @@ For a strict vacuum:
 3. synchronize candidate page bytes;
 4. rename the stage to its immutable generation filename and synchronize the
    data directory where supported;
-5. append the v2 vacuum WAL transaction;
-6. synchronize the WAL;
+5. append the v2 transaction's `BEGIN` and vacuum mutation as a recoverably
+   abortable precommit;
+6. append the terminal v2 `COMMIT` record and synchronize the WAL;
 7. publish the new `RootSet` in memory;
 8. replace the active buffer pool and page-store handle; and
 9. remove prior final generations and synchronize the directory where
@@ -156,7 +160,7 @@ The test-only vacuum entry point interrupts after:
 
 1. candidate page bytes are synchronized under the temporary name;
 2. the immutable candidate generation is published without a WAL reference;
-3. the complete vacuum WAL transaction is appended but not synchronized;
+3. the vacuum WAL precommit is appended without a terminal commit;
 4. the vacuum WAL transaction is synchronized;
 5. the replacement root set is published in memory; and
 6. the prior generation is removed.
@@ -168,7 +172,7 @@ vacuum is a no-op unless newer writes created reclaimable pages.
 
 ## Acceptance evidence
 
-The implementation gate requires:
+The current implementation proves:
 
 - codec goldens and malformed/truncated cases for page generation,
   `HYCMT001` compatibility, `HYCMT002`, `HYROOT01`, and `HYROOT02`;
@@ -180,9 +184,15 @@ The implementation gate requires:
 - corruption rejection before WAL publication;
 - all six interruption boundaries with prior-or-complete recovery;
 - exact page/file bytes before and after on a corpus that contains relational
-  history, structure tombstones, lexical updates, and ANN generations;
+  history, structures, lexical state, and ANN generations;
 - a no-op case with no CSN, WAL, or generation movement; and
 - vacuum latency reported separately from point-operation and fsync latency.
+
+The [2026-08-02 evidence](../gates/evidence/native-page-vacuum-2026-08-02.md)
+binds those results to exact source and a machine-readable Windows release
+observation. Structure tombstone removal remains the separate reachability
+compaction gate; vacuum preserves every entry reachable from its captured
+current root.
 
 This vertical closes neither G1 nor the complete retention program. It does not
 collect blobs, retain multiple restartable historical generations, rewrite or

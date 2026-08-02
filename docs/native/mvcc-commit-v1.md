@@ -41,8 +41,11 @@ The implemented relational V2 format publishes one open row-version page and
 links immutable closed copies toward older versions. Each older `end_csn`
 equals the next-newer `begin_csn`; recovery validates the entire chain and
 fails closed on cycles or discontinuities. Historical roots retain their
-original pages, so closing a version never mutates bytes reachable through an
-older snapshot. Version retention and vacuum are not yet implemented.
+original pages until explicit current-root vacuum advances the page generation
+and retention floor. Closing a version never mutates bytes reachable through
+an older snapshot. Materialized in-process snapshots survive vacuum;
+restartable pre-floor roots and multi-generation retention are not yet
+implemented.
 
 ## Snapshot-isolation conflicts
 

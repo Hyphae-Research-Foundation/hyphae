@@ -45,6 +45,7 @@ The current reviewable drafts are:
 
 - [canonical types](../native/types-v1.md);
 - [page, row, and blob format](../native/page-row-blob-format-v1.md);
+- [current-root page-generation vacuum](../native/page-vacuum-v1.md);
 - [B+tree format](../native/btree-format-v1.md);
 - [root manifest and checkpoint format](../native/root-manifest-checkpoint-v1.md);
 - [WAL format](../native/wal-format-v1.md);
@@ -313,6 +314,19 @@ ten replacement pages. The
 fixes the retention floor, generation publication, rewrite, and crash matrix;
 implementation and measured physical reclamation remain open.
 
+The [native page-generation vacuum
+evidence](evidence/native-page-vacuum-2026-08-02.md) closes that immediate
+physical-reclamation gap for the current-root policy. It binds
+generation-aware pages, WAL and root manifests; exact cross-engine/ANN
+equality; detached-writer retention-floor rejection; six interruption
+boundaries; orphan cleanup; and a clean Windows release receipt. The measured
+64-row, nine-version corpus reclaimed 97.989% of page-file bytes while
+preserving a 1.000 microsecond warm point-read p50. Strict vacuum itself
+measured 29.791 milliseconds and the immediate no-op measured 12.638
+milliseconds, so neither is claimed as a microsecond maintenance path.
+Multi-generation retention, blob/WAL collection, background scheduling, and
+the complete G1/G7 matrices remain open.
+
 The [native dependency-closure
 evidence](evidence/native-dependency-closure-2026-08-02.md) makes the non-dev
 normal/build graph rooted at `hyphae-native-runtime` an exact fail-closed
@@ -332,7 +346,8 @@ native inverted B+tree while legacy inline roots remain compatible. Detached
 transactions now prepare concurrently and rebase disjoint all-engine writes
 under serialized publication;
 simultaneous commit submission and concurrency/saturation evidence remain
-pending, along with retention/vacuum, secondary-index range/streaming
+pending, along with multi-generation retention, blob/WAL collection,
+secondary-index range/streaming
 execution, zero-copy relational operator cursors, general relational
 expressions beyond the admitted residual slice, constraints/planning,
 remaining structure families, positional
@@ -347,9 +362,9 @@ sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
 algebra/TTL, score/reverse/rank sorted-set operations, streams, an engine-owned
 background timer around the implemented scalar expiry primitive, model tests,
-and retention-aware physical vacuum required to close G3. The ordered cleanup
-and current-root compaction receipts provide exact first amplification
-measurements, not the complete memory-amplification gate.
+and configurable historical retention required to close G3. Ordered cleanup,
+current-root compaction, and page-generation vacuum provide exact first
+amplification measurements, not the complete memory-amplification gate.
 
 ## G1 substrate exit
 
