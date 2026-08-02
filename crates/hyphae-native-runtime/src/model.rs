@@ -203,6 +203,7 @@ fn legacy_catalog_object(
                 doc_values: false,
             }],
             vector: None,
+            ann: None,
         })),
         EngineKind::Kernel | EngineKind::Structure => Err(ModelError::WrongEngine),
     }

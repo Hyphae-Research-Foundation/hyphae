@@ -91,8 +91,9 @@ Current opcodes are relational `CREATE TABLE=1`, `INSERT ROW=2`, `UPDATE
 ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE VALUE=8`, `EXPIRE VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`,
 `DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
-MEMBER=16`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`,
-collection creation, hash-field deletion, and both set-member mutations
+MEMBER=16`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN
+INDEX=17`, `UPSERT VECTOR=18`, `DELETE VECTOR=19`. `DELETE VALUE`, collection
+creation, hash-field deletion, both set-member mutations, and vector deletion
 require an empty value and no expiry. `EXPIRE VALUE` requires an explicit
 expiry and carries the retained logical value.
 
@@ -117,6 +118,16 @@ by the member bytes. Conflict identities add disjoint scalar/collection,
 hash-field, and set-member domains, so arbitrary binary user keys cannot alias
 a member mutation. Set creation shares the scalar/collection ownership domain;
 different set members retain first-committer-wins independently.
+
+`CREATE ANN INDEX` carries the complete catalog `HYCOBJ01` search definition
+and normalized name identity. `UPSERT VECTOR` and `DELETE VECTOR` require a
+16-byte big-endian object ID key; upsert values contain one or more canonical
+little-endian `f32` components and delete values are empty. Expiry is
+forbidden. Recovery groups the ordered vector mutations by target index,
+rebuilds one canonical HNSW generation with the commit CSN, and persists it in
+the search B+tree. The conflict table keys vector writes by target index plus
+object ID, so disjoint vectors may rebase while same-vector writers retain
+first-committer-wins.
 
 `COMMIT` contains:
 
@@ -231,5 +242,7 @@ Current tests cover the block golden, complete transaction envelope, semantic
 mutation round-trip and count/digest verification, checkpoint encoding/chain
 validation, blob-reference commits, complete corruption, incomplete physical
 tail repair, deterministic blob/page/WAL/root/checkpoint interruptions, and
-set creation/member mutation round-trips. The broader list above remains gate
-work.
+set creation/member and ANN create/upsert/delete mutation round-trips. ANN
+shape tests reject truncated object identities and non-`f32`-aligned payloads;
+the cross-engine ANN matrix interrupts every implemented commit boundary. The
+broader list above remains gate work.

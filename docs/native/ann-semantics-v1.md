@@ -1,9 +1,10 @@
 # Native ANN semantics v1
 
-Status: normative target contract; deterministic in-memory HNSW kernel,
-canonical `f32` admission, three metrics, exact oracle, mutation rebuild,
-build identity and fail-closed canonical restore are implemented
-experimentally; search B+tree, WAL, MVCC delta, filtering and background
+Status: normative target contract; deterministic HNSW, canonical `f32`
+admission, three metrics, exact oracle, catalog definitions, native search
+B+tree generations, WAL mutations, all-engine MVCC visibility, batch rebuild,
+historical snapshots and fail-closed recovery are implemented experimentally;
+buffered graph traversal, filtering, tombstone compaction and background
 generation publication remain pending
 
 ANN is a Hyphae-owned search-engine capability. Exact vector execution remains
@@ -53,17 +54,53 @@ mutation cost.
 `IndexSnapshot` exports definition, vectors with creating CSNs, graph nodes,
 entry point, maximum level and build identity. Restore reconstructs the graph
 from the vector records and rejects any snapshot that differs from that
-canonical build. The native search engine has not yet assigned page keys or
-WAL operations to these records, so the kernel alone is not durable ANN.
+canonical build.
+
+## Implemented durable generation
+
+The native runtime stores ANN in the same copy-on-write search B+tree as
+lexical state:
+
+- `0x05 + index ObjectId` selects the current `HYANNM01` generation metadata;
+- `0x06 + index ObjectId + build identity + object ObjectId` stores one
+  `HYANNV01` vector with its creating CSN; and
+- `0x07 + index ObjectId + build identity + object ObjectId + u16 layer`
+  stores one `HYANNG01` neighbor list.
+
+Every identity component is big-endian in the key. The 32-byte build identity
+is content-bound by the kernel. Vector components remain canonical
+little-endian `f32`; graph neighbors are stable 128-bit object IDs.
+
+One commit groups all vector mutations by index, applies them in WAL order,
+builds one private canonical replacement, persists its immutable records, and
+switches the metadata pointer in the transaction's search root. The root is
+published under the same CSN as catalog, relational and structure roots. Old
+generation records remain physically reachable from newer B+tree roots but
+are logically ignored; reclamation is pending.
+
+Open and snapshot materialization scan the selected generation, validate every
+ANN physical key/value, reconstruct the complete `IndexSnapshot`, and require
+`HnswIndex::restore` to reproduce it exactly. Unknown indexes, missing
+metadata, orphan generation records, malformed vectors/layers, count
+divergence, bad neighbors or a noncanonical build fail the complete root.
+Queries currently traverse this validated in-memory materialization, not
+buffer-pool pages directly.
 
 ## MVCC and mutation
 
-New/updated vectors enter a transactional mutable delta. Deletions create
-versioned tombstones. Background graph consolidation builds from a pinned
-snapshot and publishes a new generation atomically.
+New/updated vectors enter the transaction-private replacement generation.
+`upsert_vectors` admits a duplicate-free batch atomically and performs one
+canonical rebuild. Single-vector upsert and delete preserve read-your-writes.
+At commit, all mutations for an index are rebuilt once with the assigned CSN.
+Retained root sets preserve historical generations.
 
-A query merges visible delta and graph candidates, applies snapshot filters,
-and may exact-rerank a declared candidate count.
+The current implementation does not yet retain a separate mutable delta or
+versioned tombstone set: foreground delete builds a replacement generation.
+Background consolidation, tombstone compaction and delta/graph query merge
+remain target work.
+
+A query traverses the visible graph and may exact-rerank a declared candidate
+count. Snapshot filtering remains pending.
 
 ## Filtering
 
@@ -98,7 +135,9 @@ distribution across at least ten deterministic query sets.
 
 ## Verification
 
-Tests cover metric goldens, admission failures, deterministic rebuild,
-snapshot visibility, update/delete, filter strategies, exact-rerank identity,
-corruption and interrupted build recovery, quality regression and the explicit
-approximation label.
+Current tests cover metric goldens, admission failures, deterministic rebuild,
+batch atomicity, historical snapshot visibility, optimistic write conflicts,
+update/delete, exact-rerank identity, reopen equivalence, orphan/corrupt
+generation rejection, and all seven cross-engine commit interruption
+boundaries. Filter strategies, interrupted background builds, page-buffered
+traversal and the complete quality matrix remain pending.

@@ -2,9 +2,10 @@
 
 Status: normative target contract; deterministic tokenization, BM25, native
 B+tree collection/document/term/posting namespaces, direct physical `MATCH`,
-legacy inline-state compatibility, and multilevel recovery evidence are
-implemented experimentally; positions, segments, phrases, facets, and broad
-scale/quality evidence remain pending
+catalogued vector/HNSW generations, exact/approximate vector query, legacy
+inline-state compatibility, and multilevel recovery evidence are implemented
+experimentally; positions, segments, phrases, filters, facets, hybrid fusion,
+and broad scale/quality evidence remain pending
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -55,6 +56,9 @@ copy-on-write native B+tree. It stores:
 | `0x02` | collection `ObjectId` + document ID | `HYDOCS01` token count and inline/blob source text |
 | `0x03` | collection `ObjectId` + canonical UTF-8 term | `HYTERM01` document frequency |
 | `0x04` | collection `ObjectId` + u32 term length + term + document ID | `HYPOST01` term frequency |
+| `0x05` | vector-index `ObjectId` | `HYANNM01` current generation metadata |
+| `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
+| `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
 
 The fixed 128-bit object ID is big-endian in every key. The posting term
 length is big-endian so a prefix scan identifies exactly one term even when
@@ -68,6 +72,12 @@ inserts one posting per distinct term. Text above 8,192 bytes uses the common
 content-addressed blob store. The format does not yet store positions,
 offsets, field norms, tombstones, generations, or immutable merge segments.
 
+`CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
+root and global transaction. Vector writes are grouped per index at commit so
+one duplicate-free batch produces one canonical HNSW generation rather than
+one rebuild per vector. The `0x05` record selects that generation atomically;
+older `0x06`/`0x07` records are retained until native reclamation exists.
+
 Complete-state validation rebuilds terms, document frequencies, term
 frequencies, document count, and total length from stored source text and
 requires byte-for-byte equality with the physical metadata and postings.
@@ -80,9 +90,12 @@ V1 target operators are exact term, match, boolean, phrase, range, prefix,
 fuzzy, wildcard, exists, stable-ID filter, lexical top-k, facet, metric
 aggregation, highlight, vector search and hybrid fusion.
 
-The implemented vertical slice is one analyzer, one text field, `MATCH`, top-k
-and a stable-ID tie-breaker. Phrase, boolean, range, prefix, fuzzy, wildcard,
-facets, highlighting, doc values, and hybrid operators remain target work.
+The implemented vertical slice is one analyzer, one text field, `MATCH`,
+exact vector ranking, approximate HNSW top-k with optional exact reranking,
+and stable-ID tie-breakers. Vector query receipts name the snapshot CSN, build
+identity, metric, breadth, candidate count, reranking flag and visited nodes.
+Phrase, boolean, range, prefix, fuzzy, wildcard, vector filters, facets,
+highlighting, doc values, and hybrid operators remain target work.
 
 ## Lexical scoring
 
@@ -119,10 +132,11 @@ and are labelled with the skipped/error state.
 ## Verification
 
 Current tests cover reference/physical BM25 equivalence, multilevel postings,
-historical snapshots, optimistic disjoint-document rebase, restart,
-single-page legacy compatibility, large-text blob reuse, key bounds, metadata
-corruption, and all-engine crash recovery. Required remaining evidence
+historical lexical and vector snapshots, optimistic disjoint document/vector
+rebase, vector batch atomicity, restart, single-page legacy compatibility,
+large-text blob reuse, key bounds, lexical/ANN metadata corruption, canonical
+graph restore, and all-engine crash recovery. Required remaining evidence
 includes analyzer/token/position goldens, BM25F score/explanation fixtures,
-query-operator properties, delete/update visibility, rebuild equivalence,
-merge interruption, facet/aggregation correctness, bounded cancellation,
-quality metrics, and cross-engine stable-ID joins.
+broader query-operator properties, lexical delete/update visibility, buffered
+ANN traversal, merge interruption, facet/aggregation correctness, bounded
+cancellation, full-scale quality metrics, and cross-engine stable-ID joins.

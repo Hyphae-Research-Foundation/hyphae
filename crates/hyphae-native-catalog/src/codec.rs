@@ -7,10 +7,11 @@ use hyphae_native_types::{
 };
 
 use super::{
-    CatalogError, CatalogName, CatalogObject, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
-    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
-    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition,
+    MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES,
+    ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
+    SearchFieldDefinition, SecondaryIndexDefinition, StructureDefinition, StructureKind,
+    StructureOwnership, VectorMetric,
 };
 
 const DEFINITION_MAGIC: [u8; 8] = *b"HYCOBJ01";
@@ -135,13 +136,25 @@ impl Encoder {
             }
             self.put_bool(field.doc_values)?;
         }
-        match definition.vector {
-            Some(vector) => {
+        match (definition.vector, definition.ann) {
+            (Some(vector), None) => {
                 self.put_byte(1)?;
                 self.put_byte(vector.element() as u8)?;
                 self.put_fixed(&vector.dimension().to_le_bytes())?;
             }
-            None => self.put_byte(0)?,
+            (Some(vector), Some(ann)) => {
+                self.put_byte(2)?;
+                self.put_byte(vector.element() as u8)?;
+                self.put_fixed(&vector.dimension().to_le_bytes())?;
+                self.put_byte(ann.metric() as u8)?;
+                self.put_fixed(&ann.m().to_le_bytes())?;
+                self.put_fixed(&ann.ef_construction().to_le_bytes())?;
+                self.put_fixed(&ann.ef_search_default().to_le_bytes())?;
+                self.put_fixed(&ann.ef_search_max().to_le_bytes())?;
+                self.put_fixed(&ann.seed().to_le_bytes())?;
+            }
+            (None, None) => self.put_byte(0)?,
+            (None, Some(_)) => return Err(CatalogError::AnnRequiresVector),
         }
         Ok(())
     }
@@ -320,16 +333,44 @@ impl<'encoded> Decoder<'encoded> {
                 doc_values,
             });
         }
-        let vector = match self.byte()? {
-            0 => None,
+        let (vector, ann) = match self.byte()? {
+            0 => (None, None),
             1 => {
                 if self.byte()? != VectorElement::Float32 as u8 {
                     return Err(CatalogError::InvalidDefinitionEncoding);
                 }
                 let dimension = u16::from_le_bytes(self.fixed()?);
-                Some(
-                    VectorType::new(VectorElement::Float32, dimension)
-                        .map_err(|_| CatalogError::InvalidDefinitionEncoding)?,
+                (
+                    Some(
+                        VectorType::new(VectorElement::Float32, dimension)
+                            .map_err(|_| CatalogError::InvalidDefinitionEncoding)?,
+                    ),
+                    None,
+                )
+            }
+            2 => {
+                if self.byte()? != VectorElement::Float32 as u8 {
+                    return Err(CatalogError::InvalidDefinitionEncoding);
+                }
+                let dimension = u16::from_le_bytes(self.fixed()?);
+                let vector = VectorType::new(VectorElement::Float32, dimension)
+                    .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
+                let metric = match self.byte()? {
+                    1 => VectorMetric::Cosine,
+                    2 => VectorMetric::NegativeDot,
+                    3 => VectorMetric::SquaredL2,
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
+                (
+                    Some(vector),
+                    Some(AnnIndexDefinition::new(
+                        metric,
+                        u16::from_le_bytes(self.fixed()?),
+                        u16::from_le_bytes(self.fixed()?),
+                        u16::from_le_bytes(self.fixed()?),
+                        u16::from_le_bytes(self.fixed()?),
+                        u64::from_le_bytes(self.fixed()?),
+                    )?),
                 )
             }
             _ => return Err(CatalogError::InvalidDefinitionEncoding),
@@ -338,6 +379,7 @@ impl<'encoded> Decoder<'encoded> {
             header,
             fields,
             vector,
+            ann,
         })
     }
 
@@ -462,10 +504,10 @@ mod tests {
     };
 
     use super::{
-        CatalogError, CatalogName, CatalogObject, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
-        ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-        SearchFieldDefinition, SecondaryIndexDefinition, StructureDefinition, StructureKind,
-        StructureOwnership,
+        AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition,
+        MAX_CATALOG_DEFINITION_BYTES, ObjectHeader, QualifiedName, RelationDefinition,
+        SearchCollectionDefinition, SearchFieldDefinition, SecondaryIndexDefinition,
+        StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
     };
     use crate::MAX_CATALOG_NAME_BYTES;
 
@@ -572,6 +614,23 @@ mod tests {
                 },
             ],
             vector: Some(VectorType::new(VectorElement::Float32, 384)?),
+            ann: Some(AnnIndexDefinition::new(
+                VectorMetric::Cosine,
+                16,
+                128,
+                64,
+                256,
+                7,
+            )?),
+        }))
+    }
+
+    fn legacy_exact_vector_search() -> Result<CatalogObject, Box<dyn std::error::Error>> {
+        Ok(CatalogObject::Search(SearchCollectionDefinition {
+            header: header(5, EngineKind::Search, "legacy_vectors")?,
+            fields: Vec::new(),
+            vector: Some(VectorType::new(VectorElement::Float32, 3)?),
+            ann: None,
         }))
     }
 
@@ -591,6 +650,44 @@ mod tests {
                 encoded
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_exact_vector_definition_keeps_its_canonical_v1_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let object = legacy_exact_vector_search()?;
+        let encoded = object.encode_definition()?;
+        let decoded = CatalogObject::decode_definition(&encoded)?;
+        assert_eq!(decoded, object);
+        assert_eq!(decoded.encode_definition()?, encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn ann_definition_requires_a_vector_and_checked_hnsw_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            AnnIndexDefinition::new(VectorMetric::SquaredL2, 1, 16, 16, 32, 0),
+            Err(CatalogError::InvalidAnnM)
+        );
+        assert_eq!(
+            AnnIndexDefinition::new(VectorMetric::NegativeDot, 16, 8, 16, 32, 0),
+            Err(CatalogError::InvalidAnnEfConstruction)
+        );
+        assert_eq!(
+            AnnIndexDefinition::new(VectorMetric::Cosine, 16, 64, 65, 64, 0),
+            Err(CatalogError::InvalidAnnEfSearch)
+        );
+
+        let CatalogObject::Search(mut definition) = search()? else {
+            return Err("expected search definition".into());
+        };
+        definition.vector = None;
+        assert_eq!(
+            CatalogObject::Search(definition).validate(),
+            Err(CatalogError::AnnRequiresVector)
+        );
         Ok(())
     }
 

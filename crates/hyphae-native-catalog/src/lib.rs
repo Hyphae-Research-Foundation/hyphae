@@ -58,6 +58,18 @@ pub enum CatalogError {
     /// Search fields are not strictly ordered by stable field ID.
     #[error("search fields must be strictly ordered by field ID")]
     NoncanonicalFieldOrder,
+    /// ANN configuration is present without a fixed vector type.
+    #[error("ANN configuration requires a fixed vector type")]
+    AnnRequiresVector,
+    /// HNSW `M` is outside the versioned range.
+    #[error("catalog HNSW M must be in 2 through 64")]
+    InvalidAnnM,
+    /// HNSW construction breadth is smaller than `M`.
+    #[error("catalog HNSW ef_construction must be at least M")]
+    InvalidAnnEfConstruction,
+    /// HNSW query breadth is zero, inverted, or exceeds its maximum.
+    #[error("catalog HNSW ef_search bounds are invalid")]
+    InvalidAnnEfSearch,
     /// A primary-key column is not part of the relation.
     #[error("primary-key column {0} does not exist")]
     MissingPrimaryKeyColumn(ColumnId),
@@ -435,6 +447,95 @@ pub struct SearchFieldDefinition {
     pub doc_values: bool,
 }
 
+/// Vector distance fixed by one catalog search definition.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum VectorMetric {
+    /// One minus cosine similarity.
+    Cosine = 1,
+    /// Negated dot product.
+    NegativeDot = 2,
+    /// Squared Euclidean distance.
+    SquaredL2 = 3,
+}
+
+/// Versioned HNSW construction and query configuration stored in the catalog.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AnnIndexDefinition {
+    metric: VectorMetric,
+    m: u16,
+    ef_construction: u16,
+    ef_search_default: u16,
+    ef_search_max: u16,
+    seed: u64,
+}
+
+impl AnnIndexDefinition {
+    /// Constructs a checked catalog ANN definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `M` is in 2 through 64, construction breadth
+    /// is at least `M`, and default query breadth is nonzero and no larger
+    /// than its configured maximum.
+    pub fn new(
+        metric: VectorMetric,
+        m: u16,
+        ef_construction: u16,
+        ef_search_default: u16,
+        ef_search_max: u16,
+        seed: u64,
+    ) -> Result<Self, CatalogError> {
+        if !(2..=64).contains(&m) {
+            return Err(CatalogError::InvalidAnnM);
+        }
+        if ef_construction < m {
+            return Err(CatalogError::InvalidAnnEfConstruction);
+        }
+        if ef_search_default == 0 || ef_search_default > ef_search_max {
+            return Err(CatalogError::InvalidAnnEfSearch);
+        }
+        Ok(Self {
+            metric,
+            m,
+            ef_construction,
+            ef_search_default,
+            ef_search_max,
+            seed,
+        })
+    }
+
+    /// Fixed vector distance.
+    pub const fn metric(self) -> VectorMetric {
+        self.metric
+    }
+
+    /// Maximum retained neighbors per node and layer.
+    pub const fn m(self) -> u16 {
+        self.m
+    }
+
+    /// Candidate breadth used during deterministic construction.
+    pub const fn ef_construction(self) -> u16 {
+        self.ef_construction
+    }
+
+    /// Default query breadth.
+    pub const fn ef_search_default(self) -> u16 {
+        self.ef_search_default
+    }
+
+    /// Maximum admitted query breadth.
+    pub const fn ef_search_max(self) -> u16 {
+        self.ef_search_max
+    }
+
+    /// Definition-pinned deterministic seed.
+    pub const fn seed(self) -> u64 {
+        self.seed
+    }
+}
+
 /// Native search collection definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchCollectionDefinition {
@@ -444,6 +545,8 @@ pub struct SearchCollectionDefinition {
     pub fields: Vec<SearchFieldDefinition>,
     /// Optional fixed-dimension vector index.
     pub vector: Option<VectorType>,
+    /// Optional versioned approximate-nearest-neighbor configuration.
+    pub ann: Option<AnnIndexDefinition>,
 }
 
 impl SearchCollectionDefinition {
@@ -453,6 +556,9 @@ impl SearchCollectionDefinition {
     ///
     /// Returns an error for duplicate field identities.
     pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.ann.is_some() && self.vector.is_none() {
+            return Err(CatalogError::AnnRequiresVector);
+        }
         if self.fields.len() > MAX_CATALOG_DEFINITION_ITEMS {
             return Err(CatalogError::TooManyDefinitionItems);
         }

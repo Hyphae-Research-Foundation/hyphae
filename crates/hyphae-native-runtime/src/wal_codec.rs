@@ -50,6 +50,9 @@ pub(crate) enum Opcode {
     CreateSet = 14,
     AddSetMember = 15,
     DeleteSetMember = 16,
+    CreateAnnIndex = 17,
+    UpsertVector = 18,
+    DeleteVector = 19,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +522,11 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
         }
+        value if value == Opcode::CreateAnnIndex as u8 => {
+            (Opcode::CreateAnnIndex, EngineKind::Search)
+        }
+        value if value == Opcode::UpsertVector as u8 => (Opcode::UpsertVector, EngineKind::Search),
+        value if value == Opcode::DeleteVector as u8 => (Opcode::DeleteVector, EngineKind::Search),
         _ => return Err(WalSemanticError::InvalidBody),
     })
 }
@@ -605,13 +613,18 @@ fn validate_mutation_shape(
         | Opcode::CreateSecondaryIndex
         | Opcode::CreateIndex
         | Opcode::IndexDocument
+        | Opcode::CreateAnnIndex
+        | Opcode::UpsertVector
+        | Opcode::DeleteVector
         | Opcode::UpdateRow
         | Opcode::DeleteRow
             if !has_target =>
         {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::DeleteRow if value_length != 0 => return Err(WalSemanticError::InvalidBody),
+        Opcode::DeleteRow | Opcode::DeleteVector if value_length != 0 => {
+            return Err(WalSemanticError::InvalidBody);
+        }
         Opcode::DeleteValue
         | Opcode::CreateHash
         | Opcode::DeleteHashField
@@ -631,6 +644,9 @@ fn validate_mutation_shape(
         | Opcode::UpdateRow
         | Opcode::DeleteRow
         | Opcode::CreateSecondaryIndex
+        | Opcode::CreateAnnIndex
+        | Opcode::UpsertVector
+        | Opcode::DeleteVector
             if expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -645,6 +661,12 @@ fn validate_mutation_shape(
             | Opcode::DeleteSetMember
     ) && !valid_collection_member_identity(key)
     {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    if matches!(opcode, Opcode::UpsertVector | Opcode::DeleteVector) && key.len() != 16 {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    if opcode == Opcode::UpsertVector && (value_length == 0 || !value_length.is_multiple_of(4)) {
         return Err(WalSemanticError::InvalidBody);
     }
     Ok(())
@@ -809,6 +831,30 @@ mod tests {
                 b"native search",
                 None,
             ),
+            mutation(
+                EngineKind::Search,
+                Opcode::CreateAnnIndex,
+                Some(ObjectId::new(3)?),
+                b"",
+                b"catalog-definition",
+                None,
+            ),
+            mutation(
+                EngineKind::Search,
+                Opcode::UpsertVector,
+                Some(ObjectId::new(3)?),
+                &ObjectId::new(4)?.get().to_be_bytes(),
+                &[0, 0, 128, 63, 0, 0, 0, 0],
+                None,
+            ),
+            mutation(
+                EngineKind::Search,
+                Opcode::DeleteVector,
+                Some(ObjectId::new(3)?),
+                &ObjectId::new(5)?.get().to_be_bytes(),
+                b"",
+                None,
+            ),
         ];
         let roots = [
             PageId::new(1)?,
@@ -832,8 +878,44 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 11);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 14);
         assert_eq!(recovered.commits[0].mutations, mutations);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_mutations_reject_noncanonical_object_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mutations = [mutation(
+            EngineKind::Search,
+            Opcode::UpsertVector,
+            Some(ObjectId::new(3)?),
+            &[1; 15],
+            &[0, 0, 128, 63],
+            None,
+        )];
+        let pending = encode_transaction(&TransactionPlan {
+            transaction_id: TransactionId::new(1)?,
+            read_csn: None,
+            catalog_version: CatalogVersion::new(1)?,
+            logical_time_micros: 10,
+            durability: DurabilityClass::Strict,
+            mutations: &mutations,
+            commit_csn: Csn::new(1)?,
+            roots: [
+                PageId::new(1)?,
+                PageId::new(2)?,
+                PageId::new(3)?,
+                PageId::new(4)?,
+            ],
+            blob_generation: 0,
+        })?;
+        let block = WalBlock::build(1, [0; 32], pending)?;
+        let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
+        assert!(matches!(
+            recover_wal(decoded.records()),
+            Err(WalSemanticError::InvalidBody)
+        ));
         Ok(())
     }
 

@@ -712,6 +712,7 @@ version = "0.2.1"
 dependencies = [
  "blake3",
  "crc32c",
+ "hyphae-native-ann",
  "hyphae-native-blobs",
  "hyphae-native-btree",
  "hyphae-native-catalog",

@@ -7,11 +7,15 @@
 //! lexical-search state. Its deliberately small operation surface is not a
 //! claim of complete SQL, Valkey, or `OpenSearch` compatibility.
 
+mod ann_store;
 mod local_protocol;
 mod model;
 mod sql;
 mod wal_codec;
 
+pub use hyphae_native_ann::{
+    HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
+};
 pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE,
     LocalProtocolError, decode_frame, encode_frame,
@@ -28,9 +32,9 @@ use std::{
 use hyphae_native_blobs::{BlobError, BlobStore, StagedBlob};
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
-    CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
-    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader,
+    QualifiedName, RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
 use hyphae_native_mvcc::{
@@ -44,7 +48,8 @@ use hyphae_native_records::{
 };
 use hyphae_native_types::{
     CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
-    ManifestGeneration, ObjectId, PageId, RowId, ScalarValue, TransactionId,
+    ManifestGeneration, ObjectId, PageId, RowId, ScalarValue, TransactionId, VectorElement,
+    VectorType,
 };
 use hyphae_native_wal::{WalError, WalFile, WalRecovery};
 use thiserror::Error;
@@ -169,6 +174,9 @@ enum SearchFormat {
 /// Native runtime or recovery failure.
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
+    /// Native ANN validation, construction, or query failed.
+    #[error(transparent)]
+    Ann(#[from] hyphae_native_ann::AnnError),
     /// Filesystem operation outside the page/WAL files failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -241,6 +249,15 @@ pub enum NativeRuntimeError {
     /// The lexical-search B+tree contains malformed metadata or postings.
     #[error("native lexical-search B+tree namespace is invalid")]
     InvalidSearchTree,
+    /// The ANN B+tree namespace or canonical graph generation is invalid.
+    #[error("native ANN tree is invalid")]
+    InvalidAnnTree,
+    /// The requested native ANN index does not exist.
+    #[error("native ANN index {index} does not exist")]
+    UnknownVectorIndex {
+        /// Stable search-index identity requested by the caller.
+        index: ObjectId,
+    },
     /// A detached write mutation cannot be reapplied to the admitted base.
     #[error("native optimistic write batch contains an invalid mutation")]
     InvalidPreparedMutation,
@@ -449,6 +466,31 @@ pub struct MatchHit {
     pub score: f64,
 }
 
+/// Runtime receipt for one approximate native vector query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnSearchReceipt {
+    /// Stable catalog identity of the queried vector index.
+    pub index_id: ObjectId,
+    /// Immutable all-engine CSN used by the query.
+    pub snapshot_csn: Option<Csn>,
+    /// Explicit approximation label.
+    pub approximate: bool,
+    /// Canonical physical graph-generation identity.
+    pub build_identity: [u8; 32],
+    /// Fixed index metric.
+    pub metric: VectorMetric,
+    /// Effective graph-search breadth.
+    pub ef_search: usize,
+    /// Layer-zero candidates retained before final truncation.
+    pub candidate_count: usize,
+    /// Whether candidates were exactly rescored.
+    pub exact_reranked: bool,
+    /// Distinct graph nodes whose distance was evaluated.
+    pub visited_nodes: usize,
+    /// Ordered vector hits.
+    pub hits: Vec<VectorHit>,
+}
+
 /// One row reached through an exact native secondary-index key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecondaryIndexRow {
@@ -476,12 +518,13 @@ pub(crate) enum RelationalVisitError<E> {
     Visitor(E),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct MaterializedState {
     catalog: CatalogState,
     relational: RelationState,
     structures: StructureState,
     search: SearchState,
+    ann: ann_store::AnnState,
 }
 
 /// Immutable logical snapshot spanning all three native engines.
@@ -621,6 +664,38 @@ impl NativeSnapshot {
             .collect())
     }
 
+    /// Executes approximate native vector search against this immutable
+    /// all-engine snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index, invalid query vector, or
+    /// query breadth outside the catalog definition.
+    pub fn search_ann(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let result = self.state.ann.search(index, query, options)?;
+        Ok(ann_search_receipt(index, self.metadata.visible_csn, result))
+    }
+
+    /// Executes the complete exact vector-ranking oracle against this
+    /// immutable all-engine snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index or invalid query vector.
+    pub fn search_vector_exact(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        self.state.ann.search_exact(index, query, k)
+    }
+
     /// Lexes, parses, and catalog-binds one parameterized native SQL `SELECT`.
     ///
     /// # Errors
@@ -655,6 +730,25 @@ impl NativeSnapshot {
         primary_key: &[u8],
     ) -> Result<Option<&'snapshot [u8]>, SqlError> {
         sql::execute_prepared_binary(self, prepared, primary_key)
+    }
+}
+
+fn ann_search_receipt(
+    index_id: ObjectId,
+    snapshot_csn: Option<Csn>,
+    result: hyphae_native_ann::AnnSearchResult,
+) -> AnnSearchReceipt {
+    AnnSearchReceipt {
+        index_id,
+        snapshot_csn,
+        approximate: result.approximate,
+        build_identity: result.build_identity,
+        metric: result.metric,
+        ef_search: result.ef_search,
+        candidate_count: result.candidate_count,
+        exact_reranked: result.exact_reranked,
+        visited_nodes: result.visited_nodes,
+        hits: result.hits,
     }
 }
 
@@ -1575,6 +1669,44 @@ impl NativeDatabase {
         Ok(hits)
     }
 
+    /// Executes approximate vector search against the current committed
+    /// all-engine root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index, invalid query, malformed
+    /// catalog/root state, or query breadth outside the catalog definition.
+    pub fn search_ann_latest(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let result = state.ann.search(index, query, options)?;
+        Ok(ann_search_receipt(index, snapshot.visible_csn, result))
+    }
+
+    /// Executes the complete exact vector-ranking oracle against the current
+    /// committed all-engine root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index, invalid query, or malformed
+    /// catalog/root state.
+    pub fn search_vector_exact_latest(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        load_state(&self.pages, &self.blobs, snapshot.roots())?
+            .ann
+            .search_exact(index, query, k)
+    }
+
     /// Verifies the current relational B+tree and returns its node height.
     ///
     /// # Errors
@@ -1649,6 +1781,7 @@ impl NativeDatabase {
             dirty: [false; 4],
             durability,
             structure_format: self.structure_format,
+            search_format: self.search_format,
         })
     }
 
@@ -1867,6 +2000,7 @@ pub struct NativeWriteBatch {
     dirty: [bool; 4],
     durability: DurabilityClass,
     structure_format: StructureFormat,
+    search_format: SearchFormat,
 }
 
 /// Legacy serialized transaction retaining writer admission for its lifetime.
@@ -2692,6 +2826,173 @@ impl NativeWriteBatch {
             .collect())
     }
 
+    /// Creates one catalog-bound native HNSW vector index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid catalog identity/name, vector dimension,
+    /// HNSW bounds, or a duplicate index.
+    pub fn create_vector_index(
+        &mut self,
+        id: ObjectId,
+        name: &str,
+        dimension: u16,
+        metric: VectorMetric,
+        config: HnswConfig,
+    ) -> Result<(), NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let definition = vector_search_definition(id, name, dimension, metric, config)?;
+        let native_definition = ann_store::definition_from_search(&definition)?;
+        let object = CatalogObject::Search(definition);
+        let encoded_definition = object.encode_definition()?;
+        let name_identity = catalog_name_identity(object.header())?;
+        self.state.catalog.create(object)?;
+        self.state.ann.create(native_definition)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::CreateAnnIndex,
+            target: Some(id),
+            key: name_identity,
+            value: encoded_definition,
+            expires_at_micros: None,
+        });
+        self.dirty[0] = true;
+        self.dirty[3] = true;
+        Ok(())
+    }
+
+    /// Inserts or replaces one vector in the transaction-private ANN
+    /// generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, invalid vector, dimension
+    /// mismatch, or metric-specific admission failure.
+    pub fn upsert_vector(
+        &mut self,
+        index: ObjectId,
+        object_id: ObjectId,
+        vector: Vector,
+    ) -> Result<(), NativeRuntimeError> {
+        let encoded = ann_store::encode_vector_mutation(&vector);
+        self.state
+            .ann
+            .upsert(index, object_id, ann_store::private_mutation_csn()?, vector)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::UpsertVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(object_id),
+            value: encoded,
+            expires_at_micros: None,
+        });
+        self.dirty[3] = true;
+        Ok(())
+    }
+
+    /// Inserts or replaces a duplicate-free vector batch through one
+    /// canonical graph rebuild.
+    ///
+    /// An empty batch is a no-op. The complete batch is admitted before the
+    /// transaction-private generation or WAL mutation set changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, duplicate object ID, invalid
+    /// vector, dimension mismatch, or metric-specific admission failure.
+    pub fn upsert_vectors(
+        &mut self,
+        index: ObjectId,
+        vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
+    ) -> Result<usize, NativeRuntimeError> {
+        let vectors = vectors.into_iter().collect::<Vec<_>>();
+        if vectors.is_empty() {
+            return Ok(0);
+        }
+        let mut identities = BTreeSet::new();
+        if vectors
+            .iter()
+            .any(|(object_id, _)| !identities.insert(*object_id))
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        self.state
+            .ann
+            .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)?;
+        let count = vectors.len();
+        self.mutations
+            .extend(vectors.into_iter().map(|(object_id, vector)| Mutation {
+                engine: EngineKind::Search,
+                opcode: Opcode::UpsertVector,
+                target: Some(index),
+                key: ann_store::encode_object_identity(object_id),
+                value: ann_store::encode_vector_mutation(&vector),
+                expires_at_micros: None,
+            }));
+        self.dirty[3] = true;
+        Ok(count)
+    }
+
+    /// Deletes one vector from the transaction-private ANN generation.
+    ///
+    /// Returns `true` only when the object currently has a visible vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index or failed canonical rebuild.
+    pub fn delete_vector(
+        &mut self,
+        index: ObjectId,
+        object_id: ObjectId,
+    ) -> Result<bool, NativeRuntimeError> {
+        if !self.state.ann.delete(index, object_id)? {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::DeleteVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(object_id),
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[3] = true;
+        Ok(true)
+    }
+
+    /// Executes approximate vector search over the snapshot plus private
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index or invalid query options.
+    pub fn search_ann(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let result = self.state.ann.search(index, query, options)?;
+        Ok(ann_search_receipt(index, self.snapshot.visible_csn, result))
+    }
+
+    /// Executes the complete exact vector-ranking oracle over the snapshot
+    /// plus private writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index or invalid query vector.
+    pub fn search_vector_exact(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        self.state.ann.search_exact(index, query, k)
+    }
+
     /// Returns the snapshot CSN captured before private preparation.
     pub fn read_csn(&self) -> Option<Csn> {
         self.snapshot.visible_csn
@@ -3009,6 +3310,40 @@ fn apply_mutations_to_state(
                     .search
                     .index_document(index, mutation.key.clone(), text.to_owned())?;
             }
+            Opcode::CreateAnnIndex => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                let object = decode_ann_creation(index, mutation)?;
+                let CatalogObject::Search(definition) = &object else {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                };
+                let definition = ann_store::definition_from_search(definition)?;
+                state.catalog.create(object)?;
+                state.ann.create(definition)?;
+            }
+            Opcode::UpsertVector => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                state.ann.upsert(
+                    index,
+                    ann_store::decode_object_identity(&mutation.key)?,
+                    ann_store::private_mutation_csn()?,
+                    ann_store::decode_vector_mutation(&mutation.value)?,
+                )?;
+            }
+            Opcode::DeleteVector => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                if !state
+                    .ann
+                    .delete(index, ann_store::decode_object_identity(&mutation.key)?)?
+                {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+            }
         }
     }
     Ok(())
@@ -3144,12 +3479,21 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 identity.extend_from_slice(&mutation.key);
                 identity
             }
+            Opcode::UpsertVector | Opcode::DeleteVector => {
+                let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
+                identity.push(3);
+                identity.extend_from_slice(&mutation.key);
+                identity
+            }
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
         if matches!(
             mutation.opcode,
-            Opcode::CreateTable | Opcode::CreateSecondaryIndex | Opcode::CreateIndex
+            Opcode::CreateTable
+                | Opcode::CreateSecondaryIndex
+                | Opcode::CreateIndex
+                | Opcode::CreateAnnIndex
         ) {
             if let Some(object) = mutation.target {
                 let mut object_key = Vec::with_capacity(17);
@@ -3293,11 +3637,14 @@ fn commit_engine_roots(
         roots[3] = search_root_after_mutations(
             pages,
             roots[3],
-            search_format,
             commit_csn,
-            &batch.state.search,
-            &batch.mutations,
-            blob_references,
+            &SearchMutationContext {
+                format: search_format,
+                catalog: &batch.state.catalog,
+                state: &batch.state.search,
+                mutations: &batch.mutations,
+                blob_references,
+            },
         )?;
     }
     Ok(roots)
@@ -4251,6 +4598,7 @@ fn search_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
     creating_csn: Csn,
+    catalog: &CatalogState,
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
@@ -4265,13 +4613,13 @@ fn search_tree_after_mutations(
             )?
             .tree;
     }
-    for mutation in mutations
-        .iter()
-        .filter(|mutation| mutation.engine == EngineKind::Search)
-    {
+    for mutation in mutations.iter().filter(|mutation| {
+        mutation.engine == EngineKind::Search
+            && matches!(mutation.opcode, Opcode::CreateIndex | Opcode::IndexDocument)
+    }) {
         tree = apply_search_tree_mutation(pages, tree, creating_csn, mutation, blob_references)?;
     }
-    Ok(tree)
+    ann_store::apply_tree_mutations(pages, tree, creating_csn, catalog, mutations)
 }
 
 fn apply_search_tree_mutation(
@@ -4411,28 +4759,46 @@ fn insert_search_posting(
         .tree)
 }
 
+struct SearchMutationContext<'a> {
+    format: SearchFormat,
+    catalog: &'a CatalogState,
+    state: &'a SearchState,
+    mutations: &'a [Mutation],
+    blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
+}
+
 fn search_root_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
-    format: SearchFormat,
     creating_csn: Csn,
-    state: &SearchState,
-    mutations: &[Mutation],
-    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+    context: &SearchMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
-    match format {
-        SearchFormat::InlineStateV1 => Ok(Some(pages.append(
-            PageKind::SearchDelta,
-            Some(creating_csn),
-            None,
-            state.encode()?,
-        )?)),
-        SearchFormat::InvertedBTreeV1 => {
-            Ok(
-                search_tree_after_mutations(pages, root, creating_csn, mutations, blob_references)?
-                    .root(),
-            )
+    match context.format {
+        SearchFormat::InlineStateV1 => {
+            if context.mutations.iter().any(|mutation| {
+                matches!(
+                    mutation.opcode,
+                    Opcode::CreateAnnIndex | Opcode::UpsertVector | Opcode::DeleteVector
+                )
+            }) {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            Ok(Some(pages.append(
+                PageKind::SearchDelta,
+                Some(creating_csn),
+                None,
+                context.state.encode()?,
+            )?))
         }
+        SearchFormat::InvertedBTreeV1 => Ok(search_tree_after_mutations(
+            pages,
+            root,
+            creating_csn,
+            context.catalog,
+            context.mutations,
+            context.blob_references,
+        )?
+        .root()),
     }
 }
 
@@ -5297,11 +5663,14 @@ fn load_state(
 ) -> Result<MaterializedState, NativeRuntimeError> {
     let catalog = load_catalog_state(pages, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
+    let search = load_search_state(pages, blobs, roots)?;
+    let ann = ann_store::load(pages, roots.root(SLOT_SEARCH), &catalog)?;
     Ok(MaterializedState {
         catalog,
         relational,
         structures: load_structure_state(pages, blobs, roots)?,
-        search: load_search_state(pages, blobs, roots)?,
+        search,
+        ann,
     })
 }
 
@@ -5727,6 +6096,7 @@ fn load_search_state(
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
             }
+            _ if ann_store::is_ann_physical_key(&key) => {}
             _ => return Err(NativeRuntimeError::InvalidSearchTree),
         }
     }
@@ -5928,6 +6298,27 @@ fn decode_search_creation(
     Ok(object)
 }
 
+fn decode_ann_creation(
+    id: ObjectId,
+    mutation: &Mutation,
+) -> Result<CatalogObject, NativeRuntimeError> {
+    if mutation.key.is_empty()
+        || mutation.expires_at_micros.is_some()
+        || !mutation.value.starts_with(b"HYCOBJ01")
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    let object = CatalogObject::decode_definition(&mutation.value)?;
+    let CatalogObject::Search(definition) = &object else {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    };
+    if definition.header.id != id || definition.vector.is_none() || definition.ann.is_none() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    validate_catalog_creation_identity(&object, mutation)?;
+    Ok(object)
+}
+
 fn validate_catalog_creation_identity(
     object: &CatalogObject,
     mutation: &Mutation,
@@ -6001,6 +6392,40 @@ fn text_search_definition(
             doc_values: false,
         }],
         vector: None,
+        ann: None,
+    };
+    definition.validate()?;
+    Ok(definition)
+}
+
+fn vector_search_definition(
+    id: ObjectId,
+    name: &str,
+    dimension: u16,
+    metric: VectorMetric,
+    config: HnswConfig,
+) -> Result<SearchCollectionDefinition, CatalogError> {
+    let metric = match metric {
+        VectorMetric::Cosine => CatalogVectorMetric::Cosine,
+        VectorMetric::NegativeDot => CatalogVectorMetric::NegativeDot,
+        VectorMetric::SquaredL2 => CatalogVectorMetric::SquaredL2,
+    };
+    let definition = SearchCollectionDefinition {
+        header: ObjectHeader {
+            id,
+            owner: EngineKind::Search,
+            name: qualified_name(name)?,
+        },
+        fields: Vec::new(),
+        vector: Some(VectorType::new(VectorElement::Float32, dimension)?),
+        ann: Some(AnnIndexDefinition::new(
+            metric,
+            config.m(),
+            config.ef_construction(),
+            config.ef_search_default(),
+            config.ef_search_max(),
+            config.seed(),
+        )?),
     };
     definition.validate()?;
     Ok(definition)
@@ -6034,9 +6459,9 @@ mod tests {
     };
 
     use super::{
-        CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome, NativeDatabase,
-        NativeRuntimeError, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SqlError,
-        SqlResult, SqlValue,
+        AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome,
+        HnswConfig, NativeDatabase, NativeRuntimeError, PAGE_FILE, RelationalScanRow, SetCondition,
+        SetOutcome, SqlError, SqlResult, SqlValue, Vector, VectorMetric,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -10611,6 +11036,374 @@ mod tests {
         page_file.sync_data()?;
 
         assert!(NativeDatabase::open(temporary.path()).is_err());
+        Ok(())
+    }
+
+    fn ann_config() -> Result<HnswConfig, NativeRuntimeError> {
+        Ok(HnswConfig::new(4, 16, 8, 32, 0x4859_5048_4145)?)
+    }
+
+    fn ann_options() -> Result<AnnSearchOptions, NativeRuntimeError> {
+        Ok(AnnSearchOptions::new(2, 8, Some(4))?)
+    }
+
+    #[test]
+    fn durable_ann_generation_shares_the_global_csn_and_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let lexical = ObjectId::new(2)?;
+        let vectors = ObjectId::new(3)?;
+        let mario = ObjectId::new(101)?;
+        let romina = ObjectId::new(102)?;
+        let luciana = ObjectId::new(103)?;
+
+        let mut create = database.begin(10, DurabilityClass::Strict)?;
+        create.create_relation(table, "accounts")?;
+        create.insert(table, b"mario".to_vec(), b"active".to_vec())?;
+        create.set(b"session".to_vec(), b"open".to_vec(), Some(100))?;
+        create.create_search_index(lexical, "notes")?;
+        create.index_document(lexical, b"doc-1".to_vec(), "native vector search")?;
+        create.create_vector_index(
+            vectors,
+            "embeddings",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        assert_eq!(
+            create.upsert_vectors(
+                vectors,
+                [
+                    (mario, Vector::new([1.0, 0.0, 0.0])?),
+                    (romina, Vector::new([0.0, 1.0, 0.0])?),
+                ],
+            )?,
+            2
+        );
+        let first = create.commit()?;
+        assert_eq!(first.commit_csn, Csn::new(1)?);
+
+        let historical = database.snapshot(11)?;
+        assert_eq!(
+            historical.select(table, b"mario"),
+            Some(b"active".as_slice())
+        );
+        assert_eq!(historical.get(b"session"), Some(b"open".as_slice()));
+        assert_eq!(
+            historical.match_text(lexical, "vector", 1)?[0].document_id,
+            b"doc-1"
+        );
+        let first_ann =
+            historical.search_ann(vectors, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?;
+        assert!(first_ann.approximate);
+        assert_eq!(first_ann.index_id, vectors);
+        assert_eq!(first_ann.snapshot_csn, Some(Csn::new(1)?));
+        assert_eq!(first_ann.hits[0].object_id, mario);
+        assert_eq!(
+            historical.search_vector_exact(vectors, &Vector::new([1.0, 0.0, 0.0])?, 2,)?[0]
+                .object_id,
+            mario
+        );
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        mutate.upsert_vector(vectors, mario, Vector::new([0.0, 1.0, 0.0])?)?;
+        assert!(mutate.delete_vector(vectors, romina)?);
+        mutate.upsert_vector(vectors, luciana, Vector::new([1.0, 0.0, 0.0])?)?;
+        let second = mutate.commit()?;
+        assert_eq!(second.commit_csn, Csn::new(2)?);
+
+        assert_eq!(
+            historical.search_vector_exact(vectors, &Vector::new([1.0, 0.0, 0.0])?, 2,)?[0]
+                .object_id,
+            mario
+        );
+        let current =
+            database.search_ann_latest(vectors, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?;
+        assert_eq!(current.snapshot_csn, Some(Csn::new(2)?));
+        assert_eq!(current.hits[0].object_id, luciana);
+        assert_ne!(current.build_identity, first_ann.build_identity);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        let recovered =
+            reopened.search_ann_latest(vectors, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?;
+        assert_eq!(recovered, current);
+        assert_eq!(
+            reopened
+                .search_vector_exact_latest(vectors, &Vector::new([1.0, 0.0, 0.0])?, 3,)?
+                .iter()
+                .map(|hit| hit.object_id)
+                .collect::<Vec<_>>(),
+            vec![luciana, mario]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ann_batch_ingest_rejects_the_complete_invalid_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let first = ObjectId::new(100)?;
+        let second = ObjectId::new(200)?;
+        let mut transaction = database.begin(1, DurabilityClass::Strict)?;
+        transaction.create_vector_index(
+            index,
+            "embeddings",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        assert_eq!(
+            transaction.upsert_vectors(
+                index,
+                [
+                    (first, Vector::new([1.0, 0.0, 0.0])?),
+                    (second, Vector::new([0.0, 1.0, 0.0])?),
+                ],
+            )?,
+            2
+        );
+        let before =
+            transaction.search_ann(index, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?;
+        assert!(
+            transaction
+                .upsert_vectors(
+                    index,
+                    [
+                        (first, Vector::new([0.0, 0.0, 1.0])?),
+                        (first, Vector::new([0.0, 1.0, 1.0])?),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(
+            transaction
+                .upsert_vectors(index, [(first, Vector::new([1.0, 0.0])?)])
+                .is_err()
+        );
+        assert_eq!(transaction.upsert_vectors(index, std::iter::empty())?, 0);
+        assert_eq!(
+            transaction.search_ann(index, &Vector::new([1.0, 0.0, 0.0])?, ann_options()?)?,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ann_same_vector_conflicts_and_disjoint_vectors_rebase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let first_id = ObjectId::new(100)?;
+        let second_id = ObjectId::new(200)?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "embeddings",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+
+        let mut first = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        first.upsert_vector(index, first_id, Vector::new([1.0, 0.0])?)?;
+        second.upsert_vector(index, second_id, Vector::new([0.0, 1.0])?)?;
+        database.commit_optimistic(first)?;
+        database.commit_optimistic(second)?;
+
+        let mut winner = database.begin_optimistic(3, DurabilityClass::Strict)?;
+        let mut loser = database.begin_optimistic(3, DurabilityClass::Strict)?;
+        winner.upsert_vector(index, first_id, Vector::new([2.0, 0.0])?)?;
+        loser.upsert_vector(index, first_id, Vector::new([3.0, 0.0])?)?;
+        database.commit_optimistic(winner)?;
+        assert!(matches!(
+            database.commit_optimistic(loser),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database
+                .search_vector_exact_latest(index, &Vector::new([0.0, 1.0])?, 2)?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ann_commit_crash_matrix_recovers_none_or_the_complete_cross_engine_csn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let lexical = ObjectId::new(2)?;
+            let vectors = ObjectId::new(3)?;
+            let object = ObjectId::new(4)?;
+            let mut transaction = database.begin(10, DurabilityClass::Strict)?;
+            transaction.create_relation(table, "accounts")?;
+            transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
+            transaction.set(b"session".to_vec(), b"open".to_vec(), None)?;
+            transaction.create_search_index(lexical, "notes")?;
+            transaction.index_document(lexical, b"doc-1".to_vec(), "atomic vector")?;
+            transaction.create_vector_index(
+                vectors,
+                "embeddings",
+                2,
+                VectorMetric::NegativeDot,
+                ann_config()?,
+            )?;
+            transaction.upsert_vector(vectors, object, Vector::new([1.0, 0.0])?)?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened.recovery_report().visible_csn {
+                None => {
+                    let snapshot = reopened.snapshot(11)?;
+                    assert_eq!(snapshot.select(table, b"mario"), None);
+                    assert_eq!(snapshot.get(b"session"), None);
+                    assert!(snapshot.match_text(lexical, "vector", 1).is_err());
+                    assert!(
+                        snapshot
+                            .search_ann(vectors, &Vector::new([1.0, 0.0])?, ann_options()?,)
+                            .is_err()
+                    );
+                }
+                Some(csn) if csn == Csn::new(1)? => {
+                    let snapshot = reopened.snapshot(11)?;
+                    assert_eq!(snapshot.select(table, b"mario"), Some(b"active".as_slice()));
+                    assert_eq!(snapshot.get(b"session"), Some(b"open".as_slice()));
+                    assert_eq!(
+                        snapshot.match_text(lexical, "vector", 1)?[0].document_id,
+                        b"doc-1"
+                    );
+                    assert_eq!(
+                        snapshot
+                            .search_ann(vectors, &Vector::new([1.0, 0.0])?, ann_options()?,)?
+                            .hits[0]
+                            .object_id,
+                        object
+                    );
+                }
+                found => return Err(format!("unexpected recovered CSN: {found:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_ann_generation_fails_complete_root_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let object = ObjectId::new(20)?;
+        let mut transaction = database.begin(1, DurabilityClass::Strict)?;
+        transaction.create_vector_index(
+            index,
+            "embeddings",
+            2,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        transaction.upsert_vector(index, object, Vector::new([1.0, 0.0])?)?;
+        transaction.commit()?;
+        let receipt =
+            database.search_ann_latest(index, &Vector::new([1.0, 0.0])?, ann_options()?)?;
+
+        let root_set = database.coordinator.snapshot(2)?.roots().clone();
+        let search_root = root_set
+            .root(super::SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let vector_key = super::ann_store::vector_key(index, receipt.build_identity, object);
+        let encoded_vector = hyphae_native_btree::BTree::from_root(search_root)
+            .get(&database.pages, &vector_key)?
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let corrupted = hyphae_native_btree::BTree::from_root(search_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                vector_key.clone(),
+                vec![0; 32],
+            )?
+            .tree;
+        let mut roots = root_set
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        roots.insert(
+            super::SLOT_SEARCH,
+            corrupted.root().ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            root_set
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            root_set.catalog_version(),
+            root_set
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots.clone(),
+            root_set.blob_generation(),
+        )?;
+        assert!(matches!(
+            super::load_state(&database.pages, &database.blobs, &forged),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+
+        let mut orphaned = hyphae_native_btree::BTree::empty()
+            .insert_unique(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::SEARCH_FORMAT_KEY.to_vec(),
+                super::SEARCH_FORMAT_VALUE_V1.to_vec(),
+            )?
+            .tree;
+        orphaned = orphaned
+            .insert_unique(
+                &mut database.pages,
+                Csn::new(1)?,
+                vector_key,
+                encoded_vector,
+            )?
+            .tree;
+        roots.insert(
+            super::SLOT_SEARCH,
+            orphaned.root().ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        );
+        let forged_orphan = hyphae_native_mvcc::RootSet::committed(
+            root_set
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            root_set.catalog_version(),
+            root_set
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots,
+            root_set.blob_generation(),
+        )?;
+        assert!(matches!(
+            super::load_state(&database.pages, &database.blobs, &forged_orphan),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
         Ok(())
     }
 }

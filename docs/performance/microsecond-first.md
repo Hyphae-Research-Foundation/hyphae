@@ -156,6 +156,25 @@ uses 10,000 vectors, 32 dimensions, 100 independent queries and top 10 under
 WSL2. With `M=16` and construction/search breadth 128, recall@10 was `0.970`.
 HNSW observed p50 `716.048 us` while the exact oracle observed p50
 `639.333 us`; approximation was slower at this corpus size. The graph is not
-yet page/WAL/MVCC-backed, and this run lacks the one-million-vector,
-384-dimensional corpus, concurrency, p99.9, allocations, hardware counters
-and interference lanes. It is a quality/latency observation, not G4 or G7.
+page/WAL/MVCC-backed in that source commit, and the run lacks the
+one-million-vector, 384-dimensional corpus, concurrency, p99.9, allocations,
+hardware counters and interference lanes. It is a quality/latency observation,
+not G4 or G7.
+
+The later
+[durable ANN observation](../gates/evidence/native-ann-durability-wsl2.json)
+uses the search B+tree, WAL and global MVCC root from a clean commit, then
+reopens and validates the graph before measurement. Its deliberately smaller
+512-vector, 32-dimensional corpus reached recall@10 `1.000`. Over 10,000 warm
+calls per route on a pinned materialized snapshot, HNSW observed p50/p99
+`227.227/483.309 us` and exact observed `23.032/42.020 us`. Batch seeding took
+`88.642 ms`, strict commit `127.021 ms`, reopen `89.845 ms`, and snapshot
+materialization `86.492 ms`; none of those setup/I/O clocks are folded into
+the query latency.
+
+This scenario is inside the provisional HNSW p50/p99 target, but it is not a
+gate pass: the corpus is 1,953 times smaller than the target and has 32 rather
+than 384 dimensions; execution materializes the graph instead of traversing
+buffered pages; WSL2 is virtualized; concurrency is one; and saturation,
+interference, allocations, RSS and hardware counters are absent. Exact search
+also remains roughly ten times faster on this small corpus.

@@ -127,8 +127,17 @@ evidence](evidence/native-ann-kernel-2026-08-01.md) binds the first
 Hyphae-owned deterministic HNSW implementation, three exact metric semantics,
 canonical mutation rebuild, exact oracle, content-bound build identity,
 fail-closed restore and a bounded quality observation to one source commit.
-It is not yet connected to the native search B+tree, WAL or MVCC roots, so G1,
-G4 and G7 remain open.
+
+The [durable native ANN
+evidence](evidence/native-ann-durability-2026-08-01.md) connects that kernel to
+checked catalog definitions, search B+tree vector/graph generations, three WAL
+opcodes, optimistic vector-level conflicts, historical all-engine CSNs,
+canonical reopen, batch rebuild, corrupt/orphan rejection, and a seven-boundary
+cross-engine crash matrix. Its clean WSL2 receipt observes a 512-vector,
+32-dimensional, concurrency-one materialized-snapshot query. Buffered graph
+traversal, filters, delta/tombstone merge, background publication,
+reclamation, one-million-vector quality and the complete G7 matrix remain
+open, so this milestone closes no gate.
 
 The [native type-codec
 evidence](evidence/native-type-codecs-2026-08-01.md) binds recursive logical
@@ -238,7 +247,8 @@ pending, along with retention/vacuum, secondary-index range/streaming
 execution, zero-copy relational operator cursors, general relational
 expressions beyond the admitted residual slice, constraints/planning,
 remaining structure families, positional
-postings, segments, and ANN required by G1–G4.
+postings, segments, buffered/filtered ANN, and hybrid fusion required by
+G1–G4.
 Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
