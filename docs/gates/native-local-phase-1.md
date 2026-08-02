@@ -308,7 +308,10 @@ only canonical tombstones, preserves logical state and prior roots, and
 recovers prior-or-complete at every commit boundary. On the measured
 2,048-expired/2,048-live corpus it reduced reachable node pages from 41 to 10
 and empty-expiry-scan p50 by 93.133%. The append-only file still grew by the
-ten replacement pages, so retention-aware physical vacuum remains open.
+ten replacement pages. The
+[native page-generation vacuum contract](../native/page-vacuum-v1.md) now
+fixes the retention floor, generation publication, rewrite, and crash matrix;
+implementation and measured physical reclamation remain open.
 
 The [native dependency-closure
 evidence](evidence/native-dependency-closure-2026-08-02.md) makes the non-dev

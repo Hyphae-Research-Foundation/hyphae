@@ -440,8 +440,9 @@ This operation removes tombstones from the current reachable tree but does not
 shrink the append-only `pages.hydb` file. Older roots and immutable manifests
 still own the superseded pages. Physical file reclamation requires an explicit
 retention floor, complete cross-engine reachability tracing, a new page-file
-generation, and atomic generation publication; those remain separate vacuum
-work.
+generation, and atomic generation publication. The
+[native page-generation vacuum contract](page-vacuum-v1.md) now defines that
+separate current-root protocol; implementation and evidence remain pending.
 
 ## Eviction
 

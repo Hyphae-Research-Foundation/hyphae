@@ -79,6 +79,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Snapshot format v1](storage/snapshot-format-v1.md)
 - [Manifest format v1](storage/manifest-format-v1.md)
 - [Compaction protocol v1](storage/compaction-v1.md)
+- [Native page-generation vacuum v1](native/page-vacuum-v1.md)
 
 ## Decisions and governance
 
