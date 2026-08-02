@@ -496,6 +496,18 @@ authority fixtures, for 1,088 deterministic corrupt inputs. Offline
 promotion, a sanctioned epoch transition, physical power-loss evidence, and
 the broader G1 matrix remain open.
 
+The [native process crash matrix
+evidence](evidence/native-process-crash-matrix-linux-2026-08-02.md) replaces
+the singleton commit's in-process-only interruption claim with seven
+`SIGKILL`/reopen cycles on direct Linux/ext4. A strict transaction mutates
+relational, structure/TTL, and lexical state under one CSN while also
+publishing a large immutable blob. The four pre-WAL boundaries reopen the
+prior empty state; complete WAL append, WAL synchronization, and root
+publication reopen the complete CSN 1. This is process-crash evidence, not
+physical power loss: the kernel page cache survives, and checkpoint,
+retention, maintenance, migration, resource-exhaustion, and storage-fault
+lanes remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

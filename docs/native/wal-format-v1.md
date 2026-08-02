@@ -283,4 +283,9 @@ tail repair, deterministic blob/page/WAL/root/checkpoint interruptions, and
 set creation/member and ANN create/upsert/delete mutation round-trips. ANN
 shape tests reject truncated object identities and non-`f32`-aligned payloads;
 the cross-engine ANN matrix interrupts every implemented commit boundary. The
-broader list above remains gate work.
+direct-Linux process-crash matrix additionally retains the writer lock until
+the parent sends `SIGKILL` at every singleton blob/page/WAL/root boundary, then
+reopens to either the prior state or the complete relational, structure, and
+lexical CSN. Kernel page-cache survival means this is not sector, filesystem
+reordering, device-cache, or physical power-loss evidence. The broader list
+above remains gate work.
