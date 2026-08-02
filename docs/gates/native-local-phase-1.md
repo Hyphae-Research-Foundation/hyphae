@@ -290,9 +290,9 @@ Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
-conditional writes, signed counters, and the first independent-field hash
-layout plus exact binary sets with member-granular conflicts. It still lacks
-whole-hash lifecycle/iteration, set iteration/algebra/TTL, lists, sorted sets,
+conditional writes, signed counters, independent-field hashes, exact binary
+sets with member-granular conflicts, and chunked-deque lists. It still lacks
+whole-hash lifecycle/iteration, set iteration/algebra/TTL, sorted sets,
 streams, the expiry scheduler, model tests, and amplification evidence
 required to close G3.
 

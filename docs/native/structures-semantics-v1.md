@@ -2,9 +2,9 @@
 
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
-hashes, the first native set slice, multilevel B+tree persistence, direct
+hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
 buffered reads, and large immutable blobs are implemented in the convergence
-slice; the chunked-deque list contract is admitted for implementation;
+slice; the dual-index sorted-set contract is admitted for implementation;
 version-bearing responses, the expiry scheduler, and the remaining structure
 families remain pending
 
@@ -42,9 +42,9 @@ cannot change structure kind without delete/recreate or an explicit checked
 conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
-counters, explicitly created binary hash/maps, and explicitly created binary
-sets. Lists, sorted sets, streams, bitmaps, sketches, geo indexes, and typed
-registers remain targets.
+counters, explicitly created binary hash/maps, exact binary sets, and
+chunked-deque lists. Sorted sets, streams, bitmaps, sketches, geo indexes, and
+typed registers remain targets.
 
 ## First vertical operations
 
@@ -72,6 +72,12 @@ LPOP(key)
 RPOP(key)
 LLEN(key)
 LRANGE(key, start, stop)
+CREATE_SORTED_SET(key)
+ZADD(key, score, member)
+ZSCORE(key, member)
+ZREM(key, member)
+ZCARD(key)
+ZRANGE(key, start, stop)
 ```
 
 `SET` conditions are unconditional, if-absent, if-present, or
@@ -131,6 +137,22 @@ list identity in this version; concurrent end operations do not silently
 commute. Whole-list deletion, list TTL, blocking pop, insertion by index,
 trimming, moving between lists, and element mutation remain pending.
 
+`CREATE_SORTED_SET` establishes a typed binary sorted set before member
+mutation. `ZADD` adds a member or replaces its score and reports added,
+updated, or unchanged. `ZSCORE` returns the exact canonical score for a member,
+`ZREM` returns true only for a live member, and `ZCARD` returns exact durable
+cardinality. `ZRANGE` uses the same signed, inclusive rank interval as
+`LRANGE`; results are ascending by score with exact member bytes as the
+deterministic tie-breaker.
+
+Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
+rejected before mutation. Negative zero is normalized to positive zero. These
+rules make one canonical score bit pattern per accepted numeric value. An
+empty sorted set remains typed. Scalar, hash, set, list, and sorted-set kinds
+are mutually exclusive for one user key. Different sorted-set members may
+prepare and commit independently; changes to the same member retain
+first-committer-wins semantics.
+
 ## First physical namespace
 
 New data directories store the structure partition in the native copy-on-write
@@ -146,6 +168,9 @@ B+tree:
 | `0x05` | prefix + set-member identity | canonical empty persistent `HYSTRV01` value |
 | `0x06` | prefix + binary list key | canonical `HYLSTM01` metadata |
 | `0x07` | prefix + list-key identity + ordered chunk ID | canonical `HYLSTC01` chunk or structure tombstone |
+| `0x08` | prefix + binary sorted-set key | canonical `HYZSTM01` metadata |
+| `0x09` | prefix + sorted-set-member identity | canonical `HYZSCR01` score or structure tombstone |
+| `0x0a` | prefix + sorted-set key + sortable score + member | canonical empty persistent `HYSTRV01` value or structure tombstone |
 
 The exact value envelope is:
 
@@ -244,6 +269,29 @@ pop restores canonical empty metadata. Empty live chunks, gaps, extra live
 chunks, expiry-bearing elements, malformed envelopes, blob mismatches, length
 mismatches, or metadata/count disagreement fail closed.
 
+Sorted-set metadata is exactly 16 bytes: ASCII magic `HYZSTM01` followed by
+the unsigned little-endian live member count. A membership identity uses the
+same compound form as hashes and sets: `u32` big-endian sorted-set-key length,
+the key bytes, and the remaining member bytes. The physical membership key
+prepends `0x09`; its live value is exactly 16 bytes, ASCII magic `HYZSCR01`
+followed by the canonical score bits in big-endian order. A deleted membership
+stores the canonical structure tombstone.
+
+The ordered key is `0x0a`, `u32` big-endian sorted-set-key length, the key
+bytes, an order-preserving transformed binary64 score, and the member bytes.
+Negative score encodings invert every bit; nonnegative encodings flip the sign
+bit. Lexicographic key order is therefore ascending numeric score, then
+ascending exact member bytes. Its live value is the canonical empty persistent
+`HYSTRV01` envelope; score replacement tombstones the prior ordered key before
+publishing the new one.
+
+Recovery requires every membership index entry and every ordered index entry
+to agree one-to-one on key, member, and score, and requires metadata
+cardinality to equal both live index counts. Orphan entries, `NaN`, negative
+zero, duplicate members, malformed identities, non-empty live markers,
+expiry-bearing entries, stale live ordered scores, or count mismatches fail
+closed.
+
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
 and continues reading and writing it without an implicit conversion. New
@@ -276,6 +324,13 @@ List creation and every push/pop share one whole-list conflict identity.
 Physical mutations rewrite metadata plus at most one end chunk. A pop mutation
 carries the exact removed value so optimistic replay and physical publication
 can reject a changed end rather than removing a different element.
+
+Sorted-set member write keys use the canonical membership identity. Different
+members rebase onto the admitted current root while same-member changes
+conflict. Physical `ZADD` rewrites the member score, old/new ordered keys as
+needed, and metadata only when cardinality changes. `ZREM` tombstones both
+indexes and decrements metadata. The complete sorted set is never serialized
+as one value.
 
 ## TTL and expiry
 
@@ -321,6 +376,7 @@ legacy whole-page compatibility, optimistic disjoint-key rebase, all commit
 crash boundaries with scalar and hash mutations, typed scalar/hash creation
 races, disjoint-field rebase, same-field conflict, hash count corruption,
 field tombstones, typed scalar/hash/set creation races, disjoint-member
-rebase, same-member conflict, set count corruption, member tombstones, and
-one blob deduplicated across relational, scalar, and hash field values. They
-do not close the structure gate.
+rebase, same-member conflict, set count corruption, member tombstones,
+chunked-list restart/range/corruption/conflict behavior, and one blob
+deduplicated across relational, scalar, hash field, and list values. They do
+not close the structure gate.
