@@ -25,6 +25,8 @@ use hyphae_native_runtime::{
 use hyphae_native_types::{Csn, DurabilityClass, ObjectId};
 
 const CHILD_MODE: &str = "--child";
+const SEED_CHECKPOINT_MODE: &str = "--seed-checkpoint";
+const VERIFY_POWER_LOSS_MODE: &str = "--verify-power-loss";
 const READY_PREFIX: &str = "hyphae-native-crash-ready:";
 const COMMIT_FAMILY: &str = "commit";
 const CHECKPOINT_FAMILY: &str = "checkpoint";
@@ -111,6 +113,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|_| failure("boundary is not valid UTF-8"))?;
         require_no_remaining(arguments)?;
         return run_child(&family, Path::new(&directory), &boundary);
+    }
+    if first == SEED_CHECKPOINT_MODE {
+        let directory = arguments
+            .next()
+            .ok_or_else(|| failure("checkpoint seeding requires a data directory"))?;
+        require_no_remaining(arguments)?;
+        return seed_checkpoint_directory(Path::new(&directory));
+    }
+    if first == VERIFY_POWER_LOSS_MODE {
+        let family = arguments
+            .next()
+            .ok_or_else(|| failure("power-loss verification requires a boundary family"))?
+            .into_string()
+            .map_err(|_| failure("boundary family is not valid UTF-8"))?;
+        let directory = arguments
+            .next()
+            .ok_or_else(|| failure("power-loss verification requires a data directory"))?;
+        let boundary = arguments
+            .next()
+            .ok_or_else(|| failure("power-loss verification requires a boundary"))?
+            .into_string()
+            .map_err(|_| failure("boundary is not valid UTF-8"))?;
+        require_no_remaining(arguments)?;
+        return verify_power_loss_recovery(&family, Path::new(&directory), &boundary);
     }
 
     let source_commit = first
@@ -368,6 +394,109 @@ fn validate_checkpoint_recovery(
     )
 }
 
+fn verify_power_loss_recovery(
+    family: &str,
+    directory: &Path,
+    boundary_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let database = NativeDatabase::open(directory)?;
+    match family {
+        COMMIT_FAMILY => {
+            let boundary = parse_commit_boundary(boundary_name)
+                .ok_or_else(|| failure(format!("unknown commit boundary: {boundary_name}")))?;
+            let expected_complete = expects_power_loss_complete_state(boundary);
+            validate_recovered_state(&database, expected_complete)?;
+            let report = database.recovery_report();
+            let recovered_csn = report.visible_csn.map(Csn::get);
+            println!("{{");
+            println!("  \"family\": \"{COMMIT_FAMILY}\",");
+            println!("  \"boundary\": \"{boundary_name}\",");
+            println!(
+                "  \"expected_state\": \"{}\",",
+                if expected_complete {
+                    "complete-csn-1"
+                } else {
+                    "prior-empty"
+                }
+            );
+            match recovered_csn {
+                Some(csn) => println!("  \"recovered_csn\": {csn},"),
+                None => println!("  \"recovered_csn\": null,"),
+            }
+            println!("  \"recovered_blob_count\": {}", report.blob_count);
+            println!("}}");
+        }
+        CHECKPOINT_FAMILY => {
+            let boundary = parse_checkpoint_boundary(boundary_name)
+                .ok_or_else(|| failure(format!("unknown checkpoint boundary: {boundary_name}")))?;
+            validate_recovered_state(&database, true)?;
+            validate_power_loss_checkpoint_recovery(&database, boundary)?;
+            let report = database.recovery_report();
+            println!("{{");
+            println!("  \"family\": \"{CHECKPOINT_FAMILY}\",");
+            println!("  \"boundary\": \"{boundary_name}\",");
+            println!("  \"expected_state\": \"complete-csn-1\",");
+            println!("  \"recovered_csn\": 1,");
+            println!("  \"manifest_count\": {},", report.manifest_count);
+            println!("  \"checkpoint_count\": {},", report.checkpoint_count);
+            println!(
+                "  \"unanchored_manifest_suffix\": {},",
+                report.unanchored_manifest_suffix
+            );
+            println!(
+                "  \"recovered_temporary_manifests\": {}",
+                report.recovered_temporary_manifests
+            );
+            println!("}}");
+        }
+        other => return Err(failure(format!("unknown boundary family: {other}"))),
+    }
+    Ok(())
+}
+
+fn validate_power_loss_checkpoint_recovery(
+    database: &NativeDatabase,
+    boundary: CheckpointBoundary,
+) -> Result<(), Box<dyn Error>> {
+    let report = database.recovery_report();
+    let (manifest_count, checkpoint_count, unanchored_manifest_suffix) =
+        power_loss_checkpoint_counts(boundary);
+    require_equal("manifest count", &report.manifest_count, &manifest_count)?;
+    require_equal(
+        "checkpoint count",
+        &report.checkpoint_count,
+        &checkpoint_count,
+    )?;
+    require_equal(
+        "unanchored manifest suffix",
+        &report.unanchored_manifest_suffix,
+        &unanchored_manifest_suffix,
+    )?;
+    if boundary == CheckpointBoundary::ManifestStaged {
+        if report.recovered_temporary_manifests > 1 {
+            return Err(failure(format!(
+                "staged checkpoint recovered {} temporary manifests, expected at most one",
+                report.recovered_temporary_manifests
+            )));
+        }
+    } else {
+        require_equal(
+            "recovered temporary manifests",
+            &report.recovered_temporary_manifests,
+            &0,
+        )?;
+    }
+    Ok(())
+}
+
+fn power_loss_checkpoint_counts(boundary: CheckpointBoundary) -> (usize, usize, usize) {
+    match boundary {
+        CheckpointBoundary::ManifestStaged => (0, 0, 0),
+        CheckpointBoundary::ManifestPublished | CheckpointBoundary::WalAppended => (1, 0, 1),
+        CheckpointBoundary::WalSynchronized => (1, 1, 0),
+    }
+}
+
 fn wait_for_child_ready(child: &mut Child) -> Result<String, Box<dyn Error>> {
     let stdout = child
         .stdout
@@ -521,6 +650,13 @@ fn expects_complete_state(boundary: CommitBoundary) -> bool {
     )
 }
 
+fn expects_power_loss_complete_state(boundary: CommitBoundary) -> bool {
+    matches!(
+        boundary,
+        CommitBoundary::WalSynchronized | CommitBoundary::RootPublished
+    )
+}
+
 fn large_value() -> Vec<u8> {
     vec![0x5a; LARGE_VALUE_BYTES]
 }
@@ -551,4 +687,36 @@ where
 
 fn failure(message: impl Into<String>) -> Box<dyn Error> {
     io::Error::other(message.into()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CHECKPOINT_BOUNDARIES, COMMIT_BOUNDARIES, expects_power_loss_complete_state,
+        power_loss_checkpoint_counts,
+    };
+    use hyphae_native_runtime::{CheckpointBoundary, CommitBoundary};
+
+    #[test]
+    fn power_loss_commit_authority_starts_at_synchronized_wal() {
+        let actual =
+            COMMIT_BOUNDARIES.map(|(_, boundary)| expects_power_loss_complete_state(boundary));
+        assert_eq!(actual, [false, false, false, false, false, true, true]);
+    }
+
+    #[test]
+    fn power_loss_checkpoint_authority_starts_at_synchronized_wal() {
+        let actual = CHECKPOINT_BOUNDARIES.map(|(_, boundary)| {
+            let (manifests, checkpoints, unanchored) = power_loss_checkpoint_counts(boundary);
+            (manifests, checkpoints, unanchored)
+        });
+        assert_eq!(actual, [(0, 0, 0), (1, 0, 1), (1, 0, 1), (1, 1, 0)]);
+        assert_eq!(
+            power_loss_checkpoint_counts(CheckpointBoundary::WalAppended),
+            (1, 0, 1)
+        );
+        assert!(!expects_power_loss_complete_state(
+            CommitBoundary::WalAppended
+        ));
+    }
 }
