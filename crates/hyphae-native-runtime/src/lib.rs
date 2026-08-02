@@ -3011,10 +3011,12 @@ impl NativeDatabase {
         let active_page_count = candidate.page_count;
         if active_page_count >= previous_page_count {
             fs::remove_file(&candidate.temporary_path)?;
+            sync_page_generation_directory(&self.data_directory)?;
             return Ok(page_vacuum_noop(previous_generation, previous_page_count));
         }
 
         fs::rename(&candidate.temporary_path, &candidate.final_path)?;
+        sync_page_generation_directory(&self.data_directory)?;
         interrupt_vacuum(interruption, VacuumBoundary::CandidatePublished)?;
         let replacement_pages = PageStore::open_generation(&candidate.final_path, next_generation)?;
         let replacement_buffer =
@@ -3059,6 +3061,7 @@ impl NativeDatabase {
             &self.data_directory,
             previous_generation,
         ))?;
+        sync_page_generation_directory(&self.data_directory)?;
         interrupt_vacuum(interruption, VacuumBoundary::PriorGenerationRemoved)?;
 
         Ok(PageVacuumReceipt {
@@ -8881,6 +8884,16 @@ fn page_generation_temporary_path(data_directory: &Path, generation: PageGenerat
     PathBuf::from(temporary)
 }
 
+#[cfg(unix)]
+fn sync_page_generation_directory(data_directory: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(data_directory)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_page_generation_directory(data_directory: &Path) -> Result<(), std::io::Error> {
+    fs::metadata(data_directory).map(|_| ())
+}
+
 fn cleanup_page_generation_files(
     data_directory: &Path,
     active_generation: PageGeneration,
@@ -8913,6 +8926,9 @@ fn cleanup_page_generation_files(
                 .checked_add(1)
                 .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         }
+    }
+    if removed != 0 {
+        sync_page_generation_directory(data_directory)?;
     }
     Ok(removed)
 }
