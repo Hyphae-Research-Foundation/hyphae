@@ -1,8 +1,10 @@
 # Native directory format v1
 
-Status: normative target contract for the native data directory marker,
-lock, lineage identity, and promotion lifecycle; not implemented. ADR-0021
-and ADR-0022 govern this contract. G1 remains open
+Status: partially implemented by the experimental native runtime. Canonical
+`FORMAT` creation and validation plus lifetime-held `LOCK` ownership are
+implemented. Offline promotion and lineage threading into manifests and
+retention anchors remain unimplemented. ADR-0021 and ADR-0022 govern this
+contract. G1 remains open
 
 This contract fixes the root-level identity of one native data directory:
 the `FORMAT` marker required by
@@ -21,9 +23,12 @@ This contract governs the target native data directory described by the
 and `tmp/`.
 
 The current experimental convergence layout, which materializes
-`pages.hydb`, `wal.hywal`, `roots/`, and `blobs/` without any marker, is
-implementation evidence only. It does not satisfy this contract, and no
-directory without a valid marker may be promoted to contract status.
+`pages.hydb`, `wal.hywal`, `roots/`, and `blobs/`, now creates and validates
+the canonical marker and enforces single-writer ownership. It remains
+implementation evidence only: the layout does not satisfy the complete
+contract until offline promotion and lineage threading are implemented and
+verified. No directory without a valid marker may be promoted to contract
+status.
 
 Disk format 2 directories remain governed by their own `FORMAT` marker and
 are never opened, converted, or rewritten by the native runtime.
@@ -146,3 +151,10 @@ Implementation of this contract requires:
   digest chains; and
 - a double-writer test proving that a second open fails with the explicit
   already-locked error while the first handle lives.
+
+The 2026-08-02 Linux implementation slice covers the golden marker, UUIDv7
+shape, stable reopen identity, missing/malformed/unknown/format-2/pending/
+conflicting marker failures, mixed-family rejection, and live double-writer
+exclusion. The promotion crash boundaries and the ADR-0022 lineage divergence
+round-trip remain open. This partial evidence does not close G1 or authorize
+format-2 migration.
