@@ -126,6 +126,45 @@ transaction-private visibility, multilevel early stop, boundary isolation
 between adjacent prefixes, null behavior, and corrupted-row/page failure are
 required exit tests for this slice.
 
+The bounded prefix-plus-next-component range shape is:
+
+```text
+SELECT <projection>
+FROM <table>
+WHERE <first-primary-key-column> = <scalar>
+  [AND <next-primary-key-column> = <scalar> ...]
+  AND <immediately-following-primary-key-column>
+      { > | >= | < | <= } <scalar>
+  [AND <immediately-following-primary-key-column>
+      { > | >= | < | <= } <scalar>]
+  [AND <residual-filter> ...]
+[ORDER BY <complete-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+The equality set must bind a nonempty strict left prefix. Range predicates
+must name exactly the primary-key column immediately after that prefix. At
+most one lower and one upper bound are admitted, independent of predicate text
+order. Duplicate bounds fail binding. A range on a skipped or later key
+column remains residual and cannot be reported as this access path.
+
+The physical interval starts with the canonical encoded equality prefix.
+An inclusive lower bound appends the next ordered component and includes that
+byte prefix. An exclusive lower bound starts at the binary successor of the
+appended component so every key with that component, including keys with
+remaining primary-key suffixes, is excluded. An exclusive upper bound excludes
+the appended component prefix. An inclusive upper bound excludes its binary
+successor so every key with that component is retained. Missing endpoints use
+the equality-prefix interval. The resulting bounds are intersected before
+storage traversal; inverted or empty bounds return no rows.
+
+`NULL` in either the equality prefix or range endpoint makes the predicate
+`UNKNOWN` and returns no rows after complete parameter/type validation.
+`LIMIT` and ascending complete-primary-key `ORDER BY` retain the prefix-scan
+rules. Residual predicates run before the output limit. `EXPLAIN` reports
+`PrimaryKeyPrefixRangeScan(table=<id>,prefix_columns=<count>,range_column=<id>,lower=<kind>,upper=<kind>,limit=<n>)`
+and appends `,residual=true` only when unconsumed predicates remain.
+
 The residual-filter slice admits parameterized and literal scalar predicates:
 
 ```text
