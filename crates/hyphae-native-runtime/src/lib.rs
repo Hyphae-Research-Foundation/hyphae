@@ -17812,6 +17812,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn complete_secondary_index_range_plans_ordered_physical_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Memory)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing index identity".into());
+        };
+
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT id FROM people
+                 WHERE email >= ? AND email < ?
+                 LIMIT 10",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexRangeScan(table={table},index={index},\
+                     lower=inclusive,upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        transaction.rollback();
+        Ok(())
+    }
+
     fn seed_scaled_secondary_index(
         database: &mut NativeDatabase,
     ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
