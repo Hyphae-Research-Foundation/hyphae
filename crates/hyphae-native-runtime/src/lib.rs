@@ -16836,6 +16836,68 @@ mod tests {
     }
 
     #[test]
+    fn commit_scheduler_serializes_all_durability_classes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
+        )?;
+
+        let mut strict = scheduler.begin_optimistic(151, DurabilityClass::Strict)?;
+        strict.set(b"mixed-strict".to_vec(), b"one".to_vec(), None)?;
+        let strict = scheduler.submit(strict)?;
+
+        let mut memory = scheduler.begin_optimistic(152, DurabilityClass::Memory)?;
+        memory.set(b"mixed-memory".to_vec(), b"two".to_vec(), None)?;
+        let memory = scheduler.submit(memory)?;
+
+        let mut group = scheduler.begin_optimistic(153, DurabilityClass::Group)?;
+        group.set(b"mixed-group".to_vec(), b"three".to_vec(), None)?;
+        let group = scheduler.submit(group)?;
+
+        assert_eq!(strict.durability, DurabilityClass::Strict);
+        assert_eq!(memory.durability, DurabilityClass::Memory);
+        assert_eq!(group.durability, DurabilityClass::Group);
+        assert_eq!(
+            [
+                strict.commit_csn.get(),
+                memory.commit_csn.get(),
+                group.commit_csn.get()
+            ],
+            [2, 3, 4]
+        );
+        for receipt in [strict, memory, group] {
+            assert_eq!(receipt.durability_cohort_size, 1);
+            assert_eq!(receipt.durability_cohort_position, 0);
+            assert!(receipt.end_to_end >= receipt.queue_wait);
+            assert!(receipt.end_to_end >= receipt.cohort_execution);
+        }
+        assert!(strict.page_synchronization > Duration::ZERO);
+        assert!(strict.wal_synchronization > Duration::ZERO);
+        assert_eq!(memory.page_synchronization, Duration::ZERO);
+        assert_eq!(memory.wal_synchronization, Duration::ZERO);
+
+        scheduler.shutdown()?;
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-strict", 154)?,
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-memory", 154)?,
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"mixed-group", 154)?,
+            Some(b"three".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn group_commit_advances_catalog_versions_and_rejects_wrong_durability()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
