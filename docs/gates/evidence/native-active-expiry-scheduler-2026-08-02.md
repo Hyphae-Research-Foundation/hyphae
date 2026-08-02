@@ -7,10 +7,17 @@ by [Native active-expiry scheduler v1](../../native/active-expiry-scheduler-v1.m
 It proves bounded physical cleanup inside the existing single commit scheduler.
 Logical `GET` and `TTL` correctness remains independent from this worker.
 
-The implementation and benchmark source is commit
+The benchmark source is commit
 `cdc54068014f8f1e0dcd025715653622f2c0a8b5`, tree
 `32c13048069578cdb55278e747e75c62da764ca6`, built with Rust
 `1.96.0`.
+
+The final implementation candidate is
+`008fa7949636ae44b41a710bb0a114f68e884762`, tree
+`957085f46ebc950c2c8ed70d38b8c96f8ef1af37`. Its only runtime delta after the
+benchmark source publishes the retained terminal cause before its observable
+failure counter. The accompanying shutdown test also uses a deterministic
+pre-deadline window.
 
 ## Implemented behavior
 
@@ -115,6 +122,23 @@ WSL2 ran Linux `6.18.33.1-microsoft-standard-WSL2`. Source remained on
 Consequently its synchronization and cleanup timings are tmpfs observations,
 not persistent-filesystem or power-loss durability evidence.
 
+## Final validation
+
+Candidate `008fa7949636ae44b41a710bb0a114f68e884762` passed on Windows and
+WSL2:
+
+- `cargo fmt --all -- --check`;
+- workspace clippy for all targets and features with warnings denied;
+- workspace tests for all features, including 172 native-runtime tests;
+- workspace rustdoc with warnings denied; and
+- documentation validation covering 183 Markdown files and 12 maintained JSON
+  examples.
+
+The two scheduler race tests also passed five consecutive focused repetitions
+before the full gates. WSL2 used a tmpfs Cargo target. Its first documentation
+validation exceeded the 30-second harness limit while reading `/mnt/e`; the
+same command completed successfully in 84.5 seconds under a 120-second limit.
+
 ## Remaining work
 
 - repeated randomized-order interference measurements and p99.9;
@@ -123,4 +147,3 @@ not persistent-filesystem or power-loss durability evidence.
   collection under the same scheduler;
 - native-ext4 and power-loss evidence; and
 - the complete G1, G3, and G7 exit matrices.
-
