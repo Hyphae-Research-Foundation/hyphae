@@ -331,6 +331,23 @@ impl BlobStore {
         Ok(self.generation)
     }
 
+    /// Raises the effective generation to a verified committed-root floor.
+    ///
+    /// This is used after the runtime has independently selected and verified
+    /// its retained WAL/root authority. The generation never decreases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if physical inventory cannot be represented by the
+    /// effective generation.
+    pub fn apply_committed_generation_floor(&mut self, floor: u64) -> Result<(), BlobError> {
+        let physical = generation_for_count(self.blobs.len())?;
+        self.committed_generation_floor = self.committed_generation_floor.max(floor);
+        self.generation = self.generation.max(floor).max(physical);
+        self.generation()?;
+        Ok(())
+    }
+
     /// Returns exact verified physical inventory.
     ///
     /// # Errors

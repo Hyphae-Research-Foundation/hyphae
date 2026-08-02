@@ -36,7 +36,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hyphae_native_blobs::{BlobError, BlobRecovery, BlobStore, StagedBlob};
+use hyphae_native_blobs::{
+    BlobError, BlobInventory, BlobRecovery, BlobReferenceSet, BlobStore, StagedBlob,
+};
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader,
@@ -436,6 +438,12 @@ pub enum NativeRuntimeError {
     /// A deterministic WAL-retention interruption was requested.
     #[error("native WAL retention interrupted at {0:?}; reopen the data directory")]
     InjectedWalRetentionCrash(WalRetentionBoundary),
+    /// Blob collection requires one exact retained root and an empty WAL suffix.
+    #[error("native blob collection requires one exact current retained root")]
+    BlobCollectionIneligible,
+    /// A deterministic immutable-blob collection interruption was requested.
+    #[error("native blob collection interrupted at {0:?}; reopen the data directory")]
+    InjectedBlobCollectionCrash(BlobCollectionBoundary),
     /// Test-only guard proving a path does not materialize all engine state.
     #[cfg(test)]
     #[error("unexpected complete native state materialization")]
@@ -540,6 +548,19 @@ pub enum VacuumBoundary {
     PriorGenerationRemoved,
 }
 
+/// Deterministic immutable-blob collection boundary used by the crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCollectionBoundary {
+    /// Complete root validation traced every live reference; no file was removed.
+    ReferencesTraced,
+    /// The first candidate file was removed without directory synchronization.
+    FirstCandidateRemoved,
+    /// Every candidate was removed without directory synchronization.
+    AllCandidatesRemoved,
+    /// The immutable blob namespace was synchronized where supported.
+    DirectorySynchronized,
+}
+
 /// TTL state for one native structure key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ttl {
@@ -641,6 +662,7 @@ struct OpenRecoveryReport<'recovery> {
     manifest_pruning_time: Duration,
     checkpoint_validation: &'recovery CheckpointValidation,
     blob_recovery: &'recovery BlobRecovery,
+    blob_verification_time: Duration,
     recovered_temporary_wal_anchors: usize,
 }
 
@@ -705,8 +727,14 @@ pub struct RecoveryReport {
     pub latest_checkpoint_generation: Option<ManifestGeneration>,
     /// Number of verified immutable blob files.
     pub blob_count: usize,
-    /// Physical blob generation derived from the verified namespace.
+    /// Physical bytes in verified immutable blob files.
+    pub blob_bytes: u64,
+    /// Latest retained committed blob-generation floor.
+    pub blob_generation_floor: u64,
+    /// Effective blob generation after applying physical and committed floors.
     pub blob_generation: u64,
+    /// Time spent verifying every complete physical blob file.
+    pub blob_verification_time: Duration,
     /// Interrupted temporary blob files removed during open.
     pub recovered_temporary_blobs: usize,
     /// Interrupted temporary WAL-anchor stages removed during open.
@@ -750,7 +778,10 @@ fn build_recovery_report(evidence: &OpenRecoveryReport<'_>) -> RecoveryReport {
         unanchored_manifest_suffix: evidence.checkpoint_validation.unanchored_manifest_suffix,
         latest_checkpoint_generation: evidence.checkpoint_validation.latest_generation,
         blob_count: evidence.blob_recovery.blob_count,
+        blob_bytes: evidence.blob_recovery.blob_bytes,
+        blob_generation_floor: evidence.blob_recovery.committed_generation_floor,
         blob_generation: evidence.blob_recovery.generation,
+        blob_verification_time: evidence.blob_verification_time,
         recovered_temporary_blobs: evidence.blob_recovery.recovered_temporary_files,
         recovered_temporary_wal_anchors: evidence.recovered_temporary_wal_anchors,
     }
@@ -911,6 +942,42 @@ pub struct WalRetentionReceipt {
     /// Whether strict roots-directory synchronization is implemented here.
     pub manifest_directory_sync_supported: bool,
 }
+
+/// Receipt for one authoritative immutable-blob collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobCollectionReceipt {
+    /// Sole retained all-engine root validated by the liveness trace.
+    pub root_visible_csn: Csn,
+    /// Committed blob-generation floor retained by that root.
+    pub generation_floor: u64,
+    /// Complete blob references reached by root validation.
+    pub live_files: usize,
+    /// Encoded bytes occupied by live blob references.
+    pub live_bytes: u64,
+    /// Complete verified files absent from the live set.
+    pub candidate_files: usize,
+    /// Encoded bytes occupied by initial collection candidates.
+    pub candidate_bytes: u64,
+    /// Candidate files removed by this collection.
+    pub removed_files: usize,
+    /// Encoded bytes removed by this collection.
+    pub removed_bytes: u64,
+    /// Complete immutable files retained after collection.
+    pub retained_files: usize,
+    /// Encoded bytes retained after collection.
+    pub retained_bytes: u64,
+    /// Complete root validation and reference tracing time.
+    pub reference_trace_time: Duration,
+    /// Candidate enumeration and file-removal time.
+    pub candidate_deletion_time: Duration,
+    /// Blob-namespace synchronization time.
+    pub directory_synchronization_time: Duration,
+    /// Complete eligible collection attempt time.
+    pub total_time: Duration,
+    /// Whether strict blob-directory synchronization is implemented here.
+    pub parent_directory_sync_supported: bool,
+}
+
 /// One lexical match result ordered by descending BM25 score.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchHit {
@@ -1413,7 +1480,10 @@ impl NativeDatabase {
                 unanchored_manifest_suffix: 0,
                 latest_checkpoint_generation: None,
                 blob_count: 0,
+                blob_bytes: 0,
+                blob_generation_floor: 0,
                 blob_generation: 0,
+                blob_verification_time: Duration::ZERO,
                 recovered_temporary_blobs: 0,
                 recovered_temporary_wal_anchors: 0,
             },
@@ -1429,8 +1499,9 @@ impl NativeDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
         let open_started = Instant::now();
         let path = path.as_ref();
-        let blobs = BlobStore::open(path)?;
-        let blob_recovery = blobs.recovery()?;
+        let blob_verification_started = Instant::now();
+        let mut blobs = BlobStore::open(path)?;
+        let blob_verification_time = blob_verification_started.elapsed();
         let WalOpenState {
             mut manifests,
             manifest_recovery,
@@ -1447,6 +1518,9 @@ impl NativeDatabase {
             wal_semantic_replay_time,
         } = open_wal_state(path)?;
         let commits = &recovered_wal.commits;
+        let blob_generation_floor = recovered_blob_generation_floor(base_root.as_ref(), commits);
+        blobs.apply_committed_generation_floor(blob_generation_floor)?;
+        let blob_recovery = blobs.recovery()?;
         let opened_pages = PageStore::open_repair_tail_generation(
             page_generation_path(path, active_page_generation),
             active_page_generation,
@@ -1503,6 +1577,7 @@ impl NativeDatabase {
             manifest_pruning_time,
             checkpoint_validation: &checkpoint_validation,
             blob_recovery: &blob_recovery,
+            blob_verification_time,
             recovered_temporary_wal_anchors,
         });
         Ok(Self {
@@ -3884,6 +3959,160 @@ impl NativeDatabase {
         self.recovery.unanchored_manifest_suffix = 0;
         Ok(())
     }
+
+    /// Removes complete immutable blobs unreachable from the sole retained
+    /// current root.
+    ///
+    /// The database must first complete current-root page vacuum, checkpoint,
+    /// and WAL retention. Any later WAL or manifest suffix makes collection
+    /// ineligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for ineligible retained state, root/blob corruption,
+    /// uncertain removal, or namespace synchronization failure.
+    pub fn collect_blobs(&mut self) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+        self.collect_blobs_at(None)
+    }
+
+    /// Runs immutable-blob collection with one deterministic interruption.
+    ///
+    /// After an injected interruption the caller must drop this handle and
+    /// reopen the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedBlobCollectionCrash`] at the
+    /// requested boundary, or the same errors as [`Self::collect_blobs`].
+    pub fn collect_blobs_with_interruption(
+        &mut self,
+        boundary: BlobCollectionBoundary,
+    ) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+        self.collect_blobs_at(Some(boundary))
+    }
+
+    fn collect_blobs_at(
+        &mut self,
+        interruption: Option<BlobCollectionBoundary>,
+    ) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+        let collection_started = Instant::now();
+        let eligibility = self.blob_collection_eligibility()?;
+        let initial_inventory = self.blobs.inventory()?;
+        let trace_started = Instant::now();
+        let trace = self.blobs.begin_reference_trace()?;
+        if let Err(error) = validate_roots(
+            &self.pages,
+            &self.blobs,
+            &eligibility.roots,
+            eligibility.visible_csn,
+        ) {
+            drop(trace);
+            return Err(error);
+        }
+        let live = trace.finish()?;
+        let reference_trace_time = trace_started.elapsed();
+        interrupt_blob_collection(interruption, BlobCollectionBoundary::ReferencesTraced)?;
+
+        let deletion_started = Instant::now();
+        let preview = self.blobs.prune_unreferenced(&live, Some(0), false)?;
+        if preview.candidate_files != 0
+            && interruption == Some(BlobCollectionBoundary::FirstCandidateRemoved)
+        {
+            let partial = self.blobs.prune_unreferenced(&live, Some(1), false)?;
+            if partial.removed_files != 1 {
+                return Err(NativeRuntimeError::BlobCollectionIneligible);
+            }
+            return Err(NativeRuntimeError::InjectedBlobCollectionCrash(
+                BlobCollectionBoundary::FirstCandidateRemoved,
+            ));
+        }
+        let removal = self.blobs.prune_unreferenced(&live, None, false)?;
+        let candidate_deletion_time = deletion_started.elapsed();
+        interrupt_blob_collection(interruption, BlobCollectionBoundary::AllCandidatesRemoved)?;
+
+        let synchronization_started = Instant::now();
+        self.blobs.synchronize_namespace()?;
+        let directory_synchronization_time = synchronization_started.elapsed();
+        interrupt_blob_collection(interruption, BlobCollectionBoundary::DirectorySynchronized)?;
+
+        let retained = self.blobs.inventory()?;
+        let generation = self.blobs.generation()?;
+        self.record_blob_collection(retained, eligibility.generation_floor, generation);
+        blob_collection_receipt(&BlobCollectionEvidence {
+            collection_started,
+            visible_csn: eligibility.visible_csn,
+            generation_floor: eligibility.generation_floor,
+            initial_inventory,
+            live: &live,
+            preview,
+            removal,
+            retained,
+            reference_trace_time,
+            candidate_deletion_time,
+            directory_synchronization_time,
+        })
+    }
+
+    fn blob_collection_eligibility(&self) -> Result<BlobCollectionEligibility, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let visible_csn = snapshot
+            .visible_csn
+            .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
+        let roots = snapshot.roots().clone();
+        let fields = self
+            .wal_retention
+            .current()
+            .copied()
+            .ok_or(NativeRuntimeError::BlobCollectionIneligible)?
+            .fields();
+        let wal_retention = self.wal_retention.recovery();
+        let manifest_recovery = self.manifests.recovery();
+        let manifest = self
+            .manifests
+            .current()
+            .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
+        let root_anchor = roots
+            .wal_anchor()
+            .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
+        if wal_retention.candidate.is_some()
+            || wal_retention.anchors.len() != 1
+            || fs::metadata(self.data_directory.join(WAL_FILE))?.len() != 0
+            || manifest_recovery.manifests.len() != 1
+            || manifest.generation() != fields.manifest_generation
+            || manifest.digest() != fields.manifest_digest
+            || manifest.to_root_set()? != roots
+            || roots.visible_csn() != Some(visible_csn)
+            || roots.retention_floor_csn() != Some(visible_csn)
+            || roots.page_generation() != self.pages.generation()
+            || roots.blob_generation() > self.blobs.generation()?
+            || fields.base_visible_csn != visible_csn
+            || fields.root_commit_lsn != root_anchor.lsn
+            || fields.root_commit_block_digest != root_anchor.digest
+            || fields.retired_checkpoint_lsn
+                != self
+                    .last_checkpoint_lsn
+                    .ok_or(NativeRuntimeError::BlobCollectionIneligible)?
+        {
+            return Err(NativeRuntimeError::BlobCollectionIneligible);
+        }
+        Ok(BlobCollectionEligibility {
+            visible_csn,
+            generation_floor: roots.blob_generation(),
+            roots,
+        })
+    }
+
+    fn record_blob_collection(
+        &mut self,
+        retained: BlobInventory,
+        generation_floor: u64,
+        generation: u64,
+    ) {
+        self.recovery.blob_count = retained.blob_count;
+        self.recovery.blob_bytes = retained.blob_bytes;
+        self.recovery.blob_generation_floor = generation_floor;
+        self.recovery.blob_generation = generation;
+    }
 }
 
 enum PreparedWalRetention {
@@ -3892,6 +4121,68 @@ enum PreparedWalRetention {
         anchor: WalRetentionAnchor,
         retired_wal_bytes: u64,
     },
+}
+
+struct BlobCollectionEligibility {
+    visible_csn: Csn,
+    generation_floor: u64,
+    roots: RootSet,
+}
+
+struct BlobCollectionEvidence<'evidence> {
+    collection_started: Instant,
+    visible_csn: Csn,
+    generation_floor: u64,
+    initial_inventory: BlobInventory,
+    live: &'evidence BlobReferenceSet,
+    preview: hyphae_native_blobs::BlobPruneReceipt,
+    removal: hyphae_native_blobs::BlobPruneReceipt,
+    retained: BlobInventory,
+    reference_trace_time: Duration,
+    candidate_deletion_time: Duration,
+    directory_synchronization_time: Duration,
+}
+
+fn blob_collection_receipt(
+    evidence: &BlobCollectionEvidence<'_>,
+) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+    let live_bytes = evidence
+        .initial_inventory
+        .blob_bytes
+        .checked_sub(evidence.preview.candidate_bytes)
+        .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
+    let expected_live_files = evidence
+        .initial_inventory
+        .blob_count
+        .checked_sub(evidence.preview.candidate_files)
+        .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
+    if evidence.live.len() != expected_live_files
+        || evidence.preview.candidate_files != evidence.removal.candidate_files
+        || evidence.preview.candidate_bytes != evidence.removal.candidate_bytes
+        || evidence.removal.removed_files != evidence.preview.candidate_files
+        || evidence.removal.removed_bytes != evidence.preview.candidate_bytes
+        || evidence.removal.retained_files != evidence.retained.blob_count
+        || evidence.removal.retained_bytes != evidence.retained.blob_bytes
+    {
+        return Err(NativeRuntimeError::BlobCollectionIneligible);
+    }
+    Ok(BlobCollectionReceipt {
+        root_visible_csn: evidence.visible_csn,
+        generation_floor: evidence.generation_floor,
+        live_files: evidence.live.len(),
+        live_bytes,
+        candidate_files: evidence.preview.candidate_files,
+        candidate_bytes: evidence.preview.candidate_bytes,
+        removed_files: evidence.removal.removed_files,
+        removed_bytes: evidence.removal.removed_bytes,
+        retained_files: evidence.retained.blob_count,
+        retained_bytes: evidence.retained.blob_bytes,
+        reference_trace_time: evidence.reference_trace_time,
+        candidate_deletion_time: evidence.candidate_deletion_time,
+        directory_synchronization_time: evidence.directory_synchronization_time,
+        total_time: evidence.collection_started.elapsed(),
+        parent_directory_sync_supported: evidence.removal.parent_sync_supported,
+    })
 }
 
 fn read_physical_list_chunk(
@@ -6470,6 +6761,17 @@ fn interrupt_vacuum(
 ) -> Result<(), NativeRuntimeError> {
     if requested == Some(current) {
         Err(NativeRuntimeError::InjectedVacuumCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
+fn interrupt_blob_collection(
+    requested: Option<BlobCollectionBoundary>,
+    current: BlobCollectionBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedBlobCollectionCrash(current))
     } else {
         Ok(())
     }
@@ -10436,6 +10738,16 @@ fn checked_recovery_total(base: u64, suffix: usize) -> Option<usize> {
         .and_then(|total| usize::try_from(total).ok())
 }
 
+fn recovered_blob_generation_floor(
+    base_root: Option<&RootSet>,
+    commits: &[wal_codec::RecoveredCommit],
+) -> u64 {
+    commits.last().map_or_else(
+        || base_root.map_or(0, RootSet::blob_generation),
+        |commit| commit.manifest.blob_generation,
+    )
+}
+
 fn replay_conflicts(
     commits: &[wal_codec::RecoveredCommit],
 ) -> Result<ConflictTable, NativeRuntimeError> {
@@ -10583,6 +10895,7 @@ fn validate_commit_sequence_after(
     let mut prior = base_root.and_then(RootSet::visible_csn);
     let mut prior_page_generation = base_root.map(RootSet::page_generation);
     let mut prior_retention_floor = base_root.and_then(RootSet::retention_floor_csn);
+    let mut prior_blob_generation = base_root.map_or(0, RootSet::blob_generation);
     for commit in commits {
         let page_generation = commit.manifest.page_generation;
         let retention_floor_csn = commit.manifest.retention_floor_csn;
@@ -10604,6 +10917,7 @@ fn validate_commit_sequence_after(
                 .manifest
                 .read_csn
                 .is_some_and(|read| prior.is_none_or(|published| read > published))
+            || commit.manifest.blob_generation < prior_blob_generation
             || !storage_transition_valid
         {
             return Err(NativeRuntimeError::NoncontiguousCommitSequence);
@@ -10611,6 +10925,7 @@ fn validate_commit_sequence_after(
         prior = Some(commit.manifest.commit_csn);
         prior_page_generation = Some(page_generation);
         prior_retention_floor = Some(retention_floor_csn);
+        prior_blob_generation = commit.manifest.blob_generation;
         expected = expected
             .checked_add(1)
             .ok_or(NativeRuntimeError::NoncontiguousCommitSequence)?;
@@ -15599,6 +15914,182 @@ mod tests {
         }
         let checkpoint = database.checkpoint()?;
         Ok((table, search, checkpoint.visible_csn))
+    }
+
+    fn prepare_blob_collection(
+        database: &mut NativeDatabase,
+    ) -> Result<(Vec<u8>, usize, u64), Box<dyn std::error::Error>> {
+        let mut seed = stage_vertical(database)?;
+        seed.create_relation_definition(wide_catalog_relation(ObjectId::new(3)?)?)?;
+        seed.commit()?;
+
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let mut current = Vec::new();
+        for version in 0..5 {
+            let text = format!("versiontoken{version} {}", "x ".repeat(4_500));
+            current = text.as_bytes().to_vec();
+            let mut update = database.begin(200 + version, DurabilityClass::Strict)?;
+            update.update(table, b"mario".to_vec(), current.clone())?;
+            update.set(b"session".to_vec(), current.clone(), None)?;
+            if version == 4 {
+                update.index_document(search, b"blob-current".to_vec(), &text)?;
+            }
+            update.commit()?;
+        }
+
+        let before = database.blobs.recovery()?;
+        assert_eq!(before.blob_count, 6);
+        assert_eq!(before.generation, 6);
+        let vacuum = database.vacuum_pages()?;
+        if !vacuum.applied {
+            return Err("blob collection corpus did not produce a page vacuum".into());
+        }
+        database.checkpoint()?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        assert_eq!(
+            fs::metadata(database.data_directory.join(WAL_FILE))?.len(),
+            0
+        );
+        Ok((current, before.blob_count, before.generation))
+    }
+
+    fn assert_blob_collection_state(
+        database: &NativeDatabase,
+        current: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        assert_eq!(
+            database.select_latest_relational(
+                ObjectId::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
+                b"mario"
+            )?,
+            Some(current.to_vec())
+        );
+        assert_eq!(
+            database.get_latest_structure(b"session", 1_000)?,
+            Some(current.to_vec())
+        );
+        let hits = database.match_latest_text(
+            ObjectId::new(2).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
+            "versiontoken4",
+            10,
+        )?;
+        assert_eq!(hits[0].document_id, b"blob-current");
+        assert!(matches!(
+            database.catalog_object_latest(
+                ObjectId::new(3).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?
+            )?,
+            Some(CatalogObject::Relation(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn blob_collection_reclaims_retired_content_and_preserves_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (current, before_files, generation) = prepare_blob_collection(&mut database)?;
+
+        let receipt = database.collect_blobs()?;
+        assert_eq!(receipt.root_visible_csn, Csn::new(7)?);
+        assert_eq!(receipt.generation_floor, generation);
+        assert_eq!(receipt.live_files, 2);
+        assert_eq!(receipt.candidate_files, before_files - 2);
+        assert_eq!(receipt.removed_files, before_files - 2);
+        assert_eq!(receipt.retained_files, 2);
+        assert!(receipt.candidate_bytes > receipt.retained_bytes);
+        assert!(
+            receipt.total_time
+                >= receipt.reference_trace_time
+                    + receipt.candidate_deletion_time
+                    + receipt.directory_synchronization_time
+        );
+        assert_blob_collection_state(&database, &current)?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().blob_count, 2);
+        assert_eq!(reopened.recovery_report().blob_generation_floor, generation);
+        assert_eq!(reopened.recovery_report().blob_generation, generation);
+        assert_blob_collection_state(&reopened, &current)?;
+
+        let mut update = reopened.begin(1_001, DurabilityClass::Strict)?;
+        let next = vec![b'n'; super::RELATIONAL_INLINE_VALUE_LIMIT + 1];
+        update.update(ObjectId::new(1)?, b"mario".to_vec(), next)?;
+        update.commit()?;
+        assert_eq!(reopened.blobs.generation()?, generation + 1);
+        assert!(matches!(
+            reopened.collect_blobs(),
+            Err(NativeRuntimeError::BlobCollectionIneligible)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_blob_collection_boundary_reopens_exact_retained_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            super::BlobCollectionBoundary::ReferencesTraced,
+            super::BlobCollectionBoundary::FirstCandidateRemoved,
+            super::BlobCollectionBoundary::AllCandidatesRemoved,
+            super::BlobCollectionBoundary::DirectorySynchronized,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let (current, _before_files, generation) = prepare_blob_collection(&mut database)?;
+            assert!(matches!(
+                database.collect_blobs_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedBlobCollectionCrash(actual))
+                    if actual == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(reopened.recovery_report().blob_generation, generation);
+            assert_blob_collection_state(&reopened, &current)?;
+            let retry = reopened.collect_blobs()?;
+            assert_eq!(retry.retained_files, 2);
+            assert_eq!(reopened.collect_blobs()?.removed_files, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blob_collection_requires_the_exact_single_retained_root_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::BlobCollectionIneligible)
+        ));
+        database.checkpoint()?;
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::BlobCollectionIneligible)
+        ));
+        let vacuum = database.vacuum_pages()?;
+        if !vacuum.applied {
+            return Err("eligibility corpus did not produce a page vacuum".into());
+        }
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::BlobCollectionIneligible)
+        ));
+        database.checkpoint()?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        assert_eq!(database.collect_blobs()?.removed_files, 0);
+
+        let mut suffix = database.begin(1_000, DurabilityClass::Strict)?;
+        suffix.set(b"suffix".to_vec(), b"value".to_vec(), None)?;
+        suffix.commit()?;
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::BlobCollectionIneligible)
+        ));
+        Ok(())
     }
 
     #[test]
