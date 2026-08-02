@@ -195,6 +195,11 @@ The only canonical tombstone has flags exactly `0x02`, inline storage, zero
 reserved and expiry bytes, and an empty payload. Any flag combination or
 payload on a tombstone fails closed.
 
+Logical expiry is independent from physical cleanup. The optional
+[native active-expiry scheduler](active-expiry-scheduler-v1.md) visits the
+ordered expiry namespace through the single native writer and commits bounded
+tombstone transactions without making the timer a visibility authority.
+
 Every `SET`, `EXPIRE`, and `DELETE` upserts one key through a new copy-on-write
 path. Retained roots preserve older values, TTLs, and pre-delete visibility.
 Current direct `GET` and `TTL` traverse verified pinned pages without

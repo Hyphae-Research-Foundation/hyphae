@@ -52,6 +52,7 @@ The current reviewable drafts are:
 - [MVCC and commit semantics](../native/mvcc-commit-v1.md);
 - [native group commit](../native/group-commit-v1.md);
 - [native mixed-durability scheduler](../native/mixed-durability-scheduler-v1.md);
+- [native active-expiry scheduler](../native/active-expiry-scheduler-v1.md);
 - [catalog](../native/catalog-v1.md);
 - [Hyphae SQL](../native/sql-semantics-v1.md);
 - [structures](../native/structures-semantics-v1.md);

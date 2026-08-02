@@ -55,6 +55,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
 - [Native group commit v1](native/group-commit-v1.md)
 - [Native mixed-durability scheduler v1](native/mixed-durability-scheduler-v1.md)
+- [Native active-expiry scheduler v1](native/active-expiry-scheduler-v1.md)
 - [Native catalog v1](native/catalog-v1.md)
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)
