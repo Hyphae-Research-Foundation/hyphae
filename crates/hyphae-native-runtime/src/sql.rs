@@ -150,6 +150,17 @@ enum PreparedPlan {
         prefix: KeyBinding,
         limit: usize,
     },
+    PrimaryKeyPrefixRangeScan {
+        table: ObjectId,
+        relation: Box<RelationDefinition>,
+        projection: Vec<usize>,
+        filter: BoundFilterExpression,
+        parameter_count: usize,
+        residual: bool,
+        output_columns: Vec<String>,
+        range: PrimaryKeyPrefixRange,
+        limit: usize,
+    },
     PrimaryKeyRangeScan {
         table: ObjectId,
         relation: Box<RelationDefinition>,
@@ -390,6 +401,20 @@ struct PrimaryKeyRange {
     parameter_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeyPrefixRangeEndpoint {
+    operand: BoundScalarOperand,
+    inclusive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeyPrefixRange {
+    prefix: KeyBinding,
+    range_column: usize,
+    lower: Option<PrimaryKeyPrefixRangeEndpoint>,
+    upper: Option<PrimaryKeyPrefixRangeEndpoint>,
+}
+
 type PrimaryKeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 #[derive(Clone, Copy)]
@@ -434,6 +459,10 @@ enum SelectAccess {
     },
     PrimaryKeyPrefixScan {
         prefix: KeyBinding,
+        limit: usize,
+    },
+    PrimaryKeyPrefixRangeScan {
+        range: PrimaryKeyPrefixRange,
         limit: usize,
     },
     PrimaryKeyRangeScan {
@@ -556,6 +585,19 @@ fn prepare_select_plan(
                 limit,
             }
         }
+        SelectAccess::PrimaryKeyPrefixRangeScan { range, limit } => {
+            PreparedPlan::PrimaryKeyPrefixRangeScan {
+                table: bound.table,
+                relation: Box::new(relation),
+                projection: bound.projection,
+                filter: bound.filter.ok_or(SqlError::InvalidSyntax)?,
+                parameter_count: bound.parameter_count,
+                residual: bound.residual,
+                output_columns: bound.output_columns,
+                range,
+                limit,
+            }
+        }
         SelectAccess::PrimaryKeyRangeScan {
             range,
             limit,
@@ -620,6 +662,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         | PreparedPlan::SecondaryIndexLookup { .. }
         | PreparedPlan::PrimaryKeyScan { .. }
         | PreparedPlan::PrimaryKeyPrefixScan { .. }
+        | PreparedPlan::PrimaryKeyPrefixRangeScan { .. }
         | PreparedPlan::PrimaryKeyRangeScan { .. }
         | PreparedPlan::IndexedInnerJoin { .. } => Err(SqlError::ParameterMismatch),
     }
@@ -765,6 +808,9 @@ fn execute_bound_snapshot(
         PreparedPlan::PrimaryKeyPrefixScan { .. } => {
             execute_snapshot_prefix_scan(snapshot, plan, parameters)
         }
+        PreparedPlan::PrimaryKeyPrefixRangeScan { .. } => {
+            execute_snapshot_prefix_range_scan(snapshot, plan, parameters)
+        }
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_snapshot_range_scan(snapshot, plan, parameters)
         }
@@ -830,6 +876,9 @@ fn execute_bound_latest(
         }
         PreparedPlan::PrimaryKeyPrefixScan { .. } => {
             execute_latest_prefix_scan(database, snapshot, plan, parameters)
+        }
+        PreparedPlan::PrimaryKeyPrefixRangeScan { .. } => {
+            execute_latest_prefix_range_scan(database, snapshot, plan, parameters)
         }
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_latest_range_scan(database, snapshot, plan, parameters)
@@ -2267,6 +2316,114 @@ fn execute_latest_prefix_scan(
     Ok(rows_result(output_columns, rows))
 }
 
+fn execute_snapshot_prefix_range_scan(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyPrefixRangeScan {
+        table,
+        relation,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        range,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some((lower, upper)) = bind_primary_key_prefix_range(relation, range, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    if primary_key_range_is_empty(&lower, &upper) || *limit == 0 {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let stored_rows = snapshot
+        .state
+        .relational
+        .tables
+        .get(table)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    for (primary_key, stored) in stored_rows.range((lower, upper)) {
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            false,
+            primary_key,
+            stored,
+            Some(filter),
+            parameters,
+        )? {
+            rows.push(row);
+            if rows.len() == *limit {
+                break;
+            }
+        }
+    }
+    Ok(rows_result(output_columns, rows))
+}
+
+fn execute_latest_prefix_range_scan(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::PrimaryKeyPrefixRangeScan {
+        table,
+        relation,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        range,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some((lower, upper)) = bind_primary_key_prefix_range(relation, range, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    if primary_key_range_is_empty(&lower, &upper) || *limit == 0 {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    database
+        .visit_relational_range_at(
+            snapshot,
+            *table,
+            crate::bound_as_slice(&lower),
+            crate::bound_as_slice(&upper),
+            |primary_key, stored| {
+                if let Some(row) = materialize_filtered_row(
+                    relation,
+                    projection,
+                    false,
+                    primary_key,
+                    stored,
+                    Some(filter),
+                    parameters,
+                )? {
+                    rows.push(row);
+                    if rows.len() == *limit {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .map_err(map_relational_visit_error)?;
+    Ok(rows_result(output_columns, rows))
+}
+
 fn execute_snapshot_range_scan(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,
@@ -2504,6 +2661,24 @@ fn execute_explain(
             prefix.columns.len(),
             explain_suffix(bound.residual),
         ),
+        SelectAccess::PrimaryKeyPrefixRangeScan { range, limit } => {
+            let relation = relation_by_id(&transaction.state.catalog, bound.table)?;
+            let range_column = relation
+                .columns
+                .get(range.range_column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .id
+                .get();
+            format!(
+                "PrimaryKeyPrefixRangeScan(table={},prefix_columns={},\
+                 range_column={range_column},lower={},upper={},limit={limit}{}",
+                bound.table,
+                range.prefix.columns.len(),
+                prefix_range_bound_name(range.lower.as_ref()),
+                prefix_range_bound_name(range.upper.as_ref()),
+                explain_suffix(bound.residual),
+            )
+        }
         SelectAccess::PrimaryKeyRangeScan { range, limit, .. } => format!(
             "PrimaryKeyRangeScan(table={},lower={},upper={},limit={limit}{}",
             bound.table,
@@ -2783,6 +2958,9 @@ fn execute_select(
         SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => {
             context.prefix_rows(&prefix, limit)?
         }
+        SelectAccess::PrimaryKeyPrefixRangeScan { range, limit } => {
+            context.prefix_range_rows(&range, limit)?
+        }
         SelectAccess::PrimaryKeyRangeScan {
             range,
             limit,
@@ -2927,6 +3105,29 @@ impl TransactionSelectContext<'_> {
         )
     }
 
+    fn prefix_range_rows(
+        &self,
+        range: &PrimaryKeyPrefixRange,
+        limit: usize,
+    ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+        let Some((lower, upper)) =
+            bind_primary_key_prefix_range(self.definition, range, self.parameters)?
+        else {
+            return Ok(Vec::new());
+        };
+        if primary_key_range_is_empty(&lower, &upper) || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stored_rows = self
+            .transaction
+            .state
+            .relational
+            .tables
+            .get(&self.table)
+            .ok_or(SqlError::InvalidStoredRow)?;
+        self.collect_rows(stored_rows.range((lower, upper)), limit, false)
+    }
+
     fn range_rows(
         &self,
         range: &PrimaryKeyRange,
@@ -3037,6 +3238,15 @@ fn bind_select(
             },
             range_terms,
         )
+    } else if let Some((range, range_terms)) =
+        bind_primary_key_prefix_range_shape(&comparisons, &expected_primary_key)?
+    {
+        let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
+        (
+            SelectAccess::PrimaryKeyPrefixRangeScan { range, limit },
+            range_terms,
+        )
     } else if let Some(prefix) = find_primary_key_prefix(&comparisons, &expected_primary_key) {
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
         validate_primary_key_order(definition, order_by, &expected_primary_key)?;
@@ -3141,6 +3351,9 @@ fn bind_indexed_inner_join(
             legacy_binary: false,
         } => JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit },
         SelectAccess::PrimaryKeyPrefixScan { limit, .. } => {
+            JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit }
+        }
+        SelectAccess::PrimaryKeyPrefixRangeScan { limit, .. } => {
             JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit }
         }
         SelectAccess::PrimaryKeyRangeScan {
@@ -3555,6 +3768,73 @@ fn find_primary_key_prefix(
         .then_some(KeyBinding { columns, operands })
 }
 
+fn bind_primary_key_prefix_range_shape(
+    comparisons: &[&BoundFilterExpression],
+    primary_key: &[usize],
+) -> Result<Option<(PrimaryKeyPrefixRange, usize)>, SqlError> {
+    let Some(prefix) = find_primary_key_prefix(comparisons, primary_key) else {
+        return Ok(None);
+    };
+    let range_column = primary_key
+        .get(prefix.columns.len())
+        .copied()
+        .ok_or(SqlError::InvalidPrimaryKey)?;
+    let mut lower = None;
+    let mut upper = None;
+    let mut range_terms = 0_usize;
+    for predicate in comparisons {
+        let BoundFilterExpression::Comparison {
+            columns,
+            operator,
+            operands,
+        } = predicate
+        else {
+            continue;
+        };
+        if columns.as_slice() != [range_column] {
+            continue;
+        }
+        let [operand] = operands.as_slice() else {
+            return Err(SqlError::InvalidPrimaryKey);
+        };
+        let endpoint = PrimaryKeyPrefixRangeEndpoint {
+            operand: operand.clone(),
+            inclusive: matches!(
+                operator,
+                ComparisonOperator::GreaterOrEqual | ComparisonOperator::LessOrEqual
+            ),
+        };
+        match operator {
+            ComparisonOperator::Greater | ComparisonOperator::GreaterOrEqual => {
+                if lower.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidPrimaryKey);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Less | ComparisonOperator::LessOrEqual => {
+                if upper.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidPrimaryKey);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual => {}
+        }
+    }
+    if lower.is_none() && upper.is_none() {
+        return Ok(None);
+    }
+    let used_terms = prefix.columns.len().saturating_add(range_terms);
+    Ok(Some((
+        PrimaryKeyPrefixRange {
+            prefix,
+            range_column,
+            lower,
+            upper,
+        },
+        used_terms,
+    )))
+}
+
 fn find_secondary_equality_key(
     catalog: &crate::model::CatalogState,
     table: ObjectId,
@@ -3636,6 +3916,14 @@ fn bind_primary_key_range_shape(
 }
 
 fn range_bound_name(endpoint: Option<&PrimaryKeyRangeEndpoint>) -> &'static str {
+    match endpoint {
+        Some(endpoint) if endpoint.inclusive => "inclusive",
+        Some(_) => "exclusive",
+        None => "unbounded",
+    }
+}
+
+fn prefix_range_bound_name(endpoint: Option<&PrimaryKeyPrefixRangeEndpoint>) -> &'static str {
     match endpoint {
         Some(endpoint) if endpoint.inclusive => "inclusive",
         Some(_) => "exclusive",
@@ -3917,6 +4205,76 @@ fn binary_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     upper[index] += 1;
     upper.truncate(index + 1);
     Some(upper)
+}
+
+fn bind_primary_key_prefix_range(
+    definition: &RelationDefinition,
+    range: &PrimaryKeyPrefixRange,
+    parameters: &[SqlValue],
+) -> Result<Option<PrimaryKeyBounds>, SqlError> {
+    let Some(prefix) = bind_primary_key_prefix(definition, &range.prefix, parameters)? else {
+        return Ok(None);
+    };
+    let primary_key = primary_key_indices(definition)?;
+    if primary_key.get(range.prefix.columns.len()) != Some(&range.range_column) {
+        return Err(SqlError::InvalidPrimaryKey);
+    }
+    let logical_type = &definition
+        .columns
+        .get(range.range_column)
+        .ok_or(SqlError::InvalidCatalogObject)?
+        .logical_type;
+    let prefix_upper = binary_prefix_successor(&prefix);
+    let lower = match range.lower.as_ref() {
+        Some(endpoint) => {
+            let value = resolve_operand(&endpoint.operand, parameters)?;
+            if matches!(value, SqlValue::Null) {
+                return Ok(None);
+            }
+            let key = append_ordered_component(&prefix, value, logical_type)?;
+            if endpoint.inclusive {
+                Bound::Included(key)
+            } else {
+                let Some(successor) = binary_prefix_successor(&key) else {
+                    return Ok(None);
+                };
+                Bound::Included(successor)
+            }
+        }
+        None => Bound::Included(prefix.clone()),
+    };
+    let upper = match range.upper.as_ref() {
+        Some(endpoint) => {
+            let value = resolve_operand(&endpoint.operand, parameters)?;
+            if matches!(value, SqlValue::Null) {
+                return Ok(None);
+            }
+            let key = append_ordered_component(&prefix, value, logical_type)?;
+            if endpoint.inclusive {
+                binary_prefix_successor(&key)
+                    .or(prefix_upper)
+                    .map_or(Bound::Unbounded, Bound::Excluded)
+            } else {
+                Bound::Excluded(key)
+            }
+        }
+        None => prefix_upper.map_or(Bound::Unbounded, Bound::Excluded),
+    };
+    Ok(Some((lower, upper)))
+}
+
+fn append_ordered_component(
+    prefix: &[u8],
+    value: &SqlValue,
+    logical_type: &LogicalType,
+) -> Result<Vec<u8>, SqlError> {
+    let component = value
+        .encode_ordered_component(logical_type)
+        .map_err(|_| SqlError::TypeMismatch)?;
+    let mut encoded = Vec::with_capacity(prefix.len().saturating_add(component.len()));
+    encoded.extend_from_slice(prefix);
+    encoded.extend_from_slice(&component);
+    Ok(encoded)
 }
 
 fn bind_primary_key_range(
