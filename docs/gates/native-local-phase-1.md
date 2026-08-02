@@ -384,6 +384,17 @@ p95 and p99 increased in the single run and 119 of 127 attempts were empty.
 Adaptive backoff, additional maintenance classes, native-ext4/power-loss
 evidence and the complete G1/G3/G7 matrices remain open.
 
+The [native primary-key left-prefix scan
+evidence](evidence/native-primary-key-prefix-scans-2026-08-02.md) binds the
+longest strict composite-key prefix to one canonical half-open B+tree
+interval, preserves residual-before-limit semantics, and proves private,
+retained, current-root, corrupted-row, and reopened behavior. The clean
+schema-v13 WSL2 observation measured pure prefix `LIMIT 10` at 14.557
+microseconds p50 and 78.233 microseconds p99. A next-column range left as a
+residual measured 198.603 microseconds p50 after examining 512 rows, so
+prefix-plus-range planning, secondary ranges, broader SQL, and the remaining
+G2/G7 matrices remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
@@ -432,7 +443,7 @@ unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
 along with multi-generation pin-aware retention,
-secondary-index range/streaming execution,
+prefix-plus-range and secondary-index range/streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid

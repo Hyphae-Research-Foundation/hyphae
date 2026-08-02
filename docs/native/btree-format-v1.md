@@ -193,10 +193,19 @@ primary-key bounds into the table's physical namespace, validates the table
 marker, resolves only visible row versions, skips tombstones, and returns no
 rows for inverted or equal-open intervals.
 
+Prepared SQL strict left-prefix scans concatenate the canonical ordered
+components selected from a composite primary key and derive the half-open
+interval `[prefix, binary-successor(prefix))`. The runtime maps that interval
+into the same `0x02 + table ObjectId` namespace and uses the buffered range
+visitor. This keeps self-delimiting text/binary components isolated (`a` does
+not admit `aa`), applies residual predicates before `LIMIT`, and avoids
+materializing the complete relation.
+
 This namespace remains the first physical relational route, not the complete
 SQL storage design. Secondary-key range cursors, a stateful zero-copy cursor,
-prefix compression, bulk load, primary-key-changing updates, free-space
-policy, scan-oriented column batches, retention, and vacuum remain pending.
+prefix-plus-range planning, prefix compression, bulk load,
+primary-key-changing updates, free-space policy, scan-oriented column batches,
+retention, and vacuum remain pending.
 
 ## Structure namespace
 

@@ -8,9 +8,8 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
-`INNER JOIN` shape is implemented as described below. Composite primary-key
-left-prefix scans are specified below but are not yet implemented. G2 remains
-open
+`INNER JOIN` shape and bounded composite primary-key left-prefix scans are
+implemented experimentally as described below. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -39,8 +38,9 @@ column IDs.
 The current implementation slice accepts catalog-typed primitive columns,
 inline or table-level ordered primary keys, explicit nullability, named-column
 `INSERT`, `SELECT *` or named projection, conjunctions covering exactly the
-primary key or one complete secondary-index key, and catalog-bound prepared
-point lookup. It also accepts bounded no-predicate scans:
+primary key, a strict composite primary-key left prefix, or one complete
+secondary-index key, and catalog-bound prepared point lookup. It also accepts
+bounded no-predicate scans:
 
 ```text
 SELECT <projection>
@@ -149,14 +149,15 @@ functions, and column-to-column comparisons remain outside this milestone.
 The same scalar operands are admitted by the exact-primary-key mutation slice
 defined below.
 
-The binder may extract complete primary-key equality, one complete
-secondary-index equality, or complete-primary-key lower/upper bounds from
-top-level `AND` terms. Every remaining term is a residual filter. When no
-admitted exact or range access exists, execution uses a bounded primary-key
-scan. `LIMIT` is mandatory for every scan or range plan and is applied to rows
-that evaluate to `TRUE`, not to rows merely examined. Exact primary/secondary
-access retains its existing no-`LIMIT` form. `ORDER BY`, when admitted for a
-scan or range, remains the complete ascending primary key.
+The binder may extract complete primary-key equality, the longest strict
+primary-key left prefix, one complete secondary-index equality, or
+complete-primary-key lower/upper bounds from top-level `AND` terms. Every
+remaining term is a residual filter. When no admitted exact, prefix, or range
+access exists, execution uses a bounded primary-key scan. `LIMIT` is mandatory
+for every scan, prefix, or range plan and is applied to rows that evaluate to
+`TRUE`, not to rows merely examined. Exact primary/secondary access retains
+its existing no-`LIMIT` form. `ORDER BY`, when admitted for a scan, prefix, or
+range, remains the complete ascending primary key.
 
 All parameter arity and catalog logical-type checks occur before storage
 traversal. A SQL `NULL` parameter is type-admissible in a comparison and makes
@@ -258,6 +259,7 @@ cardinality; it does not materialize the complete left relation.
 `PrimaryKeyLookup(table=<id>)` or
 `SecondaryIndexLookup(table=<id>,index=<id>)`, or
 `PrimaryKeyScan(table=<id>,limit=<n>)`, or
+`PrimaryKeyPrefixScan(table=<id>,columns=<count>,limit=<n>)`, or
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`, or
 `IndexedInnerJoin(left_table=<id>,left_access=<access>,right_table=<id>,right_access=primary-key)`.
 Join left access is `primary-key`, `unique-secondary(index=<id>)`,
@@ -279,8 +281,8 @@ prefix, secondary ranges,
 descending scans, offsets, and constraints beyond primary key/nullability and
 the first unique index remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate general
-expressions, or update multiple rows. Prefix, bitmap, and cost-based access
-selection remain pending.
+expressions, or update multiple rows. Prefix-plus-range, bitmap, and
+cost-based access selection remain pending.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -301,12 +303,12 @@ relation/index definitions in the catalog-version-bound plan.
 `execute_prepared_latest` captures one immutable root set, rejects a stale
 catalog version, traverses the buffered relational B+tree directly, and
 materializes only rows reached by the exact primary/secondary key or bounded
-primary scan/range. The secondary path scans only the length-delimited exact
-index-key prefix, follows each live entry to its primary-key row in the same
-root, and returns rows in canonical primary-key order. The scan path uses an
-inclusive/exclusive bound-aware physical visitor, prunes separator-disjoint
-subtrees, skips row tombstones, and stops after `LIMIT` matching rows. It does
-not construct `MaterializedState`.
+primary scan/prefix/range. The secondary path scans only the length-delimited
+exact index-key prefix, follows each live entry to its primary-key row in the
+same root, and returns rows in canonical primary-key order. Scan, prefix, and
+range paths use the inclusive/exclusive bound-aware physical visitor, prune
+separator-disjoint subtrees, skip row tombstones, and stop after `LIMIT`
+matching rows. They do not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last
 primary key as the caller's next exclusive cursor.
