@@ -1,7 +1,7 @@
 # Native local ecosystem phase-1 gate
 
 Status: in progress; G0 specifications are drafted but implementation and
-dependency evidence remain incomplete
+exit evidence remain incomplete
 
 This is the ordered implementation gate for the Hyphae-owned relational,
 structure, and search ecosystem. It describes future work, not shipped
@@ -151,8 +151,19 @@ The [native catalog-definition
 evidence](evidence/native-catalog-definitions-2026-08-01.md) binds
 `HYCOBJ01`, complete-definition WAL mutations, `HYCAT002` roots, immutable
 snapshot introspection, legacy `HYCAT001` reconstruction, reopen proof, and
-fail-closed definition validation to one source commit. Catalog B+tree
-scaling, definition history, typed rows, and secondary indexes remain open.
+fail-closed definition validation to one source commit. At that source commit,
+catalog B+tree scaling, definition history, typed rows, and secondary indexes
+remained open.
+
+The [native scalable catalog B+tree
+evidence](evidence/native-catalog-btree-2026-08-02.md) replaces the
+single-page write path with `HYCAT003` ID and normalized-name namespaces,
+inline/blob definition envelopes, buffered point lookup, V1/V2 migration,
+copy-on-write incremental DDL, corruption rejection and Windows/WSL2 release
+observations over 1,024 objects. ID and name lookup were observed in the
+microsecond domain; strict DDL remained millisecond work. Drops, definition
+history, dependency edges, schema evolution, cold/concurrent/saturated
+behavior and the complete G0/G1/G7 evidence remain open.
 
 The [native typed SQL-row
 evidence](evidence/native-typed-sql-rows-2026-08-01.md) binds catalog-typed
@@ -322,7 +333,7 @@ equality; detached-writer retention-floor rejection; six interruption
 boundaries; orphan cleanup; and a clean Windows release receipt. The measured
 64-row, nine-version corpus reclaimed 97.989% of page-file bytes while
 preserving a 1.000 microsecond warm point-read p50. Strict vacuum itself
-measured 29.791 milliseconds and the immediate no-op measured 12.638
+measured 29.658 milliseconds and the immediate no-op measured 12.672
 milliseconds, so neither is claimed as a microsecond maintenance path.
 Multi-generation retention, blob/WAL collection, background scheduling, and
 the complete G1/G7 matrices remain open.
@@ -341,10 +352,11 @@ key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
 explicit per-key row-version chains with closed half-open intervals while
 keeping V1 inline-row directories compatible. Catalog now retains complete
-typed definitions but remains bounded to one root page; new search roots use a
-native inverted B+tree while legacy inline roots remain compatible. Detached
-transactions now prepare concurrently and rebase disjoint all-engine writes
-under serialized publication;
+typed definitions in a multilevel native B+tree with separate ID/name
+namespaces and definition blobs; new search roots use a native inverted
+B+tree while legacy inline roots remain compatible. Detached transactions now
+prepare concurrently and rebase disjoint all-engine writes under serialized
+publication;
 simultaneous commit submission and concurrency/saturation evidence remain
 pending, along with multi-generation retention, blob/WAL collection,
 secondary-index range/streaming

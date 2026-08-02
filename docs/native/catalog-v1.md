@@ -3,9 +3,10 @@
 Status: normative target contract; immutable relation/secondary-index/
 structure/search definitions, catalogued vector metric/HNSW configuration,
 their canonical `HYCOBJ01` codec, and full-definition `HYCAT002` runtime
-persistence are implemented experimentally. The scalable `HYCAT003` B+tree
-format below is specified but not yet implemented. DDL evolution, constraints,
-and dependency tracking remain pending.
+persistence are implemented experimentally. Scalable `HYCAT003` B+tree
+persistence, immutable definition blobs and buffered ID/name lookup are also
+implemented experimentally. DDL evolution, constraints, and dependency
+tracking remain pending.
 
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
@@ -238,11 +239,11 @@ the existing all-engine crash and recovery matrices. Non-reuse,
 drops/evolution, dependency enforcement, and prepared-plan invalidation beyond
 catalog-version mismatch remain target requirements.
 
-`HYCAT003` acceptance additionally requires golden marker, key and envelope
-bytes; an object count that exceeds one page; multilevel ID and name lookup;
-large-definition blob recovery; V1/V2 migration; retained legacy snapshots;
-missing/cross-linked/corrupt entry rejection; copy-on-write page-identity
-evidence; every normal commit interruption boundary; page-generation vacuum;
-reopen equivalence; and an exact source-bound latency and page-amplification
-receipt. These requirements remain red until the implementation and evidence
-land.
+Current `HYCAT003` coverage additionally proves golden marker, key and envelope
+bytes; an object count that exceeds one page; multilevel buffered ID and name
+lookup; large-definition blob recovery; V1/V2 migration; retained prior-root
+snapshots; cross-linked and noncanonical entry rejection; bounded
+copy-on-write page amplification; every normal commit interruption boundary;
+page-generation vacuum; reopen equivalence; and source-bound Windows/WSL2
+latency receipts. Missing-entry permutations, mutation testing, cold-cache,
+concurrency, saturation and p99.9 evidence remain open.
