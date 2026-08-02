@@ -174,7 +174,7 @@ fn print_stats(name: &str, stats: Stats, keys_per_batch: u32, trailing_comma: bo
         "    \"{name}\": {{\"p50_nanos\": {}, \"p95_nanos\": {}, \
          \"p99_nanos\": {}, \"p999_nanos\": {}, \"max_nanos\": {}, \
          \"first_nanos\": {}, \"last_nanos\": {}, \
-         \"batches_per_second\": {:.3}, \"keys_per_second\": {:.3}}}{}",
+         \"operations_per_second\": {:.3}, \"work_units_per_second\": {:.3}}}{}",
         stats.p50_nanos,
         stats.p95_nanos,
         stats.p99_nanos,
