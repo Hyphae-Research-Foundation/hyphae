@@ -36,19 +36,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hyphae_native_blobs::{BlobError, BlobStore, StagedBlob};
+use hyphae_native_blobs::{BlobError, BlobRecovery, BlobStore, StagedBlob};
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader,
     QualifiedName, RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
     SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
 };
-use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
+use hyphae_native_manifest::{
+    ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
+};
 use hyphae_native_mvcc::{
     CommitCoordinator, ConflictTable, MvccError, RootGroupTransaction, RootSet, RootSlot,
     RootTransaction, Snapshot, WalAnchor, WriteConflict, WriteKey,
 };
-use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
+use hyphae_native_pages::{
+    BufferPool, BufferPoolError, OpenedPageStore, PageKind, PageStore, PageStoreError,
+};
 use hyphae_native_records::{
     BlobReference, ColumnValueRef, RecordError, RowRecord, RowRecordView, RowTupleView,
     RowVersionPointer,
@@ -59,8 +63,8 @@ use hyphae_native_types::{
     VectorElement, VectorType,
 };
 use hyphae_native_wal::{
-    WAL_BLOCK_SIZE, WalError, WalFile, WalRecovery, WalRetentionAnchor, WalRetentionAnchorFields,
-    WalRetentionStore,
+    OpenedWal, WAL_BLOCK_SIZE, WalError, WalFile, WalRecovery, WalRetentionAnchor,
+    WalRetentionAnchorFields, WalRetentionStore,
 };
 use thiserror::Error;
 
@@ -513,6 +517,8 @@ pub enum WalRetentionBoundary {
     WalSynchronized,
     /// The candidate anchor has its stable immutable filename.
     AnchorStabilized,
+    /// Immutable manifest files below the anchor's base were removed.
+    ManifestPrefixRemoved,
     /// Any prior stable anchor has been removed.
     PriorAnchorRemoved,
 }
@@ -616,6 +622,28 @@ impl SortedSetEntry {
     }
 }
 
+struct OpenRecoveryReport<'recovery> {
+    open_started: Instant,
+    opened_pages: &'recovery OpenedPageStore,
+    opened_wal: &'recovery OpenedWal,
+    replayed_transactions: usize,
+    metadata: &'recovery WalRecoveryMetadata,
+    retention_anchor: Option<WalRetentionAnchor>,
+    wal_physical_verification_time: Duration,
+    wal_semantic_replay_time: Duration,
+    root_validation_time: Duration,
+    active_page_generation: PageGeneration,
+    retention_floor_csn: Csn,
+    recovered_page_generation_files: usize,
+    manifest_recovery: &'recovery ManifestRecovery,
+    manifest_prune: Option<ManifestPruneReceipt>,
+    manifest_verification_time: Duration,
+    manifest_pruning_time: Duration,
+    checkpoint_validation: &'recovery CheckpointValidation,
+    blob_recovery: &'recovery BlobRecovery,
+    recovered_temporary_wal_anchors: usize,
+}
+
 /// Reopen evidence for the native data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReport {
@@ -653,6 +681,20 @@ pub struct RecoveryReport {
     pub recovered_page_generation_files: usize,
     /// Number of verified immutable root manifests.
     pub manifest_count: usize,
+    /// First immutable manifest generation verified during open.
+    pub manifest_base_generation: Option<ManifestGeneration>,
+    /// Physical bytes in the verified retained manifest chain.
+    pub retained_manifest_bytes: u64,
+    /// Retired manifest-prefix files discovered during open.
+    pub retired_manifest_prefix_files: usize,
+    /// Retired manifest-prefix bytes discovered during open.
+    pub retired_manifest_prefix_bytes: u64,
+    /// Retired manifest-prefix files removed after complete validation.
+    pub recovered_manifest_prefix_files: usize,
+    /// Time spent verifying the retained immutable manifest chain.
+    pub manifest_verification_time: Duration,
+    /// Time spent deleting and synchronizing a retired manifest prefix.
+    pub manifest_pruning_time: Duration,
     /// Number of semantically verified WAL checkpoint anchors.
     pub checkpoint_count: usize,
     /// Number of interrupted temporary manifests removed during open.
@@ -669,6 +711,49 @@ pub struct RecoveryReport {
     pub recovered_temporary_blobs: usize,
     /// Interrupted temporary WAL-anchor stages removed during open.
     pub recovered_temporary_wal_anchors: usize,
+}
+
+fn build_recovery_report(evidence: &OpenRecoveryReport<'_>) -> RecoveryReport {
+    let anchor = evidence.retention_anchor;
+    RecoveryReport {
+        page_tail_bytes_removed: evidence.opened_pages.truncated_tail_bytes,
+        wal_tail_bytes_removed: evidence.opened_wal.recovery.truncated_tail_bytes,
+        committed_transactions: evidence.metadata.committed_transactions,
+        wal_base_csn: anchor.map(|anchor| anchor.fields().base_visible_csn),
+        retired_wal_blocks: anchor.map_or(0, |anchor| anchor.fields().retired_through_sequence),
+        retained_wal_blocks: evidence.opened_wal.recovery.blocks.len(),
+        retained_wal_bytes: evidence.metadata.retained_wal_bytes,
+        replayed_transactions: evidence.replayed_transactions,
+        wal_physical_verification_time: evidence.wal_physical_verification_time,
+        wal_semantic_replay_time: evidence.wal_semantic_replay_time,
+        root_validation_time: evidence.root_validation_time,
+        open_time: evidence.open_started.elapsed(),
+        visible_csn: evidence.metadata.visible_csn,
+        active_page_generation: evidence.active_page_generation,
+        retention_floor_csn: evidence
+            .metadata
+            .visible_csn
+            .map(|_| evidence.retention_floor_csn),
+        recovered_page_generation_files: evidence.recovered_page_generation_files,
+        manifest_count: evidence.manifest_recovery.manifests.len(),
+        manifest_base_generation: evidence.manifest_recovery.manifest_base_generation,
+        retained_manifest_bytes: evidence.manifest_recovery.retained_manifest_bytes,
+        retired_manifest_prefix_files: evidence.manifest_recovery.retired_prefix_files,
+        retired_manifest_prefix_bytes: evidence.manifest_recovery.retired_prefix_bytes,
+        recovered_manifest_prefix_files: evidence
+            .manifest_prune
+            .map_or(0, |receipt| receipt.removed_files),
+        manifest_verification_time: evidence.manifest_verification_time,
+        manifest_pruning_time: evidence.manifest_pruning_time,
+        checkpoint_count: evidence.metadata.checkpoint_count,
+        recovered_temporary_manifests: evidence.manifest_recovery.ignored_temporary_files,
+        unanchored_manifest_suffix: evidence.checkpoint_validation.unanchored_manifest_suffix,
+        latest_checkpoint_generation: evidence.checkpoint_validation.latest_generation,
+        blob_count: evidence.blob_recovery.blob_count,
+        blob_generation: evidence.blob_recovery.generation,
+        recovered_temporary_blobs: evidence.blob_recovery.recovered_temporary_files,
+        recovered_temporary_wal_anchors: evidence.recovered_temporary_wal_anchors,
+    }
 }
 
 /// Receipt for one cross-engine native commit.
@@ -803,16 +888,28 @@ pub struct WalRetentionReceipt {
     pub anchor_digest: [u8; 32],
     /// Prior stable anchors removed after publication.
     pub prior_anchors_removed: usize,
+    /// Immutable manifest-prefix files retired with this anchor.
+    pub retired_manifest_files: usize,
+    /// Physical immutable manifest bytes retired with this anchor.
+    pub retired_manifest_bytes: u64,
+    /// Immutable manifest files retained from the anchor generation.
+    pub retained_manifest_files: usize,
+    /// Physical immutable manifest bytes retained from the anchor generation.
+    pub retained_manifest_bytes: u64,
     /// Create-new anchor stage and `.pending` publication time.
     pub anchor_publication_time: Duration,
     /// WAL reset and explicit file synchronization time.
     pub wal_reset_synchronization_time: Duration,
+    /// Manifest-prefix deletion and roots-directory synchronization time.
+    pub manifest_pruning_time: Duration,
     /// Stable-anchor promotion and prior-anchor cleanup time.
     pub anchor_stabilization_time: Duration,
     /// Complete retention operation time.
     pub total_time: Duration,
     /// Whether strict data-directory synchronization is implemented here.
     pub parent_directory_sync_supported: bool,
+    /// Whether strict roots-directory synchronization is implemented here.
+    pub manifest_directory_sync_supported: bool,
 }
 /// One lexical match result ordered by descending BM25 score.
 #[derive(Clone, Debug, PartialEq)]
@@ -1304,6 +1401,13 @@ impl NativeDatabase {
                 retention_floor_csn: None,
                 recovered_page_generation_files: 0,
                 manifest_count: 0,
+                manifest_base_generation: None,
+                retained_manifest_bytes: 0,
+                retired_manifest_prefix_files: 0,
+                retired_manifest_prefix_bytes: 0,
+                recovered_manifest_prefix_files: 0,
+                manifest_verification_time: Duration::ZERO,
+                manifest_pruning_time: Duration::ZERO,
                 checkpoint_count: 0,
                 recovered_temporary_manifests: 0,
                 unanchored_manifest_suffix: 0,
@@ -1328,7 +1432,7 @@ impl NativeDatabase {
         let blobs = BlobStore::open(path)?;
         let blob_recovery = blobs.recovery()?;
         let WalOpenState {
-            manifests,
+            mut manifests,
             manifest_recovery,
             mut wal_retention,
             recovered_temporary_wal_anchors,
@@ -1338,6 +1442,7 @@ impl NativeDatabase {
             recovered_wal,
             active_page_generation,
             retention_floor_csn,
+            manifest_verification_time,
             wal_physical_verification_time,
             wal_semantic_replay_time,
         } = open_wal_state(path)?;
@@ -1376,7 +1481,30 @@ impl NativeDatabase {
         let coordinator = restore_commit_coordinator(latest_root)?;
         let metadata =
             wal_recovery_metadata(path, retention_anchor, &opened_wal.recovery, &recovered_wal)?;
+        let (manifest_prune, manifest_pruning_time) =
+            prune_recovered_manifest_prefix(&mut manifests, retention_anchor)?;
         cleanup_stale_wal_anchors(&mut wal_retention, retention_anchor)?;
+        let recovery = build_recovery_report(&OpenRecoveryReport {
+            open_started,
+            opened_pages: &opened_pages,
+            opened_wal: &opened_wal,
+            replayed_transactions: commits.len(),
+            metadata: &metadata,
+            retention_anchor,
+            wal_physical_verification_time,
+            wal_semantic_replay_time,
+            root_validation_time,
+            active_page_generation,
+            retention_floor_csn,
+            recovered_page_generation_files,
+            manifest_recovery: &manifest_recovery,
+            manifest_prune,
+            manifest_verification_time,
+            manifest_pruning_time,
+            checkpoint_validation: &checkpoint_validation,
+            blob_recovery: &blob_recovery,
+            recovered_temporary_wal_anchors,
+        });
         Ok(Self {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
@@ -1392,34 +1520,7 @@ impl NativeDatabase {
             search_format,
             next_transaction_id: metadata.next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
-            recovery: RecoveryReport {
-                page_tail_bytes_removed: opened_pages.truncated_tail_bytes,
-                wal_tail_bytes_removed: opened_wal.recovery.truncated_tail_bytes,
-                committed_transactions: metadata.committed_transactions,
-                wal_base_csn: retention_anchor.map(|anchor| anchor.fields().base_visible_csn),
-                retired_wal_blocks: retention_anchor
-                    .map_or(0, |anchor| anchor.fields().retired_through_sequence),
-                retained_wal_blocks: opened_wal.recovery.blocks.len(),
-                retained_wal_bytes: metadata.retained_wal_bytes,
-                replayed_transactions: commits.len(),
-                wal_physical_verification_time,
-                wal_semantic_replay_time,
-                root_validation_time,
-                open_time: open_started.elapsed(),
-                visible_csn: metadata.visible_csn,
-                active_page_generation,
-                retention_floor_csn: metadata.visible_csn.map(|_| retention_floor_csn),
-                recovered_page_generation_files,
-                manifest_count: manifest_recovery.manifests.len(),
-                checkpoint_count: metadata.checkpoint_count,
-                recovered_temporary_manifests: manifest_recovery.ignored_temporary_files,
-                unanchored_manifest_suffix: checkpoint_validation.unanchored_manifest_suffix,
-                latest_checkpoint_generation: checkpoint_validation.latest_generation,
-                blob_count: blob_recovery.blob_count,
-                blob_generation: blob_recovery.generation,
-                recovered_temporary_blobs: blob_recovery.recovered_temporary_files,
-                recovered_temporary_wal_anchors,
-            },
+            recovery,
         })
     }
 
@@ -3621,10 +3722,21 @@ impl NativeDatabase {
         let anchor_stabilization_started = Instant::now();
         self.wal_retention.stabilize_candidate(fields.epoch, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorStabilized)?;
+        let anchor_promotion_time = anchor_stabilization_started.elapsed();
+        let manifest_pruning_started = Instant::now();
+        let manifest_prune = self.manifests.prune_before(
+            fields.manifest_generation,
+            fields.manifest_digest,
+            true,
+        )?;
+        let manifest_pruning_time = manifest_pruning_started.elapsed();
+        interrupt_wal_retention(interruption, WalRetentionBoundary::ManifestPrefixRemoved)?;
+        let prior_anchor_cleanup_started = Instant::now();
         let prior_anchors_removed = self.wal_retention.remove_before(fields.epoch, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::PriorAnchorRemoved)?;
-        let anchor_stabilization_time = anchor_stabilization_started.elapsed();
-        self.record_wal_retention(fields)?;
+        let anchor_stabilization_time =
+            anchor_promotion_time + prior_anchor_cleanup_started.elapsed();
+        self.record_wal_retention(fields, manifest_prune, manifest_pruning_time)?;
         Ok(WalRetentionReceipt {
             anchor_epoch: fields.epoch,
             base_visible_csn: fields.base_visible_csn,
@@ -3633,11 +3745,17 @@ impl NativeDatabase {
             checkpoint_lsn: fields.retired_checkpoint_lsn,
             anchor_digest: anchor.digest(),
             prior_anchors_removed,
+            retired_manifest_files: manifest_prune.removed_files,
+            retired_manifest_bytes: manifest_prune.removed_bytes,
+            retained_manifest_files: manifest_prune.retained_files,
+            retained_manifest_bytes: manifest_prune.retained_bytes,
             anchor_publication_time,
             wal_reset_synchronization_time,
+            manifest_pruning_time,
             anchor_stabilization_time,
             total_time: retention_started.elapsed(),
             parent_directory_sync_supported: self.wal_retention.recovery().parent_sync_supported,
+            manifest_directory_sync_supported: manifest_prune.parent_sync_supported,
         })
     }
 
@@ -3685,6 +3803,7 @@ impl NativeDatabase {
             && anchor.fields().retired_through_sequence == retired_through_sequence
             && current_wal_bytes == 0
         {
+            let manifest_recovery = self.manifests.recovery();
             return Ok(PreparedWalRetention::Existing(WalRetentionReceipt {
                 anchor_epoch: anchor.fields().epoch,
                 base_visible_csn: visible_csn,
@@ -3693,14 +3812,20 @@ impl NativeDatabase {
                 checkpoint_lsn,
                 anchor_digest: anchor.digest(),
                 prior_anchors_removed: 0,
+                retired_manifest_files: 0,
+                retired_manifest_bytes: 0,
+                retained_manifest_files: manifest_recovery.manifests.len(),
+                retained_manifest_bytes: manifest_recovery.retained_manifest_bytes,
                 anchor_publication_time: Duration::ZERO,
                 wal_reset_synchronization_time: Duration::ZERO,
+                manifest_pruning_time: Duration::ZERO,
                 anchor_stabilization_time: Duration::ZERO,
                 total_time: Duration::ZERO,
                 parent_directory_sync_supported: self
                     .wal_retention
                     .recovery()
                     .parent_sync_supported,
+                manifest_directory_sync_supported: manifest_recovery.parent_sync_supported,
             }));
         }
         let (anchor_epoch, previous_anchor_digest) =
@@ -3737,6 +3862,8 @@ impl NativeDatabase {
     fn record_wal_retention(
         &mut self,
         fields: WalRetentionAnchorFields,
+        manifest_prune: ManifestPruneReceipt,
+        manifest_pruning_time: Duration,
     ) -> Result<(), NativeRuntimeError> {
         self.recovery.committed_transactions = usize::try_from(fields.base_visible_csn.get())
             .map_err(|_| NativeRuntimeError::NoncontiguousCommitSequence)?;
@@ -3745,6 +3872,12 @@ impl NativeDatabase {
         self.recovery.retained_wal_blocks = 0;
         self.recovery.retained_wal_bytes = 0;
         self.recovery.replayed_transactions = 0;
+        self.recovery.manifest_count = manifest_prune.retained_files;
+        self.recovery.manifest_base_generation = Some(manifest_prune.base_generation);
+        self.recovery.retained_manifest_bytes = manifest_prune.retained_bytes;
+        self.recovery.retired_manifest_prefix_files = 0;
+        self.recovery.retired_manifest_prefix_bytes = 0;
+        self.recovery.manifest_pruning_time = manifest_pruning_time;
         self.recovery.checkpoint_count = usize::try_from(fields.manifest_generation.get())
             .map_err(|_| NativeRuntimeError::InvalidCheckpoint)?;
         self.recovery.latest_checkpoint_generation = Some(fields.manifest_generation);
@@ -6348,19 +6481,22 @@ struct CheckpointValidation {
     unanchored_manifest_suffix: usize,
 }
 
+fn manifest_by_generation(
+    manifests: &[RootManifest],
+    generation: ManifestGeneration,
+) -> Option<&RootManifest> {
+    manifests
+        .binary_search_by_key(&generation.get(), |manifest| manifest.generation().get())
+        .ok()
+        .and_then(|index| manifests.get(index))
+}
+
 fn validate_retention_anchor(
     anchor: &WalRetentionAnchor,
     manifests: &[RootManifest],
 ) -> Result<RootSet, NativeRuntimeError> {
     let fields = anchor.fields();
-    let manifest_index = fields
-        .manifest_generation
-        .get()
-        .checked_sub(1)
-        .and_then(|index| usize::try_from(index).ok())
-        .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
-    let manifest = manifests
-        .get(manifest_index)
+    let manifest = manifest_by_generation(manifests, fields.manifest_generation)
         .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
     let root = manifest.to_root_set()?;
     if manifest.generation() != fields.manifest_generation
@@ -6385,14 +6521,7 @@ fn validate_checkpoints(
     base_anchor: Option<&WalRetentionAnchor>,
 ) -> Result<CheckpointValidation, NativeRuntimeError> {
     for checkpoint in &recovered.checkpoints {
-        let generation_index = checkpoint
-            .manifest_generation
-            .get()
-            .checked_sub(1)
-            .and_then(|index| usize::try_from(index).ok())
-            .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
-        let manifest = manifests
-            .get(generation_index)
+        let manifest = manifest_by_generation(manifests, checkpoint.manifest_generation)
             .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
         let committed_root = committed_roots
             .get(&checkpoint.visible_csn)
@@ -6406,18 +6535,15 @@ fn validate_checkpoints(
         }
     }
     let latest = recovered.checkpoints.last();
-    let anchored_manifest_count = latest
+    let anchored_generation = latest
         .map(|checkpoint| checkpoint.manifest_generation)
-        .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_generation))
-        .map(|generation| {
-            usize::try_from(generation.get()).map_err(|_| NativeRuntimeError::InvalidCheckpoint)
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let unanchored_manifest_suffix = manifests
-        .len()
-        .checked_sub(anchored_manifest_count)
-        .ok_or(NativeRuntimeError::InvalidCheckpoint)?;
+        .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_generation));
+    let unanchored_manifest_suffix = anchored_generation.map_or(manifests.len(), |generation| {
+        manifests
+            .iter()
+            .filter(|manifest| manifest.generation() > generation)
+            .count()
+    });
     Ok(CheckpointValidation {
         last_checkpoint_lsn: latest
             .map(|checkpoint| checkpoint.checkpoint_lsn)
@@ -10139,15 +10265,30 @@ struct WalOpenState {
     recovered_wal: RecoveredWal,
     active_page_generation: PageGeneration,
     retention_floor_csn: Csn,
+    manifest_verification_time: Duration,
     wal_physical_verification_time: Duration,
     wal_semantic_replay_time: Duration,
 }
 
 fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
-    let manifests = RootManifestStore::open(path)?;
-    let manifest_recovery = manifests.recovery();
     let mut wal_retention = WalRetentionStore::open(path)?;
     let retention_recovery = wal_retention.recovery();
+    let recovery_anchor = retention_recovery
+        .candidate
+        .or_else(|| wal_retention.current().copied());
+    let manifest_verification_started = Instant::now();
+    let manifests = recovery_anchor.map_or_else(
+        || RootManifestStore::open(path),
+        |anchor| {
+            RootManifestStore::open_after(
+                path,
+                anchor.fields().manifest_generation,
+                anchor.fields().manifest_digest,
+            )
+        },
+    )?;
+    let manifest_verification_time = manifest_verification_started.elapsed();
+    let manifest_recovery = manifests.recovery();
     if let Some(candidate) = retention_recovery.candidate {
         complete_pending_wal_retention(
             path,
@@ -10201,6 +10342,7 @@ fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
         recovered_wal,
         active_page_generation,
         retention_floor_csn,
+        manifest_verification_time,
         wal_physical_verification_time,
         wal_semantic_replay_time,
     })
@@ -10221,7 +10363,6 @@ fn complete_pending_wal_retention(
     file.sync_data()?;
     drop(file);
     wal_retention.stabilize_candidate(candidate.fields().epoch, true)?;
-    wal_retention.remove_before(candidate.fields().epoch, true)?;
     Ok(())
 }
 
@@ -10329,6 +10470,23 @@ fn cleanup_stale_wal_anchors(
         store.remove_before(anchor.fields().epoch, true)?;
     }
     Ok(())
+}
+
+fn prune_recovered_manifest_prefix(
+    manifests: &mut RootManifestStore,
+    anchor: Option<WalRetentionAnchor>,
+) -> Result<(Option<ManifestPruneReceipt>, Duration), NativeRuntimeError> {
+    let started = Instant::now();
+    let receipt = anchor
+        .map(|anchor| {
+            manifests.prune_before(
+                anchor.fields().manifest_generation,
+                anchor.fields().manifest_digest,
+                true,
+            )
+        })
+        .transpose()?;
+    Ok((receipt, started.elapsed()))
 }
 
 struct RetainedPageState<'database> {
@@ -11771,15 +11929,16 @@ mod tests {
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
         CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
         EngineKind, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
-        GroupCommitSubmitError, HashSetOutcome, HnswConfig, Mutation, NativeCommitScheduler,
-        NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
-        PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
-        SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
-        WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
-        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
-        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
-        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
-        rebuild_page_generation, validate_commit_sequence,
+        GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError, Mutation,
+        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader,
+        Opcode, PAGE_FILE, PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG,
+        SetCondition, SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary,
+        Vector, VectorMetric, WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome,
+        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
+        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
+        decode_catalog_definition_storage_value, page_generation_path,
+        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
+        validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -15423,12 +15582,16 @@ mod tests {
         seed.create_search_index(search, "retention_crash_search")?;
         seed.index_document(search, b"seed-doc".to_vec(), "retention base")?;
         seed.commit()?;
+        database.checkpoint()?;
         for version in 1..=6 {
             let value = format!("value-{version}").into_bytes();
             let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
             update.update(table, b"key".to_vec(), value.clone())?;
             update.set(b"session".to_vec(), value, None)?;
             update.commit()?;
+            if version == 3 {
+                database.checkpoint()?;
+            }
         }
         let vacuum = database.vacuum_pages()?;
         if !vacuum.applied {
@@ -15452,6 +15615,7 @@ mod tests {
         seed.create_search_index(search, "retained_search")?;
         seed.index_document(search, b"doc".to_vec(), "version zero")?;
         seed.commit()?;
+        database.checkpoint()?;
         for version in 1..=8 {
             let value = format!("value-{version}");
             let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
@@ -15463,6 +15627,9 @@ mod tests {
                 format!("version {version} retained"),
             )?;
             update.commit()?;
+            if matches!(version, 3 | 6) {
+                database.checkpoint()?;
+            }
         }
         let original_wal_bytes = fs::metadata(temporary.path().join(WAL_FILE))?.len();
         let vacuum = database.vacuum_pages()?;
@@ -15479,10 +15646,15 @@ mod tests {
         assert!(retention.retired_wal_blocks > 0);
         assert_eq!(retention.retired_wal_bytes, retired_file_bytes);
         assert!(retention.retired_wal_bytes > original_wal_bytes);
+        assert_eq!(retention.retired_manifest_files, 3);
+        assert!(retention.retired_manifest_bytes > 0);
+        assert_eq!(retention.retained_manifest_files, 1);
+        assert!(retention.retained_manifest_bytes > 0);
         assert!(
             retention.total_time
                 >= retention.anchor_publication_time
                     + retention.wal_reset_synchronization_time
+                    + retention.manifest_pruning_time
                     + retention.anchor_stabilization_time
         );
         assert_eq!(fs::metadata(temporary.path().join(WAL_FILE))?.len(), 0);
@@ -15503,10 +15675,17 @@ mod tests {
         assert_eq!(recovery.wal_base_csn, Some(checkpoint.visible_csn));
         assert_eq!(recovery.retired_wal_blocks, retention.retired_wal_blocks);
         assert_eq!(recovery.replayed_transactions, 1);
-        assert_eq!(recovery.checkpoint_count, 2);
+        assert_eq!(recovery.checkpoint_count, 5);
+        assert_eq!(
+            recovery.manifest_base_generation,
+            Some(checkpoint.manifest_generation)
+        );
+        assert_eq!(recovery.manifest_count, 2);
+        assert!(recovery.retained_manifest_bytes > 0);
         assert!(
             recovery.open_time
-                >= recovery.wal_physical_verification_time
+                >= recovery.manifest_verification_time
+                    + recovery.wal_physical_verification_time
                     + recovery.wal_semantic_replay_time
                     + recovery.root_validation_time
         );
@@ -15538,6 +15717,7 @@ mod tests {
             WalRetentionBoundary::WalReset,
             WalRetentionBoundary::WalSynchronized,
             WalRetentionBoundary::AnchorStabilized,
+            WalRetentionBoundary::ManifestPrefixRemoved,
             WalRetentionBoundary::PriorAnchorRemoved,
         ] {
             let temporary = TestDirectory::new();
@@ -15580,6 +15760,109 @@ mod tests {
             let stable = NativeDatabase::open(temporary.path())?;
             assert_eq!(stable.recovery_report().wal_base_csn, Some(checkpoint_csn));
             assert_eq!(stable.recovery_report().replayed_transactions, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partially_removed_manifest_prefix_reopens_from_the_exact_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, search, checkpoint_csn) = prepare_wal_retention_checkpoint(&mut database)?;
+        assert!(matches!(
+            database.truncate_wal_at_retention_checkpoint_with_interruption(
+                WalRetentionBoundary::AnchorStabilized
+            ),
+            Err(NativeRuntimeError::InjectedWalRetentionCrash(
+                WalRetentionBoundary::AnchorStabilized
+            ))
+        ));
+        drop(database);
+
+        let roots = temporary.path().join("roots");
+        fs::remove_file(roots.join("manifest-0000000000000001.hyroot"))?;
+        let retired_path = roots.join("manifest-0000000000000002.hyroot");
+        let mut retired = fs::read(&retired_path)?;
+        retired[200] ^= 1;
+        fs::write(retired_path, retired)?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.recovery_report().wal_base_csn,
+            Some(checkpoint_csn)
+        );
+        assert_eq!(
+            reopened
+                .recovery_report()
+                .manifest_base_generation
+                .map(ManifestGeneration::get),
+            Some(3)
+        );
+        assert_eq!(reopened.recovery_report().manifest_count, 1);
+        assert_eq!(reopened.recovery_report().retired_manifest_prefix_files, 1);
+        assert_eq!(
+            reopened.recovery_report().recovered_manifest_prefix_files,
+            1
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"value-6".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"session", 30)?,
+            Some(b"value-6".to_vec())
+        );
+        assert_eq!(
+            reopened.match_latest_text(search, "retention", 1)?[0].document_id,
+            b"seed-doc"
+        );
+        drop(reopened);
+        let root_entries = fs::read_dir(roots)?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            root_entries
+                .iter()
+                .filter(|entry| { entry.file_name().to_string_lossy().ends_with(".hyroot") })
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_manifest_base_and_suffix_corruption_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for corrupt_suffix in [false, true] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            prepare_wal_retention_checkpoint(&mut database)?;
+            database.truncate_wal_at_retention_checkpoint()?;
+            let manifest_generation = if corrupt_suffix {
+                let mut suffix = database.begin(40, DurabilityClass::Strict)?;
+                suffix.set(b"after".to_vec(), b"retained".to_vec(), None)?;
+                suffix.commit()?;
+                database.checkpoint()?.manifest_generation
+            } else {
+                database
+                    .recovery_report()
+                    .manifest_base_generation
+                    .ok_or("retention did not report a manifest base")?
+            };
+            drop(database);
+
+            let manifest_path = temporary.path().join("roots").join(format!(
+                "manifest-{:016x}.hyroot",
+                manifest_generation.get()
+            ));
+            let mut manifest = fs::read(&manifest_path)?;
+            manifest[200] ^= 1;
+            fs::write(manifest_path, manifest)?;
+            assert!(matches!(
+                NativeDatabase::open(temporary.path()),
+                Err(NativeRuntimeError::Manifest(
+                    ManifestError::ChecksumMismatch
+                ))
+            ));
         }
         Ok(())
     }

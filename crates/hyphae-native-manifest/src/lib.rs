@@ -458,6 +458,7 @@ pub struct StagedManifest {
     manifest: RootManifest,
     temporary_path: PathBuf,
     final_path: PathBuf,
+    bytes: u64,
 }
 
 impl StagedManifest {
@@ -472,10 +473,40 @@ impl StagedManifest {
 pub struct ManifestRecovery {
     /// Complete verified manifests in generation order.
     pub manifests: Vec<RootManifest>,
+    /// First retained manifest generation, when any manifest exists.
+    pub manifest_base_generation: Option<ManifestGeneration>,
+    /// Canonical manifest files below the verified retained base.
+    pub retired_prefix_files: usize,
+    /// Physical bytes held by canonical files below the retained base.
+    pub retired_prefix_bytes: u64,
+    /// Physical bytes held by the verified retained manifest chain.
+    pub retained_manifest_bytes: u64,
     /// Recovered and removed create-new temporary files.
     pub ignored_temporary_files: usize,
     /// Whether strict parent-directory synchronization is supported here.
     pub parent_sync_supported: bool,
+}
+
+/// Result of one identity-preserving manifest-prefix retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestPruneReceipt {
+    /// First manifest generation retained after pruning.
+    pub base_generation: ManifestGeneration,
+    /// Canonical immutable manifest files removed.
+    pub removed_files: usize,
+    /// Physical bytes removed with the retired manifest files.
+    pub removed_bytes: u64,
+    /// Immutable manifest files retained from the selected base.
+    pub retained_files: usize,
+    /// Physical bytes retained from the selected base.
+    pub retained_bytes: u64,
+    /// Whether strict roots-directory synchronization is supported here.
+    pub parent_sync_supported: bool,
+}
+
+#[derive(Debug)]
+struct RetiredManifestFile {
+    path: PathBuf,
 }
 
 /// Root-manifest directory and current verified chain.
@@ -483,6 +514,9 @@ pub struct ManifestRecovery {
 pub struct RootManifestStore {
     directory: PathBuf,
     manifests: Vec<RootManifest>,
+    retired_prefix: Vec<RetiredManifestFile>,
+    retired_prefix_bytes: u64,
+    retained_manifest_bytes: u64,
     ignored_temporary_files: usize,
 }
 
@@ -499,6 +533,9 @@ impl RootManifestStore {
         Ok(Self {
             directory,
             manifests: Vec::new(),
+            retired_prefix: Vec::new(),
+            retired_prefix_bytes: 0,
+            retained_manifest_bytes: 0,
             ignored_temporary_files: 0,
         })
     }
@@ -514,7 +551,36 @@ impl RootManifestStore {
     /// Returns an error for I/O, unexpected entries, corrupt manifests, or a
     /// noncontiguous generation/digest chain.
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, ManifestError> {
-        let directory = data_directory.as_ref().join(DIRECTORY_NAME);
+        Self::open_from(data_directory.as_ref(), None)
+    }
+
+    /// Opens a retained immutable manifest chain from one exact anchor.
+    ///
+    /// Canonical manifest files below `base_generation` are reported as
+    /// removable prefix candidates but are not used as recovery authority.
+    /// The base file itself and every later generation remain immutable and
+    /// must form one exact contiguous digest chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O, unexpected entries, a missing or corrupt base,
+    /// base-digest divergence, or any retained chain gap/corruption.
+    pub fn open_after(
+        data_directory: impl AsRef<Path>,
+        base_generation: ManifestGeneration,
+        base_digest: [u8; 32],
+    ) -> Result<Self, ManifestError> {
+        Self::open_from(
+            data_directory.as_ref(),
+            Some((base_generation, base_digest)),
+        )
+    }
+
+    fn open_from(
+        data_directory: &Path,
+        retained_base: Option<(ManifestGeneration, [u8; 32])>,
+    ) -> Result<Self, ManifestError> {
+        let directory = data_directory.join(DIRECTORY_NAME);
         let mut manifest_paths = Vec::new();
         let mut temporary_paths = Vec::new();
         let mut ignored_temporary_files = 0;
@@ -530,34 +596,58 @@ impl RootManifestStore {
             if parse_temporary_filename(&name).is_some() {
                 ignored_temporary_files += 1;
                 temporary_paths.push(entry.path());
-            } else if parse_generation_filename(&name).is_some() {
-                manifest_paths.push((name, entry.path()));
+            } else if let Some(generation) = parse_generation_filename(&name) {
+                manifest_paths.push((generation, entry.path(), entry.metadata()?.len()));
             } else {
                 return Err(ManifestError::UnexpectedDirectoryEntry);
             }
         }
-        manifest_paths.sort_by(|left, right| left.0.cmp(&right.0));
+        manifest_paths.sort_by_key(|entry| entry.0);
         let mut manifests = Vec::with_capacity(manifest_paths.len());
-        let mut expected_generation = 1_u64;
+        let base_generation = retained_base.map_or(1, |(generation, _)| generation.get());
+        let mut expected_generation = base_generation;
         let mut previous_digest = [0_u8; 32];
-        for (name, path) in manifest_paths {
-            let generation =
-                parse_generation_filename(&name).ok_or(ManifestError::UnexpectedDirectoryEntry)?;
+        let mut retired_prefix = Vec::new();
+        let mut retired_prefix_bytes = 0_u64;
+        let mut retained_manifest_bytes = 0_u64;
+        for (generation, path, bytes) in manifest_paths {
+            if generation < base_generation {
+                retired_prefix_bytes = retired_prefix_bytes
+                    .checked_add(bytes)
+                    .ok_or(ManifestError::InvalidLength)?;
+                retired_prefix.push(RetiredManifestFile { path });
+                continue;
+            }
             if generation != expected_generation {
                 return Err(ManifestError::InvalidChain);
             }
             let encoded = fs::read(path)?;
             let manifest = RootManifest::decode(&encoded)?;
+            let is_base = generation == base_generation;
+            let base_matches = retained_base.is_none_or(|(_, digest)| manifest.digest == digest);
+            let predecessor_matches =
+                (is_base && retained_base.is_some()) || manifest.previous_digest == previous_digest;
             if manifest.generation.get() != generation
-                || manifest.previous_digest != previous_digest
+                || (is_base && !base_matches)
+                || !predecessor_matches
             {
                 return Err(ManifestError::InvalidChain);
             }
             previous_digest = manifest.digest;
+            retained_manifest_bytes = retained_manifest_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::InvalidLength)?;
             manifests.push(manifest);
             expected_generation = expected_generation
                 .checked_add(1)
                 .ok_or(ManifestError::InvalidChain)?;
+        }
+        if manifests
+            .first()
+            .is_none_or(|manifest| manifest.generation.get() != base_generation)
+            && (retained_base.is_some() || !retired_prefix.is_empty())
+        {
+            return Err(ManifestError::InvalidChain);
         }
         for temporary_path in temporary_paths {
             fs::remove_file(temporary_path)?;
@@ -568,6 +658,9 @@ impl RootManifestStore {
         Ok(Self {
             directory,
             manifests,
+            retired_prefix,
+            retired_prefix_bytes,
+            retained_manifest_bytes,
             ignored_temporary_files,
         })
     }
@@ -576,6 +669,10 @@ impl RootManifestStore {
     pub fn recovery(&self) -> ManifestRecovery {
         ManifestRecovery {
             manifests: self.manifests.clone(),
+            manifest_base_generation: self.manifests.first().map(RootManifest::generation),
+            retired_prefix_files: self.retired_prefix.len(),
+            retired_prefix_bytes: self.retired_prefix_bytes,
+            retained_manifest_bytes: self.retained_manifest_bytes,
             ignored_temporary_files: self.ignored_temporary_files,
             parent_sync_supported: parent_sync_supported(),
         }
@@ -604,11 +701,13 @@ impl RootManifestStore {
         if temporary_path.exists() || final_path.exists() {
             return Err(ManifestError::PublicationTargetExists);
         }
+        let encoded = manifest.encode()?;
+        let bytes = u64::try_from(encoded.len()).map_err(|_| ManifestError::InvalidLength)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary_path)?;
-        file.write_all(&manifest.encode()?)?;
+        file.write_all(&encoded)?;
         if synchronize {
             file.sync_all()?;
         }
@@ -617,6 +716,7 @@ impl RootManifestStore {
             manifest,
             temporary_path,
             final_path,
+            bytes,
         })
     }
 
@@ -635,11 +735,16 @@ impl RootManifestStore {
         if staged.final_path.exists() {
             return Err(ManifestError::PublicationTargetExists);
         }
+        let retained_manifest_bytes = self
+            .retained_manifest_bytes
+            .checked_add(staged.bytes)
+            .ok_or(ManifestError::InvalidLength)?;
         fs::rename(&staged.temporary_path, &staged.final_path)?;
         if synchronize {
             sync_directory(&self.directory)?;
         }
         self.manifests.push(staged.manifest.clone());
+        self.retained_manifest_bytes = retained_manifest_bytes;
         Ok(staged.manifest)
     }
 
@@ -655,6 +760,73 @@ impl RootManifestStore {
     ) -> Result<RootManifest, ManifestError> {
         let staged = self.stage(manifest, synchronize)?;
         self.publish(staged, synchronize)
+    }
+
+    /// Removes immutable manifest files strictly older than one exact base.
+    ///
+    /// The base manifest and every retained successor are verified before any
+    /// deletion. Existing prefix candidates discovered by [`Self::open_after`]
+    /// are included, which makes retry after partial deletion idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing/mismatched base, byte-count overflow,
+    /// deletion failure, or roots-directory synchronization failure.
+    pub fn prune_before(
+        &mut self,
+        base_generation: ManifestGeneration,
+        base_digest: [u8; 32],
+        synchronize: bool,
+    ) -> Result<ManifestPruneReceipt, ManifestError> {
+        let base_index = self
+            .manifests
+            .iter()
+            .position(|manifest| manifest.generation == base_generation)
+            .ok_or(ManifestError::InvalidChain)?;
+        if self.manifests[base_index].digest != base_digest {
+            return Err(ManifestError::InvalidChain);
+        }
+        let mut candidates = Vec::with_capacity(self.retired_prefix.len() + base_index);
+        let mut removed_bytes = self.retired_prefix_bytes;
+        let mut removed_retained_bytes = 0_u64;
+        for retired in &self.retired_prefix {
+            candidates.push(retired.path.clone());
+        }
+        for manifest in &self.manifests[..base_index] {
+            let path = self
+                .directory
+                .join(format!("{}.hyroot", generation_stem(manifest.generation)));
+            let bytes = fs::metadata(&path)?.len();
+            removed_retained_bytes = removed_retained_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::InvalidLength)?;
+            removed_bytes = removed_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::InvalidLength)?;
+            candidates.push(path);
+        }
+        for path in &candidates {
+            fs::remove_file(path)?;
+        }
+        if synchronize && !candidates.is_empty() {
+            sync_directory(&self.directory)?;
+        }
+        let removed_files = candidates.len();
+        self.manifests.drain(..base_index);
+        self.retired_prefix.clear();
+        self.retired_prefix_bytes = 0;
+        self.retained_manifest_bytes = self
+            .retained_manifest_bytes
+            .checked_sub(removed_retained_bytes)
+            .ok_or(ManifestError::InvalidLength)?;
+        Ok(ManifestPruneReceipt {
+            base_generation,
+            removed_files,
+            removed_bytes,
+            retained_files: self.manifests.len(),
+            retained_bytes: self.retained_manifest_bytes,
+            parent_sync_supported: parent_sync_supported(),
+        })
     }
 
     fn validate_next(&self, manifest: &RootManifest) -> Result<(), ManifestError> {
@@ -799,6 +971,26 @@ mod tests {
         )?)
     }
 
+    fn publish_manifest_chain(
+        data_directory: &Path,
+        count: u64,
+    ) -> Result<Vec<RootManifest>, Box<dyn std::error::Error>> {
+        let mut store = RootManifestStore::create(data_directory)?;
+        let mut previous_digest = [0; 32];
+        let mut manifests = Vec::new();
+        for generation in 1..=count {
+            let manifest = RootManifest::from_root_set(
+                ManifestGeneration::new(generation)?,
+                previous_digest,
+                &root_set(generation, u8::try_from(generation)?)?,
+            )?;
+            previous_digest = manifest.digest();
+            store.append(manifest.clone(), true)?;
+            manifests.push(manifest);
+        }
+        Ok(manifests)
+    }
+
     #[test]
     fn manifest_codec_and_root_reconstruction_are_stable() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -909,6 +1101,78 @@ mod tests {
         )?;
         assert!(matches!(
             reopened.stage(invalid, false),
+            Err(ManifestError::InvalidChain)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_chain_opens_from_exact_anchor_and_prunes_prefix_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let manifests = publish_manifest_chain(temporary.path(), 4)?;
+
+        let base = manifests[2].clone();
+        let mut retained =
+            RootManifestStore::open_after(temporary.path(), base.generation(), base.digest())?;
+        let recovery = retained.recovery();
+        assert_eq!(recovery.manifest_base_generation, Some(base.generation()));
+        assert_eq!(recovery.manifests, manifests[2..]);
+        assert_eq!(recovery.retired_prefix_files, 2);
+        assert!(recovery.retired_prefix_bytes > 0);
+
+        let receipt = retained.prune_before(base.generation(), base.digest(), true)?;
+        assert_eq!(receipt.base_generation, base.generation());
+        assert_eq!(receipt.removed_files, 2);
+        assert_eq!(receipt.removed_bytes, recovery.retired_prefix_bytes);
+        let retry = retained.prune_before(base.generation(), base.digest(), true)?;
+        assert_eq!(retry.removed_files, 0);
+        assert_eq!(retry.removed_bytes, 0);
+        drop(retained);
+
+        let reopened =
+            RootManifestStore::open_after(temporary.path(), base.generation(), base.digest())?;
+        assert_eq!(reopened.recovery().manifests, manifests[2..]);
+        assert_eq!(reopened.recovery().retired_prefix_files, 0);
+        assert!(matches!(
+            RootManifestStore::open(temporary.path()),
+            Err(ManifestError::InvalidChain)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_chain_ignores_retired_gaps_but_rejects_base_and_suffix_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let manifests = publish_manifest_chain(temporary.path(), 4)?;
+        let roots = temporary.path().join("roots");
+        fs::remove_file(roots.join("manifest-0000000000000001.hyroot"))?;
+        let retired_path = roots.join("manifest-0000000000000002.hyroot");
+        let mut retired = fs::read(&retired_path)?;
+        retired[200] ^= 1;
+        fs::write(retired_path, retired)?;
+        let base = manifests[2].clone();
+
+        let retained =
+            RootManifestStore::open_after(temporary.path(), base.generation(), base.digest())?;
+        assert_eq!(retained.recovery().retired_prefix_files, 1);
+        assert_eq!(retained.recovery().manifests, manifests[2..]);
+        drop(retained);
+
+        let suffix_path = roots.join("manifest-0000000000000004.hyroot");
+        let original_suffix = fs::read(&suffix_path)?;
+        let mut corrupt_suffix = original_suffix.clone();
+        corrupt_suffix[200] ^= 1;
+        fs::write(&suffix_path, corrupt_suffix)?;
+        assert!(matches!(
+            RootManifestStore::open_after(temporary.path(), base.generation(), base.digest()),
+            Err(ManifestError::ChecksumMismatch)
+        ));
+        fs::write(suffix_path, original_suffix)?;
+        fs::remove_file(roots.join("manifest-0000000000000003.hyroot"))?;
+        assert!(matches!(
+            RootManifestStore::open_after(temporary.path(), base.generation(), base.digest()),
             Err(ManifestError::InvalidChain)
         ));
         Ok(())

@@ -139,8 +139,8 @@ Environment:
 
 - Debian userspace under WSL2 kernel
   `6.18.33.1-microsoft-standard-WSL2`;
-- repository resolved through `/mnt/e/...`; and
-- filesystem reported by `statfs` as `v9fs`, not native ext4.
+- repository resolved through `/mnt/e/...`, reported as `v9fs`; and
+- benchmark data under `/tmp`, reported as `tmpfs`.
 
 Raw receipt:
 [native-group-commit-wsl2.json](native-group-commit-wsl2.json).
@@ -157,7 +157,7 @@ Group throughput was 1.654654 times strict throughput. Queue wait was 60.536
 microseconds p50. The reported page/WAL sync p50 values were 0.485 and 0.150
 microseconds.
 
-Those v9fs sync timings are not treated as physical-durability evidence. They
+Those `tmpfs` sync timings are not treated as physical-durability evidence. They
 are materially different from the Windows NTFS receipt and must not be
 generalized to ext4, bare metal, or power-loss behavior.
 

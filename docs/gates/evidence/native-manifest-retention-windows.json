@@ -1,0 +1,110 @@
+{
+  "benchmark": "hyphae-native-manifest-retention-v1",
+  "source_commit": "fc11ae290fa7c5b1808142d86aa304787f118b44",
+  "source_tree": "e583c9d55ded4179e21ae2bf33363ec353c579f3",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "historical_updates": 8,
+  "pre_base_manifests": 128,
+  "suffix_checkpoints": 2,
+  "open_rounds": 25,
+  "manifests_before_retention": 129,
+  "manifest_bytes_before_retention": 28912,
+  "full_final_manifest_files": 131,
+  "full_final_manifest_bytes": 29392,
+  "retained_final_manifest_files": 3,
+  "retained_final_manifest_bytes": 720,
+  "manifest_byte_reduction": 0.975504,
+  "manifest_verification_speedup": 38.218558,
+  "warm_reopen_speedup": 13.144985,
+  "retention": {
+    "anchor_epoch": 1,
+    "base_visible_csn": 10,
+    "retired_manifest_files": 128,
+    "retired_manifest_bytes": 28672,
+    "retained_manifest_files": 1,
+    "retained_manifest_bytes": 240,
+    "manifest_pruning_nanos": 13294900,
+    "manifest_directory_sync_supported": false,
+    "total_nanos": 17093100
+  },
+  "full_chain_open": {
+    "first_external_nanos": 20760800,
+    "manifest_base_generation": 1,
+    "manifest_count": 131,
+    "retained_manifest_bytes": 29392,
+    "checkpoint_count": 131,
+    "replayed_transactions": 11,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 15793700,
+      "p95_nanos": 17968800,
+      "p99_nanos": 18928900
+    },
+    "warm_internal": {
+      "p50_nanos": 15766700,
+      "p95_nanos": 17927400,
+      "p99_nanos": 18862300
+    },
+    "warm_manifest_verification": {
+      "p50_nanos": 4983700,
+      "p95_nanos": 5341500,
+      "p99_nanos": 5545900
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 9492500,
+      "p95_nanos": 11899600,
+      "p99_nanos": 12042000
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 45800,
+      "p95_nanos": 88900,
+      "p99_nanos": 154200
+    },
+    "warm_root_validation": {
+      "p50_nanos": 589900,
+      "p95_nanos": 620800,
+      "p99_nanos": 665500
+    }
+  },
+  "retained_chain_open": {
+    "first_external_nanos": 1547500,
+    "manifest_base_generation": 129,
+    "manifest_count": 3,
+    "retained_manifest_bytes": 720,
+    "checkpoint_count": 131,
+    "replayed_transactions": 1,
+    "verified": true,
+    "warm_external": {
+      "p50_nanos": 1201500,
+      "p95_nanos": 1505900,
+      "p99_nanos": 1514600
+    },
+    "warm_internal": {
+      "p50_nanos": 1200000,
+      "p95_nanos": 1503800,
+      "p99_nanos": 1513000
+    },
+    "warm_manifest_verification": {
+      "p50_nanos": 130400,
+      "p95_nanos": 195300,
+      "p99_nanos": 222700
+    },
+    "warm_physical_wal": {
+      "p50_nanos": 168900,
+      "p95_nanos": 255300,
+      "p99_nanos": 255900
+    },
+    "warm_semantic_replay": {
+      "p50_nanos": 3200,
+      "p95_nanos": 5900,
+      "p99_nanos": 49700
+    },
+    "warm_root_validation": {
+      "p50_nanos": 510700,
+      "p95_nanos": 642900,
+      "p99_nanos": 686600
+    }
+  }
+}

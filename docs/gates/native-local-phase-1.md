@@ -354,7 +354,7 @@ multi-producer scheduler, independent per-request admission, private MVCC root
 chains, one shared page sync and WAL sync, per-request timing receipts, orderly
 shutdown and a five-boundary crash matrix. Its exact eight-producer corpus
 improved throughput by 3.502910 times on Windows and 1.654654 times under
-WSL2/v9fs while increasing individual end-to-end p50 latency. Queue wait
+WSL2/tmpfs while increasing individual end-to-end p50 latency. Queue wait
 remained in the microsecond domain; cohort execution remained millisecond
 work. Mixed-durability scheduling, native-ext4/power-loss evidence and the
 complete G1/G7 matrices remain open.
@@ -366,8 +366,19 @@ stage/pending/stable publication, six-boundary recovery, suffix-only semantic
 replay, and fail-closed anchor/suffix validation. On the matched 402-commit
 prefix plus four-commit suffix corpus it removed 98.7775% of WAL bytes and
 reduced warm reopen p50 by 13.293409 times on Windows and 15.461882 times under
-WSL2/v9fs. Manifest-chain pruning, pin registration, native-ext4/power-loss
+WSL2/tmpfs. Pin registration, native-ext4/power-loss
 evidence and the complete G1/G7 matrices remain open.
+
+The [native manifest-retention
+evidence](evidence/native-manifest-retention-2026-08-02.md) makes the same
+`HYWAR001` anchor the exact manifest-chain trust root, preserves absolute
+generation/digest identity, tolerates partially deleted lower prefixes, fails
+closed from the retained base onward, and extends retention to seven crash
+boundaries. On the matched generation-131 corpus it reduced manifest files
+from 131 to 3 and bytes by 97.5504%. Manifest verification p50 improved by
+38.218558 times on Windows/NTFS and 48.024295 times under WSL2/tmpfs. The
+current-root policy, physical durability, pins and complete G1/G7 matrices
+remain open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
@@ -381,11 +392,12 @@ prepare concurrently and rebase disjoint all-engine writes under serialized
 publication. Bounded simultaneous `group` submission now shares page/WAL
 flushes, and current-root retention bounds WAL verification/replay to the
 retained suffix. Mixed strict/group/memory policy and concurrency/saturation
-evidence remain pending, along with multi-generation retention, manifest/blob
-collection, secondary-index range/streaming execution, zero-copy relational
-operator cursors, general relational expressions beyond the admitted residual
-slice, constraints/planning, remaining structure families, positional
-postings, segments, buffered/filtered ANN, and hybrid fusion required by G1–G4.
+evidence remain pending, along with multi-generation pin-aware retention,
+immutable-blob collection, secondary-index range/streaming execution,
+zero-copy relational operator cursors, general relational expressions beyond
+the admitted residual slice, constraints/planning, remaining structure
+families, positional postings, segments, buffered/filtered ANN, and hybrid
+fusion required by G1–G4.
 Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a

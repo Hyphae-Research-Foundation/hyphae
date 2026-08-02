@@ -206,7 +206,10 @@ The replay bound is the retained suffix, not database age. A database with one
 million retired commits and ten retained commits verifies and semantically
 replays only the ten-commit suffix plus one fixed-size anchor and the retained
 manifest chain. Manifest pruning and bounding that separate chain are later
-work and must be reported independently.
+work in the original WAL-only vertical. They are now implemented under the
+same anchor; the required authority, publication order, failure states, and
+evidence are fixed by [Native manifest retention
+v1](manifest-retention-v1.md).
 
 ## Deterministic interruption matrix
 

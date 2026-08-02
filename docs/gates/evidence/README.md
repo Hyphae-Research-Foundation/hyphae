@@ -288,6 +288,14 @@ commit before its tag can be published.
   matched release observations for a 402-commit prefix and four-commit suffix.
   They record 98.7775% fewer WAL bytes and faster warm reopen, but neither
   native-ext4 nor physical power-loss evidence.
+- [Native manifest-retention evidence —
+  2026-08-02](native-manifest-retention-2026-08-02.md) binds the existing WAL
+  anchor to identity-preserving manifest-prefix retirement, partial cleanup,
+  seven interruption boundaries and exact all-engine reopen.
+- `native-manifest-retention-windows.json` and
+  `native-manifest-retention-wsl2.json` are matched generation-131
+  observations. They record 131-to-3 manifests and 97.5504% fewer bytes; the
+  WSL2 data directory was `tmpfs`, not persistent ext4.
 
 ## Hosted release evidence
 
