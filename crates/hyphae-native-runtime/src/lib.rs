@@ -8,11 +8,17 @@
 //! claim of complete SQL, Valkey, or `OpenSearch` compatibility.
 
 mod ann_store;
+mod group_commit;
 mod local_protocol;
 mod model;
 mod sql;
 mod wal_codec;
 
+pub use group_commit::{
+    GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
+    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitClient,
+    NativeCommitScheduler,
+};
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
 };
@@ -11137,6 +11143,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicU64, Ordering},
         },
+        time::Duration,
     };
 
     use hyphae_native_btree::BTree;
@@ -11154,9 +11161,10 @@ mod tests {
         CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
         CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        EngineKind, GroupCommitOutcome, HashSetOutcome, HnswConfig, Mutation, NativeDatabase,
-        NativeRuntimeError, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
-        RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
+        EngineKind, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
+        GroupCommitSubmitError, HashSetOutcome, HnswConfig, Mutation, NativeCommitScheduler,
+        NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
+        PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
         SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
         ZAddOutcome, binary_relation_definition, catalog_definition_storage_value,
         catalog_name_identity, catalog_name_key, catalog_object_key, catalog_root_after_mutations,
@@ -15100,6 +15108,175 @@ mod tests {
         assert_eq!(recovered.select(table, b"second"), Some(b"row".as_slice()));
         assert_eq!(recovered.get(b"first"), Some(b"structure".as_slice()));
         assert_eq!(recovered.get(b"second"), Some(b"structure".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_scheduler_batches_concurrent_producers_and_stops_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(8, Duration::from_millis(10), 16)?,
+        )?;
+        let first_client = scheduler.client();
+        let second_client = scheduler.client();
+        let mut first = first_client.begin_optimistic(151, DurabilityClass::Group)?;
+        let mut second = second_client.begin_optimistic(151, DurabilityClass::Group)?;
+        first.set(b"scheduler-first".to_vec(), b"one".to_vec(), None)?;
+        second.set(b"scheduler-second".to_vec(), b"two".to_vec(), None)?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let (first_receipt, second_receipt) = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_client.submit(first)
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second_client.submit(second)
+            });
+            Ok::<_, Box<dyn std::error::Error>>((
+                first
+                    .join()
+                    .map_err(|_| std::io::Error::other("first submitter panicked"))??,
+                second
+                    .join()
+                    .map_err(|_| std::io::Error::other("second submitter panicked"))??,
+            ))
+        })?;
+        assert_eq!(first_receipt.durability_cohort_size, 2);
+        assert_eq!(second_receipt.durability_cohort_size, 2);
+        let mut positions = [
+            first_receipt.durability_cohort_position,
+            second_receipt.durability_cohort_position,
+        ];
+        positions.sort_unstable();
+        assert_eq!(positions, [0, 1]);
+
+        let stopped_client = scheduler.client();
+        let mut rejected_after_shutdown =
+            stopped_client.begin_optimistic(152, DurabilityClass::Group)?;
+        rejected_after_shutdown.set(b"too-late".to_vec(), b"value".to_vec(), None)?;
+        scheduler.shutdown()?;
+        assert!(matches!(
+            stopped_client.submit(rejected_after_shutdown),
+            Err(GroupCommitSubmitError::Unavailable)
+        ));
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"scheduler-first", 153)?,
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"scheduler-second", 153)?,
+            Some(b"two".to_vec())
+        );
+        assert_eq!(reopened.get_latest_structure(b"too-late", 153)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_advances_catalog_versions_and_rejects_wrong_durability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let relation = ObjectId::new(10)?;
+        let search = ObjectId::new(20)?;
+        let mut first = database.begin_optimistic(1, DurabilityClass::Group)?;
+        let mut second = database.begin_optimistic(1, DurabilityClass::Group)?;
+        first.create_relation(relation, "accounts")?;
+        second.create_search_index(search, "notes")?;
+
+        let report = database.commit_group(vec![first, second])?;
+        let [
+            GroupCommitOutcome::Committed(first),
+            GroupCommitOutcome::Committed(second),
+        ] = report.outcomes.as_slice()
+        else {
+            return Err("catalog cohort did not commit".into());
+        };
+        assert_eq!(first.catalog_version, CatalogVersion::new(2)?);
+        assert_eq!(second.catalog_version, CatalogVersion::new(3)?);
+        let snapshot = database.snapshot(2)?;
+        assert!(matches!(
+            snapshot.catalog_object(relation),
+            Some(CatalogObject::Relation(_))
+        ));
+        assert!(matches!(
+            snapshot.catalog_object(search),
+            Some(CatalogObject::Search(_))
+        ));
+
+        let mut strict = database.begin_optimistic(3, DurabilityClass::Strict)?;
+        strict.set(b"wrong-durability".to_vec(), b"value".to_vec(), None)?;
+        let rejected = database.commit_group(vec![strict])?;
+        assert_eq!(rejected.accepted_commits, 0);
+        assert_eq!(rejected.page_synchronizations, 0);
+        assert_eq!(rejected.wal_synchronizations, 0);
+        assert!(matches!(
+            rejected.outcomes.as_slice(),
+            [GroupCommitOutcome::Rejected(
+                NativeRuntimeError::GroupCommitRequiresGroupDurability
+            )]
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert!(reopened.catalog_object_latest(relation)?.is_some());
+        assert!(reopened.catalog_object_latest(search)?.is_some());
+        assert_eq!(reopened.get_latest_structure(b"wrong-durability", 4)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_crash_matrix_recovers_prefix_before_sync_and_complete_after_sync()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            GroupCommitBoundary::AdmittedWalPrefixAppended,
+            GroupCommitBoundary::CohortAppended,
+            GroupCommitBoundary::PageSynchronized,
+            GroupCommitBoundary::WalSynchronized,
+            GroupCommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            stage_vertical(&mut database)?.commit()?;
+            let mut first = database.begin_optimistic(151, DurabilityClass::Group)?;
+            let mut second = database.begin_optimistic(151, DurabilityClass::Group)?;
+            first.set(b"group-crash-first".to_vec(), b"one".to_vec(), None)?;
+            second.set(b"group-crash-second".to_vec(), b"two".to_vec(), None)?;
+            assert!(matches!(
+                database.commit_group_with_interruption(vec![first, second], boundary),
+                Err(NativeRuntimeError::InjectedGroupCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let recovered_count = reopened.recovery_report().committed_transactions;
+            if matches!(
+                boundary,
+                GroupCommitBoundary::WalSynchronized | GroupCommitBoundary::RootPublished
+            ) {
+                assert_eq!(recovered_count, 3);
+            } else {
+                assert!((1..=3).contains(&recovered_count));
+            }
+            assert_eq!(
+                reopened.get_latest_structure(b"group-crash-first", 152)?,
+                (recovered_count >= 2).then(|| b"one".to_vec())
+            );
+            assert_eq!(
+                reopened.get_latest_structure(b"group-crash-second", 152)?,
+                (recovered_count >= 3).then(|| b"two".to_vec())
+            );
+        }
         Ok(())
     }
 
