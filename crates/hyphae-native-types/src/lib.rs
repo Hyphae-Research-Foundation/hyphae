@@ -165,6 +165,18 @@ nonzero_identity!(
     "Physical page slot identity."
 );
 nonzero_identity!(
+    PageGeneration,
+    u64,
+    NonZeroU64,
+    "page generation",
+    "Immutable page-file generation."
+);
+
+impl PageGeneration {
+    /// Historical first page-file generation.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+}
+nonzero_identity!(
     CatalogVersion,
     u64,
     NonZeroU64,
