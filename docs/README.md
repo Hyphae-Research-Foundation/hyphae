@@ -49,6 +49,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native page, row, and blob format v1](native/page-row-blob-format-v1.md)
 - [Native B+tree format v1](native/btree-format-v1.md)
 - [Native root manifest and checkpoint format v1](native/root-manifest-checkpoint-v1.md)
+- [Native block-layer power-loss replay gate v1](native/block-power-loss-replay-v1.md)
 - [Native manifest retention v1](native/manifest-retention-v1.md)
 - [Native immutable-blob collection v1](native/blob-collection-v1.md)
 - [Native WAL format v1](native/wal-format-v1.md)
