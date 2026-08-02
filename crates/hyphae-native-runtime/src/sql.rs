@@ -3009,7 +3009,7 @@ fn bind_select(
             },
             0,
         )
-    } else if let Some(key) = find_equality_key(&comparisons, &expected_primary_key)? {
+    } else if let Some(key) = find_equality_key(&comparisons, &expected_primary_key) {
         if !order_by.is_empty() || limit.is_some() {
             return Err(SqlError::InvalidSyntax);
         }
@@ -3486,7 +3486,7 @@ fn filter_term_count(expression: &BoundFilterExpression) -> usize {
 fn find_equality_key(
     comparisons: &[&BoundFilterExpression],
     key_columns: &[usize],
-) -> Result<Option<KeyBinding>, SqlError> {
+) -> Option<KeyBinding> {
     let mut operands = Vec::with_capacity(key_columns.len());
     for key_column in key_columns {
         let matching = comparisons
@@ -3508,16 +3508,15 @@ fn find_equality_key(
                     })
             })
             .collect::<Vec<_>>();
-        match matching.as_slice() {
-            [] => return Ok(None),
-            [operand] => operands.push(operand.clone()),
-            _ => return Err(SqlError::DuplicateColumn),
-        }
+        let [operand] = matching.as_slice() else {
+            return None;
+        };
+        operands.push(operand.clone());
     }
-    Ok(Some(KeyBinding {
+    Some(KeyBinding {
         columns: key_columns.to_vec(),
         operands,
-    }))
+    })
 }
 
 fn find_primary_key_prefix(
@@ -3570,7 +3569,7 @@ fn find_secondary_equality_key(
             continue;
         }
         let columns = secondary_index_column_indices(definition, index)?;
-        if let Some(key) = find_equality_key(comparisons, &columns)? {
+        if let Some(key) = find_equality_key(comparisons, &columns) {
             return Ok(Some((*id, key)));
         }
     }
@@ -5218,7 +5217,8 @@ mod tests {
 
     use super::{
         ColumnOperand, ComparisonOperator, FilterExpression, ParsedJoinEquality, Projection,
-        ScalarOperand, SqlError, Statement, TruthValue, parse, primary_key_range_is_empty,
+        ScalarOperand, SqlError, Statement, TruthValue, binary_prefix_successor, parse,
+        primary_key_range_is_empty,
     };
 
     #[test]
@@ -5698,6 +5698,17 @@ mod tests {
             &Bound::Unbounded,
             &Bound::Unbounded,
         ));
+    }
+
+    #[test]
+    fn binary_prefix_successor_is_minimal_and_handles_terminal_ff_bytes() {
+        assert_eq!(
+            binary_prefix_successor(&[0x01, 0x02]),
+            Some(vec![0x01, 0x03])
+        );
+        assert_eq!(binary_prefix_successor(&[0x01, 0xff]), Some(vec![0x02]));
+        assert_eq!(binary_prefix_successor(&[0xff]), None);
+        assert_eq!(binary_prefix_successor(&[]), None);
     }
 
     #[test]
