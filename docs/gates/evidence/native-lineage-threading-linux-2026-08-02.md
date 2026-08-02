@@ -58,6 +58,12 @@ After implementation, the same test passed. Added coverage also proves:
 - existing checkpoint and WAL-retention interruption matrices under the new
   lineage-bearing formats.
 
+Follow-up commit `d03104b` exhausts the lineage-authority byte matrix. It
+rejects all 264 truncated prefixes and 264 single-byte corruptions of the
+264-byte `HYROOT03` fixture, plus all 280 truncated prefixes and 280
+single-byte corruptions of `HYWAR002`: 1,088 deterministic corrupt inputs in
+total.
+
 ## Gates executed
 
 ```text
@@ -71,7 +77,7 @@ python3 tools/check_native_dependencies.py
 Results:
 
 - formatting: pass;
-- documentation: pass, 192 Markdown files and 12 JSON examples;
+- documentation: pass, 193 Markdown files and 12 JSON examples;
 - Clippy: pass with warnings denied across the complete workspace;
 - workspace tests: pass, 489 listed tests;
 - native runtime tests: pass, 196 tests;
@@ -84,10 +90,9 @@ Results:
 
 This evidence does not close G1. The following remain explicit:
 
-- hosted cross-platform CI for the branch and pull request;
 - a sanctioned history-divergence operation that increments the epoch;
 - offline format-2 to native migration and promotion;
 - an explicit migration path for pre-lineage experimental native directories;
 - physical power-loss and filesystem-reordering validation;
-- the complete crash/corruption corpus and latency benchmark required by the
-  G1 exit gate.
+- the broader engine crash/corruption corpus and latency benchmark required
+  by the G1 exit gate.

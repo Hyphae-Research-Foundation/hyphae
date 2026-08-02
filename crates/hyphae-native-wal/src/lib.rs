@@ -1858,6 +1858,27 @@ mod tests {
     }
 
     #[test]
+    fn lineage_retention_anchor_v2_rejects_every_truncated_prefix_and_single_byte_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let anchor = WalRetentionAnchor::new_with_lineage(retention_anchor_fields()?, lineage)?;
+        let encoded = anchor.encode();
+
+        for truncated_length in 0..encoded.len() {
+            assert!(WalRetentionAnchor::decode(&encoded[..truncated_length]).is_err());
+        }
+        for offset in 0..encoded.len() {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert!(WalRetentionAnchor::decode(&corrupt).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn retention_store_rejects_mixed_lineage() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new()?;
         let mut store = WalRetentionStore::create(temporary.path())?;
