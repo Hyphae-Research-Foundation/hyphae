@@ -46,8 +46,10 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
-      - name: Install pinned unsafe analyzer
-        run: cargo install cargo-geiger --version 0.13.0 --locked
+      - name: Install pinned receipt tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-geiger --version 0.13.0 --locked
       - name: Audit the exact native runtime closure
         run: |
           python -m unittest tools/test_check_native_dependencies.py -v
