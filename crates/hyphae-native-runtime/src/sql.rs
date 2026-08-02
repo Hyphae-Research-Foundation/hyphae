@@ -150,6 +150,43 @@ enum PreparedPlan {
         limit: usize,
         legacy_binary: bool,
     },
+    IndexedInnerJoin {
+        left_table: ObjectId,
+        right_table: ObjectId,
+        left_relation: Box<RelationDefinition>,
+        right_relation: Box<RelationDefinition>,
+        left_access: JoinLeftAccess,
+        left_filter: BoundFilterExpression,
+        left_join_column: usize,
+        right_join_column: usize,
+        projection: Vec<JoinProjection>,
+        parameter_count: usize,
+        output_columns: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JoinLeftAccess {
+    PrimaryKey {
+        key: KeyBinding,
+    },
+    UniqueSecondaryIndex {
+        index: ObjectId,
+        definition: Box<SecondaryIndexDefinition>,
+        key: KeyBinding,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinProjection {
+    side: JoinSide,
+    column: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +234,19 @@ enum Statement {
         order_by: Vec<String>,
         limit: Option<usize>,
     },
+    SelectJoin(ParsedInnerJoin),
+    ExplainSelectJoin(ParsedInnerJoin),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedInnerJoin {
+    left_name: String,
+    right_name: String,
+    projection: Vec<String>,
+    left_join_column: String,
+    right_join_column: String,
+    filter: FilterExpression,
+    parameter_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,24 +414,48 @@ pub(crate) fn prepare_catalog(
     catalog: &crate::model::CatalogState,
     statement: &str,
 ) -> Result<PreparedStatement, SqlError> {
-    let Statement::Select {
+    let plan = match parse(statement)? {
+        Statement::Select {
+            name,
+            projection,
+            filter,
+            parameter_count,
+            order_by,
+            limit,
+        } => prepare_select_plan(
+            catalog,
+            &name,
+            &projection,
+            filter.as_ref(),
+            parameter_count,
+            &order_by,
+            limit,
+        )?,
+        Statement::SelectJoin(join) => bind_indexed_inner_join(catalog, &join)?,
+        _ => return Err(SqlError::InvalidSyntax),
+    };
+    Ok(PreparedStatement {
+        catalog_version,
+        plan,
+    })
+}
+
+fn prepare_select_plan(
+    catalog: &crate::model::CatalogState,
+    name: &str,
+    projection: &Projection,
+    filter: Option<&FilterExpression>,
+    parameter_count: usize,
+    order_by: &[String],
+    limit: Option<usize>,
+) -> Result<PreparedPlan, SqlError> {
+    let bound = bind_select(
+        catalog,
         name,
         projection,
         filter,
         parameter_count,
         order_by,
-        limit,
-    } = parse(statement)?
-    else {
-        return Err(SqlError::InvalidSyntax);
-    };
-    let bound = bind_select(
-        catalog,
-        &name,
-        &projection,
-        filter.as_ref(),
-        parameter_count,
-        &order_by,
         limit,
     )?;
     let relation = relation_by_id(catalog, bound.table)?.clone();
@@ -440,10 +514,7 @@ pub(crate) fn prepare_catalog(
             legacy_binary,
         },
     };
-    Ok(PreparedStatement {
-        catalog_version,
-        plan,
-    })
+    Ok(plan)
 }
 
 pub(crate) fn execute_prepared(
@@ -489,7 +560,8 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         PreparedPlan::PrimaryKeyLookup { .. }
         | PreparedPlan::SecondaryIndexLookup { .. }
         | PreparedPlan::PrimaryKeyScan { .. }
-        | PreparedPlan::PrimaryKeyRangeScan { .. } => Err(SqlError::ParameterMismatch),
+        | PreparedPlan::PrimaryKeyRangeScan { .. }
+        | PreparedPlan::IndexedInnerJoin { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -571,6 +643,13 @@ pub(crate) fn execute_transaction(
             },
             parameters,
         ),
+        Statement::SelectJoin(join) => {
+            let plan = bind_indexed_inner_join(&transaction.state.catalog, &join)?;
+            execute_indexed_join_transaction(transaction, &plan, parameters)
+        }
+        Statement::ExplainSelectJoin(join) => {
+            execute_indexed_join_explain(transaction, &join, parameters)
+        }
     }
 }
 
@@ -674,6 +753,9 @@ fn execute_bound_snapshot(
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_snapshot_range_scan(snapshot, plan, parameters)
         }
+        PreparedPlan::IndexedInnerJoin { .. } => {
+            execute_indexed_join_snapshot(snapshot, plan, parameters)
+        }
     }
 }
 
@@ -775,6 +857,392 @@ fn execute_bound_latest(
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
             execute_latest_range_scan(database, snapshot, plan, parameters)
         }
+        PreparedPlan::IndexedInnerJoin { .. } => {
+            execute_indexed_join_latest(database, snapshot, plan, parameters)
+        }
+    }
+}
+
+fn execute_indexed_join_snapshot(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_access,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        parameter_count,
+        output_columns,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(
+        left_relation,
+        Some(left_filter),
+        *parameter_count,
+        parameters,
+    )?;
+    let left = snapshot_join_left(
+        snapshot,
+        *left_table,
+        left_relation,
+        left_access,
+        parameters,
+    )?;
+    materialize_indexed_join(
+        &JoinMaterialization {
+            left_relation,
+            right_relation,
+            left_filter,
+            left_join_column: *left_join_column,
+            right_join_column: *right_join_column,
+            projection,
+            output_columns,
+            parameters,
+        },
+        left,
+        |primary_key| {
+            Ok(snapshot
+                .select(*right_table, primary_key)
+                .map(<[u8]>::to_vec))
+        },
+    )
+}
+
+fn execute_indexed_join_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_access,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        parameter_count,
+        output_columns,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(
+        left_relation,
+        Some(left_filter),
+        *parameter_count,
+        parameters,
+    )?;
+    let left = latest_join_left(
+        database,
+        snapshot,
+        *left_table,
+        left_relation,
+        left_access,
+        parameters,
+    )?;
+    materialize_indexed_join(
+        &JoinMaterialization {
+            left_relation,
+            right_relation,
+            left_filter,
+            left_join_column: *left_join_column,
+            right_join_column: *right_join_column,
+            projection,
+            output_columns,
+            parameters,
+        },
+        left,
+        |primary_key| {
+            database
+                .select_relational_at(snapshot, *right_table, primary_key)
+                .map_err(SqlError::from)
+        },
+    )
+}
+
+fn execute_indexed_join_transaction(
+    transaction: &NativeWriteBatch,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_access,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        parameter_count,
+        output_columns,
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(
+        left_relation,
+        Some(left_filter),
+        *parameter_count,
+        parameters,
+    )?;
+    let left = transaction_join_left(
+        transaction,
+        *left_table,
+        left_relation,
+        left_access,
+        parameters,
+    )?;
+    materialize_indexed_join(
+        &JoinMaterialization {
+            left_relation,
+            right_relation,
+            left_filter,
+            left_join_column: *left_join_column,
+            right_join_column: *right_join_column,
+            projection,
+            output_columns,
+            parameters,
+        },
+        left,
+        |primary_key| {
+            Ok(transaction
+                .select(*right_table, primary_key)
+                .map(<[u8]>::to_vec))
+        },
+    )
+}
+
+type JoinInputRow = Option<(Vec<u8>, Vec<u8>)>;
+
+fn snapshot_join_left(
+    snapshot: &NativeSnapshot,
+    table: ObjectId,
+    relation: &RelationDefinition,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<JoinInputRow, SqlError> {
+    match access {
+        JoinLeftAccess::PrimaryKey { key } => {
+            if key_contains_null(key, parameters)? {
+                return Ok(None);
+            }
+            let primary_key = bind_primary_key_binding(relation, key, parameters)?;
+            Ok(snapshot
+                .select(table, &primary_key)
+                .map(|stored| (primary_key, stored.to_vec())))
+        }
+        JoinLeftAccess::UniqueSecondaryIndex {
+            index,
+            definition,
+            key,
+        } => {
+            let Some(index_key) =
+                bind_secondary_index_key_binding(relation, definition, key, parameters)?
+            else {
+                return Ok(None);
+            };
+            let primary_keys = snapshot
+                .state
+                .relational
+                .secondary_index_lookup(*index, &index_key)
+                .map_err(NativeRuntimeError::from)?;
+            let Some(primary_keys) = primary_keys else {
+                return Ok(None);
+            };
+            let Some(primary_key) = at_most_one_unique_key(primary_keys.iter())? else {
+                return Ok(None);
+            };
+            let stored = snapshot
+                .select(table, primary_key)
+                .ok_or(SqlError::InvalidStoredRow)?;
+            Ok(Some((primary_key.clone(), stored.to_vec())))
+        }
+    }
+}
+
+fn latest_join_left(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    table: ObjectId,
+    relation: &RelationDefinition,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<JoinInputRow, SqlError> {
+    match access {
+        JoinLeftAccess::PrimaryKey { key } => {
+            if key_contains_null(key, parameters)? {
+                return Ok(None);
+            }
+            let primary_key = bind_primary_key_binding(relation, key, parameters)?;
+            Ok(database
+                .select_relational_at(snapshot, table, &primary_key)?
+                .map(|stored| (primary_key, stored)))
+        }
+        JoinLeftAccess::UniqueSecondaryIndex {
+            index,
+            definition,
+            key,
+        } => {
+            let Some(index_key) =
+                bind_secondary_index_key_binding(relation, definition, key, parameters)?
+            else {
+                return Ok(None);
+            };
+            let index_rows = database.select_secondary_index_at(snapshot, *index, &index_key)?;
+            let Some(matched) = at_most_one_unique_key(index_rows.iter())? else {
+                return Ok(None);
+            };
+            if matched.table != table {
+                return Err(SqlError::InvalidCatalogObject);
+            }
+            Ok(Some((matched.primary_key.clone(), matched.row.clone())))
+        }
+    }
+}
+
+fn transaction_join_left(
+    transaction: &NativeWriteBatch,
+    table: ObjectId,
+    relation: &RelationDefinition,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<JoinInputRow, SqlError> {
+    match access {
+        JoinLeftAccess::PrimaryKey { key } => {
+            if key_contains_null(key, parameters)? {
+                return Ok(None);
+            }
+            let primary_key = bind_primary_key_binding(relation, key, parameters)?;
+            Ok(transaction
+                .select(table, &primary_key)
+                .map(|stored| (primary_key, stored.to_vec())))
+        }
+        JoinLeftAccess::UniqueSecondaryIndex {
+            index,
+            definition,
+            key,
+        } => {
+            let Some(index_key) =
+                bind_secondary_index_key_binding(relation, definition, key, parameters)?
+            else {
+                return Ok(None);
+            };
+            let primary_keys = transaction
+                .state
+                .relational
+                .secondary_index_lookup(*index, &index_key)
+                .map_err(NativeRuntimeError::from)?;
+            let Some(primary_keys) = primary_keys else {
+                return Ok(None);
+            };
+            let Some(primary_key) = at_most_one_unique_key(primary_keys.iter())? else {
+                return Ok(None);
+            };
+            let stored = transaction
+                .select(table, primary_key)
+                .ok_or(SqlError::InvalidStoredRow)?;
+            Ok(Some((primary_key.clone(), stored.to_vec())))
+        }
+    }
+}
+
+fn at_most_one_unique_key<'item, T: 'item>(
+    mut items: impl ExactSizeIterator<Item = &'item T>,
+) -> Result<Option<&'item T>, SqlError> {
+    if items.len() > 1 {
+        return Err(SqlError::InvalidStoredRow);
+    }
+    Ok(items.next())
+}
+
+struct JoinMaterialization<'plan> {
+    left_relation: &'plan RelationDefinition,
+    right_relation: &'plan RelationDefinition,
+    left_filter: &'plan BoundFilterExpression,
+    left_join_column: usize,
+    right_join_column: usize,
+    projection: &'plan [JoinProjection],
+    output_columns: &'plan [String],
+    parameters: &'plan [SqlValue],
+}
+
+fn materialize_indexed_join(
+    context: &JoinMaterialization<'_>,
+    left: JoinInputRow,
+    right_lookup: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, SqlError>,
+) -> Result<SqlResult, SqlError> {
+    let Some((left_primary_key, left_stored)) = left else {
+        return Ok(empty_join_result(context.output_columns));
+    };
+    let left_values = decode_complete_row(
+        context.left_relation,
+        false,
+        &left_primary_key,
+        &left_stored,
+    )?;
+    if evaluate_filter(
+        context.left_relation,
+        context.left_filter,
+        &left_values,
+        context.parameters,
+    )? != TruthValue::True
+    {
+        return Ok(empty_join_result(context.output_columns));
+    }
+    let join_value = left_values
+        .get(context.left_join_column)
+        .ok_or(SqlError::InvalidStoredRow)?;
+    if matches!(join_value, SqlValue::Null) {
+        return Ok(empty_join_result(context.output_columns));
+    }
+    let right_primary_key = bind_primary_key(
+        context.right_relation,
+        &[context.right_join_column],
+        std::slice::from_ref(join_value),
+    )?;
+    let Some(right_stored) = right_lookup(&right_primary_key)? else {
+        return Ok(empty_join_result(context.output_columns));
+    };
+    let right_values = decode_complete_row(
+        context.right_relation,
+        false,
+        &right_primary_key,
+        &right_stored,
+    )?;
+    let row = context
+        .projection
+        .iter()
+        .map(|projection| match projection.side {
+            JoinSide::Left => left_values.get(projection.column),
+            JoinSide::Right => right_values.get(projection.column),
+        })
+        .map(|value| value.cloned().ok_or(SqlError::InvalidStoredRow))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: context.output_columns.to_vec(),
+        rows: vec![row],
+    })
+}
+
+fn empty_join_result(output_columns: &[String]) -> SqlResult {
+    SqlResult::Rows {
+        columns: output_columns.to_vec(),
+        rows: Vec::new(),
     }
 }
 
@@ -1129,6 +1597,38 @@ fn execute_explain(
     Ok(SqlResult::Rows {
         columns: vec!["plan".to_owned()],
         rows: vec![vec![SqlValue::Text(plan)]],
+    })
+}
+
+fn execute_indexed_join_explain(
+    transaction: &NativeWriteBatch,
+    parsed: &ParsedInnerJoin,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let plan = bind_indexed_inner_join(&transaction.state.catalog, parsed)?;
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_access,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let left_access = match left_access {
+        JoinLeftAccess::PrimaryKey { .. } => "primary-key".to_owned(),
+        JoinLeftAccess::UniqueSecondaryIndex { index, .. } => {
+            format!("unique-secondary(index={index})")
+        }
+    };
+    Ok(SqlResult::Rows {
+        columns: vec!["plan".to_owned()],
+        rows: vec![vec![SqlValue::Text(format!(
+            "IndexedInnerJoin(left_table={left_table},left_access={left_access},right_table={right_table},right_access=primary-key)"
+        ))]],
     })
 }
 
@@ -1602,6 +2102,145 @@ fn bind_select(
         output_columns,
         access,
     })
+}
+
+fn bind_indexed_inner_join(
+    catalog: &crate::model::CatalogState,
+    parsed: &ParsedInnerJoin,
+) -> Result<PreparedPlan, SqlError> {
+    let bound = bind_select(
+        catalog,
+        &parsed.left_name,
+        &Projection::All,
+        Some(&parsed.filter),
+        parsed.parameter_count,
+        &[],
+        None,
+    )?;
+    let left_relation = relation_by_id(catalog, bound.table)?.clone();
+    if is_legacy_binary_relation(&left_relation) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let left_access = match bound.access {
+        SelectAccess::PrimaryKey {
+            key,
+            legacy_binary: false,
+        } => JoinLeftAccess::PrimaryKey { key },
+        SelectAccess::SecondaryIndex { index, key } => {
+            let definition = secondary_index_by_id(catalog, index)?;
+            if !definition.unique {
+                return Err(SqlError::NoAccessPath);
+            }
+            JoinLeftAccess::UniqueSecondaryIndex {
+                index,
+                definition: Box::new(definition.clone()),
+                key,
+            }
+        }
+        SelectAccess::PrimaryKey { .. }
+        | SelectAccess::PrimaryKeyScan { .. }
+        | SelectAccess::PrimaryKeyRangeScan { .. } => return Err(SqlError::NoAccessPath),
+    };
+    let left_filter = bound.filter.ok_or(SqlError::InvalidSyntax)?;
+    let (right_table, right_relation) = relation_named(catalog, &parsed.right_name)?;
+    if is_legacy_binary_relation(right_relation) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let left_join_column =
+        qualified_column(&parsed.left_join_column, &parsed.left_name, &left_relation)?;
+    let right_join_column = qualified_column(
+        &parsed.right_join_column,
+        &parsed.right_name,
+        right_relation,
+    )?;
+    if primary_key_indices(right_relation)?.as_slice() != [right_join_column] {
+        return Err(SqlError::NoAccessPath);
+    }
+    if left_relation.columns[left_join_column].logical_type
+        != right_relation.columns[right_join_column].logical_type
+    {
+        return Err(SqlError::TypeMismatch);
+    }
+    let mut projection = Vec::with_capacity(parsed.projection.len());
+    let mut output_columns = Vec::with_capacity(parsed.projection.len());
+    for reference in &parsed.projection {
+        let (bound, output) = bind_join_projection(
+            reference,
+            &parsed.left_name,
+            &left_relation,
+            &parsed.right_name,
+            right_relation,
+        )?;
+        projection.push(bound);
+        output_columns.push(output);
+    }
+    Ok(PreparedPlan::IndexedInnerJoin {
+        left_table: bound.table,
+        right_table,
+        left_relation: Box::new(left_relation),
+        right_relation: Box::new(right_relation.clone()),
+        left_access,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        parameter_count: parsed.parameter_count,
+        output_columns,
+    })
+}
+
+fn qualified_column(
+    reference: &str,
+    relation_name: &str,
+    definition: &RelationDefinition,
+) -> Result<usize, SqlError> {
+    let (qualifier, column) = split_qualified_column(reference)?;
+    if normalize_identifier(qualifier) != normalize_identifier(relation_name) {
+        return Err(SqlError::UnknownColumn);
+    }
+    column_index(&definition.columns, column)
+}
+
+fn bind_join_projection(
+    reference: &str,
+    left_name: &str,
+    left: &RelationDefinition,
+    right_name: &str,
+    right: &RelationDefinition,
+) -> Result<(JoinProjection, String), SqlError> {
+    let (qualifier, column_name) = split_qualified_column(reference)?;
+    let (side, column, relation_display, column_display) =
+        if normalize_identifier(qualifier) == normalize_identifier(left_name) {
+            let column = column_index(&left.columns, column_name)?;
+            (
+                JoinSide::Left,
+                column,
+                left.header.name.object.display(),
+                left.columns[column].name.display(),
+            )
+        } else if normalize_identifier(qualifier) == normalize_identifier(right_name) {
+            let column = column_index(&right.columns, column_name)?;
+            (
+                JoinSide::Right,
+                column,
+                right.header.name.object.display(),
+                right.columns[column].name.display(),
+            )
+        } else {
+            return Err(SqlError::UnknownColumn);
+        };
+    Ok((
+        JoinProjection { side, column },
+        format!("{relation_display}.{column_display}"),
+    ))
+}
+
+fn split_qualified_column(reference: &str) -> Result<(&str, &str), SqlError> {
+    let (qualifier, column) = reference.split_once('.').ok_or(SqlError::InvalidSyntax)?;
+    if qualifier.is_empty() || column.is_empty() || column.contains('.') {
+        return Err(SqlError::InvalidSyntax);
+    }
+    Ok((qualifier, column))
 }
 
 fn validate_primary_key_order(
@@ -2638,24 +3277,24 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
         parse_select(&mut parser)?
     } else if parser.consume_keyword("EXPLAIN") {
         parser.expect_keyword("SELECT")?;
-        let Statement::Select {
-            name,
-            projection,
-            filter,
-            parameter_count,
-            order_by,
-            limit,
-        } = parse_select(&mut parser)?
-        else {
-            return Err(SqlError::InvalidSyntax);
-        };
-        Statement::ExplainSelect {
-            name,
-            projection,
-            filter,
-            parameter_count,
-            order_by,
-            limit,
+        match parse_select(&mut parser)? {
+            Statement::Select {
+                name,
+                projection,
+                filter,
+                parameter_count,
+                order_by,
+                limit,
+            } => Statement::ExplainSelect {
+                name,
+                projection,
+                filter,
+                parameter_count,
+                order_by,
+                limit,
+            },
+            Statement::SelectJoin(join) => Statement::ExplainSelectJoin(join),
+            _ => return Err(SqlError::InvalidSyntax),
         }
     } else {
         return Err(SqlError::InvalidSyntax);
@@ -2838,6 +3477,29 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     };
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
+    if parser.consume_keyword("INNER") {
+        parser.expect_keyword("JOIN")?;
+        let right_name = parser.identifier()?;
+        parser.expect_keyword("ON")?;
+        let left_join_column = parser.identifier()?;
+        parser.expect_symbol('=')?;
+        let right_join_column = parser.identifier()?;
+        parser.expect_keyword("WHERE")?;
+        let mut parameter_count = 0_usize;
+        let filter = parse_filter_expression(parser, &mut parameter_count)?;
+        let Projection::Columns(projection) = projection else {
+            return Err(SqlError::InvalidSyntax);
+        };
+        return Ok(Statement::SelectJoin(ParsedInnerJoin {
+            left_name: name,
+            right_name,
+            projection,
+            left_join_column,
+            right_join_column,
+            filter,
+            parameter_count,
+        }));
+    }
     let mut parameter_count = 0_usize;
     let filter = if parser.consume_keyword("WHERE") {
         Some(parse_filter_expression(parser, &mut parameter_count)?)
@@ -3023,7 +3685,7 @@ fn lex(statement: &str) -> Result<Vec<Token>, SqlError> {
             offset += 1;
         } else if matches!(
             character,
-            '(' | ')' | ',' | '=' | '!' | '<' | '>' | '-' | ';' | '?' | '*'
+            '(' | ')' | ',' | '.' | '=' | '!' | '<' | '>' | '-' | ';' | '?' | '*'
         ) {
             tokens.push(Token::Symbol(character));
             offset += 1;
@@ -3212,8 +3874,17 @@ impl Parser {
         let Some(Token::Word(identifier)) = self.tokens.get(self.offset) else {
             return Err(SqlError::InvalidSyntax);
         };
+        let mut qualified = identifier.clone();
         self.offset += 1;
-        Ok(identifier.clone())
+        while self.consume_symbol('.') {
+            let Some(Token::Word(identifier)) = self.tokens.get(self.offset) else {
+                return Err(SqlError::InvalidSyntax);
+            };
+            qualified.push('.');
+            qualified.push_str(identifier);
+            self.offset += 1;
+        }
+        Ok(qualified)
     }
 
     fn number_u8(&mut self) -> Result<u8, SqlError> {
