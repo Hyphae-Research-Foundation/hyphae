@@ -38,8 +38,8 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_manifest::{ManifestError, RootManifest, RootManifestStore};
 use hyphae_native_mvcc::{
-    CommitCoordinator, ConflictTable, MvccError, RootSet, RootSlot, RootTransaction, Snapshot,
-    WalAnchor, WriteConflict, WriteKey,
+    CommitCoordinator, ConflictTable, MvccError, RootGroupTransaction, RootSet, RootSlot,
+    RootTransaction, Snapshot, WalAnchor, WriteConflict, WriteKey,
 };
 use hyphae_native_pages::{BufferPool, BufferPoolError, PageKind, PageStore, PageStoreError};
 use hyphae_native_records::{
@@ -153,6 +153,8 @@ const SEARCH_DOCUMENT_BLOB: u8 = 1;
 const SEARCH_INLINE_VALUE_LIMIT: usize = 8_192;
 const DEFAULT_BUFFER_POOL_FRAMES: usize = 1_024;
 const DEFAULT_BUFFER_POOL_PARTITIONS: usize = 16;
+/// Maximum number of independent transactions sharing one native durability flush.
+pub const MAX_GROUP_COMMIT_BATCH_SIZE: usize = 256;
 const SLOT_CATALOG: RootSlot = RootSlot {
     engine: EngineKind::Kernel,
     partition: 0,
@@ -391,9 +393,23 @@ pub enum NativeRuntimeError {
     /// Transaction identity space is exhausted.
     #[error("native transaction identity space is exhausted")]
     TransactionIdExhausted,
+    /// A direct group-commit request is empty or exceeds its bounded cohort.
+    #[error(
+        "native group commit batch size {requested} is outside 1..={MAX_GROUP_COMMIT_BATCH_SIZE}"
+    )]
+    InvalidGroupCommitBatchSize {
+        /// Rejected number of submitted transactions.
+        requested: usize,
+    },
+    /// A transaction submitted to the group scheduler selected another class.
+    #[error("native group commit accepts only group-durability transactions")]
+    GroupCommitRequiresGroupDurability,
     /// A deterministic crash-matrix interruption was requested.
     #[error("native commit interrupted at {0:?}; reopen the data directory")]
     InjectedCrash(CommitBoundary),
+    /// A deterministic group-commit interruption was requested.
+    #[error("native group commit interrupted at {0:?}; reopen the data directory")]
+    InjectedGroupCrash(GroupCommitBoundary),
     /// A deterministic checkpoint interruption was requested.
     #[error("native checkpoint interrupted at {0:?}; reopen the data directory")]
     InjectedCheckpointCrash(CheckpointBoundary),
@@ -437,6 +453,21 @@ pub enum CommitBoundary {
     /// The WAL transaction is synchronized but roots are not published in memory.
     WalSynchronized,
     /// The complete root set has been published.
+    RootPublished,
+}
+
+/// Deterministic group-commit boundary used by the native crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupCommitBoundary {
+    /// At least one accepted WAL transaction is appended, but the cohort is incomplete.
+    AdmittedWalPrefixAppended,
+    /// Every accepted transaction is appended without a shared synchronization.
+    CohortAppended,
+    /// The page file is synchronized once, but the cohort WAL is not.
+    PageSynchronized,
+    /// The cohort WAL is synchronized once, but its final root is not visible.
+    WalSynchronized,
+    /// The final cohort root and conflict state are published.
     RootPublished,
 }
 
@@ -602,6 +633,32 @@ pub struct CommitReceipt {
     pub wal_block_digest: [u8; 32],
     /// Durability promise used for acknowledgement.
     pub durability: DurabilityClass,
+    /// Number of accepted transactions sharing this durability flush.
+    pub durability_cohort_size: usize,
+    /// Zero-based position of this transaction in its durability cohort.
+    pub durability_cohort_position: usize,
+}
+
+/// Independent result for one request submitted in a group-commit cohort.
+#[derive(Debug)]
+pub enum GroupCommitOutcome {
+    /// The transaction committed and shares the cohort durability receipt.
+    Committed(CommitReceipt),
+    /// Admission rejected this transaction before physical mutation.
+    Rejected(NativeRuntimeError),
+}
+
+/// Result of one bounded native group-commit execution.
+#[derive(Debug)]
+pub struct GroupCommitReport {
+    /// Outcomes in original submission order.
+    pub outcomes: Vec<GroupCommitOutcome>,
+    /// Number of transactions accepted into the shared durability flush.
+    pub accepted_commits: usize,
+    /// Physical page-file synchronizations performed for this cohort.
+    pub page_synchronizations: usize,
+    /// Physical WAL synchronizations performed for this cohort.
+    pub wal_synchronizations: usize,
 }
 
 /// Result of one bounded durable scalar-expiry cleanup.
@@ -3072,6 +3129,104 @@ impl NativeDatabase {
         .commit_at(interruption)
     }
 
+    /// Commits independent group-durability batches with one page and WAL sync.
+    ///
+    /// Semantic admission failures are returned in their original request
+    /// positions and do not prevent disjoint requests from committing. A
+    /// physical error after admission requires dropping this handle and
+    /// reopening the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or oversized cohort, persistence,
+    /// synchronization, WAL, page, blob, or MVCC publication failure.
+    pub fn commit_group(
+        &mut self,
+        batches: Vec<NativeWriteBatch>,
+    ) -> Result<GroupCommitReport, NativeRuntimeError> {
+        self.commit_group_at(batches, None)
+    }
+
+    /// Executes one group cohort with a deterministic crash interruption.
+    ///
+    /// The caller must drop this database handle and reopen the directory after
+    /// an injected interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedGroupCrash`] at the requested
+    /// boundary, or the same errors as [`Self::commit_group`].
+    pub fn commit_group_with_interruption(
+        &mut self,
+        batches: Vec<NativeWriteBatch>,
+        boundary: GroupCommitBoundary,
+    ) -> Result<GroupCommitReport, NativeRuntimeError> {
+        self.commit_group_at(batches, Some(boundary))
+    }
+
+    fn commit_group_at(
+        &mut self,
+        batches: Vec<NativeWriteBatch>,
+        interruption: Option<GroupCommitBoundary>,
+    ) -> Result<GroupCommitReport, NativeRuntimeError> {
+        if batches.is_empty() || batches.len() > MAX_GROUP_COMMIT_BATCH_SIZE {
+            return Err(NativeRuntimeError::InvalidGroupCommitBatchSize {
+                requested: batches.len(),
+            });
+        }
+
+        let root_group = self.coordinator.begin_group_write()?;
+        let admission = admit_group_commits(
+            &root_group,
+            &self.pages,
+            &self.blobs,
+            &self.conflicts,
+            self.next_transaction_id,
+            self.structure_format,
+            self.search_format,
+            batches,
+        )?;
+        let GroupCommitAdmission {
+            accepted,
+            mut outcomes,
+            conflicts_after_commit,
+            next_transaction_id,
+            initial_state,
+        } = admission;
+        let accepted_commits = accepted.len();
+        if accepted_commits == 0 {
+            return Ok(GroupCommitReport {
+                outcomes: collect_group_outcomes(outcomes)?,
+                accepted_commits: 0,
+                page_synchronizations: 0,
+                wal_synchronizations: 0,
+            });
+        }
+
+        let committed = GroupCommitStorage {
+            pages: &mut self.pages,
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            root_group,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+        }
+        .commit(accepted, initial_state, interruption)?;
+        self.conflicts = conflicts_after_commit;
+        self.next_transaction_id = next_transaction_id;
+        for (request_index, receipt) in committed {
+            outcomes[request_index] = Some(GroupCommitOutcome::Committed(receipt));
+        }
+        interrupt_group(interruption, GroupCommitBoundary::RootPublished)?;
+        Ok(GroupCommitReport {
+            outcomes: collect_group_outcomes(outcomes)?,
+            accepted_commits,
+            page_synchronizations: 1,
+            wal_synchronizations: 1,
+        })
+    }
+
     /// Rebuilds the current logical root set into a smaller immutable page
     /// generation and publishes it through one strict WAL commit.
     ///
@@ -3204,6 +3359,8 @@ impl NativeDatabase {
                 commit_lsn: wal_receipt.lsn,
                 wal_block_digest: wal_receipt.digest,
                 durability: DurabilityClass::Strict,
+                durability_cohort_size: 1,
+                durability_cohort_position: 0,
             }),
         })
     }
@@ -3418,6 +3575,153 @@ enum NativeWriteBatchMode {
     Materialized,
     PhysicalStructureExpiry,
     PhysicalStructureCompaction,
+}
+
+#[derive(Debug)]
+struct AdmittedGroupCommit {
+    request_index: usize,
+    transaction_id: TransactionId,
+    conflict_read_csn: Option<Csn>,
+    commit_csn: Csn,
+    catalog_version: CatalogVersion,
+    batch: NativeWriteBatch,
+}
+
+#[derive(Debug)]
+struct GroupCommitAdmission {
+    accepted: Vec<AdmittedGroupCommit>,
+    outcomes: Vec<Option<GroupCommitOutcome>>,
+    conflicts_after_commit: ConflictTable,
+    next_transaction_id: u128,
+    initial_state: MaterializedState,
+}
+
+struct GroupCommitStorage<'database, 'coordinator> {
+    pages: &'database mut PageStore,
+    blobs: &'database mut BlobStore,
+    wal: &'database mut WalFile,
+    root_group: RootGroupTransaction<'coordinator>,
+    relational_format: RelationalFormat,
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+}
+
+impl GroupCommitStorage<'_, '_> {
+    fn commit(
+        mut self,
+        accepted: Vec<AdmittedGroupCommit>,
+        mut physical_state: MaterializedState,
+        interruption: Option<GroupCommitBoundary>,
+    ) -> Result<Vec<(usize, CommitReceipt)>, NativeRuntimeError> {
+        let cohort_size = accepted.len();
+        let mut committed = Vec::with_capacity(cohort_size);
+        for (cohort_position, admitted) in accepted.into_iter().enumerate() {
+            committed.push(self.stage_one(
+                admitted,
+                &mut physical_state,
+                cohort_size,
+                cohort_position,
+            )?);
+            if cohort_position == 0 {
+                interrupt_group(interruption, GroupCommitBoundary::AdmittedWalPrefixAppended)?;
+            }
+        }
+        interrupt_group(interruption, GroupCommitBoundary::CohortAppended)?;
+        self.pages.sync_data()?;
+        interrupt_group(interruption, GroupCommitBoundary::PageSynchronized)?;
+        self.wal.sync_data()?;
+        interrupt_group(interruption, GroupCommitBoundary::WalSynchronized)?;
+        drop(self.root_group.publish()?);
+        Ok(committed)
+    }
+
+    fn stage_one(
+        &mut self,
+        admitted: AdmittedGroupCommit,
+        physical_state: &mut MaterializedState,
+        cohort_size: usize,
+        cohort_position: usize,
+    ) -> Result<(usize, CommitReceipt), NativeRuntimeError> {
+        let AdmittedGroupCommit {
+            request_index,
+            transaction_id,
+            conflict_read_csn,
+            commit_csn,
+            catalog_version,
+            mut batch,
+        } = admitted;
+        if self.root_group.next_commit_csn()? != commit_csn {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        apply_mutations_to_state(physical_state, &batch.mutations)?;
+        batch.snapshot = self
+            .root_group
+            .base_snapshot(batch.snapshot.logical_time_micros);
+        batch.state = std::mem::take(physical_state);
+
+        let roots = roots_from_snapshot(self.root_group.base_roots());
+        let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
+        let staged_blobs = stage_large_values(self.blobs, &batch, rebuild_catalog, true)?;
+        let blob_references = publish_staged_blobs(self.blobs, staged_blobs, true)?;
+        let blob_generation = self.blobs.generation()?;
+        let roots = commit_engine_roots(
+            self.pages,
+            self.blobs,
+            roots,
+            self.relational_format,
+            self.structure_format,
+            self.search_format,
+            commit_csn,
+            &batch,
+            &blob_references,
+        )?;
+        *physical_state = std::mem::take(&mut batch.state);
+
+        let concrete_roots = require_roots(roots)?;
+        let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
+        let page_generation = self.root_group.base_roots().page_generation();
+        let retention_floor_csn = self
+            .root_group
+            .base_roots()
+            .retention_floor_csn()
+            .unwrap_or(Csn::FIRST);
+        let pending = encode_transaction(&TransactionPlan {
+            transaction_id,
+            read_csn: conflict_read_csn,
+            catalog_version,
+            logical_time_micros: batch.snapshot.logical_time_micros,
+            durability: DurabilityClass::Group,
+            mutations: &wal_mutations,
+            commit_csn,
+            roots: concrete_roots,
+            blob_generation,
+            page_generation,
+            retention_floor_csn,
+        })?;
+        let receipts = self.wal.append_records(pending, false)?;
+        let block = receipts.last().ok_or(WalError::EmptyBlock)?;
+        let commit_lsn = block.last_lsn;
+        let wal_block_digest = block.digest;
+        drop(self.root_group.stage_commit(
+            catalog_version,
+            WalAnchor::new(commit_lsn, wal_block_digest)?,
+            root_map(concrete_roots),
+            blob_generation,
+        )?);
+        Ok((
+            request_index,
+            CommitReceipt {
+                transaction_id,
+                commit_csn,
+                catalog_version,
+                commit_lsn,
+                wal_block_digest,
+                durability: DurabilityClass::Group,
+                durability_cohort_size: cohort_size,
+                durability_cohort_position: cohort_position,
+            },
+        ))
+    }
 }
 
 /// Legacy serialized transaction retaining writer admission for its lifetime.
@@ -5003,6 +5307,8 @@ impl NativeTransaction<'_> {
             commit_lsn: block.last_lsn,
             wal_block_digest: block.digest,
             durability: batch.durability,
+            durability_cohort_size: 1,
+            durability_cohort_position: 0,
         })
     }
 }
@@ -5520,12 +5826,148 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     keys
 }
 
+#[allow(clippy::too_many_arguments)]
+fn admit_group_commits(
+    root_group: &RootGroupTransaction<'_>,
+    pages: &PageStore,
+    blobs: &BlobStore,
+    conflicts: &ConflictTable,
+    next_transaction_id: u128,
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+    batches: Vec<NativeWriteBatch>,
+) -> Result<GroupCommitAdmission, NativeRuntimeError> {
+    let initial_state = load_state(pages, blobs, root_group.base_roots())?;
+    let mut admission_state = initial_state.clone();
+    let mut catalog_version = root_group.base_roots().catalog_version();
+    let mut conflicts_after_commit = conflicts.clone();
+    let mut next_transaction_id = next_transaction_id;
+    let mut accepted = Vec::with_capacity(batches.len());
+    let mut outcomes = std::iter::repeat_with(|| None)
+        .take(batches.len())
+        .collect::<Vec<_>>();
+
+    for (request_index, batch) in batches.into_iter().enumerate() {
+        let rejection = group_admission_rejection(
+            root_group,
+            &conflicts_after_commit,
+            structure_format,
+            search_format,
+            &batch,
+        );
+        let write_keys = match rejection {
+            Ok(write_keys) => write_keys,
+            Err(error) => {
+                outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+                continue;
+            }
+        };
+
+        let mut candidate_state = admission_state.clone();
+        if let Err(error) = apply_mutations_to_state(&mut candidate_state, &batch.mutations) {
+            outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+            continue;
+        }
+        let candidate_catalog_version = if batch.dirty[0] {
+            if let Some(version) = catalog_version.checked_next() {
+                version
+            } else {
+                outcomes[request_index] = Some(GroupCommitOutcome::Rejected(
+                    CatalogError::VersionExhausted.into(),
+                ));
+                continue;
+            }
+        } else {
+            catalog_version
+        };
+        let commit_csn = root_group.commit_csn_at_offset(accepted.len())?;
+        let transaction_id = TransactionId::new(next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        next_transaction_id = next_transaction_id
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
+        conflicts_after_commit.publish_committed(commit_csn, write_keys.clone());
+        admission_state = candidate_state;
+        catalog_version = candidate_catalog_version;
+        accepted.push(AdmittedGroupCommit {
+            request_index,
+            transaction_id,
+            conflict_read_csn: batch.snapshot.visible_csn,
+            commit_csn,
+            catalog_version,
+            batch,
+        });
+    }
+
+    Ok(GroupCommitAdmission {
+        accepted,
+        outcomes,
+        conflicts_after_commit,
+        next_transaction_id,
+        initial_state,
+    })
+}
+
+fn group_admission_rejection(
+    root_group: &RootGroupTransaction<'_>,
+    conflicts: &ConflictTable,
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+    batch: &NativeWriteBatch,
+) -> Result<Vec<WriteKey>, NativeRuntimeError> {
+    if batch.durability != DurabilityClass::Group {
+        return Err(NativeRuntimeError::GroupCommitRequiresGroupDurability);
+    }
+    if batch.mode != NativeWriteBatchMode::Materialized
+        || batch.structure_format != structure_format
+        || batch.search_format != search_format
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    if batch.mutations.is_empty() {
+        return Err(WalSemanticError::InvalidSequence.into());
+    }
+    if let (Some(read_csn), Some(retention_floor_csn)) = (
+        batch.snapshot.visible_csn,
+        root_group.base_roots().retention_floor_csn(),
+    ) && read_csn < retention_floor_csn
+    {
+        return Err(NativeRuntimeError::SnapshotBelowRetentionFloor {
+            read_csn,
+            retention_floor_csn,
+        });
+    }
+    let write_keys = mutation_write_keys(&batch.mutations);
+    conflicts.validate(batch.snapshot.visible_csn, &write_keys)?;
+    Ok(write_keys)
+}
+
+fn collect_group_outcomes(
+    outcomes: Vec<Option<GroupCommitOutcome>>,
+) -> Result<Vec<GroupCommitOutcome>, NativeRuntimeError> {
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.ok_or(NativeRuntimeError::InvalidPreparedMutation))
+        .collect()
+}
+
 fn interrupt(
     requested: Option<CommitBoundary>,
     current: CommitBoundary,
 ) -> Result<(), NativeRuntimeError> {
     if requested == Some(current) {
         Err(NativeRuntimeError::InjectedCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
+fn interrupt_group(
+    requested: Option<GroupCommitBoundary>,
+    current: GroupCommitBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedGroupCrash(current))
     } else {
         Ok(())
     }
@@ -10712,12 +11154,12 @@ mod tests {
         CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
         CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        EngineKind, HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError,
-        NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
-        RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, ZAddOutcome,
-        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
-        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
+        EngineKind, GroupCommitOutcome, HashSetOutcome, HnswConfig, Mutation, NativeDatabase,
+        NativeRuntimeError, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
+        RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
+        SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
+        ZAddOutcome, binary_relation_definition, catalog_definition_storage_value,
+        catalog_name_identity, catalog_name_key, catalog_object_key, catalog_root_after_mutations,
         decode_catalog_definition_storage_value, page_generation_path,
         physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
         validate_commit_sequence,
@@ -14593,6 +15035,71 @@ mod tests {
             recovered.match_text(index, "second", 10)?[0].document_id,
             b"doc-second"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_shares_one_flush_without_coupling_transaction_outcomes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+
+        let mut first = database.begin_optimistic(151, DurabilityClass::Group)?;
+        let mut conflicting = database.begin_optimistic(151, DurabilityClass::Group)?;
+        let mut second = database.begin_optimistic(151, DurabilityClass::Group)?;
+        first.update(table, b"mario".to_vec(), b"first".to_vec())?;
+        first.set(b"first".to_vec(), b"structure".to_vec(), None)?;
+        first.index_document(index, b"doc-first".to_vec(), "first cohort writer")?;
+        conflicting.update(table, b"mario".to_vec(), b"conflict".to_vec())?;
+        second.insert(table, b"second".to_vec(), b"row".to_vec())?;
+        second.set(b"second".to_vec(), b"structure".to_vec(), None)?;
+        second.index_document(index, b"doc-second".to_vec(), "second cohort writer")?;
+
+        let report = database.commit_group(vec![first, conflicting, second])?;
+        assert_eq!(report.accepted_commits, 2);
+        assert_eq!(report.page_synchronizations, 1);
+        assert_eq!(report.wal_synchronizations, 1);
+        let [
+            GroupCommitOutcome::Committed(first_receipt),
+            GroupCommitOutcome::Rejected(NativeRuntimeError::WriteConflict(_)),
+            GroupCommitOutcome::Committed(second_receipt),
+        ] = report.outcomes.as_slice()
+        else {
+            return Err("unexpected group-commit outcomes".into());
+        };
+        assert_eq!(first_receipt.commit_csn, Csn::new(2)?);
+        assert_eq!(second_receipt.commit_csn, Csn::new(3)?);
+        assert_eq!(first_receipt.durability_cohort_size, 2);
+        assert_eq!(second_receipt.durability_cohort_size, 2);
+        assert_eq!(first_receipt.durability_cohort_position, 0);
+        assert_eq!(second_receipt.durability_cohort_position, 1);
+
+        let current = database.snapshot(152)?;
+        assert_eq!(current.visible_csn(), Some(Csn::new(3)?));
+        assert_eq!(current.select(table, b"mario"), Some(b"first".as_slice()));
+        assert_eq!(current.select(table, b"second"), Some(b"row".as_slice()));
+        assert_eq!(current.get(b"first"), Some(b"structure".as_slice()));
+        assert_eq!(current.get(b"second"), Some(b"structure".as_slice()));
+        assert_eq!(
+            current.match_text(index, "first", 10)?[0].document_id,
+            b"doc-first"
+        );
+        assert_eq!(
+            current.match_text(index, "second", 10)?[0].document_id,
+            b"doc-second"
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 3);
+        let recovered = reopened.snapshot(153)?;
+        assert_eq!(recovered.select(table, b"mario"), Some(b"first".as_slice()));
+        assert_eq!(recovered.select(table, b"second"), Some(b"row".as_slice()));
+        assert_eq!(recovered.get(b"first"), Some(b"structure".as_slice()));
+        assert_eq!(recovered.get(b"second"), Some(b"structure".as_slice()));
         Ok(())
     }
 
