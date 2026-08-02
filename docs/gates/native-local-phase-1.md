@@ -67,6 +67,13 @@ benchmark corpus, and implementation-facing tests exist.
 
 ## Current experimental evidence
 
+The [native directory identity and writer exclusion
+evidence](evidence/native-directory-identity-linux-2026-08-02.md) binds
+canonical native `FORMAT`, UUIDv7 lineage identity, fail-closed marker-family
+validation, and operating-system single-writer ownership to one direct Linux
+commit. Offline promotion crash boundaries and manifest/anchor lineage
+threading remain open, so this evidence closes neither G0 nor G1.
+
 The [2026-08-01 kernel evidence](evidence/native-phase1-kernel-2026-08-01.md)
 implements the first reviewable vertical. Steps 1 through 4 and the
 reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers

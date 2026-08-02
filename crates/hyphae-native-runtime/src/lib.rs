@@ -8,12 +8,14 @@
 //! claim of complete SQL, Valkey, or `OpenSearch` compatibility.
 
 mod ann_store;
+mod directory;
 mod group_commit;
 mod local_protocol;
 mod model;
 mod sql;
 mod wal_codec;
 
+pub use directory::{NativeDirectoryError, NativeDirectoryIdentity};
 pub use group_commit::{
     ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
     CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
@@ -39,6 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use directory::NativeDirectoryGuard;
 use hyphae_native_blobs::{
     BlobError, BlobInventory, BlobRecovery, BlobReferenceSet, BlobStore, StagedBlob,
 };
@@ -257,6 +260,9 @@ pub enum NativeRuntimeError {
     /// Filesystem operation outside the page/WAL files failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Native data-directory validation or single-writer ownership failed.
+    #[error(transparent)]
+    Directory(#[from] NativeDirectoryError),
     /// Native page storage failed.
     #[error(transparent)]
     Page(#[from] PageStoreError),
@@ -1405,6 +1411,12 @@ fn ann_search_receipt(
     }
 }
 
+fn open_blob_store(path: &Path) -> Result<(BlobStore, Duration), BlobError> {
+    let started = Instant::now();
+    let blobs = BlobStore::open(path)?;
+    Ok((blobs, started.elapsed()))
+}
+
 /// One Hyphae-owned native data directory.
 #[derive(Debug)]
 pub struct NativeDatabase {
@@ -1423,6 +1435,7 @@ pub struct NativeDatabase {
     next_transaction_id: u128,
     last_checkpoint_lsn: Option<Lsn>,
     recovery: RecoveryReport,
+    directory_guard: NativeDirectoryGuard,
 }
 
 impl NativeDatabase {
@@ -1437,6 +1450,7 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::DataDirectoryExists);
         }
         fs::create_dir(path)?;
+        let directory_guard = NativeDirectoryGuard::initialize(path)?;
         let pages = PageStore::create(path.join(PAGE_FILE))?;
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
@@ -1499,6 +1513,7 @@ impl NativeDatabase {
                 recovered_temporary_blobs: 0,
                 recovered_temporary_wal_anchors: 0,
             },
+            directory_guard,
         })
     }
 
@@ -1511,9 +1526,8 @@ impl NativeDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
         let open_started = Instant::now();
         let path = path.as_ref();
-        let blob_verification_started = Instant::now();
-        let mut blobs = BlobStore::open(path)?;
-        let blob_verification_time = blob_verification_started.elapsed();
+        let directory_guard = NativeDirectoryGuard::open(path)?;
+        let (mut blobs, blob_verification_time) = open_blob_store(path)?;
         let WalOpenState {
             mut manifests,
             manifest_recovery,
@@ -1608,12 +1622,18 @@ impl NativeDatabase {
             next_transaction_id: metadata.next_transaction_id,
             last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
             recovery,
+            directory_guard,
         })
     }
 
     /// Returns the owned data-directory path.
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
+    }
+
+    /// Returns the stable identity of this native data-directory history.
+    pub const fn directory_identity(&self) -> &NativeDirectoryIdentity {
+        self.directory_guard.identity()
     }
 
     /// Returns recovery evidence produced when this handle was opened.
@@ -12576,9 +12596,10 @@ fn qualified_name(name: &str) -> Result<QualifiedName, CatalogError> {
 mod tests {
     use std::{
         fs,
-        io::{Read, Seek, SeekFrom, Write},
+        io::{self, Read, Seek, SeekFrom, Write},
         ops::Bound,
         path::{Path, PathBuf},
+        process::Command,
         sync::{
             Arc, Barrier,
             atomic::{AtomicI64, AtomicU64, Ordering},
@@ -12604,11 +12625,11 @@ mod tests {
         ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
         GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
         HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
-        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeSchedulerClock,
-        NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
-        RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
-        WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
+        NativeSchedulerClock, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
+        RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
+        SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
+        WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
         catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
         catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
         page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
@@ -12616,6 +12637,7 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    const EXTERNAL_LOCK_PROBE_PATH: &str = "HYPHAE_NATIVE_LOCK_PROBE_PATH";
 
     struct TestSchedulerClock(AtomicI64);
 
@@ -12728,6 +12750,148 @@ mod tests {
             page_generation_path(directory, PageGeneration::new(42)?),
             directory.join("pages-00000000000000000042.hydb")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_database_create_writes_a_canonical_format_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let database = NativeDatabase::create(directory.path())?;
+
+        let marker = fs::read_to_string(directory.path().join("FORMAT"))?;
+        assert!(marker.ends_with('\n'));
+        let marker = &marker[..marker.len() - 1];
+        let fields = marker.split(' ').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], "hyphae-native-format=1");
+        assert!(fields[1].starts_with("directory="));
+        let directory_id = &fields[1]["directory=".len()..];
+        assert_eq!(directory_id.len(), 36);
+        assert_eq!(&directory_id[14..15], "7");
+        assert_eq!(fields[2], "epoch=1");
+        assert_eq!(database.directory_identity().directory_id(), directory_id);
+        assert_eq!(database.directory_identity().history_epoch(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_directory_identity_round_trips_and_excludes_a_second_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let database = NativeDatabase::create(directory.path())?;
+        let identity = database.directory_identity().clone();
+
+        let error = expected_open_error(directory.path())?;
+        assert!(matches!(
+            error,
+            NativeRuntimeError::Directory(NativeDirectoryError::AlreadyLocked(ref path))
+                if path == &directory.path().join("LOCK")
+        ));
+        assert_external_lock_probe(directory.path())?;
+
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.directory_identity(), &identity);
+        Ok(())
+    }
+
+    #[test]
+    fn native_directory_external_lock_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = std::env::var_os(EXTERNAL_LOCK_PROBE_PATH) else {
+            return Ok(());
+        };
+        let path = Path::new(&path);
+        assert!(matches!(
+            expected_open_error(path)?,
+            NativeRuntimeError::Directory(NativeDirectoryError::AlreadyLocked(ref lock_path))
+                if lock_path == &path.join("LOCK")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn native_directory_markers_and_mixed_families_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let missing = create_closed_native_directory()?;
+        fs::remove_file(missing.path().join("FORMAT"))?;
+        assert!(matches!(
+            expected_open_error(missing.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::MissingFormat(ref path))
+                if path == missing.path()
+        ));
+
+        let missing_lock = create_closed_native_directory()?;
+        fs::remove_file(missing_lock.path().join("LOCK"))?;
+        assert!(matches!(
+            expected_open_error(missing_lock.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::MissingLock(ref path))
+                if path == &missing_lock.path().join("LOCK")
+        ));
+
+        let pending = create_closed_native_directory()?;
+        fs::rename(
+            pending.path().join("FORMAT"),
+            pending.path().join("FORMAT.pending"),
+        )?;
+        assert!(matches!(
+            expected_open_error(pending.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::PendingMigration(ref path))
+                if path == pending.path()
+        ));
+
+        let conflicting = create_closed_native_directory()?;
+        fs::copy(
+            conflicting.path().join("FORMAT"),
+            conflicting.path().join("FORMAT.pending"),
+        )?;
+        assert!(matches!(
+            expected_open_error(conflicting.path())?,
+            NativeRuntimeError::Directory(
+                NativeDirectoryError::ConflictingFormatMarkers(ref path)
+            ) if path == conflicting.path()
+        ));
+
+        let format2 = create_closed_native_directory()?;
+        fs::write(format2.path().join("FORMAT"), b"hyphae-disk-format=2\n")?;
+        assert!(matches!(
+            expected_open_error(format2.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::Format2Directory(ref path))
+                if path == &format2.path().join("FORMAT")
+        ));
+
+        let unsupported = create_closed_native_directory()?;
+        let marker = fs::read_to_string(unsupported.path().join("FORMAT"))?.replacen(
+            "hyphae-native-format=1",
+            "hyphae-native-format=2",
+            1,
+        );
+        fs::write(unsupported.path().join("FORMAT"), marker)?;
+        assert!(matches!(
+            expected_open_error(unsupported.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::UnsupportedFormat {
+                found: 2,
+                supported: 1,
+            })
+        ));
+
+        let malformed = create_closed_native_directory()?;
+        let marker = fs::read_to_string(malformed.path().join("FORMAT"))?
+            .replace(" epoch=1\n", " epoch=1 epoch=1\n");
+        fs::write(malformed.path().join("FORMAT"), marker)?;
+        assert!(matches!(
+            expected_open_error(malformed.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::MalformedFormat(ref path))
+                if path == &malformed.path().join("FORMAT")
+        ));
+
+        let mixed = create_closed_native_directory()?;
+        fs::create_dir(mixed.path().join("log"))?;
+        assert!(matches!(
+            expected_open_error(mixed.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::MixedFormatFamilies(ref path))
+                if path == &mixed.path().join("log")
+        ));
         Ok(())
     }
 
@@ -13372,6 +13536,40 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ignored = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn assert_external_lock_probe(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let output = Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("tests::native_directory_external_lock_probe")
+            .arg("--nocapture")
+            .env(EXTERNAL_LOCK_PROBE_PATH, path)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "external lock probe failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    fn create_closed_native_directory() -> Result<TestDirectory, Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        drop(NativeDatabase::create(directory.path())?);
+        Ok(directory)
+    }
+
+    fn expected_open_error(path: &Path) -> Result<NativeRuntimeError, Box<dyn std::error::Error>> {
+        match NativeDatabase::open(path) {
+            Ok(database) => {
+                drop(database);
+                Err(io::Error::other("native directory unexpectedly opened").into())
+            }
+            Err(error) => Ok(error),
         }
     }
 

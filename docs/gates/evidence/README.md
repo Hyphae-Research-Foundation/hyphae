@@ -270,6 +270,12 @@ commit before its tag can be published.
 - `native-structure-compaction-wsl2.json` records a 41-to-10 reduction in
   reachable pages and a 93.133% empty-expiry-scan p50 improvement while also
   recording append-only file growth. Physical page-file vacuum remains open.
+- [Native directory identity and writer exclusion evidence —
+  2026-08-02](native-directory-identity-linux-2026-08-02.md) binds canonical
+  native `FORMAT`, stable UUIDv7 identity, fail-closed marker validation, and
+  same-process plus cross-process writer exclusion to one direct Linux
+  commit. Offline promotion and manifest/anchor lineage threading remain
+  open.
 - [Native dependency-closure evidence —
   2026-08-02](native-dependency-closure-2026-08-02.md) binds the exact
   non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
