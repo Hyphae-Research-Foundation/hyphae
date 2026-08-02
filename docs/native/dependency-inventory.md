@@ -1,8 +1,8 @@
 # Native clean-room and dependency inventory
 
-Status: normative G0 policy; the exact native-closure gate is specified below
-but its machine-readable policy, implementation, and clean-commit receipt are
-pending
+Status: normative G0 policy; the exact native-closure gate, machine-readable
+policy, unit tests, and pull-request CI are implemented; a clean-commit receipt
+and semantic review of reported third-party unsafe use remain pending
 
 Hyphae owns database, transaction, SQL, structure, lexical and ANN semantics.
 This document distinguishes permitted primitives from forbidden target-engine
@@ -145,7 +145,8 @@ The gate must fail when:
 The machine-readable inventory records the review category and rationale for
 every external package. It is an exact allowlist, not a permissive prefix or
 license-only filter. Package updates therefore require an intentional policy
-change and review.
+change and review. The canonical allowlist is
+[`config/native-dependency-policy.json`](../../config/native-dependency-policy.json).
 
 `cargo-geiger` is evidence rather than an authority over package semantics.
 Unsafe counts in reviewed third-party primitives are reported by package and
