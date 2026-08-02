@@ -18476,6 +18476,11 @@ mod tests {
         WHERE sequence >= ? AND tenant = ?
         ORDER BY tenant, sequence
         LIMIT 3";
+    const PRIMARY_KEY_PREFIX_RANGE_QUERY: &str = "SELECT sequence, payload
+        FROM ledger
+        WHERE sequence < ? AND tenant = ? AND sequence >= ?
+        ORDER BY tenant, sequence
+        LIMIT 4";
 
     fn seed_primary_key_prefix_ledger(
         database: &mut NativeDatabase,
@@ -18541,6 +18546,300 @@ mod tests {
         Ok(())
     }
 
+    fn primary_key_prefix_range_parameters(
+        upper: i64,
+        tenant: SqlValue,
+        lower: SqlValue,
+    ) -> [SqlValue; 3] {
+        [SqlValue::Signed(upper), tenant, lower]
+    }
+
+    fn assert_private_primary_key_prefix_range(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut private = database.begin_sql(12, DurabilityClass::Memory)?;
+        private.execute_sql(
+            "INSERT INTO ledger (tenant, sequence, payload) VALUES (?, ?, ?)",
+            &[
+                SqlValue::Text("aa".to_owned()),
+                SqlValue::Signed(128),
+                SqlValue::Text("aa-private".to_owned()),
+            ],
+        )?;
+        assert_eq!(
+            private.execute_sql(
+                PRIMARY_KEY_PREFIX_RANGE_QUERY,
+                &primary_key_prefix_range_parameters(
+                    129,
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Signed(126),
+                ),
+            )?,
+            prefix_rows(&[(126, "aa-126"), (127, "aa-127"), (128, "aa-private")])
+        );
+        private.rollback();
+        Ok(())
+    }
+
+    fn assert_primary_key_prefix_range_failures(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plan = database.prepare_sql_latest(PRIMARY_KEY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(
+                &plan,
+                &primary_key_prefix_range_parameters(128, SqlValue::Null, SqlValue::Signed(124),),
+            )?,
+            prefix_rows(&[])
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &plan,
+                &primary_key_prefix_range_parameters(
+                    128,
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Null,
+                ),
+            )?,
+            prefix_rows(&[])
+        );
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &primary_key_prefix_range_parameters(
+                    128,
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Text("wrong".to_owned()),
+                ),
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &[SqlValue::Signed(128), SqlValue::Text("aa".to_owned()),],
+            ),
+            Err(SqlError::ParameterMismatch)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT sequence FROM ledger
+                 WHERE tenant = ? AND sequence > ? AND sequence >= ?
+                 ORDER BY tenant, sequence LIMIT 1",
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn composite_primary_key_prefix_range_matches_every_executor_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_primary_key_prefix_ledger(&mut database)?;
+        assert_private_primary_key_prefix_range(&mut database)?;
+        let retained = database.snapshot(13)?;
+        let retained_plan = retained.prepare_sql(PRIMARY_KEY_PREFIX_RANGE_QUERY)?;
+        mutate_primary_key_prefix_ledger(&mut database)?;
+        let parameters = primary_key_prefix_range_parameters(
+            128,
+            SqlValue::Text("aa".to_owned()),
+            SqlValue::Signed(124),
+        );
+        assert_eq!(
+            retained.execute_prepared(&retained_plan, &parameters)?,
+            prefix_rows(&[
+                (124, "aa-124"),
+                (125, "aa-125"),
+                (126, "aa-126"),
+                (127, "aa-127"),
+            ])
+        );
+        let current = prefix_rows(&[(124, "aa-124"), (126, "aa-126"), (127, "aa-127")]);
+        let latest_plan = database.prepare_sql_latest(PRIMARY_KEY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            current
+        );
+        assert_primary_key_prefix_range_failures(&database)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(PRIMARY_KEY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            current
+        );
+        Ok(())
+    }
+
+    fn seed_primary_key_suffix_ranges(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(14, DurabilityClass::Memory)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE suffix_ledger (
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                shard BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (tenant, sequence, shard)
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing suffix-ledger table identity".into());
+        };
+        for tenant in ["a", "aa", "b"] {
+            for sequence in 1_i64..=3 {
+                for shard in 0_i64..=1 {
+                    seed.execute_sql(
+                        "INSERT INTO suffix_ledger
+                         (tenant, sequence, shard, payload)
+                         VALUES (?, ?, ?, ?)",
+                        &[
+                            SqlValue::Text(tenant.to_owned()),
+                            SqlValue::Signed(sequence),
+                            SqlValue::Signed(shard),
+                            SqlValue::Text(format!("{tenant}-{sequence}-{shard}")),
+                        ],
+                    )?;
+                }
+            }
+        }
+        seed.commit()?;
+        Ok(table)
+    }
+
+    fn sequence_shard_rows(rows: &[(i64, i64)]) -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["sequence".to_owned(), "shard".to_owned()],
+            rows: rows
+                .iter()
+                .map(|(sequence, shard)| {
+                    vec![SqlValue::Signed(*sequence), SqlValue::Signed(*shard)]
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_primary_key_prefix_range_boundaries(
+        query: &mut NativeWriteBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ordered = "ORDER BY tenant, sequence, shard LIMIT 10";
+        for (predicate, parameters, expected) in [
+            (
+                "tenant = ? AND sequence > ? AND sequence <= ?",
+                vec![
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(2),
+                ],
+                vec![(2, 0), (2, 1)],
+            ),
+            (
+                "sequence < ? AND tenant = ? AND sequence >= ?",
+                vec![
+                    SqlValue::Signed(3),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(2),
+                ],
+                vec![(2, 0), (2, 1)],
+            ),
+            (
+                "tenant = ? AND sequence > ? AND sequence <= ?",
+                vec![
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(2),
+                    SqlValue::Signed(2),
+                ],
+                vec![],
+            ),
+            (
+                "tenant = ? AND sequence >= ?",
+                vec![SqlValue::Text("a".to_owned()), SqlValue::Signed(3)],
+                vec![(3, 0), (3, 1)],
+            ),
+            (
+                "tenant = ? AND sequence <= ?",
+                vec![SqlValue::Text("a".to_owned()), SqlValue::Signed(1)],
+                vec![(1, 0), (1, 1)],
+            ),
+        ] {
+            assert_eq!(
+                query.execute_sql(
+                    &format!(
+                        "SELECT sequence, shard FROM suffix_ledger
+                         WHERE {predicate} {ordered}"
+                    ),
+                    &parameters,
+                )?,
+                sequence_shard_rows(&expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn primary_key_prefix_range_respects_remaining_suffixes_and_residual_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_primary_key_suffix_ranges(&mut database)?;
+        let mut query = database.begin_sql(15, DurabilityClass::Memory)?;
+        assert_primary_key_prefix_range_boundaries(&mut query)?;
+        assert_eq!(
+            query.execute_sql(
+                "EXPLAIN SELECT sequence, shard FROM suffix_ledger
+                 WHERE tenant = ? AND sequence >= ? AND sequence < ? AND shard = ?
+                 ORDER BY tenant, sequence, shard LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyPrefixRangeScan(table={table},prefix_columns=1,\
+                     range_column=2,lower=inclusive,upper=exclusive,limit=2,residual=true)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            query.execute_sql(
+                "SELECT sequence, shard FROM suffix_ledger
+                 WHERE tenant = ? AND sequence >= ? AND sequence < ? AND shard = ?
+                 ORDER BY tenant, sequence, shard LIMIT 2",
+                &[
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(3),
+                    SqlValue::Signed(1),
+                ],
+            )?,
+            sequence_shard_rows(&[(1, 1), (2, 1)])
+        );
+        assert_eq!(
+            query.execute_sql(
+                "EXPLAIN SELECT sequence, shard FROM suffix_ledger
+                 WHERE tenant = ? AND shard >= ?
+                 ORDER BY tenant, sequence, shard LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyPrefixScan(table={table},columns=1,limit=2,residual=true)"
+                ))]],
+            }
+        );
+        query.rollback();
+        Ok(())
+    }
+
     fn prefix_rows(rows: &[(i64, &str)]) -> SqlResult {
         SqlResult::Rows {
             columns: vec!["sequence".to_owned(), "payload".to_owned()],
@@ -18580,7 +18879,8 @@ mod tests {
             SqlResult::Rows {
                 columns: vec!["plan".to_owned()],
                 rows: vec![vec![SqlValue::Text(format!(
-                    "PrimaryKeyPrefixScan(table={table},columns=1,limit=3,residual=true)"
+                    "PrimaryKeyPrefixRangeScan(table={table},prefix_columns=1,\
+                     range_column=2,lower=inclusive,upper=unbounded,limit=3)"
                 ))]],
             }
         );
@@ -18794,6 +19094,39 @@ mod tests {
         assert!(
             matches!(&result, Err(SqlError::Runtime(_))),
             "unexpected prefix corruption result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_primary_key_prefix_range_rejects_a_malformed_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_primary_key_prefix_ledger(&mut database)?;
+        let plan = database.prepare_sql_latest(
+            "SELECT sequence FROM ledger
+             WHERE tenant = ? AND sequence >= ? AND sequence < ?
+             ORDER BY tenant, sequence LIMIT 1",
+        )?;
+        let mut primary_key =
+            SqlValue::Text("a".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        primary_key.extend_from_slice(
+            &SqlValue::Signed(0)
+                .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?,
+        );
+        forge_primary_key_prefix_row(&mut database, table, &primary_key)?;
+        let result = database.execute_prepared_latest(
+            &plan,
+            &[
+                SqlValue::Text("a".to_owned()),
+                SqlValue::Signed(0),
+                SqlValue::Signed(1),
+            ],
+        );
+        assert!(
+            matches!(&result, Err(SqlError::Runtime(_))),
+            "unexpected prefix-range corruption result: {result:?}"
         );
         Ok(())
     }

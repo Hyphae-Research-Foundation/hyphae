@@ -3238,15 +3238,14 @@ fn bind_select(
             },
             range_terms,
         )
-    } else if let Some((range, range_terms)) =
-        bind_primary_key_prefix_range_shape(&comparisons, &expected_primary_key)?
-    {
-        let limit = limit.ok_or(SqlError::InvalidSyntax)?;
-        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
-        (
-            SelectAccess::PrimaryKeyPrefixRangeScan { range, limit },
-            range_terms,
-        )
+    } else if let Some(access) = bind_primary_key_prefix_range_access(
+        definition,
+        &comparisons,
+        &expected_primary_key,
+        order_by,
+        limit,
+    )? {
+        access
     } else if let Some(prefix) = find_primary_key_prefix(&comparisons, &expected_primary_key) {
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
         validate_primary_key_order(definition, order_by, &expected_primary_key)?;
@@ -3278,20 +3277,22 @@ fn bind_select(
             0,
         )
     };
-    let residual = total_terms > used_terms;
-    let output_columns = projection
-        .iter()
-        .map(|index| definition.columns[*index].name.display().to_owned())
-        .collect();
     Ok(BoundSelect {
         table,
+        output_columns: projection_output_columns(definition, &projection),
         projection,
         filter,
         parameter_count,
-        residual,
-        output_columns,
+        residual: total_terms > used_terms,
         access,
     })
+}
+
+fn projection_output_columns(definition: &RelationDefinition, projection: &[usize]) -> Vec<String> {
+    projection
+        .iter()
+        .map(|index| definition.columns[*index].name.display().to_owned())
+        .collect()
 }
 
 fn bind_projection(
@@ -3350,10 +3351,8 @@ fn bind_indexed_inner_join(
             limit,
             legacy_binary: false,
         } => JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit },
-        SelectAccess::PrimaryKeyPrefixScan { limit, .. } => {
-            JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit }
-        }
-        SelectAccess::PrimaryKeyPrefixRangeScan { limit, .. } => {
+        SelectAccess::PrimaryKeyPrefixScan { limit, .. }
+        | SelectAccess::PrimaryKeyPrefixRangeScan { limit, .. } => {
             JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit }
         }
         SelectAccess::PrimaryKeyRangeScan {
@@ -3832,6 +3831,25 @@ fn bind_primary_key_prefix_range_shape(
             upper,
         },
         used_terms,
+    )))
+}
+
+fn bind_primary_key_prefix_range_access(
+    definition: &RelationDefinition,
+    comparisons: &[&BoundFilterExpression],
+    primary_key: &[usize],
+    order_by: &[String],
+    limit: Option<usize>,
+) -> Result<Option<(SelectAccess, usize)>, SqlError> {
+    let Some((range, range_terms)) = bind_primary_key_prefix_range_shape(comparisons, primary_key)?
+    else {
+        return Ok(None);
+    };
+    let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+    validate_primary_key_order(definition, order_by, primary_key)?;
+    Ok(Some((
+        SelectAccess::PrimaryKeyPrefixRangeScan { range, limit },
+        range_terms,
     )))
 }
 
