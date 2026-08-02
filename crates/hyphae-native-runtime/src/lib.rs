@@ -18471,6 +18471,59 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn composite_primary_key_left_prefix_has_an_explicit_bounded_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE ledger (
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (tenant, sequence)
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing ledger table identity".into());
+        };
+        for tenant in ["a", "aa", "b"] {
+            for sequence in 0_i64..128 {
+                seed.execute_sql(
+                    "INSERT INTO ledger (tenant, sequence, payload) VALUES (?, ?, ?)",
+                    &[
+                        SqlValue::Text(tenant.to_owned()),
+                        SqlValue::Signed(sequence),
+                        SqlValue::Text(format!("{tenant}-{sequence:03}")),
+                    ],
+                )?;
+            }
+        }
+        assert_eq!(
+            seed.execute_sql(
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE sequence >= ? AND tenant = ?
+                 ORDER BY tenant, sequence
+                 LIMIT 3",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyPrefixScan(table={table},columns=1,limit=3,residual=true)"
+                ))]],
+            }
+        );
+        seed.rollback();
+        Ok(())
+    }
+
     const RESIDUAL_RANGE_QUERY: &str = "SELECT id, note
         FROM events
         WHERE id >= ?
