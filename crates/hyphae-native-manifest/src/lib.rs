@@ -458,6 +458,7 @@ pub struct StagedManifest {
     manifest: RootManifest,
     temporary_path: PathBuf,
     final_path: PathBuf,
+    bytes: u64,
 }
 
 impl StagedManifest {
@@ -478,6 +479,8 @@ pub struct ManifestRecovery {
     pub retired_prefix_files: usize,
     /// Physical bytes held by canonical files below the retained base.
     pub retired_prefix_bytes: u64,
+    /// Physical bytes held by the verified retained manifest chain.
+    pub retained_manifest_bytes: u64,
     /// Recovered and removed create-new temporary files.
     pub ignored_temporary_files: usize,
     /// Whether strict parent-directory synchronization is supported here.
@@ -493,6 +496,10 @@ pub struct ManifestPruneReceipt {
     pub removed_files: usize,
     /// Physical bytes removed with the retired manifest files.
     pub removed_bytes: u64,
+    /// Immutable manifest files retained from the selected base.
+    pub retained_files: usize,
+    /// Physical bytes retained from the selected base.
+    pub retained_bytes: u64,
     /// Whether strict roots-directory synchronization is supported here.
     pub parent_sync_supported: bool,
 }
@@ -509,6 +516,7 @@ pub struct RootManifestStore {
     manifests: Vec<RootManifest>,
     retired_prefix: Vec<RetiredManifestFile>,
     retired_prefix_bytes: u64,
+    retained_manifest_bytes: u64,
     ignored_temporary_files: usize,
 }
 
@@ -527,6 +535,7 @@ impl RootManifestStore {
             manifests: Vec::new(),
             retired_prefix: Vec::new(),
             retired_prefix_bytes: 0,
+            retained_manifest_bytes: 0,
             ignored_temporary_files: 0,
         })
     }
@@ -600,6 +609,7 @@ impl RootManifestStore {
         let mut previous_digest = [0_u8; 32];
         let mut retired_prefix = Vec::new();
         let mut retired_prefix_bytes = 0_u64;
+        let mut retained_manifest_bytes = 0_u64;
         for (generation, path, bytes) in manifest_paths {
             if generation < base_generation {
                 retired_prefix_bytes = retired_prefix_bytes
@@ -624,6 +634,9 @@ impl RootManifestStore {
                 return Err(ManifestError::InvalidChain);
             }
             previous_digest = manifest.digest;
+            retained_manifest_bytes = retained_manifest_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::InvalidLength)?;
             manifests.push(manifest);
             expected_generation = expected_generation
                 .checked_add(1)
@@ -647,6 +660,7 @@ impl RootManifestStore {
             manifests,
             retired_prefix,
             retired_prefix_bytes,
+            retained_manifest_bytes,
             ignored_temporary_files,
         })
     }
@@ -658,6 +672,7 @@ impl RootManifestStore {
             manifest_base_generation: self.manifests.first().map(RootManifest::generation),
             retired_prefix_files: self.retired_prefix.len(),
             retired_prefix_bytes: self.retired_prefix_bytes,
+            retained_manifest_bytes: self.retained_manifest_bytes,
             ignored_temporary_files: self.ignored_temporary_files,
             parent_sync_supported: parent_sync_supported(),
         }
@@ -686,11 +701,13 @@ impl RootManifestStore {
         if temporary_path.exists() || final_path.exists() {
             return Err(ManifestError::PublicationTargetExists);
         }
+        let encoded = manifest.encode()?;
+        let bytes = u64::try_from(encoded.len()).map_err(|_| ManifestError::InvalidLength)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary_path)?;
-        file.write_all(&manifest.encode()?)?;
+        file.write_all(&encoded)?;
         if synchronize {
             file.sync_all()?;
         }
@@ -699,6 +716,7 @@ impl RootManifestStore {
             manifest,
             temporary_path,
             final_path,
+            bytes,
         })
     }
 
@@ -717,11 +735,16 @@ impl RootManifestStore {
         if staged.final_path.exists() {
             return Err(ManifestError::PublicationTargetExists);
         }
+        let retained_manifest_bytes = self
+            .retained_manifest_bytes
+            .checked_add(staged.bytes)
+            .ok_or(ManifestError::InvalidLength)?;
         fs::rename(&staged.temporary_path, &staged.final_path)?;
         if synchronize {
             sync_directory(&self.directory)?;
         }
         self.manifests.push(staged.manifest.clone());
+        self.retained_manifest_bytes = retained_manifest_bytes;
         Ok(staged.manifest)
     }
 
@@ -765,6 +788,7 @@ impl RootManifestStore {
         }
         let mut candidates = Vec::with_capacity(self.retired_prefix.len() + base_index);
         let mut removed_bytes = self.retired_prefix_bytes;
+        let mut removed_retained_bytes = 0_u64;
         for retired in &self.retired_prefix {
             candidates.push(retired.path.clone());
         }
@@ -773,6 +797,9 @@ impl RootManifestStore {
                 .directory
                 .join(format!("{}.hyroot", generation_stem(manifest.generation)));
             let bytes = fs::metadata(&path)?.len();
+            removed_retained_bytes = removed_retained_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::InvalidLength)?;
             removed_bytes = removed_bytes
                 .checked_add(bytes)
                 .ok_or(ManifestError::InvalidLength)?;
@@ -788,10 +815,16 @@ impl RootManifestStore {
         self.manifests.drain(..base_index);
         self.retired_prefix.clear();
         self.retired_prefix_bytes = 0;
+        self.retained_manifest_bytes = self
+            .retained_manifest_bytes
+            .checked_sub(removed_retained_bytes)
+            .ok_or(ManifestError::InvalidLength)?;
         Ok(ManifestPruneReceipt {
             base_generation,
             removed_files,
             removed_bytes,
+            retained_files: self.manifests.len(),
+            retained_bytes: self.retained_manifest_bytes,
             parent_sync_supported: parent_sync_supported(),
         })
     }
