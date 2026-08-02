@@ -1,0 +1,132 @@
+{
+  "schema": "hyphae-native-indexed-inner-join-smoke-v5",
+  "status": "observation-not-gate",
+  "source_commit": "677d7d9c570910da2f51b8d0f695eccecf881645",
+  "environment": "WSL2 Ubuntu 24.04; Linux 6.18.33.1; Intel Core Ultra 9 285H; rustc 1.96.0; single-thread warm-state",
+  "profile": "release",
+  "durability": "strict",
+  "warm_state": true,
+  "concurrency": 1,
+  "rows_per_relation": 2048,
+  "observations_per_route": 100000,
+  "warmup_per_route": 10000,
+  "commit_csn": 1,
+  "dataset_digest_blake3": "4fe12bdf14f95fc7a29203316d7ab590c280c9976644050bde8b538fc1aaf1a1",
+  "data_directory_bytes": 736313344,
+  "strict_commit_duration_millis": 1485.207,
+  "reopen_duration_millis": 73.997,
+  "snapshot_materialization_duration_millis": 63.266,
+  "provisional_targets_micros": {
+    "exact_p50": 75.000,
+    "exact_p99": 400.000,
+    "bounded_limit_10_p50": 500.000,
+    "bounded_limit_10_p99": 2000.000
+  },
+  "exact_query": "SELECT users.id, users.payload, profiles.city\n                     FROM users\n                     INNER JOIN profiles ON users.profile_id = profiles.id\n                     WHERE email = ?",
+  "bounded_query": "SELECT users.id, users.payload, profiles.city\n                             FROM users\n                             INNER JOIN profiles ON users.profile_id = profiles.id\n                             WHERE id >= ?\n                             ORDER BY id\n                             LIMIT 10",
+  "secondary_query": "SELECT users.id, users.payload, profiles.city\n                               FROM users\n                               INNER JOIN profiles ON users.profile_id = profiles.id\n                               WHERE cohort = ?\n                               ORDER BY id\n                               LIMIT 10",
+  "right_secondary_query": "SELECT users.id, users.payload, profiles.city\n                                     FROM users\n                                     INNER JOIN profiles ON users.email = profiles.code\n                                     WHERE email = ?",
+  "composite_right_secondary_query": "SELECT users.id, users.payload, profiles.city\n     FROM users\n     INNER JOIN profiles\n       ON users.email = profiles.code\n      AND users.region = profiles.region\n     WHERE email = ?",
+  "routes": {
+    "physical_latest_exact": {
+      "p50_us": 40.489,
+      "p95_us": 60.330,
+      "p99_us": 118.475,
+      "p99_9_us": 227.205,
+      "maximum_us": 1349.341,
+      "throughput_ops_s": 22492.154,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_exact": {
+      "p50_us": 0.793,
+      "p95_us": 1.003,
+      "p99_us": 1.422,
+      "p99_9_us": 11.967,
+      "maximum_us": 188.070,
+      "throughput_ops_s": 1133662.736,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "physical_latest_bounded_limit_10": {
+      "p50_us": 58.598,
+      "p95_us": 82.224,
+      "p99_us": 166.690,
+      "p99_9_us": 324.122,
+      "maximum_us": 3942.544,
+      "throughput_ops_s": 15775.743,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_bounded_limit_10": {
+      "p50_us": 4.397,
+      "p95_us": 5.002,
+      "p99_us": 6.844,
+      "p99_9_us": 60.272,
+      "maximum_us": 267.982,
+      "throughput_ops_s": 212726.856,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "physical_latest_secondary_limit_10": {
+      "p50_us": 57.725,
+      "p95_us": 85.275,
+      "p99_us": 168.518,
+      "p99_9_us": 301.518,
+      "maximum_us": 1330.526,
+      "throughput_ops_s": 16256.636,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_secondary_limit_10": {
+      "p50_us": 5.207,
+      "p95_us": 6.184,
+      "p99_us": 9.244,
+      "p99_9_us": 69.120,
+      "maximum_us": 1080.586,
+      "throughput_ops_s": 178679.877,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "physical_latest_unique_secondary_right": {
+      "p50_us": 48.491,
+      "p95_us": 71.986,
+      "p99_us": 135.423,
+      "p99_9_us": 281.320,
+      "maximum_us": 4944.667,
+      "throughput_ops_s": 18869.948,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_unique_secondary_right": {
+      "p50_us": 0.819,
+      "p95_us": 1.146,
+      "p99_us": 1.670,
+      "p99_9_us": 17.344,
+      "maximum_us": 180.768,
+      "throughput_ops_s": 1074359.251,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "physical_latest_composite_unique_secondary_right": {
+      "p50_us": 46.083,
+      "p95_us": 70.474,
+      "p99_us": 134.663,
+      "p99_9_us": 258.717,
+      "maximum_us": 1166.611,
+      "throughput_ops_s": 19557.325,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_composite_unique_secondary_right": {
+      "p50_us": 0.867,
+      "p95_us": 1.133,
+      "p99_us": 1.698,
+      "p99_9_us": 14.443,
+      "maximum_us": 374.570,
+      "throughput_ops_s": 1029114.503,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    }
+  }
+}

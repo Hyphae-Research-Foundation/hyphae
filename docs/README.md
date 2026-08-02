@@ -118,6 +118,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native bounded inner-join evidence — 2026-08-01](gates/evidence/native-bounded-inner-join-2026-08-01.md)
 - [Native secondary-index inner-join evidence — 2026-08-01](gates/evidence/native-secondary-inner-join-2026-08-01.md)
 - [Native right secondary-index inner-join evidence — 2026-08-01](gates/evidence/native-right-secondary-inner-join-2026-08-01.md)
+- [Native composite inner-join evidence — 2026-08-01](gates/evidence/native-composite-inner-join-2026-08-01.md)
 - [0.2 local evidence catalog](gates/evidence/README.md)
 - [0.2 Gate 0 repository audit and baseline](gates/0.2-gate-0.md)
 - Phase evidence: [2](gates/phase-2.md), [3](gates/phase-3.md),

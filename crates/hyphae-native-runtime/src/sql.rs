@@ -158,7 +158,7 @@ enum PreparedPlan {
         right_relation: Box<RelationDefinition>,
         left_access: JoinLeftAccess,
         left_filter: Option<BoundFilterExpression>,
-        left_join_column: usize,
+        left_join_columns: Vec<usize>,
         right_access: JoinRightAccess,
         projection: Vec<JoinProjection>,
         parameter_count: usize,
@@ -191,12 +191,11 @@ enum JoinLeftAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum JoinRightAccess {
     PrimaryKey {
-        column: usize,
+        columns: Vec<usize>,
     },
     UniqueSecondaryIndex {
         index: ObjectId,
-        definition: Box<SecondaryIndexDefinition>,
-        column: usize,
+        columns: Vec<usize>,
     },
 }
 
@@ -266,12 +265,17 @@ struct ParsedInnerJoin {
     left_name: String,
     right_name: String,
     projection: Vec<String>,
-    left_join_column: String,
-    right_join_column: String,
+    equalities: Vec<ParsedJoinEquality>,
     filter: Option<FilterExpression>,
     parameter_count: usize,
     order_by: Vec<String>,
     limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedJoinEquality {
+    left_column: String,
+    right_column: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -938,7 +942,7 @@ fn execute_indexed_join_snapshot(
         right_relation,
         left_access,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         parameter_count,
@@ -971,13 +975,21 @@ fn execute_indexed_join_snapshot(
             left_relation,
             right_relation,
             left_filter: left_filter.as_ref(),
-            left_join_column: *left_join_column,
             projection,
             output_columns,
             parameters,
         },
         left,
-        |value| snapshot_join_right(snapshot, *right_table, right_relation, right_access, value),
+        |values| {
+            snapshot_join_right(
+                snapshot,
+                *right_table,
+                right_relation,
+                right_access,
+                values,
+                left_join_columns,
+            )
+        },
     )
 }
 
@@ -994,7 +1006,7 @@ fn execute_indexed_join_latest(
         right_relation,
         left_access,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         parameter_count,
@@ -1041,7 +1053,6 @@ fn execute_indexed_join_latest(
             left_relation,
             right_relation,
             left_filter: left_filter.as_ref(),
-            left_join_column: *left_join_column,
             projection,
             output_columns,
             parameters,
@@ -1055,6 +1066,7 @@ fn execute_indexed_join_latest(
                 right_relation,
                 right_access,
                 value,
+                left_join_columns,
             )
         },
     )
@@ -1072,7 +1084,7 @@ fn execute_indexed_join_transaction(
         right_relation,
         left_access,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         parameter_count,
@@ -1116,7 +1128,6 @@ fn execute_indexed_join_transaction(
             left_relation,
             right_relation,
             left_filter: left_filter.as_ref(),
-            left_join_column: *left_join_column,
             projection,
             output_columns,
             parameters,
@@ -1129,6 +1140,7 @@ fn execute_indexed_join_transaction(
                 right_relation,
                 right_access,
                 value,
+                left_join_columns,
             )
         },
     )
@@ -1147,7 +1159,7 @@ fn execute_bounded_join_snapshot(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1171,14 +1183,22 @@ fn execute_bounded_join_snapshot(
             left_relation,
             right_relation,
             left_filter: left_filter.as_ref(),
-            left_join_column: *left_join_column,
             projection,
             output_columns,
             parameters,
         },
         stored_rows.range(bounds),
         limit,
-        |value| snapshot_join_right(snapshot, *right_table, right_relation, right_access, value),
+        |values| {
+            snapshot_join_right(
+                snapshot,
+                *right_table,
+                right_relation,
+                right_access,
+                values,
+                left_join_columns,
+            )
+        },
     )
 }
 
@@ -1196,7 +1216,7 @@ fn execute_bounded_join_latest(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1213,7 +1233,6 @@ fn execute_bounded_join_latest(
         left_relation,
         right_relation,
         left_filter: left_filter.as_ref(),
-        left_join_column: *left_join_column,
         projection,
         output_columns,
         parameters,
@@ -1234,6 +1253,7 @@ fn execute_bounded_join_latest(
                         right_relation,
                         right_access,
                         value,
+                        left_join_columns,
                     )
                 })? {
                     rows.push(row);
@@ -1267,7 +1287,7 @@ fn execute_bounded_join_transaction(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1291,7 +1311,6 @@ fn execute_bounded_join_transaction(
             left_relation,
             right_relation,
             left_filter: left_filter.as_ref(),
-            left_join_column: *left_join_column,
             projection,
             output_columns,
             parameters,
@@ -1305,6 +1324,7 @@ fn execute_bounded_join_transaction(
                 right_relation,
                 right_access,
                 value,
+                left_join_columns,
             )
         },
     )
@@ -1331,7 +1351,7 @@ fn execute_bounded_secondary_join_snapshot(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1360,7 +1380,6 @@ fn execute_bounded_secondary_join_snapshot(
         left_relation,
         right_relation,
         left_filter: left_filter.as_ref(),
-        left_join_column: *left_join_column,
         projection,
         output_columns,
         parameters,
@@ -1371,7 +1390,14 @@ fn execute_bounded_secondary_join_snapshot(
             .select(*left_table, primary_key)
             .ok_or(SqlError::InvalidStoredRow)?;
         if let Some(row) = materialize_join_row(&context, primary_key, stored, |value| {
-            snapshot_join_right(snapshot, *right_table, right_relation, right_access, value)
+            snapshot_join_right(
+                snapshot,
+                *right_table,
+                right_relation,
+                right_access,
+                value,
+                left_join_columns,
+            )
         })? {
             rows.push(row);
             if rows.len() == *limit {
@@ -1407,7 +1433,7 @@ fn execute_bounded_secondary_join_latest(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1428,7 +1454,6 @@ fn execute_bounded_secondary_join_latest(
         left_relation,
         right_relation,
         left_filter: left_filter.as_ref(),
-        left_join_column: *left_join_column,
         projection,
         output_columns,
         parameters,
@@ -1451,6 +1476,7 @@ fn execute_bounded_secondary_join_latest(
                         right_relation,
                         right_access,
                         value,
+                        left_join_columns,
                     )
                 })? {
                     rows.push(row);
@@ -1492,7 +1518,7 @@ fn execute_bounded_secondary_join_transaction(
         left_relation,
         right_relation,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         output_columns,
@@ -1521,7 +1547,6 @@ fn execute_bounded_secondary_join_transaction(
         left_relation,
         right_relation,
         left_filter: left_filter.as_ref(),
-        left_join_column: *left_join_column,
         projection,
         output_columns,
         parameters,
@@ -1538,6 +1563,7 @@ fn execute_bounded_secondary_join_transaction(
                 right_relation,
                 right_access,
                 value,
+                left_join_columns,
             )
         })? {
             rows.push(row);
@@ -1567,7 +1593,7 @@ fn collect_bounded_join<'row>(
     context: &JoinMaterialization<'_>,
     stored_rows: impl IntoIterator<Item = (&'row Vec<u8>, &'row Vec<u8>)>,
     limit: usize,
-    mut right_lookup: impl FnMut(&SqlValue) -> Result<JoinInputRow, SqlError>,
+    mut right_lookup: impl FnMut(&[SqlValue]) -> Result<JoinInputRow, SqlError>,
 ) -> Result<SqlResult, SqlError> {
     let mut rows = Vec::with_capacity(limit.min(256));
     for (primary_key, stored) in stored_rows {
@@ -1729,30 +1755,23 @@ fn snapshot_join_right(
     table: ObjectId,
     relation: &RelationDefinition,
     access: &JoinRightAccess,
-    value: &SqlValue,
+    left_values: &[SqlValue],
+    left_columns: &[usize],
 ) -> Result<JoinInputRow, SqlError> {
     match access {
-        JoinRightAccess::PrimaryKey { column } => {
-            let primary_key = bind_primary_key(
-                relation,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?;
+        JoinRightAccess::PrimaryKey { columns } => {
+            let Some(primary_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
+            else {
+                return Ok(None);
+            };
             Ok(snapshot
                 .select(table, &primary_key)
                 .map(|stored| (primary_key, stored.to_vec())))
         }
-        JoinRightAccess::UniqueSecondaryIndex {
-            index,
-            definition,
-            column,
-        } => {
-            let Some(index_key) = bind_secondary_index_key(
-                relation,
-                definition,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?
+        JoinRightAccess::UniqueSecondaryIndex { index, columns } => {
+            let Some(index_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
             else {
                 return Ok(None);
             };
@@ -1781,30 +1800,23 @@ fn latest_join_right(
     table: ObjectId,
     relation: &RelationDefinition,
     access: &JoinRightAccess,
-    value: &SqlValue,
+    left_values: &[SqlValue],
+    left_columns: &[usize],
 ) -> Result<JoinInputRow, SqlError> {
     match access {
-        JoinRightAccess::PrimaryKey { column } => {
-            let primary_key = bind_primary_key(
-                relation,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?;
+        JoinRightAccess::PrimaryKey { columns } => {
+            let Some(primary_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
+            else {
+                return Ok(None);
+            };
             Ok(database
                 .select_relational_at(snapshot, table, &primary_key)?
                 .map(|stored| (primary_key, stored)))
         }
-        JoinRightAccess::UniqueSecondaryIndex {
-            index,
-            definition,
-            column,
-        } => {
-            let Some(index_key) = bind_secondary_index_key(
-                relation,
-                definition,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?
+        JoinRightAccess::UniqueSecondaryIndex { index, columns } => {
+            let Some(index_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
             else {
                 return Ok(None);
             };
@@ -1825,30 +1837,23 @@ fn transaction_join_right(
     table: ObjectId,
     relation: &RelationDefinition,
     access: &JoinRightAccess,
-    value: &SqlValue,
+    left_values: &[SqlValue],
+    left_columns: &[usize],
 ) -> Result<JoinInputRow, SqlError> {
     match access {
-        JoinRightAccess::PrimaryKey { column } => {
-            let primary_key = bind_primary_key(
-                relation,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?;
+        JoinRightAccess::PrimaryKey { columns } => {
+            let Some(primary_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
+            else {
+                return Ok(None);
+            };
             Ok(transaction
                 .select(table, &primary_key)
                 .map(|stored| (primary_key, stored.to_vec())))
         }
-        JoinRightAccess::UniqueSecondaryIndex {
-            index,
-            definition,
-            column,
-        } => {
-            let Some(index_key) = bind_secondary_index_key(
-                relation,
-                definition,
-                std::slice::from_ref(column),
-                std::slice::from_ref(value),
-            )?
+        JoinRightAccess::UniqueSecondaryIndex { index, columns } => {
+            let Some(index_key) =
+                bind_join_access_key(relation, columns, left_values, left_columns)?
             else {
                 return Ok(None);
             };
@@ -1871,6 +1876,37 @@ fn transaction_join_right(
     }
 }
 
+fn bind_join_access_key(
+    right_relation: &RelationDefinition,
+    right_columns: &[usize],
+    left_values: &[SqlValue],
+    left_columns: &[usize],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    if right_columns.is_empty() || right_columns.len() != left_columns.len() {
+        return Err(SqlError::NoAccessPath);
+    }
+    let mut encoded = Vec::new();
+    for (right_column, left_column) in right_columns.iter().zip(left_columns) {
+        let value = left_values
+            .get(*left_column)
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if matches!(value, SqlValue::Null) {
+            return Ok(None);
+        }
+        let logical_type = &right_relation
+            .columns
+            .get(*right_column)
+            .ok_or(SqlError::InvalidCatalogObject)?
+            .logical_type;
+        encoded.extend_from_slice(
+            &value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::TypeMismatch)?,
+        );
+    }
+    Ok(Some(encoded))
+}
+
 fn at_most_one_unique_key<'item, T: 'item>(
     mut items: impl ExactSizeIterator<Item = &'item T>,
 ) -> Result<Option<&'item T>, SqlError> {
@@ -1884,7 +1920,6 @@ struct JoinMaterialization<'plan> {
     left_relation: &'plan RelationDefinition,
     right_relation: &'plan RelationDefinition,
     left_filter: Option<&'plan BoundFilterExpression>,
-    left_join_column: usize,
     projection: &'plan [JoinProjection],
     output_columns: &'plan [String],
     parameters: &'plan [SqlValue],
@@ -1893,7 +1928,7 @@ struct JoinMaterialization<'plan> {
 fn materialize_indexed_join(
     context: &JoinMaterialization<'_>,
     left: JoinInputRow,
-    right_lookup: impl FnMut(&SqlValue) -> Result<JoinInputRow, SqlError>,
+    right_lookup: impl FnMut(&[SqlValue]) -> Result<JoinInputRow, SqlError>,
 ) -> Result<SqlResult, SqlError> {
     let Some((left_primary_key, left_stored)) = left else {
         return Ok(empty_join_result(context.output_columns));
@@ -1912,7 +1947,7 @@ fn materialize_join_row(
     context: &JoinMaterialization<'_>,
     left_primary_key: &[u8],
     left_stored: &[u8],
-    mut right_lookup: impl FnMut(&SqlValue) -> Result<JoinInputRow, SqlError>,
+    mut right_lookup: impl FnMut(&[SqlValue]) -> Result<JoinInputRow, SqlError>,
 ) -> Result<Option<Vec<SqlValue>>, SqlError> {
     let left_values =
         decode_complete_row(context.left_relation, false, left_primary_key, left_stored)?;
@@ -1926,13 +1961,7 @@ fn materialize_join_row(
     {
         return Ok(None);
     }
-    let join_value = left_values
-        .get(context.left_join_column)
-        .ok_or(SqlError::InvalidStoredRow)?;
-    if matches!(join_value, SqlValue::Null) {
-        return Ok(None);
-    }
-    let Some((right_primary_key, right_stored)) = right_lookup(join_value)? else {
+    let Some((right_primary_key, right_stored)) = right_lookup(&left_values)? else {
         return Ok(None);
     };
     let right_values = decode_complete_row(
@@ -2933,19 +2962,19 @@ fn bind_indexed_inner_join(
     if is_legacy_binary_relation(right_relation) {
         return Err(SqlError::InvalidSyntax);
     }
-    let left_join_column =
-        qualified_column(&parsed.left_join_column, &parsed.left_name, &left_relation)?;
-    let right_join_column = qualified_column(
-        &parsed.right_join_column,
-        &parsed.right_name,
-        right_relation,
-    )?;
-    let right_access =
-        bind_join_right_access(catalog, right_table, right_relation, right_join_column)?;
-    if left_relation.columns[left_join_column].logical_type
-        != right_relation.columns[right_join_column].logical_type
-    {
-        return Err(SqlError::TypeMismatch);
+    let join_equalities = bind_join_equalities(parsed, &left_relation, right_relation)?;
+    let (right_access, left_join_columns) =
+        bind_join_right_access(catalog, right_table, right_relation, &join_equalities)?;
+    let right_join_columns = match &right_access {
+        JoinRightAccess::PrimaryKey { columns }
+        | JoinRightAccess::UniqueSecondaryIndex { columns, .. } => columns,
+    };
+    for (left_column, right_column) in left_join_columns.iter().zip(right_join_columns) {
+        if left_relation.columns[*left_column].logical_type
+            != right_relation.columns[*right_column].logical_type
+        {
+            return Err(SqlError::TypeMismatch);
+        }
     }
     let mut projection = Vec::with_capacity(parsed.projection.len());
     let mut output_columns = Vec::with_capacity(parsed.projection.len());
@@ -2967,7 +2996,7 @@ fn bind_indexed_inner_join(
         right_relation: Box::new(right_relation.clone()),
         left_access,
         left_filter,
-        left_join_column,
+        left_join_columns,
         right_access,
         projection,
         parameter_count: parsed.parameter_count,
@@ -2975,31 +3004,78 @@ fn bind_indexed_inner_join(
     })
 }
 
+fn bind_join_equalities(
+    parsed: &ParsedInnerJoin,
+    left_relation: &RelationDefinition,
+    right_relation: &RelationDefinition,
+) -> Result<Vec<(usize, usize)>, SqlError> {
+    let mut bound = Vec::with_capacity(parsed.equalities.len());
+    for equality in &parsed.equalities {
+        let left_column =
+            qualified_column(&equality.left_column, &parsed.left_name, left_relation)?;
+        let right_column =
+            qualified_column(&equality.right_column, &parsed.right_name, right_relation)?;
+        if bound.iter().any(|(bound_left, bound_right)| {
+            *bound_left == left_column || *bound_right == right_column
+        }) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        bound.push((left_column, right_column));
+    }
+    Ok(bound)
+}
+
 fn bind_join_right_access(
     catalog: &crate::model::CatalogState,
     table: ObjectId,
     relation: &RelationDefinition,
-    column: usize,
-) -> Result<JoinRightAccess, SqlError> {
-    if primary_key_indices(relation)?.as_slice() == [column] {
-        return Ok(JoinRightAccess::PrimaryKey { column });
+    equalities: &[(usize, usize)],
+) -> Result<(JoinRightAccess, Vec<usize>), SqlError> {
+    let primary_key = primary_key_indices(relation)?;
+    if let Some(left_columns) = align_join_columns(&primary_key, equalities) {
+        return Ok((
+            JoinRightAccess::PrimaryKey {
+                columns: primary_key,
+            },
+            left_columns,
+        ));
     }
     for (index, object) in &catalog.objects {
         let CatalogObject::SecondaryIndex(definition) = object else {
             continue;
         };
-        if definition.relation == table
-            && definition.unique
-            && secondary_index_column_indices(relation, definition)?.as_slice() == [column]
-        {
-            return Ok(JoinRightAccess::UniqueSecondaryIndex {
-                index: *index,
-                definition: Box::new(definition.clone()),
-                column,
-            });
+        if definition.relation != table || !definition.unique {
+            continue;
+        }
+        let columns = secondary_index_column_indices(relation, definition)?;
+        if let Some(left_columns) = align_join_columns(&columns, equalities) {
+            return Ok((
+                JoinRightAccess::UniqueSecondaryIndex {
+                    index: *index,
+                    columns,
+                },
+                left_columns,
+            ));
         }
     }
     Err(SqlError::NoAccessPath)
+}
+
+fn align_join_columns(
+    right_key_columns: &[usize],
+    equalities: &[(usize, usize)],
+) -> Option<Vec<usize>> {
+    if right_key_columns.len() != equalities.len() {
+        return None;
+    }
+    right_key_columns
+        .iter()
+        .map(|right_key_column| {
+            equalities.iter().find_map(|(left_column, right_column)| {
+                (*right_column == *right_key_column).then_some(*left_column)
+            })
+        })
+        .collect()
 }
 
 fn qualified_column(
@@ -4291,50 +4367,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     if parser.consume_keyword("INNER") {
-        parser.expect_keyword("JOIN")?;
-        let right_name = parser.identifier()?;
-        parser.expect_keyword("ON")?;
-        let left_join_column = parser.identifier()?;
-        parser.expect_symbol('=')?;
-        let right_join_column = parser.identifier()?;
-        let mut parameter_count = 0_usize;
-        let filter = if parser.consume_keyword("WHERE") {
-            Some(parse_filter_expression(parser, &mut parameter_count)?)
-        } else {
-            None
-        };
-        let order_by = if parser.consume_keyword("ORDER") {
-            parser.expect_keyword("BY")?;
-            let mut columns = vec![parser.identifier()?];
-            while parser.consume_symbol(',') {
-                columns.push(parser.identifier()?);
-            }
-            columns
-        } else {
-            Vec::new()
-        };
-        let limit = if parser.consume_keyword("LIMIT") {
-            Some(parser.number_usize()?)
-        } else {
-            None
-        };
-        if filter.is_none() && limit.is_none() {
-            return Err(SqlError::InvalidSyntax);
-        }
-        let Projection::Columns(projection) = projection else {
-            return Err(SqlError::InvalidSyntax);
-        };
-        return Ok(Statement::SelectJoin(ParsedInnerJoin {
-            left_name: name,
-            right_name,
-            projection,
-            left_join_column,
-            right_join_column,
-            filter,
-            parameter_count,
-            order_by,
-            limit,
-        }));
+        return parse_inner_join(parser, name, projection);
     }
     let mut parameter_count = 0_usize;
     let filter = if parser.consume_keyword("WHERE") {
@@ -4375,6 +4408,66 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         order_by,
         limit,
     })
+}
+
+fn parse_inner_join(
+    parser: &mut Parser,
+    left_name: String,
+    projection: Projection,
+) -> Result<Statement, SqlError> {
+    parser.expect_keyword("JOIN")?;
+    let right_name = parser.identifier()?;
+    parser.expect_keyword("ON")?;
+    let mut equalities = Vec::new();
+    loop {
+        let left_column = parser.identifier()?;
+        parser.expect_symbol('=')?;
+        let right_column = parser.identifier()?;
+        equalities.push(ParsedJoinEquality {
+            left_column,
+            right_column,
+        });
+        if !parser.consume_keyword("AND") {
+            break;
+        }
+    }
+    let mut parameter_count = 0_usize;
+    let filter = if parser.consume_keyword("WHERE") {
+        Some(parse_filter_expression(parser, &mut parameter_count)?)
+    } else {
+        None
+    };
+    let order_by = if parser.consume_keyword("ORDER") {
+        parser.expect_keyword("BY")?;
+        let mut columns = vec![parser.identifier()?];
+        while parser.consume_symbol(',') {
+            columns.push(parser.identifier()?);
+        }
+        columns
+    } else {
+        Vec::new()
+    };
+    let limit = if parser.consume_keyword("LIMIT") {
+        Some(parser.number_usize()?)
+    } else {
+        None
+    };
+    if filter.is_none() && limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let Projection::Columns(projection) = projection else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    Ok(Statement::SelectJoin(ParsedInnerJoin {
+        left_name,
+        right_name,
+        projection,
+        equalities,
+        filter,
+        parameter_count,
+        order_by,
+        limit,
+    }))
 }
 
 fn parse_filter_expression(
@@ -4835,8 +4928,8 @@ mod tests {
     use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
 
     use super::{
-        ColumnOperand, ComparisonOperator, FilterExpression, Projection, ScalarOperand, SqlError,
-        Statement, TruthValue, parse, primary_key_range_is_empty,
+        ColumnOperand, ComparisonOperator, FilterExpression, ParsedJoinEquality, Projection,
+        ScalarOperand, SqlError, Statement, TruthValue, parse, primary_key_range_is_empty,
     };
 
     #[test]
@@ -5365,8 +5458,13 @@ mod tests {
         assert_eq!(join.left_name, "users");
         assert_eq!(join.right_name, "profiles");
         assert_eq!(join.projection, ["users.id", "profiles.city"]);
-        assert_eq!(join.left_join_column, "users.profile_id");
-        assert_eq!(join.right_join_column, "profiles.id");
+        assert_eq!(
+            join.equalities,
+            [ParsedJoinEquality {
+                left_column: "users.profile_id".to_owned(),
+                right_column: "profiles.id".to_owned(),
+            }]
+        );
         assert_eq!(
             join.filter,
             Some(FilterExpression::Comparison {
@@ -5395,6 +5493,29 @@ mod tests {
             )?,
             Statement::SelectJoin(_)
         ));
+        let Statement::SelectJoin(composite) = parse(
+            "SELECT users.id, profiles.city FROM users
+             INNER JOIN profiles
+               ON users.profile_code = profiles.code
+              AND users.region = profiles.region
+             WHERE email = ?",
+        )?
+        else {
+            return Err("expected composite indexed inner join".into());
+        };
+        assert_eq!(
+            composite.equalities,
+            [
+                ParsedJoinEquality {
+                    left_column: "users.profile_code".to_owned(),
+                    right_column: "profiles.code".to_owned(),
+                },
+                ParsedJoinEquality {
+                    left_column: "users.region".to_owned(),
+                    right_column: "profiles.region".to_owned(),
+                },
+            ]
+        );
         Ok(())
     }
 }
