@@ -154,6 +154,13 @@ manifest suffix. The latter two recover the checkpoint. In addition to the
 deterministic in-process tests, the direct-Linux process-crash harness now
 holds the writer lock until the parent sends `SIGKILL` at each of these four
 boundaries, then verifies the exact manifest/checkpoint authority counts and
-complete all-engine CSN after reopen. Sector-level power loss, filesystem
-reordering, and device-cache behavior still require a separate physical crash
-harness.
+complete all-engine CSN after reopen.
+
+The separate [block-layer power-loss replay
+gate](block-power-loss-replay-v1.md) records writes below fresh ext4
+filesystems with `dm-log-writes` and reconstructs only the stable order through
+each interruption mark. In that lane an appended but unsynchronized
+checkpoint WAL record is absent, leaving the published manifest as an
+unanchored suffix; the synchronized checkpoint becomes authority. Literal
+EBS/host power removal, device-firmware caches, and torn completed sectors
+remain outside the evidence.

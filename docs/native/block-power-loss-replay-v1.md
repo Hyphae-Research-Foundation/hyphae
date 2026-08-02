@@ -1,6 +1,7 @@
 # Native block-layer power-loss replay gate v1
 
-Status: normative test contract; implementation and Linux evidence pending
+Status: normative test contract; harness and direct-Linux/ext4 receipt
+implemented; literal physical-device cut remains open
 
 This gate distinguishes stable-media recovery from process death. `SIGKILL`
 leaves the Linux page cache alive and can therefore expose writes that never
@@ -135,3 +136,7 @@ The JSON receipt must bind:
 A passing receipt requires all seven commit and four checkpoint observations.
 Compilation, deterministic interruption tests, process-kill evidence, or a
 successful filesystem mount cannot substitute for this receipt.
+
+The first source-bound execution is recorded in the
+[Linux evidence narrative](../gates/evidence/native-block-power-loss-replay-linux-2026-08-02.md)
+and its adjacent JSON receipt.

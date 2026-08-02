@@ -518,6 +518,19 @@ complete all-engine CSN 1. Group commit, retention, maintenance, migration,
 resource-exhaustion, filesystem-reordering, and physical power-loss lanes
 remain open.
 
+The [native block-layer power-loss replay
+evidence](evidence/native-block-power-loss-replay-linux-2026-08-02.md)
+reconstructs the worst stable ext4 image recorded by Linux `dm-log-writes`
+through each of those seven commit and four checkpoint boundaries. Unlike
+the process-kill lane, an appended but unsynchronized user WAL transaction
+reopens the prior empty state, and an appended but unsynchronized checkpoint
+WAL record leaves the published manifest as an unanchored suffix. Authority
+begins only after WAL synchronization. All 11 replay images mount, recover the
+required all-engine state, pass read-only `e2fsck`, and clean their isolated
+loop/mapping resources. This closes the singleton/checkpoint block-ordering
+slice, not literal EBS power removal, group commit, retention, maintenance,
+migration, resource exhaustion, or the complete G1 matrix.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
