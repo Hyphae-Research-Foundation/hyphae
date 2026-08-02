@@ -635,6 +635,14 @@ pub struct RecoveryReport {
     pub retained_wal_bytes: u64,
     /// Committed suffix transactions semantically replayed during open.
     pub replayed_transactions: usize,
+    /// Time spent verifying complete retained physical WAL blocks.
+    pub wal_physical_verification_time: Duration,
+    /// Time spent decoding and validating retained WAL semantics.
+    pub wal_semantic_replay_time: Duration,
+    /// Time spent reconstructing and validating committed roots.
+    pub root_validation_time: Duration,
+    /// Complete native data-directory open and recovery time.
+    pub open_time: Duration,
     /// Latest recovered visible CSN.
     pub visible_csn: Option<Csn>,
     /// Page-file generation selected by the latest committed WAL record.
@@ -795,6 +803,14 @@ pub struct WalRetentionReceipt {
     pub anchor_digest: [u8; 32],
     /// Prior stable anchors removed after publication.
     pub prior_anchors_removed: usize,
+    /// Create-new anchor stage and `.pending` publication time.
+    pub anchor_publication_time: Duration,
+    /// WAL reset and explicit file synchronization time.
+    pub wal_reset_synchronization_time: Duration,
+    /// Stable-anchor promotion and prior-anchor cleanup time.
+    pub anchor_stabilization_time: Duration,
+    /// Complete retention operation time.
+    pub total_time: Duration,
     /// Whether strict data-directory synchronization is implemented here.
     pub parent_directory_sync_supported: bool,
 }
@@ -1279,6 +1295,10 @@ impl NativeDatabase {
                 retained_wal_blocks: 0,
                 retained_wal_bytes: 0,
                 replayed_transactions: 0,
+                wal_physical_verification_time: Duration::ZERO,
+                wal_semantic_replay_time: Duration::ZERO,
+                root_validation_time: Duration::ZERO,
+                open_time: Duration::ZERO,
                 visible_csn: None,
                 active_page_generation: PageGeneration::FIRST,
                 retention_floor_csn: None,
@@ -1303,6 +1323,7 @@ impl NativeDatabase {
     /// Returns an error for any complete corruption, malformed committed
     /// transaction, missing referenced page, or noncontiguous CSN.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
+        let open_started = Instant::now();
         let path = path.as_ref();
         let blobs = BlobStore::open(path)?;
         let blob_recovery = blobs.recovery()?;
@@ -1317,6 +1338,8 @@ impl NativeDatabase {
             recovered_wal,
             active_page_generation,
             retention_floor_csn,
+            wal_physical_verification_time,
+            wal_semantic_replay_time,
         } = open_wal_state(path)?;
         let commits = &recovered_wal.commits;
         let opened_pages = PageStore::open_repair_tail_generation(
@@ -1326,6 +1349,7 @@ impl NativeDatabase {
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
         let conflicts = replay_conflicts(commits)?;
+        let root_validation_started = Instant::now();
         let (committed_roots, latest_root) = recover_committed_roots(
             commits,
             &opened_wal.recovery,
@@ -1338,6 +1362,7 @@ impl NativeDatabase {
             },
             base_root,
         )?;
+        let root_validation_time = root_validation_started.elapsed();
         let checkpoint_validation = validate_checkpoints(
             &recovered_wal,
             &manifest_recovery.manifests,
@@ -1348,20 +1373,10 @@ impl NativeDatabase {
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
         let recovered_page_generation_files =
             cleanup_page_generation_files(path, active_page_generation)?;
-        let coordinator = if let Some(root) = latest_root {
-            CommitCoordinator::restore(root)?
-        } else {
-            CommitCoordinator::new(
-                CatalogVersion::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
-            )
-        };
+        let coordinator = restore_commit_coordinator(latest_root)?;
         let metadata =
             wal_recovery_metadata(path, retention_anchor, &opened_wal.recovery, &recovered_wal)?;
-        if let Some(anchor) = retention_anchor
-            && wal_retention.recovery().anchors.len() > 1
-        {
-            wal_retention.remove_before(anchor.fields().epoch, true)?;
-        }
+        cleanup_stale_wal_anchors(&mut wal_retention, retention_anchor)?;
         Ok(Self {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
@@ -1387,6 +1402,10 @@ impl NativeDatabase {
                 retained_wal_blocks: opened_wal.recovery.blocks.len(),
                 retained_wal_bytes: metadata.retained_wal_bytes,
                 replayed_transactions: commits.len(),
+                wal_physical_verification_time,
+                wal_semantic_replay_time,
+                root_validation_time,
+                open_time: open_started.elapsed(),
                 visible_csn: metadata.visible_csn,
                 active_page_generation,
                 retention_floor_csn: metadata.visible_csn.map(|_| retention_floor_csn),
@@ -3574,6 +3593,7 @@ impl NativeDatabase {
         &mut self,
         interruption: Option<WalRetentionBoundary>,
     ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        let retention_started = Instant::now();
         let (anchor, retired_wal_bytes) = match self.prepare_wal_retention()? {
             PreparedWalRetention::Existing(receipt) => return Ok(receipt),
             PreparedWalRetention::Publish {
@@ -3582,10 +3602,13 @@ impl NativeDatabase {
             } => (anchor, retired_wal_bytes),
         };
         let fields = anchor.fields();
+        let anchor_publication_started = Instant::now();
         let staged = self.wal_retention.stage(anchor, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorStaged)?;
         self.wal_retention.publish_candidate(staged, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorPending)?;
+        let anchor_publication_time = anchor_publication_started.elapsed();
+        let wal_reset_started = Instant::now();
         self.wal.reset_after(
             fields.retired_through_sequence,
             fields.retired_block_digest,
@@ -3594,10 +3617,13 @@ impl NativeDatabase {
         interrupt_wal_retention(interruption, WalRetentionBoundary::WalReset)?;
         self.wal.sync_data()?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::WalSynchronized)?;
+        let wal_reset_synchronization_time = wal_reset_started.elapsed();
+        let anchor_stabilization_started = Instant::now();
         self.wal_retention.stabilize_candidate(fields.epoch, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::AnchorStabilized)?;
         let prior_anchors_removed = self.wal_retention.remove_before(fields.epoch, true)?;
         interrupt_wal_retention(interruption, WalRetentionBoundary::PriorAnchorRemoved)?;
+        let anchor_stabilization_time = anchor_stabilization_started.elapsed();
         self.record_wal_retention(fields)?;
         Ok(WalRetentionReceipt {
             anchor_epoch: fields.epoch,
@@ -3607,6 +3633,10 @@ impl NativeDatabase {
             checkpoint_lsn: fields.retired_checkpoint_lsn,
             anchor_digest: anchor.digest(),
             prior_anchors_removed,
+            anchor_publication_time,
+            wal_reset_synchronization_time,
+            anchor_stabilization_time,
+            total_time: retention_started.elapsed(),
             parent_directory_sync_supported: self.wal_retention.recovery().parent_sync_supported,
         })
     }
@@ -3663,6 +3693,10 @@ impl NativeDatabase {
                 checkpoint_lsn,
                 anchor_digest: anchor.digest(),
                 prior_anchors_removed: 0,
+                anchor_publication_time: Duration::ZERO,
+                wal_reset_synchronization_time: Duration::ZERO,
+                anchor_stabilization_time: Duration::ZERO,
+                total_time: Duration::ZERO,
                 parent_directory_sync_supported: self
                     .wal_retention
                     .recovery()
@@ -10105,6 +10139,8 @@ struct WalOpenState {
     recovered_wal: RecoveredWal,
     active_page_generation: PageGeneration,
     retention_floor_csn: Csn,
+    wal_physical_verification_time: Duration,
+    wal_semantic_replay_time: Duration,
 }
 
 fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
@@ -10125,13 +10161,17 @@ fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
         .as_ref()
         .map(|anchor| validate_retention_anchor(anchor, &manifest_recovery.manifests))
         .transpose()?;
+    let physical_recovery_started = Instant::now();
     let mut opened_wal = open_retained_wal(path, retention_anchor)?;
+    let wal_physical_verification_time = physical_recovery_started.elapsed();
     let semantic_base = retention_anchor.map(|anchor| WalSemanticBase {
         visible_csn: anchor.fields().base_visible_csn,
         checkpoint_lsn: anchor.fields().retired_checkpoint_lsn,
         manifest_generation: anchor.fields().manifest_generation,
     });
+    let semantic_replay_started = Instant::now();
     let recovered_wal = recover_wal_and_close_dangling(&mut opened_wal, semantic_base)?;
+    let wal_semantic_replay_time = semantic_replay_started.elapsed();
     validate_commit_sequence_after(&recovered_wal.commits, base_root.as_ref())?;
     let active_page_generation = recovered_wal.commits.last().map_or_else(
         || {
@@ -10161,6 +10201,8 @@ fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
         recovered_wal,
         active_page_generation,
         retention_floor_csn,
+        wal_physical_verification_time,
+        wal_semantic_replay_time,
     })
 }
 
@@ -10263,6 +10305,30 @@ fn replay_conflicts(
         conflicts.publish_committed(recovered.manifest.commit_csn, keys);
     }
     Ok(conflicts)
+}
+
+fn restore_commit_coordinator(
+    latest_root: Option<RootSet>,
+) -> Result<CommitCoordinator, NativeRuntimeError> {
+    if let Some(root) = latest_root {
+        CommitCoordinator::restore(root).map_err(Into::into)
+    } else {
+        Ok(CommitCoordinator::new(
+            CatalogVersion::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
+        ))
+    }
+}
+
+fn cleanup_stale_wal_anchors(
+    store: &mut WalRetentionStore,
+    current: Option<WalRetentionAnchor>,
+) -> Result<(), NativeRuntimeError> {
+    if let Some(anchor) = current
+        && store.recovery().anchors.len() > 1
+    {
+        store.remove_before(anchor.fields().epoch, true)?;
+    }
+    Ok(())
 }
 
 struct RetainedPageState<'database> {
@@ -15413,6 +15479,12 @@ mod tests {
         assert!(retention.retired_wal_blocks > 0);
         assert_eq!(retention.retired_wal_bytes, retired_file_bytes);
         assert!(retention.retired_wal_bytes > original_wal_bytes);
+        assert!(
+            retention.total_time
+                >= retention.anchor_publication_time
+                    + retention.wal_reset_synchronization_time
+                    + retention.anchor_stabilization_time
+        );
         assert_eq!(fs::metadata(temporary.path().join(WAL_FILE))?.len(), 0);
 
         let mut suffix = database.begin(30, DurabilityClass::Strict)?;
@@ -15432,6 +15504,12 @@ mod tests {
         assert_eq!(recovery.retired_wal_blocks, retention.retired_wal_blocks);
         assert_eq!(recovery.replayed_transactions, 1);
         assert_eq!(recovery.checkpoint_count, 2);
+        assert!(
+            recovery.open_time
+                >= recovery.wal_physical_verification_time
+                    + recovery.wal_semantic_replay_time
+                    + recovery.root_validation_time
+        );
         assert_eq!(
             recovery.committed_transactions,
             usize::try_from(suffix_receipt.commit_csn.get())?
