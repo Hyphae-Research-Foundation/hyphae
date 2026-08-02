@@ -103,6 +103,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native chunked-list evidence — 2026-08-01](gates/evidence/native-list-2026-08-01.md)
 - [Native dual-index sorted-set evidence — 2026-08-01](gates/evidence/native-sorted-set-2026-08-01.md)
 - [Native durable scalar-expiry evidence — 2026-08-01](gates/evidence/native-expiry-2026-08-01.md)
+- [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native inverted-search evidence — 2026-08-01](gates/evidence/native-inverted-search-2026-08-01.md)
 - [Native ANN kernel evidence — 2026-08-01](gates/evidence/native-ann-kernel-2026-08-01.md)
 - [Native ANN durability evidence — 2026-08-01](gates/evidence/native-ann-durability-2026-08-01.md)
