@@ -205,6 +205,13 @@ commit before its tag can be published.
   observation for exact, primary-scan `LIMIT 10`, and secondary `LIMIT 10`
   joins over 2,048 rows per relation and 100,000 calls per route. It remains
   outside G2 and G7.
+- [Native right secondary-index inner-join evidence —
+  2026-08-01](native-right-secondary-inner-join-2026-08-01.md) makes right
+  access explicit and binds an exact single-column `UNIQUE` secondary lookup
+  across private, retained, physical and reopened execution.
+- `native-right-secondary-inner-join-wsl2.json` is its schema-v4 clean release
+  comparison of primary-key and unique-secondary right lookups over 2,048
+  rows and 100,000 calls per route. It remains outside G2 and G7.
 
 ## Hosted release evidence
 
