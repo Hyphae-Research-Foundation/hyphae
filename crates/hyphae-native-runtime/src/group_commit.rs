@@ -5,20 +5,20 @@
 use std::{
     ops::Deref,
     sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use hyphae_native_types::DurabilityClass;
 use thiserror::Error;
 
 use crate::{
-    CommitReceipt, GroupCommitOutcome, MAX_GROUP_COMMIT_BATCH_SIZE, NativeDatabase,
-    NativeRuntimeError, NativeWriteBatch,
+    CommitReceipt, GroupCommitOutcome, MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE,
+    NativeDatabase, NativeRuntimeError, NativeWriteBatch,
 };
 
 const DEFAULT_GROUP_COMMIT_BATCH_SIZE: usize = 32;
@@ -28,6 +28,13 @@ const REQUEST_QUEUED: u8 = 0;
 const REQUEST_EXECUTING: u8 = 1;
 const REQUEST_CANCELLED: u8 = 2;
 const REQUEST_COMPLETED: u8 = 3;
+
+/// Shortest accepted active-expiry interval.
+pub const MIN_ACTIVE_EXPIRY_INTERVAL: Duration = Duration::from_micros(100);
+/// Longest accepted active-expiry interval.
+pub const MAX_ACTIVE_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+/// Largest foreground request budget before a due sweep.
+pub const MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET: usize = 4_096;
 
 /// Longest collection interval accepted by the first native scheduler.
 pub const MAX_GROUP_COMMIT_WAIT: Duration = Duration::from_millis(10);
@@ -130,6 +137,273 @@ impl Default for GroupCommitConfig {
             max_wait: DEFAULT_GROUP_COMMIT_WAIT,
             queue_capacity: DEFAULT_GROUP_COMMIT_QUEUE_CAPACITY,
         }
+    }
+}
+
+/// Invalid native active-expiry scheduler bounds.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ActiveExpiryConfigError {
+    /// The timer interval is outside the accepted finite range.
+    #[error(
+        "native active expiry interval {requested:?} is outside {MIN_ACTIVE_EXPIRY_INTERVAL:?}..={MAX_ACTIVE_EXPIRY_INTERVAL:?}"
+    )]
+    Interval {
+        /// Rejected timer interval.
+        requested: Duration,
+    },
+    /// The physical tombstone batch is empty or exceeds the runtime bound.
+    #[error("native active expiry batch size {requested} is outside 1..={MAX_EXPIRY_SWEEP_KEYS}")]
+    BatchSize {
+        /// Rejected batch size.
+        requested: usize,
+    },
+    /// Group durability has no background maintenance cohort.
+    #[error("native active expiry durability {requested:?} must be memory or strict")]
+    Durability {
+        /// Rejected durability class.
+        requested: DurabilityClass,
+    },
+    /// The foreground fairness budget is zero or exceeds its hard maximum.
+    #[error(
+        "native active expiry foreground budget {requested} is outside 1..={MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET}"
+    )]
+    ForegroundBudget {
+        /// Rejected foreground request budget.
+        requested: usize,
+    },
+}
+
+/// Validated active-expiry resource policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveExpiryConfig {
+    interval: Duration,
+    max_keys: usize,
+    durability: DurabilityClass,
+    foreground_budget: usize,
+}
+
+impl ActiveExpiryConfig {
+    /// Validates one optional active-expiry policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an invalid interval, batch, durability, or
+    /// foreground fairness bound.
+    pub const fn new(
+        interval: Duration,
+        max_keys: usize,
+        durability: DurabilityClass,
+        foreground_budget: usize,
+    ) -> Result<Self, ActiveExpiryConfigError> {
+        if interval.as_nanos() < MIN_ACTIVE_EXPIRY_INTERVAL.as_nanos()
+            || interval.as_nanos() > MAX_ACTIVE_EXPIRY_INTERVAL.as_nanos()
+        {
+            return Err(ActiveExpiryConfigError::Interval {
+                requested: interval,
+            });
+        }
+        if max_keys == 0 || max_keys > MAX_EXPIRY_SWEEP_KEYS {
+            return Err(ActiveExpiryConfigError::BatchSize {
+                requested: max_keys,
+            });
+        }
+        if matches!(durability, DurabilityClass::Group) {
+            return Err(ActiveExpiryConfigError::Durability {
+                requested: durability,
+            });
+        }
+        if foreground_budget == 0 || foreground_budget > MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET {
+            return Err(ActiveExpiryConfigError::ForegroundBudget {
+                requested: foreground_budget,
+            });
+        }
+        Ok(Self {
+            interval,
+            max_keys,
+            durability,
+            foreground_budget,
+        })
+    }
+
+    /// Returns the interval between completed sweep attempts.
+    pub const fn interval(self) -> Duration {
+        self.interval
+    }
+
+    /// Returns the maximum scalar keys tombstoned by one sweep.
+    pub const fn max_keys(self) -> usize {
+        self.max_keys
+    }
+
+    /// Returns singleton durability used by non-empty sweeps.
+    pub const fn durability(self) -> DurabilityClass {
+        self.durability
+    }
+
+    /// Returns foreground requests admitted after a due deadline.
+    pub const fn foreground_budget(self) -> usize {
+        self.foreground_budget
+    }
+}
+
+/// Thread-safe absolute-microsecond authority for active expiry.
+pub trait NativeSchedulerClock: Send + Sync {
+    /// Returns one signed absolute logical-time sample.
+    fn logical_time_micros(&self) -> i64;
+}
+
+struct SystemSchedulerClock;
+
+impl NativeSchedulerClock for SystemSchedulerClock {
+    fn logical_time_micros(&self) -> i64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(since_epoch) => i64::try_from(since_epoch.as_micros()).unwrap_or(i64::MAX),
+            Err(before_epoch) => {
+                let magnitude =
+                    i64::try_from(before_epoch.duration().as_micros()).unwrap_or(i64::MAX);
+                magnitude.saturating_neg()
+            }
+        }
+    }
+}
+
+/// Lock-free diagnostic snapshot for one active-expiry worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveExpiryStats {
+    /// Timer-driven sweep attempts.
+    pub attempted_sweeps: u64,
+    /// Non-empty sweeps that committed a tombstone transaction.
+    pub committed_sweeps: u64,
+    /// Scalar identities tombstoned by committed sweeps.
+    pub expired_keys: u64,
+    /// Sweep attempts that found no due scalar identity.
+    pub empty_sweeps: u64,
+    /// Fatal sweep attempts.
+    pub failures: u64,
+    /// Latest non-decreasing logical-time sample.
+    pub latest_logical_time_micros: i64,
+    /// Complete duration of the latest attempted sweep.
+    pub latest_sweep_duration: Duration,
+    /// Largest foreground request count observed after a due deadline.
+    pub max_foreground_after_due: usize,
+}
+
+/// Terminal reason one active-expiry worker stopped.
+#[derive(Clone, Debug, Error)]
+pub enum ActiveExpiryFailure {
+    /// The scheduler no longer owned an accessible database.
+    #[error("native active expiry database is unavailable")]
+    DatabaseUnavailable,
+    /// Native persistence rejected the expiry transaction.
+    #[error("native active expiry failed: {source}")]
+    Runtime {
+        /// Shared typed runtime failure retained after the worker stops.
+        #[source]
+        source: Arc<NativeRuntimeError>,
+    },
+}
+
+impl ActiveExpiryFailure {
+    fn submit_error(&self) -> GroupCommitSubmitError {
+        match self {
+            Self::DatabaseUnavailable => GroupCommitSubmitError::Unavailable,
+            Self::Runtime { source } => GroupCommitSubmitError::Runtime {
+                source: Arc::clone(source),
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActiveExpiryMetrics {
+    attempted_sweeps: AtomicU64,
+    committed_sweeps: AtomicU64,
+    expired_keys: AtomicU64,
+    empty_sweeps: AtomicU64,
+    failures: AtomicU64,
+    latest_logical_time_micros: AtomicI64,
+    latest_sweep_nanos: AtomicU64,
+    max_foreground_after_due: AtomicUsize,
+    terminal_failure: OnceLock<ActiveExpiryFailure>,
+}
+
+impl ActiveExpiryMetrics {
+    fn snapshot(&self) -> ActiveExpiryStats {
+        ActiveExpiryStats {
+            attempted_sweeps: self.attempted_sweeps.load(Ordering::Acquire),
+            committed_sweeps: self.committed_sweeps.load(Ordering::Acquire),
+            expired_keys: self.expired_keys.load(Ordering::Acquire),
+            empty_sweeps: self.empty_sweeps.load(Ordering::Acquire),
+            failures: self.failures.load(Ordering::Acquire),
+            latest_logical_time_micros: self.latest_logical_time_micros.load(Ordering::Acquire),
+            latest_sweep_duration: Duration::from_nanos(
+                self.latest_sweep_nanos.load(Ordering::Acquire),
+            ),
+            max_foreground_after_due: self.max_foreground_after_due.load(Ordering::Acquire),
+        }
+    }
+}
+
+struct ActiveExpiryRuntime {
+    config: ActiveExpiryConfig,
+    clock: Arc<dyn NativeSchedulerClock>,
+    metrics: Arc<ActiveExpiryMetrics>,
+    next_deadline: Instant,
+    logical_watermark: i64,
+    foreground_after_due: usize,
+}
+
+impl ActiveExpiryRuntime {
+    fn new(
+        config: ActiveExpiryConfig,
+        clock: Arc<dyn NativeSchedulerClock>,
+        metrics: Arc<ActiveExpiryMetrics>,
+    ) -> Self {
+        Self {
+            config,
+            clock,
+            metrics,
+            next_deadline: Instant::now() + config.interval,
+            logical_watermark: i64::MIN,
+            foreground_after_due: 0,
+        }
+    }
+
+    fn wait_until_deadline(&self) -> Duration {
+        self.next_deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn should_force_sweep(&self) -> bool {
+        self.wait_until_deadline().is_zero()
+            && self.foreground_after_due >= self.config.foreground_budget
+    }
+
+    fn record_foreground(&mut self, requests: usize) {
+        if self.wait_until_deadline().is_zero() {
+            self.foreground_after_due = self.foreground_after_due.saturating_add(requests);
+            self.metrics
+                .max_foreground_after_due
+                .fetch_max(self.foreground_after_due, Ordering::AcqRel);
+        }
+    }
+
+    fn begin_sweep(&mut self) -> i64 {
+        let sample = self.clock.logical_time_micros();
+        self.logical_watermark = self.logical_watermark.max(sample);
+        atomic_saturating_add(&self.metrics.attempted_sweeps, 1);
+        self.metrics
+            .latest_logical_time_micros
+            .store(self.logical_watermark, Ordering::Release);
+        self.logical_watermark
+    }
+
+    fn finish_sweep(&mut self, started: Instant) {
+        let elapsed_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics
+            .latest_sweep_nanos
+            .store(elapsed_nanos, Ordering::Release);
+        self.foreground_after_due = 0;
+        self.next_deadline = Instant::now() + self.config.interval;
     }
 }
 
@@ -461,6 +735,7 @@ impl NativeCommitClient {
 pub struct NativeCommitScheduler {
     client: NativeCommitClient,
     worker: Option<JoinHandle<()>>,
+    active_expiry_metrics: Option<Arc<ActiveExpiryMetrics>>,
 }
 
 impl NativeCommitScheduler {
@@ -473,6 +748,48 @@ impl NativeCommitScheduler {
         database: NativeDatabase,
         config: GroupCommitConfig,
     ) -> Result<Self, GroupCommitSubmitError> {
+        Self::start_inner(database, config, None)
+    }
+
+    /// Starts one scheduler with system-clock active expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime I/O failure if the worker thread cannot start.
+    pub fn start_with_active_expiry(
+        database: NativeDatabase,
+        config: GroupCommitConfig,
+        active_expiry: ActiveExpiryConfig,
+    ) -> Result<Self, GroupCommitSubmitError> {
+        Self::start_with_active_expiry_clock(
+            database,
+            config,
+            active_expiry,
+            Arc::new(SystemSchedulerClock),
+        )
+    }
+
+    /// Starts one scheduler with an injected absolute-microsecond clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed runtime I/O failure if the worker thread cannot start.
+    pub fn start_with_active_expiry_clock(
+        database: NativeDatabase,
+        config: GroupCommitConfig,
+        active_expiry: ActiveExpiryConfig,
+        clock: Arc<dyn NativeSchedulerClock>,
+    ) -> Result<Self, GroupCommitSubmitError> {
+        let metrics = Arc::new(ActiveExpiryMetrics::default());
+        let runtime = ActiveExpiryRuntime::new(active_expiry, clock, Arc::clone(&metrics));
+        Self::start_inner(database, config, Some((runtime, metrics)))
+    }
+
+    fn start_inner(
+        database: NativeDatabase,
+        config: GroupCommitConfig,
+        active_expiry: Option<(ActiveExpiryRuntime, Arc<ActiveExpiryMetrics>)>,
+    ) -> Result<Self, GroupCommitSubmitError> {
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let gate = Arc::new(Mutex::new(SubmissionGate {
             sender,
@@ -483,14 +800,33 @@ impl NativeCommitScheduler {
             gate: Arc::clone(&gate),
             database: Arc::clone(&database),
         };
+        let (active_expiry, active_expiry_metrics) = active_expiry
+            .map_or((None, None), |(runtime, metrics)| {
+                (Some(runtime), Some(metrics))
+            });
         let worker = thread::Builder::new()
-            .name("hyphae-group-commit".to_owned())
-            .spawn(move || run_scheduler(&receiver, &database, &gate, config))
+            .name("hyphae-commit-scheduler".to_owned())
+            .spawn(move || run_scheduler(&receiver, &database, &gate, config, active_expiry))
             .map_err(|source| GroupCommitSubmitError::runtime(NativeRuntimeError::Io(source)))?;
         Ok(Self {
             client,
             worker: Some(worker),
+            active_expiry_metrics,
         })
+    }
+
+    /// Returns the current lock-free active-expiry diagnostics.
+    pub fn active_expiry_stats(&self) -> Option<ActiveExpiryStats> {
+        self.active_expiry_metrics
+            .as_ref()
+            .map(|metrics| metrics.snapshot())
+    }
+
+    /// Returns the retained terminal active-expiry failure, when present.
+    pub fn active_expiry_failure(&self) -> Option<ActiveExpiryFailure> {
+        self.active_expiry_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.terminal_failure.get().cloned())
     }
 
     /// Returns one cloneable producer bound to this scheduler.
@@ -556,7 +892,8 @@ impl NativeCommitScheduler {
     /// # Errors
     ///
     /// Returns unavailable if scheduler synchronization is poisoned or the
-    /// worker terminated abnormally.
+    /// worker terminated abnormally, or the retained typed runtime failure
+    /// when active expiry stopped the worker.
     pub fn shutdown(mut self) -> Result<(), GroupCommitSubmitError> {
         self.stop_and_join()
     }
@@ -585,7 +922,11 @@ impl NativeCommitScheduler {
         }
         worker
             .join()
-            .map_err(|_| GroupCommitSubmitError::Unavailable)
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        match self.active_expiry_failure() {
+            Some(failure) => Err(failure.submit_error()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -705,24 +1046,72 @@ fn run_scheduler(
     database: &RwLock<Option<NativeDatabase>>,
     gate: &Mutex<SubmissionGate>,
     config: GroupCommitConfig,
+    mut active_expiry: Option<ActiveExpiryRuntime>,
 ) {
     let mut shutdown = false;
     let mut pending = None;
     while !shutdown {
-        let first = match pending.take().map_or_else(|| receiver.recv(), Ok) {
-            Ok(SchedulerCommand::Commit(request)) => *request,
-            Ok(SchedulerCommand::Shutdown) | Err(_) => break,
-        };
+        if active_expiry
+            .as_ref()
+            .is_some_and(ActiveExpiryRuntime::should_force_sweep)
+        {
+            let Some(expiry) = active_expiry.as_mut() else {
+                break;
+            };
+            if !execute_active_expiry(database, expiry) {
+                break;
+            }
+            continue;
+        }
+        let first =
+            match receive_scheduler_command(receiver, &mut pending, active_expiry.as_ref()) {
+                SchedulerWake::Command(SchedulerCommand::Commit(request)) => *request,
+                SchedulerWake::Command(SchedulerCommand::Shutdown)
+                | SchedulerWake::Disconnected => break,
+                SchedulerWake::ExpiryDue => {
+                    let Some(expiry) = active_expiry.as_mut() else {
+                        break;
+                    };
+                    if !execute_active_expiry(database, expiry) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+        let counts_after_due = active_expiry
+            .as_ref()
+            .is_some_and(|expiry| expiry.wait_until_deadline().is_zero());
         if first.batch.durability != DurabilityClass::Group {
             if !execute_single_request(database, first) {
                 break;
+            }
+            if counts_after_due {
+                record_expiry_foreground(&mut active_expiry, 1);
             }
             continue;
         }
         let mut requests = vec![first];
         let deadline = Instant::now() + config.max_wait;
-        while requests.len() < config.max_batch_size {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+        let max_batch_size = active_expiry
+            .as_ref()
+            .map_or(config.max_batch_size, |expiry| {
+                if counts_after_due {
+                    config.max_batch_size.min(
+                        expiry
+                            .config
+                            .foreground_budget
+                            .saturating_sub(expiry.foreground_after_due)
+                            .max(1),
+                    )
+                } else {
+                    config.max_batch_size
+                }
+            });
+        while requests.len() < max_batch_size {
+            let mut remaining = deadline.saturating_duration_since(Instant::now());
+            if !counts_after_due && let Some(expiry) = active_expiry.as_ref() {
+                remaining = remaining.min(expiry.wait_until_deadline());
+            }
             match receiver.recv_timeout(remaining) {
                 Ok(SchedulerCommand::Commit(request))
                     if request.batch.durability == DurabilityClass::Group =>
@@ -740,12 +1129,102 @@ fn run_scheduler(
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }
+        let request_count = requests.len();
         if !execute_group_requests(database, requests) {
             shutdown = true;
+        } else if counts_after_due {
+            record_expiry_foreground(&mut active_expiry, request_count);
         }
     }
     stop_accepting(gate);
     close_database(database);
+}
+
+enum SchedulerWake {
+    Command(SchedulerCommand),
+    ExpiryDue,
+    Disconnected,
+}
+
+fn receive_scheduler_command(
+    receiver: &Receiver<SchedulerCommand>,
+    pending: &mut Option<SchedulerCommand>,
+    active_expiry: Option<&ActiveExpiryRuntime>,
+) -> SchedulerWake {
+    if let Some(command) = pending.take() {
+        return SchedulerWake::Command(command);
+    }
+    match active_expiry {
+        Some(expiry) => match receiver.recv_timeout(expiry.wait_until_deadline()) {
+            Ok(command) => SchedulerWake::Command(command),
+            Err(RecvTimeoutError::Timeout) => SchedulerWake::ExpiryDue,
+            Err(RecvTimeoutError::Disconnected) => SchedulerWake::Disconnected,
+        },
+        None => receiver
+            .recv()
+            .map_or(SchedulerWake::Disconnected, SchedulerWake::Command),
+    }
+}
+
+fn record_expiry_foreground(active_expiry: &mut Option<ActiveExpiryRuntime>, requests: usize) {
+    if let Some(expiry) = active_expiry {
+        expiry.record_foreground(requests);
+    }
+}
+
+fn execute_active_expiry(
+    database: &RwLock<Option<NativeDatabase>>,
+    active_expiry: &mut ActiveExpiryRuntime,
+) -> bool {
+    let started = Instant::now();
+    let logical_time_micros = active_expiry.begin_sweep();
+    let result = match database.write() {
+        Ok(mut database) => match database.as_mut() {
+            Some(database) => database
+                .expire_due_structures(
+                    logical_time_micros,
+                    active_expiry.config.max_keys,
+                    active_expiry.config.durability,
+                )
+                .map_err(|source| ActiveExpiryFailure::Runtime {
+                    source: Arc::new(source),
+                }),
+            None => Err(ActiveExpiryFailure::DatabaseUnavailable),
+        },
+        Err(_) => Err(ActiveExpiryFailure::DatabaseUnavailable),
+    };
+    let success = match result {
+        Ok(receipt) => {
+            atomic_saturating_add(
+                &active_expiry.metrics.expired_keys,
+                u64::try_from(receipt.expired_keys).unwrap_or(u64::MAX),
+            );
+            if receipt.commit.is_some() {
+                atomic_saturating_add(&active_expiry.metrics.committed_sweeps, 1);
+            } else {
+                atomic_saturating_add(&active_expiry.metrics.empty_sweeps, 1);
+            }
+            true
+        }
+        Err(failure) => {
+            atomic_saturating_add(&active_expiry.metrics.failures, 1);
+            let _ = active_expiry.metrics.terminal_failure.set(failure);
+            false
+        }
+    };
+    active_expiry.finish_sweep(started);
+    success
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn execute_single_request(
@@ -933,10 +1412,10 @@ fn close_database(database: &RwLock<Option<NativeDatabase>>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveExpiryConfig, ActiveExpiryConfigError, CommitCancellationOutcome,
-        GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
-        MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitControl,
-        REQUEST_QUEUED, SchedulerCommand, SubmissionGate, admit_command,
+        ActiveExpiryConfig, ActiveExpiryConfigError, CommitCancellationOutcome, GroupCommitConfig,
+        GroupCommitConfigError, GroupCommitSubmitError, MAX_GROUP_COMMIT_QUEUE_CAPACITY,
+        MAX_GROUP_COMMIT_WAIT, NativeCommitControl, REQUEST_QUEUED, SchedulerCommand,
+        SubmissionGate, admit_command,
     };
     use crate::MAX_GROUP_COMMIT_BATCH_SIZE;
     use hyphae_native_types::DurabilityClass;
@@ -1024,41 +1503,21 @@ mod tests {
     #[test]
     fn active_expiry_bounds_fail_closed() {
         assert!(matches!(
-            ActiveExpiryConfig::new(
-                Duration::from_micros(99),
-                1,
-                DurabilityClass::Memory,
-                1
-            ),
+            ActiveExpiryConfig::new(Duration::from_micros(99), 1, DurabilityClass::Memory, 1),
             Err(ActiveExpiryConfigError::Interval { .. })
         ));
         assert_eq!(
-            ActiveExpiryConfig::new(
-                Duration::from_micros(100),
-                0,
-                DurabilityClass::Memory,
-                1
-            ),
+            ActiveExpiryConfig::new(Duration::from_micros(100), 0, DurabilityClass::Memory, 1),
             Err(ActiveExpiryConfigError::BatchSize { requested: 0 })
         );
         assert_eq!(
-            ActiveExpiryConfig::new(
-                Duration::from_micros(100),
-                1,
-                DurabilityClass::Group,
-                1
-            ),
+            ActiveExpiryConfig::new(Duration::from_micros(100), 1, DurabilityClass::Group, 1),
             Err(ActiveExpiryConfigError::Durability {
                 requested: DurabilityClass::Group
             })
         );
         assert_eq!(
-            ActiveExpiryConfig::new(
-                Duration::from_micros(100),
-                1,
-                DurabilityClass::Memory,
-                0
-            ),
+            ActiveExpiryConfig::new(Duration::from_micros(100), 1, DurabilityClass::Memory, 0),
             Err(ActiveExpiryConfigError::ForegroundBudget { requested: 0 })
         );
     }

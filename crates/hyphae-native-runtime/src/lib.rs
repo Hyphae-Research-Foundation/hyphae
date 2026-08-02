@@ -15,9 +15,12 @@ mod sql;
 mod wal_codec;
 
 pub use group_commit::{
+    ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
     CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
-    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitCancellation,
-    NativeCommitClient, NativeCommitControl, NativeCommitScheduler, ScheduledCommitReceipt,
+    MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET, MAX_ACTIVE_EXPIRY_INTERVAL,
+    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, MIN_ACTIVE_EXPIRY_INTERVAL,
+    NativeCommitCancellation, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
+    NativeSchedulerClock, ScheduledCommitReceipt,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -12279,7 +12282,7 @@ mod tests {
     use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
-        ActiveExpiryConfig, ActiveExpiryStats, AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY,
+        ActiveExpiryConfig, AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY,
         CATALOG_FORMAT_VALUE_V3, CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX,
         CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE,
         CATALOG_VALUE_MAGIC, CatalogName, CatalogObject, CatalogState, CheckpointBoundary,
@@ -17059,21 +17062,13 @@ mod tests {
         let seed = seed.commit()?;
         assert_eq!(seed.transaction_id, TransactionId::new(1)?);
         assert_eq!(seed.commit_csn, Csn::new(1)?);
-        assert_eq!(
-            database.get_latest_structure(b"active-expiry", 10)?,
-            None
-        );
+        assert_eq!(database.get_latest_structure(b"active-expiry", 10)?, None);
 
         let clock = Arc::new(TestSchedulerClock::new(10));
         let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
             database,
             GroupCommitConfig::new(4, Duration::from_micros(100), 8)?,
-            ActiveExpiryConfig::new(
-                Duration::from_micros(100),
-                1,
-                DurabilityClass::Memory,
-                1,
-            )?,
+            ActiveExpiryConfig::new(Duration::from_micros(100), 1, DurabilityClass::Memory, 1)?,
             clock.clone(),
         )?;
         let first_deadline = Instant::now() + Duration::from_secs(2);
@@ -17081,7 +17076,7 @@ mod tests {
             let stats = scheduler
                 .active_expiry_stats()
                 .ok_or("active expiry stats missing")?;
-            if stats.expired_keys == 1 {
+            if stats.expired_keys == 1 && stats.committed_sweeps == 1 {
                 break stats;
             }
             if Instant::now() >= first_deadline {
@@ -17099,7 +17094,7 @@ mod tests {
             let stats = scheduler
                 .active_expiry_stats()
                 .ok_or("active expiry stats missing")?;
-            if stats.attempted_sweeps > first_stats.attempted_sweeps {
+            if stats.attempted_sweeps > first_stats.attempted_sweeps && stats.empty_sweeps >= 1 {
                 break stats;
             }
             if Instant::now() >= regression_deadline {
@@ -17118,10 +17113,7 @@ mod tests {
         scheduler.shutdown()?;
 
         let reopened = NativeDatabase::open(temporary.path())?;
-        assert_eq!(
-            reopened.get_latest_structure(b"active-expiry", 11)?,
-            None
-        );
+        assert_eq!(reopened.get_latest_structure(b"active-expiry", 11)?, None);
         assert_eq!(
             reopened.get_latest_structure(b"after-active-expiry", 11)?,
             Some(b"visible".to_vec())
