@@ -18514,6 +18514,33 @@ mod tests {
         Ok(table)
     }
 
+    #[test]
+    fn composite_primary_key_prefix_range_plans_physical_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_primary_key_prefix_ledger(&mut database)?;
+        let mut transaction = database.begin_sql(11, DurabilityClass::Memory)?;
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT sequence FROM ledger
+                 WHERE sequence < ? AND tenant = ? AND sequence >= ?
+                 ORDER BY tenant, sequence
+                 LIMIT 3",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "PrimaryKeyPrefixRangeScan(table={table},prefix_columns=1,\
+                     range_column=2,lower=inclusive,upper=exclusive,limit=3)"
+                ))]],
+            }
+        );
+        transaction.rollback();
+        Ok(())
+    }
+
     fn prefix_rows(rows: &[(i64, &str)]) -> SqlResult {
         SqlResult::Rows {
             columns: vec!["sequence".to_owned(), "payload".to_owned()],
