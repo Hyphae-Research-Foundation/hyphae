@@ -270,6 +270,16 @@ release calls are proven. Composite equality/keys, non-unique or ranged right
 access, general join ordering and algorithms, spill, the complete G2
 correctness suites, and the G7 matrix remain open.
 
+The [native dual-index sorted-set
+evidence](evidence/native-sorted-set-2026-08-01.md) binds exact binary
+membership and score/member order to one native structure B+tree. It proves
+canonical binary64 ordering, retained snapshots, member-granular optimistic
+rebase, strict reopen, fail-closed dual-index recovery, all seven commit crash
+boundaries, and clean physical microsecond observations over 2,048 members.
+Score ranges, reverse/rank acceleration, algebra, TTL, protocol exposure,
+model testing, amplification evidence, the complete G3 suite, and G7 remain
+open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -291,10 +301,10 @@ primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes, exact binary
-sets with member-granular conflicts, and chunked-deque lists. It still lacks
-whole-hash lifecycle/iteration, set iteration/algebra/TTL, sorted sets,
-streams, the expiry scheduler, model tests, and amplification evidence
-required to close G3.
+sets with member-granular conflicts, chunked-deque lists, and dual-index
+sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
+algebra/TTL, score/reverse/rank sorted-set operations, streams, the expiry
+scheduler, model tests, and amplification evidence required to close G3.
 
 ## G1 substrate exit
 

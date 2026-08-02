@@ -55,6 +55,11 @@ writable without an implicit format conversion.
 New structure roots also use the native B+tree: binary keys map to a canonical
 TTL/storage envelope, direct `GET`/`TTL` traverse pinned pages, and large
 structure strings share the immutable blob namespace with relational values.
+Explicit hashes use independent field paths, sets use exact member paths,
+lists use bounded packed deque chunks, and sorted sets maintain both a
+member-to-score index and a score/member ordered index. Their mutations share
+the same WAL, MVCC root, conflict table, crash recovery, and strict reopen
+authority as scalar structure values; none is serialized as one scalar value.
 Legacy single-page structure roots remain readable and writable.
 New lexical-search roots use native collection, stored-document, term, and
 posting B+tree namespaces. Direct `MATCH` prunes to each query term's posting
@@ -73,9 +78,11 @@ before serving exact or explicitly approximate search.
 
 The implementation remains deliberately bounded: transaction snapshots still
 materialize relation state, version retention and vacuum are not implemented,
-partial/secondary ranges and zero-copy operator cursors remain pending,
-structures still lack most Valkey-class families, and lexical search still
-lacks positions, phrases, filters, facets, doc values, deletes/updates,
+partial/secondary ranges and zero-copy operator cursors remain pending.
+Structures still lack streams, bitmaps, probabilistic structures, geo,
+complete string/hash/set/list/sorted-set operations, collection TTL, active
+expiry, blocking operations, eviction, and protocol exposure. Lexical search
+still lacks positions, phrases, filters, facets, doc values, deletes/updates,
 segments, and hybrid fusion. ANN still materializes the validated generation
 at open/snapshot time; direct buffer-pool graph traversal, snapshot filters,
 delta/tombstone merge, background build publication, and reclamation remain
