@@ -490,3 +490,14 @@ detectable.
   It is warm, memory-durability, concurrency-one embedded/local-frame
   evidence; it is not strict-durability, transport, power-loss, G1, or G7
   closure.
+
+## Native process crash matrix on Linux
+
+- `native-process-crash-matrix-linux-2026-08-02.md` binds seven real
+  process-kill/reopen cycles to the exact singleton all-engine commit source.
+  It verifies prior-or-complete CSN visibility across relational,
+  structure/TTL, lexical, and blob state while the child retains the writer
+  lock until `SIGKILL`.
+- `native-process-crash-matrix-linux.json` is the exact release receipt from
+  AWS Linux/ext4. It is process-crash evidence, not sector, filesystem
+  reordering, device-cache, EC2-stop, or physical power-loss evidence.
