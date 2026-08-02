@@ -93,9 +93,12 @@ During open, Hyphae verifies that every checkpoint:
 4. retains valid reachable pages for every committed root, including roots
    superseded by later commits.
 
-The current recovery path still scans the complete WAL. Replay starting at the
-latest verified checkpoint and WAL retention/truncation are pending; neither is
-claimed by this implementation.
+Without a retention anchor, recovery scans the complete WAL. With a verified
+`HYWAR001` anchor, current-root retention and bounded suffix replay are
+implemented. Manifest recovery still verifies from generation one in this
+source commit. The identity-preserving design that makes `HYWAR001` the later
+manifest-chain trust root is fixed separately by [Native manifest retention
+v1](manifest-retention-v1.md).
 
 ## Interruption states
 
