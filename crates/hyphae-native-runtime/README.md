@@ -5,11 +5,11 @@ native data ecosystem. It owns a single data directory and coordinates native
 catalog, relational, structure, lexical-search, and ANN state through
 copy-on-write pages, one WAL transaction, and one published CSN.
 
-Catalog create mutations and `HYCAT002` roots retain complete canonical
-relation/search definitions instead of discarding them after validation.
-Snapshots expose the immutable definition pinned to their catalog version;
-legacy `HYCAT001` name-only roots reconstruct their known fixed shapes. The
-catalog root remains bounded to one page pending its native B+tree migration.
+Catalog create mutations and `HYCAT003` roots retain complete canonical
+definitions in separate ID and normalized-name B+tree namespaces. Large
+definitions use immutable blobs, and snapshots expose the definition pinned
+to their catalog version. Legacy `HYCAT001` name-only and `HYCAT002`
+single-page roots reopen and migrate on a later write.
 
 Native SQL now binds primitive values and projections to those immutable
 definitions. Typed inserts encode canonical primary-key components and
@@ -21,21 +21,20 @@ backfills atomically, inserts maintain every admitted projection, exact-key
 `WHERE` can use composite indexes independent of predicate text order, and
 bounded `EXPLAIN` identifies primary-key or secondary-index lookup. Unique
 non-null collisions fail before publication; null equality retains SQL
-three-valued behavior. Bounded primary-key scans/ranges, exact-PK typed
+three-valued behavior. Bounded primary-key scans, complete-key ranges,
+left-prefix scans, prefix-plus-next-component ranges, exact-PK typed
 updates/deletes, and current-root secondary execution are physical native
 operators. Parameterized scalar residual filters support comparison,
-`IS [NOT] NULL`, `NOT`, `AND`, and `OR`; the binder extracts admitted exact or
-range access and applies `LIMIT` after filtering. The historical
+`IS [NOT] NULL`, `NOT`, `AND`, and `OR`; the binder extracts admitted exact,
+prefix, or range access and applies `LIMIT` after filtering. The historical
 two-binary-column shape retains its raw bytes and allocation-free prepared
-lookup. The first qualified `INNER JOIN` plan resolves at most one left row
-through a primary key or unique secondary index, then resolves a
-single-column right primary key against the same transaction or snapshot.
-The next bounded form walks a full or ranged left primary-key input and stops
-after `LIMIT` joined output rows; null join keys and missing right rows do not
-consume that limit. Non-unique secondary inputs, composite/right-secondary
-access, join reordering, hash/merge and outer joins, literals beyond the
-admitted scalar families, casts, arithmetic/functions, grouping,
-sorting/spill, cost planning, and complete `EXPLAIN` remain pending.
+lookup. Qualified bounded `INNER JOIN` plans accept exact, primary-range, and
+non-unique secondary left inputs, composite equalities, and primary or unique
+secondary right access. They stop after `LIMIT` joined output rows; null join
+keys and missing right rows do not consume that limit. General join
+reordering, hash/merge and outer joins, literals beyond the admitted scalar
+families, casts, arithmetic/functions, grouping, sorting/spill, cost planning,
+and complete `EXPLAIN` remain pending.
 
 The first relational physical route stores table markers and canonical MVCC
 rows in the native copy-on-write B+tree and performs current-root point reads
@@ -76,21 +75,22 @@ index into one canonical persisted replacement. Retained roots preserve
 historical vector results; reopen validates and restores the complete graph
 before serving exact or explicitly approximate search.
 
-The implementation remains deliberately bounded: transaction snapshots still
-materialize relation state, version retention and vacuum are not implemented,
-partial/secondary ranges and zero-copy operator cursors remain pending.
+The implementation remains deliberately bounded: retained transaction
+snapshots still materialize relation state, while current-root page vacuum,
+WAL/manifest retention, and blob collection do not yet provide configurable
+multi-generation pins. Secondary ranges and zero-copy operator cursors remain
+pending.
 Structures still lack streams, bitmaps, probabilistic structures, geo,
 complete string/hash/set/list/sorted-set operations, collection TTL, active
-expiry, blocking operations, eviction, and protocol exposure. Lexical search
-still lacks positions, phrases, filters, facets, doc values, deletes/updates,
-segments, and hybrid fusion. ANN still materializes the validated generation
-at open/snapshot time; direct buffer-pool graph traversal, snapshot filters,
-delta/tombstone merge, background build publication, and reclamation remain
-pending. Detached
-transactions can prepare concurrently without holding
-writer admission; commit validates their original read CSN and rebases
-disjoint mutations over the admitted current root. Publication and its
-durability I/O are still serialized and require exclusive access to the
-database handle. This proves the native transaction/recovery architecture; it
-is not the complete SQL, Valkey-class structure, or OpenSearch-class search
-engine.
+expiry backoff, blocking operations, eviction, and protocol exposure. Lexical
+search still lacks positions, phrases, filters, facets, doc values,
+deletes/updates, segments, and hybrid fusion. ANN still materializes the
+validated generation at open/snapshot time; direct buffer-pool graph
+traversal, snapshot filters, delta/tombstone merge, background build
+publication, and reclamation remain pending. Detached transactions can prepare
+concurrently without holding writer admission; commit validates their
+original read CSN and rebases disjoint mutations over the admitted current
+root. Publication and its durability I/O are still serialized and require
+exclusive access to the database handle. This proves the native
+transaction/recovery architecture; it is not the complete SQL, Valkey-class
+structure, or OpenSearch-class search engine.

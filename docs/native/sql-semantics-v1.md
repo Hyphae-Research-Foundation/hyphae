@@ -8,8 +8,9 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
-`INNER JOIN` shape and bounded composite primary-key left-prefix scans are
-implemented experimentally as described below. G2 remains open
+`INNER JOIN` shape, bounded composite primary-key left-prefix scans, and
+prefix-plus-next-component range scans are implemented experimentally as
+described below. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -125,6 +126,45 @@ than returning a partial result. Reopen, retained-snapshot equivalence,
 transaction-private visibility, multilevel early stop, boundary isolation
 between adjacent prefixes, null behavior, and corrupted-row/page failure are
 required exit tests for this slice.
+
+The bounded prefix-plus-next-component range shape is:
+
+```text
+SELECT <projection>
+FROM <table>
+WHERE <first-primary-key-column> = <scalar>
+  [AND <next-primary-key-column> = <scalar> ...]
+  AND <immediately-following-primary-key-column>
+      { > | >= | < | <= } <scalar>
+  [AND <immediately-following-primary-key-column>
+      { > | >= | < | <= } <scalar>]
+  [AND <residual-filter> ...]
+[ORDER BY <complete-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+The equality set must bind a nonempty strict left prefix. Range predicates
+must name exactly the primary-key column immediately after that prefix. At
+most one lower and one upper bound are admitted, independent of predicate text
+order. Duplicate bounds fail binding. A range on a skipped or later key
+column remains residual and cannot be reported as this access path.
+
+The physical interval starts with the canonical encoded equality prefix.
+An inclusive lower bound appends the next ordered component and includes that
+byte prefix. An exclusive lower bound starts at the binary successor of the
+appended component so every key with that component, including keys with
+remaining primary-key suffixes, is excluded. An exclusive upper bound excludes
+the appended component prefix. An inclusive upper bound excludes its binary
+successor so every key with that component is retained. Missing endpoints use
+the equality-prefix interval. The resulting bounds are intersected before
+storage traversal; inverted or empty bounds return no rows.
+
+`NULL` in either the equality prefix or range endpoint makes the predicate
+`UNKNOWN` and returns no rows after complete parameter/type validation.
+`LIMIT` and ascending complete-primary-key `ORDER BY` retain the prefix-scan
+rules. Residual predicates run before the output limit. `EXPLAIN` reports
+`PrimaryKeyPrefixRangeScan(table=<id>,prefix_columns=<count>,range_column=<id>,lower=<kind>,upper=<kind>,limit=<n>)`
+and appends `,residual=true` only when unconsumed predicates remain.
 
 The residual-filter slice admits parameterized and literal scalar predicates:
 
@@ -260,6 +300,8 @@ cardinality; it does not materialize the complete left relation.
 `SecondaryIndexLookup(table=<id>,index=<id>)`, or
 `PrimaryKeyScan(table=<id>,limit=<n>)`, or
 `PrimaryKeyPrefixScan(table=<id>,columns=<count>,limit=<n>)`, or
+`PrimaryKeyPrefixRangeScan(table=<id>,prefix_columns=<count>,range_column=<id>,lower=<kind>,upper=<kind>,limit=<n>)`,
+or
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`, or
 `IndexedInnerJoin(left_table=<id>,left_access=<access>,right_table=<id>,right_access=primary-key)`.
 Join left access is `primary-key`, `unique-secondary(index=<id>)`,
@@ -276,13 +318,12 @@ integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
-remaining literal families, casts, range bounds after a partial primary-key
-prefix, secondary ranges,
-descending scans, offsets, and constraints beyond primary key/nullability and
-the first unique index remain pending. Typed mutation does
+remaining literal families, casts, secondary ranges, descending scans,
+offsets, and constraints beyond primary key/nullability and the first unique
+index remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate general
-expressions, or update multiple rows. Prefix-plus-range, bitmap, and
-cost-based access selection remain pending.
+expressions, or update multiple rows. Multi-range, bitmap, and cost-based
+access selection remain pending.
 
 The historical table shape `(primary_key BINARY PRIMARY KEY, row BINARY)`
 retains its byte-for-byte raw row route, allocation-free prepared binary point
@@ -303,12 +344,13 @@ relation/index definitions in the catalog-version-bound plan.
 `execute_prepared_latest` captures one immutable root set, rejects a stale
 catalog version, traverses the buffered relational B+tree directly, and
 materializes only rows reached by the exact primary/secondary key or bounded
-primary scan/prefix/range. The secondary path scans only the length-delimited
-exact index-key prefix, follows each live entry to its primary-key row in the
-same root, and returns rows in canonical primary-key order. Scan, prefix, and
-range paths use the inclusive/exclusive bound-aware physical visitor, prune
-separator-disjoint subtrees, skip row tombstones, and stop after `LIMIT`
-matching rows. They do not construct `MaterializedState`.
+primary scan/prefix/prefix-range/range. The secondary path scans only the
+length-delimited exact index-key prefix, follows each live entry to its
+primary-key row in the same root, and returns rows in canonical primary-key
+order. Scan, prefix, prefix-range, and range paths use the
+inclusive/exclusive bound-aware physical visitor, prune separator-disjoint
+subtrees, skip row tombstones, and stop after `LIMIT` matching rows. They do
+not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last
 primary key as the caller's next exclusive cursor.
