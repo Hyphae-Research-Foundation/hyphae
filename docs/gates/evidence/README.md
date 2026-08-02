@@ -461,3 +461,15 @@ detectable.
   schema-v15 WSL2 release observation. It reports the ordered secondary
   range and its deliberately expensive unindexed differential baseline
   separately and remains outside G7.
+
+## Native ext4 Linux baseline
+
+- `native-ext4-linux-baseline-2026-08-02.md` binds the first native-Linux,
+  non-tmpfs execution of the schema-v15 smoke to exact source: an AWS EC2
+  devbox with the benchmark data directory on persistent ext4. It opens the
+  native-ext4 observation lane and its explicit warm/memory-durability,
+  virtualization, and non-comparability limits.
+- `native-microsecond-smoke-ext4-linux.json` is its clean schema-v15
+  release observation. Its numbers are a new devbox baseline, not
+  run-to-run comparable with the WSL2 or Windows receipts, and it remains
+  outside G7.

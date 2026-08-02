@@ -425,6 +425,17 @@ p50. This is an operator observation, not G2 or G7; composite
 equality-prefix secondary ranges, descending and streaming execution, and
 the complete correctness and performance matrices remain open.
 
+The [native ext4 Linux baseline
+evidence](evidence/native-ext4-linux-baseline-2026-08-02.md) executes the
+same schema-v15 smoke on native Linux for the first time, with the
+benchmark data directory on persistent ext4 rather than tmpfs. It opens
+the native-ext4 observation lane that the retention milestones name where
+"native-ext4/power-loss evidence remain open", but the run is warm,
+memory-durability, and concurrency one and does not fsync, so it covers
+neither power-loss nor physical-durability evidence. It closes no gate;
+its numbers are a new devbox baseline that is not run-to-run comparable
+with the WSL2 or Windows receipts.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
