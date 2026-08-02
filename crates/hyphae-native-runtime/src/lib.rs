@@ -10852,6 +10852,222 @@ mod tests {
         Ok(())
     }
 
+    fn seed_composite_secondary_join(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE accounts (
+                id BIGINT PRIMARY KEY,
+                region TEXT,
+                plan_code TEXT
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "CREATE TABLE plans (
+                id BIGINT PRIMARY KEY,
+                region TEXT,
+                code TEXT,
+                label TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        for statement in [
+            "INSERT INTO accounts (id, region, plan_code) VALUES (1, 'latam', 'pro')",
+            "INSERT INTO accounts (id, region, plan_code) VALUES (2, NULL, 'pro')",
+            "INSERT INTO accounts (id, region, plan_code) VALUES (3, 'latam', NULL)",
+            "INSERT INTO accounts (id, region, plan_code) VALUES (4, 'latam', 'missing')",
+            "INSERT INTO plans (id, region, code, label)
+             VALUES (100, 'latam', 'pro', 'Pro LATAM')",
+        ] {
+            seed.execute_sql(statement, &[])?;
+        }
+        seed.execute_sql(
+            "CREATE UNIQUE INDEX plans_region_code ON plans (region, code)",
+            &[],
+        )?;
+        seed.execute_sql("CREATE INDEX plans_label_code ON plans (label, code)", &[])?;
+        seed.commit()?;
+        Ok(())
+    }
+
+    fn composite_secondary_join_query() -> &'static str {
+        "SELECT accounts.id, plans.label
+         FROM accounts
+         INNER JOIN plans
+           ON accounts.plan_code = plans.code
+          AND accounts.region = plans.region
+         WHERE id = ?"
+    }
+
+    #[test]
+    fn composite_unique_secondary_inner_join_handles_order_nulls_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_composite_secondary_join(&mut database)?;
+        let expected = expected_account_plan(1, "Pro LATAM");
+        let snapshot = database.snapshot(11)?;
+        let snapshot_plan = snapshot.prepare_sql(composite_secondary_join_query())?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &[SqlValue::Signed(1)])?,
+            expected
+        );
+        let latest_plan = database.prepare_sql_latest(composite_secondary_join_query())?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &[SqlValue::Signed(1)])?,
+            expected
+        );
+        for id in [2, 3, 4, 404] {
+            assert_eq!(
+                database.execute_prepared_latest(&latest_plan, &[SqlValue::Signed(id)])?,
+                SqlResult::Rows {
+                    columns: vec!["accounts.id".to_owned(), "plans.label".to_owned()],
+                    rows: Vec::new(),
+                }
+            );
+        }
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(composite_secondary_join_query())?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[SqlValue::Signed(1)])?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_unique_secondary_inner_join_reads_private_updates_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_composite_secondary_join(&mut database)?;
+        let historical = database.snapshot(11)?;
+        let historical_plan = historical.prepare_sql(composite_secondary_join_query())?;
+        let mut transaction = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            transaction.execute_sql(
+                &format!("EXPLAIN {}", composite_secondary_join_query()),
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=primary-key,right_table=2,right_access=unique-secondary(index=3))"
+                        .to_owned(),
+                )]],
+            }
+        );
+        transaction.execute_sql(
+            "UPDATE plans
+             SET region = 'north-america', code = 'plus', label = 'Plus NA'
+             WHERE id = 100",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "UPDATE accounts
+             SET region = 'north-america', plan_code = 'plus'
+             WHERE id = 1",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO plans (id, region, code, label)
+             VALUES (200, 'latam', 'enterprise', 'Enterprise LATAM')",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO accounts (id, region, plan_code)
+             VALUES (5, 'latam', 'enterprise')",
+            &[],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(composite_secondary_join_query(), &[SqlValue::Signed(1)],)?,
+            expected_account_plan(1, "Plus NA")
+        );
+        assert_eq!(
+            transaction.execute_sql(composite_secondary_join_query(), &[SqlValue::Signed(5)],)?,
+            expected_account_plan(5, "Enterprise LATAM")
+        );
+        transaction.commit()?;
+        assert_eq!(
+            historical.execute_prepared(&historical_plan, &[SqlValue::Signed(1)])?,
+            expected_account_plan(1, "Pro LATAM")
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(composite_secondary_join_query())?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[SqlValue::Signed(1)])?,
+            expected_account_plan(1, "Plus NA")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_inner_join_rejects_partial_duplicate_mismatched_and_nonunique_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_composite_secondary_join(&mut database)?;
+        let mut transaction = database.begin_sql(11, DurabilityClass::Strict)?;
+        for (query, expected_error) in [
+            (
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans ON accounts.plan_code = plans.code
+                 WHERE id = ?",
+                SqlError::NoAccessPath,
+            ),
+            (
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans
+                   ON accounts.plan_code = plans.code
+                  AND accounts.plan_code = plans.region
+                 WHERE id = ?",
+                SqlError::DuplicateColumn,
+            ),
+            (
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans
+                   ON accounts.plan_code = plans.code
+                  AND accounts.region = plans.code
+                 WHERE id = ?",
+                SqlError::DuplicateColumn,
+            ),
+            (
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans
+                   ON accounts.id = plans.code
+                  AND accounts.region = plans.region
+                 WHERE id = ?",
+                SqlError::TypeMismatch,
+            ),
+            (
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans
+                   ON accounts.plan_code = plans.code
+                  AND accounts.region = plans.label
+                 WHERE id = ?",
+                SqlError::NoAccessPath,
+            ),
+        ] {
+            let actual = transaction.execute_sql(query, &[SqlValue::Signed(1)]);
+            assert_eq!(
+                actual.as_ref().err().map(std::mem::discriminant),
+                Some(std::mem::discriminant(&expected_error))
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn bounded_secondary_index_select_matches_every_executor()
     -> Result<(), Box<dyn std::error::Error>> {
