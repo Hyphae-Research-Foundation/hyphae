@@ -10619,6 +10619,68 @@ mod tests {
     }
 
     #[test]
+    fn right_unique_secondary_inner_join_matches_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE accounts (
+                id BIGINT PRIMARY KEY,
+                plan_code TEXT
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "CREATE TABLE plans (
+                id BIGINT PRIMARY KEY,
+                code TEXT NOT NULL,
+                label TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO accounts (id, plan_code) VALUES (1, 'pro')",
+            &[],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO plans (id, code, label) VALUES (100, 'pro', 'Pro')",
+            &[],
+        )?;
+        seed.execute_sql("CREATE UNIQUE INDEX plans_code ON plans (code)", &[])?;
+        seed.commit()?;
+        let query = "SELECT accounts.id, plans.label
+                     FROM accounts
+                     INNER JOIN plans ON accounts.plan_code = plans.code
+                     WHERE id = ?";
+        let parameters = [SqlValue::Signed(1)];
+        let expected = SqlResult::Rows {
+            columns: vec!["accounts.id".to_owned(), "plans.label".to_owned()],
+            rows: vec![vec![SqlValue::Signed(1), SqlValue::Text("Pro".to_owned())]],
+        };
+        let snapshot = database.snapshot(11)?;
+        let snapshot_plan = snapshot.prepare_sql(query)?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &parameters)?,
+            expected
+        );
+        let latest_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            expected
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn bounded_secondary_index_select_matches_every_executor()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
