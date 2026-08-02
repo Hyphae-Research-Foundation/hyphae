@@ -384,6 +384,15 @@ the structure format is `HYSTRBT2`, and every mutation is one canonical scalar
 delete. It otherwise fails closed. `HYSTRBT1` and whole-state compatibility
 formats keep their materialized fallback.
 
+The admitted `HYSTRBT2` cleanup resolves every scalar tombstone and matching
+expiry-index tombstone against the captured structure root, sorts the complete
+physical key/value set, and publishes it through one ordered B+tree batch.
+Each affected existing node is rewritten at most once for that cleanup; an
+unaffected subtree retains its prior page ID. Duplicate physical identities or
+any scalar/index mismatch fail before the batch can publish. Cleanup evidence
+must report both latency and pages appended so a faster result cannot hide
+greater write amplification.
+
 Recovery reconstructs pending work directly from the durable ordered
 namespace. It requires a one-to-one match between every live expiry identity
 and every scalar envelope carrying that exact timestamp. Missing, duplicate,

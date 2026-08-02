@@ -111,6 +111,15 @@ pub struct MutationResult {
     pub pages_written: usize,
 }
 
+/// Result of one ordered multi-key copy-on-write mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchMutationResult {
+    /// New immutable tree root.
+    pub tree: BTree,
+    /// Number of newly appended pages.
+    pub pages_written: usize,
+}
+
 /// Immutable root identity for one binary B+tree generation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BTree {
@@ -257,6 +266,56 @@ impl BTree {
         value: Vec<u8>,
     ) -> Result<MutationResult, BTreeError> {
         self.mutate(store, creating_csn, key, value, MutationMode::Upsert)
+    }
+
+    /// Inserts or replaces one strictly ordered, duplicate-free key batch.
+    ///
+    /// An empty batch is a no-op. All input entries are validated before the
+    /// first page append. Existing nodes reached by multiple keys are decoded
+    /// and rewritten once for this batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BTreeError::NoncanonicalKeyOrder`] for duplicate or unordered
+    /// keys and otherwise fails on storage, codec, split, height, or entry-size
+    /// errors.
+    pub fn upsert_sorted_batch(
+        self,
+        store: &mut PageStore,
+        creating_csn: Csn,
+        entries: Vec<KeyValue>,
+    ) -> Result<BatchMutationResult, BTreeError> {
+        if entries.is_empty() {
+            return Ok(BatchMutationResult {
+                tree: self,
+                pages_written: 0,
+            });
+        }
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        for (key, value) in &entries {
+            ensure_leaf_entry_fits(key, value)?;
+        }
+
+        let updates = entries
+            .into_iter()
+            .map(|(key, value)| LeafEntry { key, value })
+            .collect::<Vec<_>>();
+        let starting_pages = store.page_count();
+        let references = if let Some(root) = self.root {
+            let minimum = leftmost_key(store, root)?;
+            rewrite_node_batch(store, root, creating_csn, &updates, &minimum, 0)?
+        } else {
+            append_leaf_level(store, creating_csn, updates)?
+        };
+        let tree = assemble_batch_root(store, creating_csn, references)?;
+        let pages_written = usize::try_from(store.page_count() - starting_pages)
+            .map_err(|_| BTreeError::LengthOverflow)?;
+        Ok(BatchMutationResult {
+            tree,
+            pages_written,
+        })
     }
 
     fn mutate(
@@ -544,6 +603,12 @@ enum Rewrite {
     },
 }
 
+#[derive(Debug)]
+struct ChildReference {
+    minimum: Vec<u8>,
+    page: PageId,
+}
+
 enum LookupStep {
     Descend(PageId),
     Value(Option<Range<usize>>),
@@ -738,6 +803,241 @@ fn rewrite_node(
     }
 }
 
+fn leftmost_key(store: &PageStore, mut page_id: PageId) -> Result<Vec<u8>, BTreeError> {
+    let mut visited = [0_u64; MAX_TREE_HEIGHT];
+    for depth in 0..MAX_TREE_HEIGHT {
+        if visited[..depth].contains(&page_id.get()) {
+            return Err(BTreeError::Cycle);
+        }
+        visited[depth] = page_id.get();
+        match read_node(store, page_id)? {
+            Node::Leaf(entries) => {
+                return entries
+                    .first()
+                    .map(|entry| entry.key.clone())
+                    .ok_or(BTreeError::InvalidCount);
+            }
+            Node::Internal { children, .. } => {
+                page_id = *children.first().ok_or(BTreeError::InvalidCount)?;
+            }
+        }
+    }
+    Err(BTreeError::HeightExceeded)
+}
+
+fn rewrite_node_batch(
+    store: &mut PageStore,
+    page_id: PageId,
+    creating_csn: Csn,
+    updates: &[LeafEntry],
+    known_minimum: &[u8],
+    depth: usize,
+) -> Result<Vec<ChildReference>, BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    match read_node(store, page_id)? {
+        Node::Leaf(entries) => {
+            let merged = merge_leaf_updates(entries, updates);
+            append_leaf_level(store, creating_csn, merged)
+        }
+        Node::Internal { keys, children } => {
+            let mut rewritten_children = Vec::with_capacity(children.len());
+            let mut update_start = 0;
+            for (index, child) in children.into_iter().enumerate() {
+                let update_end = keys.get(index).map_or(updates.len(), |upper| {
+                    update_start
+                        + updates[update_start..]
+                            .partition_point(|entry| entry.key.as_slice() < upper.as_slice())
+                });
+                let child_minimum = index
+                    .checked_sub(1)
+                    .and_then(|prior| keys.get(prior))
+                    .map_or(known_minimum, Vec::as_slice);
+                if update_start == update_end {
+                    rewritten_children.push(ChildReference {
+                        minimum: child_minimum.to_vec(),
+                        page: child,
+                    });
+                } else {
+                    rewritten_children.extend(rewrite_node_batch(
+                        store,
+                        child,
+                        creating_csn,
+                        &updates[update_start..update_end],
+                        child_minimum,
+                        depth + 1,
+                    )?);
+                }
+                update_start = update_end;
+            }
+            if update_start != updates.len() {
+                return Err(BTreeError::NoncanonicalKeyOrder);
+            }
+            append_internal_level(store, creating_csn, rewritten_children)
+        }
+    }
+}
+
+fn merge_leaf_updates(entries: Vec<LeafEntry>, updates: &[LeafEntry]) -> Vec<LeafEntry> {
+    let mut existing = entries.into_iter().peekable();
+    let mut merged = Vec::with_capacity(existing.len().saturating_add(updates.len()));
+    for update in updates {
+        while existing.peek().is_some_and(|entry| entry.key < update.key) {
+            if let Some(entry) = existing.next() {
+                merged.push(entry);
+            }
+        }
+        if existing.peek().is_some_and(|entry| entry.key == update.key) {
+            existing.next();
+        }
+        merged.push(update.clone());
+    }
+    merged.extend(existing);
+    merged
+}
+
+fn append_leaf_level(
+    store: &mut PageStore,
+    creating_csn: Csn,
+    entries: Vec<LeafEntry>,
+) -> Result<Vec<ChildReference>, BTreeError> {
+    if entries.is_empty() {
+        return Err(BTreeError::InvalidCount);
+    }
+    let mut references = Vec::new();
+    let mut page_entries = Vec::new();
+    let mut encoded_length = LEAF_HEADER_SIZE;
+    for entry in entries {
+        let entry_length = leaf_entry_encoded_length(&entry)?;
+        if !page_entries.is_empty()
+            && encoded_length
+                .checked_add(entry_length)
+                .ok_or(BTreeError::LengthOverflow)?
+                > PAGE_PAYLOAD_SIZE
+        {
+            references.push(append_leaf_reference(
+                store,
+                creating_csn,
+                std::mem::take(&mut page_entries),
+            )?);
+            encoded_length = LEAF_HEADER_SIZE;
+        }
+        encoded_length = encoded_length
+            .checked_add(entry_length)
+            .ok_or(BTreeError::LengthOverflow)?;
+        page_entries.push(entry);
+    }
+    if !page_entries.is_empty() {
+        references.push(append_leaf_reference(store, creating_csn, page_entries)?);
+    }
+    Ok(references)
+}
+
+fn append_leaf_reference(
+    store: &mut PageStore,
+    creating_csn: Csn,
+    entries: Vec<LeafEntry>,
+) -> Result<ChildReference, BTreeError> {
+    let minimum = entries
+        .first()
+        .map(|entry| entry.key.clone())
+        .ok_or(BTreeError::InvalidCount)?;
+    let page = append_node(store, creating_csn, &Node::Leaf(entries))?;
+    Ok(ChildReference { minimum, page })
+}
+
+fn append_internal_level(
+    store: &mut PageStore,
+    creating_csn: Csn,
+    references: Vec<ChildReference>,
+) -> Result<Vec<ChildReference>, BTreeError> {
+    let group_sizes = internal_group_sizes(&references)?;
+    let mut references = references.into_iter();
+    let mut parents = Vec::with_capacity(group_sizes.len());
+    for group_size in group_sizes {
+        let group = references.by_ref().take(group_size).collect::<Vec<_>>();
+        if group.len() != group_size {
+            return Err(BTreeError::InvalidCount);
+        }
+        let minimum = group
+            .first()
+            .map(|reference| reference.minimum.clone())
+            .ok_or(BTreeError::InvalidCount)?;
+        let keys = group
+            .iter()
+            .skip(1)
+            .map(|reference| reference.minimum.clone())
+            .collect();
+        let children = group.iter().map(|reference| reference.page).collect();
+        let page = append_node(store, creating_csn, &Node::Internal { keys, children })?;
+        parents.push(ChildReference { minimum, page });
+    }
+    if references.next().is_some() {
+        return Err(BTreeError::InvalidCount);
+    }
+    Ok(parents)
+}
+
+fn internal_group_sizes(references: &[ChildReference]) -> Result<Vec<usize>, BTreeError> {
+    if references.len() < 2 {
+        return Err(BTreeError::InvalidCount);
+    }
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < references.len() {
+        let remaining = references.len() - start;
+        if remaining < 2 {
+            return Err(BTreeError::NoValidSplit);
+        }
+        let mut group_size = 2;
+        let mut encoded_length = INTERNAL_HEADER_SIZE
+            .checked_add(internal_separator_encoded_length(
+                &references[start + 1].minimum,
+            )?)
+            .ok_or(BTreeError::LengthOverflow)?;
+        while group_size < remaining {
+            let next_length =
+                internal_separator_encoded_length(&references[start + group_size].minimum)?;
+            if encoded_length
+                .checked_add(next_length)
+                .ok_or(BTreeError::LengthOverflow)?
+                > PAGE_PAYLOAD_SIZE
+            {
+                break;
+            }
+            encoded_length += next_length;
+            group_size += 1;
+        }
+        if remaining - group_size == 1 {
+            if group_size == 2 {
+                return Err(BTreeError::NoValidSplit);
+            }
+            group_size -= 1;
+        }
+        groups.push(group_size);
+        start += group_size;
+    }
+    Ok(groups)
+}
+
+fn assemble_batch_root(
+    store: &mut PageStore,
+    creating_csn: Csn,
+    mut references: Vec<ChildReference>,
+) -> Result<BTree, BTreeError> {
+    for _ in 0..MAX_TREE_HEIGHT {
+        match references.len() {
+            0 => return Err(BTreeError::InvalidCount),
+            1 => return Ok(BTree::from_root(references[0].page)),
+            _ => {
+                references = append_internal_level(store, creating_csn, references)?;
+            }
+        }
+    }
+    Err(BTreeError::HeightExceeded)
+}
+
 fn append_node(
     store: &mut PageStore,
     creating_csn: Csn,
@@ -904,6 +1204,15 @@ fn leaf_encoded_length(entries: &[LeafEntry]) -> Result<usize, BTreeError> {
     })
 }
 
+fn leaf_entry_encoded_length(entry: &LeafEntry) -> Result<usize, BTreeError> {
+    u32::try_from(entry.key.len()).map_err(|_| BTreeError::LengthOverflow)?;
+    u32::try_from(entry.value.len()).map_err(|_| BTreeError::LengthOverflow)?;
+    8_usize
+        .checked_add(entry.key.len())
+        .and_then(|length| length.checked_add(entry.value.len()))
+        .ok_or(BTreeError::LengthOverflow)
+}
+
 fn internal_encoded_length(keys: &[Vec<u8>]) -> Result<usize, BTreeError> {
     keys.iter().try_fold(INTERNAL_HEADER_SIZE, |total, key| {
         u32::try_from(key.len()).map_err(|_| BTreeError::LengthOverflow)?;
@@ -912,6 +1221,13 @@ fn internal_encoded_length(keys: &[Vec<u8>]) -> Result<usize, BTreeError> {
             .and_then(|size| size.checked_add(key.len()))
             .ok_or(BTreeError::LengthOverflow)
     })
+}
+
+fn internal_separator_encoded_length(key: &[u8]) -> Result<usize, BTreeError> {
+    u32::try_from(key.len()).map_err(|_| BTreeError::LengthOverflow)?;
+    12_usize
+        .checked_add(key.len())
+        .ok_or(BTreeError::LengthOverflow)
 }
 
 fn ensure_leaf_entry_fits(key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
@@ -1373,7 +1689,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use hyphae_native_pages::{BufferPool, PageKind, PageStore};
+    use hyphae_native_pages::{BufferPool, PAGE_PAYLOAD_SIZE, PageKind, PageStore};
     use hyphae_native_types::Csn;
 
     use super::{BTree, BTreeError, LeafEntry, Node, encode_leaf};
@@ -1703,6 +2019,184 @@ mod tests {
             updated.tree.get_cached(&store, &pool, b"k")?,
             Some(b"two".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_batch_coalesces_copy_on_write_paths_and_preserves_old_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let batch_directory = TestDirectory::create()?;
+        let sequential_directory = TestDirectory::create()?;
+        let mut batch_store = PageStore::create(batch_directory.page_file())?;
+        let mut sequential_store = PageStore::create(sequential_directory.page_file())?;
+        let mut batch_tree = BTree::empty();
+        let mut sequential_tree = BTree::empty();
+        for index in 0..2_048_u32 {
+            let key = index.to_be_bytes().to_vec();
+            let value = vec![u8::try_from(index % 251)?; 64];
+            batch_tree = batch_tree
+                .insert_unique(&mut batch_store, Csn::new(1)?, key.clone(), value.clone())?
+                .tree;
+            sequential_tree = sequential_tree
+                .insert_unique(&mut sequential_store, Csn::new(1)?, key, value)?
+                .tree;
+        }
+        assert!(batch_tree.height(&batch_store)? >= 2);
+        let old_batch_tree = batch_tree;
+        let updates = (512..768_u32)
+            .map(|index| -> Result<_, std::num::TryFromIntError> {
+                Ok((
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 197)?; 96],
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let batch =
+            batch_tree.upsert_sorted_batch(&mut batch_store, Csn::new(2)?, updates.clone())?;
+        let sequential_start = sequential_store.page_count();
+        for (key, value) in updates {
+            sequential_tree = sequential_tree
+                .upsert(&mut sequential_store, Csn::new(2)?, key, value)?
+                .tree;
+        }
+        let sequential_pages = usize::try_from(
+            sequential_store
+                .page_count()
+                .checked_sub(sequential_start)
+                .ok_or("sequential page count regressed")?,
+        )?;
+
+        assert!(batch.pages_written < sequential_pages);
+        assert_eq!(
+            batch.tree.scan(&batch_store)?,
+            sequential_tree.scan(&sequential_store)?
+        );
+        assert_eq!(
+            old_batch_tree.get(&batch_store, &512_u32.to_be_bytes())?,
+            Some(vec![u8::try_from(512 % 251)?; 64])
+        );
+        assert_eq!(old_batch_tree.validate(&batch_store)?, 2_048);
+        assert_eq!(batch.tree.validate(&batch_store)?, 2_048);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_batch_rejects_invalid_input_before_appending_pages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let tree = BTree::empty()
+            .insert_unique(
+                &mut store,
+                Csn::new(1)?,
+                b"existing".to_vec(),
+                b"value".to_vec(),
+            )?
+            .tree;
+        let initial_pages = store.page_count();
+
+        let empty = tree.upsert_sorted_batch(&mut store, Csn::new(2)?, Vec::new())?;
+        assert_eq!(empty.tree, tree);
+        assert_eq!(empty.pages_written, 0);
+        assert_eq!(store.page_count(), initial_pages);
+
+        for invalid in [
+            vec![
+                (b"duplicate".to_vec(), b"one".to_vec()),
+                (b"duplicate".to_vec(), b"two".to_vec()),
+            ],
+            vec![
+                (b"second".to_vec(), b"two".to_vec()),
+                (b"first".to_vec(), b"one".to_vec()),
+            ],
+        ] {
+            assert!(matches!(
+                tree.upsert_sorted_batch(&mut store, Csn::new(2)?, invalid),
+                Err(BTreeError::NoncanonicalKeyOrder)
+            ));
+            assert_eq!(store.page_count(), initial_pages);
+        }
+        assert!(matches!(
+            tree.upsert_sorted_batch(
+                &mut store,
+                Csn::new(2)?,
+                vec![(b"oversized".to_vec(), vec![0; PAGE_PAYLOAD_SIZE])],
+            ),
+            Err(BTreeError::EntryTooLarge)
+        ));
+        assert_eq!(store.page_count(), initial_pages);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_batch_builds_a_balanced_multilevel_tree_from_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let entries = (0..4_096_u32)
+            .map(|index| -> Result<_, std::num::TryFromIntError> {
+                Ok((
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 251)?; 96],
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = BTree::empty().upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?;
+
+        assert_eq!(u64::try_from(batch.pages_written)?, store.page_count());
+        assert!(batch.tree.height(&store)? >= 2);
+        assert_eq!(batch.tree.validate(&store)?, 4_096);
+        for index in [0_u32, 1, 2_047, 4_095] {
+            assert_eq!(
+                batch.tree.get(&store, &index.to_be_bytes())?,
+                Some(vec![u8::try_from(index % 251)?; 96])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_batch_retains_unaffected_root_children() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for index in 0..2_048_u32 {
+            tree = tree
+                .insert_unique(
+                    &mut store,
+                    Csn::new(1)?,
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 251)?; 64],
+                )?
+                .tree;
+        }
+        let target = 1_024_u32.to_be_bytes();
+        let (old_keys, old_children) =
+            match super::read_node(&store, tree.root().ok_or("missing old root")?)? {
+                Node::Internal { keys, children } => (keys, children),
+                Node::Leaf(_) => return Err("expected a multilevel old tree".into()),
+            };
+        let changed_child = super::child_index(&old_keys, &target);
+        let batch = tree.upsert_sorted_batch(
+            &mut store,
+            Csn::new(2)?,
+            vec![(target.to_vec(), vec![b'x'; 64])],
+        )?;
+        let new_children =
+            match super::read_node(&store, batch.tree.root().ok_or("missing new root")?)? {
+                Node::Internal { children, .. } => children,
+                Node::Leaf(_) => return Err("expected a multilevel new tree".into()),
+            };
+
+        assert_eq!(new_children.len(), old_children.len());
+        for (index, (old, new)) in old_children.iter().zip(&new_children).enumerate() {
+            if index == changed_child {
+                assert_ne!(new, old);
+            } else {
+                assert_eq!(new, old);
+            }
+        }
         Ok(())
     }
 

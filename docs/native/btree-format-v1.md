@@ -1,11 +1,11 @@
 # Native B+tree format v1
 
 Status: normative experimental format; copy-on-write insertion, replacement,
-recursive splitting, point lookup, ordered scan, bounded prefix scan,
-reentrant buffered prefix visitation, complete validation, balanced-height
-validation, historical roots, and allocation-free buffer-pool point traversal
-are implemented; relational, structure, and lexical-search namespaces now use
-the native tree
+ordered multi-key replacement, recursive splitting, point lookup, ordered
+scan, bounded prefix scan, reentrant buffered prefix visitation, complete
+validation, balanced-height validation, historical roots, and allocation-free
+buffer-pool point traversal are implemented or implementation-gated;
+relational, structure, and lexical-search namespaces use the native tree
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -91,6 +91,26 @@ Insertion descends through immutable nodes, rewrites only the affected path,
 and splits nodes when their exact encoded payload exceeds the page capacity.
 A root split appends a new internal root. Insert-only mode rejects an existing
 key; upsert returns the prior value. Old roots remain readable.
+
+Ordered multi-key upsert accepts a strictly increasing, duplicate-free sequence
+of canonical key/value pairs. An empty sequence is a no-op. The complete input
+is validated for key order and leaf-entry fit before any page is appended.
+Duplicate, descending, oversized, or individually unencodable entries fail
+without changing the page count.
+
+One batch partitions its ordered changes through the existing separator
+ranges. Every reached existing node is decoded at most once for that batch;
+each affected leaf merges all of its changes before it is encoded, and each
+affected internal level is rebuilt once from changed and retained child
+references. Unaffected subtrees retain their exact page IDs. A leaf or
+internal node may split into multiple nodes, and the root grows by as many
+levels as required within the canonical height bound.
+
+The result reports the new immutable root and exact appended-page count. Batch
+publication does not weaken transaction atomicity: the engine root remains
+unpublished until the owning WAL transaction and global root set commit.
+Callers that require sequential same-key semantics must coalesce those
+operations before invoking the ordered batch.
 
 No published page is changed in place. Pages appended by an interrupted
 transaction remain unreachable until a WAL-committed root set names the new
@@ -229,8 +249,9 @@ implicit conversion. New directories use the B+tree format.
 Current tests cover a stable leaf golden, 1,000 inserts with recursive splits,
 balanced-height verification, point reads, ordered and prefix scans (including
 an all-`0xff` upper range), retained historical roots, duplicate/upsert
-semantics, buffered lookup/scan, oversized and noncanonical rejection,
-complete-node validation after an early key match, and future-node rejection.
+semantics, ordered-batch equivalence and path coalescing, buffered lookup/scan,
+oversized and noncanonical rejection, complete-node validation after an early
+key match, and future-node rejection.
 Buffered visitor coverage additionally proves exclusive resume, early stop,
 multilevel traversal, order equivalence with the materialized prefix scan, and
 exhaustion after the final key. Bound-aware visitor coverage proves inclusive

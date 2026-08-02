@@ -5120,11 +5120,15 @@ fn commit_engine_roots(
         roots[2] = structure_root_after_mutations(
             pages,
             roots[2],
-            structure_format,
             commit_csn,
-            &batch.state.structures,
-            &batch.mutations,
-            blob_references,
+            &StructureMutationContext {
+                format: structure_format,
+                mode: batch.mode,
+                logical_time_micros: batch.snapshot.logical_time_micros,
+                state: &batch.state.structures,
+                mutations: &batch.mutations,
+                blob_references,
+            },
         )?;
     }
     if batch.dirty[3] || roots[3].is_none() {
@@ -7051,32 +7055,100 @@ fn upsert_scalar_structure_mutation(
         .tree)
 }
 
+struct StructureMutationContext<'a> {
+    format: StructureFormat,
+    mode: NativeWriteBatchMode,
+    logical_time_micros: i64,
+    state: &'a StructureState,
+    mutations: &'a [Mutation],
+    blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
+}
+
 fn structure_root_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
-    format: StructureFormat,
     creating_csn: Csn,
-    state: &StructureState,
-    mutations: &[Mutation],
-    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+    context: &StructureMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
-    match format {
+    if context.mode == NativeWriteBatchMode::PhysicalStructureExpiry {
+        if context.format != StructureFormat::BTreeV2 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        return Ok(physical_expiry_tree_after_mutations(
+            pages,
+            root,
+            creating_csn,
+            context.logical_time_micros,
+            context.mutations,
+        )?
+        .root());
+    }
+    match context.format {
         StructureFormat::InlineStateV1 => Ok(Some(pages.append(
             PageKind::StructureNode,
             Some(creating_csn),
             None,
-            state.encode()?,
+            context.state.encode()?,
         )?)),
         StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => Ok(structure_tree_after_mutations(
             pages,
             root,
-            format,
+            context.format,
             creating_csn,
-            mutations,
-            blob_references,
+            context.mutations,
+            context.blob_references,
         )?
         .root()),
     }
+}
+
+fn physical_expiry_tree_after_mutations(
+    pages: &mut PageStore,
+    root: Option<PageId>,
+    creating_csn: Csn,
+    logical_time_micros: i64,
+    mutations: &[Mutation],
+) -> Result<BTree, NativeRuntimeError> {
+    let tree = BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?);
+    let mut physical_entries = Vec::with_capacity(
+        mutations
+            .len()
+            .checked_mul(2)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+    );
+    for mutation in mutations {
+        if mutation.engine != EngineKind::Structure
+            || mutation.opcode != Opcode::DeleteValue
+            || mutation.target.is_some()
+            || !mutation.value.is_empty()
+            || mutation.expires_at_micros.is_some()
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let scalar_key = structure_key(&mutation.key);
+        let scalar = tree
+            .get(pages, &scalar_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let expiry = structure_value_expiry(&scalar)?
+            .filter(|expiry| *expiry <= logical_time_micros)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+        if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        physical_entries.push((scalar_key, structure_tombstone_value()));
+        physical_entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
+    physical_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if physical_entries
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, physical_entries)?
+        .tree)
 }
 
 fn search_tree_after_mutations(
@@ -9235,10 +9307,11 @@ mod tests {
     };
 
     use super::{
-        AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome,
-        HnswConfig, NativeDatabase, NativeRuntimeError, NativeWriteBatch, PAGE_FILE,
-        RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue,
-        Vector, VectorMetric, ZAddOutcome,
+        AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, EngineKind,
+        HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError, NativeWriteBatch,
+        Opcode, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, Vector, VectorMetric, ZAddOutcome,
+        physical_expiry_tree_after_mutations,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -9900,6 +9973,82 @@ mod tests {
             database.get_latest_structure(b"physical-expiry", i64::MIN)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hystrbt2_cleanup_coalesces_physical_copy_on_write_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        for index in 0..512_u32 {
+            let key = index.to_be_bytes().to_vec();
+            seed.set(key.clone(), key, Some(10))?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+        let pages_before = database.pages.page_count();
+
+        let cleanup = database.expire_due_structures(10, 64, DurabilityClass::Memory)?;
+        let pages_appended = database
+            .pages
+            .page_count()
+            .checked_sub(pages_before)
+            .ok_or("cleanup page count regressed")?;
+
+        assert_eq!(cleanup.expired_keys, 64);
+        assert!(cleanup.more_due);
+        assert!(
+            pages_appended < u64::try_from(cleanup.expired_keys)?,
+            "cleanup appended {pages_appended} pages for {} keys",
+            cleanup.expired_keys
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_expiry_batch_rejects_stale_or_duplicate_work_before_page_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"lease".to_vec(), b"value".to_vec(), Some(10))?;
+        seed.commit()?;
+        let snapshot = database.coordinator.snapshot(10)?;
+        let root = snapshot.roots().root(super::SLOT_STRUCTURE);
+        let mutation = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteValue,
+            target: None,
+            key: b"lease".to_vec(),
+            value: Vec::new(),
+            expires_at_micros: None,
+        };
+        let pages_before = database.pages.page_count();
+
+        assert!(matches!(
+            physical_expiry_tree_after_mutations(
+                &mut database.pages,
+                root,
+                Csn::new(2)?,
+                9,
+                std::slice::from_ref(&mutation),
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        assert_eq!(database.pages.page_count(), pages_before);
+        assert!(matches!(
+            physical_expiry_tree_after_mutations(
+                &mut database.pages,
+                root,
+                Csn::new(2)?,
+                10,
+                &[mutation.clone(), mutation],
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(database.pages.page_count(), pages_before);
         Ok(())
     }
 
