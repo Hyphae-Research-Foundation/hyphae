@@ -66,8 +66,8 @@ use crate::{
         bm25_term_score, normalize_list_range,
     },
     wal_codec::{
-        Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_checkpoint,
-        encode_transaction, recover_wal,
+        Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_abort,
+        encode_checkpoint, encode_transaction, recover_wal,
     },
 };
 
@@ -279,6 +279,9 @@ pub enum NativeRuntimeError {
     /// The requested data directory already exists.
     #[error("native data directory already exists")]
     DataDirectoryExists,
+    /// A page-generation-like directory entry is not one canonical filename.
+    #[error("native data directory contains a noncanonical page-generation entry")]
+    UnexpectedPageGenerationEntry,
     /// A committed root is missing or has the wrong page kind.
     #[error("committed native root is missing or has the wrong page kind")]
     InvalidCommittedRoot,
@@ -357,6 +360,16 @@ pub enum NativeRuntimeError {
     /// Recovered commit sequences are not contiguous.
     #[error("recovered native commit sequence is not contiguous")]
     NoncontiguousCommitSequence,
+    /// A detached writer predates the oldest retained physical root.
+    #[error(
+        "native write snapshot CSN {read_csn} predates retained physical floor {retention_floor_csn}"
+    )]
+    SnapshotBelowRetentionFloor {
+        /// Detached snapshot used to prepare the write.
+        read_csn: Csn,
+        /// Oldest physical root retained by the active page generation.
+        retention_floor_csn: Csn,
+    },
     /// A checkpoint does not match its manifest, WAL commit, or root set.
     #[error("native checkpoint does not match the verified manifest/WAL chain")]
     InvalidCheckpoint,
@@ -372,6 +385,9 @@ pub enum NativeRuntimeError {
     /// A deterministic checkpoint interruption was requested.
     #[error("native checkpoint interrupted at {0:?}; reopen the data directory")]
     InjectedCheckpointCrash(CheckpointBoundary),
+    /// A deterministic page-vacuum interruption was requested.
+    #[error("native page vacuum interrupted at {0:?}; reopen the data directory")]
+    InjectedVacuumCrash(VacuumBoundary),
     /// Test-only guard proving a path does not materialize all engine state.
     #[cfg(test)]
     #[error("unexpected complete native state materialization")]
@@ -423,6 +439,23 @@ pub enum CheckpointBoundary {
     WalAppended,
     /// The manifest and its WAL checkpoint record are synchronized.
     WalSynchronized,
+}
+
+/// Deterministic page-generation vacuum boundary used by the crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VacuumBoundary {
+    /// The complete candidate exists only under its temporary filename.
+    CandidateSynchronized,
+    /// The candidate has its final generation filename but no WAL authority.
+    CandidatePublished,
+    /// The vacuum transaction is appended but not explicitly synchronized.
+    WalAppended,
+    /// WAL authority selects the new generation but roots are not in memory.
+    WalSynchronized,
+    /// The new roots and page store are active while the prior file remains.
+    RootPublished,
+    /// The prior page-file generation has been removed.
+    PriorGenerationRemoved,
 }
 
 /// TTL state for one native structure key.
@@ -518,6 +551,12 @@ pub struct RecoveryReport {
     pub committed_transactions: usize,
     /// Latest recovered visible CSN.
     pub visible_csn: Option<Csn>,
+    /// Page-file generation selected by the latest committed WAL record.
+    pub active_page_generation: PageGeneration,
+    /// Oldest CSN whose physical roots remain available.
+    pub retention_floor_csn: Option<Csn>,
+    /// Interrupted or retired page-generation files removed after validation.
+    pub recovered_page_generation_files: usize,
     /// Number of verified immutable root manifests.
     pub manifest_count: usize,
     /// Number of semantically verified WAL checkpoint anchors.
@@ -580,6 +619,25 @@ pub struct StructureCompactionReceipt {
     /// New B+tree pages appended for the replacement root.
     pub pages_appended: u64,
     /// Native maintenance commit, absent when no tombstone existed.
+    pub commit: Option<CommitReceipt>,
+}
+
+/// Receipt for one current-root physical page-generation vacuum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageVacuumReceipt {
+    /// Whether a smaller generation replaced the active page file.
+    pub applied: bool,
+    /// Active generation before the attempt.
+    pub previous_generation: PageGeneration,
+    /// Active generation after the attempt.
+    pub active_generation: PageGeneration,
+    /// Complete pages in the prior generation.
+    pub previous_page_count: u64,
+    /// Complete pages in the retained generation.
+    pub active_page_count: u64,
+    /// Pages physically reclaimed by generation replacement.
+    pub reclaimed_pages: u64,
+    /// Vacuum commit, absent when the candidate was not smaller.
     pub commit: Option<CommitReceipt>,
 }
 
@@ -1073,6 +1131,9 @@ impl NativeDatabase {
                 wal_tail_bytes_removed: 0,
                 committed_transactions: 0,
                 visible_csn: None,
+                active_page_generation: PageGeneration::FIRST,
+                retention_floor_csn: None,
+                recovered_page_generation_files: 0,
                 manifest_count: 0,
                 checkpoint_count: 0,
                 recovered_temporary_manifests: 0,
@@ -1095,8 +1156,8 @@ impl NativeDatabase {
         let path = path.as_ref();
         let blobs = BlobStore::open(path)?;
         let blob_recovery = blobs.recovery()?;
-        let opened_wal = WalFile::open(path.join(WAL_FILE))?;
-        let recovered_wal = recover_wal(&opened_wal.recovery.records)?;
+        let mut opened_wal = WalFile::open(path.join(WAL_FILE))?;
+        let recovered_wal = recover_wal_and_close_dangling(&mut opened_wal)?;
         let commits = &recovered_wal.commits;
         validate_commit_sequence(commits)?;
         let active_page_generation = commits.last().map_or(PageGeneration::FIRST, |commit| {
@@ -1137,6 +1198,8 @@ impl NativeDatabase {
         )?;
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
+        let recovered_page_generation_files =
+            cleanup_page_generation_files(path, active_page_generation)?;
         let coordinator = if let Some(root) = latest_root {
             CommitCoordinator::restore(root)?
         } else {
@@ -1175,6 +1238,11 @@ impl NativeDatabase {
                 wal_tail_bytes_removed: opened_wal.recovery.truncated_tail_bytes,
                 committed_transactions: commits.len(),
                 visible_csn,
+                active_page_generation,
+                retention_floor_csn: commits
+                    .last()
+                    .map(|commit| commit.manifest.retention_floor_csn),
+                recovered_page_generation_files,
                 manifest_count: manifest_recovery.manifests.len(),
                 checkpoint_count: recovered_wal.checkpoints.len(),
                 recovered_temporary_manifests: manifest_recovery.ignored_temporary_files,
@@ -2842,6 +2910,16 @@ impl NativeDatabase {
         let conflict_read_csn = batch.snapshot.visible_csn;
         let logical_time_micros = batch.snapshot.logical_time_micros;
         let root_transaction = self.coordinator.begin_write()?;
+        if let (Some(read_csn), Some(retention_floor_csn)) = (
+            conflict_read_csn,
+            root_transaction.base_roots().retention_floor_csn(),
+        ) && read_csn < retention_floor_csn
+        {
+            return Err(NativeRuntimeError::SnapshotBelowRetentionFloor {
+                read_csn,
+                retention_floor_csn,
+            });
+        }
         let write_keys = mutation_write_keys(&batch.mutations);
         self.conflicts.validate(conflict_read_csn, &write_keys)?;
 
@@ -2866,6 +2944,139 @@ impl NativeDatabase {
             batch,
         }
         .commit_at(interruption)
+    }
+
+    /// Rebuilds the current logical root set into a smaller immutable page
+    /// generation and publishes it through one strict WAL commit.
+    ///
+    /// A candidate that is not physically smaller is removed without
+    /// advancing the CSN. Immutable blobs are not reclaimed by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page corruption, candidate divergence, filesystem
+    /// publication, WAL synchronization, or MVCC publication failure.
+    pub fn vacuum_pages(&mut self) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        self.vacuum_pages_at(None)
+    }
+
+    /// Runs page vacuum with one deterministic crash-matrix interruption.
+    ///
+    /// After an injected interruption the caller must drop the database handle
+    /// and reopen the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedVacuumCrash`] at the requested
+    /// boundary, or another page-vacuum failure.
+    pub fn vacuum_pages_with_interruption(
+        &mut self,
+        boundary: VacuumBoundary,
+    ) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        self.vacuum_pages_at(Some(boundary))
+    }
+
+    fn vacuum_pages_at(
+        &mut self,
+        interruption: Option<VacuumBoundary>,
+    ) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        let current = self.coordinator.snapshot(0)?;
+        let previous_generation = current.roots().page_generation();
+        let previous_page_count = self.pages.page_count();
+        if current.visible_csn.is_none() {
+            return Ok(page_vacuum_noop(previous_generation, previous_page_count));
+        }
+
+        let mut root_transaction = self.coordinator.begin_write()?;
+        let vacuum_csn = root_transaction.commit_csn()?;
+        let next_generation = previous_generation
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let candidate = build_page_generation_candidate(
+            &PageGenerationBuildContext {
+                data_directory: &self.data_directory,
+                source: &self.pages,
+                blobs: &self.blobs,
+                base_roots: root_transaction.base_roots(),
+                formats: (
+                    self.relational_format,
+                    self.structure_format,
+                    self.search_format,
+                ),
+                generation: next_generation,
+                vacuum_csn,
+            },
+            interruption,
+        )?;
+        let active_page_count = candidate.page_count;
+        if active_page_count >= previous_page_count {
+            fs::remove_file(&candidate.temporary_path)?;
+            return Ok(page_vacuum_noop(previous_generation, previous_page_count));
+        }
+
+        fs::rename(&candidate.temporary_path, &candidate.final_path)?;
+        interrupt_vacuum(interruption, VacuumBoundary::CandidatePublished)?;
+        let replacement_pages = PageStore::open_generation(&candidate.final_path, next_generation)?;
+        let replacement_buffer =
+            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let wal_receipt = append_vacuum_wal(
+            &mut self.wal,
+            &VacuumWalContext {
+                transaction_id,
+                read_csn: root_transaction.read_csn(),
+                catalog_version: root_transaction.base_roots().catalog_version(),
+                commit_csn: vacuum_csn,
+                roots: candidate.roots,
+                blob_generation: root_transaction.base_roots().blob_generation(),
+                page_generation: next_generation,
+            },
+            interruption,
+        )?;
+
+        for (slot, page) in ROOT_SLOTS.into_iter().zip(candidate.roots) {
+            root_transaction.set_root(slot, page);
+        }
+        root_transaction.set_blob_generation(self.blobs.generation()?);
+        root_transaction.set_page_generation(next_generation);
+        root_transaction.set_retention_floor(vacuum_csn);
+        root_transaction.commit(
+            current.catalog_version,
+            WalAnchor::new(wal_receipt.lsn, wal_receipt.digest)?,
+        )?;
+        self.conflicts
+            .publish_committed(vacuum_csn, vec![vacuum_write_key()]);
+        self.next_transaction_id = transaction_id
+            .get()
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
+        let prior_pages = std::mem::replace(&mut self.pages, replacement_pages);
+        self.buffer_pool = replacement_buffer;
+        drop(prior_pages);
+        interrupt_vacuum(interruption, VacuumBoundary::RootPublished)?;
+        fs::remove_file(page_generation_path(
+            &self.data_directory,
+            previous_generation,
+        ))?;
+        interrupt_vacuum(interruption, VacuumBoundary::PriorGenerationRemoved)?;
+
+        Ok(PageVacuumReceipt {
+            applied: true,
+            previous_generation,
+            active_generation: next_generation,
+            previous_page_count,
+            active_page_count,
+            reclaimed_pages: previous_page_count - active_page_count,
+            commit: Some(CommitReceipt {
+                transaction_id,
+                commit_csn: vacuum_csn,
+                catalog_version: current.catalog_version,
+                commit_lsn: wal_receipt.lsn,
+                wal_block_digest: wal_receipt.digest,
+                durability: DurabilityClass::Strict,
+            }),
+        })
     }
 
     /// Publishes and WAL-anchors one synchronized immutable root checkpoint.
@@ -4915,15 +5126,8 @@ fn apply_mutations_to_state(
             | Opcode::DeleteSortedSetMember => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
-            Opcode::CompactStructure => {
-                if mutation.engine != EngineKind::Structure
-                    || mutation.target.is_some()
-                    || !mutation.key.is_empty()
-                    || !mutation.value.is_empty()
-                    || mutation.expires_at_micros.is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
+            Opcode::CompactStructure | Opcode::VacuumPageGeneration => {
+                validate_maintenance_mutation(mutation)?;
             }
             Opcode::CreateIndex => {
                 let index = mutation
@@ -4981,6 +5185,23 @@ fn apply_mutations_to_state(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntimeError> {
+    let expected_engine = match mutation.opcode {
+        Opcode::CompactStructure => EngineKind::Structure,
+        Opcode::VacuumPageGeneration => EngineKind::Kernel,
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    };
+    if mutation.engine != expected_engine
+        || mutation.target.is_some()
+        || !mutation.key.is_empty()
+        || !mutation.value.is_empty()
+        || mutation.expires_at_micros.is_some()
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     Ok(())
 }
@@ -5092,6 +5313,10 @@ fn apply_secondary_index_creation(
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
     for mutation in mutations {
+        if mutation.opcode == Opcode::VacuumPageGeneration {
+            keys.push(vacuum_write_key());
+            continue;
+        }
         let identity = match mutation.opcode {
             Opcode::SetValue
             | Opcode::DeleteValue
@@ -5181,6 +5406,17 @@ fn interrupt_checkpoint(
 ) -> Result<(), NativeRuntimeError> {
     if requested == Some(current) {
         Err(NativeRuntimeError::InjectedCheckpointCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
+fn interrupt_vacuum(
+    requested: Option<VacuumBoundary>,
+    current: VacuumBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedVacuumCrash(current))
     } else {
         Ok(())
     }
@@ -5303,6 +5539,264 @@ fn commit_engine_roots(
         )?;
     }
     Ok(roots)
+}
+
+struct PageGenerationBuildContext<'database> {
+    data_directory: &'database Path,
+    source: &'database PageStore,
+    blobs: &'database BlobStore,
+    base_roots: &'database RootSet,
+    formats: (RelationalFormat, StructureFormat, SearchFormat),
+    generation: PageGeneration,
+    vacuum_csn: Csn,
+}
+
+struct BuiltPageGeneration {
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    roots: [PageId; 4],
+    page_count: u64,
+}
+
+struct VacuumWalContext {
+    transaction_id: TransactionId,
+    read_csn: Option<Csn>,
+    catalog_version: CatalogVersion,
+    commit_csn: Csn,
+    roots: [PageId; 4],
+    blob_generation: u64,
+    page_generation: PageGeneration,
+}
+
+struct VacuumWalReceipt {
+    lsn: Lsn,
+    digest: [u8; 32],
+}
+
+fn append_vacuum_wal(
+    wal: &mut WalFile,
+    context: &VacuumWalContext,
+    interruption: Option<VacuumBoundary>,
+) -> Result<VacuumWalReceipt, NativeRuntimeError> {
+    let mutations = [Mutation {
+        engine: EngineKind::Kernel,
+        opcode: Opcode::VacuumPageGeneration,
+        target: None,
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_micros: None,
+    }];
+    let mut pending = encode_transaction(&TransactionPlan {
+        transaction_id: context.transaction_id,
+        read_csn: context.read_csn,
+        catalog_version: context.catalog_version,
+        logical_time_micros: 0,
+        durability: DurabilityClass::Strict,
+        mutations: &mutations,
+        commit_csn: context.commit_csn,
+        roots: context.roots,
+        blob_generation: context.blob_generation,
+        page_generation: context.page_generation,
+        retention_floor_csn: context.commit_csn,
+    })?;
+    let commit_record = pending.pop().ok_or(WalError::EmptyBlock)?;
+    wal.append_records(pending, false)?;
+    interrupt_vacuum(interruption, VacuumBoundary::WalAppended)?;
+    let receipts = wal.append_records(vec![commit_record], false)?;
+    wal.sync_data()?;
+    interrupt_vacuum(interruption, VacuumBoundary::WalSynchronized)?;
+    let block = receipts.last().ok_or(WalError::EmptyBlock)?;
+    Ok(VacuumWalReceipt {
+        lsn: block.last_lsn,
+        digest: block.digest,
+    })
+}
+
+fn vacuum_write_key() -> WriteKey {
+    WriteKey::new(EngineKind::Kernel, None, vec![u8::MAX])
+}
+
+fn build_page_generation_candidate(
+    context: &PageGenerationBuildContext<'_>,
+    interruption: Option<VacuumBoundary>,
+) -> Result<BuiltPageGeneration, NativeRuntimeError> {
+    let temporary_path = page_generation_temporary_path(context.data_directory, context.generation);
+    let final_path = page_generation_path(context.data_directory, context.generation);
+    let mut candidate = PageStore::create_generation(&temporary_path, context.generation)?;
+    let roots = match rebuild_page_generation(
+        context.source,
+        &mut candidate,
+        context.blobs,
+        context.base_roots,
+        context.formats,
+        context.vacuum_csn,
+    ) {
+        Ok(roots) => roots,
+        Err(source) => {
+            drop(candidate);
+            fs::remove_file(&temporary_path)?;
+            return Err(source);
+        }
+    };
+    if let Err(source) = candidate.sync_data() {
+        drop(candidate);
+        fs::remove_file(&temporary_path)?;
+        return Err(source.into());
+    }
+    interrupt_vacuum(interruption, VacuumBoundary::CandidateSynchronized)?;
+    let page_count = candidate.page_count();
+    drop(candidate);
+    Ok(BuiltPageGeneration {
+        temporary_path,
+        final_path,
+        roots,
+        page_count,
+    })
+}
+
+fn page_vacuum_noop(generation: PageGeneration, page_count: u64) -> PageVacuumReceipt {
+    PageVacuumReceipt {
+        applied: false,
+        previous_generation: generation,
+        active_generation: generation,
+        previous_page_count: page_count,
+        active_page_count: page_count,
+        reclaimed_pages: 0,
+        commit: None,
+    }
+}
+
+fn rebuild_page_generation(
+    source: &PageStore,
+    candidate: &mut PageStore,
+    blobs: &BlobStore,
+    base_roots: &RootSet,
+    formats: (RelationalFormat, StructureFormat, SearchFormat),
+    vacuum_csn: Csn,
+) -> Result<[PageId; 4], NativeRuntimeError> {
+    let source_state = load_state(source, blobs, base_roots)?;
+    let source_roots = require_roots(roots_from_snapshot(base_roots))?;
+    let catalog = copy_root_page(
+        source,
+        candidate,
+        source_roots[0],
+        PageKind::CatalogRoot,
+        vacuum_csn,
+    )?;
+    let relational =
+        rebuild_relational_root(source, candidate, source_roots[1], formats.0, vacuum_csn)?;
+    let structures = match formats.1 {
+        StructureFormat::InlineStateV1 => copy_root_page(
+            source,
+            candidate,
+            source_roots[2],
+            PageKind::StructureNode,
+            vacuum_csn,
+        )?,
+        StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => {
+            rebuild_btree_root(source, candidate, source_roots[2], vacuum_csn)?
+        }
+    };
+    let search = match formats.2 {
+        SearchFormat::InlineStateV1 => copy_root_page(
+            source,
+            candidate,
+            source_roots[3],
+            PageKind::SearchDelta,
+            vacuum_csn,
+        )?,
+        SearchFormat::InvertedBTreeV1 => {
+            rebuild_btree_root(source, candidate, source_roots[3], vacuum_csn)?
+        }
+    };
+    let roots = [catalog, relational, structures, search];
+    let candidate_roots = RootSet::committed_with_storage(
+        vacuum_csn,
+        base_roots.catalog_version(),
+        base_roots
+            .wal_anchor()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        root_map(roots),
+        base_roots.blob_generation(),
+        candidate.generation(),
+        vacuum_csn,
+    )?;
+    validate_roots(candidate, blobs, &candidate_roots, vacuum_csn)?;
+    if load_state(candidate, blobs, &candidate_roots)? != source_state {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    Ok(roots)
+}
+
+fn copy_root_page(
+    source: &PageStore,
+    candidate: &mut PageStore,
+    source_root: PageId,
+    expected_kind: PageKind,
+    vacuum_csn: Csn,
+) -> Result<PageId, NativeRuntimeError> {
+    let page = source.read(source_root)?;
+    if page.kind() != expected_kind || page.next().is_some() {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    Ok(candidate.append(
+        expected_kind,
+        Some(vacuum_csn),
+        None,
+        page.payload().to_vec(),
+    )?)
+}
+
+fn rebuild_btree_root(
+    source: &PageStore,
+    candidate: &mut PageStore,
+    source_root: PageId,
+    vacuum_csn: Csn,
+) -> Result<PageId, NativeRuntimeError> {
+    let entries = BTree::from_root(source_root).scan(source)?;
+    BTree::empty()
+        .upsert_sorted_batch(candidate, vacuum_csn, entries)?
+        .tree
+        .root()
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)
+}
+
+fn rebuild_relational_root(
+    source: &PageStore,
+    candidate: &mut PageStore,
+    source_root: PageId,
+    format: RelationalFormat,
+    vacuum_csn: Csn,
+) -> Result<PageId, NativeRuntimeError> {
+    let mut entries = BTree::from_root(source_root).scan(source)?;
+    if format == RelationalFormat::VersionChainV2 {
+        for (key, value) in &mut entries {
+            if key.first() != Some(&RELATIONAL_ROW_PREFIX) {
+                continue;
+            }
+            let pointer = RowVersionPointer::decode(value)?;
+            let head = source.read(pointer.page_id)?;
+            if head.kind() != PageKind::VersionChain {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            let row = RowRecord::decode(head.payload())?;
+            if row.end_csn().is_some() {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            let page_id = candidate.append(
+                PageKind::VersionChain,
+                Some(row.begin_csn()),
+                None,
+                head.payload().to_vec(),
+            )?;
+            *value = RowVersionPointer { page_id }.encode().to_vec();
+        }
+    }
+    BTree::empty()
+        .upsert_sorted_batch(candidate, vacuum_csn, entries)?
+        .tree
+        .root()
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)
 }
 
 fn validate_write_batch_shape(
@@ -8380,12 +8874,78 @@ fn page_generation_path(data_directory: &Path, generation: PageGeneration) -> Pa
     }
 }
 
+fn page_generation_temporary_path(data_directory: &Path, generation: PageGeneration) -> PathBuf {
+    let final_path = page_generation_path(data_directory, generation);
+    let mut temporary = final_path.into_os_string();
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
+}
+
+fn cleanup_page_generation_files(
+    data_directory: &Path,
+    active_generation: PageGeneration,
+) -> Result<usize, NativeRuntimeError> {
+    let mut removed = 0_usize;
+    for entry in fs::read_dir(data_directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let page_generation_like = name == PAGE_FILE || name.starts_with("pages-");
+        if page_generation_like && !entry.file_type()?.is_file() {
+            return Err(NativeRuntimeError::UnexpectedPageGenerationEntry);
+        }
+        let remove = if name == PAGE_FILE {
+            active_generation != PageGeneration::FIRST
+        } else if let Some(generation) = parse_page_generation_filename(name, ".hydb") {
+            generation != active_generation
+        } else if parse_page_generation_filename(name, ".hydb.tmp").is_some() {
+            true
+        } else if name.starts_with("pages-") {
+            return Err(NativeRuntimeError::UnexpectedPageGenerationEntry);
+        } else {
+            false
+        };
+        if remove {
+            fs::remove_file(entry.path())?;
+            removed = removed
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        }
+    }
+    Ok(removed)
+}
+
+fn parse_page_generation_filename(name: &str, suffix: &str) -> Option<PageGeneration> {
+    let value = name.strip_prefix("pages-")?.strip_suffix(suffix)?;
+    if value.len() != 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|generation| PageGeneration::new(generation).ok())
+}
+
 struct RetainedPageState<'database> {
     pages: &'database PageStore,
     blobs: &'database BlobStore,
     blob_generation: u64,
     active_generation: PageGeneration,
     retention_floor_csn: Csn,
+}
+
+fn recover_wal_and_close_dangling(
+    opened: &mut hyphae_native_wal::OpenedWal,
+) -> Result<RecoveredWal, NativeRuntimeError> {
+    let recovered = recover_wal(&opened.recovery.records)?;
+    if let Some(transaction_id) = recovered.dangling_transaction {
+        opened
+            .wal
+            .append_records(vec![encode_abort(transaction_id)?], true)?;
+    }
+    Ok(recovered)
 }
 
 fn recover_committed_roots(
@@ -9672,8 +10232,9 @@ mod tests {
         AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, EngineKind,
         HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError, NativeWriteBatch,
         Opcode, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, Vector, VectorMetric, ZAddOutcome, page_generation_path,
-        physical_expiry_tree_after_mutations, validate_commit_sequence,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, ZAddOutcome,
+        page_generation_path, physical_expiry_tree_after_mutations, rebuild_page_generation,
+        validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -9747,6 +10308,332 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn page_generation_rebuild_preserves_state_and_truncates_row_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "vacuum_rows")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.commit()?;
+        for version in 1..=12 {
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("value-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+
+        let base_roots = database.coordinator.snapshot(30)?.roots().clone();
+        let source_page_count = database.pages.page_count();
+        let candidate_path = temporary.path().join("pages-00000000000000000002.tmp");
+        let mut candidate = hyphae_native_pages::PageStore::create_generation(
+            &candidate_path,
+            PageGeneration::new(2)?,
+        )?;
+        let vacuum_csn = Csn::new(14)?;
+        let roots = rebuild_page_generation(
+            &database.pages,
+            &mut candidate,
+            &database.blobs,
+            &base_roots,
+            (
+                database.relational_format,
+                database.structure_format,
+                database.search_format,
+            ),
+            vacuum_csn,
+        )?;
+        assert!(candidate.page_count() < source_page_count);
+
+        let pointer = hyphae_native_btree::BTree::from_root(roots[1])
+            .get(&candidate, &super::relational_row_key(table, b"key"))?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let pointer = hyphae_native_records::RowVersionPointer::decode(&pointer)?;
+        let head = candidate.read(pointer.page_id)?;
+        let row = hyphae_native_records::RowRecord::decode(head.payload())?;
+        assert_eq!(head.next(), None);
+        assert_eq!(row.begin_csn(), Csn::new(13)?);
+        assert_eq!(row.end_csn(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn page_vacuum_reclaims_file_space_rejects_stale_writers_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "vacuum_runtime")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.set(b"session".to_vec(), b"active".to_vec(), None)?;
+        let search = ObjectId::new(2)?;
+        seed.create_search_index(search, "vacuum_search")?;
+        seed.index_document(search, b"doc".to_vec(), "native vacuum search")?;
+        seed.commit()?;
+        for version in 1..=12 {
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("value-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        let historical = database.snapshot(30)?;
+        let mut stale = database.begin_optimistic(31, DurabilityClass::Strict)?;
+        stale.set(b"stale".to_vec(), b"writer".to_vec(), None)?;
+
+        let receipt = database.vacuum_pages()?;
+        assert!(receipt.applied);
+        assert_eq!(receipt.previous_generation, PageGeneration::FIRST);
+        assert_eq!(receipt.active_generation, PageGeneration::new(2)?);
+        assert!(receipt.reclaimed_pages > 0);
+        assert_eq!(
+            receipt.commit.map(|commit| commit.commit_csn),
+            Some(Csn::new(14)?)
+        );
+        assert!(!temporary.path().join(PAGE_FILE).exists());
+        assert!(
+            temporary
+                .path()
+                .join("pages-00000000000000000002.hydb")
+                .exists()
+        );
+        assert_eq!(
+            database.select_latest_relational(table, b"key")?,
+            Some(b"value-12".to_vec())
+        );
+        assert_eq!(
+            database.snapshot(30)?.get(b"session"),
+            Some(b"active".as_slice())
+        );
+        assert_eq!(
+            database.match_latest_text(search, "vacuum", 1)?[0].document_id,
+            b"doc"
+        );
+        assert_eq!(
+            historical.select(table, b"key"),
+            Some(b"value-12".as_slice())
+        );
+        let checkpoint = database.checkpoint()?;
+        assert_eq!(checkpoint.visible_csn, Csn::new(14)?);
+
+        let no_op = database.vacuum_pages()?;
+        assert!(!no_op.applied);
+        assert_eq!(no_op.active_generation, PageGeneration::new(2)?);
+        assert_eq!(no_op.commit, None);
+        assert!(
+            !temporary
+                .path()
+                .join("pages-00000000000000000003.hydb")
+                .exists()
+        );
+        assert!(matches!(
+            database.commit_optimistic(stale),
+            Err(NativeRuntimeError::SnapshotBelowRetentionFloor {
+                read_csn,
+                retention_floor_csn,
+            }) if read_csn == Csn::new(13)? && retention_floor_csn == Csn::new(14)?
+        ));
+
+        let mut later = database.begin(32, DurabilityClass::Strict)?;
+        later.set(b"after-vacuum".to_vec(), b"active".to_vec(), None)?;
+        assert_eq!(later.commit()?.commit_csn, Csn::new(15)?);
+        drop(database);
+
+        assert_reopened_vacuum_state(temporary.path(), table, search)?;
+        Ok(())
+    }
+
+    #[test]
+    fn page_vacuum_preserves_ann_generation_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let vectors = ObjectId::new(3)?;
+        let mario = ObjectId::new(101)?;
+        let romina = ObjectId::new(102)?;
+        let query = Vector::new([1.0, 0.0, 0.0])?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "vacuum_ann_rows")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.create_vector_index(
+            vectors,
+            "vacuum_vectors",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        seed.upsert_vectors(
+            vectors,
+            [
+                (mario, Vector::new([1.0, 0.0, 0.0])?),
+                (romina, Vector::new([0.0, 1.0, 0.0])?),
+            ],
+        )?;
+        seed.commit()?;
+        for version in 1..=8 {
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("value-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+
+        let before = database.search_ann_latest(vectors, &query, ann_options()?)?;
+        assert!(database.vacuum_pages()?.applied);
+        let after = database.search_ann_latest(vectors, &query, ann_options()?)?;
+        assert_eq!(after.build_identity, before.build_identity);
+        assert_eq!(after.hits, before.hits);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let recovered = reopened.search_ann_latest(vectors, &query, ann_options()?)?;
+        assert_eq!(recovered.build_identity, before.build_identity);
+        assert_eq!(recovered.hits, before.hits);
+        Ok(())
+    }
+
+    #[test]
+    fn every_page_vacuum_boundary_recovers_prior_or_complete_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            VacuumBoundary::CandidateSynchronized,
+            VacuumBoundary::CandidatePublished,
+            VacuumBoundary::WalAppended,
+            VacuumBoundary::WalSynchronized,
+            VacuumBoundary::RootPublished,
+            VacuumBoundary::PriorGenerationRemoved,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "vacuum_crash_matrix")?;
+            seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+            seed.commit()?;
+            for version in 1..=8 {
+                let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("value-{version}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+            assert!(matches!(
+                database.vacuum_pages_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedVacuumCrash(actual)) if actual == boundary
+            ));
+            drop(database);
+
+            let prior_expected = matches!(
+                boundary,
+                VacuumBoundary::CandidateSynchronized
+                    | VacuumBoundary::CandidatePublished
+                    | VacuumBoundary::WalAppended
+            );
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let expected_generation = if prior_expected { 1 } else { 2 };
+            let expected_commits = if prior_expected { 9 } else { 10 };
+            assert_eq!(
+                reopened.recovery_report().active_page_generation,
+                PageGeneration::new(expected_generation)?
+            );
+            assert_eq!(
+                reopened.recovery_report().committed_transactions,
+                expected_commits
+            );
+            assert_eq!(
+                reopened.select_latest_relational(table, b"key")?,
+                Some(b"value-8".to_vec())
+            );
+            assert_eq!(temporary.path().join(PAGE_FILE).exists(), prior_expected);
+            assert_eq!(
+                temporary
+                    .path()
+                    .join("pages-00000000000000000002.hydb")
+                    .exists(),
+                !prior_expected
+            );
+            drop(reopened);
+
+            let stable = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                stable.recovery_report().active_page_generation,
+                PageGeneration::new(expected_generation)?
+            );
+            assert_eq!(stable.recovery_report().recovered_page_generation_files, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_candidate_without_wal_authority_is_removed_unread()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "orphan_candidate")?;
+        seed.insert(table, b"key".to_vec(), b"value-0".to_vec())?;
+        seed.commit()?;
+        for version in 1..=8 {
+            let mut update = database.begin(10 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("value-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        assert!(matches!(
+            database.vacuum_pages_with_interruption(VacuumBoundary::CandidatePublished),
+            Err(NativeRuntimeError::InjectedVacuumCrash(
+                VacuumBoundary::CandidatePublished
+            ))
+        ));
+        drop(database);
+
+        let orphan = temporary.path().join("pages-00000000000000000002.hydb");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&orphan)?;
+        file.seek(SeekFrom::Start(100))?;
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)?;
+        file.seek(SeekFrom::Current(-1))?;
+        byte[0] ^= 1;
+        file.write_all(&byte)?;
+        file.sync_data()?;
+        drop(file);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.recovery_report().active_page_generation,
+            PageGeneration::FIRST
+        );
+        assert_eq!(
+            reopened.recovery_report().recovered_page_generation_files,
+            1
+        );
+        assert!(!orphan.exists());
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"value-8".to_vec())
+        );
+        Ok(())
+    }
+
     struct TestDirectory {
         path: PathBuf,
     }
@@ -9771,6 +10658,37 @@ mod tests {
         fn drop(&mut self) {
             let _ignored = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn assert_reopened_vacuum_state(
+        path: &Path,
+        table: ObjectId,
+        search: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reopened = NativeDatabase::open(path)?;
+        assert_eq!(
+            reopened.recovery_report().active_page_generation,
+            PageGeneration::new(2)?
+        );
+        assert_eq!(
+            reopened.recovery_report().retention_floor_csn,
+            Some(Csn::new(14)?)
+        );
+        assert_eq!(reopened.recovery_report().committed_transactions, 15);
+        assert_eq!(reopened.recovery_report().manifest_count, 1);
+        assert_eq!(reopened.recovery_report().checkpoint_count, 1);
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"value-12".to_vec())
+        );
+        let snapshot = reopened.snapshot(33)?;
+        assert_eq!(snapshot.get(b"after-vacuum"), Some(b"active".as_slice()));
+        assert_eq!(snapshot.get(b"session"), Some(b"active".as_slice()));
+        assert_eq!(
+            reopened.match_latest_text(search, "vacuum", 1)?[0].document_id,
+            b"doc"
+        );
+        Ok(())
     }
 
     fn stage_vertical(

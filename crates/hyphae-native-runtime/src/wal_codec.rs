@@ -65,6 +65,7 @@ pub(crate) enum Opcode {
     UpsertSortedSetMember = 26,
     DeleteSortedSetMember = 27,
     CompactStructure = 28,
+    VacuumPageGeneration = 29,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +218,7 @@ pub(crate) struct RecoveredCheckpoint {
 pub(crate) struct RecoveredWal {
     pub(crate) commits: Vec<RecoveredCommit>,
     pub(crate) checkpoints: Vec<RecoveredCheckpoint>,
+    pub(crate) dangling_transaction: Option<TransactionId>,
 }
 
 pub(crate) struct TransactionPlan<'mutations> {
@@ -345,6 +347,18 @@ pub(crate) fn encode_checkpoint(
     )?)
 }
 
+pub(crate) fn encode_abort(
+    transaction_id: TransactionId,
+) -> Result<PendingRecord, WalSemanticError> {
+    Ok(PendingRecord::new(
+        RecordKind::Abort,
+        EngineKind::Kernel,
+        0,
+        transaction_id,
+        ABORT_MAGIC.to_vec(),
+    )?)
+}
+
 pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSemanticError> {
     let mut recovered = RecoveredWal::default();
     let mut active: Option<ActiveTransaction> = None;
@@ -438,6 +452,7 @@ pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSema
             }
         }
     }
+    recovered.dangling_transaction = active.map(|transaction| transaction.transaction_id);
     Ok(recovered)
 }
 
@@ -606,6 +621,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::CompactStructure as u8 => {
             (Opcode::CompactStructure, EngineKind::Structure)
         }
+        value if value == Opcode::VacuumPageGeneration as u8 => {
+            (Opcode::VacuumPageGeneration, EngineKind::Kernel)
+        }
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
@@ -682,13 +700,11 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
-    if opcode == Opcode::CompactStructure {
-        return validate_structure_compaction_shape(
-            has_target,
-            value_length,
-            expires_at_micros,
-            key,
-        );
+    if matches!(
+        opcode,
+        Opcode::CompactStructure | Opcode::VacuumPageGeneration
+    ) {
+        return validate_empty_maintenance_shape(has_target, value_length, expires_at_micros, key);
     }
     match opcode {
         Opcode::SetValue
@@ -797,7 +813,7 @@ fn validate_mutation_identity(
     Ok(())
 }
 
-fn validate_structure_compaction_shape(
+fn validate_empty_maintenance_shape(
     has_target: bool,
     value_length: usize,
     expires_at_micros: Option<i64>,
@@ -1202,6 +1218,27 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutation_shape(Opcode::CompactStructure, false, 0, Some(10), b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn page_vacuum_requires_an_empty_kernel_maintenance_body() {
+        assert!(validate_mutation_shape(Opcode::VacuumPageGeneration, false, 0, None, b"").is_ok());
+        assert!(matches!(
+            validate_mutation_shape(Opcode::VacuumPageGeneration, true, 0, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::VacuumPageGeneration, false, 0, None, b"key"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::VacuumPageGeneration, false, 1, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::VacuumPageGeneration, false, 0, Some(10), b""),
             Err(WalSemanticError::InvalidBody)
         ));
     }
