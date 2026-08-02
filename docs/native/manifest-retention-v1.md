@@ -1,7 +1,8 @@
 # Native manifest retention v1
 
-Status: normative target contract; implementation and exit evidence are
-pending
+Status: normative contract; anchored retained-chain open, identity-preserving
+prefix retirement, idempotent partial cleanup, fail-closed validation, runtime
+instrumentation, and local Windows/WSL2 observations are implemented
 
 This protocol bounds root-manifest verification after current-root WAL
 retention. It uses the existing `HYWAR001` anchor as the compacted-history

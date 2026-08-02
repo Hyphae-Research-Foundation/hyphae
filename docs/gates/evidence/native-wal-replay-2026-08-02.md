@@ -151,8 +151,8 @@ Environment:
 
 - Debian userspace under WSL2 kernel
   `6.18.33.1-microsoft-standard-WSL2`;
-- repository resolved through `/mnt/e/...`; and
-- filesystem reported by `statfs` as `v9fs`, not native ext4.
+- repository resolved through `/mnt/e/...`, reported as `v9fs`; and
+- benchmark data under `/tmp`, reported as `tmpfs`.
 
 Raw observation:
 [native-wal-replay-wsl2.json](native-wal-replay-wsl2.json).
@@ -181,7 +181,7 @@ improved by 15.461882 times.
 | anchor stabilization | 0.007 ms |
 | total | 1.134 ms |
 
-The WSL2 directory is exposed through `v9fs`. Its synchronization timings are
+The WSL2 benchmark data directory was `tmpfs`. Its synchronization timings are
 not treated as native Linux filesystem or physical-durability evidence.
 
 ## Mechanical validation

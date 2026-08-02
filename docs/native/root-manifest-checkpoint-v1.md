@@ -3,7 +3,8 @@
 Status: normative experimental format; immutable manifest publication,
 digest-chain recovery, WAL checkpoint records, cross-validation, temporary
 stage recovery, page-generation V2 metadata, and deterministic interruption
-tests are implemented
+tests are implemented; `HYWAR001`-anchored retained-chain recovery and
+manifest-prefix retirement are also implemented
 
 The WAL remains transaction authority. A root manifest is an immutable,
 content-authenticated snapshot of one already committed all-engine `RootSet`.
@@ -95,10 +96,11 @@ During open, Hyphae verifies that every checkpoint:
 
 Without a retention anchor, recovery scans the complete WAL. With a verified
 `HYWAR001` anchor, current-root retention and bounded suffix replay are
-implemented. Manifest recovery still verifies from generation one in this
-source commit. The identity-preserving design that makes `HYWAR001` the later
-manifest-chain trust root is fixed separately by [Native manifest retention
-v1](manifest-retention-v1.md).
+implemented. The same anchor selects one exact immutable manifest generation
+and digest as the retained-chain trust root, so recovery no longer reads
+retired lower generations. The identity-preserving publication, partial
+cleanup, failure, and evidence rules are fixed separately by [Native manifest
+retention v1](manifest-retention-v1.md).
 
 ## Interruption states
 
