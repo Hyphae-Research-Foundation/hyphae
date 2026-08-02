@@ -73,6 +73,15 @@ use crate::{
 
 const PAGE_FILE: &str = "pages.hydb";
 const WAL_FILE: &str = "wal.hywal";
+const CATALOG_FORMAT_KEY: &[u8] = b"\x00";
+const CATALOG_FORMAT_VALUE_V3: &[u8] = b"HYCAT003";
+const CATALOG_OBJECT_PREFIX: u8 = 1;
+const CATALOG_NAME_PREFIX: u8 = 2;
+const CATALOG_VALUE_MAGIC: &[u8; 8] = b"HYCVAL01";
+const CATALOG_VALUE_HEADER_SIZE: usize = 16;
+const CATALOG_VALUE_INLINE: u8 = 0;
+const CATALOG_VALUE_BLOB: u8 = 1;
+const CATALOG_INLINE_VALUE_LIMIT: usize = 8_192;
 const RELATIONAL_FORMAT_KEY: &[u8] = b"\x00";
 const RELATIONAL_FORMAT_VALUE_V1: &[u8] = b"HYRELBT1";
 const RELATIONAL_FORMAT_VALUE_V2: &[u8] = b"HYRELBT2";
@@ -288,6 +297,9 @@ pub enum NativeRuntimeError {
     /// A committed page was created after the commit that references it.
     #[error("committed native page has a future creating CSN")]
     FuturePage,
+    /// The catalog B+tree contains malformed or cross-linked namespace entries.
+    #[error("native catalog B+tree namespace is invalid")]
+    InvalidCatalogTree,
     /// The relational B+tree contains malformed namespace keys or markers.
     #[error("native relational B+tree namespace is invalid")]
     InvalidRelationalTree,
@@ -1290,7 +1302,7 @@ impl NativeDatabase {
             .coordinator
             .snapshot(0)
             .map_err(NativeRuntimeError::from)?;
-        let catalog = load_catalog_state(&self.pages, metadata.roots())?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, metadata.roots())?;
         sql::prepare_catalog(metadata.catalog_version, &catalog, statement)
     }
 
@@ -4801,7 +4813,9 @@ impl NativeTransaction<'_> {
         let catalog_version = self.commit_catalog_version()?;
         let batch = self.batch;
         let synchronize = batch.durability != DurabilityClass::Memory;
-        let staged_blobs = stage_large_values(self.blobs, &batch.mutations, synchronize)?;
+        let roots = roots_from_snapshot(batch.snapshot.roots());
+        let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
+        let staged_blobs = stage_large_values(self.blobs, &batch, rebuild_catalog, synchronize)?;
         interrupt(interruption, CommitBoundary::BlobStaged)?;
         let blob_references = publish_staged_blobs(self.blobs, staged_blobs, synchronize)?;
         let blob_generation = self.blobs.generation()?;
@@ -4810,7 +4824,7 @@ impl NativeTransaction<'_> {
         let roots = commit_engine_roots(
             self.pages,
             self.blobs,
-            roots_from_snapshot(batch.snapshot.roots()),
+            roots,
             self.relational_format,
             self.structure_format,
             self.search_format,
@@ -5490,12 +5504,15 @@ fn commit_engine_roots(
 ) -> Result<[Option<PageId>; 4], NativeRuntimeError> {
     validate_write_batch_shape(batch, &roots, structure_format, search_format)?;
     if batch.dirty[0] || roots[0].is_none() {
-        roots[0] = Some(pages.append(
-            PageKind::CatalogRoot,
-            Some(commit_csn),
-            None,
-            batch.state.catalog.encode()?,
-        )?);
+        roots[0] = catalog_root_after_mutations(
+            pages,
+            blobs,
+            roots[0],
+            commit_csn,
+            &batch.state.catalog,
+            &batch.mutations,
+            blob_references,
+        )?;
     }
     if batch.dirty[1] || roots[1].is_none() {
         roots[1] = relational_tree_after_mutations(
@@ -5542,6 +5559,190 @@ fn commit_engine_roots(
         )?;
     }
     Ok(roots)
+}
+
+fn catalog_requires_full_rebuild(
+    pages: &PageStore,
+    root: Option<PageId>,
+) -> Result<bool, NativeRuntimeError> {
+    let Some(root) = root else {
+        return Ok(true);
+    };
+    let page = pages.read(root)?;
+    match page.kind() {
+        PageKind::CatalogRoot => Ok(true),
+        PageKind::BTreeLeaf | PageKind::BTreeInternal => {
+            let marker = BTree::from_root(root)
+                .get(pages, CATALOG_FORMAT_KEY)?
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            if marker == CATALOG_FORMAT_VALUE_V3 {
+                Ok(false)
+            } else {
+                Err(NativeRuntimeError::InvalidCatalogTree)
+            }
+        }
+        _ => Err(NativeRuntimeError::InvalidCatalogTree),
+    }
+}
+
+fn catalog_root_after_mutations(
+    pages: &mut PageStore,
+    blobs: &BlobStore,
+    root: Option<PageId>,
+    commit_csn: Csn,
+    catalog: &CatalogState,
+    mutations: &[Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Option<PageId>, NativeRuntimeError> {
+    let rebuild = catalog_requires_full_rebuild(pages, root)?;
+    let tree = if rebuild {
+        let mut entries = Vec::with_capacity(
+            catalog
+                .objects
+                .len()
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(1))
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
+        );
+        entries.push((
+            CATALOG_FORMAT_KEY.to_vec(),
+            CATALOG_FORMAT_VALUE_V3.to_vec(),
+        ));
+        for object in catalog.objects.values() {
+            append_catalog_object_entries(&mut entries, object, blob_references)?;
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        BTree::empty()
+            .upsert_sorted_batch(pages, commit_csn, entries)?
+            .tree
+    } else {
+        let root = root.ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        let existing = BTree::from_root(root);
+        let mut entries = Vec::new();
+        for mutation in mutations
+            .iter()
+            .filter(|mutation| is_catalog_creation(mutation.opcode))
+        {
+            let object = catalog_object_from_creation_mutation(mutation)?;
+            let object_key = catalog_object_key(object.header().id);
+            let name_key = catalog_name_key(object.header())?;
+            if existing.get(pages, &object_key)?.is_some()
+                || existing.get(pages, &name_key)?.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidCatalogTree);
+            }
+            append_catalog_object_entries(&mut entries, &object, blob_references)?;
+        }
+        if entries.is_empty() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        existing
+            .upsert_sorted_batch(pages, commit_csn, entries)?
+            .tree
+    };
+    let root = tree.root().ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+    if load_catalog_state_root(pages, blobs, root)? != *catalog {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    Ok(Some(root))
+}
+
+fn append_catalog_object_entries(
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    object: &CatalogObject,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<(), NativeRuntimeError> {
+    let definition = object.encode_definition()?;
+    entries.push((
+        catalog_object_key(object.header().id),
+        catalog_definition_storage_value(&definition, blob_references)?,
+    ));
+    entries.push((
+        catalog_name_key(object.header())?,
+        object.header().id.get().to_be_bytes().to_vec(),
+    ));
+    Ok(())
+}
+
+fn catalog_definition_storage_value(
+    definition: &[u8],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let uses_blob = definition.len() > CATALOG_INLINE_VALUE_LIMIT;
+    let payload_length = if uses_blob {
+        hyphae_native_records::BLOB_REFERENCE_SIZE
+    } else {
+        definition.len()
+    };
+    let mut encoded = Vec::with_capacity(CATALOG_VALUE_HEADER_SIZE + payload_length);
+    encoded.extend_from_slice(CATALOG_VALUE_MAGIC);
+    encoded.push(if uses_blob {
+        CATALOG_VALUE_BLOB
+    } else {
+        CATALOG_VALUE_INLINE
+    });
+    encoded.extend_from_slice(&[0; 7]);
+    if uses_blob {
+        let digest = *blake3::hash(definition).as_bytes();
+        let reference = blob_references
+            .get(&digest)
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        encoded.extend_from_slice(&reference.encode());
+    } else {
+        encoded.extend_from_slice(definition);
+    }
+    Ok(encoded)
+}
+
+fn catalog_object_key(id: ObjectId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(CATALOG_OBJECT_PREFIX);
+    key.extend_from_slice(&id.get().to_be_bytes());
+    key
+}
+
+fn catalog_name_key(header: &ObjectHeader) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = catalog_name_identity(header)?;
+    let mut key = Vec::with_capacity(
+        identity
+            .len()
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
+    );
+    key.push(CATALOG_NAME_PREFIX);
+    key.extend_from_slice(&identity);
+    if key.len() > BTREE_MAX_KEY_SIZE {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    Ok(key)
+}
+
+const fn is_catalog_creation(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::CreateTable
+            | Opcode::CreateSecondaryIndex
+            | Opcode::CreateIndex
+            | Opcode::CreateAnnIndex
+    )
+}
+
+fn catalog_object_from_creation_mutation(
+    mutation: &Mutation,
+) -> Result<CatalogObject, NativeRuntimeError> {
+    let id = mutation
+        .target
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    match (mutation.engine, mutation.opcode) {
+        (EngineKind::Relational, Opcode::CreateTable) => decode_relation_creation(id, mutation),
+        (EngineKind::Relational, Opcode::CreateSecondaryIndex) => {
+            decode_secondary_index_creation(id, mutation)
+        }
+        (EngineKind::Search, Opcode::CreateIndex) => decode_search_creation(id, mutation),
+        (EngineKind::Search, Opcode::CreateAnnIndex) => decode_ann_creation(id, mutation),
+        _ => Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
 }
 
 struct PageGenerationBuildContext<'database> {
@@ -5679,13 +5880,19 @@ fn rebuild_page_generation(
 ) -> Result<[PageId; 4], NativeRuntimeError> {
     let source_state = load_state(source, blobs, base_roots)?;
     let source_roots = require_roots(roots_from_snapshot(base_roots))?;
-    let catalog = copy_root_page(
-        source,
-        candidate,
-        source_roots[0],
-        PageKind::CatalogRoot,
-        vacuum_csn,
-    )?;
+    let catalog = match source.read(source_roots[0])?.kind() {
+        PageKind::CatalogRoot => copy_root_page(
+            source,
+            candidate,
+            source_roots[0],
+            PageKind::CatalogRoot,
+            vacuum_csn,
+        )?,
+        PageKind::BTreeLeaf | PageKind::BTreeInternal => {
+            rebuild_btree_root(source, candidate, source_roots[0], vacuum_csn)?
+        }
+        _ => return Err(NativeRuntimeError::InvalidCatalogTree),
+    };
     let relational =
         rebuild_relational_root(source, candidate, source_roots[1], formats.0, vacuum_csn)?;
     let structures = match formats.1 {
@@ -5868,12 +6075,35 @@ fn validate_write_batch_shape(
 
 fn stage_large_values(
     blobs: &BlobStore,
-    mutations: &[Mutation],
+    batch: &NativeWriteBatch,
+    rebuild_catalog: bool,
     synchronize: bool,
 ) -> Result<BTreeMap<[u8; 32], StagedBlob>, NativeRuntimeError> {
     let mut staged = BTreeMap::new();
-    for mutation in mutations.iter().filter(|mutation| {
-        (mutation.engine == EngineKind::Relational
+    if batch.dirty[0] {
+        if rebuild_catalog {
+            for object in batch.state.catalog.objects.values() {
+                let definition = object.encode_definition()?;
+                if definition.len() > CATALOG_INLINE_VALUE_LIMIT {
+                    stage_blob_value(blobs, &mut staged, &definition, synchronize)?;
+                }
+            }
+        } else {
+            for mutation in batch
+                .mutations
+                .iter()
+                .filter(|mutation| is_catalog_creation(mutation.opcode))
+            {
+                let definition =
+                    catalog_object_from_creation_mutation(mutation)?.encode_definition()?;
+                if definition.len() > CATALOG_INLINE_VALUE_LIMIT {
+                    stage_blob_value(blobs, &mut staged, &definition, synchronize)?;
+                }
+            }
+        }
+    }
+    for mutation in &batch.mutations {
+        let large = (mutation.engine == EngineKind::Relational
             && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
             && mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Structure
@@ -5890,14 +6120,25 @@ fn stage_large_values(
                 && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Search
                 && mutation.opcode == Opcode::IndexDocument
-                && mutation.value.len() > SEARCH_INLINE_VALUE_LIMIT)
-    }) {
-        let digest = *blake3::hash(&mutation.value).as_bytes();
-        if let std::collections::btree_map::Entry::Vacant(entry) = staged.entry(digest) {
-            entry.insert(blobs.stage(&mutation.value, synchronize)?);
+                && mutation.value.len() > SEARCH_INLINE_VALUE_LIMIT);
+        if large {
+            stage_blob_value(blobs, &mut staged, &mutation.value, synchronize)?;
         }
     }
     Ok(staged)
+}
+
+fn stage_blob_value(
+    blobs: &BlobStore,
+    staged: &mut BTreeMap<[u8; 32], StagedBlob>,
+    value: &[u8],
+    synchronize: bool,
+) -> Result<(), NativeRuntimeError> {
+    let digest = *blake3::hash(value).as_bytes();
+    if let std::collections::btree_map::Entry::Vacant(entry) = staged.entry(digest) {
+        entry.insert(blobs.stage(value, synchronize)?);
+    }
+    Ok(())
 }
 
 fn publish_staged_blobs(
@@ -9066,7 +9307,10 @@ fn validate_roots(
         .root(SLOT_CATALOG)
         .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
     let catalog_page = pages.read(catalog_root)?;
-    if catalog_page.kind() != PageKind::CatalogRoot {
+    if !matches!(
+        catalog_page.kind(),
+        PageKind::CatalogRoot | PageKind::BTreeLeaf | PageKind::BTreeInternal
+    ) {
         return Err(NativeRuntimeError::InvalidCommittedRoot);
     }
     if catalog_page
@@ -9074,6 +9318,12 @@ fn validate_roots(
         .is_none_or(|creating| creating > visible_csn)
     {
         return Err(NativeRuntimeError::FuturePage);
+    }
+    if matches!(
+        catalog_page.kind(),
+        PageKind::BTreeLeaf | PageKind::BTreeInternal
+    ) {
+        BTree::from_root(catalog_root).validate_visible(pages, visible_csn)?;
     }
     let relational_root = roots
         .root(SLOT_RELATIONAL)
@@ -9150,7 +9400,7 @@ fn load_state(
     if FAIL_FULL_STATE_LOAD.get() {
         return Err(NativeRuntimeError::UnexpectedFullStateLoad);
     }
-    let catalog = load_catalog_state(pages, roots)?;
+    let catalog = load_catalog_state(pages, blobs, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
     let search = load_search_state(pages, blobs, roots)?;
     let ann = ann_store::load(pages, roots.root(SLOT_SEARCH), &catalog)?;
@@ -9165,16 +9415,126 @@ fn load_state(
 
 fn load_catalog_state(
     pages: &PageStore,
+    blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<CatalogState, NativeRuntimeError> {
-    Ok(load_root(
-        pages,
-        roots,
-        SLOT_CATALOG,
-        PageKind::CatalogRoot,
-        CatalogState::decode,
-    )?
-    .unwrap_or_default())
+    let Some(root) = roots.root(SLOT_CATALOG) else {
+        return Ok(CatalogState::default());
+    };
+    load_catalog_state_root(pages, blobs, root)
+}
+
+fn load_catalog_state_root(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<CatalogState, NativeRuntimeError> {
+    let page = pages.read(root)?;
+    if page.kind() == PageKind::CatalogRoot {
+        return Ok(CatalogState::decode(page.payload())?);
+    }
+    if !matches!(page.kind(), PageKind::BTreeLeaf | PageKind::BTreeInternal) {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let entries = BTree::from_root(root).scan(pages)?;
+    let mut iterator = entries.into_iter();
+    let Some((format_key, format_value)) = iterator.next() else {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    };
+    if format_key != CATALOG_FORMAT_KEY || format_value != CATALOG_FORMAT_VALUE_V3 {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+
+    let mut objects = Vec::new();
+    let mut names = BTreeMap::new();
+    for (key, value) in iterator {
+        match key.first().copied() {
+            Some(CATALOG_OBJECT_PREFIX) if key.len() == 17 => {
+                let id = ObjectId::new(u128::from_be_bytes(
+                    key[1..]
+                        .try_into()
+                        .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+                ))
+                .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+                let definition = decode_catalog_definition_storage_value(&value, blobs)?;
+                let object = CatalogObject::decode_definition(&definition)?;
+                if object.header().id != id {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+                objects.push(object);
+            }
+            Some(CATALOG_NAME_PREFIX) if key.len() > 1 && value.len() == 16 => {
+                let id = ObjectId::new(u128::from_be_bytes(
+                    value
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+                ))
+                .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+                if names.insert(key, id).is_some() {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+            }
+            _ => return Err(NativeRuntimeError::InvalidCatalogTree),
+        }
+    }
+
+    let mut expected_names = BTreeMap::new();
+    for object in &objects {
+        if expected_names
+            .insert(catalog_name_key(object.header())?, object.header().id)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+    }
+    if names != expected_names || names.len() != objects.len() {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+
+    let mut catalog = CatalogState::default();
+    for object in objects
+        .iter()
+        .filter(|object| !matches!(object, CatalogObject::SecondaryIndex(_)))
+    {
+        catalog.create(object.clone())?;
+    }
+    for object in objects
+        .into_iter()
+        .filter(|object| matches!(object, CatalogObject::SecondaryIndex(_)))
+    {
+        catalog.create(object)?;
+    }
+    if catalog.objects.len() != names.len() {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    Ok(catalog)
+}
+
+fn decode_catalog_definition_storage_value(
+    encoded: &[u8],
+    blobs: &BlobStore,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    if encoded.len() < CATALOG_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(CATALOG_VALUE_MAGIC.as_slice())
+        || encoded[9..CATALOG_VALUE_HEADER_SIZE]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let payload = &encoded[CATALOG_VALUE_HEADER_SIZE..];
+    match encoded[8] {
+        CATALOG_VALUE_INLINE if payload.len() <= CATALOG_INLINE_VALUE_LIMIT => Ok(payload.to_vec()),
+        CATALOG_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= CATALOG_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidCatalogTree);
+            }
+            Ok(blobs.read(reference)?)
+        }
+        _ => Err(NativeRuntimeError::InvalidCatalogTree),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9997,23 +10357,6 @@ fn search_format_for_root(
     }
 }
 
-fn load_root<T>(
-    pages: &PageStore,
-    roots: &RootSet,
-    slot: RootSlot,
-    expected_kind: PageKind,
-    decode: impl FnOnce(&[u8]) -> Result<T, ModelError>,
-) -> Result<Option<T>, NativeRuntimeError> {
-    let Some(page_id) = roots.root(slot) else {
-        return Ok(None);
-    };
-    let page = pages.read(page_id)?;
-    if page.kind() != expected_kind {
-        return Err(NativeRuntimeError::InvalidCommittedRoot);
-    }
-    Ok(Some(decode(page.payload())?))
-}
-
 fn decode_relation_creation(
     id: ObjectId,
     mutation: &Mutation,
@@ -10236,7 +10579,9 @@ mod tests {
         },
     };
 
+    use hyphae_native_btree::BTree;
     use hyphae_native_mvcc::WriteKey;
+    use hyphae_native_pages::PageKind;
     use hyphae_native_types::{
         CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
         Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
@@ -10245,11 +10590,18 @@ mod tests {
     use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
-        AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, EngineKind,
-        HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError, NativeWriteBatch,
-        Opcode, PAGE_FILE, RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError,
+        AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
+        CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
+        CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
+        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
+        EngineKind, HashSetOutcome, HnswConfig, Mutation, NativeDatabase, NativeRuntimeError,
+        NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
+        RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
         SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, ZAddOutcome,
-        page_generation_path, physical_expiry_tree_after_mutations, rebuild_page_generation,
+        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
+        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
+        decode_catalog_definition_storage_value, page_generation_path,
+        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
         validate_commit_sequence,
     };
 
@@ -10282,6 +10634,33 @@ mod tests {
                 retention_floor_csn: Csn::new(retention_floor_csn)?,
             },
             mutations: Vec::new(),
+        })
+    }
+
+    fn wide_catalog_relation(
+        id: ObjectId,
+    ) -> Result<RelationDefinition, Box<dyn std::error::Error>> {
+        let columns = (1_u32..=64)
+            .map(|sequence| {
+                Ok(ColumnDefinition {
+                    id: ColumnId::new(sequence)?,
+                    name: CatalogName::unquoted(format!(
+                        "catalog_column_{sequence:03}_{}",
+                        "x".repeat(180)
+                    ))?,
+                    logical_type: LogicalType::Binary,
+                    nullable: sequence != 1,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok(RelationDefinition {
+            header: ObjectHeader {
+                id,
+                owner: EngineKind::Relational,
+                name: qualified_name("wide_catalog_relation")?,
+            },
+            columns,
+            primary_key: vec![ColumnId::new(1)?],
         })
     }
 
@@ -10321,6 +10700,285 @@ mod tests {
             page_generation_path(directory, PageGeneration::new(42)?),
             directory.join("pages-00000000000000000042.hydb")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_tree_keys_and_inline_envelope_have_golden_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = ObjectId::new(0x0102)?;
+        let object = CatalogObject::Relation(binary_relation_definition(id, "accounts")?);
+        let definition = object.encode_definition()?;
+
+        let mut expected_object_key = vec![CATALOG_OBJECT_PREFIX];
+        expected_object_key.extend_from_slice(&id.get().to_be_bytes());
+        assert_eq!(catalog_object_key(id), expected_object_key);
+
+        let mut expected_name_key = vec![CATALOG_NAME_PREFIX];
+        for component in [
+            b"main".as_slice(),
+            b"public".as_slice(),
+            b"accounts".as_slice(),
+        ] {
+            expected_name_key.extend_from_slice(&u32::try_from(component.len())?.to_le_bytes());
+            expected_name_key.extend_from_slice(component);
+        }
+        assert_eq!(catalog_name_key(object.header())?, expected_name_key);
+
+        let stored =
+            catalog_definition_storage_value(&definition, &std::collections::BTreeMap::new())?;
+        assert_eq!(&stored[..8], CATALOG_VALUE_MAGIC);
+        assert_eq!(stored[8], CATALOG_VALUE_INLINE);
+        assert_eq!(&stored[9..CATALOG_VALUE_HEADER_SIZE], &[0; 7]);
+        assert_eq!(&stored[CATALOG_VALUE_HEADER_SIZE..], definition);
+        assert_eq!(CATALOG_FORMAT_KEY, &[0]);
+        assert_eq!(CATALOG_FORMAT_VALUE_V3, b"HYCAT003");
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_scales_beyond_one_page_and_reopens() -> Result<(), Box<dyn std::error::Error>> {
+        const RELATION_COUNT: u128 = 256;
+
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        for sequence in 1..=RELATION_COUNT {
+            transaction.create_relation(
+                ObjectId::new(sequence)?,
+                &format!("catalog_relation_{sequence:04}"),
+            )?;
+        }
+        transaction.commit()?;
+
+        let roots = database.coordinator.snapshot(0)?;
+        let catalog_root = roots
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(matches!(
+            database.pages.read(catalog_root)?.kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ));
+        let catalog_tree = BTree::from_root(catalog_root);
+        assert!(catalog_tree.height(&database.pages)? > 1);
+        for sequence in [1, RELATION_COUNT / 2, RELATION_COUNT] {
+            let id = ObjectId::new(sequence)?;
+            let object = CatalogObject::Relation(binary_relation_definition(
+                id,
+                &format!("catalog_relation_{sequence:04}"),
+            )?);
+            assert_eq!(
+                catalog_tree.get(&database.pages, &catalog_name_key(object.header())?)?,
+                Some(id.get().to_be_bytes().to_vec())
+            );
+            let stored = catalog_tree
+                .get(&database.pages, &catalog_object_key(id))?
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            let definition = decode_catalog_definition_storage_value(&stored, &database.blobs)?;
+            assert_eq!(CatalogObject::decode_definition(&definition)?, object);
+        }
+        let retained = database.snapshot(0)?;
+        assert_eq!(retained.state.catalog.objects.len(), 256);
+        let pages_before = database.pages.page_count();
+        let reachable_before = catalog_tree.reachable_page_count(&database.pages)?;
+
+        let mut append = database.begin(0, DurabilityClass::Strict)?;
+        append.create_relation(ObjectId::new(RELATION_COUNT + 1)?, "catalog_relation_0257")?;
+        append.commit()?;
+        let pages_written = database.pages.page_count() - pages_before;
+        assert!(pages_written < u64::try_from(reachable_before)?);
+        assert_eq!(retained.state.catalog.objects.len(), 256);
+        assert_eq!(
+            super::load_catalog_state_root(&database.pages, &database.blobs, catalog_root)?
+                .objects
+                .len(),
+            256
+        );
+        assert_eq!(database.snapshot(0)?.state.catalog.objects.len(), 257);
+
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        let snapshot = reopened.snapshot(0)?;
+        assert_eq!(snapshot.state.catalog.objects.len(), 257);
+        for sequence in [1, RELATION_COUNT / 2, RELATION_COUNT + 1] {
+            assert!(snapshot.catalog_object(ObjectId::new(sequence)?).is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_large_definition_uses_an_immutable_blob_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let table = ObjectId::new(1)?;
+        let definition = wide_catalog_relation(table)?;
+        let object = CatalogObject::Relation(definition.clone());
+        assert!(object.encode_definition()?.len() > CATALOG_INLINE_VALUE_LIMIT);
+
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_relation_definition(definition.clone())?;
+        transaction.commit()?;
+
+        let roots = database.coordinator.snapshot(0)?;
+        let root = roots
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let stored = BTree::from_root(root)
+            .get(&database.pages, &catalog_object_key(table))?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        assert_eq!(stored[8], CATALOG_VALUE_BLOB);
+        assert_eq!(
+            database.snapshot(0)?.catalog_object(table),
+            Some(&CatalogObject::Relation(definition.clone()))
+        );
+        assert_eq!(database.blobs.recovery()?.blob_count, 1);
+
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(
+            reopened.snapshot(0)?.catalog_object(table),
+            Some(&CatalogObject::Relation(definition))
+        );
+        assert_eq!(reopened.recovery_report().blob_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_large_definition_blob_boundaries_recover_prior_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [CommitBoundary::BlobStaged, CommitBoundary::BlobPromoted] {
+            let directory = TestDirectory::new();
+            let mut database = NativeDatabase::create(directory.path())?;
+            let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+            transaction.create_relation_definition(wide_catalog_relation(ObjectId::new(1)?)?)?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(directory.path())?;
+            assert_eq!(reopened.recovery_report().visible_csn, None);
+            assert!(reopened.snapshot(0)?.state.catalog.objects.is_empty());
+            match boundary {
+                CommitBoundary::BlobStaged => {
+                    assert_eq!(reopened.recovery_report().blob_count, 0);
+                    assert_eq!(reopened.recovery_report().recovered_temporary_blobs, 1);
+                }
+                CommitBoundary::BlobPromoted => {
+                    assert_eq!(reopened.recovery_report().blob_count, 1);
+                    assert_eq!(reopened.recovery_report().blob_generation, 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inline_catalog_root_migrates_to_the_native_tree() -> Result<(), Box<dyn std::error::Error>> {
+        let first = ObjectId::new(1)?;
+        let second = ObjectId::new(2)?;
+        let first_object = CatalogObject::Relation(binary_relation_definition(first, "legacy")?);
+        let mut v2_catalog = CatalogState::default();
+        v2_catalog.create(first_object)?;
+        let mut v1 = b"HYCAT001".to_vec();
+        v1.extend_from_slice(&1_u32.to_le_bytes());
+        v1.extend_from_slice(&first.get().to_le_bytes());
+        v1.push(EngineKind::Relational as u8);
+        v1.extend_from_slice(&6_u32.to_le_bytes());
+        v1.extend_from_slice(b"legacy");
+
+        for payload in [v1, v2_catalog.encode()?] {
+            let directory = TestDirectory::new();
+            fs::create_dir(directory.path())?;
+            let mut pages = PageStore::create(directory.path().join("catalog-pages.hydb"))?;
+            let blobs = BlobStore::create(directory.path())?;
+            let inline = pages.append(
+                PageKind::CatalogRoot,
+                Some(Csn::FIRST),
+                None,
+                payload.clone(),
+            )?;
+            let mut catalog = CatalogState::decode(&payload)?;
+            let second_object =
+                CatalogObject::Relation(binary_relation_definition(second, "native")?);
+            let mutation = Mutation {
+                engine: EngineKind::Relational,
+                opcode: Opcode::CreateTable,
+                target: Some(second),
+                key: catalog_name_identity(second_object.header())?,
+                value: second_object.encode_definition()?,
+                expires_at_micros: None,
+            };
+            catalog.create(second_object)?;
+            let root = catalog_root_after_mutations(
+                &mut pages,
+                &blobs,
+                Some(inline),
+                Csn::new(2)?,
+                &catalog,
+                &[mutation],
+                &std::collections::BTreeMap::new(),
+            )?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            assert!(matches!(
+                pages.read(root)?.kind(),
+                PageKind::BTreeLeaf | PageKind::BTreeInternal
+            ));
+            assert_eq!(
+                super::load_catalog_state_root(&pages, &blobs, root)?,
+                catalog
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_tree_rejects_noncanonical_envelopes_and_cross_links()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let table = ObjectId::new(1)?;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_relation(table, "accounts")?;
+        transaction.commit()?;
+
+        let roots = database.coordinator.snapshot(0)?;
+        let root = roots
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let object_key = catalog_object_key(table);
+        let mut invalid_envelope = BTree::from_root(root)
+            .get(&database.pages, &object_key)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        invalid_envelope[9] = 1;
+        assert!(matches!(
+            decode_catalog_definition_storage_value(&invalid_envelope, &database.blobs),
+            Err(NativeRuntimeError::InvalidCatalogTree)
+        ));
+
+        let name_key = catalog_name_key(
+            CatalogObject::Relation(binary_relation_definition(table, "accounts")?).header(),
+        )?;
+        let cross_linked = BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(2)?,
+                name_key,
+                ObjectId::new(2)?.get().to_be_bytes().to_vec(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        assert!(matches!(
+            super::load_catalog_state_root(&database.pages, &database.blobs, cross_linked),
+            Err(NativeRuntimeError::InvalidCatalogTree)
+        ));
         Ok(())
     }
 
