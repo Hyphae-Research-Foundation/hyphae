@@ -80,9 +80,9 @@ thread_local! {
 
 use crate::{
     model::{
-        CatalogState, ListPop, ModelError, RelationState, SearchState, SortedSetMemberState,
-        SortedSetScore, StructureEntry, StructureState, TtlValue, analyze, bm25_idf,
-        bm25_term_score, normalize_list_range,
+        CatalogState, ListPop, ModelError, RelationState, SearchState, SecondaryIndexLayout,
+        SortedSetMemberState, SortedSetScore, StructureEntry, StructureState, TtlValue, analyze,
+        bm25_idf, bm25_term_score, normalize_list_range,
     },
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticBase, WalSemanticError,
@@ -108,7 +108,8 @@ const RELATIONAL_TABLE_PREFIX: u8 = 1;
 const RELATIONAL_ROW_PREFIX: u8 = 2;
 const RELATIONAL_SECONDARY_INDEX_PREFIX: u8 = 3;
 const RELATIONAL_SECONDARY_ENTRY_PREFIX: u8 = 4;
-const RELATIONAL_SECONDARY_INDEX_MAGIC: &[u8; 8] = b"HYRIDX01";
+const RELATIONAL_SECONDARY_INDEX_MAGIC_V1: &[u8; 8] = b"HYRIDX01";
+const RELATIONAL_SECONDARY_INDEX_MAGIC_V2: &[u8; 8] = b"HYRIDX02";
 const RELATIONAL_SECONDARY_INDEX_META_SIZE: usize = 32;
 const RELATIONAL_SECONDARY_ENTRY_TOMBSTONE: u8 = 0;
 const RELATIONAL_SECONDARY_ENTRY_LIVE: u8 = 1;
@@ -191,6 +192,7 @@ const SLOT_SEARCH: RootSlot = RootSlot {
     partition: 0,
 };
 const ROOT_SLOTS: [RootSlot; 4] = [SLOT_CATALOG, SLOT_RELATIONAL, SLOT_STRUCTURE, SLOT_SEARCH];
+type PhysicalKeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelationalFormat {
@@ -1759,7 +1761,13 @@ impl NativeDatabase {
             .snapshot(0)
             .map_err(NativeRuntimeError::from)?;
         let catalog = load_catalog_state(&self.pages, &self.blobs, metadata.roots())?;
-        sql::prepare_catalog(metadata.catalog_version, &catalog, statement)
+        let ordered_secondary_indexes = self.ordered_secondary_indexes_at(&metadata, &catalog)?;
+        sql::prepare_catalog(
+            metadata.catalog_version,
+            &catalog,
+            &ordered_secondary_indexes,
+            statement,
+        )
     }
 
     /// Executes one current catalog-bound SQL plan through physical roots.
@@ -1825,6 +1833,49 @@ impl NativeDatabase {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    fn ordered_secondary_indexes_at(
+        &self,
+        snapshot: &Snapshot,
+        catalog: &CatalogState,
+    ) -> Result<BTreeSet<ObjectId>, NativeRuntimeError> {
+        let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            if catalog
+                .objects
+                .values()
+                .any(|object| matches!(object, CatalogObject::SecondaryIndex(_)))
+            {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            return Ok(BTreeSet::new());
+        };
+        let tree = BTree::from_root(root);
+        let mut ordered = BTreeSet::new();
+        for (index, object) in &catalog.objects {
+            let CatalogObject::SecondaryIndex(definition) = object else {
+                continue;
+            };
+            let metadata = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &relational_secondary_index_key(*index),
+                )?
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let (relation, unique, nulls_distinct, layout) =
+                decode_secondary_index_metadata(metadata.bytes())?;
+            if relation != definition.relation
+                || unique != definition.unique
+                || nulls_distinct != definition.nulls_distinct
+            {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            if layout == SecondaryIndexLayout::OrderedV2 {
+                ordered.insert(*index);
+            }
+        }
+        Ok(ordered)
     }
 
     /// Scans visible current rows in canonical primary-key order without
@@ -2071,7 +2122,7 @@ impl NativeDatabase {
             ));
         };
         let tree = BTree::from_root(root);
-        let table = {
+        let (table, layout) = {
             let metadata = tree
                 .get_cached_pinned(
                     &self.pages,
@@ -2082,11 +2133,11 @@ impl NativeDatabase {
                 .map_err(RelationalVisitError::Runtime)?
                 .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })
                 .map_err(RelationalVisitError::Runtime)?;
-            let (table, _, _) = decode_secondary_index_metadata(metadata.bytes())
+            let (table, _, _, layout) = decode_secondary_index_metadata(metadata.bytes())
                 .map_err(RelationalVisitError::Runtime)?;
-            table
+            (table, layout)
         };
-        let prefix = relational_secondary_entry_prefix(index, index_key)
+        let prefix = relational_secondary_entry_prefix(index, layout, index_key)
             .map_err(RelationalVisitError::Runtime)?;
         let context = RelationalReadContext {
             pages: &self.pages,
@@ -2108,7 +2159,7 @@ impl NativeDatabase {
                             .get(17..)
                             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
                         let (stored_index_key, primary_key) =
-                            decode_secondary_index_entry_identity(identity)?;
+                            decode_secondary_index_entry_identity(layout, identity)?;
                         if stored_index_key != index_key {
                             return Err(NativeRuntimeError::InvalidRelationalTree);
                         }
@@ -2144,6 +2195,113 @@ impl NativeDatabase {
                                 ControlFlow::Break(())
                             }
                         },
+                        Err(error) => {
+                            failure = Some(RelationalVisitError::Runtime(error));
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visit_secondary_index_range_at<E>(
+        &self,
+        snapshot: &Snapshot,
+        index: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mut visitor: impl FnMut(ObjectId, &[u8], &[u8], &[u8]) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), RelationalVisitError<E>> {
+        let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            return Err(RelationalVisitError::Runtime(
+                NativeRuntimeError::UnknownSecondaryIndex { index },
+            ));
+        };
+        let tree = BTree::from_root(root);
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &relational_secondary_index_key(index),
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?
+            .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })
+            .map_err(RelationalVisitError::Runtime)?;
+        let (table, _, _, layout) = decode_secondary_index_metadata(metadata.bytes())
+            .map_err(RelationalVisitError::Runtime)?;
+        if layout != SecondaryIndexLayout::OrderedV2 {
+            return Err(RelationalVisitError::Runtime(
+                NativeRuntimeError::InvalidRelationalTree,
+            ));
+        }
+        let prefix = relational_secondary_entry_namespace(index);
+        let (physical_lower, physical_upper) =
+            secondary_index_physical_bounds(&prefix, lower, upper)
+                .map_err(RelationalVisitError::Runtime)?;
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut failure = None;
+        let _outcome = tree
+            .visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                bound_as_slice(&physical_lower),
+                bound_as_slice(&physical_upper),
+                |physical_key, marker| {
+                    let row_result = (|| {
+                        let identity = physical_key
+                            .get(17..)
+                            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        let (stored_index_key, primary_key) =
+                            decode_secondary_index_entry_identity(layout, identity)?;
+                        if !bytes_within_bounds(stored_index_key, &lower, &upper) {
+                            return Err(NativeRuntimeError::InvalidRelationalTree);
+                        }
+                        match marker {
+                            [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => return Ok(None),
+                            [RELATIONAL_SECONDARY_ENTRY_LIVE] => {}
+                            _ => return Err(NativeRuntimeError::InvalidRelationalTree),
+                        }
+                        let encoded_row = tree
+                            .get_cached_pinned(
+                                &self.pages,
+                                &self.buffer_pool,
+                                &relational_row_key(table, primary_key),
+                            )?
+                            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        let row = decode_relational_value_cached(
+                            &context,
+                            table,
+                            primary_key,
+                            encoded_row.bytes(),
+                        )?
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        Ok(Some((stored_index_key, primary_key, row)))
+                    })();
+                    match row_result {
+                        Ok(None) => ControlFlow::Continue(()),
+                        Ok(Some((index_key, primary_key, row))) => {
+                            match visitor(table, index_key, primary_key, &row) {
+                                Ok(control) => control,
+                                Err(error) => {
+                                    failure = Some(RelationalVisitError::Visitor(error));
+                                    ControlFlow::Break(())
+                                }
+                            }
+                        }
                         Err(error) => {
                             failure = Some(RelationalVisitError::Runtime(error));
                             ControlFlow::Break(())
@@ -9837,21 +9995,25 @@ fn relational_tree_after_mutations(
                 let CatalogObject::SecondaryIndex(definition) = object else {
                     return Err(NativeRuntimeError::InvalidRelationalTree);
                 };
+                let index_state = relational
+                    .indexes
+                    .get(&target)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
                 tree = tree
                     .insert_unique(
                         pages,
                         creating_csn,
                         relational_secondary_index_key(target),
-                        encode_secondary_index_metadata(&definition).to_vec(),
+                        encode_secondary_index_metadata(&definition, index_state.layout).to_vec(),
                     )?
                     .tree;
-                let index_state = relational
-                    .indexes
-                    .get(&target)
-                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
                 for (index_key, primary_keys) in &index_state.entries {
                     for primary_key in primary_keys {
-                        let identity = secondary_index_entry_identity(index_key, primary_key)?;
+                        let identity = secondary_index_entry_identity(
+                            index_state.layout,
+                            index_key,
+                            primary_key,
+                        )?;
                         tree = tree
                             .upsert(
                                 pages,
@@ -9916,6 +10078,7 @@ fn relational_tree_after_mutations(
             &old_projections,
             &mutation.key,
             RELATIONAL_SECONDARY_ENTRY_TOMBSTONE,
+            relational,
         )?;
         if mutation.opcode != Opcode::DeleteRow {
             let new_projections = secondary_index_projections(catalog, target, &mutation.value)?;
@@ -9926,6 +10089,7 @@ fn relational_tree_after_mutations(
                 &new_projections,
                 &mutation.key,
                 RELATIONAL_SECONDARY_ENTRY_LIVE,
+                relational,
             )?;
         }
     }
@@ -9961,6 +10125,7 @@ fn write_secondary_index_projection_markers(
     projections: &[SecondaryIndexProjection],
     primary_key: &[u8],
     marker: u8,
+    relational: &RelationState,
 ) -> Result<BTree, NativeRuntimeError> {
     if !matches!(
         marker,
@@ -9969,7 +10134,12 @@ fn write_secondary_index_projection_markers(
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }
     for projection in projections {
-        let identity = secondary_index_entry_identity(&projection.key, primary_key)?;
+        let layout = relational
+            .indexes
+            .get(&projection.index)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+            .layout;
+        let identity = secondary_index_entry_identity(layout, &projection.key, primary_key)?;
         tree = tree
             .upsert(
                 pages,
@@ -10161,14 +10331,20 @@ fn secondary_index_projection(
 }
 
 fn secondary_index_entry_identity(
+    layout: SecondaryIndexLayout,
     index_key: &[u8],
     primary_key: &[u8],
 ) -> Result<Vec<u8>, NativeRuntimeError> {
-    let index_length =
-        u32::try_from(index_key.len()).map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
-    let capacity = 4_usize
-        .checked_add(index_key.len())
-        .and_then(|length| length.checked_add(primary_key.len()))
+    let recorded_length = match layout {
+        SecondaryIndexLayout::LegacyLengthFirstV1 => index_key.len(),
+        SecondaryIndexLayout::OrderedV2 => primary_key.len(),
+    };
+    let recorded_length =
+        u32::try_from(recorded_length).map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+    let capacity = index_key
+        .len()
+        .checked_add(primary_key.len())
+        .and_then(|length| length.checked_add(4))
         .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
     if capacity
         .checked_add(17)
@@ -10177,34 +10353,70 @@ fn secondary_index_entry_identity(
         return Err(NativeRuntimeError::InvalidRelationalTree);
     }
     let mut encoded = Vec::with_capacity(capacity);
-    encoded.extend_from_slice(&index_length.to_be_bytes());
-    encoded.extend_from_slice(index_key);
-    encoded.extend_from_slice(primary_key);
+    match layout {
+        SecondaryIndexLayout::LegacyLengthFirstV1 => {
+            encoded.extend_from_slice(&recorded_length.to_be_bytes());
+            encoded.extend_from_slice(index_key);
+            encoded.extend_from_slice(primary_key);
+        }
+        SecondaryIndexLayout::OrderedV2 => {
+            encoded.extend_from_slice(index_key);
+            encoded.extend_from_slice(primary_key);
+            encoded.extend_from_slice(&recorded_length.to_be_bytes());
+        }
+    }
     Ok(encoded)
 }
 
 fn decode_secondary_index_entry_identity(
+    layout: SecondaryIndexLayout,
     encoded: &[u8],
 ) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
-    let length = encoded
-        .get(..4)
-        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-    let index_length = usize::try_from(u32::from_be_bytes(
-        length
-            .try_into()
-            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
-    ))
-    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
-    let index_end = 4_usize
-        .checked_add(index_length)
-        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-    let index_key = encoded
-        .get(4..index_end)
-        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-    let primary_key = encoded
-        .get(index_end..)
-        .filter(|key| !key.is_empty())
-        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let (index_key, primary_key) = match layout {
+        SecondaryIndexLayout::LegacyLengthFirstV1 => {
+            let length = encoded
+                .get(..4)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let index_length = usize::try_from(u32::from_be_bytes(
+                length
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            ))
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+            let index_end = 4_usize
+                .checked_add(index_length)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let index_key = encoded
+                .get(4..index_end)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let primary_key = encoded
+                .get(index_end..)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            (index_key, primary_key)
+        }
+        SecondaryIndexLayout::OrderedV2 => {
+            let suffix_offset = encoded
+                .len()
+                .checked_sub(4)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let primary_length = usize::try_from(u32::from_be_bytes(
+                encoded[suffix_offset..]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            ))
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+            let primary_offset = suffix_offset
+                .checked_sub(primary_length)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            (
+                &encoded[..primary_offset],
+                &encoded[primary_offset..suffix_offset],
+            )
+        }
+    };
+    if index_key.is_empty() || primary_key.is_empty() {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
     Ok((index_key, primary_key))
 }
 
@@ -10213,6 +10425,13 @@ fn relational_secondary_index_key(index: ObjectId) -> Vec<u8> {
     key.push(RELATIONAL_SECONDARY_INDEX_PREFIX);
     key.extend_from_slice(&index.get().to_be_bytes());
     key
+}
+
+fn relational_secondary_entry_namespace(index: ObjectId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(17);
+    prefix.push(RELATIONAL_SECONDARY_ENTRY_PREFIX);
+    prefix.extend_from_slice(&index.get().to_be_bytes());
+    prefix
 }
 
 fn relational_secondary_entry_key(
@@ -10232,14 +10451,87 @@ fn relational_secondary_entry_key(
     Ok(key)
 }
 
-fn relational_secondary_entry_prefix(
-    index: ObjectId,
+fn secondary_index_physical_bounds(
+    namespace: &[u8],
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> Result<PhysicalKeyBounds, NativeRuntimeError> {
+    let namespace_upper =
+        byte_prefix_successor(namespace).ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    let lower = match lower {
+        Bound::Unbounded => Bound::Included(namespace.to_vec()),
+        Bound::Included(index_key) => {
+            Bound::Included(secondary_index_bound_key(namespace, index_key)?)
+        }
+        Bound::Excluded(index_key) => Bound::Included(
+            byte_prefix_successor(&secondary_index_bound_key(namespace, index_key)?)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        ),
+    };
+    let upper = match upper {
+        Bound::Unbounded => Bound::Excluded(namespace_upper),
+        Bound::Excluded(index_key) => {
+            Bound::Excluded(secondary_index_bound_key(namespace, index_key)?)
+        }
+        Bound::Included(index_key) => Bound::Excluded(
+            byte_prefix_successor(&secondary_index_bound_key(namespace, index_key)?)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        ),
+    };
+    Ok((lower, upper))
+}
+
+fn secondary_index_bound_key(
+    namespace: &[u8],
     index_key: &[u8],
 ) -> Result<Vec<u8>, NativeRuntimeError> {
-    let index_length =
-        u32::try_from(index_key.len()).map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
-    let capacity = 21_usize
+    let capacity = namespace
+        .len()
         .checked_add(index_key.len())
+        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+    if capacity > BTREE_MAX_KEY_SIZE {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let mut key = Vec::with_capacity(capacity);
+    key.extend_from_slice(namespace);
+    key.extend_from_slice(index_key);
+    Ok(key)
+}
+
+fn byte_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    let offset = successor.iter().rposition(|byte| *byte != u8::MAX)?;
+    successor[offset] += 1;
+    successor.truncate(offset + 1);
+    Some(successor)
+}
+
+fn bytes_within_bounds(value: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+    let above_lower = match lower {
+        Bound::Included(lower) => value >= *lower,
+        Bound::Excluded(lower) => value > *lower,
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(upper) => value <= *upper,
+        Bound::Excluded(upper) => value < *upper,
+        Bound::Unbounded => true,
+    };
+    above_lower && below_upper
+}
+
+fn relational_secondary_entry_prefix(
+    index: ObjectId,
+    layout: SecondaryIndexLayout,
+    index_key: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let layout_bytes = match layout {
+        SecondaryIndexLayout::LegacyLengthFirstV1 => 4,
+        SecondaryIndexLayout::OrderedV2 => 0,
+    };
+    let capacity = 17_usize
+        .checked_add(layout_bytes)
+        .and_then(|length| length.checked_add(index_key.len()))
         .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
     if capacity >= BTREE_MAX_KEY_SIZE {
         return Err(NativeRuntimeError::InvalidRelationalTree);
@@ -10247,16 +10539,24 @@ fn relational_secondary_entry_prefix(
     let mut prefix = Vec::with_capacity(capacity);
     prefix.push(RELATIONAL_SECONDARY_ENTRY_PREFIX);
     prefix.extend_from_slice(&index.get().to_be_bytes());
-    prefix.extend_from_slice(&index_length.to_be_bytes());
+    if layout == SecondaryIndexLayout::LegacyLengthFirstV1 {
+        let index_length = u32::try_from(index_key.len())
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+        prefix.extend_from_slice(&index_length.to_be_bytes());
+    }
     prefix.extend_from_slice(index_key);
     Ok(prefix)
 }
 
 fn encode_secondary_index_metadata(
     definition: &SecondaryIndexDefinition,
+    layout: SecondaryIndexLayout,
 ) -> [u8; RELATIONAL_SECONDARY_INDEX_META_SIZE] {
     let mut encoded = [0_u8; RELATIONAL_SECONDARY_INDEX_META_SIZE];
-    encoded[..8].copy_from_slice(RELATIONAL_SECONDARY_INDEX_MAGIC);
+    encoded[..8].copy_from_slice(match layout {
+        SecondaryIndexLayout::LegacyLengthFirstV1 => RELATIONAL_SECONDARY_INDEX_MAGIC_V1,
+        SecondaryIndexLayout::OrderedV2 => RELATIONAL_SECONDARY_INDEX_MAGIC_V2,
+    });
     encoded[8..24].copy_from_slice(&definition.relation.get().to_be_bytes());
     encoded[24] = u8::from(definition.unique);
     encoded[25] = u8::from(definition.nulls_distinct);
@@ -10265,9 +10565,8 @@ fn encode_secondary_index_metadata(
 
 fn decode_secondary_index_metadata(
     encoded: &[u8],
-) -> Result<(ObjectId, bool, bool), NativeRuntimeError> {
+) -> Result<(ObjectId, bool, bool, SecondaryIndexLayout), NativeRuntimeError> {
     if encoded.len() != RELATIONAL_SECONDARY_INDEX_META_SIZE
-        || encoded.get(..8) != Some(RELATIONAL_SECONDARY_INDEX_MAGIC.as_slice())
         || !matches!(encoded[24], 0 | 1)
         || !matches!(encoded[25], 0 | 1)
         || encoded[26..].iter().any(|byte| *byte != 0)
@@ -10280,7 +10579,16 @@ fn decode_secondary_index_metadata(
             .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
     ))
     .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
-    Ok((relation, encoded[24] == 1, encoded[25] == 1))
+    let layout = match encoded.get(..8) {
+        Some(magic) if magic == RELATIONAL_SECONDARY_INDEX_MAGIC_V1 => {
+            SecondaryIndexLayout::LegacyLengthFirstV1
+        }
+        Some(magic) if magic == RELATIONAL_SECONDARY_INDEX_MAGIC_V2 => {
+            SecondaryIndexLayout::OrderedV2
+        }
+        _ => return Err(NativeRuntimeError::InvalidRelationalTree),
+    };
+    Ok((relation, encoded[24] == 1, encoded[25] == 1, layout))
 }
 
 fn relational_row_id(table: ObjectId, primary_key: &[u8]) -> Result<RowId, NativeRuntimeError> {
@@ -11289,7 +11597,8 @@ fn load_relational_state(
             }
             Some(RELATIONAL_SECONDARY_INDEX_PREFIX) if key.len() == 17 => {
                 let index = decode_relational_table(&key, RELATIONAL_SECONDARY_INDEX_PREFIX)?;
-                let (relation, unique, nulls_distinct) = decode_secondary_index_metadata(&value)?;
+                let (relation, unique, nulls_distinct, layout) =
+                    decode_secondary_index_metadata(&value)?;
                 let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(index) else {
                     return Err(NativeRuntimeError::InvalidRelationalTree);
                 };
@@ -11304,6 +11613,7 @@ fn load_relational_state(
                                 relation,
                                 unique,
                                 nulls_distinct,
+                                layout,
                                 entries: BTreeMap::new(),
                             },
                         )
@@ -11314,7 +11624,12 @@ fn load_relational_state(
             }
             Some(RELATIONAL_SECONDARY_ENTRY_PREFIX) if key.len() > 21 => {
                 let index = decode_relational_table(&key, RELATIONAL_SECONDARY_ENTRY_PREFIX)?;
-                let (index_key, primary_key) = decode_secondary_index_entry_identity(&key[17..])?;
+                let layout = indexes
+                    .get(&index)
+                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                    .layout;
+                let (index_key, primary_key) =
+                    decode_secondary_index_entry_identity(layout, &key[17..])?;
                 let marker = match value.as_slice() {
                     [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => false,
                     [RELATIONAL_SECONDARY_ENTRY_LIVE] => true,
@@ -17812,6 +18127,704 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn complete_secondary_index_range_plans_ordered_physical_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Memory)?;
+        let created = transaction.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing table identity".into());
+        };
+        let created =
+            transaction.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing index identity".into());
+        };
+
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT id FROM people
+                 WHERE email >= ? AND email < ?
+                 LIMIT 10",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexRangeScan(table={table},index={index},\
+                     lower=inclusive,upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        transaction.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_secondary_identity_preserves_variable_key_then_primary_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let short_later =
+            SqlValue::Text("b".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        let long_earlier =
+            SqlValue::Text("aa".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        assert!(long_earlier < short_later);
+        let primary_one = SqlValue::Signed(1)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
+        let primary_two = SqlValue::Signed(2)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
+
+        let ordered_earlier = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &long_earlier,
+            &primary_two,
+        )?;
+        let ordered_later = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &short_later,
+            &primary_one,
+        )?;
+        assert!(ordered_earlier < ordered_later);
+        let same_key_one = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &long_earlier,
+            &primary_one,
+        )?;
+        assert!(same_key_one < ordered_earlier);
+        assert_eq!(
+            super::decode_secondary_index_entry_identity(
+                super::SecondaryIndexLayout::OrderedV2,
+                &ordered_earlier,
+            )?,
+            (long_earlier.as_slice(), primary_two.as_slice())
+        );
+
+        let legacy_earlier = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::LegacyLengthFirstV1,
+            &long_earlier,
+            &primary_two,
+        )?;
+        let legacy_later = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::LegacyLengthFirstV1,
+            &short_later,
+            &primary_one,
+        )?;
+        assert!(legacy_later < legacy_earlier);
+        assert_eq!(
+            super::decode_secondary_index_entry_identity(
+                super::SecondaryIndexLayout::LegacyLengthFirstV1,
+                &legacy_earlier,
+            )?,
+            (long_earlier.as_slice(), primary_two.as_slice())
+        );
+        assert!(matches!(
+            super::decode_secondary_index_entry_identity(
+                super::SecondaryIndexLayout::OrderedV2,
+                &[1, 2, 3],
+            ),
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        ));
+        Ok(())
+    }
+
+    const SECONDARY_RANGE_QUERY: &str = "SELECT id, email
+        FROM people
+        WHERE email >= ?
+          AND email < ?
+          AND active = ?
+        ORDER BY email
+        LIMIT 3";
+
+    fn secondary_range_parameters() -> [SqlValue; 3] {
+        [
+            SqlValue::Text("aa".to_owned()),
+            SqlValue::Text("c".to_owned()),
+            SqlValue::Boolean(true),
+        ]
+    }
+
+    fn secondary_range_rows(rows: &[(i64, &str)]) -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["id".to_owned(), "email".to_owned()],
+            rows: rows
+                .iter()
+                .map(|(id, email)| vec![SqlValue::Signed(*id), SqlValue::Text((*email).to_owned())])
+                .collect(),
+        }
+    }
+
+    fn seed_ordered_secondary_range(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing secondary-range table identity".into());
+        };
+        for (id, email, active) in [
+            (1_i64, "a", true),
+            (2, "aa", true),
+            (3, "b", false),
+            (4, "b", true),
+            (5, "ba", true),
+            (6, "c", true),
+        ] {
+            seed.execute_sql(
+                "INSERT INTO people (id, email, active) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(email.to_owned()),
+                    SqlValue::Boolean(active),
+                ],
+            )?;
+        }
+        let created = seed.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing ordered secondary-index identity".into());
+        };
+        assert_eq!(
+            seed.execute_sql(SECONDARY_RANGE_QUERY, &secondary_range_parameters())?,
+            secondary_range_rows(&[(2, "aa"), (4, "b"), (5, "ba")])
+        );
+        seed.commit()?;
+        Ok((table, index))
+    }
+
+    #[test]
+    fn ordered_secondary_range_matches_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_table, _index) = seed_ordered_secondary_range(&mut database)?;
+        let retained = database.snapshot(11)?;
+        let retained_plan = retained.prepare_sql(SECONDARY_RANGE_QUERY)?;
+
+        let mut mutation = database.begin_sql(12, DurabilityClass::Strict)?;
+        mutation.execute_sql("UPDATE people SET email = 'z' WHERE id = 2", &[])?;
+        mutation.execute_sql("DELETE FROM people WHERE id = 4", &[])?;
+        mutation.execute_sql(
+            "INSERT INTO people (id, email, active) VALUES (8, 'ab', TRUE)",
+            &[],
+        )?;
+        mutation.commit()?;
+
+        assert_eq!(
+            retained.execute_prepared(&retained_plan, &secondary_range_parameters())?,
+            secondary_range_rows(&[(2, "aa"), (4, "b"), (5, "ba")])
+        );
+        let current = secondary_range_rows(&[(8, "ab"), (5, "ba")]);
+        let latest_plan = database.prepare_sql_latest(SECONDARY_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &secondary_range_parameters())?,
+            current
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(SECONDARY_RANGE_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &secondary_range_parameters())?,
+            current
+        );
+        Ok(())
+    }
+
+    fn assert_ordered_secondary_range_boundaries(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (predicate, parameters, expected) in [
+            (
+                "email > ? AND email <= ?",
+                vec![
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Text("b".to_owned()),
+                ],
+                vec![(3, "b"), (4, "b")],
+            ),
+            (
+                "email >= ? AND email <= ?",
+                vec![
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Text("b".to_owned()),
+                ],
+                vec![(2, "aa"), (3, "b"), (4, "b")],
+            ),
+            (
+                "email >= ? AND email <= ?",
+                vec![
+                    SqlValue::Text("b".to_owned()),
+                    SqlValue::Text("b".to_owned()),
+                ],
+                vec![(3, "b"), (4, "b")],
+            ),
+            (
+                "email > ? AND email <= ?",
+                vec![
+                    SqlValue::Text("b".to_owned()),
+                    SqlValue::Text("b".to_owned()),
+                ],
+                vec![],
+            ),
+            (
+                "email >= ? AND email < ?",
+                vec![
+                    SqlValue::Text("c".to_owned()),
+                    SqlValue::Text("a".to_owned()),
+                ],
+                vec![],
+            ),
+            (
+                "email >= ?",
+                vec![SqlValue::Text("ba".to_owned())],
+                vec![(5, "ba"), (6, "c")],
+            ),
+            (
+                "email < ?",
+                vec![SqlValue::Text("aa".to_owned())],
+                vec![(1, "a")],
+            ),
+        ] {
+            let statement = format!(
+                "SELECT id, email FROM people
+                 WHERE {predicate}
+                 ORDER BY email LIMIT 10"
+            );
+            let plan = database.prepare_sql_latest(&statement)?;
+            assert_eq!(
+                database.execute_prepared_latest(&plan, &parameters)?,
+                secondary_range_rows(&expected),
+                "unexpected secondary range for {predicate}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_ordered_secondary_range_binding_failures(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let nullable = database.prepare_sql_latest(
+            "SELECT id, email FROM people
+             WHERE email >= ?
+             ORDER BY email LIMIT 10",
+        )?;
+        assert_eq!(
+            database.execute_prepared_latest(&nullable, &[SqlValue::Null])?,
+            secondary_range_rows(&[])
+        );
+        let zero = database.prepare_sql_latest(
+            "SELECT id, email FROM people
+             WHERE email >= ?
+             ORDER BY email LIMIT 0",
+        )?;
+        assert_eq!(
+            database.execute_prepared_latest(&zero, &[SqlValue::Text("a".to_owned())])?,
+            secondary_range_rows(&[])
+        );
+        assert!(matches!(
+            database.execute_prepared_latest(&zero, &[SqlValue::Signed(1)]),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(&nullable, &[]),
+            Err(SqlError::ParameterMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(&nullable, &[SqlValue::Signed(1)]),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT id FROM people
+                 WHERE email >= ? AND email > ?
+                 ORDER BY email LIMIT 10"
+            ),
+            Err(SqlError::InvalidSecondaryIndexRange)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT id FROM people
+                 WHERE email >= ?
+                 ORDER BY id LIMIT 10"
+            ),
+            Err(SqlError::InvalidSecondaryIndexRange)
+        ));
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT id FROM people WHERE email >= ?"),
+            Err(SqlError::InvalidSyntax)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_secondary_range_enforces_boundaries_and_binding_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_ordered_secondary_range(&mut database)?;
+        assert_ordered_secondary_range_boundaries(&database)?;
+        assert_ordered_secondary_range_binding_failures(&database)
+    }
+
+    fn seed_composite_secondary_range(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                payload TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing composite-secondary table identity".into());
+        };
+        for (id, tenant, sequence) in [(1_i64, "a", 1_i64), (2, "a", 2), (3, "aa", 0), (4, "b", 0)]
+        {
+            seed.execute_sql(
+                "INSERT INTO events (id, tenant, sequence, payload) VALUES (?, ?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Signed(sequence),
+                    SqlValue::Text(format!("{tenant}-{sequence}")),
+                ],
+            )?;
+        }
+        let created = seed.execute_sql(
+            "CREATE INDEX events_order ON events (tenant, sequence)",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing composite-secondary index identity".into());
+        };
+        seed.commit()?;
+        Ok((table, index))
+    }
+
+    fn composite_secondary_range_rows() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["id".to_owned(), "tenant".to_owned(), "sequence".to_owned()],
+            rows: vec![
+                vec![
+                    SqlValue::Signed(2),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(2),
+                ],
+                vec![
+                    SqlValue::Signed(3),
+                    SqlValue::Text("aa".to_owned()),
+                    SqlValue::Signed(0),
+                ],
+            ],
+        }
+    }
+
+    #[test]
+    fn composite_secondary_range_requires_the_complete_ordered_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, index) = seed_composite_secondary_range(&mut database)?;
+        let statement = "SELECT id, tenant, sequence FROM events
+            WHERE (tenant, sequence) < (?, ?)
+              AND (tenant, sequence) >= (?, ?)
+            ORDER BY tenant, sequence LIMIT 10";
+        let parameters = [
+            SqlValue::Text("b".to_owned()),
+            SqlValue::Signed(0),
+            SqlValue::Text("a".to_owned()),
+            SqlValue::Signed(2),
+        ];
+        let plan = database
+            .prepare_sql_latest(statement)
+            .map_err(|error| format!("failed to prepare composite secondary range: {error}"))?;
+        assert_eq!(
+            database
+                .execute_prepared_latest(&plan, &parameters)
+                .map_err(|error| format!("failed to execute composite secondary range: {error}"))?,
+            composite_secondary_range_rows()
+        );
+        let mut explain = database.begin_sql(11, DurabilityClass::Memory)?;
+        assert_eq!(
+            explain.execute_sql(&format!("EXPLAIN {statement}"), &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexRangeScan(table={table},index={index},\
+                     lower=inclusive,upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        for predicate in ["tenant >= ?", "sequence >= ?"] {
+            assert_eq!(
+                explain.execute_sql(
+                    &format!(
+                        "EXPLAIN SELECT id FROM events
+                         WHERE {predicate}
+                         ORDER BY id LIMIT 10"
+                    ),
+                    &[],
+                )?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(format!(
+                        "PrimaryKeyScan(table={table},limit=10,residual=true)"
+                    ))]],
+                }
+            );
+        }
+        explain.rollback();
+        assert!(matches!(
+            database.prepare_sql_latest(
+                "SELECT id FROM events
+                 WHERE (sequence, tenant) >= (?, ?)
+                 ORDER BY sequence, tenant LIMIT 10"
+            ),
+            Err(SqlError::InvalidSecondaryIndexRange)
+        ));
+        assert_eq!(
+            database.execute_prepared_latest(
+                &plan,
+                &[
+                    SqlValue::Text("b".to_owned()),
+                    SqlValue::Signed(0),
+                    SqlValue::Null,
+                    SqlValue::Signed(2),
+                ],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned(), "tenant".to_owned(), "sequence".to_owned(),],
+                rows: Vec::new(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_secondary_layout_keeps_exact_lookup_and_rejects_range_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE people (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing legacy-layout table identity".into());
+        };
+        for (id, email) in [(1_i64, "a"), (2, "aa"), (3, "b")] {
+            seed.execute_sql(
+                "INSERT INTO people (id, email) VALUES (?, ?)",
+                &[SqlValue::Signed(id), SqlValue::Text(email.to_owned())],
+            )?;
+        }
+        let created = seed.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing legacy-layout index identity".into());
+        };
+        seed.state
+            .relational
+            .indexes
+            .get_mut(&index)
+            .ok_or("missing private legacy-layout index")?
+            .layout = super::SecondaryIndexLayout::LegacyLengthFirstV1;
+        seed.commit()?;
+
+        let assert_legacy_behavior =
+            |database: &mut NativeDatabase| -> Result<(), Box<dyn std::error::Error>> {
+                let snapshot = database.snapshot(11)?;
+                assert_eq!(
+                    snapshot
+                        .state
+                        .relational
+                        .indexes
+                        .get(&index)
+                        .ok_or("missing materialized legacy-layout index")?
+                        .layout,
+                    super::SecondaryIndexLayout::LegacyLengthFirstV1
+                );
+                let exact = database.prepare_sql_latest("SELECT id FROM people WHERE email = ?")?;
+                assert_eq!(
+                    database.execute_prepared_latest(&exact, &[SqlValue::Text("aa".to_owned())],)?,
+                    SqlResult::Rows {
+                        columns: vec!["id".to_owned()],
+                        rows: vec![vec![SqlValue::Signed(2)]],
+                    }
+                );
+                let mut explain = database.begin_sql(11, DurabilityClass::Memory)?;
+                assert_eq!(
+                    explain.execute_sql(
+                        "EXPLAIN SELECT id FROM people
+                             WHERE email >= ? LIMIT 10",
+                        &[],
+                    )?,
+                    SqlResult::Rows {
+                        columns: vec!["plan".to_owned()],
+                        rows: vec![vec![SqlValue::Text(format!(
+                            "PrimaryKeyScan(table={table},limit=10,residual=true)"
+                        ))]],
+                    }
+                );
+                explain.rollback();
+                Ok(())
+            };
+        assert_legacy_behavior(&mut database)?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_legacy_behavior(&mut reopened)?;
+        Ok(())
+    }
+
+    fn forge_relational_entry(
+        database: &mut NativeDatabase,
+        physical_key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let roots = database.coordinator.snapshot(100)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let visible_csn = roots
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(&mut database.pages, visible_csn, physical_key, value)?
+            .tree;
+        let mut forged_roots = roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        forged_roots.insert(
+            super::SLOT_RELATIONAL,
+            forged_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            visible_csn,
+            roots.catalog_version(),
+            roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_roots,
+            roots.blob_generation(),
+        )?;
+        database.coordinator = hyphae_native_mvcc::CommitCoordinator::restore(forged)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physical_secondary_range_rejects_a_malformed_ordered_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_, index) = seed_ordered_secondary_range(&mut database)?;
+        let plan = database.prepare_sql_latest(SECONDARY_RANGE_QUERY)?;
+        let mut malformed =
+            SqlValue::Text("ab".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        malformed.extend_from_slice(&u32::MAX.to_be_bytes());
+        let physical_key = super::relational_secondary_entry_key(index, &malformed)?;
+        forge_relational_entry(
+            &mut database,
+            physical_key,
+            vec![super::RELATIONAL_SECONDARY_ENTRY_LIVE],
+        )?;
+
+        let result = database.execute_prepared_latest(&plan, &secondary_range_parameters());
+        assert!(
+            matches!(
+                result,
+                Err(SqlError::Runtime(NativeRuntimeError::InvalidRelationalTree))
+            ),
+            "unexpected malformed secondary-range result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_secondary_range_rejects_a_forged_row_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_, index) = seed_ordered_secondary_range(&mut database)?;
+        let plan = database.prepare_sql_latest(SECONDARY_RANGE_QUERY)?;
+        let index_key =
+            SqlValue::Text("ab".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        let primary_key = SqlValue::Signed(1)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
+        let identity = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &index_key,
+            &primary_key,
+        )?;
+        let physical_key = super::relational_secondary_entry_key(index, &identity)?;
+        forge_relational_entry(
+            &mut database,
+            physical_key,
+            vec![super::RELATIONAL_SECONDARY_ENTRY_LIVE],
+        )?;
+
+        let result = database.execute_prepared_latest(&plan, &secondary_range_parameters());
+        assert!(
+            matches!(result, Err(SqlError::InvalidStoredRow)),
+            "unexpected forged secondary projection result: {result:?}"
+        );
+        Ok(())
+    }
+
     fn seed_scaled_secondary_index(
         database: &mut NativeDatabase,
     ) -> Result<(ObjectId, ObjectId), Box<dyn std::error::Error>> {
@@ -19530,7 +20543,11 @@ mod tests {
             .encode_ordered_component(&LogicalType::Text)?;
         let primary_key = SqlValue::Signed(1)
             .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
-        let identity = super::secondary_index_entry_identity(&index_key, &primary_key)?;
+        let identity = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &index_key,
+            &primary_key,
+        )?;
         let physical_key = super::relational_secondary_entry_key(index, &identity)?;
         let roots = database.coordinator.snapshot(11)?.roots().clone();
         let root = roots
@@ -21628,7 +22645,8 @@ mod tests {
         let primary_key = primary_keys
             .first()
             .ok_or("missing secondary-index primary key")?;
-        let identity = super::secondary_index_entry_identity(index_key, primary_key)?;
+        let identity =
+            super::secondary_index_entry_identity(index_state.layout, index_key, primary_key)?;
         let physical_key = super::relational_secondary_entry_key(index, &identity)?;
         let root = roots
             .root(super::SLOT_RELATIONAL)

@@ -228,7 +228,14 @@ pub(crate) struct SecondaryIndexState {
     pub(crate) relation: ObjectId,
     pub(crate) unique: bool,
     pub(crate) nulls_distinct: bool,
+    pub(crate) layout: SecondaryIndexLayout,
     pub(crate) entries: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecondaryIndexLayout {
+    LegacyLengthFirstV1,
+    OrderedV2,
 }
 
 impl RelationState {
@@ -257,6 +264,7 @@ impl RelationState {
                     relation,
                     unique,
                     nulls_distinct,
+                    layout: SecondaryIndexLayout::OrderedV2,
                     entries: BTreeMap::new(),
                 },
             )

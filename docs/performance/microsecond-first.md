@@ -156,6 +156,22 @@ regression threshold or a G7 pass: WSL2 is virtualized, state is warm,
 concurrency is one, and the required cold-state, saturation, interference,
 allocation, transport, durability, and hardware-counter lanes are absent.
 
+Schema v15 adds the first ordered physical secondary-index range and its
+deliberately expensive unindexed differential baseline in one process and
+corpus. Over the same height-two, 2,048-row relation with variable-width
+text keys in `[a,b)`, the physical prepared secondary range observed p50
+`24.328 us`, p99 `58.527 us`, and throughput `37,844 ops/s` in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-secondary-range-wsl2.json),
+while the unindexed baseline returned the same ten validated rows at p50
+`7,971.720 us`, p99 `10,082.542 us`, and `123 ops/s`. The indexed route
+reduces p50 by `99.695%` and p99 by `99.420%` against that baseline and sits
+inside the provisional bounded indexed-SQL target for this single scenario.
+This is an algorithmic-work observation, not a controlled same-process
+regression threshold or a G7 pass: WSL2 is virtualized, state is warm,
+durability is memory, concurrency is one, and the required cold-state,
+saturation, interference, allocation, transport, durability, and
+hardware-counter lanes are absent.
+
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50
 latencies of approximately 22.9 ms exact, 83.4 ms lexical, and 113.9 ms hybrid

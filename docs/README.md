@@ -89,6 +89,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Decisions and governance
 
+- [Fable 5 native-ecosystem handoff — 2026-08-02](handoffs/fable-5-native-ecosystem-2026-08-02.md)
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)
 - [Porting ledger](porting/ledger.md)
@@ -135,6 +136,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native primary-key range evidence — 2026-08-01](gates/evidence/native-primary-key-ranges-2026-08-01.md)
 - [Native primary-key left-prefix scan evidence — 2026-08-02](gates/evidence/native-primary-key-prefix-scans-2026-08-02.md)
 - [Native primary-key prefix-range evidence — 2026-08-02](gates/evidence/native-primary-key-prefix-ranges-2026-08-02.md)
+- [Native secondary-index range evidence — 2026-08-02](gates/evidence/native-secondary-index-ranges-2026-08-02.md)
 - [Native SQL residual-filter evidence — 2026-08-01](gates/evidence/native-sql-residual-filters-2026-08-01.md)
 - [Native SQL scalar-literal evidence — 2026-08-01](gates/evidence/native-sql-scalar-literals-2026-08-01.md)
 - [Native SQL mutation-literal evidence — 2026-08-01](gates/evidence/native-sql-mutation-literals-2026-08-01.md)

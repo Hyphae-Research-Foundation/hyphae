@@ -25,6 +25,13 @@ const SECONDARY_SCALE_ROWS: u32 = 2_048;
 const SECONDARY_TARGET_ROW: u32 = SECONDARY_SCALE_ROWS / 2;
 const SECONDARY_OBSERVATIONS: u32 = 100_000;
 const SECONDARY_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const SECONDARY_RANGE_OBSERVATIONS: u32 = 10_000;
+const SECONDARY_RANGE_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const SECONDARY_RANGE_WARMUP: u32 = 1_000;
+const SECONDARY_RANGE_LOWER_ROW: u32 = SECONDARY_TARGET_ROW;
+const SECONDARY_RANGE_UPPER_ROW: u32 = SECONDARY_RANGE_LOWER_ROW + 10;
+const SECONDARY_RANGE_LOWER_KEY: &str = "a";
+const SECONDARY_RANGE_UPPER_KEY: &str = "b";
 const SCAN_LIMIT: usize = 10;
 const SCAN_OBSERVATIONS: u32 = 100_000;
 const SCAN_OPERATIONS_PER_OBSERVATION: u32 = 1;
@@ -98,6 +105,8 @@ struct OperationStats {
     prepared_sql_prefix_range: Stats,
     secondary_btree: Stats,
     secondary_prepared_sql: Stats,
+    secondary_range_scan: Stats,
+    secondary_range_physical: Stats,
     codec_dispatch: Stats,
 }
 
@@ -109,6 +118,8 @@ struct BenchmarkInputs<'a> {
     prefix_prepared: &'a PreparedStatement,
     prefix_range_prepared: &'a PreparedStatement,
     secondary_prepared: &'a PreparedStatement,
+    secondary_range_scan_prepared: &'a PreparedStatement,
+    secondary_range_prepared: &'a PreparedStatement,
     table: ObjectId,
     scan_table: ObjectId,
     secondary_index: ObjectId,
@@ -116,6 +127,7 @@ struct BenchmarkInputs<'a> {
     relational_target: &'a [u8],
     secondary_index_key: &'a [u8],
     secondary_parameters: &'a [SqlValue],
+    secondary_range_parameters: &'a [SqlValue],
     range_lower: &'a [u8],
     range_upper: &'a [u8],
     range_parameters: &'a [SqlValue],
@@ -140,6 +152,18 @@ struct PrefixBenchmarkInput {
     parameters: [SqlValue; 1],
     range_prepared: PreparedStatement,
     range_parameters: [SqlValue; 2],
+}
+
+struct SecondaryRangeBenchmarkInput {
+    scan_prepared: PreparedStatement,
+    physical_prepared: PreparedStatement,
+    parameters: [SqlValue; 2],
+}
+
+struct SecondaryExactBenchmarkInput {
+    prepared: PreparedStatement,
+    parameters: [SqlValue; 1],
+    index_key: Vec<u8>,
 }
 
 fn seed_prefix_sql_data(
@@ -230,6 +254,7 @@ fn seed_secondary_sql_data(
         "CREATE TABLE benchmark_people (
             id BIGINT PRIMARY KEY,
             email TEXT NOT NULL,
+            scan_email TEXT NOT NULL,
             active BOOLEAN NOT NULL,
             payload BINARY NOT NULL
         )",
@@ -243,17 +268,20 @@ fn seed_secondary_sql_data(
         return Err("secondary benchmark table identity was not returned".into());
     };
     for row in 0..SECONDARY_SCALE_ROWS {
-        let email = format!("person-{row:04}@hyphae.local");
+        let email = benchmark_email(row)?;
         let active = row % 2 == 0;
         let payload = vec![u8::try_from(row % 251)?; 96];
         dataset_hasher.update(&row.to_be_bytes());
         dataset_hasher.update(email.as_bytes());
+        dataset_hasher.update(email.as_bytes());
         dataset_hasher.update(&[u8::from(active)]);
         dataset_hasher.update(&payload);
         transaction.execute_sql(
-            "INSERT INTO benchmark_people (id, email, active, payload) VALUES (?, ?, ?, ?)",
+            "INSERT INTO benchmark_people (id, email, scan_email, active, payload)
+             VALUES (?, ?, ?, ?, ?)",
             &[
                 SqlValue::Signed(i64::from(row)),
+                SqlValue::Text(email.clone()),
                 SqlValue::Text(email),
                 SqlValue::Boolean(active),
                 SqlValue::Binary(payload),
@@ -272,6 +300,14 @@ fn seed_secondary_sql_data(
         return Err("secondary benchmark index identity was not returned".into());
     };
     Ok((table, index))
+}
+
+fn benchmark_email(row: u32) -> Result<String, std::num::TryFromIntError> {
+    if (SECONDARY_RANGE_LOWER_ROW..SECONDARY_RANGE_UPPER_ROW).contains(&row) {
+        Ok("a".repeat(usize::try_from(row - SECONDARY_RANGE_LOWER_ROW + 1)?))
+    } else {
+        Ok(format!("z-person-{row:04}!hyphae.local"))
+    }
 }
 
 fn warm_operations(
@@ -355,6 +391,8 @@ fn measure_operations(
     let prepared_sql_residual_range = measure_residual_filter(database, inputs);
     let prepared_sql_prefix = measure_prefix_scan(database, inputs);
     let prepared_sql_prefix_range = measure_prefix_range_scan(database, inputs);
+    let (secondary_range_scan, secondary_range_physical) =
+        measure_secondary_range(database, inputs);
     Ok(OperationStats {
         structure,
         structure_btree,
@@ -426,12 +464,67 @@ fn measure_operations(
             SECONDARY_OBSERVATIONS,
             SECONDARY_OPERATIONS_PER_OBSERVATION,
         ),
+        secondary_range_scan,
+        secondary_range_physical,
         codec_dispatch: measure(|| {
             if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
                 black_box(snapshot.get(black_box(decoded.payload)));
             }
         }),
     })
+}
+
+fn measure_secondary_range(
+    database: &NativeDatabase,
+    inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats) {
+    for _ in 0..SECONDARY_RANGE_WARMUP {
+        black_box(
+            database
+                .execute_prepared_latest(
+                    inputs.secondary_range_scan_prepared,
+                    black_box(inputs.secondary_range_parameters),
+                )
+                .is_ok(),
+        );
+        black_box(
+            database
+                .execute_prepared_latest(
+                    inputs.secondary_range_prepared,
+                    black_box(inputs.secondary_range_parameters),
+                )
+                .is_ok(),
+        );
+    }
+    let scan = measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(
+                        inputs.secondary_range_scan_prepared,
+                        black_box(inputs.secondary_range_parameters),
+                    )
+                    .is_ok(),
+            );
+        },
+        SECONDARY_RANGE_OBSERVATIONS,
+        SECONDARY_OPERATIONS_PER_OBSERVATION,
+    );
+    let physical = measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(
+                        inputs.secondary_range_prepared,
+                        black_box(inputs.secondary_range_parameters),
+                    )
+                    .is_ok(),
+            );
+        },
+        SECONDARY_RANGE_OBSERVATIONS,
+        SECONDARY_OPERATIONS_PER_OBSERVATION,
+    );
+    (scan, physical)
 }
 
 fn measure_structure_reads(
@@ -714,6 +807,56 @@ fn prepare_residual_benchmark(
     Ok((prepared, parameters))
 }
 
+fn prepare_secondary_range_benchmark(
+    database: &NativeDatabase,
+) -> Result<SecondaryRangeBenchmarkInput, Box<dyn std::error::Error>> {
+    let scan_prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_people
+         WHERE scan_email >= ? AND scan_email < ?
+         ORDER BY id
+         LIMIT 10",
+    )?;
+    let physical_prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_people
+         WHERE email >= ? AND email < ?
+         ORDER BY email
+         LIMIT 10",
+    )?;
+    let parameters = [
+        SqlValue::Text(SECONDARY_RANGE_LOWER_KEY.to_owned()),
+        SqlValue::Text(SECONDARY_RANGE_UPPER_KEY.to_owned()),
+    ];
+    let scan = database.execute_prepared_latest(&scan_prepared, &parameters)?;
+    let physical = database.execute_prepared_latest(&physical_prepared, &parameters)?;
+    let SqlResult::Rows { rows, .. } = &physical else {
+        return Err("physical secondary range benchmark did not return rows".into());
+    };
+    if rows.len() != SCAN_LIMIT || scan != physical {
+        return Err("secondary range benchmark routes did not return the same ten rows".into());
+    }
+    Ok(SecondaryRangeBenchmarkInput {
+        scan_prepared,
+        physical_prepared,
+        parameters,
+    })
+}
+
+fn prepare_secondary_exact_benchmark(
+    database: &NativeDatabase,
+    index: ObjectId,
+) -> Result<SecondaryExactBenchmarkInput, Box<dyn std::error::Error>> {
+    let prepared =
+        database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
+    let parameters = [SqlValue::Text(benchmark_email(SECONDARY_TARGET_ROW)?)];
+    let index_key = parameters[0].encode_ordered_component(&LogicalType::Text)?;
+    validate_secondary_routes(database, index, &index_key, &prepared, &parameters)?;
+    Ok(SecondaryExactBenchmarkInput {
+        prepared,
+        parameters,
+        index_key,
+    })
+}
+
 fn prepare_prefix_benchmark(
     database: &NativeDatabase,
 ) -> Result<PrefixBenchmarkInput, Box<dyn std::error::Error>> {
@@ -798,7 +941,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v14");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v15");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
     let (secondary_table, secondary_index) =
         seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
@@ -814,20 +957,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let range = prepare_range_benchmark(&database, secondary_table)?;
     let (residual_prepared, residual_parameters) = prepare_residual_benchmark(&database)?;
     let prefix = prepare_prefix_benchmark(&database)?;
-    let secondary_prepared =
-        database.prepare_sql_latest("SELECT id, payload FROM benchmark_people WHERE email = ?")?;
+    let secondary_range = prepare_secondary_range_benchmark(&database)?;
+    let secondary_exact = prepare_secondary_exact_benchmark(&database, secondary_index)?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
-    let secondary_target = format!("person-{SECONDARY_TARGET_ROW:04}@hyphae.local");
-    let secondary_parameters = [SqlValue::Text(secondary_target)];
-    let secondary_index_key =
-        secondary_parameters[0].encode_ordered_component(&LogicalType::Text)?;
-    validate_secondary_routes(
-        &database,
-        secondary_index,
-        &secondary_index_key,
-        &secondary_prepared,
-        &secondary_parameters,
-    )?;
     validate_scan_routes(&database, secondary_table, &scan_prepared)?;
     let structure_target = STRUCTURE_TARGET_KEY.to_be_bytes();
     let hash_target = HASH_TARGET_FIELD.to_be_bytes();
@@ -850,14 +982,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             residual_prepared: &residual_prepared,
             prefix_prepared: &prefix.prepared,
             prefix_range_prepared: &prefix.range_prepared,
-            secondary_prepared: &secondary_prepared,
+            secondary_prepared: &secondary_exact.prepared,
+            secondary_range_scan_prepared: &secondary_range.scan_prepared,
+            secondary_range_prepared: &secondary_range.physical_prepared,
             table,
             scan_table: secondary_table,
             secondary_index,
             search_index: index,
             relational_target: &relational_target,
-            secondary_index_key: &secondary_index_key,
-            secondary_parameters: &secondary_parameters,
+            secondary_index_key: &secondary_exact.index_key,
+            secondary_parameters: &secondary_exact.parameters,
+            secondary_range_parameters: &secondary_range.parameters,
             range_lower: &range.lower,
             range_upper: &range.upper,
             range_parameters: &range.parameters,
@@ -895,7 +1030,7 @@ fn print_report(
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v14\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v15\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -912,6 +1047,16 @@ fn print_report(
     println!("  \"search_operations_per_observation\": {SEARCH_OPERATIONS_PER_OBSERVATION},");
     println!("  \"secondary_observations\": {SECONDARY_OBSERVATIONS},");
     println!("  \"secondary_operations_per_observation\": {SECONDARY_OPERATIONS_PER_OBSERVATION},");
+    println!("  \"secondary_range_observations\": {SECONDARY_RANGE_OBSERVATIONS},");
+    println!("  \"secondary_range_warmup\": {SECONDARY_RANGE_WARMUP},");
+    println!(
+        "  \"secondary_range_operations_per_observation\": \
+         {SECONDARY_RANGE_OPERATIONS_PER_OBSERVATION},"
+    );
+    println!("  \"secondary_range_lower_row_inclusive\": {SECONDARY_RANGE_LOWER_ROW},");
+    println!("  \"secondary_range_upper_row_exclusive\": {SECONDARY_RANGE_UPPER_ROW},");
+    println!("  \"secondary_range_lower_key_inclusive\": \"{SECONDARY_RANGE_LOWER_KEY}\",");
+    println!("  \"secondary_range_upper_key_exclusive\": \"{SECONDARY_RANGE_UPPER_KEY}\",");
     println!("  \"scan_limit\": {SCAN_LIMIT},");
     println!("  \"range_lower_row_inclusive\": {RANGE_LOWER_ROW},");
     println!("  \"range_upper_row_exclusive\": {RANGE_UPPER_ROW},");
@@ -1006,6 +1151,16 @@ fn print_operation_stats(operations: &OperationStats) {
     print_stats(
         "physical_prepared_sql_secondary_exact_unique_multilevel",
         operations.secondary_prepared_sql,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_unindexed_text_range_pk_scan_limit10_multilevel",
+        operations.secondary_range_scan,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_secondary_range_limit10_multilevel",
+        operations.secondary_range_physical,
         true,
     );
     print_stats(
