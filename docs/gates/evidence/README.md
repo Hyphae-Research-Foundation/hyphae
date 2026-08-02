@@ -236,6 +236,15 @@ commit before its tag can be published.
 - `native-sorted-set-wsl2.json` is its clean release observation for physical
   `ZCARD`, middle-member `ZSCORE`, and ten-entry head `ZRANGE` over 2,048
   members. It remains outside G3 and G7.
+- [Native durable scalar-expiry evidence —
+  2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
+  expiry identities, bounded cleanup, renewal conflicts, fail-closed
+  reconstruction, legacy `HYSTRBT1` compatibility, and all seven cleanup
+  crash boundaries to one source commit.
+- `native-expiry-wsl2.json` is its clean release observation for an empty hot
+  due scan plus memory- and strict-durability cleanup batches. It records
+  microsecond empty scans and millisecond cleanup batches, and remains
+  outside G3 and G7.
 
 ## Hosted release evidence
 

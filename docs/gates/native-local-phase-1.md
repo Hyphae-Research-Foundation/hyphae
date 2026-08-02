@@ -280,6 +280,16 @@ Score ranges, reverse/rank acceleration, algebra, TTL, protocol exposure,
 model testing, amplification evidence, the complete G3 suite, and G7 remain
 open.
 
+The [native durable scalar-expiry
+evidence](evidence/native-expiry-2026-08-01.md) binds `HYSTRBT2`, its ordered
+expiry namespace, bounded deterministic cleanup, `HYSTRBT1` compatibility,
+first-committer-wins renewal safety, fail-closed reconstruction, all seven
+cleanup crash boundaries, and the first scheduler/cleanup latency
+observations to one clean source commit. The empty hot scan is measured in
+microseconds; current multi-key cleanup batches remain millisecond operations
+and expose complete-state materialization plus per-key copy-on-write
+publication as open performance work.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -303,8 +313,9 @@ multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes, exact binary
 sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
-algebra/TTL, score/reverse/rank sorted-set operations, streams, the expiry
-scheduler, model tests, and amplification evidence required to close G3.
+algebra/TTL, score/reverse/rank sorted-set operations, streams, an engine-owned
+background timer around the implemented scalar expiry primitive, model tests,
+and amplification/compaction evidence required to close G3.
 
 ## G1 substrate exit
 

@@ -4,9 +4,10 @@ Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
 buffered reads, large immutable blobs, and dual-index sorted sets are
-implemented in the convergence slice; the ordered durable expiry-index
-contract is admitted for implementation; version-bearing responses and the
-remaining structure families remain pending
+implemented in the convergence slice; the ordered durable scalar-expiry index
+and bounded cleanup are implemented; an engine-owned background timer,
+version-bearing responses, and the remaining structure families remain
+pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -418,11 +419,14 @@ cross-engine transactions.
 Current experimental tests cover a 2,048-key multilevel tree, historical roots,
 direct TTL and expiry reads, canonical tombstones, `NX`/`XX`, racing `NX`
 writers, signed counter bounds, strict reopen, canonical-envelope corruption,
-legacy whole-page compatibility, optimistic disjoint-key rebase, all commit
-crash boundaries with scalar and hash mutations, typed scalar/hash creation
-races, disjoint-field rebase, same-field conflict, hash count corruption,
-field tombstones, typed scalar/hash/set creation races, disjoint-member
-rebase, same-member conflict, set count corruption, member tombstones,
-chunked-list restart/range/corruption/conflict behavior, and one blob
-deduplicated across relational, scalar, hash field, and list values. They do
-not close the structure gate.
+legacy whole-page and `HYSTRBT1` compatibility, optimistic disjoint-key
+rebase, all commit crash boundaries with scalar and hash mutations, durable
+expiry reconstruction and cleanup at all seven commit boundaries, stale
+cleanup/renewal conflict, full signed timestamp order, forged expiry-index
+corruption, typed scalar/hash creation races, disjoint-field rebase,
+same-field conflict, hash count corruption, field tombstones, typed
+scalar/hash/set creation races, disjoint-member rebase, same-member conflict,
+set count corruption, member tombstones, chunked-list
+restart/range/corruption/conflict behavior, and one blob deduplicated across
+relational, scalar, hash field, and list values. They do not close the
+structure gate.
