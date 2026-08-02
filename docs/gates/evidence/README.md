@@ -374,3 +374,16 @@ detectable.
   57,475,072 reclaimed bytes, strict/no-op maintenance latency, separate warm
   point-read percentiles, an isolated same-filesystem sync probe, and reopen
   verification. It is an observation, not a G7 gate.
+
+## Native group commit
+
+- `native-group-commit-2026-08-02.md` binds the bounded multi-producer
+  scheduler, independent conflict admission, private MVCC root chain, one
+  shared page/WAL flush, orderly shutdown and five-boundary crash matrix to
+  exact source.
+- `native-group-commit-windows.json` records the clean Windows/NTFS
+  eight-producer comparison: 3.502910 times strict throughput, microsecond queue
+  wait and millisecond cohort/end-to-end latency.
+- `native-group-commit-wsl2.json` records the clean WSL2/v9fs comparison:
+  1.654654 times strict throughput. Its sub-microsecond sync observations are
+  explicitly not native-ext4 or physical power-loss evidence.

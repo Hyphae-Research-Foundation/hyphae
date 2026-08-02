@@ -4,8 +4,9 @@ Status: normative target contract; block/record framing, append, integrity
 chain, incomplete-tail repair, typed transaction envelopes, root-manifest
 checkpoint anchors, and page-generation commit metadata are implemented
 experimentally; committed mutation decoding reconstructs the write-conflict
-table, while bounded checkpoint replay, WAL retention, idempotent retries, and
-the separately specified group-commit scheduler remain pending
+table and the first bounded group-commit scheduler shares page/WAL flushes,
+while bounded checkpoint replay, WAL retention, and idempotent retries remain
+pending
 
 The WAL is the only transaction authority for the three native engines. It
 records one cross-engine transaction, not three engine-specific commits.

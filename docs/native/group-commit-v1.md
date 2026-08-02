@@ -1,7 +1,8 @@
 # Native group commit v1
 
-Status: normative target contract; implementation and exit evidence are
-pending
+Status: normative target contract; bounded scheduler, independent admission,
+private MVCC root chain, shared page/WAL flush, timing receipts and
+five-boundary crash matrix are implemented experimentally
 
 Group commit is a durability scheduler, not a transaction-composition feature.
 It allows independent native transactions to share the physical synchronization
