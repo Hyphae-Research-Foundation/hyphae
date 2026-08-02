@@ -16,6 +16,8 @@ use std::{
 use hyphae_native_types::DurabilityClass;
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::CommitBoundary;
 use crate::{
     CommitReceipt, GroupCommitOutcome, MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE,
     NativeDatabase, NativeRuntimeError, NativeWriteBatch,
@@ -351,6 +353,8 @@ struct ActiveExpiryRuntime {
     next_deadline: Instant,
     logical_watermark: i64,
     foreground_after_due: usize,
+    #[cfg(test)]
+    interruption: Option<CommitBoundary>,
 }
 
 impl ActiveExpiryRuntime {
@@ -366,6 +370,8 @@ impl ActiveExpiryRuntime {
             next_deadline: Instant::now() + config.interval,
             logical_watermark: i64::MIN,
             foreground_after_due: 0,
+            #[cfg(test)]
+            interruption: None,
         }
     }
 
@@ -693,6 +699,11 @@ impl NativeCommitClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn accepting_for_test(&self) -> Result<bool, GroupCommitSubmitError> {
+        self.accepting()
+    }
+
+    #[cfg(test)]
     pub(crate) fn enqueue_for_test(
         &self,
         batch: NativeWriteBatch,
@@ -782,6 +793,20 @@ impl NativeCommitScheduler {
     ) -> Result<Self, GroupCommitSubmitError> {
         let metrics = Arc::new(ActiveExpiryMetrics::default());
         let runtime = ActiveExpiryRuntime::new(active_expiry, clock, Arc::clone(&metrics));
+        Self::start_inner(database, config, Some((runtime, metrics)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_active_expiry_clock_at(
+        database: NativeDatabase,
+        config: GroupCommitConfig,
+        active_expiry: ActiveExpiryConfig,
+        clock: Arc<dyn NativeSchedulerClock>,
+        interruption: CommitBoundary,
+    ) -> Result<Self, GroupCommitSubmitError> {
+        let metrics = Arc::new(ActiveExpiryMetrics::default());
+        let mut runtime = ActiveExpiryRuntime::new(active_expiry, clock, Arc::clone(&metrics));
+        runtime.interruption = Some(interruption);
         Self::start_inner(database, config, Some((runtime, metrics)))
     }
 
@@ -1180,15 +1205,24 @@ fn execute_active_expiry(
     let logical_time_micros = active_expiry.begin_sweep();
     let result = match database.write() {
         Ok(mut database) => match database.as_mut() {
-            Some(database) => database
-                .expire_due_structures(
+            Some(database) => {
+                #[cfg(not(test))]
+                let sweep = database.expire_due_structures(
                     logical_time_micros,
                     active_expiry.config.max_keys,
                     active_expiry.config.durability,
-                )
-                .map_err(|source| ActiveExpiryFailure::Runtime {
+                );
+                #[cfg(test)]
+                let sweep = database.expire_due_structures_at(
+                    logical_time_micros,
+                    active_expiry.config.max_keys,
+                    active_expiry.config.durability,
+                    active_expiry.interruption,
+                );
+                sweep.map_err(|source| ActiveExpiryFailure::Runtime {
                     source: Arc::new(source),
-                }),
+                })
+            }
             None => Err(ActiveExpiryFailure::DatabaseUnavailable),
         },
         Err(_) => Err(ActiveExpiryFailure::DatabaseUnavailable),
