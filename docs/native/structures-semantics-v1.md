@@ -375,6 +375,15 @@ typed error. No due keys means no WAL record and no CSN advancement. The
 receipt reports the expired-key count, whether another due live identity was
 observed, and the optional commit receipt.
 
+For `HYSTRBT2`, cleanup preparation is a physical-root operation. After the
+ordered scan validates each selected scalar envelope, it builds a
+structure-only delete batch without materializing the catalog, relational,
+search, ANN, or complete structure state. The commit path admits that fast
+path only when all four prior roots exist, only the structure slot is dirty,
+the structure format is `HYSTRBT2`, and every mutation is one canonical scalar
+delete. It otherwise fails closed. `HYSTRBT1` and whole-state compatibility
+formats keep their materialized fallback.
+
 Recovery reconstructs pending work directly from the durable ordered
 namespace. It requires a one-to-one match between every live expiry identity
 and every scalar envelope carrying that exact timestamp. Missing, duplicate,

@@ -54,6 +54,11 @@ use hyphae_native_types::{
 use hyphae_native_wal::{WalError, WalFile, WalRecovery};
 use thiserror::Error;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 use crate::{
     model::{
         CatalogState, ListPop, ModelError, RelationState, SearchState, SortedSetMemberState,
@@ -364,6 +369,10 @@ pub enum NativeRuntimeError {
     /// A deterministic checkpoint interruption was requested.
     #[error("native checkpoint interrupted at {0:?}; reopen the data directory")]
     InjectedCheckpointCrash(CheckpointBoundary),
+    /// Test-only guard proving a path does not materialize all engine state.
+    #[cfg(test)]
+    #[error("unexpected complete native state materialization")]
+    UnexpectedFullStateLoad,
 }
 
 impl From<WalSemanticError> for NativeRuntimeError {
@@ -1673,7 +1682,9 @@ impl NativeDatabase {
                 requested: max_keys,
             });
         }
-        let (due_keys, more_due) = self.due_structure_keys(logical_time_micros, max_keys)?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let (due_keys, more_due) =
+            self.due_structure_keys(&snapshot, logical_time_micros, max_keys)?;
         if due_keys.is_empty() {
             return Ok(ExpirySweepReceipt {
                 expired_keys: 0,
@@ -1682,12 +1693,56 @@ impl NativeDatabase {
             });
         }
         let expired_keys = due_keys.len();
-        let mut transaction = self.begin(logical_time_micros, durability)?;
-        for key in due_keys {
-            if !transaction.delete_expired_structure(key)? {
-                return Err(NativeRuntimeError::InvalidStructureTree);
+        let transaction = if self.structure_format == StructureFormat::BTreeV2 {
+            let transaction_id = TransactionId::new(self.next_transaction_id)
+                .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+            let root_transaction = self.coordinator.begin_write()?;
+            if root_transaction.base_roots() != snapshot.roots() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
-        }
+            let mutations = due_keys
+                .into_iter()
+                .map(|key| Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::DeleteValue,
+                    target: None,
+                    key,
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                })
+                .collect();
+            NativeTransaction {
+                pages: &mut self.pages,
+                blobs: &mut self.blobs,
+                wal: &mut self.wal,
+                conflicts: &mut self.conflicts,
+                relational_format: self.relational_format,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                root_transaction,
+                conflict_read_csn: snapshot.visible_csn,
+                transaction_id,
+                next_transaction_id: &mut self.next_transaction_id,
+                batch: NativeWriteBatch {
+                    snapshot,
+                    state: MaterializedState::default(),
+                    mutations,
+                    dirty: [false, false, true, false],
+                    durability,
+                    structure_format: self.structure_format,
+                    search_format: self.search_format,
+                    mode: NativeWriteBatchMode::PhysicalStructureExpiry,
+                },
+            }
+        } else {
+            let mut transaction = self.begin(logical_time_micros, durability)?;
+            for key in due_keys {
+                if !transaction.delete_expired_structure(key)? {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
+            transaction
+        };
         let commit = match interruption {
             Some(boundary) => transaction.commit_with_interruption(boundary)?,
             None => transaction.commit()?,
@@ -1701,10 +1756,10 @@ impl NativeDatabase {
 
     fn due_structure_keys(
         &self,
+        snapshot: &Snapshot,
         logical_time_micros: i64,
         max_keys: usize,
     ) -> Result<(Vec<Vec<u8>>, bool), NativeRuntimeError> {
-        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         if !self.structure_format.has_expiry_index() {
             let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
             let mut due = state
@@ -2555,6 +2610,7 @@ impl NativeDatabase {
             durability,
             structure_format: self.structure_format,
             search_format: self.search_format,
+            mode: NativeWriteBatchMode::Materialized,
         })
     }
 
@@ -2641,6 +2697,9 @@ impl NativeDatabase {
         mut batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
+        if batch.mode != NativeWriteBatchMode::Materialized {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
         if batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
         }
@@ -2875,6 +2934,13 @@ pub struct NativeWriteBatch {
     durability: DurabilityClass,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    mode: NativeWriteBatchMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWriteBatchMode {
+    Materialized,
+    PhysicalStructureExpiry,
 }
 
 /// Legacy serialized transaction retaining writer admission for its lifetime.
@@ -5027,6 +5093,7 @@ fn commit_engine_roots(
     batch: &NativeWriteBatch,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<[Option<PageId>; 4], NativeRuntimeError> {
+    validate_write_batch_shape(batch, &roots, structure_format, search_format)?;
     if batch.dirty[0] || roots[0].is_none() {
         roots[0] = Some(pages.append(
             PageKind::CatalogRoot,
@@ -5075,6 +5142,42 @@ fn commit_engine_roots(
         )?;
     }
     Ok(roots)
+}
+
+fn validate_write_batch_shape(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    match batch.mode {
+        NativeWriteBatchMode::Materialized => Ok(()),
+        NativeWriteBatchMode::PhysicalStructureExpiry => {
+            let valid_roots = roots.iter().all(Option::is_some);
+            let valid_formats = structure_format == StructureFormat::BTreeV2
+                && batch.structure_format == StructureFormat::BTreeV2
+                && batch.search_format == search_format;
+            let valid_state = batch.state == MaterializedState::default();
+            let valid_mutations = !batch.mutations.is_empty()
+                && batch.mutations.iter().all(|mutation| {
+                    mutation.engine == EngineKind::Structure
+                        && mutation.opcode == Opcode::DeleteValue
+                        && mutation.target.is_none()
+                        && mutation.value.is_empty()
+                        && mutation.expires_at_micros.is_none()
+                });
+            if valid_roots
+                && valid_formats
+                && valid_state
+                && batch.dirty == [false, false, true, false]
+                && valid_mutations
+            {
+                Ok(())
+            } else {
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            }
+        }
+    }
 }
 
 fn stage_large_values(
@@ -8043,6 +8146,10 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
+    #[cfg(test)]
+    if FAIL_FULL_STATE_LOAD.get() {
+        return Err(NativeRuntimeError::UnexpectedFullStateLoad);
+    }
     let catalog = load_catalog_state(pages, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
     let search = load_search_state(pages, blobs, roots)?;
@@ -9770,6 +9877,28 @@ mod tests {
         assert_eq!(
             reopened.get_latest_structure(b"c", 100)?,
             Some(b"persistent-now".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hystrbt2_cleanup_does_not_materialize_complete_engine_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"physical-expiry".to_vec(), b"value".to_vec(), Some(10))?;
+        seed.commit()?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        let cleanup = database.expire_due_structures(10, 1, DurabilityClass::Strict);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        let cleanup = cleanup?;
+        assert_eq!(cleanup.expired_keys, 1);
+        assert!(cleanup.commit.is_some());
+        assert_eq!(
+            database.get_latest_structure(b"physical-expiry", i64::MIN)?,
+            None
         );
         Ok(())
     }
