@@ -12265,7 +12265,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicU64, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use hyphae_native_btree::BTree;
@@ -12282,13 +12282,15 @@ mod tests {
         AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
         CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
-        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        EngineKind, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
+        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition,
+        CommitCancellationOutcome, CommitBoundary, EngineKind, GroupCommitBoundary,
+        GroupCommitConfig, GroupCommitOutcome,
         GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError, Mutation,
-        NativeCommitScheduler, NativeDatabase, NativeRuntimeError, NativeWriteBatch, ObjectHeader,
-        Opcode, PAGE_FILE, PageStore, RelationDefinition, RelationalScanRow, SLOT_CATALOG,
-        SetCondition, SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary,
-        Vector, VectorMetric, WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome,
+        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
+        NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
+        RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
+        WalRetentionBoundary, ZAddOutcome,
         binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
         catalog_name_key, catalog_object_key, catalog_root_after_mutations,
         decode_catalog_definition_storage_value, page_generation_path,
@@ -16933,6 +16935,57 @@ mod tests {
         assert_eq!(
             reopened.get_latest_structure(b"mixed-group", 154)?,
             Some(b"three".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_scheduler_cancels_only_queued_work_without_consuming_csn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(2, Duration::ZERO, 2)?,
+        )?;
+
+        let mut cancelled = scheduler.begin_optimistic(151, DurabilityClass::Strict)?;
+        cancelled.set(b"cancelled".to_vec(), b"never".to_vec(), None)?;
+        let control = NativeCommitControl::new();
+        assert_eq!(
+            control.cancellation().cancel(),
+            CommitCancellationOutcome::Cancelled
+        );
+        assert!(matches!(
+            scheduler.submit_controlled(cancelled, control, None),
+            Err(GroupCommitSubmitError::Cancelled)
+        ));
+
+        let mut expired = scheduler.begin_optimistic(152, DurabilityClass::Strict)?;
+        expired.set(b"expired".to_vec(), b"never".to_vec(), None)?;
+        assert!(matches!(
+            scheduler.submit_controlled(
+                expired,
+                NativeCommitControl::new(),
+                Some(Instant::now() - Duration::from_nanos(1))
+            ),
+            Err(GroupCommitSubmitError::DeadlineExceeded)
+        ));
+
+        let mut committed = scheduler.begin_optimistic(153, DurabilityClass::Strict)?;
+        committed.set(b"committed".to_vec(), b"yes".to_vec(), None)?;
+        let receipt = scheduler.submit(committed)?;
+        assert_eq!(receipt.transaction_id, TransactionId::new(2)?);
+        assert_eq!(receipt.commit_csn, Csn::new(2)?);
+
+        scheduler.shutdown()?;
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.get_latest_structure(b"cancelled", 154)?, None);
+        assert_eq!(reopened.get_latest_structure(b"expired", 154)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"committed", 154)?,
+            Some(b"yes".to_vec())
         );
         Ok(())
     }

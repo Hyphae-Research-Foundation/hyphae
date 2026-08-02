@@ -599,8 +599,8 @@ fn close_database(database: &RwLock<Option<NativeDatabase>>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupCommitConfig, GroupCommitConfigError, MAX_GROUP_COMMIT_QUEUE_CAPACITY,
-        MAX_GROUP_COMMIT_WAIT,
+        CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError,
+        MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitControl,
     };
     use crate::MAX_GROUP_COMMIT_BATCH_SIZE;
     use std::time::Duration;
@@ -645,6 +645,34 @@ mod tests {
             GroupCommitConfig::new(8, Duration::from_micros(100), 16)
                 .map(GroupCommitConfig::max_batch_size),
             Ok(8)
+        );
+    }
+
+    #[test]
+    fn cancellation_state_has_one_exact_execution_boundary() {
+        let control = NativeCommitControl::new();
+        let cancellation = control.cancellation();
+        assert!(control.claim_execution());
+        assert_eq!(
+            cancellation.cancel(),
+            CommitCancellationOutcome::TooLate
+        );
+        control.complete();
+        assert_eq!(
+            cancellation.cancel(),
+            CommitCancellationOutcome::Completed
+        );
+
+        let queued = NativeCommitControl::new();
+        let cancellation = queued.cancellation();
+        assert_eq!(
+            cancellation.cancel(),
+            CommitCancellationOutcome::Cancelled
+        );
+        assert!(!queued.claim_execution());
+        assert_eq!(
+            cancellation.cancel(),
+            CommitCancellationOutcome::Cancelled
         );
     }
 }
