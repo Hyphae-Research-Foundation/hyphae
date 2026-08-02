@@ -1797,29 +1797,15 @@ impl NativeDatabase {
         let Some((range_start, range_stop)) = normalize_list_range(length, start, stop) else {
             return Ok(Vec::new());
         };
-        let mut values = Vec::with_capacity(length);
-        let mut chunk_id = metadata.head_chunk;
-        loop {
-            let chunk_key = structure_list_chunk_key(key, chunk_id)?;
-            let encoded_chunk = tree
-                .get_cached_pinned(&self.pages, &self.buffer_pool, &chunk_key)?
-                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-            let elements = decode_list_chunk_storage(encoded_chunk.bytes())?
-                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-            for element in elements {
-                values.push(decode_list_element(&element, &self.blobs)?);
-            }
-            if chunk_id == metadata.tail_chunk {
-                break;
-            }
-            chunk_id = chunk_id
-                .checked_add(1)
-                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-        }
-        if values.len() != length {
+        let values = if range_start <= length - 1 - range_stop {
+            read_list_range_from_head(self, tree, key, metadata, range_start, range_stop)?
+        } else {
+            read_list_range_from_tail(self, tree, key, metadata, range_start, range_stop)?
+        };
+        if values.len() != range_stop - range_start + 1 {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
-        Ok(values[range_start..=range_stop].to_vec())
+        Ok(values)
     }
 
     /// Executes BM25 matching through the current physical inverted index.
@@ -2244,6 +2230,107 @@ impl NativeDatabase {
             parent_directory_sync_supported: hyphae_native_manifest::parent_sync_supported(),
         })
     }
+}
+
+fn read_physical_list_chunk(
+    database: &NativeDatabase,
+    tree: BTree,
+    key: &[u8],
+    chunk_id: i64,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    let chunk_key = structure_list_chunk_key(key, chunk_id)?;
+    let encoded = tree
+        .get_cached_pinned(&database.pages, &database.buffer_pool, &chunk_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    decode_list_chunk_storage(encoded.bytes())?.ok_or(NativeRuntimeError::InvalidStructureTree)
+}
+
+fn decode_list_range_elements(
+    envelopes: &[Vec<u8>],
+    start: usize,
+    stop: usize,
+    blobs: &BlobStore,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    envelopes[start..=stop]
+        .iter()
+        .map(|element| decode_list_element(element, blobs))
+        .collect()
+}
+
+fn read_list_range_from_head(
+    database: &NativeDatabase,
+    tree: BTree,
+    key: &[u8],
+    metadata: ListMetadata,
+    range_start: usize,
+    range_stop: usize,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    let mut values = Vec::with_capacity(range_stop - range_start + 1);
+    let mut position = 0_usize;
+    let mut chunk_id = metadata.head_chunk;
+    loop {
+        let elements = read_physical_list_chunk(database, tree, key, chunk_id)?;
+        let chunk_end = position
+            .checked_add(elements.len())
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if range_start < chunk_end && range_stop >= position {
+            let local_start = range_start.saturating_sub(position);
+            let local_stop = range_stop.min(chunk_end - 1) - position;
+            values.extend(decode_list_range_elements(
+                &elements,
+                local_start,
+                local_stop,
+                &database.blobs,
+            )?);
+        }
+        if range_stop < chunk_end || chunk_id == metadata.tail_chunk {
+            break;
+        }
+        position = chunk_end;
+        chunk_id = chunk_id
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    }
+    Ok(values)
+}
+
+fn read_list_range_from_tail(
+    database: &NativeDatabase,
+    tree: BTree,
+    key: &[u8],
+    metadata: ListMetadata,
+    range_start: usize,
+    range_stop: usize,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    let mut segments = Vec::new();
+    let mut position_end =
+        usize::try_from(metadata.length).map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    let mut chunk_id = metadata.tail_chunk;
+    loop {
+        let elements = read_physical_list_chunk(database, tree, key, chunk_id)?;
+        let chunk_start = position_end
+            .checked_sub(elements.len())
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if range_start < position_end && range_stop >= chunk_start {
+            let local_start = range_start.saturating_sub(chunk_start);
+            let local_stop = range_stop.min(position_end - 1) - chunk_start;
+            segments.push(decode_list_range_elements(
+                &elements,
+                local_start,
+                local_stop,
+                &database.blobs,
+            )?);
+        }
+        if range_start >= chunk_start || chunk_id == metadata.head_chunk {
+            break;
+        }
+        position_end = chunk_start;
+        chunk_id = chunk_id
+            .checked_sub(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    }
+    segments.reverse();
+    Ok(segments.into_iter().flatten().collect())
 }
 
 /// Detached private write set over one immutable all-engine snapshot.
