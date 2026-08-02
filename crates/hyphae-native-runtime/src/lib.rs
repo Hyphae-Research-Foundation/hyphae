@@ -17699,7 +17699,7 @@ mod tests {
                 "SELECT payload FROM events WHERE tenant = ?",
                 &[SqlValue::Text("celiums".to_owned())],
             ),
-            Err(SqlError::InvalidPrimaryKey)
+            Err(SqlError::InvalidSyntax)
         ));
         transaction.commit()?;
 
