@@ -8,10 +8,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest.mock import patch
 
 from tools.run_native_power_loss_gate import (
     assert_owned_path,
     normalize_loop_backing,
+    mounted_source,
     require_loop_device,
     validate_label,
     validate_mapper_name,
@@ -59,6 +62,15 @@ class NativePowerLossGateSafetyTests(unittest.TestCase):
                 normalize_loop_backing(f"{image} (deleted)\n"),
                 image.resolve(),
             )
+
+    @patch("tools.run_native_power_loss_gate.run")
+    def test_mount_detection_requires_an_exact_mountpoint(self, run_mock) -> None:
+        run_mock.return_value = CompletedProcess((), 1, "", "")
+        mountpoint = Path("/var/tmp/hyphae-power-loss-test/mount")
+        self.assertIsNone(mounted_source(mountpoint))
+        arguments = run_mock.call_args.args[0]
+        self.assertIn("--mountpoint", arguments)
+        self.assertNotIn("--target", arguments)
 
 
 if __name__ == "__main__":

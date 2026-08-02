@@ -226,7 +226,7 @@ def mapper_exists(name: str) -> bool:
 
 def mounted_source(mountpoint: Path) -> str | None:
     completed = run(
-        ("findmnt", "--noheadings", "--output", "SOURCE", "--target", mountpoint),
+        ("findmnt", "--noheadings", "--output", "SOURCE", "--mountpoint", mountpoint),
         check=False,
     )
     if completed.returncode != 0:
@@ -383,7 +383,14 @@ class Topology:
                 f"mountpoint source is {source!r}, expected isolated device {expected!r}"
             )
         return run(
-            ("findmnt", "--noheadings", "--output", "OPTIONS", "--target", self.mountpoint)
+            (
+                "findmnt",
+                "--noheadings",
+                "--output",
+                "OPTIONS",
+                "--mountpoint",
+                self.mountpoint,
+            )
         ).stdout.strip()
 
     def unmount(self) -> None:
@@ -546,9 +553,18 @@ def run_scenario(
             }
         )
     finally:
+        active_error = sys.exception()
         stop_child(child)
-        topology.cleanup()
-        shutil.rmtree(topology.scenario_root)
+        try:
+            topology.cleanup()
+            shutil.rmtree(topology.scenario_root)
+        except Exception as cleanup_error:
+            if isinstance(active_error, Exception):
+                raise ExceptionGroup(
+                    f"scenario {family}:{boundary} and cleanup both failed",
+                    (active_error, cleanup_error),
+                ) from None
+            raise
     if observation is None:
         raise RuntimeError(f"scenario {family}:{boundary} produced no observation")
     observation["cleanup"] = "complete"
