@@ -80,7 +80,11 @@ def run(
     )
 
 
-def sudo(*arguments: str | Path, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def sudo(
+    *arguments: str | Path,
+    check: bool = True,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
     return run(("sudo", "-n", *arguments), check=check, timeout=timeout)
 
 
@@ -224,6 +228,20 @@ def mapper_exists(name: str) -> bool:
     return sudo("dmsetup", "info", name, check=False).returncode == 0
 
 
+def parse_dm_log_status(status: str) -> tuple[int, int]:
+    fields = status.split()
+    if len(fields) != 5 or fields[2] != "log-writes":
+        raise RuntimeError(f"unexpected dm-log-writes status: {status!r}")
+    try:
+        logged_entries = int(fields[3])
+        highest_allocated_sector = int(fields[4])
+    except ValueError as error:
+        raise RuntimeError(f"non-numeric dm-log-writes status: {status!r}") from error
+    if logged_entries < 0 or highest_allocated_sector < 0:
+        raise RuntimeError(f"negative dm-log-writes status: {status!r}")
+    return logged_entries, highest_allocated_sector
+
+
 def mounted_source(mountpoint: Path) -> str | None:
     completed = run(
         ("findmnt", "--noheadings", "--output", "SOURCE", "--mountpoint", mountpoint),
@@ -335,8 +353,7 @@ class Topology:
         sudo("dmsetup", "create", self.mapper_name, "--table", table)
         self.mapper_created = True
         status = sudo("dmsetup", "status", self.mapper_name).stdout.strip()
-        if " log-writes " not in f" {status} ":
-            raise RuntimeError(f"unexpected dm-log-writes status: {status!r}")
+        parse_dm_log_status(status)
         return status
 
     def format_and_mount_live(self) -> str:
@@ -504,6 +521,16 @@ def run_scenario(
         mark = f"interrupt-{family}-{boundary}"
         validate_label("interruption mark", mark)
         sudo("dmsetup", "message", topology.mapper_name, "0", "mark", mark)
+        interruption_status = sudo(
+            "dmsetup", "status", topology.mapper_name
+        ).stdout.strip()
+        logged_entries, highest_allocated_sector = parse_dm_log_status(
+            interruption_status
+        )
+        if logged_entries == 0:
+            raise RuntimeError(
+                f"interruption mark {mark} recorded no stable log entries"
+            )
         termination = terminate_boundary_child(child)
         child = None
 
@@ -546,7 +573,10 @@ def run_scenario(
             {
                 "termination": termination,
                 "interruption_mark": mark,
-                "dm_status": dm_status,
+                "dm_status_initial": dm_status,
+                "dm_status_at_interruption": interruption_status,
+                "logged_entries_at_interruption": logged_entries,
+                "highest_allocated_sector": highest_allocated_sector,
                 "live_mount_options": live_mount_options,
                 "replay_mount_options": replay_mount_options,
                 "ext4_post_recovery_check": "e2fsck-fn-clean",

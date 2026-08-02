@@ -15,6 +15,7 @@ from tools.run_native_power_loss_gate import (
     assert_owned_path,
     normalize_loop_backing,
     mounted_source,
+    parse_dm_log_status,
     require_loop_device,
     validate_label,
     validate_mapper_name,
@@ -71,6 +72,18 @@ class NativePowerLossGateSafetyTests(unittest.TestCase):
         arguments = run_mock.call_args.args[0]
         self.assertIn("--mountpoint", arguments)
         self.assertNotIn("--target", arguments)
+
+    def test_dm_log_status_requires_numeric_log_writes_shape(self) -> None:
+        self.assertEqual(parse_dm_log_status("0 262144 log-writes 17 8191"), (17, 8191))
+        for value in (
+            "0 262144 linear 17 8191",
+            "0 262144 log-writes seventeen 8191",
+            "0 262144 log-writes -1 8191",
+            "0 262144 log-writes 17",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(RuntimeError):
+                    parse_dm_log_status(value)
 
 
 if __name__ == "__main__":
