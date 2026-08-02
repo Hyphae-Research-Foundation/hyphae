@@ -6,6 +6,7 @@ from tools.check_native_dependencies import (
     GateFailure,
     audit_metadata,
     audit_unsafe,
+    sanitize_receipt_paths,
     validate_lint_policy,
 )
 
@@ -278,6 +279,27 @@ class NativeDependencyGateTests(unittest.TestCase):
                 "Failed to parse file: /registry/blake3-1.0.0/src/lib.rs, Syn(Error)",
                 closure,
             )
+
+    def test_receipt_paths_remove_repo_cargo_and_home_identity(self) -> None:
+        sanitized = sanitize_receipt_paths(
+            {
+                "repo": "/home/mario/work/hyphae/crates/runtime/Cargo.toml",
+                "cargo": "/home/mario/.cargo/registry/src/demo",
+                "home": "/home/mario/.local/bin/git",
+            },
+            repo_paths=["/home/mario/work/hyphae"],
+            cargo_home="/home/mario/.cargo",
+            home="/home/mario",
+        )
+
+        self.assertEqual(
+            sanitized,
+            {
+                "repo": "<repo>/crates/runtime/Cargo.toml",
+                "cargo": "<cargo-home>/registry/src/demo",
+                "home": "<home>/.local/bin/git",
+            },
+        )
 
 
 if __name__ == "__main__":

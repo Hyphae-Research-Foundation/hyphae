@@ -454,6 +454,44 @@ def _git_value(arguments: list[str], root: Path) -> str:
     return completed.stdout.strip()
 
 
+def sanitize_receipt_paths(
+    value: Any,
+    *,
+    repo_paths: list[str],
+    cargo_home: str,
+    home: str,
+) -> Any:
+    """Replace machine-specific path prefixes in one receipt value."""
+
+    replacements: dict[str, str] = {}
+    for path, label in (
+        *((path, "<repo>") for path in repo_paths),
+        (cargo_home, "<cargo-home>"),
+        (home, "<home>"),
+    ):
+        stripped = path.rstrip("/\\")
+        if not stripped:
+            continue
+        replacements[stripped] = label
+        replacements[stripped.replace("\\", "/")] = label
+        replacements[stripped.replace("/", "\\")] = label
+    ordered = sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True)
+
+    def sanitize(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {key: sanitize(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [sanitize(child) for child in item]
+        if isinstance(item, str):
+            result = item
+            for prefix, replacement in ordered:
+                result = result.replace(prefix, replacement)
+            return result
+        return item
+
+    return sanitize(value)
+
+
 def build_receipt(
     root: Path,
     policy_path: Path,
@@ -537,7 +575,7 @@ def build_receipt(
     if require_clean and not clean:
         raise GateFailure("clean evidence run requested from a dirty worktree")
 
-    return {
+    receipt = {
         "schema": RECEIPT_SCHEMA,
         "gate_version": GATE_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -569,6 +607,13 @@ def build_receipt(
         "unsafe": unsafe_report,
         "commands": commands,
     }
+    cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+    return sanitize_receipt_paths(
+        receipt,
+        repo_paths=[str(root.absolute()), str(root.resolve())],
+        cargo_home=cargo_home,
+        home=str(Path.home()),
+    )
 
 
 def main() -> int:
