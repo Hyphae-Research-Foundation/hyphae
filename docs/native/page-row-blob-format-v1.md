@@ -275,5 +275,6 @@ every byte range, streaming/chunked values, compression, encryption,
 reference-count/retention tests across snapshots, orphan reclamation, and
 large-corpus blob garbage collection. Current-root page-generation vacuum now
 has an implementation, crash matrix, and one measured corpus. The first
-single-retained-root blob-collection contract is specified but not yet
-implemented; broader multi-generation retention remains pending.
+single-retained-root blob-collection contract now has an implementation,
+process-interruption matrix, and one measured corpus; broader multi-generation
+retention remains pending.

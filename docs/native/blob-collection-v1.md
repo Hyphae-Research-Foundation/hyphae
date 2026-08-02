@@ -1,7 +1,8 @@
 # Native immutable-blob collection v1
 
-Status: normative target contract; implementation, interruption matrix, and
-performance evidence are pending
+Status: normative contract; single-retained-root implementation, deterministic
+process-interruption matrix, instrumentation, and matched Windows/WSL2
+observations are implemented
 
 This protocol bounds the verified immutable-blob corpus after current-root
 page vacuum, checkpoint, and WAL retention. It removes only complete
@@ -130,7 +131,8 @@ V1 preserves the field and existing bytes:
 - `BlobStore::create` starts at generation zero;
 - legacy `BlobStore::open` retains count-derived behavior for isolated crate
   callers;
-- runtime open supplies the latest retained committed generation as a floor;
+- runtime open verifies the physical namespace first and then applies the
+  latest retained committed generation as a floor;
 - physical verification may raise the runtime generation when complete
   promoted orphans exist;
 - collection leaves the in-memory generation unchanged; and

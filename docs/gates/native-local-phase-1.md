@@ -380,6 +380,17 @@ from 131 to 3 and bytes by 97.5504%. Manifest verification p50 improved by
 current-root policy, physical durability, pins and complete G1/G7 matrices
 remain open.
 
+The [native immutable-blob collection
+evidence](evidence/native-blob-collection-2026-08-02.md) adds exact
+all-engine liveness tracing, a committed generation floor independent from
+post-collection file count, digest-ordered idempotent deletion, strict
+single-root eligibility, and four interruption boundaries. On the matched
+130-file corpus it removed 128 files and 97.0063% of encoded blob bytes while
+preserving relational, scalar, lexical, ANN, and typed-catalog state. Blob
+verification p50 improved by 26.467297 times on Windows/NTFS and 39.915948
+times under WSL2/tmpfs. Multi-root pins, native-ext4/power-loss evidence,
+automatic scheduling, and complete G1/G7 matrices remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -391,9 +402,10 @@ B+tree while legacy inline roots remain compatible. Detached transactions now
 prepare concurrently and rebase disjoint all-engine writes under serialized
 publication. Bounded simultaneous `group` submission now shares page/WAL
 flushes, and current-root retention bounds WAL verification/replay to the
-retained suffix. Mixed strict/group/memory policy and concurrency/saturation
-evidence remain pending, along with multi-generation pin-aware retention,
-immutable-blob collection, secondary-index range/streaming execution,
+retained suffix. Explicit single-root maintenance now collects blobs
+unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
+policy and concurrency/saturation evidence remain pending, along with
+multi-generation pin-aware retention, secondary-index range/streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid
