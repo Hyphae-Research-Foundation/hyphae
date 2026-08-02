@@ -190,14 +190,23 @@ The same scalar operands are admitted by the exact-primary-key mutation slice
 defined below.
 
 The binder may extract complete primary-key equality, the longest strict
-primary-key left prefix, one complete secondary-index equality, or
-complete-primary-key lower/upper bounds from top-level `AND` terms. Every
-remaining term is a residual filter. When no admitted exact, prefix, or range
-access exists, execution uses a bounded primary-key scan. `LIMIT` is mandatory
-for every scan, prefix, or range plan and is applied to rows that evaluate to
-`TRUE`, not to rows merely examined. Exact primary/secondary access retains
-its existing no-`LIMIT` form. `ORDER BY`, when admitted for a scan, prefix, or
-range, remains the complete ascending primary key.
+primary-key left prefix, one complete secondary-index equality,
+complete-primary-key lower/upper bounds, or complete-secondary-index
+lower/upper bounds from top-level `AND` terms. Every remaining term is a
+residual filter. When no admitted exact, prefix, or range access exists,
+execution uses a bounded primary-key scan. `LIMIT` is mandatory for every
+scan, prefix, or range plan and is applied to rows that evaluate to `TRUE`,
+not to rows merely examined. Exact primary/secondary access retains its
+existing no-`LIMIT` form.
+
+Primary scans and ranges admit either no `ORDER BY` or the complete ascending
+primary key. A secondary range admits either no `ORDER BY` or the complete
+ascending secondary-index column list in catalog order. Rows with the same
+secondary key use canonical primary-key bytes as the deterministic physical
+tie-breaker. The binder considers only an index whose persisted entry layout
+is order-preserving. A legacy length-first secondary index remains valid for
+exact equality but is not reported as a physical secondary range; without
+another admitted path the query falls back to the bounded primary-key scan.
 
 All parameter arity and catalog logical-type checks occur before storage
 traversal. A SQL `NULL` parameter is type-admissible in a comparison and makes
@@ -238,6 +247,39 @@ stable catalog object and a physical relational B+tree namespace. Creation
 backfills admitted rows atomically. Later inserts, updates, and deletes derive
 their live/tombstone index changes from catalog-bound tuples in the same
 transaction and WAL/CSN publication.
+
+New indexes use `HYRIDX02` metadata and an order-preserving entry identity:
+
+```text
+index_key || primary_key || u32be(primary_key_length)
+```
+
+Both keys are concatenations of self-delimiting memcomparable components with
+a schema-fixed component count. Neither complete key can be a strict prefix of
+another key from the same definition, so ordinary byte order is
+`index_key`, then `primary_key`; the final length suffix is reached only after
+both keys compare equal and makes the identity independently decodable.
+`HYRIDX01` metadata and its historical
+`u32be(index_key_length) || index_key || primary_key` identity remain readable
+for exact lookup and recovery. One physical index cannot mix layouts.
+
+For ordered namespace prefix `N` and complete encoded secondary key `K`, a
+range uses these full physical bounds:
+
+| SQL endpoint | Physical endpoint |
+|---|---|
+| no lower bound | `Included(N)` |
+| `key >= K` | `Included(N || K)` |
+| `key > K` | `Included(successor(N || K))` |
+| no upper bound | `Excluded(successor(N))` |
+| `key < K` | `Excluded(N || K)` |
+| `key <= K` | `Excluded(successor(N || K))` |
+
+The successor endpoints include or exclude every primary-key tie under `K`.
+An empty or inverted intersection returns no rows. A null in either complete
+endpoint makes that comparison `UNKNOWN` and returns no rows after full
+parameter and type validation. A second lower or upper endpoint for the same
+selected index is rejected rather than silently replaced.
 Unique indexes reject duplicate non-null composite keys before statement or
 commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
@@ -303,6 +345,8 @@ cardinality; it does not materialize the complete left relation.
 `PrimaryKeyPrefixRangeScan(table=<id>,prefix_columns=<count>,range_column=<id>,lower=<kind>,upper=<kind>,limit=<n>)`,
 or
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`, or
+`SecondaryIndexRangeScan(table=<id>,index=<id>,lower=<kind>,upper=<kind>,limit=<n>)`,
+or
 `IndexedInnerJoin(left_table=<id>,left_access=<access>,right_table=<id>,right_access=primary-key)`.
 Join left access is `primary-key`, `unique-secondary(index=<id>)`,
 `primary-key-scan(limit=<n>)`, or
@@ -318,9 +362,11 @@ integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
-remaining literal families, casts, secondary ranges, descending scans,
-offsets, and constraints beyond primary key/nullability and the first unique
-index remain pending. Typed mutation does
+remaining literal families, casts, descending scans, offsets, and constraints
+beyond primary key/nullability and the first unique index remain pending.
+Secondary equality prefixes followed by a range, index unions/intersections,
+and ranges over a legacy length-first secondary layout remain pending. Typed
+mutation does
 not yet change primary keys, use a secondary access path, evaluate general
 expressions, or update multiple rows. Multi-range, bitmap, and cost-based
 access selection remain pending.
@@ -344,20 +390,20 @@ relation/index definitions in the catalog-version-bound plan.
 `execute_prepared_latest` captures one immutable root set, rejects a stale
 catalog version, traverses the buffered relational B+tree directly, and
 materializes only rows reached by the exact primary/secondary key or bounded
-primary scan/prefix/prefix-range/range. The secondary path scans only the
-length-delimited exact index-key prefix, follows each live entry to its
-primary-key row in the same root, and returns rows in canonical primary-key
-order. Scan, prefix, prefix-range, and range paths use the
-inclusive/exclusive bound-aware physical visitor, prune separator-disjoint
-subtrees, skip row tombstones, and stop after `LIMIT` matching rows. They do
-not construct `MaterializedState`.
+primary/secondary scan/prefix/range. Exact legacy secondary lookup scans only
+its length-delimited index-key prefix. Ordered secondary equality and range
+paths use the `HYRIDX02` namespace and visit entries in index-key then
+primary-key order. Every live entry follows its primary-key row in the same
+root. Scan, prefix, and range paths use inclusive/exclusive bound-aware
+physical visitors, prune separator-disjoint subtrees, skip row tombstones, and
+stop after `LIMIT` matching rows. They do not construct `MaterializedState`.
 
 The public relational scan returns one owned bounded page and exposes its last
 primary key as the caller's next exclusive cursor.
 `scan_latest_relational_range` additionally accepts independent canonical
 primary-key `Included`, `Excluded`, or `Unbounded` bounds. A stateful zero-copy
-cursor, secondary-key ranges, offset handling, request arenas, and allocation
-evidence remain separate work.
+cursor, secondary-prefix ranges, legacy secondary-layout rebuild, offset
+handling, request arenas, and allocation evidence remain separate work.
 
 ## Null and boolean semantics
 
