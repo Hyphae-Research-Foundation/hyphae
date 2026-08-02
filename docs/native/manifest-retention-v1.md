@@ -2,12 +2,12 @@
 
 Status: normative contract; anchored retained-chain open, identity-preserving
 prefix retirement, idempotent partial cleanup, fail-closed validation, runtime
-instrumentation, and local Windows/WSL2 observations are implemented
+instrumentation, lineage validation, and direct Linux tests are implemented
 
 This protocol bounds root-manifest verification after current-root WAL
-retention. It uses the existing `HYWAR001` anchor as the compacted-history
-trust root and deletes only immutable manifest generations older than the
-manifest bound by that anchor.
+retention. Native directories use the lineage-bearing `HYWAR002` anchor as the
+compacted-history trust root and delete only immutable manifest generations
+older than the manifest bound by that anchor.
 
 V1 does not rewrite, renumber, or re-digest any retained manifest. The base
 manifest keeps its original generation, predecessor digest, bytes, and
@@ -28,8 +28,9 @@ Deleting old manifests without another trust root is invalid:
 - a retained WAL suffix may reference manifests newer than the retention
   checkpoint.
 
-`HYWAR001` already binds the exact current-root checkpoint manifest generation
-and digest. V1 makes that binding the explicit retained manifest-chain root.
+`HYWAR002` binds the exact current-root checkpoint manifest generation,
+digest, and directory lineage. V1 makes that binding the explicit retained
+manifest-chain root.
 
 ## Required invariants
 
@@ -58,7 +59,7 @@ and digest. V1 makes that binding the explicit retained manifest-chain root.
 
 ## Authority and eligibility
 
-No new manifest-anchor file is introduced. The selected `HYWAR001` anchor is
+No new manifest-anchor file is introduced. The selected `HYWAR002` anchor is
 the only prefix-retirement authority.
 
 Without a WAL-retention anchor, manifest recovery remains unchanged: it starts
@@ -143,7 +144,7 @@ Recovery and maintenance receipts report:
 - whether roots-directory synchronization is supported.
 
 The retained count includes the base manifest. It is independent from the
-logical cumulative checkpoint count held by `HYWAR001`.
+logical cumulative checkpoint count held by `HYWAR002`.
 
 ## Deterministic interruption and corruption matrix
 

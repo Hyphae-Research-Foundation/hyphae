@@ -475,6 +475,15 @@ verification p50 improved by 26.467297 times on Windows/NTFS and 39.915948
 times under WSL2/tmpfs. Multi-root pins, native-ext4/power-loss evidence,
 automatic scheduling, and complete G1/G7 matrices remain open.
 
+The [native lineage-threading
+evidence](evidence/native-lineage-threading-linux-2026-08-02.md) makes the
+directory UUIDv7 plus history epoch part of `HYROOT03` manifests and
+`HYWAR002` retention anchors. Direct Linux tests preserve historical codec
+bytes while rejecting legacy, mixed, and marker-divergent recovery authority
+before retained WAL state can be selected or reset. Offline promotion, a
+sanctioned epoch transition, physical power-loss evidence, hosted CI, and the
+complete G1 matrix remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains

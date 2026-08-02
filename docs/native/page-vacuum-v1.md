@@ -99,10 +99,10 @@ The vacuum transaction contains exactly one kernel mutation with opcode
 `VacuumPageGeneration`. It has no target, key, value, or expiry. It changes no
 logical engine state and claims one global maintenance write identity.
 
-## Root manifest v2
+## Root manifest storage state
 
-Checkpoints after a generation transition use `HYROOT02`. The v2 header is 192
-bytes and retains the v1 root-entry payload:
+The standalone historical codec uses `HYROOT02` after a generation transition.
+Its 192-byte header retains the v1 root-entry payload:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -126,8 +126,12 @@ bytes and retains the v1 root-entry payload:
 | 184 | 8 | retention-floor CSN |
 | 192 | variable | canonical root entries |
 
-Generation-one/floor-one checkpoints remain byte-identical `HYROOT01`.
-Manifest-chain digests therefore continue to bind every storage transition.
+Native directories always publish `HYROOT03`, including at generation one.
+Its 216-byte header preserves these page-generation and retention-floor
+offsets, then adds the 24-byte directory lineage before the root payload.
+`HYROOT01` and `HYROOT02` remain byte-identical decodeable historical formats,
+but native-marker recovery rejects them as authority. Manifest-chain digests
+therefore bind every storage transition and its exact directory lineage.
 
 ## Publication and cleanup order
 

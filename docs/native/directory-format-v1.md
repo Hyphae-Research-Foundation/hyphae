@@ -1,10 +1,10 @@
 # Native directory format v1
 
 Status: partially implemented by the experimental native runtime. Canonical
-`FORMAT` creation and validation plus lifetime-held `LOCK` ownership are
-implemented. Offline promotion and lineage threading into manifests and
-retention anchors remain unimplemented. ADR-0021 and ADR-0022 govern this
-contract. G1 remains open
+`FORMAT` creation and validation, lifetime-held `LOCK` ownership, and lineage
+threading through `HYROOT03` manifests and `HYWAR002` retention anchors are
+implemented. Offline promotion remains unimplemented. ADR-0021 and ADR-0022
+govern this contract. G1 remains open
 
 This contract fixes the root-level identity of one native data directory:
 the `FORMAT` marker required by
@@ -12,8 +12,10 @@ the `FORMAT` marker required by
 writer-exclusion file, the lineage identity required by
 [ADR-0022](../adr/0022-cloud-ready-local-primitives.md), and the promotion
 marker used by the offline format-2 to native migration. Every other native
-file family (`HYWAL001`, `HYROOT01`/`HYROOT02`, `HYWAR001`, pages, blobs,
-segments) lives inside a directory governed by this marker.
+file family (`HYWAL001`, `HYROOT03`, `HYWAR002`, pages, blobs, segments) lives
+inside a directory governed by this marker. Historical `HYROOT01`,
+`HYROOT02`, and `HYWAR001` remain decodeable but are not native-marker
+authority.
 
 ## Scope
 
@@ -96,21 +98,34 @@ by itself.
 
 ## Lineage threading
 
-Future revisions of the root manifest and retention anchor contracts must
-reference the lineage identity, the directory identifier plus the history
-epoch, using the existing reserved fields of `HYROOT02` and `HYWAR001`.
-Per ADR-0022, any concrete use of those reserved fields requires updating
-the corresponding versioned contract; a silent reinterpretation is
-forbidden.
+`HYROOT03` and `HYWAR002` record the exact 24-byte lineage identity defined
+by [native canonical types](types-v1.md): 16 UUIDv7 bytes in network order,
+followed by the nonzero history epoch as a little-endian `u64`.
+
+`HYROOT03` has a 216-byte header. It preserves all `HYROOT02` fields and
+offsets through byte 191, stores the directory UUID at bytes 192 through 207,
+the history epoch at bytes 208 through 215, and begins canonical root entries
+at byte 216.
+
+`HYWAR002` is 280 bytes. It preserves the `HYWAR001` fields through the prior
+anchor digest at byte 223, stores the directory UUID at bytes 224 through
+239, the history epoch at bytes 240 through 247, and stores its final BLAKE3
+digest at bytes 248 through 279. Its checksum remains at bytes 12 through 15.
+
+The earlier reserved manifest bytes are not silently reinterpreted: they
+cannot hold the complete 24-byte identity, and split-field identity would
+make recovery and independent inspection needlessly ambiguous. The explicit
+new magics, versions, and header lengths keep historical decoders fail-closed.
 
 Two divergent histories of the same origin must be distinguishable
 offline by comparing the recorded (directory identifier, history epoch)
 pairs together with the manifest and anchor digest chains, without opening
 either directory for write.
 
-This document does not change those binary formats. It declares the
-threading requirement and defers the exact field encoding to the versioned
-revision of each contract.
+The codecs may continue to decode `HYROOT01`, `HYROOT02`, and `HYWAR001` for
+historical compatibility and explicit import tooling. A directory governed
+by a native `FORMAT` marker rejects any manifest or retention-anchor authority
+that lacks the exact marker lineage, and one chain may never mix identities.
 
 ## Promotion marker (migration)
 

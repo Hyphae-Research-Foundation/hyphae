@@ -20,11 +20,13 @@ properties a hosted program will need, and retrofitting those properties
 after the formats freeze is expensive and compatibility-breaking.
 
 The existing primitives already point in the right direction. The WAL is
-digest-chained per block with absolute LSN identity. `HYWAR001` retention
+digest-chained per block with absolute LSN identity. `HYWAR002` retention
 anchors carry a monotonically increasing anchor epoch and bind one exact
-manifest generation and digest. Root manifests are digest-chained and
-carry reserved zero fields. ADR-0019 defines finite budgets and deadlines
-for every bounded operation. Commit and maintenance receipts separate
+manifest generation, digest, and directory lineage. `HYROOT03` manifests are
+digest-chained and carry the same lineage. Historical `HYWAR001`,
+`HYROOT01`, and `HYROOT02` bytes remain decodeable but cannot become authority
+under a native marker. ADR-0019 defines finite budgets and deadlines for every
+bounded operation. Commit and maintenance receipts separate
 admission, queue, execution, page-synchronization, and WAL-synchronization
 clocks. What is missing is declaring these facts as protected contractual
 properties instead of implementation accidents.

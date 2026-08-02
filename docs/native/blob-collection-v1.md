@@ -44,7 +44,7 @@ safe. Liveness must include:
    WAL state, retained manifest chain, pages, roots, and all-engine logical
    state verify.
 3. The sole retained root is the exact root bound by the active stable
-   `HYWAR001` retention anchor.
+   `HYWAR002` retention anchor with the same directory lineage.
 4. The retained WAL suffix is empty, the retained manifest chain contains
    exactly the anchor manifest, and the root's visible CSN equals its retention
    floor.

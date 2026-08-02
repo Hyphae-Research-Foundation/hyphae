@@ -237,10 +237,12 @@ super-transaction.
 
 Recovery never guesses an opcode or skips an unknown committed mutation.
 Without a retention anchor, the current vertical still scans the complete WAL.
-With a verified `HYWAR001` anchor, it reconstructs the base roots from the
-bound immutable manifest, verifies and decodes only the identity-preserving WAL
-suffix, and rebuilds point-write conflict state from that suffix. The manifest
-chain is not yet pruned and remains separate unbounded recovery work.
+With a verified native `HYWAR002` anchor, it reconstructs the base roots from
+the bound immutable manifest, verifies and decodes only the identity-preserving
+WAL suffix, and rebuilds point-write conflict state from that suffix. The
+manifest chain is pruned from that exact lineage-bearing trust root.
+`HYWAR001` remains decodeable only for historical tooling and is not authority
+under `FORMAT`.
 
 ## Checkpoints
 

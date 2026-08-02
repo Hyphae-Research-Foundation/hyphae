@@ -100,6 +100,26 @@ invalid escapes, noncanonical float bits, wrong fixed widths, and
 out-of-domain values. Ordered codecs for `JSON`, `ARRAY`, `MAP`, and `VECTOR`
 remain undefined and fail explicitly.
 
+## Directory lineage identity
+
+One native history is identified by exactly 24 bytes:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 16 | RFC 9562 UUIDv7 bytes in network byte order |
+| 16 | 8 | nonzero history epoch, little-endian |
+
+The UUID is generated once when the native directory is created. Its version
+nibble is seven and its variant bits are `10`; all textual representations
+use lowercase hyphenated hexadecimal. The history epoch starts at one,
+increases only through a sanctioned history-divergent operation, never
+decreases, and fails before overflow.
+
+The pair is copied byte-for-byte into lineage-bearing manifests and retention
+anchors. Equality is exact over all 24 bytes. A UUID with another version or
+variant, a zero epoch, a noncanonical text form, or mixed lineage within one
+digest chain fails closed.
+
 ## Stable identities
 
 | Identity | Width | Invalid value | Rule |
@@ -112,6 +132,8 @@ remain undefined and fail explicitly.
 | `CatalogVersion` | 64 bits | zero | Immutable catalog snapshot identity |
 | `CSN` | 64 bits | zero | Commit sequence; the first committed transaction is one |
 | `LSN` | 64 bits | zero | Byte position of a WAL record start |
+| `DirectoryUuid` | 128 bits | non-v7 or non-RFC variant | Stable identity generated once per native directory |
+| `HistoryEpoch` | 64 bits | zero | Monotonic identity for one nondivergent history |
 
 Counters fail closed before overflow. Dropping and recreating a named object
 allocates a new `ObjectId`.

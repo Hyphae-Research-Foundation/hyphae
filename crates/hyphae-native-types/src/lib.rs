@@ -31,6 +31,10 @@ pub enum NativeTypeError {
     InvalidScalarEncoding,
     /// A scalar value exceeded its declared precision or domain.
     ScalarOutOfRange,
+    /// A directory UUID was not a canonical RFC 9562 `UUIDv7` identity.
+    InvalidDirectoryUuid,
+    /// A lineage byte representation had the wrong length or invalid fields.
+    InvalidLineageEncoding,
     /// An ordered-key codec is not yet defined for this logical type.
     UnsupportedOrderedType,
     /// A canonical scalar codec is not yet defined for this logical type.
@@ -68,6 +72,12 @@ impl fmt::Display for NativeTypeError {
             Self::ScalarOutOfRange => {
                 formatter.write_str("scalar value is outside its declared domain")
             }
+            Self::InvalidDirectoryUuid => {
+                formatter.write_str("directory UUID must be a canonical RFC 9562 UUIDv7")
+            }
+            Self::InvalidLineageEncoding => {
+                formatter.write_str("directory lineage encoding is invalid")
+            }
             Self::UnsupportedOrderedType => {
                 formatter.write_str("logical type has no native ordered-key codec")
             }
@@ -82,6 +92,104 @@ impl fmt::Display for NativeTypeError {
 }
 
 impl Error for NativeTypeError {}
+
+/// Stable RFC 9562 `UUIDv7` identity for one native data directory.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DirectoryUuid([u8; 16]);
+
+impl DirectoryUuid {
+    /// Constructs a checked `UUIDv7` identity from network-order bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the version or RFC variant bits are invalid.
+    pub fn new(bytes: [u8; 16]) -> Result<Self, NativeTypeError> {
+        if bytes[6] >> 4 != 7 || bytes[8] & 0xc0 != 0x80 {
+            return Err(NativeTypeError::InvalidDirectoryUuid);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Parses the exact lowercase hyphenated `UUIDv7` representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for noncanonical text, non-v7 bytes, or a non-RFC
+    /// variant.
+    pub fn parse_canonical(value: &str) -> Result<Self, NativeTypeError> {
+        let encoded = value.as_bytes();
+        if encoded.len() != 36
+            || !matches!(
+                (encoded[8], encoded[13], encoded[18], encoded[23]),
+                (b'-', b'-', b'-', b'-')
+            )
+        {
+            return Err(NativeTypeError::InvalidDirectoryUuid);
+        }
+        let mut bytes = [0_u8; 16];
+        let mut source = 0_usize;
+        let mut target = 0_usize;
+        while source < encoded.len() {
+            if matches!(source, 8 | 13 | 18 | 23) {
+                source += 1;
+                continue;
+            }
+            let high =
+                decode_lower_hex(encoded[source]).ok_or(NativeTypeError::InvalidDirectoryUuid)?;
+            let low = decode_lower_hex(encoded[source + 1])
+                .ok_or(NativeTypeError::InvalidDirectoryUuid)?;
+            bytes[target] = (high << 4) | low;
+            source += 2;
+            target += 1;
+        }
+        Self::new(bytes)
+    }
+
+    /// Returns the UUID bytes in RFC network order.
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Display for DirectoryUuid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = self.0;
+        write!(
+            formatter,
+            concat!(
+                "{:02x}{:02x}{:02x}{:02x}-",
+                "{:02x}{:02x}-",
+                "{:02x}{:02x}-",
+                "{:02x}{:02x}-",
+                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}"
+            ),
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15],
+        )
+    }
+}
+
+const fn decode_lower_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
 
 macro_rules! nonzero_identity {
     ($name:ident, $inner:ty, $nonzero:ty, $label:literal, $docs:literal) => {
@@ -171,6 +279,84 @@ nonzero_identity!(
     "page generation",
     "Immutable page-file generation."
 );
+nonzero_identity!(
+    HistoryEpoch,
+    u64,
+    NonZeroU64,
+    "history epoch",
+    "Monotonic identity for one nondivergent native directory history."
+);
+
+impl HistoryEpoch {
+    /// Initial history epoch for a newly created native directory.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    /// Returns the next history epoch before overflow.
+    pub fn checked_next(self) -> Option<Self> {
+        self.get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+}
+
+/// Exact directory and history identity carried by native authority records.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LineageIdentity {
+    directory_uuid: DirectoryUuid,
+    history_epoch: HistoryEpoch,
+}
+
+impl LineageIdentity {
+    /// Exact encoded lineage width.
+    pub const ENCODED_SIZE: usize = 24;
+
+    /// Constructs one checked lineage identity.
+    pub const fn new(directory_uuid: DirectoryUuid, history_epoch: HistoryEpoch) -> Self {
+        Self {
+            directory_uuid,
+            history_epoch,
+        }
+    }
+
+    /// Returns the stable directory UUID.
+    pub const fn directory_uuid(self) -> DirectoryUuid {
+        self.directory_uuid
+    }
+
+    /// Returns the nonzero history epoch.
+    pub const fn history_epoch(self) -> HistoryEpoch {
+        self.history_epoch
+    }
+
+    /// Encodes UUID bytes followed by a little-endian history epoch.
+    pub fn encode(self) -> [u8; Self::ENCODED_SIZE] {
+        let mut encoded = [0_u8; Self::ENCODED_SIZE];
+        encoded[..16].copy_from_slice(&self.directory_uuid.to_bytes());
+        encoded[16..].copy_from_slice(&self.history_epoch.get().to_le_bytes());
+        encoded
+    }
+
+    /// Decodes one exact lineage identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the wrong length, invalid `UUIDv7`, or zero epoch.
+    pub fn decode(encoded: &[u8]) -> Result<Self, NativeTypeError> {
+        if encoded.len() != Self::ENCODED_SIZE {
+            return Err(NativeTypeError::InvalidLineageEncoding);
+        }
+        let mut uuid = [0_u8; 16];
+        uuid.copy_from_slice(&encoded[..16]);
+        let mut epoch = [0_u8; 8];
+        epoch.copy_from_slice(&encoded[16..]);
+        let directory_uuid =
+            DirectoryUuid::new(uuid).map_err(|_| NativeTypeError::InvalidLineageEncoding)?;
+        let history_epoch = HistoryEpoch::new(u64::from_le_bytes(epoch))
+            .map_err(|_| NativeTypeError::InvalidLineageEncoding)?;
+        Ok(Self::new(directory_uuid, history_epoch))
+    }
+}
 
 impl PageGeneration {
     /// Historical first page-file generation.
@@ -1304,9 +1490,60 @@ fn decode_memcomparable_bytes(encoded: &[u8]) -> Result<Vec<u8>, NativeTypeError
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, IntegerWidth, LogicalType,
-        MAX_SCALAR_BYTES, NativeTypeError, ObjectId, ScalarValue, VectorElement, VectorType,
+        CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, DirectoryUuid, HistoryEpoch,
+        IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
+        ScalarValue, VectorElement, VectorType,
     };
+
+    #[test]
+    fn lineage_identity_has_canonical_text_and_binary_forms() -> Result<(), NativeTypeError> {
+        let directory_uuid =
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?;
+        let lineage = LineageIdentity::new(directory_uuid, HistoryEpoch::new(42)?);
+        let encoded = lineage.encode();
+
+        assert_eq!(
+            directory_uuid.to_string(),
+            "018f4e9d-3d7a-7b6c-8f12-123456789abc"
+        );
+        assert_eq!(
+            encoded,
+            [
+                0x01, 0x8f, 0x4e, 0x9d, 0x3d, 0x7a, 0x7b, 0x6c, 0x8f, 0x12, 0x12, 0x34, 0x56, 0x78,
+                0x9a, 0xbc, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(LineageIdentity::decode(&encoded)?, lineage);
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_identity_rejects_noncanonical_or_invalid_values() {
+        for value in [
+            "018f4e9d-3d7a-6b6c-8f12-123456789abc",
+            "018f4e9d-3d7a-7b6c-7f12-123456789abc",
+            "018F4E9D-3D7A-7B6C-8F12-123456789ABC",
+            "018f4e9d3d7a7b6c8f12123456789abc",
+        ] {
+            assert_eq!(
+                DirectoryUuid::parse_canonical(value),
+                Err(NativeTypeError::InvalidDirectoryUuid)
+            );
+        }
+        let mut zero_epoch = [
+            0x01, 0x8f, 0x4e, 0x9d, 0x3d, 0x7a, 0x7b, 0x6c, 0x8f, 0x12, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            LineageIdentity::decode(&zero_epoch),
+            Err(NativeTypeError::InvalidLineageEncoding)
+        );
+        zero_epoch[6] = 0x6b;
+        assert_eq!(
+            LineageIdentity::decode(&zero_epoch),
+            Err(NativeTypeError::InvalidLineageEncoding)
+        );
+    }
 
     #[test]
     fn stable_identities_reject_zero() {
