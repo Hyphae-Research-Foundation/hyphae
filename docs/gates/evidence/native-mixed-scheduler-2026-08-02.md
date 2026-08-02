@@ -100,6 +100,24 @@ Raw observations:
 - [Windows](native-mixed-scheduler-windows.json)
 - [WSL2](native-mixed-scheduler-wsl2.json)
 
+## Final validation
+
+Implementation/evidence candidate
+`2dfd733bd6c8d4903a67425ff12ab48f41e14404`, tree
+`8d1153f6fce3f2a80812dc59770446a492429f34`, passed on both Windows and
+WSL2:
+
+- `cargo fmt --all -- --check`;
+- workspace clippy for all targets and features with warnings denied;
+- workspace tests for all features, including 167 native-runtime tests;
+- workspace rustdoc with warnings denied; and
+- documentation validation covering 181 Markdown files and 12 maintained JSON
+  examples.
+
+WSL2 used a tmpfs target directory. The first combined clean-target command
+exceeded the 120-second harness limit; the same gates then passed separately
+while reusing that target. The only later source delta is this validation note.
+
 ## Remaining work
 
 - a sustained saturation/soak test with an explicit fairness SLO;
@@ -107,4 +125,3 @@ Raw observations:
 - abandoned-waiter and saturated-shutdown executable coverage;
 - maintenance commands under the same resource policy; and
 - persistent Linux filesystem latency and power-loss evidence.
-
