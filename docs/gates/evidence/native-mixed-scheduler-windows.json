@@ -1,0 +1,138 @@
+{
+  "benchmark": "hyphae-native-mixed-scheduler-v1",
+  "source_commit": "3ddee943f5b23cdef20d4a50d274fe0e690e6f43",
+  "source_tree": "7f38147621a4acbed0f8a2006fbf7264c9301df8",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "profile": "debug",
+  "release_blocker": "Application Control policy blocked the release executable with os error 4551",
+  "os": "windows",
+  "arch": "x86_64",
+  "data_directory_parent": "C:\\Users\\Mario\\AppData\\Local\\Temp",
+  "data_filesystem": "NTFS",
+  "volume_health": "Healthy",
+  "producers": 8,
+  "rounds_per_producer": 32,
+  "workload_commits": 256,
+  "wall_nanos": 701081800,
+  "commits_per_second": 365.150,
+  "max_consecutive_group_commits": 11,
+  "final_fence_csn": 257,
+  "reopen_verified": true,
+  "group": {
+    "commits": 192,
+    "end_to_end": {
+      "p50_nanos": 9902700,
+      "p95_nanos": 30792400,
+      "p99_nanos": 32028500,
+      "max_nanos": 33065500
+    },
+    "admission_wait": {
+      "p50_nanos": 3900,
+      "p95_nanos": 17000,
+      "p99_nanos": 67300,
+      "max_nanos": 86300
+    },
+    "queue_wait": {
+      "p50_nanos": 4920100,
+      "p95_nanos": 25947600,
+      "p99_nanos": 26658400,
+      "max_nanos": 29243300
+    },
+    "execution": {
+      "p50_nanos": 4893300,
+      "p95_nanos": 7590100,
+      "p99_nanos": 9371200,
+      "max_nanos": 9371200
+    },
+    "page_sync": {
+      "p50_nanos": 636200,
+      "p95_nanos": 1187800,
+      "p99_nanos": 1227800,
+      "max_nanos": 1227800
+    },
+    "wal_sync": {
+      "p50_nanos": 542300,
+      "p95_nanos": 990600,
+      "p99_nanos": 1605900,
+      "max_nanos": 1605900
+    }
+  },
+  "strict": {
+    "commits": 32,
+    "end_to_end": {
+      "p50_nanos": 8801700,
+      "p95_nanos": 15400700,
+      "p99_nanos": 16333900,
+      "max_nanos": 16333900
+    },
+    "admission_wait": {
+      "p50_nanos": 4300,
+      "p95_nanos": 24800,
+      "p99_nanos": 26600,
+      "max_nanos": 26600
+    },
+    "queue_wait": {
+      "p50_nanos": 5669900,
+      "p95_nanos": 11831300,
+      "p99_nanos": 12324400,
+      "max_nanos": 12324400
+    },
+    "execution": {
+      "p50_nanos": 1986400,
+      "p95_nanos": 2468700,
+      "p99_nanos": 2805700,
+      "max_nanos": 2805700
+    },
+    "page_sync": {
+      "p50_nanos": 571300,
+      "p95_nanos": 828000,
+      "p99_nanos": 884000,
+      "max_nanos": 884000
+    },
+    "wal_sync": {
+      "p50_nanos": 534000,
+      "p95_nanos": 832100,
+      "p99_nanos": 1399300,
+      "max_nanos": 1399300
+    }
+  },
+  "memory": {
+    "commits": 32,
+    "end_to_end": {
+      "p50_nanos": 6143800,
+      "p95_nanos": 13849100,
+      "p99_nanos": 16151400,
+      "max_nanos": 16151400
+    },
+    "admission_wait": {
+      "p50_nanos": 3900,
+      "p95_nanos": 22400,
+      "p99_nanos": 23500,
+      "max_nanos": 23500
+    },
+    "queue_wait": {
+      "p50_nanos": 4454000,
+      "p95_nanos": 12296500,
+      "p99_nanos": 14492300,
+      "max_nanos": 14492300
+    },
+    "execution": {
+      "p50_nanos": 721200,
+      "p95_nanos": 983600,
+      "p99_nanos": 1213100,
+      "max_nanos": 1213100
+    },
+    "page_sync": {
+      "p50_nanos": 0,
+      "p95_nanos": 0,
+      "p99_nanos": 0,
+      "max_nanos": 0
+    },
+    "wal_sync": {
+      "p50_nanos": 0,
+      "p95_nanos": 0,
+      "p99_nanos": 0,
+      "max_nanos": 0
+    }
+  }
+}

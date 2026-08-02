@@ -121,6 +121,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native catalog-definition evidence — 2026-08-01](gates/evidence/native-catalog-definitions-2026-08-01.md)
 - [Native scalable catalog B+tree evidence — 2026-08-02](gates/evidence/native-catalog-btree-2026-08-02.md)
 - [Native group-commit evidence — 2026-08-02](gates/evidence/native-group-commit-2026-08-02.md)
+- [Native mixed-durability scheduler evidence — 2026-08-02](gates/evidence/native-mixed-scheduler-2026-08-02.md)
 - [Native bounded-WAL-replay evidence — 2026-08-02](gates/evidence/native-wal-replay-2026-08-02.md)
 - [Native manifest-retention evidence — 2026-08-02](gates/evidence/native-manifest-retention-2026-08-02.md)
 - [Native immutable-blob collection evidence — 2026-08-02](gates/evidence/native-blob-collection-2026-08-02.md)

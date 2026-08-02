@@ -1,6 +1,9 @@
 # Native mixed-durability scheduler v1
 
-Status: normative target contract; implementation and evidence pending
+Status: normative target contract; mixed execution, FIFO barriers, bounded
+admission, exact queued cancellation, timing receipts, and bounded-load
+evidence are implemented experimentally; sustained fairness, maintenance
+scheduling, and failure/soak evidence remain pending
 
 The native commit scheduler is the single writer-admission authority for
 detached transactions. It orders `strict`, `group`, and `memory` durability
@@ -148,4 +151,3 @@ Executable evidence must cover:
 
 Evidence must distinguish queue admission, queue wait, execution, page sync,
 WAL sync, and response time. WSL2 filesystem provenance must be recorded.
-

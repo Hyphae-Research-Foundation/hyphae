@@ -1,0 +1,139 @@
+{
+  "benchmark": "hyphae-native-mixed-scheduler-v1",
+  "source_commit": "3ddee943f5b23cdef20d4a50d274fe0e690e6f43",
+  "source_tree": "7f38147621a4acbed0f8a2006fbf7264c9301df8",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "profile": "release",
+  "os": "linux",
+  "kernel": "Linux 6.18.33.1-microsoft-standard-WSL2",
+  "arch": "x86_64",
+  "source_filesystem": "9p",
+  "target_filesystem": "tmpfs",
+  "data_filesystem": "tmpfs",
+  "persistent_filesystem_evidence": false,
+  "producers": 8,
+  "rounds_per_producer": 32,
+  "workload_commits": 256,
+  "wall_nanos": 85049359,
+  "commits_per_second": 3010.017,
+  "max_consecutive_group_commits": 8,
+  "final_fence_csn": 257,
+  "reopen_verified": true,
+  "group": {
+    "commits": 192,
+    "end_to_end": {
+      "p50_nanos": 1378426,
+      "p95_nanos": 2746927,
+      "p99_nanos": 3631216,
+      "max_nanos": 3632512
+    },
+    "admission_wait": {
+      "p50_nanos": 335,
+      "p95_nanos": 865,
+      "p99_nanos": 1487,
+      "max_nanos": 1696
+    },
+    "queue_wait": {
+      "p50_nanos": 630566,
+      "p95_nanos": 2039327,
+      "p99_nanos": 2735105,
+      "max_nanos": 2743265
+    },
+    "execution": {
+      "p50_nanos": 714792,
+      "p95_nanos": 1044949,
+      "p99_nanos": 1087794,
+      "max_nanos": 1087794
+    },
+    "page_sync": {
+      "p50_nanos": 459,
+      "p95_nanos": 1032,
+      "p99_nanos": 1314,
+      "max_nanos": 1314
+    },
+    "wal_sync": {
+      "p50_nanos": 193,
+      "p95_nanos": 322,
+      "p99_nanos": 512,
+      "max_nanos": 512
+    }
+  },
+  "strict": {
+    "commits": 32,
+    "end_to_end": {
+      "p50_nanos": 1177259,
+      "p95_nanos": 2492033,
+      "p99_nanos": 2534127,
+      "max_nanos": 2534127
+    },
+    "admission_wait": {
+      "p50_nanos": 560,
+      "p95_nanos": 1476,
+      "p99_nanos": 1644,
+      "max_nanos": 1644
+    },
+    "queue_wait": {
+      "p50_nanos": 786147,
+      "p95_nanos": 2058405,
+      "p99_nanos": 2162140,
+      "max_nanos": 2162140
+    },
+    "execution": {
+      "p50_nanos": 142365,
+      "p95_nanos": 230930,
+      "p99_nanos": 237350,
+      "max_nanos": 237350
+    },
+    "page_sync": {
+      "p50_nanos": 203,
+      "p95_nanos": 529,
+      "p99_nanos": 629,
+      "max_nanos": 629
+    },
+    "wal_sync": {
+      "p50_nanos": 171,
+      "p95_nanos": 202,
+      "p99_nanos": 317,
+      "max_nanos": 317
+    }
+  },
+  "memory": {
+    "commits": 32,
+    "end_to_end": {
+      "p50_nanos": 1344500,
+      "p95_nanos": 2164004,
+      "p99_nanos": 2293230,
+      "max_nanos": 2293230
+    },
+    "admission_wait": {
+      "p50_nanos": 462,
+      "p95_nanos": 1639,
+      "p99_nanos": 1640,
+      "max_nanos": 1640
+    },
+    "queue_wait": {
+      "p50_nanos": 974945,
+      "p95_nanos": 1780605,
+      "p99_nanos": 1820403,
+      "max_nanos": 1820403
+    },
+    "execution": {
+      "p50_nanos": 141946,
+      "p95_nanos": 295096,
+      "p99_nanos": 389744,
+      "max_nanos": 389744
+    },
+    "page_sync": {
+      "p50_nanos": 0,
+      "p95_nanos": 0,
+      "p99_nanos": 0,
+      "max_nanos": 0
+    },
+    "wal_sync": {
+      "p50_nanos": 0,
+      "p95_nanos": 0,
+      "p99_nanos": 0,
+      "max_nanos": 0
+    }
+  }
+}
