@@ -125,7 +125,7 @@ The relational vertical uses one tree root and these private key namespaces:
 | `0x00` | exact one-byte format key | ASCII `HYRELBT1` or `HYRELBT2` |
 | `0x01` | prefix + 128-bit big-endian table `ObjectId` | empty table marker |
 | `0x02` | prefix + table `ObjectId` + primary-key bytes | format-specific row value |
-| `0x03` | prefix + 128-bit big-endian index `ObjectId` | 32-byte `HYRIDX01` metadata |
+| `0x03` | prefix + 128-bit big-endian index `ObjectId` | 32-byte `HYRIDX01` or `HYRIDX02` metadata |
 | `0x04` | prefix + index `ObjectId` + secondary-entry identity | live/tombstone byte |
 
 The table marker preserves an empty table. A row record currently contains the
@@ -148,30 +148,60 @@ snapshots retain their prior roots.
 
 `HYRIDX01` contains its magic, the 128-bit big-endian relation `ObjectId`,
 one canonical boolean for `unique`, one for `nulls_distinct`, and six reserved
-zero bytes. A secondary-entry identity is:
+zero bytes. An `HYRIDX01` secondary-entry identity is:
 
 1. big-endian `u32` secondary-key byte length;
 2. canonical ordered secondary-key bytes; and
 3. canonical primary-key bytes.
 
-The B+tree key remains limited to 4,096 bytes. Entry value `1` is live and `0`
-is a tombstone. Creation writes the metadata marker and backfills the final
-admitted relation state. Row insertion derives every index projection from the
-catalog-bound tuple. Update writes tombstones for every old projection and live
-markers for every new projection; delete writes the old tombstones. These
-markers share the row mutation's copy-on-write root and CSN. Optimistic rebase
-repeats old/new projection maintenance against the currently admitted catalog
-and rows before publication. Recovery verifies metadata against the catalog,
-recomputes every live entry from its row, enforces uniqueness, rejects
-orphan/malformed entries, and proves that every row has every required
-projection.
+`HYRIDX02` metadata shares the same 32-byte layout as `HYRIDX01`: an
+eight-byte magic, the 128-bit big-endian relation `ObjectId`, one canonical
+boolean for `unique`, one for `nulls_distinct`, and six reserved zero bytes.
+Only the magic differs. Metadata decoding fails closed on an unknown magic, a
+noncanonical boolean, or a nonzero reserved byte. An `HYRIDX02`
+secondary-entry identity is:
 
-Exact current-root secondary lookup now reads `HYRIDX01`, constructs the
-length-delimited entry prefix, uses separator-pruned buffered prefix traversal,
-validates every live/tombstone marker, and follows live primary keys to visible
-rows through the same captured root. Missing metadata has a distinct
-`UnknownSecondaryIndex` failure; malformed entries or dangling live rows fail
-closed. The public result is deterministic primary-key order.
+1. canonical ordered secondary-key bytes;
+2. canonical primary-key bytes; and
+3. big-endian `u32` primary-key byte length.
+
+Both keys are concatenations of self-delimiting memcomparable components with
+a schema-fixed component count, so no complete key can be a strict prefix of
+another key from the same definition. Ordinary byte order therefore sorts by
+the index key first and uses the primary key as the deterministic tie-breaker;
+the trailing length suffix is reached only when both keys compare equal and
+makes the identity independently decodable.
+
+New secondary indexes are created with `HYRIDX02`. `HYRIDX01` remains
+readable, writable, and recoverable for exact lookup; there is no implicit
+rebuild and no in-place conversion. One physical index cannot mix layouts.
+Physical range planning is admitted only when the persisted metadata confirms
+the ordered `HYRIDX02` layout; catalog intent alone is insufficient.
+`HYRIDX01` is never advertised as range-capable because its length-first
+identity orders variable-width values by length before value; plans over the
+legacy layout fall back to a bounded primary-key scan when that fallback is
+legal.
+
+Under both layouts the B+tree key remains limited to 4,096 bytes; entry value
+`1` is live and `0` is a tombstone. Creation writes the metadata marker and
+backfills the final admitted relation state. Row insertion derives every index
+projection from the catalog-bound tuple. Update writes tombstones for every
+old projection and live markers for every new projection; delete writes the
+old tombstones. These markers share the row mutation's copy-on-write root and
+CSN. Optimistic rebase repeats old/new projection maintenance against the
+currently admitted catalog and rows before publication. Recovery verifies
+metadata against the catalog, recomputes every live entry from its row using
+the registered layout, enforces uniqueness, rejects orphan/malformed
+identities fail closed, and proves that every row has every required
+projection under both layouts.
+
+Exact current-root secondary lookup reads the index metadata, resolves the
+registered layout, and constructs the matching entry prefix: length-delimited
+for `HYRIDX01`, ordered for `HYRIDX02`. It uses separator-pruned buffered
+prefix traversal, validates every live/tombstone marker, and follows live
+primary keys to visible rows through the same captured root. Missing metadata
+has a distinct `UnknownSecondaryIndex` failure; malformed entries or dangling
+live rows fail closed. The public result is deterministic primary-key order.
 
 Current-root primary-key scan uses the `0x02 + table ObjectId` prefix and the
 buffered visitor. `scan_latest_relational(table, start_after, limit)` validates
@@ -191,7 +221,10 @@ wrapper over this range visitor with an exclusive lower bound.
 `scan_latest_relational_range(table, lower, upper, limit)` maps canonical
 primary-key bounds into the table's physical namespace, validates the table
 marker, resolves only visible row versions, skips tombstones, and returns no
-rows for inverted or equal-open intervals.
+rows for inverted or equal-open intervals. Ordered secondary ranges use the
+same bound-aware visitor over the `0x04` + index `ObjectId` namespace with
+physical bounds derived from the canonical secondary key, as specified in
+[Hyphae SQL semantics v1](sql-semantics-v1.md).
 
 Prepared SQL strict left-prefix scans concatenate the canonical ordered
 components selected from a composite primary key and derive the half-open

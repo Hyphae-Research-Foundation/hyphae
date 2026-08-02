@@ -407,6 +407,23 @@ microseconds p99. This is an operator observation, not G2 or G7; secondary
 ranges, general expressions/planning, and the complete correctness and
 performance matrices remain open.
 
+The [native secondary-index range
+evidence](evidence/native-secondary-index-ranges-2026-08-02.md) replaces the
+length-first secondary identity assumption with the order-preserving
+`HYRIDX02` layout and executes the first bounded physical secondary-index
+range scans. Range planning is admitted only from persisted physical
+metadata; legacy `HYRIDX01` indexes keep exact lookup and fall back to a
+legal bounded primary-key scan instead of a false range plan. The evidence
+proves inclusive/exclusive/one-sided/empty/`NULL` endpoints, complete simple
+and composite keys, residual-before-limit, private/retained/current/reopened
+equivalence, and fail-closed malformed-identity and forged-projection cases.
+The clean schema-v15 WSL2 observation measured the ordered secondary range
+at 24.328 microseconds p50 and 58.527 microseconds p99 while its unindexed
+differential baseline returned the same ten rows at 7,971.720 microseconds
+p50. This is an operator observation, not G2 or G7; composite
+equality-prefix secondary ranges, descending and streaming execution, and
+the complete correctness and performance matrices remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
@@ -455,7 +472,7 @@ unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
 along with multi-generation pin-aware retention,
-secondary-index range/streaming execution,
+composite secondary equality-prefix ranges and streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid

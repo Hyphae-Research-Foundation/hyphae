@@ -22,9 +22,11 @@ backfills atomically, inserts maintain every admitted projection, exact-key
 bounded `EXPLAIN` identifies primary-key or secondary-index lookup. Unique
 non-null collisions fail before publication; null equality retains SQL
 three-valued behavior. Bounded primary-key scans, complete-key ranges,
-left-prefix scans, prefix-plus-next-component ranges, exact-PK typed
-updates/deletes, and current-root secondary execution are physical native
-operators. Parameterized scalar residual filters support comparison,
+left-prefix scans, prefix-plus-next-component ranges, ordered secondary-index
+ranges, exact-PK typed updates/deletes, and current-root secondary execution
+are physical native operators. New secondary indexes use the order-preserving
+`HYRIDX02` identity; legacy `HYRIDX01` indexes keep exact lookup without false
+range planning. Parameterized scalar residual filters support comparison,
 `IS [NOT] NULL`, `NOT`, `AND`, and `OR`; the binder extracts admitted exact,
 prefix, or range access and applies `LIMIT` after filtering. The historical
 two-binary-column shape retains its raw bytes and allocation-free prepared
@@ -78,8 +80,8 @@ before serving exact or explicitly approximate search.
 The implementation remains deliberately bounded: retained transaction
 snapshots still materialize relation state, while current-root page vacuum,
 WAL/manifest retention, and blob collection do not yet provide configurable
-multi-generation pins. Secondary ranges and zero-copy operator cursors remain
-pending.
+multi-generation pins. Composite secondary equality-prefix ranges, descending
+traversal, streaming cursors, and zero-copy operator cursors remain pending.
 Structures still lack streams, bitmaps, probabilistic structures, geo,
 complete string/hash/set/list/sorted-set operations, collection TTL, active
 expiry backoff, blocking operations, eviction, and protocol exposure. Lexical

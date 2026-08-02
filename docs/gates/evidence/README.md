@@ -447,3 +447,17 @@ detectable.
 - `native-microsecond-smoke-primary-prefix-range-wsl2.json` is its clean
   schema-v14 WSL2 release observation. It reports the strict-prefix and
   prefix-plus-range routes separately and remains outside G7.
+
+## Native SQL secondary-index ranges
+
+- `native-secondary-index-ranges-2026-08-02.md` binds the first ordered
+  physical secondary-index range scan to exact source. It covers the
+  order-preserving `HYRIDX02` identity, physical-metadata range admission,
+  legacy `HYRIDX01` exact-only compatibility, canonical inclusive/exclusive
+  bounds, residual-before-limit behavior, private/retained/current/reopen
+  equivalence, and fail-closed malformed-identity and forged-projection
+  cases.
+- `native-microsecond-smoke-secondary-range-wsl2.json` is its clean
+  schema-v15 WSL2 release observation. It reports the ordered secondary
+  range and its deliberately expensive unindexed differential baseline
+  separately and remains outside G7.

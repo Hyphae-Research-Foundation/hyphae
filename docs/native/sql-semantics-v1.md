@@ -8,9 +8,9 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
-`INNER JOIN` shape, bounded composite primary-key left-prefix scans, and
-prefix-plus-next-component range scans are implemented experimentally as
-described below. G2 remains open
+`INNER JOIN` shape, bounded composite primary-key left-prefix scans,
+prefix-plus-next-component range scans, and ordered secondary-index range
+scans are implemented experimentally as described below. G2 remains open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -459,9 +459,10 @@ back that statement's private changes. An explicit transaction remains failed
 until rollback when an error can invalidate later semantics.
 
 Errors have stable Hyphae codes. The current slice implements `HYSQL001`
-through `HYSQL013` for syntax, parameters, stale plans, columns, types,
+through `HYSQL014` for syntax, parameters, stale plans, columns, types,
 nullability, primary-key binding/mutation, stored tuples, catalog-kind
-mismatch, absent implemented access paths, and unique-index violations.
+mismatch, absent implemented access paths, unique-index violations, and
+invalid secondary-index range bindings.
 Statement byte spans, optional object/column IDs, retry classification, and
 compatibility SQLSTATE mapping remain target requirements.
 
