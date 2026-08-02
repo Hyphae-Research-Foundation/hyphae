@@ -10393,6 +10393,82 @@ mod tests {
     }
 
     #[test]
+    fn structure_compaction_is_noop_on_empty_and_rejects_legacy_without_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty_directory = TestDirectory::new();
+        let mut empty = NativeDatabase::create(empty_directory.path())?;
+        let empty_pages = empty.pages.page_count();
+        let empty_receipt = empty.compact_structure(DurabilityClass::Strict)?;
+        assert_eq!(
+            empty_receipt,
+            super::StructureCompactionReceipt {
+                scanned_entries: 0,
+                retained_entries: 0,
+                dropped_tombstones: 0,
+                pages_appended: 0,
+                commit: None,
+            }
+        );
+        assert_eq!(empty.pages.page_count(), empty_pages);
+        assert_eq!(empty.snapshot(0)?.visible_csn(), None);
+
+        let legacy_directory = TestDirectory::new();
+        let mut legacy = NativeDatabase::create(legacy_directory.path())?;
+        legacy.structure_format = super::StructureFormat::BTreeV1;
+        let mut seed = legacy.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"legacy".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        let pages_before = legacy.pages.page_count();
+        let csn_before = legacy.snapshot(2)?.visible_csn();
+        assert!(matches!(
+            legacy.compact_structure(DurabilityClass::Strict),
+            Err(NativeRuntimeError::StructureCompactionUnsupported)
+        ));
+        assert_eq!(legacy.pages.page_count(), pages_before);
+        assert_eq!(legacy.snapshot(2)?.visible_csn(), csn_before);
+        Ok(())
+    }
+
+    #[test]
+    fn structure_compaction_rejects_corruption_before_appending_pages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"valid".to_vec(), b"value".to_vec(), Some(10))?;
+        seed.commit()?;
+        let root = database
+            .coordinator
+            .snapshot(2)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                vec![0xff, 0x00],
+                b"unknown".to_vec(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let pages_before = database.pages.page_count();
+
+        assert!(matches!(
+            super::compact_structure_tree(
+                &mut database.pages,
+                &database.blobs,
+                Some(forged),
+                Csn::new(2)?
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        assert_eq!(database.pages.page_count(), pages_before);
+        Ok(())
+    }
+
+    #[test]
     fn physical_expiry_batch_rejects_stale_or_duplicate_work_before_page_append()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -10675,6 +10751,65 @@ mod tests {
                 other => {
                     return Err(format!(
                         "unexpected recovered expiry CSN {other:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_compaction_boundary_recovers_prior_or_complete_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.set(b"expired".to_vec(), b"gone".to_vec(), Some(10))?;
+            seed.set(b"persistent".to_vec(), b"kept".to_vec(), None)?;
+            seed.commit()?;
+            database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+
+            let result = database.compact_structure_at(DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened.get_latest_structure(b"persistent", 100)?,
+                Some(b"kept".to_vec())
+            );
+            assert_eq!(reopened.get_latest_structure(b"expired", i64::MIN)?, None);
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(2) => {
+                    let retry = reopened.compact_structure(DurabilityClass::Strict)?;
+                    assert_eq!(retry.dropped_tombstones, 2);
+                    assert!(retry.commit.is_some());
+                }
+                Some(3) => {
+                    let no_op = reopened.compact_structure(DurabilityClass::Strict)?;
+                    assert_eq!(no_op.dropped_tombstones, 0);
+                    assert!(no_op.commit.is_none());
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected recovered compaction CSN {other:?} at {boundary:?}"
                     )
                     .into());
                 }
