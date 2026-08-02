@@ -142,6 +142,20 @@ The residual route visits roughly 19 rows to return 10 matches. This is a
 virtualized, warm, concurrency-one observation outside G7, not a broad SQL
 latency claim.
 
+Schema v14 replaces the measured residual range after a strict composite
+primary-key equality prefix with a bounded physical route. Over a height-two,
+2,048-row relation split between adjacent text prefixes, the physical prepared
+prefix-plus-range query observed p50 `15.119 us`, p99 `40.127 us`, and
+throughput `60,804 ops/s` in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-primary-prefix-range-wsl2.json).
+The prior schema-v13 residual route observed p50/p99 `198.603/589.950 us` and
+`4,472 ops/s`; across those exact source-bound observations, the new route
+reduced p50 by `92.387%`, p99 by `93.198%`, and raised throughput `13.597`
+times. This is an algorithmic-work observation, not a controlled same-process
+regression threshold or a G7 pass: WSL2 is virtualized, state is warm,
+concurrency is one, and the required cold-state, saturation, interference,
+allocation, transport, durability, and hardware-counter lanes are absent.
+
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50
 latencies of approximately 22.9 ms exact, 83.4 ms lexical, and 113.9 ms hybrid

@@ -436,3 +436,14 @@ detectable.
 - `native-microsecond-smoke-primary-prefix-wsl2.json` is its clean schema-v13
   WSL2 release observation. It reports pure prefix and prefix-plus-residual
   calls separately and remains outside G7.
+
+## Native SQL primary-key prefix ranges
+
+- `native-primary-key-prefix-ranges-2026-08-02.md` binds the first physical
+  range on the primary-key component immediately following a strict equality
+  prefix to exact source. It covers canonical inclusive/exclusive bounds,
+  remaining suffixes, residual-before-limit behavior, transaction/snapshot/
+  current/reopen equivalence, and fail-closed physical corruption.
+- `native-microsecond-smoke-primary-prefix-range-wsl2.json` is its clean
+  schema-v14 WSL2 release observation. It reports the strict-prefix and
+  prefix-plus-range routes separately and remains outside G7.

@@ -395,6 +395,18 @@ residual measured 198.603 microseconds p50 after examining 512 rows, so
 prefix-plus-range planning, secondary ranges, broader SQL, and the remaining
 G2/G7 matrices remain open.
 
+The [native primary-key prefix-plus-range
+evidence](evidence/native-primary-key-prefix-ranges-2026-08-02.md) replaces
+that measured residual with an interval over the equality prefix and the
+immediately following primary-key component. It proves inclusive/exclusive
+endpoints with remaining composite-key suffixes, residual-before-limit,
+private/retained/current/reopened equivalence, typed empty/failure cases, and
+fail-closed corruption. The clean schema-v14 WSL2 observation measured the
+former lower-bound residual case at 15.119 microseconds p50 and 40.127
+microseconds p99. This is an operator observation, not G2 or G7; secondary
+ranges, general expressions/planning, and the complete correctness and
+performance matrices remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
@@ -443,7 +455,7 @@ unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
 along with multi-generation pin-aware retention,
-prefix-plus-range and secondary-index range/streaming execution,
+secondary-index range/streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid
