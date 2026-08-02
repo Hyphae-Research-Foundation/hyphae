@@ -172,6 +172,18 @@ durability is memory, concurrency is one, and the required cold-state,
 saturation, interference, allocation, transport, durability, and
 hardware-counter lanes are absent.
 
+The same schema-v15 build also ran on native Linux for the first time:
+an AWS EC2 devbox with the benchmark data directory on persistent ext4
+rather than tmpfs, recorded in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-ext4-linux.json).
+The physical prepared secondary range observed p50 `42.698 us` and p99
+`90.215 us`, still inside the provisional bounded indexed-SQL target
+for this single scenario on that hardware. The hardware differs from
+the WSL2 receipts, so the numbers are a new baseline rather than a
+comparison. This is not a G7 pass or a regression threshold: EC2 is
+virtualized, state is warm, durability is memory, concurrency is one,
+and the timed paths do not fsync.
+
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50
 latencies of approximately 22.9 ms exact, 83.4 ms lexical, and 113.9 ms hybrid
