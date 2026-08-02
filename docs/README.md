@@ -55,6 +55,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native WAL format v1](native/wal-format-v1.md)
 - [Native WAL retention and bounded replay v1](native/wal-retention-v1.md)
 - [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
+- [Native durable snapshot pins v1](native/snapshot-pins-v1.md)
 - [Native group commit v1](native/group-commit-v1.md)
 - [Native mixed-durability scheduler v1](native/mixed-durability-scheduler-v1.md)
 - [Native active-expiry scheduler v1](native/active-expiry-scheduler-v1.md)
