@@ -27,6 +27,7 @@ const SECONDARY_OBSERVATIONS: u32 = 100_000;
 const SECONDARY_OPERATIONS_PER_OBSERVATION: u32 = 1;
 const SECONDARY_RANGE_OBSERVATIONS: u32 = 10_000;
 const SECONDARY_RANGE_OPERATIONS_PER_OBSERVATION: u32 = 1;
+const SECONDARY_RANGE_WARMUP: u32 = 1_000;
 const SECONDARY_RANGE_LOWER_ROW: u32 = SECONDARY_TARGET_ROW;
 const SECONDARY_RANGE_UPPER_ROW: u32 = SECONDARY_RANGE_LOWER_ROW + 10;
 const SECONDARY_RANGE_LOWER_KEY: &str = "a";
@@ -371,14 +372,6 @@ fn warm_operations(
             inputs.secondary_prepared,
             black_box(inputs.secondary_parameters),
         )?);
-        black_box(database.execute_prepared_latest(
-            inputs.secondary_range_scan_prepared,
-            black_box(inputs.secondary_range_parameters),
-        )?);
-        black_box(database.execute_prepared_latest(
-            inputs.secondary_range_prepared,
-            black_box(inputs.secondary_range_parameters),
-        )?);
         let decoded = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD)?;
         black_box(snapshot.get(black_box(decoded.payload)));
     }
@@ -485,6 +478,24 @@ fn measure_secondary_range(
     database: &NativeDatabase,
     inputs: &BenchmarkInputs<'_>,
 ) -> (Stats, Stats) {
+    for _ in 0..SECONDARY_RANGE_WARMUP {
+        black_box(
+            database
+                .execute_prepared_latest(
+                    inputs.secondary_range_scan_prepared,
+                    black_box(inputs.secondary_range_parameters),
+                )
+                .is_ok(),
+        );
+        black_box(
+            database
+                .execute_prepared_latest(
+                    inputs.secondary_range_prepared,
+                    black_box(inputs.secondary_range_parameters),
+                )
+                .is_ok(),
+        );
+    }
     let scan = measure_counted(
         || {
             black_box(
@@ -1037,6 +1048,7 @@ fn print_report(
     println!("  \"secondary_observations\": {SECONDARY_OBSERVATIONS},");
     println!("  \"secondary_operations_per_observation\": {SECONDARY_OPERATIONS_PER_OBSERVATION},");
     println!("  \"secondary_range_observations\": {SECONDARY_RANGE_OBSERVATIONS},");
+    println!("  \"secondary_range_warmup\": {SECONDARY_RANGE_WARMUP},");
     println!(
         "  \"secondary_range_operations_per_observation\": \
          {SECONDARY_RANGE_OPERATIONS_PER_OBSERVATION},"
