@@ -8,6 +8,10 @@ table and the first bounded group-commit scheduler shares page/WAL flushes,
 while bounded checkpoint replay, WAL retention, and idempotent retries remain
 pending
 
+The identity-preserving current-root design for bounded replay and prefix
+deletion is fixed separately by [Native WAL retention and bounded replay
+v1](wal-retention-v1.md).
+
 The WAL is the only transaction authority for the three native engines. It
 records one cross-engine transaction, not three engine-specific commits.
 
