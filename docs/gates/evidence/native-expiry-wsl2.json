@@ -1,0 +1,55 @@
+{
+  "schema": "hyphae-native-expiry-smoke-v1",
+  "status": "observation-not-gate",
+  "source_commit": "8f6fc731f066fe18d7b45fa68ac677595abe6169",
+  "source_tree": "fa8e4ac2a14dc28b18f8686ac466b7848ba4e74c",
+  "environment": "WSL2; Linux 6.18.33.1-microsoft-standard-WSL2; Intel Core Ultra 9 285H; 16 vCPUs; rustc 1.96.0; single-thread warm-state",
+  "profile": "release",
+  "seed_durability": "strict-and-reopen",
+  "warm_state": true,
+  "concurrency": 1,
+  "empty_observations": 100000,
+  "empty_warmup": 10000,
+  "empty_operations_per_observation": 8,
+  "memory_keys": 4096,
+  "memory_batch": 64,
+  "strict_keys": 512,
+  "strict_batch": 16,
+  "structure_tree_height": 2,
+  "memory_dataset_blake3": "e498c4ac45c5a948d186160c44c9326db207f87ea7a5f03cb0315f23050e71c8",
+  "strict_dataset_blake3": "58d75195d5040b9b4503f2bfeb8aa554a01bded97c727fff4b69164df1abbfa1",
+  "routes": {
+    "empty_due_scan": {
+      "p50_ns": 15890,
+      "p95_ns": 21854,
+      "p99_ns": 33785,
+      "p99_9_ns": 55945,
+      "maximum_ns": 625181,
+      "first_ns": 16369,
+      "last_ns": 15460,
+      "operations_per_second": 59271.419
+    },
+    "memory_cleanup_64": {
+      "p50_ns": 16635224,
+      "p95_ns": 18782558,
+      "p99_ns": 19245685,
+      "p99_9_ns": 19245685,
+      "maximum_ns": 19263057,
+      "first_ns": 16635224,
+      "last_ns": 19245685,
+      "batches_per_second": 59.337,
+      "keys_per_second": 3797.561
+    },
+    "strict_cleanup_16": {
+      "p50_ns": 4839773,
+      "p95_ns": 5456381,
+      "p99_ns": 5495005,
+      "p99_9_ns": 5495005,
+      "maximum_ns": 6336387,
+      "first_ns": 4729659,
+      "last_ns": 5130561,
+      "batches_per_second": 202.100,
+      "keys_per_second": 3233.601
+    }
+  }
+}

@@ -185,7 +185,7 @@ namespace:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact one-byte format key | ASCII `HYSTRBT1` |
+| `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
 | `0x02` | prefix + binary hash key | `HYHSHM01` live-field count |
 | `0x03` | prefix + length-delimited hash key + field | persistent `HYSTRV01` field envelope |
@@ -193,17 +193,23 @@ namespace:
 | `0x05` | prefix + length-delimited set key + member | persistent empty `HYSTRV01` marker |
 | `0x06` | prefix + binary list key | `HYLSTM01` length and end-chunk IDs |
 | `0x07` | prefix + length-delimited list key + ordered chunk ID | `HYLSTC01` packed element envelopes |
+| `0x08` | prefix + binary sorted-set key | `HYZSTM01` live-member count |
+| `0x09` | prefix + length-delimited sorted-set key + member | `HYZSCR01` canonical score |
+| `0x0a` | prefix + sorted-set key + sortable score + member | persistent empty `HYSTRV01` marker |
+| `0x0b` | prefix + sortable expiry + scalar key | one-byte live marker or tombstone |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
 `EXPIRE`, and `DELETE` rewrite only their copy-on-write leaf-to-root paths;
 `DELETE` stores the canonical scalar tombstone. Direct current reads traverse
 the buffer pool. Hash field changes rewrite their own field path plus the small
-hash metadata path rather than a whole serialized map. The current
-implementation has no general range/streaming cursor, expiry index/timing wheel,
+hash metadata path rather than a whole serialized map. `HYSTRBT2` maintains
+the scalar expiry index in the same mutation path and validates it
+one-to-one on recovery. `HYSTRBT1` remains a compatibility format without
+that index. The current implementation has no general range/streaming cursor,
 expected-version response, whole-hash deletion, or layouts for the remaining
-collection families. The admitted list layout rewrites metadata plus one
-packed end chunk per push/pop; its exact metadata, chunk, tombstone, and
+collection families. The list layout rewrites metadata plus one packed end
+chunk per push/pop; its exact metadata, chunk, tombstone, and
 corruption rules are specified in the structure contract.
 
 ## Lexical-search namespace

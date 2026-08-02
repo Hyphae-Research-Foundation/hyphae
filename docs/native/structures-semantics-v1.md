@@ -3,10 +3,11 @@
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
-buffered reads, and large immutable blobs are implemented in the convergence
-slice; the dual-index sorted-set contract is admitted for implementation;
-version-bearing responses, the expiry scheduler, and the remaining structure
-families remain pending
+buffered reads, large immutable blobs, and dual-index sorted sets are
+implemented in the convergence slice; the ordered durable scalar-expiry index
+and bounded cleanup are implemented; an engine-owned background timer,
+version-bearing responses, and the remaining structure families remain
+pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -78,6 +79,7 @@ ZSCORE(key, member)
 ZREM(key, member)
 ZCARD(key)
 ZRANGE(key, start, stop)
+EXPIRE_DUE(logical_time, max_keys)
 ```
 
 `SET` conditions are unconditional, if-absent, if-present, or
@@ -160,7 +162,7 @@ B+tree:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact one-byte format key | ASCII `HYSTRBT1` |
+| `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + arbitrary binary user key | canonical `HYSTRV01` value |
 | `0x02` | prefix + binary hash key | canonical `HYHSHM01` metadata |
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
@@ -171,6 +173,7 @@ B+tree:
 | `0x08` | prefix + binary sorted-set key | canonical `HYZSTM01` metadata |
 | `0x09` | prefix + sorted-set-member identity | canonical `HYZSCR01` score or structure tombstone |
 | `0x0a` | prefix + sorted-set key + sortable score + member | canonical empty persistent `HYSTRV01` value or structure tombstone |
+| `0x0b` | prefix + sortable expiry + binary scalar key | one-byte live marker or tombstone |
 
 The exact value envelope is:
 
@@ -294,8 +297,11 @@ closed.
 
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
-and continues reading and writing it without an implicit conversion. New
-directories use `HYSTRBT1`.
+and continues reading and writing it without an implicit conversion.
+`HYSTRBT1` B+tree directories remain readable and writable through a
+compatibility path that reconstructs due expiries from scalar envelopes.
+New directories use `HYSTRBT2`; only that marker requires and maintains the
+ordered expiry namespace.
 
 ## Atomicity
 
@@ -336,12 +342,52 @@ as one value.
 
 Expiry is an absolute signed UTC microsecond timestamp captured in the value
 version. Reads compare against snapshot logical time. Lazy expiry hides an
-expired version from that snapshot; a bounded timing wheel schedules a
-tombstone transaction.
+expired version from that snapshot even before physical cleanup. Historical
+proofs pin both a root and logical time, so active cleanup cannot alter an
+older snapshot.
 
-TTL changes are versioned writes. At or after the exact expiry, both `GET` and
-`TTL` report the key as missing. Historical proofs pin logical time. Restart
-reconstruction of the pending timing wheel remains unimplemented.
+Every live expiring scalar has exactly one live entry in the ordered expiry
+namespace. Its physical key is:
+
+```text
+0x0b || sortable_i64(expires_at_micros) || scalar_key
+```
+
+`sortable_i64` flips the sign bit of the signed timestamp and writes the
+result as unsigned big-endian bytes. Lexicographic order therefore matches
+the complete signed timestamp domain, with exact binary scalar-key order as
+the tie-break. The value is exactly `0x01` for live and `0x00` for a
+tombstone; every other value fails closed. An expiry-bearing scalar key must
+fit both its scalar identity and this nine-byte index overhead.
+
+`SET`, `EXPIRE`, `DELETE`, and counter writes maintain the scalar envelope and
+expiry index in the same structure mutation, WAL transaction, root
+publication, and CSN. Replacing or removing an expiry tombstones the prior
+index identity. Adding or changing an expiry publishes the new identity.
+Rewriting a value under the same expiry keeps that identity live.
+
+`EXPIRE_DUE(logical_time, max_keys)` visits the current physical index in
+timestamp/key order, selects at most `max_keys` live identities whose expiry
+is less than or equal to `logical_time`, revalidates each scalar against the
+same deterministic time, and commits their scalar and index tombstones as one
+native transaction. `max_keys` is in `1..=4096`; zero or a larger value is a
+typed error. No due keys means no WAL record and no CSN advancement. The
+receipt reports the expired-key count, whether another due live identity was
+observed, and the optional commit receipt.
+
+Recovery reconstructs pending work directly from the durable ordered
+namespace. It requires a one-to-one match between every live expiry identity
+and every scalar envelope carrying that exact timestamp. Missing, duplicate,
+stale, malformed, persistent-key, or orphan live identities fail closed.
+Index tombstones are ignored for logical reconstruction and remain physical
+until native compaction; scan-amplification evidence is therefore required
+before G3 closes.
+
+At or after the exact expiry, both `GET` and `TTL` report the key as missing
+whether or not `EXPIRE_DUE` has published cleanup. An optimistic cleanup batch
+uses the scalar write identity, so a concurrent renewal of the same key wins
+or conflicts under first-committer-wins; cleanup cannot delete the renewed
+value.
 
 ## Eviction
 
@@ -366,17 +412,21 @@ does not rewrite the structure as a table.
 
 Required evidence includes model-based randomized operations for every
 structure, restart equivalence, multi-key atomicity, write conflicts,
-controlled-clock TTL tests, timing-wheel rebuild, blocking cancellation,
-memory-amplification receipts, eviction safety, and cross-engine transactions.
+controlled-clock TTL tests, expiry-index reconstruction, bounded cleanup,
+blocking cancellation, memory-amplification receipts, eviction safety, and
+cross-engine transactions.
 
 Current experimental tests cover a 2,048-key multilevel tree, historical roots,
 direct TTL and expiry reads, canonical tombstones, `NX`/`XX`, racing `NX`
 writers, signed counter bounds, strict reopen, canonical-envelope corruption,
-legacy whole-page compatibility, optimistic disjoint-key rebase, all commit
-crash boundaries with scalar and hash mutations, typed scalar/hash creation
-races, disjoint-field rebase, same-field conflict, hash count corruption,
-field tombstones, typed scalar/hash/set creation races, disjoint-member
-rebase, same-member conflict, set count corruption, member tombstones,
-chunked-list restart/range/corruption/conflict behavior, and one blob
-deduplicated across relational, scalar, hash field, and list values. They do
-not close the structure gate.
+legacy whole-page and `HYSTRBT1` compatibility, optimistic disjoint-key
+rebase, all commit crash boundaries with scalar and hash mutations, durable
+expiry reconstruction and cleanup at all seven commit boundaries, stale
+cleanup/renewal conflict, full signed timestamp order, forged expiry-index
+corruption, typed scalar/hash creation races, disjoint-field rebase,
+same-field conflict, hash count corruption, field tombstones, typed
+scalar/hash/set creation races, disjoint-member rebase, same-member conflict,
+set count corruption, member tombstones, chunked-list
+restart/range/corruption/conflict behavior, and one blob deduplicated across
+relational, scalar, hash field, and list values. They do not close the
+structure gate.
