@@ -1,0 +1,51 @@
+{
+  "benchmark": "hyphae-native-group-commit-v1",
+  "source_commit": "d48f3c2c69be0b19130c00bebbec3a29e76a479d",
+  "source_tree": "8af4f3a5f6304c72d6bc7c43d1f4cc0c02946e9e",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "commits": 256,
+  "producers": 8,
+  "strict_wall_nanos": 381924700,
+  "strict_commits_per_second": 670.289,
+  "strict_commit_latency": {
+    "p50_nanos": 1294200,
+    "p95_nanos": 1756700,
+    "p99_nanos": 1990800
+  },
+  "group_wall_nanos": 109030700,
+  "group_commits_per_second": 2347.963,
+  "group_throughput_over_strict": 3.502910,
+  "group_end_to_end": {
+    "p50_nanos": 2735300,
+    "p95_nanos": 3684900,
+    "p99_nanos": 3838800
+  },
+  "group_queue_wait": {
+    "p50_nanos": 14600,
+    "p95_nanos": 54400,
+    "p99_nanos": 60700
+  },
+  "cohort_execution": {
+    "p50_nanos": 2696400,
+    "p95_nanos": 3648800,
+    "p99_nanos": 3791900
+  },
+  "cohort_page_sync": {
+    "p50_nanos": 464400,
+    "p95_nanos": 688500,
+    "p99_nanos": 747600
+  },
+  "cohort_wal_sync": {
+    "p50_nanos": 540400,
+    "p95_nanos": 1289400,
+    "p99_nanos": 1411200
+  },
+  "cohort_count": 32,
+  "cohort_size_min": 8,
+  "cohort_size_max": 8,
+  "cohort_size_mean": 8.000000,
+  "strict_reopen_verified": true,
+  "group_reopen_verified": true
+}

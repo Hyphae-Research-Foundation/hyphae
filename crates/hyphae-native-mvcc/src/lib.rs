@@ -147,6 +147,9 @@ pub enum MvccError {
     /// Page generation or retention-floor publication is invalid.
     #[error("native MVCC page generation or retention floor is invalid")]
     InvalidStorageTransition,
+    /// A group publication was requested without a staged root set.
+    #[error("native MVCC group publication requires at least one staged commit")]
+    EmptyGroup,
 }
 
 /// WAL identity required before a root set can be published.
@@ -463,6 +466,30 @@ impl CommitCoordinator {
             retention_floor_csn: None,
         })
     }
+
+    /// Begins one serialized group of privately staged root transactions.
+    ///
+    /// Every staged commit receives its own CSN and WAL anchor. No root becomes
+    /// visible until [`RootGroupTransaction::publish`] installs the final root
+    /// after the caller's shared durability synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if coordinator state is poisoned or CSN space is
+    /// exhausted.
+    pub fn begin_group_write(&self) -> Result<RootGroupTransaction<'_>, MvccError> {
+        let writer = self.writer.lock().map_err(|_| MvccError::Poisoned)?;
+        if writer.next_csn == 0 {
+            return Err(MvccError::CsnExhausted);
+        }
+        let current = self.current.read().map_err(|_| MvccError::Poisoned)?;
+        Ok(RootGroupTransaction {
+            coordinator: self,
+            writer,
+            initial: Arc::clone(&current),
+            staged: Vec::new(),
+        })
+    }
 }
 
 /// Private cross-engine root write set.
@@ -596,8 +623,120 @@ impl RootTransaction<'_> {
     }
 }
 
+/// Serialized private root chain for one durability cohort.
+///
+/// Staging advances only the chain owned by this value. Dropping it before
+/// publication leaves the coordinator's visible root and next CSN unchanged.
+#[derive(Debug)]
+pub struct RootGroupTransaction<'coordinator> {
+    coordinator: &'coordinator CommitCoordinator,
+    writer: MutexGuard<'coordinator, WriterState>,
+    initial: Arc<RootSet>,
+    staged: Vec<Arc<RootSet>>,
+}
+
+impl RootGroupTransaction<'_> {
+    /// Returns the latest privately staged root, or the admitted visible root.
+    pub fn base_roots(&self) -> &RootSet {
+        self.staged.last().map_or(&self.initial, AsRef::as_ref)
+    }
+
+    /// Captures the latest private group root as a transaction snapshot.
+    pub fn base_snapshot(&self, logical_time_micros: i64) -> Snapshot {
+        let roots = self
+            .staged
+            .last()
+            .map_or_else(|| Arc::clone(&self.initial), Arc::clone);
+        Snapshot {
+            visible_csn: roots.visible_csn(),
+            catalog_version: roots.catalog_version(),
+            logical_time_micros,
+            roots,
+        }
+    }
+
+    /// Returns the CSN for a future accepted offset in this cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CSN domain cannot represent the offset.
+    pub fn commit_csn_at_offset(&self, offset: usize) -> Result<Csn, MvccError> {
+        let offset = u64::try_from(offset).map_err(|_| MvccError::CsnExhausted)?;
+        let sequence = self
+            .writer
+            .next_csn
+            .checked_add(offset)
+            .ok_or(MvccError::CsnExhausted)?;
+        Csn::new(sequence).map_err(|_| MvccError::CsnExhausted)
+    }
+
+    /// Returns the CSN assigned to the next privately staged commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when sequence space is exhausted.
+    pub fn next_commit_csn(&self) -> Result<Csn, MvccError> {
+        self.commit_csn_at_offset(self.staged.len())
+    }
+
+    /// Adds one WAL-anchored root to the private cohort chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid storage state, WAL authority, or exhausted
+    /// sequence space.
+    pub fn stage_commit(
+        &mut self,
+        catalog_version: CatalogVersion,
+        wal_anchor: WalAnchor,
+        roots: BTreeMap<RootSlot, PageId>,
+        blob_generation: u64,
+    ) -> Result<Arc<RootSet>, MvccError> {
+        let base = self.base_roots();
+        let commit_csn = self.next_commit_csn()?;
+        let retention_floor_csn = base.retention_floor_csn().unwrap_or(commit_csn);
+        let root = RootSet::committed_with_storage(
+            commit_csn,
+            catalog_version,
+            wal_anchor,
+            roots,
+            blob_generation,
+            base.page_generation(),
+            retention_floor_csn,
+        )?;
+        let staged = Arc::new(root);
+        self.staged.push(Arc::clone(&staged));
+        Ok(staged)
+    }
+
+    /// Atomically installs the final staged root and consumes the cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty cohort, poisoned publication, or exhausted
+    /// CSN space.
+    pub fn publish(mut self) -> Result<Arc<RootSet>, MvccError> {
+        let published = self.staged.pop().ok_or(MvccError::EmptyGroup)?;
+        let next_csn = published
+            .visible_csn()
+            .ok_or(MvccError::UncommittedRootSet)?
+            .get()
+            .checked_add(1)
+            .ok_or(MvccError::CsnExhausted)?;
+        *self
+            .coordinator
+            .current
+            .write()
+            .map_err(|_| MvccError::Poisoned)? = Arc::clone(&published);
+        self.writer.next_csn = next_csn;
+        Ok(published)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyphae_native_types::{
         CatalogVersion, Csn, EngineKind, Lsn, ObjectId, PageGeneration, PageId,
     };
@@ -757,6 +896,65 @@ mod tests {
         let second = restored.begin_write()?;
         assert_eq!(second.read_csn().map(Csn::get), Some(1));
         assert_eq!(second.commit_csn()?.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn group_roots_remain_private_until_final_publication() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let coordinator = CommitCoordinator::new(CatalogVersion::new(1)?);
+        let slot = RootSlot {
+            engine: EngineKind::Structure,
+            partition: 0,
+        };
+        let mut group = coordinator.begin_group_write()?;
+        assert_eq!(group.commit_csn_at_offset(0)?, Csn::new(1)?);
+        assert_eq!(group.commit_csn_at_offset(1)?, Csn::new(2)?);
+
+        group.stage_commit(
+            CatalogVersion::new(1)?,
+            wal_anchor(112, 9)?,
+            BTreeMap::from([(slot, PageId::new(1)?)]),
+            0,
+        )?;
+        group.stage_commit(
+            CatalogVersion::new(1)?,
+            wal_anchor(224, 10)?,
+            BTreeMap::from([(slot, PageId::new(2)?)]),
+            0,
+        )?;
+        assert_eq!(group.base_roots().visible_csn(), Some(Csn::new(2)?));
+        assert_eq!(group.base_roots().root(slot), Some(PageId::new(2)?));
+        assert_eq!(coordinator.snapshot(0)?.visible_csn, None);
+
+        let published = group.publish()?;
+        assert_eq!(published.visible_csn(), Some(Csn::new(2)?));
+        assert_eq!(published.root(slot), Some(PageId::new(2)?));
+        assert_eq!(coordinator.snapshot(0)?.visible_csn, Some(Csn::new(2)?));
+        assert_eq!(coordinator.begin_write()?.commit_csn()?, Csn::new(3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_group_does_not_consume_sequence_space() -> Result<(), Box<dyn std::error::Error>> {
+        let coordinator = CommitCoordinator::new(CatalogVersion::new(1)?);
+        {
+            let mut group = coordinator.begin_group_write()?;
+            group.stage_commit(
+                CatalogVersion::new(1)?,
+                wal_anchor(112, 11)?,
+                BTreeMap::from([(
+                    RootSlot {
+                        engine: EngineKind::Search,
+                        partition: 0,
+                    },
+                    PageId::new(1)?,
+                )]),
+                0,
+            )?;
+        }
+        assert_eq!(coordinator.snapshot(0)?.visible_csn, None);
+        assert_eq!(coordinator.begin_write()?.commit_csn()?, Csn::new(1)?);
         Ok(())
     }
 

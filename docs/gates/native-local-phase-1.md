@@ -50,6 +50,7 @@ The current reviewable drafts are:
 - [root manifest and checkpoint format](../native/root-manifest-checkpoint-v1.md);
 - [WAL format](../native/wal-format-v1.md);
 - [MVCC and commit semantics](../native/mvcc-commit-v1.md);
+- [native group commit](../native/group-commit-v1.md);
 - [catalog](../native/catalog-v1.md);
 - [Hyphae SQL](../native/sql-semantics-v1.md);
 - [structures](../native/structures-semantics-v1.md);
@@ -347,6 +348,17 @@ native unsafe findings. Reported third-party unsafe syntax still requires
 semantic review, and the remaining golden/corpus/conformance requirements keep
 G0 open.
 
+The [native group-commit
+evidence](evidence/native-group-commit-2026-08-02.md) adds a bounded
+multi-producer scheduler, independent per-request admission, private MVCC root
+chains, one shared page sync and WAL sync, per-request timing receipts, orderly
+shutdown and a five-boundary crash matrix. Its exact eight-producer corpus
+improved throughput by 3.502910 times on Windows and 1.654654 times under
+WSL2/v9fs while increasing individual end-to-end p50 latency. Queue wait
+remained in the microsecond domain; cohort execution remained millisecond
+work. Mixed-durability scheduling, native-ext4/power-loss evidence and the
+complete G1/G7 matrices remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -356,9 +368,9 @@ typed definitions in a multilevel native B+tree with separate ID/name
 namespaces and definition blobs; new search roots use a native inverted
 B+tree while legacy inline roots remain compatible. Detached transactions now
 prepare concurrently and rebase disjoint all-engine writes under serialized
-publication;
-simultaneous commit submission and concurrency/saturation evidence remain
-pending, along with multi-generation retention, blob/WAL collection,
+publication. Bounded simultaneous `group` submission now shares page/WAL
+flushes; mixed strict/group/memory policy and concurrency/saturation evidence
+remain pending, along with multi-generation retention, blob/WAL collection,
 secondary-index range/streaming
 execution, zero-copy relational operator cursors, general relational
 expressions beyond the admitted residual slice, constraints/planning,
