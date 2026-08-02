@@ -254,6 +254,14 @@ commit before its tag can be published.
   amplification for the same expiry datasets. It improves cleanup p50 by
   about 80% while leaving compaction, background scheduling, and the G3/G7
   matrices open.
+- [Native structure reachability-compaction evidence —
+  2026-08-02](native-structure-compaction-2026-08-02.md) binds complete
+  pre-write validation, canonical tombstone filtering, logical-state
+  equivalence, retained historical roots, and all seven interruption
+  boundaries to one source commit.
+- `native-structure-compaction-wsl2.json` records a 41-to-10 reduction in
+  reachable pages and a 93.133% empty-expiry-scan p50 improvement while also
+  recording append-only file growth. Physical page-file vacuum remains open.
 
 ## Hosted release evidence
 
