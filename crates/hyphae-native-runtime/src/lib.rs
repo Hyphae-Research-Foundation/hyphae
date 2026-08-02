@@ -9789,6 +9789,11 @@ mod tests {
         ));
 
         let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        let oversized_expiry_key = vec![b'x'; hyphae_native_btree::BTREE_MAX_KEY_SIZE - 8];
+        assert!(matches!(
+            seed.set(oversized_expiry_key, b"value".to_vec(), Some(10)),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
         for key in [b"c".as_slice(), b"a".as_slice(), b"b".as_slice()] {
             seed.set(key.to_vec(), key.to_vec(), Some(10))?;
         }
@@ -9836,6 +9841,207 @@ mod tests {
         assert_eq!(
             database.ttl_latest_structure(b"lease", 10)?,
             super::Ttl::RemainingMicros(90)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_index_order_covers_the_complete_signed_timestamp_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timestamps = [i64::MIN, -1, 0, 1, i64::MAX];
+        let encoded = timestamps
+            .iter()
+            .map(|timestamp| super::structure_expiry_key(*timestamp, b"key"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(encoded.windows(2).all(|pair| pair[0] < pair[1]));
+        for (timestamp, physical) in timestamps.into_iter().zip(encoded) {
+            let (decoded, key) = super::decode_structure_expiry_identity(&physical[1..])?;
+            assert_eq!(decoded, timestamp);
+            assert_eq!(key, b"key");
+        }
+        assert!(super::structure_expiry_key(0, b"a")? < super::structure_expiry_key(0, b"b")?);
+
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(b"minimum".to_vec(), b"min".to_vec(), Some(i64::MIN))?;
+        seed.set(b"maximum".to_vec(), b"max".to_vec(), Some(i64::MAX))?;
+        seed.commit()?;
+        assert_eq!(
+            database
+                .expire_due_structures(i64::MIN, 1, DurabilityClass::Strict)?
+                .expired_keys,
+            1
+        );
+        assert_eq!(
+            database.get_latest_structure(b"maximum", i64::MAX - 1)?,
+            Some(b"max".to_vec())
+        );
+        assert_eq!(
+            database
+                .expire_due_structures(i64::MAX, 1, DurabilityClass::Strict)?
+                .expired_keys,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_index_corruption_fails_complete_state_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"lease".to_vec(), b"value".to_vec(), Some(10))?;
+        seed.set(b"persistent".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+
+        let roots = database.coordinator.snapshot(2)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forgeries = vec![
+            (
+                super::structure_expiry_key(10, b"lease")?,
+                vec![super::STRUCTURE_EXPIRY_TOMBSTONE],
+            ),
+            (
+                super::structure_expiry_key(9, b"lease")?,
+                vec![super::STRUCTURE_EXPIRY_LIVE],
+            ),
+            (
+                super::structure_expiry_key(10, b"orphan")?,
+                vec![super::STRUCTURE_EXPIRY_LIVE],
+            ),
+            (super::structure_expiry_key(10, b"lease")?, vec![2]),
+            (
+                super::structure_expiry_key(20, b"persistent")?,
+                vec![super::STRUCTURE_EXPIRY_LIVE],
+            ),
+            (
+                vec![super::STRUCTURE_EXPIRY_PREFIX, 0],
+                vec![super::STRUCTURE_EXPIRY_LIVE],
+            ),
+        ];
+        for (key, value) in forgeries {
+            let forged_tree = hyphae_native_btree::BTree::from_root(root)
+                .upsert(&mut database.pages, Csn::new(1)?, key, value)?
+                .tree;
+            let mut forged_roots = roots
+                .iter_roots()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            forged_roots.insert(
+                super::SLOT_STRUCTURE,
+                forged_tree
+                    .root()
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+            );
+            let forged = hyphae_native_mvcc::RootSet::committed(
+                roots
+                    .visible_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                roots.catalog_version(),
+                roots
+                    .wal_anchor()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                forged_roots,
+                roots.blob_generation(),
+            )?;
+            assert!(matches!(
+                super::load_structure_state(&database.pages, &database.blobs, &forged),
+                Err(NativeRuntimeError::InvalidStructureTree)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_expiry_cleanup_boundary_recovers_prior_or_complete_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.set(b"crash-a".to_vec(), b"a".to_vec(), Some(10))?;
+            seed.set(b"crash-b".to_vec(), b"b".to_vec(), Some(10))?;
+            seed.commit()?;
+
+            let result =
+                database.expire_due_structures_at(10, 2, DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => {
+                    assert_eq!(
+                        reopened.get_latest_structure(b"crash-a", i64::MIN)?,
+                        Some(b"a".to_vec())
+                    );
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 2, DurabilityClass::Strict)?
+                            .expired_keys,
+                        2
+                    );
+                }
+                Some(2) => {
+                    assert_eq!(reopened.get_latest_structure(b"crash-a", i64::MIN)?, None);
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 2, DurabilityClass::Strict)?
+                            .commit,
+                        None
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected recovered expiry CSN {other:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn btree_v1_expiry_directories_remain_cleanup_compatible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        database.structure_format = super::StructureFormat::BTreeV1;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"legacy-expiry".to_vec(), b"value".to_vec(), Some(10))?;
+        seed.commit()?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV1);
+        let cleanup = reopened.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(cleanup.expired_keys, 1);
+        assert!(!cleanup.more_due);
+        drop(reopened);
+
+        let recovered = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            recovered.get_latest_structure(b"legacy-expiry", i64::MIN)?,
+            None
         );
         Ok(())
     }
