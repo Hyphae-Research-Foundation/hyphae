@@ -11,6 +11,7 @@ use std::{
 };
 
 use blake3::Hasher;
+use hyphae_native_types::{DirectoryUuid, HistoryEpoch, LineageIdentity};
 use thiserror::Error;
 
 const FORMAT_FILE: &str = "FORMAT";
@@ -19,7 +20,6 @@ const LOCK_FILE: &str = "LOCK";
 const NATIVE_FORMAT_PREFIX: &str = "hyphae-native-format=";
 const FORMAT2_PREFIX: &str = "hyphae-disk-format=";
 const SUPPORTED_FORMAT_VERSION: u64 = 1;
-const INITIAL_HISTORY_EPOCH: u64 = 1;
 const MAX_FORMAT_BYTES: usize = 128;
 const MAX_FORMAT_READ_BYTES: u64 = 129;
 const FORMAT2_ONLY_ENTRIES: [&str; 2] = ["indexes", "log"];
@@ -31,7 +31,7 @@ const MAX_UUID_V7_MILLISECONDS: u64 = 0x0000_ffff_ffff_ffff;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDirectoryIdentity {
     directory_id: String,
-    history_epoch: u64,
+    lineage: LineageIdentity,
 }
 
 impl NativeDirectoryIdentity {
@@ -42,20 +42,26 @@ impl NativeDirectoryIdentity {
 
     /// Returns the nonzero history epoch.
     pub const fn history_epoch(&self) -> u64 {
-        self.history_epoch
+        self.lineage.history_epoch().get()
     }
 
-    fn new(directory_id: String, history_epoch: u64) -> Self {
+    /// Returns the canonical binary lineage carried by native authority records.
+    pub const fn lineage(&self) -> LineageIdentity {
+        self.lineage
+    }
+
+    fn new(directory_uuid: DirectoryUuid, history_epoch: HistoryEpoch) -> Self {
         Self {
-            directory_id,
-            history_epoch,
+            directory_id: directory_uuid.to_string(),
+            lineage: LineageIdentity::new(directory_uuid, history_epoch),
         }
     }
 
     fn encode(&self) -> String {
         format!(
             "{NATIVE_FORMAT_PREFIX}{SUPPORTED_FORMAT_VERSION} directory={} epoch={}\n",
-            self.directory_id, self.history_epoch
+            self.directory_id,
+            self.history_epoch()
         )
     }
 }
@@ -119,7 +125,7 @@ impl NativeDirectoryGuard {
     pub(crate) fn initialize(path: &Path) -> Result<Self, NativeDirectoryError> {
         let lock = acquire_lock(path, true)?;
         let identity =
-            NativeDirectoryIdentity::new(generate_directory_id(path)?, INITIAL_HISTORY_EPOCH);
+            NativeDirectoryIdentity::new(generate_directory_id(path)?, HistoryEpoch::FIRST);
         write_format_marker(path, &identity)?;
         Ok(Self {
             identity,
@@ -270,11 +276,8 @@ fn parse_marker(
     let directory_text = fields[1]
         .strip_prefix("directory=")
         .ok_or_else(|| NativeDirectoryError::MalformedFormat(format_path.to_path_buf()))?;
-    if !is_canonical_uuid_v7(directory_text) {
-        return Err(NativeDirectoryError::MalformedFormat(
-            format_path.to_path_buf(),
-        ));
-    }
+    let directory_uuid = DirectoryUuid::parse_canonical(directory_text)
+        .map_err(|_| NativeDirectoryError::MalformedFormat(format_path.to_path_buf()))?;
 
     let epoch_text = fields[2]
         .strip_prefix("epoch=")
@@ -282,13 +285,15 @@ fn parse_marker(
     let history_epoch = epoch_text
         .parse::<u64>()
         .map_err(|_| NativeDirectoryError::MalformedFormat(format_path.to_path_buf()))?;
-    if history_epoch == 0 || epoch_text != history_epoch.to_string() {
+    let history_epoch = HistoryEpoch::new(history_epoch)
+        .map_err(|_| NativeDirectoryError::MalformedFormat(format_path.to_path_buf()))?;
+    if epoch_text != history_epoch.to_string() {
         return Err(NativeDirectoryError::MalformedFormat(
             format_path.to_path_buf(),
         ));
     }
 
-    let identity = NativeDirectoryIdentity::new(directory_text.to_owned(), history_epoch);
+    let identity = NativeDirectoryIdentity::new(directory_uuid, history_epoch);
     if identity.encode() != marker {
         return Err(NativeDirectoryError::MalformedFormat(
             format_path.to_path_buf(),
@@ -297,7 +302,7 @@ fn parse_marker(
     Ok(identity)
 }
 
-fn generate_directory_id(path: &Path) -> Result<String, NativeDirectoryError> {
+fn generate_directory_id(path: &Path) -> Result<DirectoryUuid, NativeDirectoryError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| NativeDirectoryError::InvalidSystemClock)?;
@@ -325,49 +330,7 @@ fn generate_directory_id(path: &Path) -> Result<String, NativeDirectoryError> {
 
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(format_uuid(bytes))
-}
-
-fn format_uuid(bytes: [u8; 16]) -> String {
-    format!(
-        concat!(
-            "{:02x}{:02x}{:02x}{:02x}-",
-            "{:02x}{:02x}-",
-            "{:02x}{:02x}-",
-            "{:02x}{:02x}-",
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}"
-        ),
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
-}
-
-fn is_canonical_uuid_v7(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 36 || bytes[14] != b'7' || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
-        return false;
-    }
-    bytes.iter().enumerate().all(|(index, byte)| {
-        if matches!(index, 8 | 13 | 18 | 23) {
-            *byte == b'-'
-        } else {
-            byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
-        }
-    })
+    DirectoryUuid::new(bytes).map_err(|_| NativeDirectoryError::InvalidSystemClock)
 }
 
 fn reject_mixed_format_families(path: &Path) -> Result<(), NativeDirectoryError> {
@@ -405,16 +368,20 @@ fn io_error(path: &Path, source: io::Error) -> NativeDirectoryError {
 #[cfg(test)]
 mod tests {
     use super::{NativeDirectoryError, NativeDirectoryIdentity, parse_marker};
+    use hyphae_native_types::{DirectoryUuid, HistoryEpoch};
     use std::path::Path;
 
     #[test]
-    fn canonical_marker_has_golden_bytes() {
-        let identity =
-            NativeDirectoryIdentity::new("018f4e9d-3d7a-7b6c-8f12-123456789abc".to_owned(), 42);
+    fn canonical_marker_has_golden_bytes() -> Result<(), hyphae_native_types::NativeTypeError> {
+        let identity = NativeDirectoryIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
         assert_eq!(
             identity.encode(),
             "hyphae-native-format=1 directory=018f4e9d-3d7a-7b6c-8f12-123456789abc epoch=42\n"
         );
+        Ok(())
     }
 
     #[test]

@@ -41,8 +41,8 @@ be promoted to a contract without this marker.
 One policy governs physical format evolution. Every physical family declares
 versioned magics; the existing set is `HYCAT001` through `HYCAT003`,
 `HYRELBT1`, `HYRELBT2`, `HYSTRBT1`, `HYSTRBT2`, `HYSEABT1`, `HYRIDX01`,
-`HYRIDX02`, `HYWAL001`, `HYPAGE01`, `HYBLOB01`, `HYROOT01`, `HYROOT02`, and
-`HYWAR001`. The rules are:
+`HYRIDX02`, `HYWAL001`, `HYPAGE01`, `HYBLOB01`, `HYROOT01`, `HYROOT02`,
+`HYROOT03`, `HYWAR001`, and `HYWAR002`. The rules are:
 
 1. legacy roots remain readable and writable without implicit conversion;
 2. new physical objects use the newest layout;

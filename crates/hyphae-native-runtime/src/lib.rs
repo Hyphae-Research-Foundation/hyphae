@@ -66,9 +66,9 @@ use hyphae_native_records::{
     RowVersionPointer,
 };
 use hyphae_native_types::{
-    CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LogicalType, Lsn,
-    ManifestGeneration, ObjectId, PageGeneration, PageId, RowId, ScalarValue, TransactionId,
-    VectorElement, VectorType,
+    CatalogVersion, ColumnId, Csn, DurabilityClass, EngineKind, FieldId, LineageIdentity,
+    LogicalType, Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, RowId, ScalarValue,
+    TransactionId, VectorElement, VectorType,
 };
 use hyphae_native_wal::{
     OpenedWal, WAL_BLOCK_SIZE, WalError, WalFile, WalRecovery, WalRetentionAnchor,
@@ -1542,7 +1542,7 @@ impl NativeDatabase {
             manifest_verification_time,
             wal_physical_verification_time,
             wal_semantic_replay_time,
-        } = open_wal_state(path)?;
+        } = open_wal_state(path, directory_guard.identity().lineage())?;
         let commits = &recovered_wal.commits;
         let blob_generation_floor = recovered_blob_generation_floor(base_root.as_ref(), commits);
         blobs.apply_committed_generation_floor(blob_generation_floor)?;
@@ -3902,7 +3902,12 @@ impl NativeDatabase {
         };
         let generation = ManifestGeneration::new(next_generation)
             .map_err(|_| NativeRuntimeError::InvalidCheckpoint)?;
-        let manifest = RootManifest::from_root_set(generation, previous_digest, snapshot.roots())?;
+        let manifest = RootManifest::from_root_set_with_lineage(
+            generation,
+            previous_digest,
+            snapshot.roots(),
+            self.directory_guard.identity().lineage(),
+        )?;
         let staged = self.manifests.stage(manifest, true)?;
         interrupt_checkpoint(interruption, CheckpointBoundary::ManifestStaged)?;
         let manifest = self.manifests.publish(staged, true)?;
@@ -4062,11 +4067,14 @@ impl NativeDatabase {
             .and_then(|sequence| sequence.checked_add(1))
             .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
         let retired_through_sequence = self.wal.last_sequence();
-        if manifest.visible_csn() != visible_csn
-            || manifest.retention_floor_csn() != visible_csn
-            || !manifest.to_root_set()?.eq(snapshot.roots())
-            || checkpoint_sequence != retired_through_sequence
-        {
+        if !Self::retention_manifest_matches(
+            manifest,
+            snapshot.roots(),
+            visible_csn,
+            self.directory_guard.identity().lineage(),
+            checkpoint_sequence,
+            retired_through_sequence,
+        )? {
             return Err(NativeRuntimeError::WalRetentionIneligible);
         }
         let prior_anchor = self.wal_retention.current().copied();
@@ -4076,36 +4084,15 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::WalRetentionIneligible);
         }
         let current_wal_bytes = fs::metadata(self.data_directory.join(WAL_FILE))?.len();
-        if let Some(anchor) = prior_anchor
-            && anchor.fields().retired_checkpoint_lsn == checkpoint_lsn
-            && anchor.fields().manifest_digest == manifest.digest()
-            && anchor.fields().retired_through_sequence == retired_through_sequence
-            && current_wal_bytes == 0
-        {
-            let manifest_recovery = self.manifests.recovery();
-            return Ok(PreparedWalRetention::Existing(WalRetentionReceipt {
-                anchor_epoch: anchor.fields().epoch,
-                base_visible_csn: visible_csn,
-                retired_wal_blocks: retired_through_sequence,
-                retired_wal_bytes: 0,
-                checkpoint_lsn,
-                anchor_digest: anchor.digest(),
-                prior_anchors_removed: 0,
-                retired_manifest_files: 0,
-                retired_manifest_bytes: 0,
-                retained_manifest_files: manifest_recovery.manifests.len(),
-                retained_manifest_bytes: manifest_recovery.retained_manifest_bytes,
-                anchor_publication_time: Duration::ZERO,
-                wal_reset_synchronization_time: Duration::ZERO,
-                manifest_pruning_time: Duration::ZERO,
-                anchor_stabilization_time: Duration::ZERO,
-                total_time: Duration::ZERO,
-                parent_directory_sync_supported: self
-                    .wal_retention
-                    .recovery()
-                    .parent_sync_supported,
-                manifest_directory_sync_supported: manifest_recovery.parent_sync_supported,
-            }));
+        if let Some(receipt) = self.existing_wal_retention_receipt(
+            prior_anchor,
+            manifest,
+            checkpoint_lsn,
+            retired_through_sequence,
+            current_wal_bytes,
+            visible_csn,
+        ) {
+            return Ok(PreparedWalRetention::Existing(receipt));
         }
         let (anchor_epoch, previous_anchor_digest) =
             prior_anchor.map_or(Ok((1, [0; 32])), |anchor| {
@@ -4117,24 +4104,82 @@ impl NativeDatabase {
                     .ok_or(NativeRuntimeError::WalRetentionIneligible)
             })?;
         let root_anchor = manifest.wal_anchor();
-        let anchor = WalRetentionAnchor::new(WalRetentionAnchorFields {
-            epoch: anchor_epoch,
-            retired_through_sequence,
-            retired_checkpoint_lsn: checkpoint_lsn,
-            retired_block_digest: self.wal.last_digest(),
-            base_visible_csn: visible_csn,
-            manifest_generation: manifest.generation(),
-            manifest_digest: manifest.digest(),
-            root_commit_lsn: root_anchor.lsn,
-            root_commit_block_digest: root_anchor.digest,
-            next_transaction_id: self.next_transaction_id,
-            checkpoint_count: manifest.generation().get(),
-            committed_transaction_count: visible_csn.get(),
-            previous_anchor_digest,
-        })?;
+        let anchor = WalRetentionAnchor::new_with_lineage(
+            WalRetentionAnchorFields {
+                epoch: anchor_epoch,
+                retired_through_sequence,
+                retired_checkpoint_lsn: checkpoint_lsn,
+                retired_block_digest: self.wal.last_digest(),
+                base_visible_csn: visible_csn,
+                manifest_generation: manifest.generation(),
+                manifest_digest: manifest.digest(),
+                root_commit_lsn: root_anchor.lsn,
+                root_commit_block_digest: root_anchor.digest,
+                next_transaction_id: self.next_transaction_id,
+                checkpoint_count: manifest.generation().get(),
+                committed_transaction_count: visible_csn.get(),
+                previous_anchor_digest,
+            },
+            self.directory_guard.identity().lineage(),
+        )?;
         Ok(PreparedWalRetention::Publish {
             anchor,
             retired_wal_bytes: current_wal_bytes,
+        })
+    }
+
+    fn retention_manifest_matches(
+        manifest: &RootManifest,
+        roots: &RootSet,
+        visible_csn: Csn,
+        lineage: LineageIdentity,
+        checkpoint_sequence: u64,
+        retired_through_sequence: u64,
+    ) -> Result<bool, ManifestError> {
+        Ok(manifest.visible_csn() == visible_csn
+            && manifest.retention_floor_csn() == visible_csn
+            && manifest.lineage() == Some(lineage)
+            && manifest.to_root_set()?.eq(roots)
+            && checkpoint_sequence == retired_through_sequence)
+    }
+
+    fn existing_wal_retention_receipt(
+        &self,
+        anchor: Option<WalRetentionAnchor>,
+        manifest: &RootManifest,
+        checkpoint_lsn: Lsn,
+        retired_through_sequence: u64,
+        current_wal_bytes: u64,
+        visible_csn: Csn,
+    ) -> Option<WalRetentionReceipt> {
+        let anchor = anchor?;
+        if anchor.fields().retired_checkpoint_lsn != checkpoint_lsn
+            || anchor.fields().manifest_digest != manifest.digest()
+            || anchor.fields().retired_through_sequence != retired_through_sequence
+            || current_wal_bytes != 0
+        {
+            return None;
+        }
+        let manifest_recovery = self.manifests.recovery();
+        Some(WalRetentionReceipt {
+            anchor_epoch: anchor.fields().epoch,
+            base_visible_csn: visible_csn,
+            retired_wal_blocks: retired_through_sequence,
+            retired_wal_bytes: 0,
+            checkpoint_lsn,
+            anchor_digest: anchor.digest(),
+            prior_anchors_removed: 0,
+            retired_manifest_files: 0,
+            retired_manifest_bytes: 0,
+            retained_manifest_files: manifest_recovery.manifests.len(),
+            retained_manifest_bytes: manifest_recovery.retained_manifest_bytes,
+            anchor_publication_time: Duration::ZERO,
+            wal_reset_synchronization_time: Duration::ZERO,
+            manifest_pruning_time: Duration::ZERO,
+            anchor_stabilization_time: Duration::ZERO,
+            total_time: Duration::ZERO,
+            parent_directory_sync_supported: self.wal_retention.recovery().parent_sync_supported,
+            manifest_directory_sync_supported: manifest_recovery.parent_sync_supported,
         })
     }
 
@@ -7024,6 +7069,7 @@ fn validate_retention_anchor(
     let root = manifest.to_root_set()?;
     if manifest.generation() != fields.manifest_generation
         || manifest.generation().get() != fields.checkpoint_count
+        || manifest.lineage() != anchor.lineage()
         || manifest.digest() != fields.manifest_digest
         || manifest.visible_csn() != fields.base_visible_csn
         || manifest.retention_floor_csn() != fields.base_visible_csn
@@ -10943,8 +10989,12 @@ struct WalOpenState {
     wal_semantic_replay_time: Duration,
 }
 
-fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
+fn open_wal_state(
+    path: &Path,
+    expected_lineage: LineageIdentity,
+) -> Result<WalOpenState, NativeRuntimeError> {
     let mut wal_retention = WalRetentionStore::open(path)?;
+    wal_retention.validate_lineage(expected_lineage)?;
     let retention_recovery = wal_retention.recovery();
     let recovery_anchor = retention_recovery
         .candidate
@@ -10960,6 +11010,7 @@ fn open_wal_state(path: &Path) -> Result<WalOpenState, NativeRuntimeError> {
             )
         },
     )?;
+    manifests.validate_lineage(expected_lineage)?;
     let manifest_verification_time = manifest_verification_started.elapsed();
     let manifest_recovery = manifests.recovery();
     if let Some(candidate) = retention_recovery.candidate {
@@ -12627,13 +12678,14 @@ mod tests {
         HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
         NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
         NativeSchedulerClock, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
-        RelationDefinition, RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome,
-        SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric,
-        WAL_FILE, WalError, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
-        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
-        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
-        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
-        rebuild_page_generation, validate_commit_sequence,
+        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
+        SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector,
+        VectorMetric, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome,
+        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
+        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
+        decode_catalog_definition_storage_value, page_generation_path,
+        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
+        validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -16364,8 +16416,14 @@ mod tests {
         let mut database = NativeDatabase::create(temporary.path())?;
         stage_vertical(&mut database)?.commit()?;
         let checkpoint = database.checkpoint()?;
+        let encoded_manifest = fs::read(
+            temporary
+                .path()
+                .join("roots/manifest-0000000000000001.hyroot"),
+        )?;
         assert_eq!(checkpoint.visible_csn.get(), 1);
         assert_eq!(checkpoint.manifest_generation.get(), 1);
+        assert_eq!(&encoded_manifest[..8], b"HYROOT03");
         drop(database);
 
         let reopened = NativeDatabase::open(temporary.path())?;
@@ -16380,6 +16438,112 @@ mod tests {
             Some(1)
         );
         assert_vertical(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_marker_rejects_legacy_manifest_authority() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        database.checkpoint()?;
+        let legacy = {
+            let current = database
+                .manifests
+                .current()
+                .ok_or("checkpoint did not publish a manifest")?;
+            RootManifest::from_root_set(
+                current.generation(),
+                current.previous_digest(),
+                &current.to_root_set()?,
+            )?
+        };
+        let manifest_path = temporary
+            .path()
+            .join("roots/manifest-0000000000000001.hyroot");
+        drop(database);
+        fs::write(manifest_path, legacy.encode()?)?;
+
+        assert!(matches!(
+            NativeDatabase::open(temporary.path()),
+            Err(NativeRuntimeError::Manifest(ManifestError::LineageMismatch))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn native_marker_rejects_legacy_retention_anchor_before_wal_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        prepare_wal_retention_checkpoint(&mut database)?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        let current = *database
+            .wal_retention
+            .current()
+            .ok_or("retention did not publish an anchor")?;
+        let legacy = WalRetentionAnchor::new(current.fields())?;
+        let anchor_path = temporary
+            .path()
+            .join("wal-anchor-00000000000000000001.hywa");
+        drop(database);
+        fs::write(anchor_path, legacy.encode())?;
+
+        assert!(matches!(
+            NativeDatabase::open(temporary.path()),
+            Err(NativeRuntimeError::Wal(
+                WalError::RetentionAnchorLineageMismatch
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn marker_lineage_must_match_manifest_and_retention_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for with_retention_anchor in [false, true] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            if with_retention_anchor {
+                prepare_wal_retention_checkpoint(&mut database)?;
+                database.truncate_wal_at_retention_checkpoint()?;
+            } else {
+                stage_vertical(&mut database)?.commit()?;
+                database.checkpoint()?;
+            }
+            let directory_id = database.directory_identity().directory_id().to_owned();
+            let mut divergent_id = directory_id.clone();
+            divergent_id.replace_range(
+                35..36,
+                if directory_id.ends_with('0') {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
+            drop(database);
+
+            let marker_path = temporary.path().join("FORMAT");
+            let marker = fs::read_to_string(&marker_path)?;
+            fs::write(
+                marker_path,
+                marker.replacen(&directory_id, &divergent_id, 1),
+            )?;
+            let result = NativeDatabase::open(temporary.path());
+            if with_retention_anchor {
+                assert!(matches!(
+                    result,
+                    Err(NativeRuntimeError::Wal(
+                        WalError::RetentionAnchorLineageMismatch
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(NativeRuntimeError::Manifest(ManifestError::LineageMismatch))
+                ));
+            }
+        }
         Ok(())
     }
 
