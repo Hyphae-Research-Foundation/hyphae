@@ -15,9 +15,9 @@ mod sql;
 mod wal_codec;
 
 pub use group_commit::{
-    GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
-    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitClient,
-    NativeCommitScheduler, ScheduledCommitReceipt,
+    CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
+    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, NativeCommitCancellation,
+    NativeCommitClient, NativeCommitControl, NativeCommitScheduler, ScheduledCommitReceipt,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -12282,20 +12282,18 @@ mod tests {
         AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
         CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_VALUE_BLOB,
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
-        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition,
-        CommitCancellationOutcome, CommitBoundary, EngineKind, GroupCommitBoundary,
-        GroupCommitConfig, GroupCommitOutcome,
-        GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError, Mutation,
-        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
+        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
+        CommitCancellationOutcome, EngineKind, GroupCommitBoundary, GroupCommitConfig,
+        GroupCommitOutcome, GroupCommitSubmitError, HashSetOutcome, HnswConfig, ManifestError,
+        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeRuntimeError,
         NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition,
         RelationalScanRow, SLOT_CATALOG, SetCondition, SetOutcome, SortedSetEntry, SqlError,
         SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
-        WalRetentionBoundary, ZAddOutcome,
-        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
-        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
-        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
+        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
+        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
+        rebuild_page_generation, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -16945,10 +16943,8 @@ mod tests {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         stage_vertical(&mut database)?.commit()?;
-        let scheduler = NativeCommitScheduler::start(
-            database,
-            GroupCommitConfig::new(2, Duration::ZERO, 2)?,
-        )?;
+        let scheduler =
+            NativeCommitScheduler::start(database, GroupCommitConfig::new(2, Duration::ZERO, 2)?)?;
 
         let mut cancelled = scheduler.begin_optimistic(151, DurabilityClass::Strict)?;
         cancelled.set(b"cancelled".to_vec(), b"never".to_vec(), None)?;
@@ -16965,11 +16961,7 @@ mod tests {
         let mut expired = scheduler.begin_optimistic(152, DurabilityClass::Strict)?;
         expired.set(b"expired".to_vec(), b"never".to_vec(), None)?;
         assert!(matches!(
-            scheduler.submit_controlled(
-                expired,
-                NativeCommitControl::new(),
-                Some(Instant::now() - Duration::from_nanos(1))
-            ),
+            scheduler.submit_controlled(expired, NativeCommitControl::new(), Some(Instant::now())),
             Err(GroupCommitSubmitError::DeadlineExceeded)
         ));
 
