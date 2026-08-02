@@ -4616,6 +4616,12 @@ impl NativeTransaction<'_> {
 
         let concrete_roots = require_roots(roots)?;
         let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
+        let page_generation = self.root_transaction.base_roots().page_generation();
+        let retention_floor_csn = self
+            .root_transaction
+            .base_roots()
+            .retention_floor_csn()
+            .unwrap_or(Csn::FIRST);
         let pending = encode_transaction(&TransactionPlan {
             transaction_id: self.transaction_id,
             read_csn: self.conflict_read_csn,
@@ -4626,6 +4632,8 @@ impl NativeTransaction<'_> {
             commit_csn,
             roots: concrete_roots,
             blob_generation,
+            page_generation,
+            retention_floor_csn,
         })?;
         let receipts = self.wal.append_records(pending, false)?;
         interrupt(interruption, CommitBoundary::WalAppended)?;

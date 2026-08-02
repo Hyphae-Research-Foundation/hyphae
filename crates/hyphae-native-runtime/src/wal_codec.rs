@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_types::{
-    CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId, PageId,
-    TransactionId,
+    CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
+    PageGeneration, PageId, TransactionId,
 };
 use hyphae_native_wal::{PendingRecord, RecordKind, WalRecord};
 use thiserror::Error;
 
 const BEGIN_MAGIC: &[u8; 8] = b"HYBGN001";
 const MUTATION_MAGIC: &[u8; 8] = b"HYMUT001";
-const COMMIT_MAGIC: &[u8; 8] = b"HYCMT001";
+const COMMIT_MAGIC_V1: &[u8; 8] = b"HYCMT001";
+const COMMIT_MAGIC_V2: &[u8; 8] = b"HYCMT002";
+const COMMIT_V1_SIZE: usize = 124;
+const COMMIT_V2_SIZE: usize = 140;
 const ABORT_MAGIC: &[u8; 8] = b"HYABT001";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"HYCHK001";
 const ROOT_COUNT: usize = 4;
@@ -103,12 +106,24 @@ pub(crate) struct CommitManifest {
     pub(crate) logical_time_micros: i64,
     pub(crate) mutation_digest: [u8; 32],
     pub(crate) roots: [PageId; ROOT_COUNT],
+    pub(crate) page_generation: PageGeneration,
+    pub(crate) retention_floor_csn: Csn,
 }
 
 impl CommitManifest {
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(124);
-        bytes.extend_from_slice(COMMIT_MAGIC);
+        let is_v1 =
+            self.page_generation == PageGeneration::FIRST && self.retention_floor_csn == Csn::FIRST;
+        let mut bytes = Vec::with_capacity(if is_v1 {
+            COMMIT_V1_SIZE
+        } else {
+            COMMIT_V2_SIZE
+        });
+        bytes.extend_from_slice(if is_v1 {
+            COMMIT_MAGIC_V1
+        } else {
+            COMMIT_MAGIC_V2
+        });
         bytes.extend_from_slice(&self.read_csn.map_or(0, Csn::get).to_le_bytes());
         bytes.extend_from_slice(&self.commit_csn.get().to_le_bytes());
         bytes.extend_from_slice(&self.catalog_version.get().to_le_bytes());
@@ -120,11 +135,19 @@ impl CommitManifest {
         for root in self.roots {
             bytes.extend_from_slice(&root.get().to_le_bytes());
         }
+        if !is_v1 {
+            bytes.extend_from_slice(&self.page_generation.get().to_le_bytes());
+            bytes.extend_from_slice(&self.retention_floor_csn.get().to_le_bytes());
+        }
         bytes
     }
 
     fn decode(body: &[u8]) -> Result<Self, WalSemanticError> {
-        if body.len() != 124 || body.get(..8) != Some(COMMIT_MAGIC.as_slice()) {
+        let is_v1 =
+            body.len() == COMMIT_V1_SIZE && body.get(..8) == Some(COMMIT_MAGIC_V1.as_slice());
+        let is_v2 =
+            body.len() == COMMIT_V2_SIZE && body.get(..8) == Some(COMMIT_MAGIC_V2.as_slice());
+        if !is_v1 && !is_v2 {
             return Err(WalSemanticError::InvalidBody);
         }
         let read_csn = optional_csn(read_u64(&body[8..16]))?;
@@ -145,6 +168,17 @@ impl CommitManifest {
             *root = PageId::new(read_u64(&body[start..start + 8]))
                 .map_err(|_| WalSemanticError::InvalidIdentity)?;
         }
+        let (page_generation, retention_floor_csn) = if is_v1 {
+            (PageGeneration::FIRST, Csn::FIRST)
+        } else {
+            (
+                PageGeneration::new(read_u64(&body[124..132]))
+                    .map_err(|_| WalSemanticError::InvalidIdentity)?,
+                Csn::new(read_u64(&body[132..140]))
+                    .map_err(|_| WalSemanticError::InvalidIdentity)?,
+            )
+        };
+        validate_storage_state(page_generation, retention_floor_csn, commit_csn)?;
         Ok(Self {
             read_csn,
             commit_csn,
@@ -155,6 +189,8 @@ impl CommitManifest {
             logical_time_micros,
             mutation_digest,
             roots,
+            page_generation,
+            retention_floor_csn,
         })
     }
 }
@@ -193,6 +229,8 @@ pub(crate) struct TransactionPlan<'mutations> {
     pub(crate) commit_csn: Csn,
     pub(crate) roots: [PageId; ROOT_COUNT],
     pub(crate) blob_generation: u64,
+    pub(crate) page_generation: PageGeneration,
+    pub(crate) retention_floor_csn: Csn,
 }
 
 pub(crate) fn encode_transaction(
@@ -201,6 +239,11 @@ pub(crate) fn encode_transaction(
     if plan.mutations.is_empty() {
         return Err(WalSemanticError::InvalidSequence);
     }
+    validate_storage_state(
+        plan.page_generation,
+        plan.retention_floor_csn,
+        plan.commit_csn,
+    )?;
     let encoded_mutations = plan
         .mutations
         .iter()
@@ -237,6 +280,8 @@ pub(crate) fn encode_transaction(
         logical_time_micros: plan.logical_time_micros,
         mutation_digest: digest,
         roots: plan.roots,
+        page_generation: plan.page_generation,
+        retention_floor_csn: plan.retention_floor_csn,
     };
     let mut records = Vec::with_capacity(plan.mutations.len() + 2);
     records.push(PendingRecord::new(
@@ -263,6 +308,19 @@ pub(crate) fn encode_transaction(
         manifest.encode(),
     )?);
     Ok(records)
+}
+
+fn validate_storage_state(
+    page_generation: PageGeneration,
+    retention_floor_csn: Csn,
+    commit_csn: Csn,
+) -> Result<(), WalSemanticError> {
+    let first_generation = page_generation == PageGeneration::FIRST;
+    let first_floor = retention_floor_csn == Csn::FIRST;
+    if retention_floor_csn > commit_csn || first_generation != first_floor {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_checkpoint(
@@ -833,14 +891,14 @@ fn read_i64(bytes: &[u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use hyphae_native_types::{
-        CatalogVersion, Csn, DurabilityClass, EngineKind, ManifestGeneration, ObjectId, PageId,
-        TransactionId,
+        CatalogVersion, Csn, DurabilityClass, EngineKind, ManifestGeneration, ObjectId,
+        PageGeneration, PageId, TransactionId,
     };
     use hyphae_native_wal::WalBlock;
 
     use super::{
-        Mutation, Opcode, TransactionPlan, WalSemanticError, encode_checkpoint, encode_transaction,
-        recover_wal, validate_mutation_shape,
+        CommitManifest, Mutation, Opcode, TransactionPlan, WalSemanticError, encode_checkpoint,
+        encode_transaction, recover_wal, validate_mutation_shape,
     };
 
     fn mutation(
@@ -875,6 +933,106 @@ mod tests {
             value,
             expires_at_micros,
         )
+    }
+
+    fn commit_manifest(
+        page_generation: PageGeneration,
+        retention_floor_csn: Csn,
+    ) -> Result<CommitManifest, hyphae_native_types::NativeTypeError> {
+        Ok(CommitManifest {
+            read_csn: Some(Csn::new(7)?),
+            commit_csn: Csn::new(9)?,
+            catalog_version: CatalogVersion::new(3)?,
+            blob_generation: 4,
+            mutation_count: 2,
+            mutation_bytes: 17,
+            logical_time_micros: 123,
+            mutation_digest: [0xa5; 32],
+            roots: [
+                PageId::new(11)?,
+                PageId::new(12)?,
+                PageId::new(13)?,
+                PageId::new(14)?,
+            ],
+            page_generation,
+            retention_floor_csn,
+        })
+    }
+
+    #[test]
+    fn generation_one_commit_manifest_keeps_the_v1_golden_encoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = commit_manifest(PageGeneration::FIRST, Csn::FIRST)?;
+        let encoded = manifest.encode();
+        assert_eq!(encoded.len(), 124);
+        assert_eq!(&encoded[..8], b"HYCMT001");
+        assert_eq!(
+            blake3::hash(&encoded).to_hex().as_str(),
+            "c113774534f936d83b929b9f07cb3d60990f0a1accc17fe886a335c2cb60b36b"
+        );
+        assert_eq!(CommitManifest::decode(&encoded)?, manifest);
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_commit_manifest_round_trips_v2_storage_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = commit_manifest(PageGeneration::new(2)?, Csn::new(8)?)?;
+        let encoded = manifest.encode();
+        assert_eq!(encoded.len(), 140);
+        assert_eq!(&encoded[..8], b"HYCMT002");
+        assert_eq!(&encoded[124..132], &2_u64.to_le_bytes());
+        assert_eq!(&encoded[132..140], &8_u64.to_le_bytes());
+        assert_eq!(CommitManifest::decode(&encoded)?, manifest);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_manifest_rejects_invalid_storage_state() -> Result<(), Box<dyn std::error::Error>> {
+        let mut zero_generation = commit_manifest(PageGeneration::new(2)?, Csn::new(8)?)?.encode();
+        zero_generation[124..132].fill(0);
+        assert!(matches!(
+            CommitManifest::decode(&zero_generation),
+            Err(WalSemanticError::InvalidIdentity)
+        ));
+
+        let mut future_floor = commit_manifest(PageGeneration::new(2)?, Csn::new(8)?)?.encode();
+        future_floor[132..140].copy_from_slice(&10_u64.to_le_bytes());
+        assert!(matches!(
+            CommitManifest::decode(&future_floor),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+
+        let invalid_v1_state = [Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+        }];
+        assert!(matches!(
+            encode_transaction(&TransactionPlan {
+                transaction_id: TransactionId::new(1)?,
+                read_csn: Some(Csn::new(8)?),
+                catalog_version: CatalogVersion::new(3)?,
+                logical_time_micros: 123,
+                durability: DurabilityClass::Strict,
+                mutations: &invalid_v1_state,
+                commit_csn: Csn::new(9)?,
+                roots: [
+                    PageId::new(11)?,
+                    PageId::new(12)?,
+                    PageId::new(13)?,
+                    PageId::new(14)?,
+                ],
+                blob_generation: 4,
+                page_generation: PageGeneration::FIRST,
+                retention_floor_csn: Csn::new(8)?,
+            }),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+        Ok(())
     }
 
     #[test]
@@ -968,6 +1126,8 @@ mod tests {
             commit_csn: Csn::new(1)?,
             roots,
             blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
         })?;
         let block = WalBlock::build(1, [0; 32], pending)?;
         let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
@@ -1072,6 +1232,8 @@ mod tests {
                 PageId::new(4)?,
             ],
             blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
         })?;
         let block = WalBlock::build(1, [0; 32], pending)?;
         let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
@@ -1106,6 +1268,8 @@ mod tests {
                 PageId::new(4)?,
             ],
             blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
         })?;
         let block = WalBlock::build(1, [0; 32], pending)?;
         let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
@@ -1144,6 +1308,8 @@ mod tests {
             commit_csn: Csn::new(1)?,
             roots,
             blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
         })?;
         let commit_block = WalBlock::build(1, [0; 32], pending)?;
         let commit_decoded = WalBlock::decode(1, [0; 32], &commit_block.encode()?)?;
