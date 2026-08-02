@@ -84,6 +84,7 @@ const RELATIONAL_VALUE_BLOB: u8 = 1;
 const RELATIONAL_INLINE_VALUE_LIMIT: usize = 8_192;
 const STRUCTURE_FORMAT_KEY: &[u8] = b"\x00";
 const STRUCTURE_FORMAT_VALUE_V1: &[u8] = b"HYSTRBT1";
+const STRUCTURE_FORMAT_VALUE_V2: &[u8] = b"HYSTRBT2";
 const STRUCTURE_ENTRY_PREFIX: u8 = 1;
 const STRUCTURE_HASH_META_PREFIX: u8 = 2;
 const STRUCTURE_HASH_FIELD_PREFIX: u8 = 3;
@@ -94,6 +95,7 @@ const STRUCTURE_LIST_CHUNK_PREFIX: u8 = 7;
 const STRUCTURE_SORTED_SET_META_PREFIX: u8 = 8;
 const STRUCTURE_SORTED_SET_MEMBER_PREFIX: u8 = 9;
 const STRUCTURE_SORTED_SET_ORDER_PREFIX: u8 = 10;
+const STRUCTURE_EXPIRY_PREFIX: u8 = 11;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_SET_META_MAGIC: &[u8; 8] = b"HYSETM01";
@@ -114,6 +116,9 @@ const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
 const STRUCTURE_VALUE_TOMBSTONE: u8 = 2;
 const STRUCTURE_VALUE_INLINE: u8 = 0;
 const STRUCTURE_VALUE_BLOB: u8 = 1;
+const STRUCTURE_EXPIRY_TOMBSTONE: u8 = 0;
+const STRUCTURE_EXPIRY_LIVE: u8 = 1;
+const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
 const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
@@ -179,6 +184,25 @@ impl RelationalFormat {
 enum StructureFormat {
     InlineStateV1,
     BTreeV1,
+    BTreeV2,
+}
+
+impl StructureFormat {
+    const fn is_btree(self) -> bool {
+        matches!(self, Self::BTreeV1 | Self::BTreeV2)
+    }
+
+    const fn has_expiry_index(self) -> bool {
+        matches!(self, Self::BTreeV2)
+    }
+
+    const fn marker(self) -> Option<&'static [u8]> {
+        match self {
+            Self::InlineStateV1 => None,
+            Self::BTreeV1 => Some(STRUCTURE_FORMAT_VALUE_V1),
+            Self::BTreeV2 => Some(STRUCTURE_FORMAT_VALUE_V2),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +337,12 @@ pub enum NativeRuntimeError {
     /// A composite structure identity cannot fit its canonical u32 length.
     #[error("native structure identity exceeds its canonical length field")]
     StructureIdentityTooLarge,
+    /// A durable expiry cleanup request is zero or exceeds its hard bound.
+    #[error("native expiry sweep limit {requested} is outside 1..={MAX_EXPIRY_SWEEP_KEYS}")]
+    InvalidExpirySweepLimit {
+        /// Rejected caller-supplied key bound.
+        requested: usize,
+    },
     /// A search document or analyzed term cannot fit one canonical B+tree key.
     #[error("native search identity exceeds the canonical B+tree key limit")]
     SearchIdentityTooLarge,
@@ -509,6 +539,17 @@ pub struct CommitReceipt {
     pub wal_block_digest: [u8; 32],
     /// Durability promise used for acknowledgement.
     pub durability: DurabilityClass,
+}
+
+/// Result of one bounded durable scalar-expiry cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpirySweepReceipt {
+    /// Number of scalar keys tombstoned by this cleanup.
+    pub expired_keys: usize,
+    /// Whether one additional due live identity was observed.
+    pub more_due: bool,
+    /// Native commit receipt, absent when no key was due.
+    pub commit: Option<CommitReceipt>,
 }
 
 /// Receipt for one synchronized immutable root checkpoint.
@@ -992,7 +1033,7 @@ impl NativeDatabase {
             coordinator,
             conflicts: ConflictTable::default(),
             relational_format: RelationalFormat::VersionChainV2,
-            structure_format: StructureFormat::BTreeV1,
+            structure_format: StructureFormat::BTreeV2,
             search_format: SearchFormat::InvertedBTreeV1,
             next_transaction_id: 1,
             last_checkpoint_lsn: None,
@@ -1600,6 +1641,148 @@ impl NativeDatabase {
         })
     }
 
+    /// Tombstones at most `max_keys` due scalar values through one native
+    /// transaction.
+    ///
+    /// The ordered durable expiry index is visited at the supplied
+    /// deterministic logical time. An empty sweep writes no WAL record and
+    /// advances no CSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InvalidExpirySweepLimit`] outside
+    /// `1..=4096`, or a storage, corruption, transaction, or durability error.
+    pub fn expire_due_structures(
+        &mut self,
+        logical_time_micros: i64,
+        max_keys: usize,
+        durability: DurabilityClass,
+    ) -> Result<ExpirySweepReceipt, NativeRuntimeError> {
+        self.expire_due_structures_at(logical_time_micros, max_keys, durability, None)
+    }
+
+    fn expire_due_structures_at(
+        &mut self,
+        logical_time_micros: i64,
+        max_keys: usize,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<ExpirySweepReceipt, NativeRuntimeError> {
+        if !(1..=MAX_EXPIRY_SWEEP_KEYS).contains(&max_keys) {
+            return Err(NativeRuntimeError::InvalidExpirySweepLimit {
+                requested: max_keys,
+            });
+        }
+        let (due_keys, more_due) = self.due_structure_keys(logical_time_micros, max_keys)?;
+        if due_keys.is_empty() {
+            return Ok(ExpirySweepReceipt {
+                expired_keys: 0,
+                more_due: false,
+                commit: None,
+            });
+        }
+        let expired_keys = due_keys.len();
+        let mut transaction = self.begin(logical_time_micros, durability)?;
+        for key in due_keys {
+            if !transaction.delete_expired_structure(key)? {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        }
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+        Ok(ExpirySweepReceipt {
+            expired_keys,
+            more_due,
+            commit: Some(commit),
+        })
+    }
+
+    fn due_structure_keys(
+        &self,
+        logical_time_micros: i64,
+        max_keys: usize,
+    ) -> Result<(Vec<Vec<u8>>, bool), NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        if !self.structure_format.has_expiry_index() {
+            let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
+            let mut due = state
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| {
+                    entry
+                        .expires_at_micros
+                        .filter(|expiry| *expiry <= logical_time_micros)
+                        .map(|expiry| (expiry, key.clone()))
+                })
+                .collect::<Vec<_>>();
+            due.sort_unstable();
+            let more_due = due.len() > max_keys;
+            due.truncate(max_keys);
+            return Ok((due.into_iter().map(|(_, key)| key).collect(), more_due));
+        }
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+            return Ok((Vec::new(), false));
+        };
+        let tree = BTree::from_root(root);
+        let mut due = Vec::with_capacity(max_keys.saturating_add(1));
+        let mut failure = None;
+        let _outcome = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &[STRUCTURE_EXPIRY_PREFIX],
+            None,
+            |physical_key, marker| {
+                let result = (|| {
+                    let (expiry, key) = decode_structure_expiry_identity(
+                        physical_key
+                            .get(1..)
+                            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+                    )?;
+                    if expiry > logical_time_micros {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    match marker {
+                        [STRUCTURE_EXPIRY_TOMBSTONE] => Ok(ControlFlow::Continue(())),
+                        [STRUCTURE_EXPIRY_LIVE] => {
+                            let scalar = tree
+                                .get_cached_pinned(
+                                    &self.pages,
+                                    &self.buffer_pool,
+                                    &structure_key(key),
+                                )?
+                                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                            if structure_value_expiry(scalar.bytes())? != Some(expiry) {
+                                return Err(NativeRuntimeError::InvalidStructureTree);
+                            }
+                            due.push(key.to_vec());
+                            Ok(if due.len() > max_keys {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            })
+                        }
+                        _ => Err(NativeRuntimeError::InvalidStructureTree),
+                    }
+                })();
+                match result {
+                    Ok(control) => control,
+                    Err(error) => {
+                        failure = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let more_due = due.len() > max_keys;
+        due.truncate(max_keys);
+        Ok((due, more_due))
+    }
+
     fn latest_structure_entry(
         &self,
         key: &[u8],
@@ -1613,7 +1796,7 @@ impl NativeDatabase {
                 let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
                 Ok(state.entries.get(key).cloned())
             }
-            StructureFormat::BTreeV1 => BTree::from_root(root)
+            StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => BTree::from_root(root)
                 .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
                 .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
                 .transpose()
@@ -1632,7 +1815,7 @@ impl NativeDatabase {
         key: &[u8],
         field: &[u8],
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1697,7 +1880,7 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, a scalar key, a missing hash, or
     /// malformed B+tree metadata.
     pub fn hlen_latest_hash(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1759,7 +1942,7 @@ impl NativeDatabase {
         key: &[u8],
         member: &[u8],
     ) -> Result<bool, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1821,7 +2004,7 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, a scalar/hash key, a missing set,
     /// or malformed B+tree metadata.
     pub fn scard_latest_set(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1876,7 +2059,7 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, another family, a missing list, or
     /// malformed metadata.
     pub fn llen_latest_list(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1939,7 +2122,7 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -1985,7 +2168,7 @@ impl NativeDatabase {
         key: &[u8],
         member: &[u8],
     ) -> Result<Option<f64>, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -2018,7 +2201,7 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, another family, a missing sorted
     /// set, or malformed metadata.
     pub fn zcard_latest_sorted_set(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -2052,7 +2235,7 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -3001,6 +3184,11 @@ impl NativeWriteBatch {
         if !applies {
             return Ok(SetOutcome::NotApplied);
         }
+        if self.structure_format.has_expiry_index()
+            && let Some(expiry) = expires_at_micros
+        {
+            let _identity = structure_expiry_key(expiry, &key)?;
+        }
         self.state
             .structures
             .set(key.clone(), value.clone(), expires_at_micros);
@@ -3058,6 +3246,42 @@ impl NativeWriteBatch {
         Ok(true)
     }
 
+    fn delete_expired_structure(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into();
+        if self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let is_due = self
+            .state
+            .structures
+            .entries
+            .get(&key)
+            .and_then(|entry| entry.expires_at_micros)
+            .is_some_and(|expiry| expiry <= self.snapshot.logical_time_micros);
+        if !is_due {
+            return Ok(false);
+        }
+        let removed = self.state.structures.delete(&key);
+        debug_assert!(removed.is_some());
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteValue,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Replaces one visible scalar value's absolute expiry.
     ///
     /// The value bytes are retained in the WAL mutation so recovery can verify
@@ -3087,6 +3311,9 @@ impl NativeWriteBatch {
         else {
             return Ok(false);
         };
+        if self.structure_format.has_expiry_index() {
+            let _identity = structure_expiry_key(expires_at_micros, &key)?;
+        }
         self.state
             .structures
             .set(key.clone(), value.clone(), Some(expires_at_micros));
@@ -3163,7 +3390,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing scalar/hash key.
     pub fn create_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3193,7 +3420,7 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<HashSetOutcome, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3256,7 +3483,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         field: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3315,7 +3542,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3347,7 +3574,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3411,7 +3638,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3468,7 +3695,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_list(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3520,7 +3747,7 @@ impl NativeWriteBatch {
         value: Vec<u8>,
         opcode: Opcode,
     ) -> Result<usize, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         structure_list_meta_key(&key)?;
@@ -3572,7 +3799,7 @@ impl NativeWriteBatch {
         key: Vec<u8>,
         opcode: Opcode,
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         structure_list_meta_key(&key)?;
@@ -3655,7 +3882,7 @@ impl NativeWriteBatch {
     /// Returns an error for legacy storage, an oversized key, or an existing
     /// structure key.
     pub fn create_sorted_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3687,7 +3914,7 @@ impl NativeWriteBatch {
         score: f64,
         member: impl Into<Vec<u8>>,
     ) -> Result<ZAddOutcome, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -3756,7 +3983,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV1 {
+        if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -5097,6 +5324,69 @@ fn structure_key(key: &[u8]) -> Vec<u8> {
     encoded.push(STRUCTURE_ENTRY_PREFIX);
     encoded.extend_from_slice(key);
     encoded
+}
+
+fn structure_expiry_key(expires_at_micros: i64, key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if key
+        .len()
+        .checked_add(9)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let sortable = expires_at_micros.cast_unsigned() ^ (1_u64 << 63);
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(9));
+    encoded.push(STRUCTURE_EXPIRY_PREFIX);
+    encoded.extend_from_slice(&sortable.to_be_bytes());
+    encoded.extend_from_slice(key);
+    Ok(encoded)
+}
+
+fn decode_structure_expiry_identity(identity: &[u8]) -> Result<(i64, &[u8]), NativeRuntimeError> {
+    let timestamp = identity
+        .get(..8)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut sortable = [0_u8; 8];
+    sortable.copy_from_slice(timestamp);
+    let expires_at_micros = (u64::from_be_bytes(sortable) ^ (1_u64 << 63)).cast_signed();
+    Ok((expires_at_micros, &identity[8..]))
+}
+
+fn structure_value_expiry(encoded: &[u8]) -> Result<Option<i64>, NativeRuntimeError> {
+    if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        || !matches!(
+            encoded[8],
+            0 | STRUCTURE_VALUE_HAS_EXPIRY | STRUCTURE_VALUE_TOMBSTONE
+        )
+        || encoded[10..16] != [0; 6]
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if encoded[8] == STRUCTURE_VALUE_TOMBSTONE {
+        return is_structure_tombstone(encoded)
+            .then_some(None)
+            .ok_or(NativeRuntimeError::InvalidStructureTree);
+    }
+    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
+    if !matches!(
+        (encoded[9], payload.len()),
+        (STRUCTURE_VALUE_INLINE, 0..=STRUCTURE_INLINE_VALUE_LIMIT)
+            | (
+                STRUCTURE_VALUE_BLOB,
+                hyphae_native_records::BLOB_REFERENCE_SIZE
+            )
+    ) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut expiry = [0_u8; 8];
+    expiry.copy_from_slice(&encoded[16..24]);
+    let expiry = i64::from_le_bytes(expiry);
+    match encoded[8] {
+        STRUCTURE_VALUE_HAS_EXPIRY => Ok(Some(expiry)),
+        0 if expiry == 0 => Ok(None),
+        _ => Err(NativeRuntimeError::InvalidStructureTree),
+    }
 }
 
 fn structure_hash_meta_key(key: &[u8]) -> Vec<u8> {
@@ -6493,10 +6783,14 @@ fn pop_list_in_tree(
 fn structure_tree_after_mutations(
     pages: &mut PageStore,
     root: Option<PageId>,
+    format: StructureFormat,
     creating_csn: Csn,
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
+    let marker = format
+        .marker()
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
     let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
     if tree.root().is_none() {
         tree = tree
@@ -6504,7 +6798,7 @@ fn structure_tree_after_mutations(
                 pages,
                 creating_csn,
                 STRUCTURE_FORMAT_KEY.to_vec(),
-                STRUCTURE_FORMAT_VALUE_V1.to_vec(),
+                marker.to_vec(),
             )?
             .tree;
     }
@@ -6512,7 +6806,14 @@ fn structure_tree_after_mutations(
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Structure)
     {
-        tree = apply_structure_tree_mutation(pages, tree, creating_csn, mutation, blob_references)?;
+        tree = apply_structure_tree_mutation(
+            pages,
+            tree,
+            format,
+            creating_csn,
+            mutation,
+            blob_references,
+        )?;
     }
     Ok(tree)
 }
@@ -6520,6 +6821,7 @@ fn structure_tree_after_mutations(
 fn apply_structure_tree_mutation(
     pages: &mut PageStore,
     tree: BTree,
+    format: StructureFormat,
     creating_csn: Csn,
     mutation: &Mutation,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -6561,7 +6863,14 @@ fn apply_structure_tree_mutation(
             blob_references,
         ),
         Opcode::SetValue | Opcode::ExpireValue | Opcode::DeleteValue => {
-            upsert_scalar_structure_mutation(pages, tree, creating_csn, mutation, blob_references)
+            upsert_scalar_structure_mutation(
+                pages,
+                tree,
+                format.has_expiry_index(),
+                creating_csn,
+                mutation,
+                blob_references,
+            )
         }
         _ => Err(NativeRuntimeError::InvalidStructureTree),
     }
@@ -6569,7 +6878,8 @@ fn apply_structure_tree_mutation(
 
 fn upsert_scalar_structure_mutation(
     pages: &mut PageStore,
-    tree: BTree,
+    mut tree: BTree,
+    maintain_expiry_index: bool,
     creating_csn: Csn,
     mutation: &Mutation,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -6603,6 +6913,36 @@ fn upsert_scalar_structure_mutation(
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
+    if maintain_expiry_index {
+        let prior_expiry = tree
+            .get(pages, &structure_key(&mutation.key))?
+            .map(|encoded| structure_value_expiry(&encoded))
+            .transpose()?
+            .flatten();
+        let new_expiry = mutation.expires_at_micros;
+        if prior_expiry != new_expiry {
+            if let Some(expiry) = prior_expiry {
+                tree = tree
+                    .upsert(
+                        pages,
+                        creating_csn,
+                        structure_expiry_key(expiry, &mutation.key)?,
+                        vec![STRUCTURE_EXPIRY_TOMBSTONE],
+                    )?
+                    .tree;
+            }
+            if let Some(expiry) = new_expiry {
+                tree = tree
+                    .upsert(
+                        pages,
+                        creating_csn,
+                        structure_expiry_key(expiry, &mutation.key)?,
+                        vec![STRUCTURE_EXPIRY_LIVE],
+                    )?
+                    .tree;
+            }
+        }
+    }
     Ok(tree
         .upsert(pages, creating_csn, structure_key(&mutation.key), value)?
         .tree)
@@ -6624,9 +6964,10 @@ fn structure_root_after_mutations(
             None,
             state.encode()?,
         )?)),
-        StructureFormat::BTreeV1 => Ok(structure_tree_after_mutations(
+        StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => Ok(structure_tree_after_mutations(
             pages,
             root,
+            format,
             creating_csn,
             mutations,
             blob_references,
@@ -7904,7 +8245,7 @@ fn formats_for_latest_root(
     root.map_or(
         Ok((
             RelationalFormat::VersionChainV2,
-            StructureFormat::BTreeV1,
+            StructureFormat::BTreeV2,
             SearchFormat::InvertedBTreeV1,
         )),
         |root| {
@@ -7950,10 +8291,18 @@ fn load_structure_state(
     let Some((format_key, format_value)) = iterator.next() else {
         return Err(NativeRuntimeError::InvalidStructureTree);
     };
-    if format_key != STRUCTURE_FORMAT_KEY || format_value != STRUCTURE_FORMAT_VALUE_V1 {
+    if format_key != STRUCTURE_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
-    let mut decoder = StructureTreeDecoder::default();
+    let require_expiry_index = match format_value.as_slice() {
+        STRUCTURE_FORMAT_VALUE_V1 => false,
+        STRUCTURE_FORMAT_VALUE_V2 => true,
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    let mut decoder = StructureTreeDecoder {
+        require_expiry_index,
+        ..StructureTreeDecoder::default()
+    };
     for (key, value) in iterator {
         decoder.consume(&key, &value, blobs)?;
     }
@@ -7962,6 +8311,7 @@ fn load_structure_state(
 
 #[derive(Default)]
 struct StructureTreeDecoder {
+    require_expiry_index: bool,
     entries: BTreeMap<Vec<u8>, StructureEntry>,
     hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     hash_counts: BTreeMap<Vec<u8>, u64>,
@@ -7972,6 +8322,7 @@ struct StructureTreeDecoder {
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
+    expiry_index: BTreeSet<(i64, Vec<u8>)>,
 }
 
 impl StructureTreeDecoder {
@@ -8026,6 +8377,15 @@ impl StructureTreeDecoder {
             }
             Some(STRUCTURE_SORTED_SET_ORDER_PREFIX) => {
                 self.consume_sorted_set_order(&key[1..], value)?;
+            }
+            Some(STRUCTURE_EXPIRY_PREFIX) => {
+                let (expiry, scalar_key) = decode_structure_expiry_identity(&key[1..])?;
+                match value {
+                    [STRUCTURE_EXPIRY_TOMBSTONE] => {}
+                    [STRUCTURE_EXPIRY_LIVE]
+                        if self.expiry_index.insert((expiry, scalar_key.to_vec())) => {}
+                    _ => return Err(NativeRuntimeError::InvalidStructureTree),
+                }
             }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
         }
@@ -8181,11 +8541,18 @@ impl StructureTreeDecoder {
             sorted_sets,
             sorted_set_counts,
             sorted_set_order,
+            expiry_index,
+            require_expiry_index,
         } = self;
         validate_hash_counts(&hashes, hash_counts)?;
         validate_set_counts(&sets, set_counts)?;
         let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
         validate_sorted_sets(&sorted_sets, &sorted_set_counts, sorted_set_order)?;
+        if require_expiry_index {
+            validate_expiry_index(&entries, &expiry_index)?;
+        } else if !expiry_index.is_empty() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
         Ok(StructureState {
             entries,
             hashes,
@@ -8298,6 +8665,20 @@ fn validate_sorted_sets(
         }
     }
     if expected_counts.len() != sorted_sets.len() || !ordered.is_empty() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+fn validate_expiry_index(
+    entries: &BTreeMap<Vec<u8>, StructureEntry>,
+    actual: &BTreeSet<(i64, Vec<u8>)>,
+) -> Result<(), NativeRuntimeError> {
+    let expected = entries
+        .iter()
+        .filter_map(|(key, entry)| entry.expires_at_micros.map(|expiry| (expiry, key.clone())))
+        .collect::<BTreeSet<_>>();
+    if *actual != expected {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     Ok(())
@@ -8467,6 +8848,8 @@ fn structure_format_for_root(
                 .ok_or(NativeRuntimeError::InvalidStructureTree)?;
             if marker == STRUCTURE_FORMAT_VALUE_V1 {
                 Ok(StructureFormat::BTreeV1)
+            } else if marker == STRUCTURE_FORMAT_VALUE_V2 {
+                Ok(StructureFormat::BTreeV2)
             } else {
                 Err(NativeRuntimeError::InvalidStructureTree)
             }
@@ -9321,6 +9704,138 @@ mod tests {
         assert_eq!(
             reopened.ttl_latest_structure(b"max-expiry", 202)?,
             super::Ttl::RemainingMicros(i64::MAX - 202)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_expiry_index_drives_bounded_cleanup_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"a".to_vec(), b"early-a".to_vec(), Some(50))?;
+        seed.set(b"b".to_vec(), b"early-b".to_vec(), Some(50))?;
+        seed.set(b"c".to_vec(), b"later".to_vec(), Some(100))?;
+        seed.set(b"persistent".to_vec(), b"kept".to_vec(), None)?;
+        seed.commit()?;
+
+        let historical = database.snapshot(49)?;
+        let mut reschedule = database.begin(20, DurabilityClass::Strict)?;
+        assert!(reschedule.expire_structure(b"a".to_vec(), 70)?);
+        reschedule.set(b"c".to_vec(), b"persistent-now".to_vec(), None)?;
+        reschedule.commit()?;
+
+        let before_empty_sweep = database.snapshot(60)?.visible_csn();
+        let first = database.expire_due_structures(60, 1, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(!first.more_due);
+        assert!(first.commit.is_some());
+        assert_eq!(historical.get(b"b"), Some(b"early-b".as_slice()));
+        assert_eq!(database.get_latest_structure(b"b", i64::MIN)?, None);
+        assert_eq!(
+            database.get_latest_structure(b"a", 60)?,
+            Some(b"early-a".to_vec())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"a", 60)?,
+            super::Ttl::RemainingMicros(10)
+        );
+        assert_eq!(
+            database.get_latest_structure(b"c", 100)?,
+            Some(b"persistent-now".to_vec())
+        );
+
+        let empty = database.expire_due_structures(60, 1, DurabilityClass::Strict)?;
+        assert_eq!(empty.expired_keys, 0);
+        assert!(!empty.more_due);
+        assert_eq!(empty.commit, None);
+        assert_ne!(database.snapshot(60)?.visible_csn(), before_empty_sweep);
+        let after_cleanup = database.snapshot(60)?.visible_csn();
+        assert_eq!(
+            database
+                .expire_due_structures(60, 1, DurabilityClass::Strict)?
+                .commit,
+            None
+        );
+        assert_eq!(database.snapshot(60)?.visible_csn(), after_cleanup);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.get_latest_structure(b"b", i64::MIN)?, None);
+        assert_eq!(
+            reopened.get_latest_structure(b"a", 60)?,
+            Some(b"early-a".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"c", 100)?,
+            Some(b"persistent-now".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_cleanup_is_typed_bounded_and_reports_more_due()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        assert!(matches!(
+            database.expire_due_structures(10, 0, DurabilityClass::Memory),
+            Err(NativeRuntimeError::InvalidExpirySweepLimit { requested: 0 })
+        ));
+        assert!(matches!(
+            database.expire_due_structures(10, 4_097, DurabilityClass::Memory),
+            Err(NativeRuntimeError::InvalidExpirySweepLimit { requested: 4_097 })
+        ));
+
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        for key in [b"c".as_slice(), b"a".as_slice(), b"b".as_slice()] {
+            seed.set(key.to_vec(), key.to_vec(), Some(10))?;
+        }
+        seed.commit()?;
+
+        let first = database.expire_due_structures(10, 2, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 2);
+        assert!(first.more_due);
+        assert_eq!(database.get_latest_structure(b"a", i64::MIN)?, None);
+        assert_eq!(database.get_latest_structure(b"b", i64::MIN)?, None);
+        assert_eq!(
+            database.get_latest_structure(b"c", i64::MIN)?,
+            Some(b"c".to_vec())
+        );
+
+        let second = database.expire_due_structures(10, 2, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 1);
+        assert!(!second.more_due);
+        assert_eq!(database.get_latest_structure(b"c", i64::MIN)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_expiry_cleanup_conflicts_with_scalar_renewal() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"lease".to_vec(), b"owned".to_vec(), Some(10))?;
+        seed.commit()?;
+
+        let mut cleanup = database.begin_optimistic(10, DurabilityClass::Strict)?;
+        assert!(cleanup.delete_expired_structure(b"lease".to_vec())?);
+        let mut renewal = database.begin_optimistic(9, DurabilityClass::Strict)?;
+        assert!(renewal.expire_structure(b"lease".to_vec(), 100)?);
+        database.commit_optimistic(renewal)?;
+        assert!(matches!(
+            database.commit_optimistic(cleanup),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.get_latest_structure(b"lease", 10)?,
+            Some(b"owned".to_vec())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"lease", 10)?,
+            super::Ttl::RemainingMicros(90)
         );
         Ok(())
     }

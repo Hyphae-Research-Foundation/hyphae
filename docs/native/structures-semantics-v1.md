@@ -161,7 +161,7 @@ B+tree:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact one-byte format key | ASCII `HYSTRBT1` |
+| `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + arbitrary binary user key | canonical `HYSTRV01` value |
 | `0x02` | prefix + binary hash key | canonical `HYHSHM01` metadata |
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
@@ -296,8 +296,11 @@ closed.
 
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
-and continues reading and writing it without an implicit conversion. New
-directories use `HYSTRBT1`.
+and continues reading and writing it without an implicit conversion.
+`HYSTRBT1` B+tree directories remain readable and writable through a
+compatibility path that reconstructs due expiries from scalar envelopes.
+New directories use `HYSTRBT2`; only that marker requires and maintains the
+ordered expiry namespace.
 
 ## Atomicity
 
