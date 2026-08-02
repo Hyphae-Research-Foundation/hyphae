@@ -90,10 +90,11 @@ non-`i64::MAX` expiry as present. Unknown flag bits fail closed.
 Current opcodes are relational `CREATE TABLE=1`, `INSERT ROW=2`, `UPDATE
 ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE VALUE=8`, `EXPIRE VALUE=9`, `CREATE HASH=10`, `SET HASH FIELD=11`,
-`DELETE HASH FIELD=12`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`.
-`DELETE VALUE`, `CREATE HASH`, and `DELETE HASH FIELD` require an empty value
-and no expiry. `EXPIRE VALUE` requires an explicit expiry and carries the
-retained logical value.
+`DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
+MEMBER=16`; and search `CREATE INDEX=4`, `INDEX DOCUMENT=5`. `DELETE VALUE`,
+collection creation, hash-field deletion, and both set-member mutations
+require an empty value and no expiry. `EXPIRE VALUE` requires an explicit
+expiry and carries the retained logical value.
 
 Relational `CREATE TABLE` and `CREATE SECONDARY INDEX` carry one complete
 `HYCOBJ01` definition as their value and the normalized qualified-name
@@ -110,6 +111,12 @@ Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
 field bytes as their mutation key. The decoder rejects truncated identities.
 This makes first-committer-wins field-granular while keeping creation of a hash
 on the same write key as scalar creation.
+
+Set member mutations use the same compound identity with the set key followed
+by the member bytes. Conflict identities add disjoint scalar/collection,
+hash-field, and set-member domains, so arbitrary binary user keys cannot alias
+a member mutation. Set creation shares the scalar/collection ownership domain;
+different set members retain first-committer-wins independently.
 
 `COMMIT` contains:
 
@@ -223,5 +230,6 @@ receipts, checkpoint replay, and bounded recovery.
 Current tests cover the block golden, complete transaction envelope, semantic
 mutation round-trip and count/digest verification, checkpoint encoding/chain
 validation, blob-reference commits, complete corruption, incomplete physical
-tail repair, and deterministic blob/page/WAL/root/checkpoint interruptions.
-The broader list above remains gate work.
+tail repair, deterministic blob/page/WAL/root/checkpoint interruptions, and
+set creation/member mutation round-trips. The broader list above remains gate
+work.

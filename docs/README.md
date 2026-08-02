@@ -99,6 +99,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native structure B+tree evidence — 2026-08-01](gates/evidence/native-structure-btree-2026-08-01.md)
 - [Native scalar structure mutation evidence — 2026-08-01](gates/evidence/native-scalar-structure-mutations-2026-08-01.md)
 - [Native hash structure evidence — 2026-08-01](gates/evidence/native-hash-structure-2026-08-01.md)
+- [Native set structure evidence — 2026-08-01](gates/evidence/native-set-structure-2026-08-01.md)
 - [Native inverted-search evidence — 2026-08-01](gates/evidence/native-inverted-search-2026-08-01.md)
 - [Native canonical type-codec evidence — 2026-08-01](gates/evidence/native-type-codecs-2026-08-01.md)
 - [Native catalog-definition evidence — 2026-08-01](gates/evidence/native-catalog-definitions-2026-08-01.md)

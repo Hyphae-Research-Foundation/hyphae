@@ -394,6 +394,7 @@ pub(crate) enum TtlValue {
 pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
     pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
 }
 
 impl StructureState {
@@ -429,7 +430,10 @@ impl StructureState {
     }
 
     pub(crate) fn create_hash(&mut self, key: Vec<u8>) -> bool {
-        if self.entries.contains_key(&key) || self.hashes.contains_key(&key) {
+        if self.entries.contains_key(&key)
+            || self.hashes.contains_key(&key)
+            || self.sets.contains_key(&key)
+        {
             return false;
         }
         self.hashes.insert(key, BTreeMap::new());
@@ -459,6 +463,33 @@ impl StructureState {
         self.hashes.get(key).map(BTreeMap::len)
     }
 
+    pub(crate) fn create_set(&mut self, key: Vec<u8>) -> bool {
+        if self.entries.contains_key(&key)
+            || self.hashes.contains_key(&key)
+            || self.sets.contains_key(&key)
+        {
+            return false;
+        }
+        self.sets.insert(key, BTreeSet::new());
+        true
+    }
+
+    pub(crate) fn sadd(&mut self, key: &[u8], member: Vec<u8>) -> Option<bool> {
+        self.sets.get_mut(key).map(|members| members.insert(member))
+    }
+
+    pub(crate) fn sismember(&self, key: &[u8], member: &[u8]) -> Option<bool> {
+        self.sets.get(key).map(|members| members.contains(member))
+    }
+
+    pub(crate) fn srem(&mut self, key: &[u8], member: &[u8]) -> Option<bool> {
+        self.sets.get_mut(key).map(|members| members.remove(member))
+    }
+
+    pub(crate) fn scard(&self, key: &[u8]) -> Option<usize> {
+        self.sets.get(key).map(BTreeSet::len)
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
         self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
@@ -470,7 +501,7 @@ impl StructureState {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
-        if !self.hashes.is_empty() {
+        if !self.hashes.is_empty() || !self.sets.is_empty() {
             return Err(ModelError::UnsupportedLegacyStructureFamily);
         }
         let mut bytes = Vec::new();
@@ -504,6 +535,7 @@ impl StructureState {
         Ok(Self {
             entries,
             hashes: BTreeMap::new(),
+            sets: BTreeMap::new(),
         })
     }
 }

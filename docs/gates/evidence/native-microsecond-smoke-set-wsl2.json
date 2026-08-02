@@ -1,0 +1,217 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v11",
+  "measured_at": "2026-08-01T18:53:39-05:00",
+  "status": "observation-not-gate",
+  "source_state": {
+    "commit": "9a63526d04f94979dd5c93fc4110f1ccf68fbfb3",
+    "tree": "81803ed03ff2d1dba4c81a54c20b86e7becee471",
+    "branch": "codex/native-set-structure",
+    "worktree": "clean at measurement",
+    "warning": "This is one clean local observation without affinity, background-load, or hardware-counter controls."
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release",
+    "target": "x86_64-linux"
+  },
+  "environment": {
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "6.18.33.1-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285H",
+    "visible_cpus": 16,
+    "threads_per_core": 1,
+    "cores_per_socket": 16,
+    "visible_ram_bytes": 16502120448,
+    "benchmark_temp_filesystem": "tmpfs",
+    "repository_filesystem": "9p-mounted Windows E drive"
+  },
+  "method": {
+    "observations_per_operation": 1000000,
+    "operations_per_observation": 32,
+    "latency_value": "integer nanosecond average of a 32-operation batch",
+    "warmup_per_operation": 100000,
+    "search_observations": 100000,
+    "search_operations_per_observation": 1,
+    "secondary_observations": 100000,
+    "secondary_operations_per_observation": 1,
+    "scan_observations": 100000,
+    "scan_operations_per_observation": 1,
+    "scan_limit": 10,
+    "range_lower_row_inclusive": 1024,
+    "range_upper_row_exclusive": 1034,
+    "concurrency": 1,
+    "durability": "memory",
+    "warm_state": true,
+    "proofs": false,
+    "buffer_pool_frames": 1024,
+    "buffer_pool_partitions": 16,
+    "primary_relational_rows": 2049,
+    "secondary_index_rows": 2048,
+    "relational_rows": 4097,
+    "relational_tree_height": 2,
+    "structure_keys": 2048,
+    "hash_fields": 2048,
+    "set_members": 2048,
+    "structure_tree_height": 2,
+    "structure_value_bytes": 64,
+    "hash_field_value_bytes": 64,
+    "set_member_value_bytes": 0,
+    "search_documents": 2048,
+    "search_tree_height": 2,
+    "search_query_document_frequency": 1,
+    "dataset_digest_blake3": "234b0da22107fcdd0ed1e31c2345421b7a783f67994509033628399a07272c29",
+    "affinity_controlled": false,
+    "priority_controlled": false,
+    "background_services_controlled": false,
+    "hardware_counters": false,
+    "allocation_counter": false,
+    "transport_note": "Frame codec plus embedded dispatch only; no UDS or Windows named-pipe transport was measured.",
+    "set_path_note": "Physical SISMEMBER validates HYSETM01 metadata through one pinned B+tree lookup, traverses the independent member identity through a second lookup, and validates the exact empty persistent HYSTRV01 member envelope.",
+    "timed_mutations": false
+  },
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.047,
+      "p95_us": 0.049,
+      "p99_us": 0.057,
+      "p99_9_us": 0.367,
+      "throughput_ops_s": 19795443
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 0.767,
+      "p95_us": 0.843,
+      "p99_us": 1.312,
+      "p99_9_us": 4.516,
+      "throughput_ops_s": 1254031
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.107,
+      "p95_us": 0.110,
+      "p99_us": 0.125,
+      "p99_9_us": 0.657,
+      "throughput_ops_s": 9010756
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 1.353,
+      "p95_us": 1.650,
+      "p99_us": 2.328,
+      "p99_9_us": 7.459,
+      "throughput_ops_s": 713945
+    },
+    "embedded_set_sismember_materialized_scaled_snapshot": {
+      "p50_us": 0.100,
+      "p95_us": 0.104,
+      "p99_us": 0.182,
+      "p99_9_us": 0.711,
+      "throughput_ops_s": 9623907
+    },
+    "buffered_set_sismember_multilevel": {
+      "p50_us": 1.635,
+      "p95_us": 2.003,
+      "p99_us": 3.623,
+      "p99_9_us": 7.235,
+      "throughput_ops_s": 583618
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 18.934,
+      "p95_us": 22.156,
+      "p99_us": 42.770,
+      "p99_9_us": 138.873,
+      "throughput_ops_s": 49936
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.038,
+      "p95_us": 0.040,
+      "p99_us": 0.077,
+      "p99_9_us": 0.292,
+      "throughput_ops_s": 24358650
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.152,
+      "p95_us": 1.419,
+      "p99_us": 2.619,
+      "p99_9_us": 5.363,
+      "throughput_ops_s": 837567
+    },
+    "buffered_relational_btree_pk_scan_limit10_multilevel": {
+      "p50_us": 11.819,
+      "p95_us": 13.889,
+      "p99_us": 27.236,
+      "p99_9_us": 95.872,
+      "throughput_ops_s": 79562
+    },
+    "physical_prepared_sql_pk_scan_limit10_multilevel": {
+      "p50_us": 13.216,
+      "p95_us": 15.208,
+      "p99_us": 28.064,
+      "p99_9_us": 94.482,
+      "throughput_ops_s": 72394
+    },
+    "buffered_relational_btree_pk_range_limit10_multilevel": {
+      "p50_us": 12.238,
+      "p95_us": 13.875,
+      "p99_us": 25.790,
+      "p99_9_us": 111.048,
+      "throughput_ops_s": 77373
+    },
+    "physical_prepared_sql_pk_range_limit10_multilevel": {
+      "p50_us": 15.077,
+      "p95_us": 18.352,
+      "p99_us": 36.683,
+      "p99_9_us": 115.886,
+      "throughput_ops_s": 62410
+    },
+    "physical_prepared_sql_pk_range_residual_boolean_limit10_multilevel": {
+      "p50_us": 19.790,
+      "p95_us": 23.958,
+      "p99_us": 45.866,
+      "p99_9_us": 134.450,
+      "throughput_ops_s": 47797
+    },
+    "buffered_relational_btree_secondary_exact_unique_multilevel": {
+      "p50_us": 8.861,
+      "p95_us": 10.769,
+      "p99_us": 21.128,
+      "p99_9_us": 105.008,
+      "throughput_ops_s": 104445
+    },
+    "physical_prepared_sql_secondary_exact_unique_multilevel": {
+      "p50_us": 9.222,
+      "p95_us": 11.071,
+      "p99_us": 21.664,
+      "p99_9_us": 72.180,
+      "throughput_ops_s": 102404
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.082,
+      "p95_us": 0.088,
+      "p99_us": 0.118,
+      "p99_9_us": 0.643,
+      "throughput_ops_s": 11761377
+    }
+  },
+  "comparison": {
+    "direct_set_physical_baseline_available": false,
+    "reason": "Schema v11 introduces the first 2,048-member physical set corpus and direct SISMEMBER operation. V10 has no set operation and a different dataset digest.",
+    "hash_sanity_receipt": "native-microsecond-smoke-hash-wsl2.json",
+    "sanity_note": "Scalar, hash, search, and SQL routes remain diagnostic only; cross-schema timing deltas are not treated as a controlled regression result."
+  },
+  "interpretation": {
+    "sub_microsecond_batch_average_materialized_set_p50_observed": true,
+    "microsecond_physical_set_hot_path_observed": true,
+    "phase_1_performance_gate_passed": false,
+    "reasons_not_a_gate": [
+      "batch-averaged timer observations hide individual-operation tails",
+      "single concurrency only",
+      "2,048-member corpus and tree height two only",
+      "no SADD, SREM, WAL, or fsync latency measurement",
+      "no set iteration, whole-set delete, member TTL, or remaining collection families",
+      "no UDS or named-pipe transport",
+      "no saturation or background interference",
+      "no allocation, CPU-cycle, cache-miss, page-fault, RSS, or I/O counters",
+      "virtualized WSL2 environment"
+    ]
+  }
+}

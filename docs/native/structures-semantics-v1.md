@@ -2,10 +2,10 @@
 
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
-hashes, multilevel B+tree persistence, direct buffered reads, and large
-immutable blobs are implemented in the convergence slice; version-bearing
-responses, the expiry scheduler, and the remaining structure families remain
-pending
+hashes, the first native set slice, multilevel B+tree persistence, direct
+buffered reads, and large immutable blobs are implemented in the convergence
+slice; version-bearing responses, the expiry scheduler, and the remaining
+structure families remain pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -41,8 +41,9 @@ cannot change structure kind without delete/recreate or an explicit checked
 conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
-counters, and explicitly created binary hash/maps. Lists, sets, sorted sets,
-streams, bitmaps, sketches, geo indexes, and typed registers remain targets.
+counters, explicitly created binary hash/maps, and explicitly created binary
+sets. Lists, sorted sets, streams, bitmaps, sketches, geo indexes, and typed
+registers remain targets.
 
 ## First vertical operations
 
@@ -58,6 +59,11 @@ HSET(key, field, value)
 HGET(key, field)
 HDELETE(key, field)
 HLEN(key)
+CREATE_SET(key)
+SADD(key, member)
+SISMEMBER(key, member)
+SREM(key, member)
+SCARD(key)
 ```
 
 `SET` conditions are unconditional, if-absent, if-present, or
@@ -92,6 +98,17 @@ creation and hash creation over the same absent key conflict. Once the hash
 exists, different field identities can prepare and commit independently;
 same-field writers retain first-committer-wins semantics.
 
+`CREATE_SET` establishes a binary set before member mutation. `SADD` returns
+true only when it adds a missing member, `SISMEMBER` reports exact membership,
+`SREM` returns true only when it removes a live member, and `SCARD` reads the
+durable exact cardinality. An empty set remains typed after its last member is
+removed; whole-set deletion and per-member TTL are outside this slice.
+
+Scalar, hash, and set kinds are mutually exclusive for one user key.
+Concurrent creation of different kinds over the same absent key conflicts.
+Once a set exists, different member identities can prepare and commit
+independently; same-member writers retain first-committer-wins semantics.
+
 ## First physical namespace
 
 New data directories store the structure partition in the native copy-on-write
@@ -103,6 +120,8 @@ B+tree:
 | `0x01` | prefix + arbitrary binary user key | canonical `HYSTRV01` value |
 | `0x02` | prefix + binary hash key | canonical `HYHSHM01` metadata |
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
+| `0x04` | prefix + binary set key | canonical `HYSETM01` metadata |
+| `0x05` | prefix + set-member identity | canonical empty persistent `HYSTRV01` value |
 
 The exact value envelope is:
 
@@ -150,6 +169,19 @@ metadata and requires metadata cardinality to equal the exact number of live
 field envelopes. Orphan fields, malformed identities, expiry-bearing fields,
 and count mismatches fail closed.
 
+The exact set metadata is 16 bytes: ASCII magic `HYSETM01` followed by the
+unsigned little-endian live member count. A set-member identity uses the same
+unambiguous compound form as a hash field: `u32` big-endian set-key length,
+the set-key bytes, and the remaining member bytes. The physical key prepends
+`0x05`.
+
+A live member is represented only by the canonical persistent inline
+`HYSTRV01` envelope with an empty payload. `SREM` stores the canonical
+structure tombstone. Recovery requires every member to have prior set
+metadata and requires metadata cardinality to equal the exact number of live
+member envelopes. Orphan members, malformed identities, non-empty live
+payloads, expiry-bearing members, and count mismatches fail closed.
+
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
 and continues reading and writing it without an implicit conversion. New
@@ -171,6 +203,12 @@ different fields rebase onto the admitted current root without losing the
 metadata count, while same-field updates conflict. Physical `HSET`/`HDELETE`
 rewrite the field path and the 16-byte metadata path; they never serialize the
 complete hash as one value.
+
+Set member write keys use the canonical set-member identity. Therefore
+different members rebase onto the admitted current root without losing the
+metadata count, while same-member changes conflict. Physical `SADD`/`SREM`
+rewrite the member path and the 16-byte metadata path; they never serialize
+the complete set as one value.
 
 ## TTL and expiry
 
@@ -215,5 +253,7 @@ writers, signed counter bounds, strict reopen, canonical-envelope corruption,
 legacy whole-page compatibility, optimistic disjoint-key rebase, all commit
 crash boundaries with scalar and hash mutations, typed scalar/hash creation
 races, disjoint-field rebase, same-field conflict, hash count corruption,
-field tombstones, and one blob deduplicated across relational, scalar, and hash
-field values. They do not close the structure gate.
+field tombstones, typed scalar/hash/set creation races, disjoint-member
+rebase, same-member conflict, set count corruption, member tombstones, and
+one blob deduplicated across relational, scalar, and hash field values. They
+do not close the structure gate.
