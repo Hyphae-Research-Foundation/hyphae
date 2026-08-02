@@ -3,8 +3,9 @@
 Status: normative target contract; immutable relation/secondary-index/
 structure/search definitions, catalogued vector metric/HNSW configuration,
 their canonical `HYCOBJ01` codec, and full-definition `HYCAT002` runtime
-persistence are implemented experimentally. Scalable catalog pages, DDL
-evolution, constraints, and dependency tracking remain pending.
+persistence are implemented experimentally. The scalable `HYCAT003` B+tree
+format below is specified but not yet implemented. DDL evolution, constraints,
+and dependency tracking remain pending.
 
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
@@ -113,8 +114,64 @@ shapes fail closed instead of inventing a definition.
 
 `HYCAT002` is still stored in one 16 KiB catalog-root page. This is sufficient
 to establish definition authority and recovery compatibility, but it is not a
-scalable final catalog. A copy-on-write catalog B+tree, separate name
-namespace, definition blobs, and per-object history remain required.
+scalable final catalog.
+
+## Scalable B+tree persistence
+
+New catalog writes use one native copy-on-write B+tree rooted directly in the
+catalog root slot. Generic `HYBTLF01`/`HYBTIN01` pages provide traversal,
+checksums, visibility and split behavior. The catalog defines these ordered
+entries:
+
+| Key | Value |
+|---|---|
+| `00` | ASCII `HYCAT003` |
+| `01 \|\| object_id_be` | one `HYCVAL01` definition envelope |
+| `02 \|\| qualified_lookup` | the same 16-byte big-endian `ObjectId` |
+
+`object_id_be` is the complete nonzero 128-bit stable ID. `qualified_lookup`
+contains database, schema and object lookup bytes in that order. Each
+component is framed by a little-endian `u32` byte length and retains the name
+limits from `HYCOBJ01`. Including the namespace byte, its maximum canonical
+key size is 3,085 bytes and therefore remains below the native B+tree's
+4,096-byte key limit.
+
+`HYCVAL01` is:
+
+| Field | Encoding |
+|---|---|
+| magic | ASCII `HYCVAL01` |
+| storage | `0` inline, `1` immutable blob |
+| reserved | seven zero bytes |
+| payload | complete `HYCOBJ01` bytes or one canonical blob reference |
+
+An inline definition is at most 8,192 bytes. A blob reference is canonical
+only when its logical length is greater than 8,192 bytes. The referenced blob
+must exist, match its encoded digest and length, and decode as exactly one
+canonical `HYCOBJ01` definition.
+
+The format marker is mandatory and sorts first. Every live object has exactly
+one ID entry and one normalized-name entry. The ID inside the decoded
+definition must equal the ID key. Its normalized qualified name must reproduce
+the name key, and the name entry must point back to the same ID. Duplicate,
+missing, extra, unknown-prefix, wrong-length, noncanonical-envelope, dangling
+blob and cross-linked entries fail closed. Secondary-index relation and column
+references are revalidated after reconstruction.
+
+One catalog mutation publishes its object and name entries under the same
+catalog root, WAL commit and global CSN. Definition blobs are staged and
+synchronized before page publication under strict or group durability. A
+failed or interrupted mutation cannot expose only one namespace entry.
+
+Legacy `HYCAT001` and `HYCAT002` catalog-root pages remain readable. The next
+catalog mutation materializes their validated live definitions into
+`HYCAT003`; the legacy root remains immutable for retained snapshots. Once a
+root is `HYCAT003`, later create operations copy only affected B+tree paths.
+Page-generation vacuum rebuilds the complete reachable catalog tree without
+rewriting immutable definition blobs.
+
+`HYCAT003` removes the single-page object-count limit. It does not add drop
+history, dependency edges, background blob reclamation or schema evolution.
 
 ## Required definitions
 
@@ -180,3 +237,12 @@ type, length, and trailing-byte failures; `HYCAT001` reconstruction and
 the existing all-engine crash and recovery matrices. Non-reuse,
 drops/evolution, dependency enforcement, and prepared-plan invalidation beyond
 catalog-version mismatch remain target requirements.
+
+`HYCAT003` acceptance additionally requires golden marker, key and envelope
+bytes; an object count that exceeds one page; multilevel ID and name lookup;
+large-definition blob recovery; V1/V2 migration; retained legacy snapshots;
+missing/cross-linked/corrupt entry rejection; copy-on-write page-identity
+evidence; every normal commit interruption boundary; page-generation vacuum;
+reopen equivalence; and an exact source-bound latency and page-amplification
+receipt. These requirements remain red until the implementation and evidence
+land.
