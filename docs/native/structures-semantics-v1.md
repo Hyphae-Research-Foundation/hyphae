@@ -4,8 +4,9 @@ Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, the first native set slice, multilevel B+tree persistence, direct
 buffered reads, and large immutable blobs are implemented in the convergence
-slice; version-bearing responses, the expiry scheduler, and the remaining
-structure families remain pending
+slice; the chunked-deque list contract is admitted for implementation;
+version-bearing responses, the expiry scheduler, and the remaining structure
+families remain pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -64,6 +65,13 @@ SADD(key, member)
 SISMEMBER(key, member)
 SREM(key, member)
 SCARD(key)
+CREATE_LIST(key)
+LPUSH(key, value)
+RPUSH(key, value)
+LPOP(key)
+RPOP(key)
+LLEN(key)
+LRANGE(key, start, stop)
 ```
 
 `SET` conditions are unconditional, if-absent, if-present, or
@@ -109,6 +117,20 @@ Concurrent creation of different kinds over the same absent key conflicts.
 Once a set exists, different member identities can prepare and commit
 independently; same-member writers retain first-committer-wins semantics.
 
+`CREATE_LIST` establishes a binary chunked deque before element mutation.
+`LPUSH` and `RPUSH` insert one exact binary value and return the new length.
+`LPOP` and `RPOP` return and remove one end value, or return absence without a
+mutation when the typed list is empty. `LLEN` returns the exact durable
+length. `LRANGE` uses signed zero-based indexes and an inclusive stop:
+negative indexes count back from the tail, bounds clamp to the list, and an
+empty or inverted normalized interval returns an empty result.
+
+An empty list remains typed. Scalar, hash, set, and list kinds are mutually
+exclusive for one user key. Every list mutation conflicts on the complete
+list identity in this version; concurrent end operations do not silently
+commute. Whole-list deletion, list TTL, blocking pop, insertion by index,
+trimming, moving between lists, and element mutation remain pending.
+
 ## First physical namespace
 
 New data directories store the structure partition in the native copy-on-write
@@ -122,6 +144,8 @@ B+tree:
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
 | `0x04` | prefix + binary set key | canonical `HYSETM01` metadata |
 | `0x05` | prefix + set-member identity | canonical empty persistent `HYSTRV01` value |
+| `0x06` | prefix + binary list key | canonical `HYLSTM01` metadata |
+| `0x07` | prefix + list-key identity + ordered chunk ID | canonical `HYLSTC01` chunk or structure tombstone |
 
 The exact value envelope is:
 
@@ -182,6 +206,44 @@ metadata and requires metadata cardinality to equal the exact number of live
 member envelopes. Orphan members, malformed identities, non-empty live
 payloads, expiry-bearing members, and count mismatches fail closed.
 
+List metadata is exactly 32 bytes:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYLSTM01` |
+| 8 | 8 | unsigned little-endian live element count |
+| 16 | 8 | signed little-endian head chunk ID |
+| 24 | 8 | signed little-endian tail chunk ID |
+
+An empty list requires count zero and both chunk IDs zero. A non-empty list
+requires head less than or equal to tail and one live chunk at every ID in the
+inclusive interval. Chunk IDs start at zero, decrease for new head chunks and
+increase for new tail chunks. Exhausting either signed 64-bit direction fails
+before mutation.
+
+A list-chunk key is `0x07`, `u32` big-endian list-key length, list-key bytes,
+then the signed chunk ID with its sign bit flipped and encoded big-endian.
+This preserves list grouping and signed numeric chunk order.
+
+A live chunk uses:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYLSTC01` |
+| 8 | 2 | unsigned little-endian element count |
+| 10 | 6 | reserved zero |
+| 16 | variable | repeated `u32` little-endian envelope length plus envelope |
+
+Each chunk contains 1 through 64 elements and is at most 10,000 encoded bytes.
+Each element is one persistent, non-tombstone `HYSTRV01` envelope, so values
+above the scalar inline threshold use the same immutable blob store. A push
+rewrites an end chunk while both count and byte limits admit the value;
+otherwise it creates one adjacent chunk. A pop rewrites a non-empty end chunk
+or tombstones it and advances the corresponding metadata boundary. The last
+pop restores canonical empty metadata. Empty live chunks, gaps, extra live
+chunks, expiry-bearing elements, malformed envelopes, blob mismatches, length
+mismatches, or metadata/count disagreement fail closed.
+
 Earlier convergence directories used one `StructureNode` page containing the
 `HYSTRT01` whole-state codec. Open detects that format from the root page kind
 and continues reading and writing it without an implicit conversion. New
@@ -209,6 +271,11 @@ different members rebase onto the admitted current root without losing the
 metadata count, while same-member changes conflict. Physical `SADD`/`SREM`
 rewrite the member path and the 16-byte metadata path; they never serialize
 the complete set as one value.
+
+List creation and every push/pop share one whole-list conflict identity.
+Physical mutations rewrite metadata plus at most one end chunk. A pop mutation
+carries the exact removed value so optimistic replay and physical publication
+can reject a changed end rather than removing a different element.
 
 ## TTL and expiry
 
