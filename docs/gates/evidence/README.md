@@ -510,3 +510,14 @@ detectable.
 - `native-process-crash-matrix-v2-linux.json` preserves the prior seven
   singleton results and records four checkpoint authority outcomes. It
   remains process-crash evidence, not physical power-loss evidence.
+
+## Native block-layer power-loss replay on Linux
+
+- `native-block-power-loss-replay-linux-2026-08-02.md` binds seven singleton
+  commit and four checkpoint interruption marks to an exact source tree,
+  Linux `dm-log-writes` target, pinned replay utility, and fresh ext4 images.
+- `native-block-power-loss-replay-linux.json` is the raw stable-media replay
+  receipt. It proves the worst recorded state through completed flush/FUA
+  barriers, normal ext4 journal recovery, native reopen, and exact cleanup.
+  Its status is deliberately `block-replay-not-physical-device-cut`; literal
+  EC2/EBS power removal and device-firmware behavior remain outside the claim.
