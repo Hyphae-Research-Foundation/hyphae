@@ -10618,11 +10618,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn right_unique_secondary_inner_join_matches_snapshot_latest_and_reopen()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TestDirectory::new();
-        let mut database = NativeDatabase::create(temporary.path())?;
+    fn seed_right_secondary_join(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
         seed.execute_sql(
             "CREATE TABLE accounts (
@@ -10643,39 +10641,143 @@ mod tests {
             "INSERT INTO accounts (id, plan_code) VALUES (1, 'pro')",
             &[],
         )?;
+        seed.execute_sql("INSERT INTO accounts (id, plan_code) VALUES (2, NULL)", &[])?;
+        seed.execute_sql(
+            "INSERT INTO accounts (id, plan_code) VALUES (3, 'missing')",
+            &[],
+        )?;
         seed.execute_sql(
             "INSERT INTO plans (id, code, label) VALUES (100, 'pro', 'Pro')",
             &[],
         )?;
         seed.execute_sql("CREATE UNIQUE INDEX plans_code ON plans (code)", &[])?;
+        seed.execute_sql("CREATE INDEX plans_label ON plans (label)", &[])?;
         seed.commit()?;
-        let query = "SELECT accounts.id, plans.label
-                     FROM accounts
-                     INNER JOIN plans ON accounts.plan_code = plans.code
-                     WHERE id = ?";
-        let parameters = [SqlValue::Signed(1)];
-        let expected = SqlResult::Rows {
+        Ok(())
+    }
+
+    fn right_secondary_join_query() -> &'static str {
+        "SELECT accounts.id, plans.label
+         FROM accounts
+         INNER JOIN plans ON accounts.plan_code = plans.code
+         WHERE id = ?"
+    }
+
+    fn expected_account_plan(id: i64, label: &str) -> SqlResult {
+        SqlResult::Rows {
             columns: vec!["accounts.id".to_owned(), "plans.label".to_owned()],
-            rows: vec![vec![SqlValue::Signed(1), SqlValue::Text("Pro".to_owned())]],
-        };
+            rows: vec![vec![SqlValue::Signed(id), SqlValue::Text(label.to_owned())]],
+        }
+    }
+
+    #[test]
+    fn right_unique_secondary_inner_join_matches_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_right_secondary_join(&mut database)?;
+        let parameters = [SqlValue::Signed(1)];
+        let expected = expected_account_plan(1, "Pro");
         let snapshot = database.snapshot(11)?;
-        let snapshot_plan = snapshot.prepare_sql(query)?;
+        let snapshot_plan = snapshot.prepare_sql(right_secondary_join_query())?;
         assert_eq!(
             snapshot.execute_prepared(&snapshot_plan, &parameters)?,
             expected
         );
-        let latest_plan = database.prepare_sql_latest(query)?;
+        let latest_plan = database.prepare_sql_latest(right_secondary_join_query())?;
         assert_eq!(
             database.execute_prepared_latest(&latest_plan, &parameters)?,
             expected
         );
+        for id in [2, 3, 404] {
+            assert_eq!(
+                database.execute_prepared_latest(&latest_plan, &[SqlValue::Signed(id)])?,
+                SqlResult::Rows {
+                    columns: vec!["accounts.id".to_owned(), "plans.label".to_owned()],
+                    rows: Vec::new(),
+                }
+            );
+        }
         drop(database);
 
         let reopened = NativeDatabase::open(temporary.path())?;
-        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        let reopened_plan = reopened.prepare_sql_latest(right_secondary_join_query())?;
         assert_eq!(
             reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
             expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn right_unique_secondary_inner_join_reads_private_index_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_right_secondary_join(&mut database)?;
+        let historical = database.snapshot(11)?;
+        let historical_plan = historical.prepare_sql(right_secondary_join_query())?;
+        let mut transaction = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans ON accounts.plan_code = plans.code
+                 WHERE id = ?",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=primary-key,right_table=2,right_access=unique-secondary(index=3))"
+                        .to_owned(),
+                )]],
+            }
+        );
+        transaction.execute_sql(
+            "UPDATE plans SET code = 'plus', label = 'Plus' WHERE id = 100",
+            &[],
+        )?;
+        transaction.execute_sql("UPDATE accounts SET plan_code = 'plus' WHERE id = 1", &[])?;
+        transaction.execute_sql(
+            "INSERT INTO plans (id, code, label)
+             VALUES (200, 'enterprise', 'Enterprise')",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO accounts (id, plan_code) VALUES (4, 'enterprise')",
+            &[],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(right_secondary_join_query(), &[SqlValue::Signed(1)])?,
+            expected_account_plan(1, "Plus")
+        );
+        assert_eq!(
+            transaction.execute_sql(right_secondary_join_query(), &[SqlValue::Signed(4)])?,
+            expected_account_plan(4, "Enterprise")
+        );
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT accounts.id, plans.label
+                 FROM accounts
+                 INNER JOIN plans ON accounts.plan_code = plans.label
+                 WHERE id = ?",
+                &[SqlValue::Signed(1)],
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        transaction.commit()?;
+        assert_eq!(
+            historical.execute_prepared(&historical_plan, &[SqlValue::Signed(1)])?,
+            expected_account_plan(1, "Pro")
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(right_secondary_join_query())?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &[SqlValue::Signed(1)])?,
+            expected_account_plan(1, "Plus")
         );
         Ok(())
     }
