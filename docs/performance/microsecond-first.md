@@ -184,6 +184,17 @@ comparison. This is not a G7 pass or a regression threshold: EC2 is
 virtualized, state is warm, durability is memory, concurrency is one,
 and the timed paths do not fsync.
 
+The lineage-bearing source tree later merged by PR 53 has a same-host
+schema-v15 [repeat](../gates/evidence/native-microsecond-smoke-lineage-ext4-linux.json).
+Its local-frame decode plus embedded dispatch observed p50/p99
+`0.104/0.121 us`; buffered relational primary-key lookup observed
+`1.986/3.808 us`; BM25 `MATCH` top 1 observed `29.034/53.672 us`; and the
+ordered secondary range observed `42.989/83.120 us`. All 20 hot or indexed
+routes remained below one millisecond through p99.9. This is a direct-Linux
+observation, not a regression threshold or G7 pass: it is still virtualized,
+warm, memory-durability, concurrency one, and excludes physical transport,
+strict synchronization, power loss, and the controlled performance matrix.
+
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50
 latencies of approximately 22.9 ms exact, 83.4 ms lexical, and 113.9 ms hybrid

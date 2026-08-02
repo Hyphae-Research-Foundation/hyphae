@@ -443,6 +443,16 @@ neither power-loss nor physical-durability evidence. It closes no gate;
 its numbers are a new devbox baseline that is not run-to-run comparable
 with the WSL2 or Windows receipts.
 
+The [native lineage ext4 latency
+evidence](evidence/native-lineage-ext4-latency-2026-08-02.md) repeats the
+schema-v15 embedded/local-frame smoke directly on that Linux host for the
+exact lineage-bearing source tree merged by PR 53. All 20 hot or indexed
+routes remain below one millisecond through p99.9, and the local-frame route
+observes p50/p99 `0.104/0.121 us`. This satisfies the first latency
+observation for that source tree but does not time the one-CSN commit, strict
+durability, UDS/named-pipe transport, or power loss and closes neither G1 nor
+G7.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit

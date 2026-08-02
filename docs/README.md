@@ -131,6 +131,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native manifest-retention evidence — 2026-08-02](gates/evidence/native-manifest-retention-2026-08-02.md)
 - [Native immutable-blob collection evidence — 2026-08-02](gates/evidence/native-blob-collection-2026-08-02.md)
 - [Native lineage-threading Linux evidence — 2026-08-02](gates/evidence/native-lineage-threading-linux-2026-08-02.md)
+- [Native lineage ext4 latency evidence — 2026-08-02](gates/evidence/native-lineage-ext4-latency-2026-08-02.md)
 - [Native typed SQL-row evidence — 2026-08-01](gates/evidence/native-typed-sql-rows-2026-08-01.md)
 - [Native secondary-index evidence — 2026-08-01](gates/evidence/native-secondary-indexes-2026-08-01.md)
 - [Native direct secondary-index execution evidence — 2026-08-01](gates/evidence/native-direct-secondary-index-2026-08-01.md)

@@ -479,3 +479,14 @@ detectable.
   release observation. Its numbers are a new devbox baseline, not
   run-to-run comparable with the WSL2 or Windows receipts, and it remains
   outside G7.
+
+## Native lineage ext4 latency
+
+- `native-lineage-ext4-latency-2026-08-02.md` binds a direct-Linux schema-v15
+  repeat to the exact lineage-bearing source tree later merged by PR 53. It
+  records all 21 routes and a bounded same-host comparison without inventing
+  a regression threshold.
+- `native-microsecond-smoke-lineage-ext4-linux.json` is the raw clean receipt.
+  It is warm, memory-durability, concurrency-one embedded/local-frame
+  evidence; it is not strict-durability, transport, power-loss, G1, or G7
+  closure.
