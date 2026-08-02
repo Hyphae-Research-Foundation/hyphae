@@ -465,6 +465,13 @@ pub(crate) enum ListPop {
     Value(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SortedSetMemberState {
+    MissingSet,
+    MissingMember,
+    Present(SortedSetScore),
+}
+
 impl StructureState {
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
@@ -638,22 +645,34 @@ impl StructureState {
         key: &[u8],
         member: Vec<u8>,
         score: SortedSetScore,
-    ) -> Option<Option<SortedSetScore>> {
-        self.sorted_sets
-            .get_mut(key)
-            .map(|members| members.insert(member, score))
+    ) -> SortedSetMemberState {
+        let Some(members) = self.sorted_sets.get_mut(key) else {
+            return SortedSetMemberState::MissingSet;
+        };
+        members.insert(member, score).map_or(
+            SortedSetMemberState::MissingMember,
+            SortedSetMemberState::Present,
+        )
     }
 
-    pub(crate) fn zscore(&self, key: &[u8], member: &[u8]) -> Option<Option<SortedSetScore>> {
-        self.sorted_sets
-            .get(key)
-            .map(|members| members.get(member).copied())
+    pub(crate) fn zscore(&self, key: &[u8], member: &[u8]) -> SortedSetMemberState {
+        let Some(members) = self.sorted_sets.get(key) else {
+            return SortedSetMemberState::MissingSet;
+        };
+        members.get(member).copied().map_or(
+            SortedSetMemberState::MissingMember,
+            SortedSetMemberState::Present,
+        )
     }
 
-    pub(crate) fn zrem(&mut self, key: &[u8], member: &[u8]) -> Option<Option<SortedSetScore>> {
-        self.sorted_sets
-            .get_mut(key)
-            .map(|members| members.remove(member))
+    pub(crate) fn zrem(&mut self, key: &[u8], member: &[u8]) -> SortedSetMemberState {
+        let Some(members) = self.sorted_sets.get_mut(key) else {
+            return SortedSetMemberState::MissingSet;
+        };
+        members.remove(member).map_or(
+            SortedSetMemberState::MissingMember,
+            SortedSetMemberState::Present,
+        )
     }
 
     pub(crate) fn zcard(&self, key: &[u8]) -> Option<usize> {

@@ -56,9 +56,9 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        CatalogState, ListPop, ModelError, RelationState, SearchState, SortedSetScore,
-        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
-        normalize_list_range,
+        CatalogState, ListPop, ModelError, RelationState, SearchState, SortedSetMemberState,
+        SortedSetScore, StructureEntry, StructureState, TtlValue, analyze, bm25_idf,
+        bm25_term_score, normalize_list_range,
     },
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_checkpoint,
@@ -778,11 +778,11 @@ impl NativeSnapshot {
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
-        self.state
-            .structures
-            .zscore(key, member)
-            .map(|score| score.map(SortedSetScore::value))
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        match self.state.structures.zscore(key, member) {
+            SortedSetMemberState::MissingSet => Err(NativeRuntimeError::UnknownStructureSortedSet),
+            SortedSetMemberState::MissingMember => Ok(None),
+            SortedSetMemberState::Present(score) => Ok(Some(score.value())),
+        }
     }
 
     /// Returns one native sorted set's exact member count.
@@ -3702,15 +3702,16 @@ impl NativeWriteBatch {
         let score = canonical_sorted_set_score(score)?;
         let identity = sorted_set_member_identity(&key, &member)?;
         structure_sorted_set_order_key(&key, score, &member)?;
-        let previous = self
-            .state
-            .structures
-            .zadd(&key, member, score)
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
+        let previous = self.state.structures.zadd(&key, member, score);
         let outcome = match previous {
-            None => ZAddOutcome::Added,
-            Some(previous) if previous == score => return Ok(ZAddOutcome::Unchanged),
-            Some(_) => ZAddOutcome::Updated,
+            SortedSetMemberState::MissingSet => {
+                return Err(NativeRuntimeError::UnknownStructureSortedSet);
+            }
+            SortedSetMemberState::MissingMember => ZAddOutcome::Added,
+            SortedSetMemberState::Present(previous) if previous == score => {
+                return Ok(ZAddOutcome::Unchanged);
+            }
+            SortedSetMemberState::Present(_) => ZAddOutcome::Updated,
         };
         self.mutations.push(Mutation {
             engine: EngineKind::Structure,
@@ -3737,11 +3738,11 @@ impl NativeWriteBatch {
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
-        self.state
-            .structures
-            .zscore(key, member)
-            .map(|score| score.map(SortedSetScore::value))
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        match self.state.structures.zscore(key, member) {
+            SortedSetMemberState::MissingSet => Err(NativeRuntimeError::UnknownStructureSortedSet),
+            SortedSetMemberState::MissingMember => Ok(None),
+            SortedSetMemberState::Present(score) => Ok(Some(score.value())),
+        }
     }
 
     /// Removes one exact binary member without deleting the typed sorted set.
@@ -3768,13 +3769,12 @@ impl NativeWriteBatch {
         }
         let member = member.into();
         let identity = sorted_set_member_identity(&key, &member)?;
-        let removed = self
-            .state
-            .structures
-            .zrem(&key, &member)
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
-        if removed.is_none() {
-            return Ok(false);
+        match self.state.structures.zrem(&key, &member) {
+            SortedSetMemberState::MissingSet => {
+                return Err(NativeRuntimeError::UnknownStructureSortedSet);
+            }
+            SortedSetMemberState::MissingMember => return Ok(false),
+            SortedSetMemberState::Present(_) => {}
         }
         self.mutations.push(Mutation {
             engine: EngineKind::Structure,
@@ -4319,7 +4319,7 @@ fn apply_structure_mutation(
         | Opcode::PopListHead
         | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
         Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
-            apply_sorted_set_mutation(state, mutation)?
+            apply_sorted_set_mutation(state, mutation)?;
         }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
@@ -4342,11 +4342,12 @@ fn apply_sorted_set_mutation(
         Opcode::UpsertSortedSetMember => {
             let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
             let score = decode_sorted_set_wal_score(&mutation.value)?;
-            let previous = state
-                .zadd(key, member.to_vec(), score)
-                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-            if previous == Some(score) {
-                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            match state.zadd(key, member.to_vec(), score) {
+                SortedSetMemberState::Present(previous) if previous != score => {}
+                SortedSetMemberState::MissingMember => {}
+                SortedSetMemberState::MissingSet | SortedSetMemberState::Present(_) => {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
             }
         }
         Opcode::DeleteSortedSetMember => {
@@ -4354,7 +4355,7 @@ fn apply_sorted_set_mutation(
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
             let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
-            if state.zrem(key, member).flatten().is_none() {
+            if !matches!(state.zrem(key, member), SortedSetMemberState::Present(_)) {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
@@ -8184,7 +8185,7 @@ impl StructureTreeDecoder {
         validate_hash_counts(&hashes, hash_counts)?;
         validate_set_counts(&sets, set_counts)?;
         let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
-        validate_sorted_sets(&sorted_sets, sorted_set_counts, sorted_set_order)?;
+        validate_sorted_sets(&sorted_sets, &sorted_set_counts, sorted_set_order)?;
         Ok(StructureState {
             entries,
             hashes,
@@ -8276,7 +8277,7 @@ fn validate_set_counts(
 
 fn validate_sorted_sets(
     sorted_sets: &BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
-    expected_counts: BTreeMap<Vec<u8>, u64>,
+    expected_counts: &BTreeMap<Vec<u8>, u64>,
     mut ordered: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
 ) -> Result<(), NativeRuntimeError> {
     for (key, members) in sorted_sets {
