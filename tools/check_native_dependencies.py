@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -546,7 +547,15 @@ def build_receipt(
             "tree": _git_value(["rev-parse", "HEAD^{tree}"], root),
             "worktree_clean_before_receipt": clean,
         },
+        "host": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
         "tools": {
+            "git": _version(["git", "--version"], root),
+            "git_executable": shutil.which("git"),
             "rustc": _version(["rustc", "--version", "--verbose"], root),
             "cargo": _version(["cargo", "--version"], root),
             "cargo_deny": _version(["cargo", "deny", "--version"], root),
