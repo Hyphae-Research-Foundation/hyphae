@@ -180,6 +180,14 @@ commit before its tag can be published.
   operands to `INSERT`, exact-primary-key `UPDATE` and `DELETE`, including
   fail-before-write behavior, index maintenance, recovery, and explicit
   remaining G2 limits to one source commit.
+- [Native indexed inner-join evidence —
+  2026-08-01](native-indexed-inner-join-2026-08-01.md) binds the first exact
+  qualified `INNER JOIN`, primary/unique-secondary left access,
+  single-primary-key right access, three-executor historical/private/physical
+  equivalence, reopen and typed failure behavior to one source commit.
+- `native-indexed-inner-join-wsl2.json` is its clean release observation over
+  2,048 rows per relation and 100,000 complete calls per route. It remains
+  outside G2 and G7.
 
 ## Hosted release evidence
 

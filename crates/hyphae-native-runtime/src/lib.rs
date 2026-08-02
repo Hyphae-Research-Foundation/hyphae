@@ -10339,6 +10339,217 @@ mod tests {
         Ok(())
     }
 
+    fn indexed_join_query() -> &'static str {
+        "SELECT users.id, users.name, profiles.city
+         FROM users
+         INNER JOIN profiles ON users.profile_id = profiles.id
+         WHERE email = ?"
+    }
+
+    fn indexed_join_columns() -> Vec<String> {
+        vec![
+            "users.id".to_owned(),
+            "users.name".to_owned(),
+            "profiles.city".to_owned(),
+        ]
+    }
+
+    fn seed_indexed_join(database: &mut NativeDatabase) -> Result<(), Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                name TEXT NOT NULL,
+                profile_id BIGINT
+            )",
+            &[],
+        )?;
+        seed.execute_sql(
+            "CREATE TABLE profiles (
+                id BIGINT PRIMARY KEY,
+                city TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        for values in [
+            "(1, 'one@hyphae.local', 'Mario', 100)",
+            "(2, 'two@hyphae.local', 'Romina', NULL)",
+            "(3, 'three@hyphae.local', 'Luciana', 999)",
+        ] {
+            seed.execute_sql(
+                &format!("INSERT INTO users (id, email, name, profile_id) VALUES {values}"),
+                &[],
+            )?;
+        }
+        seed.execute_sql(
+            "INSERT INTO profiles (id, city) VALUES (100, 'Medellin')",
+            &[],
+        )?;
+        seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        seed.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_inner_join_matches_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let historical = database.snapshot(11)?;
+        let historical_plan = historical.prepare_sql(indexed_join_query())?;
+        let expected_medellin = SqlResult::Rows {
+            columns: indexed_join_columns(),
+            rows: vec![vec![
+                SqlValue::Signed(1),
+                SqlValue::Text("Mario".to_owned()),
+                SqlValue::Text("Medellin".to_owned()),
+            ]],
+        };
+        let mario = [SqlValue::Text("one@hyphae.local".to_owned())];
+        assert_eq!(
+            historical.execute_prepared(&historical_plan, &mario)?,
+            expected_medellin
+        );
+        let latest_plan = database.prepare_sql_latest(indexed_join_query())?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &mario)?,
+            expected_medellin
+        );
+        for email in [
+            "two@hyphae.local",
+            "three@hyphae.local",
+            "absent@hyphae.local",
+        ] {
+            assert_eq!(
+                database
+                    .execute_prepared_latest(&latest_plan, &[SqlValue::Text(email.to_owned())],)?,
+                SqlResult::Rows {
+                    columns: indexed_join_columns(),
+                    rows: Vec::new(),
+                }
+            );
+        }
+
+        let mut update = database.begin_sql(12, DurabilityClass::Strict)?;
+        update.execute_sql("UPDATE profiles SET city = 'Envigado' WHERE id = 100", &[])?;
+        let expected_envigado = SqlResult::Rows {
+            columns: indexed_join_columns(),
+            rows: vec![vec![
+                SqlValue::Signed(1),
+                SqlValue::Text("Mario".to_owned()),
+                SqlValue::Text("Envigado".to_owned()),
+            ]],
+        };
+        assert_eq!(
+            update.execute_sql(indexed_join_query(), &mario)?,
+            expected_envigado
+        );
+        update.commit()?;
+        assert_eq!(
+            historical.execute_prepared(&historical_plan, &mario)?,
+            expected_medellin
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(indexed_join_query())?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &mario)?,
+            expected_envigado
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_inner_join_explains_and_rejects_unsupported_access_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let mut transaction = database.begin_sql(11, DurabilityClass::Strict)?;
+        assert_eq!(
+            transaction.execute_sql(&format!("EXPLAIN {}", indexed_join_query()), &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=unique-secondary(index=3),right_table=2,right_access=primary-key)"
+                        .to_owned()
+                )]]
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT users.name, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE id = ?",
+                &[SqlValue::Signed(1)],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.name".to_owned(), "profiles.city".to_owned()],
+                rows: vec![vec![
+                    SqlValue::Text("Mario".to_owned()),
+                    SqlValue::Text("Medellin".to_owned()),
+                ]]
+            }
+        );
+        transaction.execute_sql("CREATE INDEX users_name ON users (name)", &[])?;
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE name = ?",
+                &[SqlValue::Text("Mario".to_owned())],
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        let mario = [SqlValue::Text("one@hyphae.local".to_owned())];
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.name = profiles.city
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::NoAccessPath)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::InvalidSyntax)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.email = profiles.id
+                 WHERE email = ?",
+                &mario,
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                indexed_join_query(),
+                &[
+                    SqlValue::Text("one@hyphae.local".to_owned()),
+                    SqlValue::Signed(1)
+                ]
+            ),
+            Err(SqlError::ParameterMismatch)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn indexed_updates_preserve_unique_nulls_distinct() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
