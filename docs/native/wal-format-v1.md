@@ -93,14 +93,23 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
 MEMBER=16`, `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`, `POP
 LIST HEAD=23`, `POP LIST TAIL=24`, `CREATE SORTED SET=25`, `UPSERT SORTED SET
-MEMBER=26`, `DELETE SORTED SET MEMBER=27`; and search `CREATE INDEX=4`, `INDEX
-DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`, `DELETE VECTOR=19`.
+MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`; and search
+`CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
+`DELETE VECTOR=19`.
 `DELETE VALUE`, collection creation, hash-field deletion, set/sorted-set
 member deletion, and vector deletion require an empty value and no expiry.
 `EXPIRE VALUE` requires an explicit expiry and carries the retained logical
 value. The ordered expiry index is a derived physical structure maintained by
 the existing scalar opcodes, so it introduces no second mutation stream or
 WAL opcode.
+
+`COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
+engine, a zero target, empty key and value, and no expiry. Its commit advances
+the global CSN and names the replacement structure root while retaining the
+other engine roots. The mutation is not a logical delete stream and cannot be
+combined with user mutations. Recovery validates the complete prior and
+replacement roots; it never attempts to infer dropped entries from the empty
+maintenance body.
 
 Relational `CREATE TABLE` and `CREATE SECONDARY INDEX` carry one complete
 `HYCOBJ01` definition as their value and the normalized qualified-name
