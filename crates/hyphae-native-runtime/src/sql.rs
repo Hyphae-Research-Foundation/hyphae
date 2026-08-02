@@ -126,6 +126,7 @@ enum PreparedPlan {
         parameter_count: usize,
         residual: bool,
         output_columns: Vec<String>,
+        limit: Option<usize>,
     },
     PrimaryKeyScan {
         table: ObjectId,
@@ -174,6 +175,12 @@ enum JoinLeftAccess {
         index: ObjectId,
         definition: Box<SecondaryIndexDefinition>,
         key: KeyBinding,
+    },
+    BoundedSecondaryIndex {
+        index: ObjectId,
+        definition: Box<SecondaryIndexDefinition>,
+        key: KeyBinding,
+        limit: usize,
     },
     BoundedPrimaryKeyScan {
         range: Option<PrimaryKeyRange>,
@@ -392,6 +399,7 @@ enum SelectAccess {
     SecondaryIndex {
         index: ObjectId,
         key: KeyBinding,
+        limit: Option<usize>,
     },
     PrimaryKeyScan {
         limit: usize,
@@ -477,7 +485,7 @@ fn prepare_select_plan(
             output_columns: bound.output_columns,
             legacy_binary,
         },
-        SelectAccess::SecondaryIndex { index, key } => PreparedPlan::SecondaryIndexLookup {
+        SelectAccess::SecondaryIndex { index, key, limit } => PreparedPlan::SecondaryIndexLookup {
             table: bound.table,
             index,
             relation: Box::new(relation),
@@ -488,6 +496,7 @@ fn prepare_select_plan(
             parameter_count: bound.parameter_count,
             residual: bound.residual,
             output_columns: bound.output_columns,
+            limit,
         },
         SelectAccess::PrimaryKeyScan {
             limit,
@@ -704,56 +713,8 @@ fn execute_bound_snapshot(
                 rows,
             })
         }
-        PreparedPlan::SecondaryIndexLookup {
-            table,
-            index,
-            relation,
-            index_definition,
-            projection,
-            key,
-            filter,
-            parameter_count,
-            output_columns,
-            ..
-        } => {
-            validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
-            let Some(index_key) =
-                bind_secondary_index_key_binding(relation, index_definition, key, parameters)?
-            else {
-                return Ok(SqlResult::Rows {
-                    columns: output_columns.clone(),
-                    rows: Vec::new(),
-                });
-            };
-            let primary_keys = snapshot
-                .state
-                .relational
-                .secondary_index_lookup(*index, &index_key)
-                .map_err(NativeRuntimeError::from)?;
-            let mut rows = Vec::new();
-            if let Some(primary_keys) = primary_keys {
-                rows.reserve(primary_keys.len());
-                for primary_key in primary_keys {
-                    let stored = snapshot
-                        .select(*table, primary_key)
-                        .ok_or(SqlError::InvalidStoredRow)?;
-                    if let Some(row) = materialize_filtered_row(
-                        relation,
-                        projection,
-                        false,
-                        primary_key,
-                        stored,
-                        Some(filter),
-                        parameters,
-                    )? {
-                        rows.push(row);
-                    }
-                }
-            }
-            Ok(SqlResult::Rows {
-                columns: output_columns.clone(),
-                rows,
-            })
+        PreparedPlan::SecondaryIndexLookup { .. } => {
+            execute_secondary_index_snapshot(snapshot, plan, parameters)
         }
         PreparedPlan::PrimaryKeyScan { .. } => execute_snapshot_scan(snapshot, plan, parameters),
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
@@ -813,49 +774,8 @@ fn execute_bound_latest(
                 rows,
             })
         }
-        PreparedPlan::SecondaryIndexLookup {
-            table,
-            index,
-            relation,
-            index_definition,
-            projection,
-            key,
-            filter,
-            parameter_count,
-            output_columns,
-            ..
-        } => {
-            validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
-            let Some(index_key) =
-                bind_secondary_index_key_binding(relation, index_definition, key, parameters)?
-            else {
-                return Ok(SqlResult::Rows {
-                    columns: output_columns.clone(),
-                    rows: Vec::new(),
-                });
-            };
-            let matches = database.select_secondary_index_at(snapshot, *index, &index_key)?;
-            let mut rows = Vec::with_capacity(matches.len());
-            for matched in matches {
-                if matched.table != *table {
-                    return Err(SqlError::InvalidCatalogObject);
-                }
-                if let Some(row) = materialize_filtered_row(
-                    relation,
-                    projection,
-                    false,
-                    &matched.primary_key,
-                    &matched.row,
-                    Some(filter),
-                    parameters,
-                )? {
-                    rows.push(row);
-                }
-            }
-            Ok(SqlResult::Rows {
-                columns: output_columns.clone(),
-                rows,
-            })
+        PreparedPlan::SecondaryIndexLookup { .. } => {
+            execute_secondary_index_latest(database, snapshot, plan, parameters)
         }
         PreparedPlan::PrimaryKeyScan { .. } => {
             execute_latest_scan(database, snapshot, plan, parameters)
@@ -867,6 +787,131 @@ fn execute_bound_latest(
             execute_indexed_join_latest(database, snapshot, plan, parameters)
         }
     }
+}
+
+fn execute_secondary_index_snapshot(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::SecondaryIndexLookup {
+        table,
+        index,
+        relation,
+        index_definition,
+        projection,
+        key,
+        filter,
+        parameter_count,
+        output_columns,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some(index_key) =
+        bind_secondary_index_key_binding(relation, index_definition, key, parameters)?
+    else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    let mut rows = Vec::with_capacity(limit.unwrap_or(0).min(256));
+    if *limit == Some(0) {
+        return Ok(rows_result(output_columns, rows));
+    }
+    let primary_keys = snapshot
+        .state
+        .relational
+        .secondary_index_lookup(*index, &index_key)
+        .map_err(NativeRuntimeError::from)?;
+    if let Some(primary_keys) = primary_keys {
+        if limit.is_none() {
+            rows.reserve(primary_keys.len());
+        }
+        for primary_key in primary_keys {
+            let stored = snapshot
+                .select(*table, primary_key)
+                .ok_or(SqlError::InvalidStoredRow)?;
+            if let Some(row) = materialize_filtered_row(
+                relation,
+                projection,
+                false,
+                primary_key,
+                stored,
+                Some(filter),
+                parameters,
+            )? {
+                rows.push(row);
+                if limit.is_some_and(|limit| rows.len() == limit) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(rows_result(output_columns, rows))
+}
+
+fn execute_secondary_index_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::SecondaryIndexLookup {
+        table,
+        index,
+        relation,
+        index_definition,
+        projection,
+        key,
+        filter,
+        parameter_count,
+        output_columns,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    let Some(index_key) =
+        bind_secondary_index_key_binding(relation, index_definition, key, parameters)?
+    else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    let mut rows = Vec::with_capacity(limit.unwrap_or(0).min(256));
+    if *limit == Some(0) {
+        return Ok(rows_result(output_columns, rows));
+    }
+    database
+        .visit_secondary_index_at(
+            snapshot,
+            *index,
+            &index_key,
+            |matched_table, primary_key, stored| {
+                if matched_table != *table {
+                    return Err(SqlError::InvalidCatalogObject);
+                }
+                if let Some(row) = materialize_filtered_row(
+                    relation,
+                    projection,
+                    false,
+                    primary_key,
+                    stored,
+                    Some(filter),
+                    parameters,
+                )? {
+                    rows.push(row);
+                    if limit.is_some_and(|limit| rows.len() == limit) {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .map_err(map_relational_visit_error)?;
+    Ok(rows_result(output_columns, rows))
 }
 
 fn execute_indexed_join_snapshot(
@@ -898,6 +943,9 @@ fn execute_indexed_join_snapshot(
     )?;
     if let JoinLeftAccess::BoundedPrimaryKeyScan { range, limit } = left_access {
         return execute_bounded_join_snapshot(snapshot, plan, range.as_ref(), *limit, parameters);
+    }
+    if matches!(left_access, JoinLeftAccess::BoundedSecondaryIndex { .. }) {
+        return execute_bounded_secondary_join_snapshot(snapshot, plan, left_access, parameters);
     }
     let left = snapshot_join_left(
         snapshot,
@@ -964,6 +1012,15 @@ fn execute_indexed_join_latest(
             parameters,
         );
     }
+    if matches!(left_access, JoinLeftAccess::BoundedSecondaryIndex { .. }) {
+        return execute_bounded_secondary_join_latest(
+            database,
+            snapshot,
+            plan,
+            left_access,
+            parameters,
+        );
+    }
     let left = latest_join_left(
         database,
         snapshot,
@@ -1025,6 +1082,14 @@ fn execute_indexed_join_transaction(
             plan,
             range.as_ref(),
             *limit,
+            parameters,
+        );
+    }
+    if matches!(left_access, JoinLeftAccess::BoundedSecondaryIndex { .. }) {
+        return execute_bounded_secondary_join_transaction(
+            transaction,
+            plan,
+            left_access,
             parameters,
         );
     }
@@ -1231,6 +1296,250 @@ fn execute_bounded_join_transaction(
     )
 }
 
+fn execute_bounded_secondary_join_snapshot(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let JoinLeftAccess::BoundedSecondaryIndex {
+        index,
+        definition,
+        key,
+        limit,
+    } = access
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        output_columns,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let Some(index_key) =
+        bind_secondary_index_key_binding(left_relation, definition, key, parameters)?
+    else {
+        return Ok(empty_join_result(output_columns));
+    };
+    if *limit == 0 {
+        return Ok(empty_join_result(output_columns));
+    }
+    let Some(primary_keys) = snapshot
+        .state
+        .relational
+        .secondary_index_lookup(*index, &index_key)
+        .map_err(NativeRuntimeError::from)?
+    else {
+        return Ok(empty_join_result(output_columns));
+    };
+    let context = JoinMaterialization {
+        left_relation,
+        right_relation,
+        left_filter: left_filter.as_ref(),
+        left_join_column: *left_join_column,
+        right_join_column: *right_join_column,
+        projection,
+        output_columns,
+        parameters,
+    };
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    for primary_key in primary_keys {
+        let stored = snapshot
+            .select(*left_table, primary_key)
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if let Some(row) =
+            materialize_join_row(&context, primary_key, stored, |right_primary_key| {
+                Ok(snapshot
+                    .select(*right_table, right_primary_key)
+                    .map(<[u8]>::to_vec))
+            })?
+        {
+            rows.push(row);
+            if rows.len() == *limit {
+                break;
+            }
+        }
+    }
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
+fn execute_bounded_secondary_join_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let JoinLeftAccess::BoundedSecondaryIndex {
+        index,
+        definition,
+        key,
+        limit,
+    } = access
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        output_columns,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let Some(index_key) =
+        bind_secondary_index_key_binding(left_relation, definition, key, parameters)?
+    else {
+        return Ok(empty_join_result(output_columns));
+    };
+    if *limit == 0 {
+        return Ok(empty_join_result(output_columns));
+    }
+    let context = JoinMaterialization {
+        left_relation,
+        right_relation,
+        left_filter: left_filter.as_ref(),
+        left_join_column: *left_join_column,
+        right_join_column: *right_join_column,
+        projection,
+        output_columns,
+        parameters,
+    };
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    database
+        .visit_secondary_index_at(
+            snapshot,
+            *index,
+            &index_key,
+            |matched_table, primary_key, stored| {
+                if matched_table != *left_table {
+                    return Err(SqlError::InvalidCatalogObject);
+                }
+                if let Some(row) =
+                    materialize_join_row(&context, primary_key, stored, |right_primary_key| {
+                        database
+                            .select_relational_at(snapshot, *right_table, right_primary_key)
+                            .map_err(SqlError::from)
+                    })?
+                {
+                    rows.push(row);
+                    if rows.len() == *limit {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .map_err(|error| match error {
+            crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
+            crate::RelationalVisitError::Visitor(error) => error,
+        })?;
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
+fn execute_bounded_secondary_join_transaction(
+    transaction: &NativeWriteBatch,
+    plan: &PreparedPlan,
+    access: &JoinLeftAccess,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let JoinLeftAccess::BoundedSecondaryIndex {
+        index,
+        definition,
+        key,
+        limit,
+    } = access
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let PreparedPlan::IndexedInnerJoin {
+        left_table,
+        right_table,
+        left_relation,
+        right_relation,
+        left_filter,
+        left_join_column,
+        right_join_column,
+        projection,
+        output_columns,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let Some(index_key) =
+        bind_secondary_index_key_binding(left_relation, definition, key, parameters)?
+    else {
+        return Ok(empty_join_result(output_columns));
+    };
+    if *limit == 0 {
+        return Ok(empty_join_result(output_columns));
+    }
+    let Some(primary_keys) = transaction
+        .state
+        .relational
+        .secondary_index_lookup(*index, &index_key)
+        .map_err(NativeRuntimeError::from)?
+    else {
+        return Ok(empty_join_result(output_columns));
+    };
+    let context = JoinMaterialization {
+        left_relation,
+        right_relation,
+        left_filter: left_filter.as_ref(),
+        left_join_column: *left_join_column,
+        right_join_column: *right_join_column,
+        projection,
+        output_columns,
+        parameters,
+    };
+    let mut rows = Vec::with_capacity((*limit).min(256));
+    for primary_key in primary_keys {
+        let stored = transaction
+            .select(*left_table, primary_key)
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if let Some(row) =
+            materialize_join_row(&context, primary_key, stored, |right_primary_key| {
+                Ok(transaction
+                    .select(*right_table, right_primary_key)
+                    .map(<[u8]>::to_vec))
+            })?
+        {
+            rows.push(row);
+            if rows.len() == *limit {
+                break;
+            }
+        }
+    }
+    Ok(SqlResult::Rows {
+        columns: output_columns.clone(),
+        rows,
+    })
+}
+
 fn join_scan_bounds(
     relation: &RelationDefinition,
     range: Option<&PrimaryKeyRange>,
@@ -1308,7 +1617,8 @@ fn snapshot_join_left(
                 .ok_or(SqlError::InvalidStoredRow)?;
             Ok(Some((primary_key.clone(), stored.to_vec())))
         }
-        JoinLeftAccess::BoundedPrimaryKeyScan { .. } => Err(SqlError::InvalidSyntax),
+        JoinLeftAccess::BoundedPrimaryKeyScan { .. }
+        | JoinLeftAccess::BoundedSecondaryIndex { .. } => Err(SqlError::InvalidSyntax),
     }
 }
 
@@ -1349,7 +1659,8 @@ fn latest_join_left(
             }
             Ok(Some((matched.primary_key.clone(), matched.row.clone())))
         }
-        JoinLeftAccess::BoundedPrimaryKeyScan { .. } => Err(SqlError::InvalidSyntax),
+        JoinLeftAccess::BoundedPrimaryKeyScan { .. }
+        | JoinLeftAccess::BoundedSecondaryIndex { .. } => Err(SqlError::InvalidSyntax),
     }
 }
 
@@ -1396,7 +1707,8 @@ fn transaction_join_left(
                 .ok_or(SqlError::InvalidStoredRow)?;
             Ok(Some((primary_key.clone(), stored.to_vec())))
         }
-        JoinLeftAccess::BoundedPrimaryKeyScan { .. } => Err(SqlError::InvalidSyntax),
+        JoinLeftAccess::BoundedPrimaryKeyScan { .. }
+        | JoinLeftAccess::BoundedSecondaryIndex { .. } => Err(SqlError::InvalidSyntax),
     }
 }
 
@@ -1489,9 +1801,24 @@ fn materialize_join_row(
 }
 
 fn empty_join_result(output_columns: &[String]) -> SqlResult {
+    empty_rows_result(output_columns)
+}
+
+fn empty_rows_result(output_columns: &[String]) -> SqlResult {
+    rows_result(output_columns, Vec::new())
+}
+
+fn rows_result(output_columns: &[String], rows: Vec<Vec<SqlValue>>) -> SqlResult {
     SqlResult::Rows {
         columns: output_columns.to_vec(),
-        rows: Vec::new(),
+        rows,
+    }
+}
+
+fn map_relational_visit_error(error: crate::RelationalVisitError<SqlError>) -> SqlError {
+    match error {
+        crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
+        crate::RelationalVisitError::Visitor(error) => error,
     }
 }
 
@@ -1821,13 +2148,22 @@ fn execute_explain(
                 explain_suffix(bound.residual)
             )
         }
-        SelectAccess::SecondaryIndex { index, .. } => {
-            format!(
-                "SecondaryIndexLookup(table={},index={index}{}",
-                bound.table,
-                explain_suffix(bound.residual)
-            )
-        }
+        SelectAccess::SecondaryIndex { index, limit, .. } => limit.map_or_else(
+            || {
+                format!(
+                    "SecondaryIndexLookup(table={},index={index}{}",
+                    bound.table,
+                    explain_suffix(bound.residual)
+                )
+            },
+            |limit| {
+                format!(
+                    "SecondaryIndexLookup(table={},index={index},limit={limit}{}",
+                    bound.table,
+                    explain_suffix(bound.residual)
+                )
+            },
+        ),
         SelectAccess::PrimaryKeyScan { limit, .. } => {
             format!(
                 "PrimaryKeyScan(table={},limit={limit}{}",
@@ -1871,6 +2207,9 @@ fn execute_indexed_join_explain(
         JoinLeftAccess::PrimaryKey { .. } => "primary-key".to_owned(),
         JoinLeftAccess::UniqueSecondaryIndex { index, .. } => {
             format!("unique-secondary(index={index})")
+        }
+        JoinLeftAccess::BoundedSecondaryIndex { index, limit, .. } => {
+            format!("secondary(index={index},limit={limit})")
         }
         JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit } => {
             format!("primary-key-scan(limit={limit})")
@@ -2094,7 +2433,9 @@ fn execute_select(
         SelectAccess::PrimaryKey { key, legacy_binary } => {
             context.primary_key_rows(&key, legacy_binary)?
         }
-        SelectAccess::SecondaryIndex { index, key } => context.secondary_index_rows(index, &key)?,
+        SelectAccess::SecondaryIndex { index, key, limit } => {
+            context.secondary_index_rows(index, &key, limit)?
+        }
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary,
@@ -2159,7 +2500,11 @@ impl TransactionSelectContext<'_> {
         &self,
         index: ObjectId,
         key: &KeyBinding,
+        limit: Option<usize>,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let definition = secondary_index_by_id(&self.transaction.state.catalog, index)?;
         let Some(index_key) =
             bind_secondary_index_key_binding(self.definition, definition, key, self.parameters)?
@@ -2191,6 +2536,9 @@ impl TransactionSelectContext<'_> {
                 self.parameters,
             )? {
                 rows.push(row);
+                if limit.is_some_and(|limit| rows.len() == limit) {
+                    break;
+                }
             }
         }
         Ok(rows)
@@ -2307,11 +2655,12 @@ fn bind_select(
     } else if let Some((index, key)) =
         find_secondary_equality_key(catalog, table, definition, &comparisons)?
     {
-        if !order_by.is_empty() || limit.is_some() {
-            return Err(SqlError::InvalidSyntax);
-        }
+        validate_primary_key_order(definition, order_by, &expected_primary_key)?;
         let used_terms = key.columns.len();
-        (SelectAccess::SecondaryIndex { index, key }, used_terms)
+        (
+            SelectAccess::SecondaryIndex { index, key, limit },
+            used_terms,
+        )
     } else if let Some((range, range_terms)) =
         bind_primary_key_range_shape(&comparisons, &expected_primary_key, parameter_count)?
     {
@@ -2386,15 +2735,21 @@ fn bind_indexed_inner_join(
             key,
             legacy_binary: false,
         } => JoinLeftAccess::PrimaryKey { key },
-        SelectAccess::SecondaryIndex { index, key } => {
+        SelectAccess::SecondaryIndex { index, key, limit } => {
             let definition = secondary_index_by_id(catalog, index)?;
-            if !definition.unique {
-                return Err(SqlError::NoAccessPath);
-            }
-            JoinLeftAccess::UniqueSecondaryIndex {
-                index,
-                definition: Box::new(definition.clone()),
-                key,
+            match (definition.unique, limit) {
+                (true, None) => JoinLeftAccess::UniqueSecondaryIndex {
+                    index,
+                    definition: Box::new(definition.clone()),
+                    key,
+                },
+                (_, Some(limit)) => JoinLeftAccess::BoundedSecondaryIndex {
+                    index,
+                    definition: Box::new(definition.clone()),
+                    key,
+                    limit,
+                },
+                (false, None) => return Err(SqlError::NoAccessPath),
             }
         }
         SelectAccess::PrimaryKeyScan {

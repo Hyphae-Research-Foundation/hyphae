@@ -1249,8 +1249,32 @@ impl NativeDatabase {
         index: ObjectId,
         index_key: &[u8],
     ) -> Result<Vec<SecondaryIndexRow>, NativeRuntimeError> {
+        let mut rows = Vec::new();
+        self.visit_secondary_index_at(snapshot, index, index_key, |table, primary_key, row| {
+            rows.push(SecondaryIndexRow {
+                table,
+                primary_key: primary_key.to_vec(),
+                row: row.to_vec(),
+            });
+            Ok(ControlFlow::Continue(()))
+        })
+        .map_err(|error| match error {
+            RelationalVisitError::Runtime(error) | RelationalVisitError::Visitor(error) => error,
+        })?;
+        Ok(rows)
+    }
+
+    pub(crate) fn visit_secondary_index_at<E>(
+        &self,
+        snapshot: &Snapshot,
+        index: ObjectId,
+        index_key: &[u8],
+        mut visitor: impl FnMut(ObjectId, &[u8], &[u8]) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), RelationalVisitError<E>> {
         let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
-            return Err(NativeRuntimeError::UnknownSecondaryIndex { index });
+            return Err(RelationalVisitError::Runtime(
+                NativeRuntimeError::UnknownSecondaryIndex { index },
+            ));
         };
         let tree = BTree::from_root(root);
         let table = {
@@ -1259,13 +1283,17 @@ impl NativeDatabase {
                     &self.pages,
                     &self.buffer_pool,
                     &relational_secondary_index_key(index),
-                )?
-                .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })?;
-            let (table, _, _) = decode_secondary_index_metadata(metadata.bytes())?;
+                )
+                .map_err(NativeRuntimeError::from)
+                .map_err(RelationalVisitError::Runtime)?
+                .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })
+                .map_err(RelationalVisitError::Runtime)?;
+            let (table, _, _) = decode_secondary_index_metadata(metadata.bytes())
+                .map_err(RelationalVisitError::Runtime)?;
             table
         };
-        let prefix = relational_secondary_entry_prefix(index, index_key)?;
-        let entries = tree.scan_prefix_cached(&self.pages, &self.buffer_pool, &prefix)?;
+        let prefix = relational_secondary_entry_prefix(index, index_key)
+            .map_err(RelationalVisitError::Runtime)?;
         let context = RelationalReadContext {
             pages: &self.pages,
             pool: &self.buffer_pool,
@@ -1273,37 +1301,68 @@ impl NativeDatabase {
             format: self.relational_format,
             visible_csn: snapshot.visible_csn,
         };
-        let mut rows = Vec::with_capacity(entries.len());
-        for (physical_key, marker) in entries {
-            let identity = physical_key
-                .get(17..)
-                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-            let (stored_index_key, primary_key) = decode_secondary_index_entry_identity(identity)?;
-            if stored_index_key != index_key {
-                return Err(NativeRuntimeError::InvalidRelationalTree);
-            }
-            match marker.as_slice() {
-                [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => continue,
-                [RELATIONAL_SECONDARY_ENTRY_LIVE] => {}
-                _ => return Err(NativeRuntimeError::InvalidRelationalTree),
-            }
-            let encoded_row = tree
-                .get_cached_pinned(
-                    &self.pages,
-                    &self.buffer_pool,
-                    &relational_row_key(table, primary_key),
-                )?
-                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-            let row =
-                decode_relational_value_cached(&context, table, primary_key, encoded_row.bytes())?
-                    .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-            rows.push(SecondaryIndexRow {
-                table,
-                primary_key: primary_key.to_vec(),
-                row,
-            });
+        let mut failure = None;
+        let _outcome = tree
+            .visit_prefix_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                None,
+                |physical_key, marker| {
+                    let row_result = (|| {
+                        let identity = physical_key
+                            .get(17..)
+                            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        let (stored_index_key, primary_key) =
+                            decode_secondary_index_entry_identity(identity)?;
+                        if stored_index_key != index_key {
+                            return Err(NativeRuntimeError::InvalidRelationalTree);
+                        }
+                        match marker {
+                            [RELATIONAL_SECONDARY_ENTRY_TOMBSTONE] => {
+                                return Ok(None);
+                            }
+                            [RELATIONAL_SECONDARY_ENTRY_LIVE] => {}
+                            _ => return Err(NativeRuntimeError::InvalidRelationalTree),
+                        }
+                        let encoded_row = tree
+                            .get_cached_pinned(
+                                &self.pages,
+                                &self.buffer_pool,
+                                &relational_row_key(table, primary_key),
+                            )?
+                            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        let row = decode_relational_value_cached(
+                            &context,
+                            table,
+                            primary_key,
+                            encoded_row.bytes(),
+                        )?
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                        Ok(Some((primary_key, row)))
+                    })();
+                    match row_result {
+                        Ok(None) => ControlFlow::Continue(()),
+                        Ok(Some((primary_key, row))) => match visitor(table, primary_key, &row) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                failure = Some(RelationalVisitError::Visitor(error));
+                                ControlFlow::Break(())
+                            }
+                        },
+                        Err(error) => {
+                            failure = Some(RelationalVisitError::Runtime(error));
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?;
+        if let Some(error) = failure {
+            return Err(error);
         }
-        Ok(rows)
+        Ok(())
     }
 
     /// Reads one current structure value through its physical root.
@@ -10362,7 +10421,8 @@ mod tests {
                 id BIGINT PRIMARY KEY,
                 email TEXT NOT NULL,
                 name TEXT NOT NULL,
-                profile_id BIGINT
+                profile_id BIGINT,
+                cohort TEXT NOT NULL
             )",
             &[],
         )?;
@@ -10374,14 +10434,14 @@ mod tests {
             &[],
         )?;
         for values in [
-            "(1, 'one@hyphae.local', 'Mario', 100)",
-            "(2, 'two@hyphae.local', 'Romina', NULL)",
-            "(3, 'three@hyphae.local', 'Luciana', 999)",
-            "(4, 'four@hyphae.local', 'Genesis', 400)",
-            "(5, 'five@hyphae.local', 'Suli', 500)",
+            "(1, 'one@hyphae.local', 'Mario', 100, 'alpha')",
+            "(2, 'two@hyphae.local', 'Romina', NULL, 'alpha')",
+            "(3, 'three@hyphae.local', 'Luciana', 999, 'alpha')",
+            "(4, 'four@hyphae.local', 'Genesis', 400, 'alpha')",
+            "(5, 'five@hyphae.local', 'Suli', 500, 'alpha')",
         ] {
             seed.execute_sql(
-                &format!("INSERT INTO users (id, email, name, profile_id) VALUES {values}"),
+                &format!("INSERT INTO users (id, email, name, profile_id, cohort) VALUES {values}"),
                 &[],
             )?;
         }
@@ -10398,6 +10458,7 @@ mod tests {
             &[],
         )?;
         seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+        seed.execute_sql("CREATE INDEX users_cohort ON users (cohort)", &[])?;
         seed.commit()?;
         Ok(())
     }
@@ -10515,6 +10576,210 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn nonunique_secondary_inner_join_is_bounded_after_right_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let query = "SELECT users.id, profiles.city
+                     FROM users
+                     INNER JOIN profiles ON users.profile_id = profiles.id
+                     WHERE cohort = ?
+                     ORDER BY id
+                     LIMIT 2";
+        let parameters = [SqlValue::Text("alpha".to_owned())];
+        let expected = SqlResult::Rows {
+            columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(1), SqlValue::Text("Medellin".to_owned())],
+                vec![SqlValue::Signed(4), SqlValue::Text("Caracas".to_owned())],
+            ],
+        };
+        let snapshot = database.snapshot(11)?;
+        let snapshot_plan = snapshot.prepare_sql(query)?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &parameters)?,
+            expected
+        );
+        let physical_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &parameters)?,
+            expected
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_secondary_index_select_matches_every_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let query = "SELECT id FROM users WHERE cohort = ? ORDER BY id LIMIT 2";
+        let parameters = [SqlValue::Text("alpha".to_owned())];
+        let expected = SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: vec![vec![SqlValue::Signed(1)], vec![SqlValue::Signed(2)]],
+        };
+        let snapshot = database.snapshot(11)?;
+        let snapshot_plan = snapshot.prepare_sql(query)?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &parameters)?,
+            expected
+        );
+        let physical_plan = database.prepare_sql_latest(query)?;
+        assert_eq!(
+            database.execute_prepared_latest(&physical_plan, &parameters)?,
+            expected
+        );
+
+        let mut private = database.begin_sql(12, DurabilityClass::Strict)?;
+        private.execute_sql(
+            "INSERT INTO users (id, email, name, profile_id, cohort)
+             VALUES (0, 'zero@hyphae.local', 'Private', NULL, 'alpha')",
+            &[],
+        )?;
+        assert_eq!(
+            private.execute_sql(query, &parameters)?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(0)], vec![SqlValue::Signed(1)]],
+            }
+        );
+        assert_eq!(
+            private.execute_sql(
+                "EXPLAIN SELECT id FROM users
+                 WHERE cohort = ? ORDER BY id LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "SecondaryIndexLookup(table=1,index=4,limit=2)".to_owned(),
+                )]],
+            }
+        );
+        private.rollback();
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(query)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonunique_secondary_inner_join_reads_private_rows_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let mut transaction = database.begin_sql(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            transaction.execute_sql(
+                "EXPLAIN SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE cohort = ?
+                 ORDER BY id
+                 LIMIT 2",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(
+                    "IndexedInnerJoin(left_table=1,left_access=secondary(index=4,limit=2),right_table=2,right_access=primary-key)"
+                        .to_owned(),
+                )]],
+            }
+        );
+        transaction.execute_sql(
+            "INSERT INTO profiles (id, city) VALUES (600, 'Maracaibo')",
+            &[],
+        )?;
+        transaction.execute_sql(
+            "INSERT INTO users (id, email, name, profile_id, cohort)
+             VALUES (6, 'six@hyphae.local', 'Danny', 600, 'alpha')",
+            &[],
+        )?;
+        assert_eq!(
+            transaction.execute_sql(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE cohort = ?
+                 ORDER BY id
+                 LIMIT 4",
+                &[SqlValue::Text("alpha".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("Medellin".to_owned())],
+                    vec![SqlValue::Signed(4), SqlValue::Text("Caracas".to_owned())],
+                    vec![
+                        SqlValue::Signed(5),
+                        SqlValue::Text("San Cristobal".to_owned()),
+                    ],
+                    vec![SqlValue::Signed(6), SqlValue::Text("Maracaibo".to_owned())],
+                ],
+            }
+        );
+        assert_secondary_join_rejections(&mut transaction)?;
+        transaction.rollback();
+        Ok(())
+    }
+
+    fn assert_secondary_join_rejections(
+        transaction: &mut NativeWriteBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let query = "SELECT users.id, profiles.city
+                     FROM users
+                     INNER JOIN profiles ON users.profile_id = profiles.id
+                     WHERE cohort = ?";
+        assert!(matches!(
+            transaction.execute_sql(query, &[SqlValue::Text("alpha".to_owned())]),
+            Err(SqlError::NoAccessPath)
+        ));
+        assert!(matches!(
+            transaction.execute_sql(
+                &format!("{query} ORDER BY profile_id LIMIT 2"),
+                &[SqlValue::Text("alpha".to_owned())],
+            ),
+            Err(SqlError::InvalidPrimaryKey)
+        ));
+        assert_eq!(
+            transaction.execute_sql(
+                &format!("{query} ORDER BY id LIMIT 0"),
+                &[SqlValue::Text("alpha".to_owned())],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql(&format!("{query} ORDER BY id LIMIT 2"), &[SqlValue::Null],)?,
+            SqlResult::Rows {
+                columns: vec!["users.id".to_owned(), "profiles.city".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        Ok(())
+    }
+
     fn assert_bounded_join_plan_and_full_scan(
         transaction: &mut NativeWriteBatch,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -10575,8 +10840,8 @@ mod tests {
             &[],
         )?;
         transaction.execute_sql(
-            "INSERT INTO users (id, email, name, profile_id)
-             VALUES (6, 'six@hyphae.local', 'Danny', 600)",
+            "INSERT INTO users (id, email, name, profile_id, cohort)
+             VALUES (6, 'six@hyphae.local', 'Danny', 600, 'alpha')",
             &[],
         )?;
         assert_eq!(

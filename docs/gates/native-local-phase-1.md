@@ -247,7 +247,17 @@ evidence](evidence/native-bounded-inner-join-2026-08-01.md) extends that plan
 to full and ranged left primary-key inputs with a mandatory output-level
 `LIMIT`. It proves early stop after valid right matches, private rows,
 historical/physical/reopened equivalence, typed failures, and clean exact plus
-`LIMIT 10` WSL2 observations. Non-unique secondary inputs, general join
+`LIMIT 10` WSL2 observations. At that source commit, non-unique secondary
+inputs, general join ordering and algorithms, spill, the complete G2
+correctness suites, and the G7 matrix remained open.
+
+The [native secondary-index inner-join
+evidence](evidence/native-secondary-inner-join-2026-08-01.md) adds bounded
+non-unique secondary equality as a canonical left input. It proves
+output-level early stop across private, retained, physical and reopened
+execution, plus exact planning and typed rejection paths. Its clean release
+observation measures 100,000 `LIMIT 10` calls through a 128-row secondary
+cohort. Secondary ranges, composite/right-secondary access, general join
 ordering and algorithms, spill, the complete G2 correctness suites, and the
 G7 matrix remain open.
 
