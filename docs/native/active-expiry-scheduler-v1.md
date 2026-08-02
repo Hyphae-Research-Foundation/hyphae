@@ -1,6 +1,7 @@
 # Native active-expiry scheduler v1
 
-Status: normative target contract; implementation and evidence pending
+Status: implemented; evidence recorded in
+[Native active-expiry scheduler evidence — 2026-08-02](../gates/evidence/native-active-expiry-scheduler-2026-08-02.md)
 
 Active expiry is physical structure maintenance owned by the native commit
 scheduler. It removes due scalar values through the existing expiry index and
@@ -140,4 +141,3 @@ Executable evidence must cover:
 
 Persistent-filesystem and power-loss claims require a persistent Linux lane;
 tmpfs synchronization timings are observational only.
-

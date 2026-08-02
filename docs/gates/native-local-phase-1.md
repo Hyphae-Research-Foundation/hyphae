@@ -369,8 +369,20 @@ durability barriers, and separate admission/queue/execution/sync timing. Under
 six group producers plus one strict and one memory producer, all 256 requests
 completed and reopened behind strict fence CSN 257. End-to-end p50 remained
 millisecond-scale on Windows debug and WSL2 release; queue wait is now the
-dominant measured pain point. Sustained fairness, maintenance scheduling,
+dominant measured pain point. Broader maintenance scheduling,
 native-ext4/power-loss evidence and the complete G1/G7 matrices remain open.
+
+The [native active-expiry scheduler
+evidence](evidence/native-active-expiry-scheduler-2026-08-02.md) moves bounded
+scalar cleanup into that same writer without a second database handle or
+thread. It proves idle scheduling, one-CSN non-empty sweeps, empty no-ops,
+non-decreasing clock authority, strict and memory durability, continuous group
+fairness, typed terminal failure, shutdown ordering, and reopen. The matched
+release benchmark drained 512 keys in eight transactions and retained all 256
+foreground commits. Its WSL2 enabled p50 remained 1.679 milliseconds, while
+p95 and p99 increased in the single run and 119 of 127 attempts were empty.
+Adaptive backoff, additional maintenance classes, native-ext4/power-loss
+evidence and the complete G1/G3/G7 matrices remain open.
 
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
@@ -417,8 +429,9 @@ publication. Bounded simultaneous `group` submission now shares page/WAL
 flushes, and current-root retention bounds WAL verification/replay to the
 retained suffix. Explicit single-root maintenance now collects blobs
 unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
-policy now has bounded-load concurrency and saturation evidence; sustained
-fairness remains pending, along with multi-generation pin-aware retention,
+policy now has bounded-load concurrency, saturation, active-expiry fairness,
+and terminal-failure evidence. Broader sustained fairness remains pending,
+along with multi-generation pin-aware retention,
 secondary-index range/streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
@@ -431,9 +444,9 @@ multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes, exact binary
 sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
-algebra/TTL, score/reverse/rank sorted-set operations, streams, an engine-owned
-background timer around the implemented scalar expiry primitive, model tests,
-and configurable historical retention required to close G3. Ordered cleanup,
+algebra/TTL, score/reverse/rank sorted-set operations, streams, adaptive
+empty-expiry backoff, model tests, and configurable historical retention
+required to close G3. Ordered cleanup,
 current-root compaction, and page-generation vacuum provide exact first
 amplification measurements, not the complete memory-amplification gate.
 
