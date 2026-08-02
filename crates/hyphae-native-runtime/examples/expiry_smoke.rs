@@ -9,6 +9,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use hyphae_native_pages::PAGE_SIZE;
 use hyphae_native_runtime::NativeDatabase;
 use hyphae_native_types::DurabilityClass;
 
@@ -21,6 +22,7 @@ const STRICT_KEYS: u32 = 512;
 const STRICT_BATCH: usize = 16;
 const DUE_AT: i64 = 100;
 const BEFORE_DUE: i64 = 99;
+const PAGE_FILE: &str = "pages.hydb";
 
 struct TemporaryDirectory(PathBuf);
 
@@ -55,6 +57,13 @@ struct Stats {
     first_nanos: u64,
     last_nanos: u64,
     throughput_per_second: f64,
+}
+
+struct CleanupStats {
+    latency: Stats,
+    pages_appended: u64,
+    bytes_appended: u64,
+    pages_per_key: f64,
 }
 
 fn summarize(
@@ -139,13 +148,15 @@ fn measure_empty(database: &mut NativeDatabase) -> Result<Stats, Box<dyn std::er
 
 fn measure_cleanup(
     database: &mut NativeDatabase,
+    path: &Path,
     keys: u32,
     batch: usize,
     durability: DurabilityClass,
-) -> Result<Stats, Box<dyn std::error::Error>> {
+) -> Result<CleanupStats, Box<dyn std::error::Error>> {
     let expected_batches = usize::try_from(keys)?.div_ceil(batch);
     let mut samples = Vec::with_capacity(expected_batches);
     let mut expired = 0_usize;
+    let bytes_before = fs::metadata(path.join(PAGE_FILE))?.len();
     let total_started = Instant::now();
     while expired < usize::try_from(keys)? {
         let started = Instant::now();
@@ -166,7 +177,20 @@ fn measure_cleanup(
     {
         return Err("expiry cleanup batch count or terminal empty sweep is wrong".into());
     }
-    summarize(samples, 1, total_started.elapsed().as_secs_f64())
+    let bytes_appended = fs::metadata(path.join(PAGE_FILE))?
+        .len()
+        .checked_sub(bytes_before)
+        .ok_or("expiry cleanup page file shrank")?;
+    let page_size = u64::try_from(PAGE_SIZE)?;
+    if bytes_appended % page_size != 0 {
+        return Err("expiry cleanup appended a partial native page".into());
+    }
+    Ok(CleanupStats {
+        latency: summarize(samples, 1, total_started.elapsed().as_secs_f64())?,
+        pages_appended: bytes_appended / page_size,
+        bytes_appended,
+        pages_per_key: f64::from(u32::try_from(bytes_appended / page_size)?) / f64::from(keys),
+    })
 }
 
 fn print_stats(name: &str, stats: Stats, keys_per_batch: u32, trailing_comma: bool) {
@@ -188,6 +212,34 @@ fn print_stats(name: &str, stats: Stats, keys_per_batch: u32, trailing_comma: bo
     );
 }
 
+fn print_cleanup_stats(
+    name: &str,
+    stats: &CleanupStats,
+    keys_per_batch: u32,
+    trailing_comma: bool,
+) {
+    println!(
+        "    \"{name}\": {{\"p50_nanos\": {}, \"p95_nanos\": {}, \
+         \"p99_nanos\": {}, \"p999_nanos\": {}, \"max_nanos\": {}, \
+         \"first_nanos\": {}, \"last_nanos\": {}, \
+         \"operations_per_second\": {:.3}, \"work_units_per_second\": {:.3}, \
+         \"pages_appended\": {}, \"bytes_appended\": {}, \"pages_per_key\": {:.6}}}{}",
+        stats.latency.p50_nanos,
+        stats.latency.p95_nanos,
+        stats.latency.p99_nanos,
+        stats.latency.p999_nanos,
+        stats.latency.max_nanos,
+        stats.latency.first_nanos,
+        stats.latency.last_nanos,
+        stats.latency.throughput_per_second,
+        stats.latency.throughput_per_second * f64::from(keys_per_batch),
+        stats.pages_appended,
+        stats.bytes_appended,
+        stats.pages_per_key,
+        if trailing_comma { "," } else { "" }
+    );
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_directory = TemporaryDirectory::create("memory")?;
     let (mut memory_database, memory_digest) = seed(memory_directory.path(), MEMORY_KEYS)?;
@@ -195,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let empty = measure_empty(&mut memory_database)?;
     let memory_cleanup = measure_cleanup(
         &mut memory_database,
+        memory_directory.path(),
         MEMORY_KEYS,
         MEMORY_BATCH,
         DurabilityClass::Memory,
@@ -204,13 +257,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut strict_database, strict_digest) = seed(strict_directory.path(), STRICT_KEYS)?;
     let strict_cleanup = measure_cleanup(
         &mut strict_database,
+        strict_directory.path(),
         STRICT_KEYS,
         STRICT_BATCH,
         DurabilityClass::Strict,
     )?;
 
     println!("{{");
-    println!("  \"schema\": \"hyphae-native-expiry-smoke-v1\",");
+    println!("  \"schema\": \"hyphae-native-expiry-smoke-v2\",");
     println!("  \"mode\": \"release-warm-concurrency-1\",");
     println!("  \"empty_observations\": {EMPTY_OBSERVATIONS},");
     println!("  \"empty_warmup\": {WARMUP},");
@@ -224,15 +278,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"strict_dataset_blake3\": \"{strict_digest}\",");
     println!("  \"metrics\": {{");
     print_stats("empty_due_scan", empty, 1, true);
-    print_stats(
+    print_cleanup_stats(
         "memory_cleanup",
-        memory_cleanup,
+        &memory_cleanup,
         u32::try_from(MEMORY_BATCH)?,
         true,
     );
-    print_stats(
+    print_cleanup_stats(
         "strict_cleanup",
-        strict_cleanup,
+        &strict_cleanup,
         u32::try_from(STRICT_BATCH)?,
         false,
     );
