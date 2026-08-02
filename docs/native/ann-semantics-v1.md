@@ -1,6 +1,10 @@
 # Native ANN semantics v1
 
-Status: normative target contract; implementation pending
+Status: normative target contract; deterministic in-memory HNSW kernel,
+canonical `f32` admission, three metrics, exact oracle, mutation rebuild,
+build identity and fail-closed canonical restore are implemented
+experimentally; search B+tree, WAL, MVCC delta, filtering and background
+generation publication remain pending
 
 ANN is a Hyphae-owned search-engine capability. Exact vector execution remains
 the quality oracle.
@@ -37,6 +41,20 @@ The first approximate index is Hyphae-owned HNSW with versioned:
 Canonical rebuild orders insertions by creating CSN then object ID and derives
 randomness from index ID plus definition digest. Parallel optimization may not
 change logical results without a new physical-build identity.
+
+The first executable kernel is `hyphae-native-ann`. V1 bounds `M` to 2 through
+64, requires `ef_construction >= M`, derives each node level from BLAKE3 over
+the index-definition digest and object ID, and retains at most `M` directed
+neighbors per layer. Neighbor selection uses exact metric distance followed by
+object ID. An update or delete currently rebuilds the complete graph in
+canonical order; this is a correctness reference, not the target foreground
+mutation cost.
+
+`IndexSnapshot` exports definition, vectors with creating CSNs, graph nodes,
+entry point, maximum level and build identity. Restore reconstructs the graph
+from the vector records and rejects any snapshot that differs from that
+canonical build. The native search engine has not yet assigned page keys or
+WAL operations to these records, so the kernel alone is not durable ANN.
 
 ## MVCC and mutation
 

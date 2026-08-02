@@ -630,6 +630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-ann"
+version = "0.2.1"
+dependencies = [
+ "blake3",
+ "hyphae-native-types",
+ "thiserror",
+]
+
+[[package]]
 name = "hyphae-native-blobs"
 version = "0.2.1"
 dependencies = [
