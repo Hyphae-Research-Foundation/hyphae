@@ -16938,6 +16938,54 @@ mod tests {
     }
 
     #[test]
+    fn commit_scheduler_preserves_group_strict_group_fifo_barriers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(4, Duration::from_millis(10), 8)?,
+        )?;
+        let client = scheduler.client();
+
+        let mut first_group = client.begin_optimistic(151, DurabilityClass::Group)?;
+        first_group.set(b"barrier-first".to_vec(), b"group".to_vec(), None)?;
+        let mut strict = client.begin_optimistic(151, DurabilityClass::Strict)?;
+        strict.set(b"barrier-middle".to_vec(), b"strict".to_vec(), None)?;
+        let mut second_group = client.begin_optimistic(151, DurabilityClass::Group)?;
+        second_group.set(b"barrier-last".to_vec(), b"group".to_vec(), None)?;
+
+        let worker_guard = client.block_worker_for_test()?;
+        let first = client.enqueue_for_test(first_group)?;
+        let middle = client.enqueue_for_test(strict)?;
+        let last = client.enqueue_for_test(second_group)?;
+        drop(worker_guard);
+
+        let first = first.recv()??;
+        let middle = middle.recv()??;
+        let last = last.recv()??;
+        assert_eq!(
+            [
+                first.commit_csn.get(),
+                middle.commit_csn.get(),
+                last.commit_csn.get()
+            ],
+            [2, 3, 4]
+        );
+        assert_eq!(first.durability, DurabilityClass::Group);
+        assert_eq!(middle.durability, DurabilityClass::Strict);
+        assert_eq!(last.durability, DurabilityClass::Group);
+        for receipt in [first, middle, last] {
+            assert_eq!(receipt.durability_cohort_size, 1);
+            assert_eq!(receipt.durability_cohort_position, 0);
+        }
+
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn commit_scheduler_cancels_only_queued_work_without_consuming_csn()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();

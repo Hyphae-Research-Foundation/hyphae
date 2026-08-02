@@ -417,6 +417,44 @@ impl NativeCommitClient {
             .map(|gate| gate.accepting)
             .map_err(|_| GroupCommitSubmitError::Unavailable)
     }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_for_test(
+        &self,
+        batch: NativeWriteBatch,
+    ) -> Result<
+        Receiver<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
+        GroupCommitSubmitError,
+    > {
+        let submitted_at = Instant::now();
+        let control = NativeCommitControl::new();
+        let state = Arc::clone(&control.state);
+        let (response, receiver) = mpsc::sync_channel(1);
+        admit_command(
+            &self.gate,
+            SchedulerCommand::Commit(Box::new(CommitRequest {
+                batch,
+                submitted_at,
+                enqueued_at: submitted_at,
+                control,
+                response,
+            })),
+            &state,
+            None,
+            false,
+        )?;
+        Ok(receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_worker_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, Option<NativeDatabase>>, GroupCommitSubmitError>
+    {
+        self.database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
+    }
 }
 
 /// Owner of one bounded native group-commit worker and database handle.
