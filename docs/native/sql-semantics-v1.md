@@ -8,7 +8,9 @@ direct current-root prepared primary/secondary lookup, exact-primary-key typed
 rollback, and the parameterized residual-filter slice below are implemented
 experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
-`INNER JOIN` shape is implemented as described below. G2 remains open
+`INNER JOIN` shape is implemented as described below. Composite primary-key
+left-prefix scans are specified below but are not yet implemented. G2 remains
+open
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -77,6 +79,52 @@ Inclusive, exclusive, one-sided, inverted, and equal-open ranges have explicit
 semantics: inverted and empty ranges return no rows rather than raising or
 panicking. Equality predicates retain their exact point/index access contract
 when they cover a complete primary or secondary key.
+
+The bounded composite primary-key left-prefix shape is:
+
+```text
+SELECT <projection>
+FROM <table>
+WHERE <first-primary-key-column> = <scalar>
+  [AND <next-primary-key-column> = <scalar> ...]
+  [AND <residual-filter> ...]
+[ORDER BY <complete-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+The access equality set must cover a nonempty strict left prefix of a
+composite primary key. Predicate text order may differ from catalog key order,
+but skipped, duplicate, non-key, `OR`-nested, or `NOT`-nested equalities do not
+extend the access prefix. A complete primary key retains point-lookup
+semantics. A gapped or non-leading key predicate may still execute as a
+bounded residual table scan; it must never be mislabeled as a prefix access.
+The binder selects the longest admitted left prefix and treats every
+unconsumed predicate as residual.
+
+`LIMIT` is mandatory and counts rows whose complete filter evaluates to
+`TRUE`. `LIMIT 0` still performs parsing, catalog binding, parameter arity, and
+type validation before returning no rows. `ORDER BY`, when present, must name
+the complete ascending primary key. A `NULL` prefix operand makes the equality
+`UNKNOWN` and therefore returns no rows; it is not encoded as a nullable
+primary-key component and is not a type error.
+
+The physical bound prefix is the concatenation of the canonical ordered
+components for the selected key columns. Execution intersects
+`[prefix, binary-successor(prefix))` with the table's relational B+tree
+namespace. Transaction-local and retained materialized execution use the same
+canonical byte interval. Current-root execution captures one root set and
+visible CSN, traverses the buffered B+tree directly, applies residuals before
+the limit, stops at the requested output cardinality, and never constructs a
+complete relation or `MaterializedState`.
+
+`EXPLAIN` reports
+`PrimaryKeyPrefixScan(table=<id>,columns=<count>,limit=<n>)` and appends
+`,residual=true` when predicates remain. Parameter/type failures occur before
+storage traversal. Malformed pages, rows, or version chains fail closed rather
+than returning a partial result. Reopen, retained-snapshot equivalence,
+transaction-private visibility, multilevel early stop, boundary isolation
+between adjacent prefixes, null behavior, and corrupted-row/page failure are
+required exit tests for this slice.
 
 The residual-filter slice admits parameterized and literal scalar predicates:
 
@@ -226,8 +274,8 @@ integers, `DECIMAL(p,s)`, binary32/binary64, text, binary, date, time,
 timestamp, interval, UUID, and JSON declarations. Primitive value codecs are
 executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
-remaining literal families, casts, partial primary-key prefix ranges,
-secondary ranges,
+remaining literal families, casts, range bounds after a partial primary-key
+prefix, secondary ranges,
 descending scans, offsets, and constraints beyond primary key/nullability and
 the first unique index remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate general
