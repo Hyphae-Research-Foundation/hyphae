@@ -1,0 +1,69 @@
+{
+  "schema": "hyphae-native-indexed-inner-join-smoke-v2",
+  "status": "observation-not-gate",
+  "source_commit": "c8f1c05210f3b60aa356d0e2366c51d3d2d4996b",
+  "environment": "WSL2 Ubuntu 24.04; Linux 6.18.33.1; x86_64; Intel Core Ultra 9 285H; rustc 1.96.0",
+  "profile": "release",
+  "durability": "strict",
+  "warm_state": true,
+  "concurrency": 1,
+  "rows_per_relation": 2048,
+  "observations_per_route": 100000,
+  "warmup_per_route": 10000,
+  "commit_csn": 1,
+  "dataset_digest_blake3": "086986403a1f59c272e2a938cb18a8a61c6df971decd963770dfcbf5424f6ae8",
+  "data_directory_bytes": 332382208,
+  "strict_commit_duration_millis": 668.544,
+  "reopen_duration_millis": 58.743,
+  "snapshot_materialization_duration_millis": 52.639,
+  "provisional_targets_micros": {
+    "exact_p50": 75.000,
+    "exact_p99": 400.000,
+    "bounded_limit_10_p50": 500.000,
+    "bounded_limit_10_p99": 2000.000
+  },
+  "exact_query": "SELECT users.id, users.payload, profiles.city\n                     FROM users\n                     INNER JOIN profiles ON users.profile_id = profiles.id\n                     WHERE email = ?",
+  "bounded_query": "SELECT users.id, users.payload, profiles.city\n                             FROM users\n                             INNER JOIN profiles ON users.profile_id = profiles.id\n                             WHERE id >= ?\n                             ORDER BY id\n                             LIMIT 10",
+  "routes": {
+    "physical_latest_exact": {
+      "p50_us": 30.901,
+      "p95_us": 48.922,
+      "p99_us": 104.434,
+      "p99_9_us": 231.807,
+      "maximum_us": 1099.910,
+      "throughput_ops_s": 28818.527,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_exact": {
+      "p50_us": 0.543,
+      "p95_us": 0.766,
+      "p99_us": 1.290,
+      "p99_9_us": 8.722,
+      "maximum_us": 329.447,
+      "throughput_ops_s": 1581696.657,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "physical_latest_bounded_limit_10": {
+      "p50_us": 45.669,
+      "p95_us": 70.963,
+      "p99_us": 154.697,
+      "p99_9_us": 304.271,
+      "maximum_us": 2788.082,
+      "throughput_ops_s": 19472.021,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    },
+    "materialized_snapshot_bounded_limit_10": {
+      "p50_us": 2.766,
+      "p95_us": 3.275,
+      "p99_us": 4.060,
+      "p99_9_us": 46.776,
+      "maximum_us": 836.985,
+      "throughput_ops_s": 331724.785,
+      "provisional_p50_met": true,
+      "provisional_p99_met": true
+    }
+  }
+}

@@ -188,6 +188,14 @@ commit before its tag can be published.
 - `native-indexed-inner-join-wsl2.json` is its clean release observation over
   2,048 rows per relation and 100,000 complete calls per route. It remains
   outside G2 and G7.
+- [Native bounded inner-join evidence —
+  2026-08-01](native-bounded-inner-join-2026-08-01.md) binds full and ranged
+  left primary-key inputs, output-level limits, private/historical/physical
+  equivalence, early stop, reopen, and typed failure paths to one source
+  commit.
+- `native-bounded-inner-join-wsl2.json` is its schema-v2 clean release
+  observation for exact and `LIMIT 10` joins over 2,048 rows per relation and
+  100,000 complete calls per route. It remains outside G2 and G7.
 
 ## Hosted release evidence
 

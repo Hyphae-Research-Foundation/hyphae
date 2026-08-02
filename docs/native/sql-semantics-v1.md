@@ -154,7 +154,7 @@ commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
 `column = NULL` remains `UNKNOWN` and returns no rows.
 
-The first native join shape is:
+The first exact native join shape is:
 
 ```text
 SELECT <qualified-column> [, ...]
@@ -178,9 +178,33 @@ right primary key also produces no match. Transaction execution sees private
 row changes, a retained snapshot remains historical, and
 `execute_prepared_latest` performs both physical lookups without constructing
 `MaterializedState`. Non-unique left access, composite/right-secondary access,
-multi-row inputs, aliases, general column expressions, join reordering,
-hash/merge algorithms, outer/semi/anti joins, and cross-engine table-valued
-sources remain pending.
+aliases, general column expressions, join reordering, hash/merge algorithms,
+outer/semi/anti joins, and cross-engine table-valued sources remain pending.
+
+The bounded multirow extension is:
+
+```text
+SELECT <qualified-column> [, ...]
+FROM <left-table>
+INNER JOIN <right-table>
+  ON <left-table>.<column> = <right-table>.<single-column-primary-key>
+[WHERE <left-filter>]
+[ORDER BY <complete-left-primary-key-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+The left input is a full primary-key scan or a complete primary-key range.
+`LIMIT` is mandatory and applies to joined output rows, not to examined left
+rows. A left row filtered to `FALSE`/`UNKNOWN`, a null join key, or an absent
+right primary key does not consume the limit. `ORDER BY`, when present, must
+be the complete ascending left primary key. `LIMIT 0` binds the complete plan
+and returns no rows.
+
+Private execution can join uncommitted left and right rows. Retained execution
+uses historical materialized relation maps. Current execution uses the
+bound-aware physical B+tree visitor and every right lookup shares the one
+captured root set and CSN. The visitor stops after the requested output
+cardinality; it does not materialize the complete left relation.
 
 `EXPLAIN SELECT` currently reports only the admitted access path:
 `PrimaryKeyLookup(table=<id>)` or
@@ -188,7 +212,9 @@ sources remain pending.
 `PrimaryKeyScan(table=<id>,limit=<n>)`, or
 `PrimaryKeyRangeScan(table=<id>,lower=<kind>,upper=<kind>,limit=<n>)`, or
 `IndexedInnerJoin(left_table=<id>,left_access=<access>,right_table=<id>,right_access=primary-key)`.
-Join left access is `primary-key` or `unique-secondary(index=<id>)`.
+Join left access is `primary-key`, `unique-secondary(index=<id>)`,
+`primary-key-scan(limit=<n>)`, or
+`primary-key-range(lower=<kind>,upper=<kind>,limit=<n>)`.
 Range kinds are `inclusive`, `exclusive`, or `unbounded`. This is deterministic
 introspection, not yet a logical tree, cost estimate, row estimate, or runtime
 statistics report. A plan appends `,residual=true` inside the closing

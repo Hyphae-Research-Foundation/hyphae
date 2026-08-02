@@ -238,9 +238,18 @@ evidence](evidence/native-indexed-inner-join-2026-08-01.md) binds the first
 qualified `INNER JOIN` to exact primary/unique-secondary left access and a
 single-column right primary key. It proves private, retained, physical and
 reopened execution, typed fail-closed binding, and a clean 100,000-call WSL2
-observation. Multi-row and composite joins, aliases and expressions,
+observation. Composite/right-secondary joins, aliases and expressions,
 statistics/cardinality estimation, join ordering, hash/merge/outer operators,
 spill, SQLLogicTest, TPC-H/TPC-C, and the full G2/G7 evidence remain open.
+
+The [native bounded inner-join
+evidence](evidence/native-bounded-inner-join-2026-08-01.md) extends that plan
+to full and ranged left primary-key inputs with a mandatory output-level
+`LIMIT`. It proves early stop after valid right matches, private rows,
+historical/physical/reopened equivalence, typed failures, and clean exact plus
+`LIMIT 10` WSL2 observations. Non-unique secondary inputs, general join
+ordering and algorithms, spill, the complete G2 correctness suites, and the
+G7 matrix remain open.
 
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
