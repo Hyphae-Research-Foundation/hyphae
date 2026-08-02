@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hyphae_native_catalog::{
@@ -386,6 +387,63 @@ pub(crate) struct StructureEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SortedSetScore(u64);
+
+impl SortedSetScore {
+    pub(crate) fn new(value: f64) -> Option<Self> {
+        if value.is_nan() {
+            return None;
+        }
+        Some(Self(if value == 0.0 { 0 } else { value.to_bits() }))
+    }
+
+    pub(crate) fn from_canonical_bits(bits: u64) -> Option<Self> {
+        let value = f64::from_bits(bits);
+        if value.is_nan() || bits == (-0.0_f64).to_bits() {
+            return None;
+        }
+        Some(Self(bits))
+    }
+
+    pub(crate) const fn canonical_bits(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    pub(crate) const fn sortable_bits(self) -> u64 {
+        if self.0 & (1_u64 << 63) == 0 {
+            self.0 ^ (1_u64 << 63)
+        } else {
+            !self.0
+        }
+    }
+
+    pub(crate) fn from_sortable_bits(bits: u64) -> Option<Self> {
+        let canonical = if bits & (1_u64 << 63) == 0 {
+            !bits
+        } else {
+            bits ^ (1_u64 << 63)
+        };
+        Self::from_canonical_bits(canonical)
+    }
+}
+
+impl Ord for SortedSetScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.value().total_cmp(&other.value())
+    }
+}
+
+impl PartialOrd for SortedSetScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TtlValue {
     Persistent,
     Remaining(i64),
@@ -397,6 +455,7 @@ pub(crate) struct StructureState {
     pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
+    pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,6 +502,7 @@ impl StructureState {
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
+            || self.sorted_sets.contains_key(&key)
         {
             return false;
         }
@@ -478,6 +538,7 @@ impl StructureState {
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
+            || self.sorted_sets.contains_key(&key)
         {
             return false;
         }
@@ -506,6 +567,7 @@ impl StructureState {
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
+            || self.sorted_sets.contains_key(&key)
         {
             return false;
         }
@@ -558,6 +620,69 @@ impl StructureState {
         )
     }
 
+    pub(crate) fn create_sorted_set(&mut self, key: Vec<u8>) -> bool {
+        if self.entries.contains_key(&key)
+            || self.hashes.contains_key(&key)
+            || self.sets.contains_key(&key)
+            || self.lists.contains_key(&key)
+            || self.sorted_sets.contains_key(&key)
+        {
+            return false;
+        }
+        self.sorted_sets.insert(key, BTreeMap::new());
+        true
+    }
+
+    pub(crate) fn zadd(
+        &mut self,
+        key: &[u8],
+        member: Vec<u8>,
+        score: SortedSetScore,
+    ) -> Option<Option<SortedSetScore>> {
+        self.sorted_sets
+            .get_mut(key)
+            .map(|members| members.insert(member, score))
+    }
+
+    pub(crate) fn zscore(&self, key: &[u8], member: &[u8]) -> Option<Option<SortedSetScore>> {
+        self.sorted_sets
+            .get(key)
+            .map(|members| members.get(member).copied())
+    }
+
+    pub(crate) fn zrem(&mut self, key: &[u8], member: &[u8]) -> Option<Option<SortedSetScore>> {
+        self.sorted_sets
+            .get_mut(key)
+            .map(|members| members.remove(member))
+    }
+
+    pub(crate) fn zcard(&self, key: &[u8]) -> Option<usize> {
+        self.sorted_sets.get(key).map(BTreeMap::len)
+    }
+
+    pub(crate) fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        let members = self.sorted_sets.get(key)?;
+        let Some((start, stop)) = normalize_list_range(members.len(), start, stop) else {
+            return Some(Vec::new());
+        };
+        let mut ordered = members
+            .iter()
+            .map(|(member, score)| (*score, member))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable();
+        Some(
+            ordered[start..=stop]
+                .iter()
+                .map(|(score, member)| ((*member).clone(), *score))
+                .collect(),
+        )
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
         self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
@@ -569,7 +694,11 @@ impl StructureState {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
-        if !self.hashes.is_empty() || !self.sets.is_empty() || !self.lists.is_empty() {
+        if !self.hashes.is_empty()
+            || !self.sets.is_empty()
+            || !self.lists.is_empty()
+            || !self.sorted_sets.is_empty()
+        {
             return Err(ModelError::UnsupportedLegacyStructureFamily);
         }
         let mut bytes = Vec::new();
@@ -605,6 +734,7 @@ impl StructureState {
             hashes: BTreeMap::new(),
             sets: BTreeMap::new(),
             lists: BTreeMap::new(),
+            sorted_sets: BTreeMap::new(),
         })
     }
 }

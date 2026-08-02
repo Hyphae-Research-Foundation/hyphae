@@ -58,6 +58,9 @@ pub(crate) enum Opcode {
     PushListTail = 22,
     PopListHead = 23,
     PopListTail = 24,
+    CreateSortedSet = 25,
+    UpsertSortedSetMember = 26,
+    DeleteSortedSetMember = 27,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +535,15 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         }
         value if value == Opcode::PopListHead as u8 => (Opcode::PopListHead, EngineKind::Structure),
         value if value == Opcode::PopListTail as u8 => (Opcode::PopListTail, EngineKind::Structure),
+        value if value == Opcode::CreateSortedSet as u8 => {
+            (Opcode::CreateSortedSet, EngineKind::Structure)
+        }
+        value if value == Opcode::UpsertSortedSetMember as u8 => {
+            (Opcode::UpsertSortedSetMember, EngineKind::Structure)
+        }
+        value if value == Opcode::DeleteSortedSetMember as u8 => {
+            (Opcode::DeleteSortedSetMember, EngineKind::Structure)
+        }
         value if value == Opcode::CreateIndex as u8 => (Opcode::CreateIndex, EngineKind::Search),
         value if value == Opcode::IndexDocument as u8 => {
             (Opcode::IndexDocument, EngineKind::Search)
@@ -623,6 +635,9 @@ fn validate_mutation_shape(
         | Opcode::PushListTail
         | Opcode::PopListHead
         | Opcode::PopListTail
+        | Opcode::CreateSortedSet
+        | Opcode::UpsertSortedSetMember
+        | Opcode::DeleteSortedSetMember
             if has_target =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -651,6 +666,8 @@ fn validate_mutation_shape(
         | Opcode::AddSetMember
         | Opcode::DeleteSetMember
         | Opcode::CreateList
+        | Opcode::CreateSortedSet
+        | Opcode::DeleteSortedSetMember
             if value_length != 0 || expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -663,6 +680,7 @@ fn validate_mutation_shape(
         | Opcode::PopListHead
         | Opcode::PopListTail
         | Opcode::SetHashField
+        | Opcode::UpsertSortedSetMember
         | Opcode::CreateTable
         | Opcode::InsertRow
         | Opcode::UpdateRow
@@ -683,6 +701,8 @@ fn validate_mutation_shape(
             | Opcode::DeleteHashField
             | Opcode::AddSetMember
             | Opcode::DeleteSetMember
+            | Opcode::UpsertSortedSetMember
+            | Opcode::DeleteSortedSetMember
     ) && !valid_collection_member_identity(key)
     {
         return Err(WalSemanticError::InvalidBody);
@@ -691,6 +711,9 @@ fn validate_mutation_shape(
         return Err(WalSemanticError::InvalidBody);
     }
     if opcode == Opcode::UpsertVector && (value_length == 0 || !value_length.is_multiple_of(4)) {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    if opcode == Opcode::UpsertSortedSetMember && value_length != 8 {
         return Err(WalSemanticError::InvalidBody);
     }
     Ok(())
@@ -829,6 +852,8 @@ mod tests {
         hash_field.extend_from_slice(b"hashfield");
         let mut set_member = 3_u32.to_be_bytes().to_vec();
         set_member.extend_from_slice(b"setmember");
+        let mut sorted_set_member = 6_u32.to_be_bytes().to_vec();
+        sorted_set_member.extend_from_slice(b"sortedmember");
         let mutations = vec![
             mutation(
                 EngineKind::Relational,
@@ -852,6 +877,14 @@ mod tests {
             structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
             structure_mutation(Opcode::PopListHead, b"list", b"head", None),
             structure_mutation(Opcode::PopListTail, b"list", b"tail", None),
+            structure_mutation(Opcode::CreateSortedSet, b"sorted", b"", None),
+            structure_mutation(
+                Opcode::UpsertSortedSetMember,
+                &sorted_set_member,
+                &20.0_f64.to_bits().to_be_bytes(),
+                None,
+            ),
+            structure_mutation(Opcode::DeleteSortedSetMember, &sorted_set_member, b"", None),
             mutation(
                 EngineKind::Search,
                 Opcode::IndexDocument,
@@ -907,7 +940,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 19);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 22);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -928,6 +961,32 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutation_shape(Opcode::PopListTail, true, 0, None, b"list"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn sorted_set_mutations_reject_noncanonical_shapes() {
+        let mut member = 3_u32.to_be_bytes().to_vec();
+        member.extend_from_slice(b"setmember");
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CreateSortedSet, false, 1, None, b"sorted"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::UpsertSortedSetMember, false, 7, None, &member),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::UpsertSortedSetMember, false, 8, Some(10), &member),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::DeleteSortedSetMember, false, 1, None, &member),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::DeleteSortedSetMember, true, 0, None, &member),
             Err(WalSemanticError::InvalidBody)
         ));
     }

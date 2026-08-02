@@ -56,8 +56,9 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        CatalogState, ListPop, ModelError, RelationState, SearchState, StructureEntry,
-        StructureState, TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
+        CatalogState, ListPop, ModelError, RelationState, SearchState, SortedSetScore,
+        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
+        normalize_list_range,
     },
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticError, encode_checkpoint,
@@ -90,17 +91,24 @@ const STRUCTURE_SET_META_PREFIX: u8 = 4;
 const STRUCTURE_SET_MEMBER_PREFIX: u8 = 5;
 const STRUCTURE_LIST_META_PREFIX: u8 = 6;
 const STRUCTURE_LIST_CHUNK_PREFIX: u8 = 7;
+const STRUCTURE_SORTED_SET_META_PREFIX: u8 = 8;
+const STRUCTURE_SORTED_SET_MEMBER_PREFIX: u8 = 9;
+const STRUCTURE_SORTED_SET_ORDER_PREFIX: u8 = 10;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_SET_META_MAGIC: &[u8; 8] = b"HYSETM01";
 const STRUCTURE_LIST_META_MAGIC: &[u8; 8] = b"HYLSTM01";
 const STRUCTURE_LIST_CHUNK_MAGIC: &[u8; 8] = b"HYLSTC01";
+const STRUCTURE_SORTED_SET_META_MAGIC: &[u8; 8] = b"HYZSTM01";
+const STRUCTURE_SORTED_SET_SCORE_MAGIC: &[u8; 8] = b"HYZSCR01";
 const STRUCTURE_HASH_META_SIZE: usize = 16;
 const STRUCTURE_SET_META_SIZE: usize = 16;
 const STRUCTURE_LIST_META_SIZE: usize = 32;
 const STRUCTURE_LIST_CHUNK_HEADER_SIZE: usize = 16;
 const STRUCTURE_LIST_CHUNK_MAX_ELEMENTS: usize = 64;
 const STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES: usize = 10_000;
+const STRUCTURE_SORTED_SET_META_SIZE: usize = 16;
+const STRUCTURE_SORTED_SET_SCORE_SIZE: usize = 16;
 const STRUCTURE_VALUE_HEADER_SIZE: usize = 24;
 const STRUCTURE_VALUE_HAS_EXPIRY: u8 = 1;
 const STRUCTURE_VALUE_TOMBSTONE: u8 = 2;
@@ -287,6 +295,12 @@ pub enum NativeRuntimeError {
     /// The requested native list does not exist.
     #[error("native structure list does not exist")]
     UnknownStructureList,
+    /// The requested native sorted set does not exist.
+    #[error("native structure sorted set does not exist")]
+    UnknownStructureSortedSet,
+    /// A native sorted-set score is NaN or has a noncanonical encoding.
+    #[error("native structure sorted-set score is not canonical")]
+    StructureScoreNotCanonical,
     /// A native list cannot allocate another signed chunk identity.
     #[error("native structure list chunk identity space is exhausted")]
     StructureListIndexExhausted,
@@ -407,6 +421,48 @@ pub enum HashSetOutcome {
     Added,
     /// The field existed and its value was replaced.
     Updated,
+}
+
+/// Result of one native sorted-set member upsert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZAddOutcome {
+    /// The member did not exist and increased cardinality.
+    Added,
+    /// The member existed and its score changed.
+    Updated,
+    /// The member already had the canonical score; no mutation was added.
+    Unchanged,
+}
+
+/// One native sorted-set result ordered by score and exact member bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortedSetEntry {
+    member: Vec<u8>,
+    score: SortedSetScore,
+}
+
+impl SortedSetEntry {
+    /// Creates an entry after canonicalizing zero and rejecting `NaN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::StructureScoreNotCanonical`] for `NaN`.
+    pub fn new(member: Vec<u8>, score: f64) -> Result<Self, NativeRuntimeError> {
+        Ok(Self {
+            member,
+            score: canonical_sorted_set_score(score)?,
+        })
+    }
+
+    /// Returns the exact binary member.
+    pub fn member(&self) -> &[u8] {
+        &self.member
+    }
+
+    /// Returns the canonical binary64 score.
+    pub const fn score(&self) -> f64 {
+        self.score.value()
+    }
 }
 
 /// Reopen evidence for the native data directory.
@@ -599,6 +655,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -617,6 +674,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -635,6 +693,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -653,6 +712,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -671,6 +731,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -694,6 +755,7 @@ impl NativeSnapshot {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -701,6 +763,75 @@ impl NativeSnapshot {
             .structures
             .lrange(key, start, stop)
             .ok_or(NativeRuntimeError::UnknownStructureList)
+    }
+
+    /// Reads one member score from an existing native sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zscore(&self, key: &[u8], member: &[u8]) -> Result<Option<f64>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zscore(key, member)
+            .map(|score| score.map(SortedSetScore::value))
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+    }
+
+    /// Returns one native sorted set's exact member count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zcard(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zcard(key)
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+    }
+
+    /// Returns an inclusive signed-rank range from one native sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zrange(key, start, stop)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(member, score)| SortedSetEntry { member, score })
+                    .collect()
+            })
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
     }
 
     /// Executes deterministic native lexical matching.
@@ -1536,6 +1667,13 @@ impl NativeDatabase {
                         &structure_list_meta_key(key)?,
                     )?
                     .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_sorted_set_meta_key(key)?,
+                    )?
+                    .is_some()
             {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
@@ -1594,6 +1732,13 @@ impl NativeDatabase {
                         &structure_list_meta_key(key)?,
                     )?
                     .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_sorted_set_meta_key(key)?,
+                    )?
+                    .is_some()
             {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
@@ -1646,7 +1791,14 @@ impl NativeDatabase {
                     &structure_list_meta_key(key)?,
                 )?
                 .is_some();
-            if scalar_exists || hash_exists || list_exists {
+            let sorted_set_exists = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &structure_sorted_set_meta_key(key)?,
+                )?
+                .is_some();
+            if scalar_exists || hash_exists || list_exists || sorted_set_exists {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
             return Err(NativeRuntimeError::UnknownStructureSet);
@@ -1701,7 +1853,14 @@ impl NativeDatabase {
                     &structure_list_meta_key(key)?,
                 )?
                 .is_some();
-            if scalar_exists || hash_exists || list_exists {
+            let sorted_set_exists = tree
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &structure_sorted_set_meta_key(key)?,
+                )?
+                .is_some();
+            if scalar_exists || hash_exists || list_exists || sorted_set_exists {
                 return Err(NativeRuntimeError::StructureKindMismatch);
             }
             return Err(NativeRuntimeError::UnknownStructureSet);
@@ -1750,6 +1909,13 @@ impl NativeDatabase {
                         &self.pages,
                         &self.buffer_pool,
                         &structure_set_meta_key(key),
+                    )?
+                    .is_some()
+                || tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_sorted_set_meta_key(key)?,
                     )?
                     .is_some()
             {
@@ -1806,6 +1972,186 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(values)
+    }
+
+    /// Reads one member score through the current physical membership index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata/member state.
+    pub fn zscore_latest_sorted_set(
+        &self,
+        key: &[u8],
+        member: &[u8],
+    ) -> Result<Option<f64>, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata_key = structure_sorted_set_meta_key(key)?;
+        let Some(metadata) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(tree, key);
+        };
+        decode_sorted_set_metadata(metadata.bytes())?;
+        tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_sorted_set_member_key(key, member)?,
+        )?
+        .map(|encoded| decode_sorted_set_score(encoded.bytes()))
+        .transpose()
+        .map(|score| score.flatten().map(SortedSetScore::value))
+    }
+
+    /// Reads exact sorted-set cardinality through physical metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata.
+    pub fn zcard_latest_sorted_set(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata_key = structure_sorted_set_meta_key(key)?;
+        let Some(metadata) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(tree, key);
+        };
+        usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Reads an inclusive signed-rank range through the ordered physical index.
+    ///
+    /// Traversal stops after the last requested live rank and does not
+    /// materialize the complete sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata/index state.
+    pub fn zrange_latest_sorted_set(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata_key = structure_sorted_set_meta_key(key)?;
+        let Some(metadata) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(tree, key);
+        };
+        let length = usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let Some((range_start, range_stop)) = normalize_list_range(length, start, stop) else {
+            return Ok(Vec::new());
+        };
+        let prefix = structure_sorted_set_order_prefix(key)?;
+        let mut live_rank = 0_usize;
+        let mut entries = Vec::with_capacity(range_stop - range_start + 1);
+        let mut failure = None;
+        let _visit = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            None,
+            |physical_key, value| {
+                let decoded = (|| {
+                    let (_, score, member) = decode_sorted_set_order_identity(&physical_key[1..])?;
+                    let live = decode_set_member_value(value)?;
+                    Ok::<_, NativeRuntimeError>((score, member, live))
+                })();
+                let (score, member, live) = match decoded {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if !live {
+                    return ControlFlow::Continue(());
+                }
+                if live_rank >= range_start {
+                    entries.push(SortedSetEntry {
+                        member: member.to_vec(),
+                        score,
+                    });
+                }
+                if live_rank == range_stop {
+                    return ControlFlow::Break(());
+                }
+                live_rank += 1;
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if entries.len() != range_stop - range_start + 1 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(entries)
+    }
+
+    fn sorted_set_missing_or_kind_error<T>(
+        &self,
+        tree: BTree,
+        key: &[u8],
+    ) -> Result<T, NativeRuntimeError> {
+        let scalar = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+            .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let hash = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_hash_meta_key(key),
+            )?
+            .is_some();
+        let set = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
+            .is_some();
+        let list = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_list_meta_key(key)?,
+            )?
+            .is_some();
+        if scalar || hash || set || list {
+            Err(NativeRuntimeError::StructureKindMismatch)
+        } else {
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        }
     }
 
     /// Executes BM25 matching through the current physical inverted index.
@@ -2638,6 +2984,7 @@ impl NativeWriteBatch {
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2685,6 +3032,7 @@ impl NativeWriteBatch {
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2727,6 +3075,7 @@ impl NativeWriteBatch {
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2773,6 +3122,7 @@ impl NativeWriteBatch {
         if self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2850,6 +3200,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2885,6 +3236,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2911,6 +3263,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -2944,6 +3297,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3000,6 +3354,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3033,6 +3388,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3062,6 +3418,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
             || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3095,6 +3452,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3169,6 +3527,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3220,6 +3579,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(&key)
             || self.state.structures.hashes.contains_key(&key)
             || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3254,6 +3614,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3277,6 +3638,7 @@ impl NativeWriteBatch {
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.hashes.contains_key(key)
             || self.state.structures.sets.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
@@ -3284,6 +3646,195 @@ impl NativeWriteBatch {
             .structures
             .lrange(key, start, stop)
             .ok_or(NativeRuntimeError::UnknownStructureList)
+    }
+
+    /// Creates one explicitly typed empty native sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized key, or an existing
+    /// structure key.
+    pub fn create_sorted_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        structure_sorted_set_meta_key(&key)?;
+        if !self.state.structures.create_sorted_set(key.clone()) {
+            return Err(NativeRuntimeError::StructureKeyExists);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::CreateSortedSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(())
+    }
+
+    /// Adds or rescoring one exact binary sorted-set member.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, an oversized identity, or `NaN`.
+    pub fn zadd(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        score: f64,
+        member: impl Into<Vec<u8>>,
+    ) -> Result<ZAddOutcome, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let member = member.into();
+        let score = canonical_sorted_set_score(score)?;
+        let identity = sorted_set_member_identity(&key, &member)?;
+        structure_sorted_set_order_key(&key, score, &member)?;
+        let previous = self
+            .state
+            .structures
+            .zadd(&key, member, score)
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
+        let outcome = match previous {
+            None => ZAddOutcome::Added,
+            Some(previous) if previous == score => return Ok(ZAddOutcome::Unchanged),
+            Some(_) => ZAddOutcome::Updated,
+        };
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::UpsertSortedSetMember,
+            target: None,
+            key: identity,
+            value: score.canonical_bits().to_be_bytes().to_vec(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(outcome)
+    }
+
+    /// Reads one member score from the private sorted-set state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zscore(&self, key: &[u8], member: &[u8]) -> Result<Option<f64>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zscore(key, member)
+            .map(|score| score.map(SortedSetScore::value))
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+    }
+
+    /// Removes one exact binary member without deleting the typed sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or an oversized identity.
+    pub fn zrem(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        member: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        if self.structure_format != StructureFormat::BTreeV1 {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.hashes.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let member = member.into();
+        let identity = sorted_set_member_identity(&key, &member)?;
+        let removed = self
+            .state
+            .structures
+            .zrem(&key, &member)
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
+        if removed.is_none() {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSetMember,
+            target: None,
+            key: identity,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Returns the current private exact sorted-set cardinality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zcard(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zcard(key)
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+    }
+
+    /// Returns an inclusive signed-rank range from private sorted-set state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .zrange(key, start, stop)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(member, score)| SortedSetEntry { member, score })
+                    .collect()
+            })
+            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
     }
 
     /// Creates one native text search collection.
@@ -3686,6 +4237,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.sorted_sets.contains_key(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
@@ -3702,6 +4254,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.sorted_sets.contains_key(&mutation.key)
                 || state.delete(&mutation.key).is_none()
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -3713,6 +4266,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.sorted_sets.contains_key(&mutation.key)
                 || !state.entries.contains_key(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -3764,6 +4318,46 @@ fn apply_structure_mutation(
         | Opcode::PushListTail
         | Opcode::PopListHead
         | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
+        Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
+            apply_sorted_set_mutation(state, mutation)?
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn apply_sorted_set_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    if mutation.target.is_some() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    match mutation.opcode {
+        Opcode::CreateSortedSet => {
+            if !mutation.value.is_empty() || !state.create_sorted_set(mutation.key.clone()) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::UpsertSortedSetMember => {
+            let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
+            let score = decode_sorted_set_wal_score(&mutation.value)?;
+            let previous = state
+                .zadd(key, member.to_vec(), score)
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            if previous == Some(score) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::DeleteSortedSetMember => {
+            if !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
+            if state.zrem(key, member).flatten().is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
     Ok(())
@@ -3876,7 +4470,10 @@ fn apply_mutations_to_state(
             | Opcode::PushListHead
             | Opcode::PushListTail
             | Opcode::PopListHead
-            | Opcode::PopListTail => {
+            | Opcode::PopListTail
+            | Opcode::CreateSortedSet
+            | Opcode::UpsertSortedSetMember
+            | Opcode::DeleteSortedSetMember => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CreateIndex => {
@@ -4053,6 +4650,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::CreateHash
             | Opcode::CreateSet
             | Opcode::CreateList
+            | Opcode::CreateSortedSet
             | Opcode::PushListHead
             | Opcode::PushListTail
             | Opcode::PopListHead
@@ -4071,6 +4669,12 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             Opcode::AddSetMember | Opcode::DeleteSetMember => {
                 let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
                 identity.push(2);
+                identity.extend_from_slice(&mutation.key);
+                identity
+            }
+            Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
+                let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
+                identity.push(4);
                 identity.extend_from_slice(&mutation.key);
                 identity
             }
@@ -4522,6 +5126,24 @@ fn structure_list_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
     Ok(encoded)
 }
 
+fn canonical_sorted_set_score(score: f64) -> Result<SortedSetScore, NativeRuntimeError> {
+    SortedSetScore::new(score).ok_or(NativeRuntimeError::StructureScoreNotCanonical)
+}
+
+fn structure_sorted_set_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if key
+        .len()
+        .checked_add(13)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(1));
+    encoded.push(STRUCTURE_SORTED_SET_META_PREFIX);
+    encoded.extend_from_slice(key);
+    Ok(encoded)
+}
+
 fn list_chunk_identity(key: &[u8], chunk_id: i64) -> Result<Vec<u8>, NativeRuntimeError> {
     let key_length =
         u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
@@ -4614,6 +5236,22 @@ fn decode_set_member_identity(encoded: &[u8]) -> Result<(&[u8], &[u8]), NativeRu
     decode_collection_member_identity(encoded)
 }
 
+fn sorted_set_member_identity(key: &[u8], member: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = collection_member_identity(key, member)?;
+    if identity
+        .len()
+        .checked_add(1)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    Ok(identity)
+}
+
+fn decode_sorted_set_member_identity(encoded: &[u8]) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
+    decode_collection_member_identity(encoded)
+}
+
 fn structure_hash_field_key(key: &[u8], field: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
     let identity = hash_field_identity(key, field)?;
     let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
@@ -4627,6 +5265,92 @@ fn structure_set_member_key(key: &[u8], member: &[u8]) -> Result<Vec<u8>, Native
     let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
     encoded.push(STRUCTURE_SET_MEMBER_PREFIX);
     encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn structure_sorted_set_member_key(
+    key: &[u8],
+    member: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = sorted_set_member_identity(key, member)?;
+    let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
+    encoded.push(STRUCTURE_SORTED_SET_MEMBER_PREFIX);
+    encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn sorted_set_order_identity(
+    key: &[u8],
+    score: SortedSetScore,
+    member: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let key_length =
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+    let mut encoded = Vec::with_capacity(
+        12_usize
+            .saturating_add(key.len())
+            .saturating_add(member.len()),
+    );
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(key);
+    encoded.extend_from_slice(&score.sortable_bits().to_be_bytes());
+    encoded.extend_from_slice(member);
+    if encoded
+        .len()
+        .checked_add(1)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    Ok(encoded)
+}
+
+fn decode_sorted_set_order_identity(
+    encoded: &[u8],
+) -> Result<(&[u8], SortedSetScore, &[u8]), NativeRuntimeError> {
+    let length_bytes = encoded
+        .get(..4)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut length = [0_u8; 4];
+    length.copy_from_slice(length_bytes);
+    let key_length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    let score_start = 4_usize
+        .checked_add(key_length)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let member_start = score_start
+        .checked_add(8)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if member_start > encoded.len() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut sortable = [0_u8; 8];
+    sortable.copy_from_slice(&encoded[score_start..member_start]);
+    let score = SortedSetScore::from_sortable_bits(u64::from_be_bytes(sortable))
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    Ok((&encoded[4..score_start], score, &encoded[member_start..]))
+}
+
+fn structure_sorted_set_order_key(
+    key: &[u8],
+    score: SortedSetScore,
+    member: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = sorted_set_order_identity(key, score, member)?;
+    let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
+    encoded.push(STRUCTURE_SORTED_SET_ORDER_PREFIX);
+    encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn structure_sorted_set_order_prefix(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    structure_sorted_set_meta_key(key)?;
+    let key_length =
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(5));
+    encoded.push(STRUCTURE_SORTED_SET_ORDER_PREFIX);
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(key);
     Ok(encoded)
 }
 
@@ -4694,6 +5418,55 @@ fn decode_set_member_value(encoded: &[u8]) -> Result<bool, NativeRuntimeError> {
     } else {
         Err(NativeRuntimeError::InvalidStructureTree)
     }
+}
+
+fn encode_sorted_set_metadata(member_count: u64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_META_SIZE);
+    encoded.extend_from_slice(STRUCTURE_SORTED_SET_META_MAGIC);
+    encoded.extend_from_slice(&member_count.to_le_bytes());
+    encoded
+}
+
+fn decode_sorted_set_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
+    if encoded.len() != STRUCTURE_SORTED_SET_META_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_SORTED_SET_META_MAGIC.as_slice())
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut count = [0_u8; 8];
+    count.copy_from_slice(&encoded[8..16]);
+    Ok(u64::from_le_bytes(count))
+}
+
+fn encode_sorted_set_score(score: SortedSetScore) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_SCORE_SIZE);
+    encoded.extend_from_slice(STRUCTURE_SORTED_SET_SCORE_MAGIC);
+    encoded.extend_from_slice(&score.canonical_bits().to_be_bytes());
+    encoded
+}
+
+fn decode_sorted_set_score(encoded: &[u8]) -> Result<Option<SortedSetScore>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        return Ok(None);
+    }
+    if encoded.len() != STRUCTURE_SORTED_SET_SCORE_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_SORTED_SET_SCORE_MAGIC.as_slice())
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut bits = [0_u8; 8];
+    bits.copy_from_slice(&encoded[8..16]);
+    SortedSetScore::from_canonical_bits(u64::from_be_bytes(bits))
+        .map(Some)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)
+}
+
+fn decode_sorted_set_wal_score(encoded: &[u8]) -> Result<SortedSetScore, NativeRuntimeError> {
+    let bits: [u8; 8] = encoded
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    SortedSetScore::from_canonical_bits(u64::from_be_bytes(bits))
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5136,6 +5909,9 @@ fn create_hash_in_tree(
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
             .is_some()
+        || tree
+            .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
+            .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
@@ -5166,6 +5942,9 @@ fn create_set_in_tree(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .is_some()
+        || tree
+            .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
             .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -5350,6 +6129,9 @@ fn create_list_in_tree(
             .get(pages, &structure_set_meta_key(&mutation.key))?
             .is_some()
         || tree
+            .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
+            .is_some()
+        || tree
             .get(pages, &structure_key(&mutation.key))?
             .is_some_and(|value| !is_structure_tombstone(&value))
     {
@@ -5361,6 +6143,165 @@ fn create_list_in_tree(
             creating_csn,
             metadata_key,
             encode_list_metadata(ListMetadata::empty()),
+        )?
+        .tree)
+}
+
+fn create_sorted_set_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    if tree.get(pages, &metadata_key)?.is_some()
+        || tree
+            .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_set_meta_key(&mutation.key))?
+            .is_some()
+        || tree
+            .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .is_some()
+        || tree
+            .get(pages, &structure_key(&mutation.key))?
+            .is_some_and(|value| !is_structure_tombstone(&value))
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .insert_unique(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_sorted_set_metadata(0),
+        )?
+        .tree)
+}
+
+fn upsert_sorted_set_member_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
+    let score = decode_sorted_set_wal_score(&mutation.value)
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    let metadata_key = structure_sorted_set_meta_key(key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut count = decode_sorted_set_metadata(&metadata)?;
+    let member_key = structure_sorted_set_member_key(key, member)?;
+    let previous = tree
+        .get(pages, &member_key)?
+        .map(|encoded| decode_sorted_set_score(&encoded))
+        .transpose()?
+        .flatten();
+    if previous == Some(score) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if let Some(previous) = previous {
+        let old_order_key = structure_sorted_set_order_key(key, previous, member)?;
+        let old_marker = tree
+            .get(pages, &old_order_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if !decode_set_member_value(&old_marker)? {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                old_order_key,
+                structure_tombstone_value(),
+            )?
+            .tree;
+    } else {
+        count = count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                metadata_key.clone(),
+                encode_sorted_set_metadata(count),
+            )?
+            .tree;
+    }
+    let new_order_key = structure_sorted_set_order_key(key, score, member)?;
+    if tree
+        .get(pages, &new_order_key)?
+        .is_some_and(|encoded| decode_set_member_value(&encoded).unwrap_or(true))
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tree = tree
+        .upsert(
+            pages,
+            creating_csn,
+            member_key,
+            encode_sorted_set_score(score),
+        )?
+        .tree;
+    Ok(tree
+        .upsert(pages, creating_csn, new_order_key, set_member_live_value())?
+        .tree)
+}
+
+fn delete_sorted_set_member_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
+    let metadata_key = structure_sorted_set_meta_key(key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let count = decode_sorted_set_metadata(&metadata)?;
+    let member_key = structure_sorted_set_member_key(key, member)?;
+    let score = tree
+        .get(pages, &member_key)?
+        .map(|encoded| decode_sorted_set_score(&encoded))
+        .transpose()?
+        .flatten()
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let order_key = structure_sorted_set_order_key(key, score, member)?;
+    let order_marker = tree
+        .get(pages, &order_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if !decode_set_member_value(&order_marker)? {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tree = tree
+        .upsert(pages, creating_csn, member_key, structure_tombstone_value())?
+        .tree;
+    tree = tree
+        .upsert(pages, creating_csn, order_key, structure_tombstone_value())?
+        .tree;
+    let count = count
+        .checked_sub(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_sorted_set_metadata(count),
         )?
         .tree)
 }
@@ -5594,6 +6535,13 @@ fn apply_structure_tree_mutation(
         Opcode::CreateSet => create_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::AddSetMember => add_set_member_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteSetMember => delete_set_member_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::CreateSortedSet => create_sorted_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::UpsertSortedSetMember => {
+            upsert_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
+        }
+        Opcode::DeleteSortedSetMember => {
+            delete_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
+        }
         Opcode::CreateList => create_list_in_tree(pages, tree, creating_csn, mutation),
         Opcode::PushListHead | Opcode::PushListTail => push_list_in_tree(
             pages,
@@ -5647,6 +6595,9 @@ fn upsert_scalar_structure_mutation(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .is_some()
+        || tree
+            .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
             .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -7017,6 +7968,9 @@ struct StructureTreeDecoder {
     set_counts: BTreeMap<Vec<u8>, u64>,
     list_metadata: BTreeMap<Vec<u8>, ListMetadata>,
     list_chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
+    sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
+    sorted_set_counts: BTreeMap<Vec<u8>, u64>,
+    sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
 }
 
 impl StructureTreeDecoder {
@@ -7063,7 +8017,80 @@ impl StructureTreeDecoder {
             Some(STRUCTURE_SET_MEMBER_PREFIX) => self.consume_set_member(&key[1..], value)?,
             Some(STRUCTURE_LIST_META_PREFIX) => self.consume_list_metadata(&key[1..], value)?,
             Some(STRUCTURE_LIST_CHUNK_PREFIX) => self.consume_list_chunk(&key[1..], value)?,
+            Some(STRUCTURE_SORTED_SET_META_PREFIX) => {
+                self.consume_sorted_set_metadata(&key[1..], value)?;
+            }
+            Some(STRUCTURE_SORTED_SET_MEMBER_PREFIX) => {
+                self.consume_sorted_set_member(&key[1..], value)?;
+            }
+            Some(STRUCTURE_SORTED_SET_ORDER_PREFIX) => {
+                self.consume_sorted_set_order(&key[1..], value)?;
+            }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        }
+        Ok(())
+    }
+
+    fn consume_sorted_set_metadata(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let sorted_set = key.to_vec();
+        if self.entries.contains_key(&sorted_set)
+            || self.hashes.contains_key(&sorted_set)
+            || self.sets.contains_key(&sorted_set)
+            || self.list_metadata.contains_key(&sorted_set)
+            || self
+                .sorted_sets
+                .insert(sorted_set.clone(), BTreeMap::new())
+                .is_some()
+            || self
+                .sorted_set_counts
+                .insert(sorted_set, decode_sorted_set_metadata(value)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_sorted_set_member(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let (sorted_set, member) = decode_sorted_set_member_identity(identity)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let members = self
+            .sorted_sets
+            .get_mut(sorted_set)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if let Some(score) = decode_sorted_set_score(value)?
+            && members.insert(member.to_vec(), score).is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_sorted_set_order(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let (sorted_set, score, member) = decode_sorted_set_order_identity(identity)?;
+        if !self.sorted_sets.contains_key(sorted_set) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if decode_set_member_value(value)?
+            && !self
+                .sorted_set_order
+                .entry(sorted_set.to_vec())
+                .or_default()
+                .insert((score, member.to_vec()))
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(())
     }
@@ -7150,15 +8177,20 @@ impl StructureTreeDecoder {
             set_counts,
             list_metadata,
             list_chunks,
+            sorted_sets,
+            sorted_set_counts,
+            sorted_set_order,
         } = self;
         validate_hash_counts(&hashes, hash_counts)?;
         validate_set_counts(&sets, set_counts)?;
         let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
+        validate_sorted_sets(&sorted_sets, sorted_set_counts, sorted_set_order)?;
         Ok(StructureState {
             entries,
             hashes,
             sets,
             lists,
+            sorted_sets,
         })
     }
 }
@@ -7238,6 +8270,34 @@ fn validate_set_counts(
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
+    }
+    Ok(())
+}
+
+fn validate_sorted_sets(
+    sorted_sets: &BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
+    expected_counts: BTreeMap<Vec<u8>, u64>,
+    mut ordered: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
+) -> Result<(), NativeRuntimeError> {
+    for (key, members) in sorted_sets {
+        let expected = expected_counts
+            .get(key)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let actual =
+            u64::try_from(members.len()).map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if actual != *expected {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let expected_order = members
+            .iter()
+            .map(|(member, score)| (*score, member.clone()))
+            .collect::<BTreeSet<_>>();
+        if ordered.remove(key).unwrap_or_default() != expected_order {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    if expected_counts.len() != sorted_sets.len() || !ordered.is_empty() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
     }
     Ok(())
 }
@@ -7686,8 +8746,8 @@ mod tests {
     use super::{
         AnnSearchOptions, CatalogObject, CheckpointBoundary, CommitBoundary, HashSetOutcome,
         HnswConfig, NativeDatabase, NativeRuntimeError, NativeWriteBatch, PAGE_FILE,
-        RelationalScanRow, SetCondition, SetOutcome, SqlError, SqlResult, SqlValue, Vector,
-        VectorMetric,
+        RelationalScanRow, SetCondition, SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue,
+        Vector, VectorMetric, ZAddOutcome,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -8678,6 +9738,376 @@ mod tests {
         assert_eq!(
             reopened.lrange_latest_list(b"queue", 0, -1)?,
             [b"one".to_vec(), b"three".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_sorted_set_orders_updates_history_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"leaderboard".to_vec())?;
+        assert_eq!(
+            seed.zadd(b"leaderboard".to_vec(), 20.0, b"charlie".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            seed.zadd(b"leaderboard".to_vec(), -0.0, b"alpha".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            seed.zadd(b"leaderboard".to_vec(), 20.0, b"bravo".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            seed.zrange(b"leaderboard", 0, -1)?,
+            [
+                SortedSetEntry::new(b"alpha".to_vec(), 0.0)?,
+                SortedSetEntry::new(b"bravo".to_vec(), 20.0)?,
+                SortedSetEntry::new(b"charlie".to_vec(), 20.0)?,
+            ]
+        );
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert_eq!(
+            mutate.zadd(b"leaderboard".to_vec(), 5.0, b"charlie".to_vec())?,
+            ZAddOutcome::Updated
+        );
+        assert_eq!(
+            mutate.zadd(b"leaderboard".to_vec(), 20.0, b"bravo".to_vec())?,
+            ZAddOutcome::Unchanged
+        );
+        assert!(mutate.zrem(b"leaderboard".to_vec(), b"alpha".to_vec())?);
+        assert_eq!(mutate.zcard(b"leaderboard")?, 2);
+        mutate.commit()?;
+
+        assert_eq!(historical.zscore(b"leaderboard", b"alpha")?, Some(0.0));
+        assert_eq!(historical.zcard(b"leaderboard")?, 3);
+        assert_eq!(
+            database.zrange_latest_sorted_set(b"leaderboard", 0, -1)?,
+            [
+                SortedSetEntry::new(b"charlie".to_vec(), 5.0)?,
+                SortedSetEntry::new(b"bravo".to_vec(), 20.0)?,
+            ]
+        );
+        assert_eq!(
+            database.zscore_latest_sorted_set(b"leaderboard", b"charlie")?,
+            Some(5.0)
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        assert_eq!(reopened.zcard_latest_sorted_set(b"leaderboard")?, 2);
+        assert_eq!(
+            reopened.zrange_latest_sorted_set(b"leaderboard", -1, -1)?,
+            [SortedSetEntry::new(b"bravo".to_vec(), 20.0)?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_sorted_sets_reject_nan_enforce_types_and_bound_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin(10, DurabilityClass::Strict)?;
+        transaction.create_sorted_set(b"scores".to_vec())?;
+        assert!(matches!(
+            transaction.zadd(b"scores".to_vec(), f64::NAN, b"invalid".to_vec()),
+            Err(NativeRuntimeError::StructureScoreNotCanonical)
+        ));
+        assert_eq!(transaction.zcard(b"scores")?, 0);
+        assert_eq!(
+            transaction.zadd(b"scores".to_vec(), -0.0, b"zero".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            transaction.zadd(b"scores".to_vec(), 0.0, b"zero".to_vec())?,
+            ZAddOutcome::Unchanged
+        );
+        assert_eq!(
+            transaction.zadd(b"scores".to_vec(), f64::NEG_INFINITY, b"first".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            transaction.zadd(b"scores".to_vec(), -1.0, b"negative".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            transaction.zadd(b"scores".to_vec(), f64::INFINITY, b"last".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            transaction.zrange(b"scores", -100, 100)?,
+            [
+                SortedSetEntry::new(b"first".to_vec(), f64::NEG_INFINITY)?,
+                SortedSetEntry::new(b"negative".to_vec(), -1.0)?,
+                SortedSetEntry::new(b"zero".to_vec(), 0.0)?,
+                SortedSetEntry::new(b"last".to_vec(), f64::INFINITY)?,
+            ]
+        );
+        assert!(matches!(
+            transaction.set(b"scores".to_vec(), b"scalar".to_vec(), None),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.hset(b"scores".to_vec(), b"field".to_vec(), b"value".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.sadd(b"scores".to_vec(), b"member".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.rpush(b"scores".to_vec(), b"value".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            transaction.zadd(
+                b"scores".to_vec(),
+                1.0,
+                vec![b'x'; hyphae_native_btree::BTREE_MAX_KEY_SIZE],
+            ),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        transaction.commit()?;
+
+        assert!(matches!(
+            database.hlen_latest_hash(b"scores"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.scard_latest_set(b"scores"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.llen_latest_list(b"scores"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.zcard_latest_sorted_set(b"missing"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        let mut oversized = database.begin(11, DurabilityClass::Strict)?;
+        assert!(matches!(
+            oversized.create_sorted_set(vec![b'x'; hyphae_native_btree::BTREE_MAX_KEY_SIZE]),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        oversized.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_sorted_set_writers_rebase_disjoint_members_and_conflict_per_member()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"rank".to_vec())?;
+        seed.commit()?;
+
+        let mut first = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        let mut second = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        first.zadd(b"rank".to_vec(), 1.0, b"alpha".to_vec())?;
+        second.zadd(b"rank".to_vec(), 2.0, b"beta".to_vec())?;
+        database.commit_optimistic(first)?;
+        database.commit_optimistic(second)?;
+        assert_eq!(database.zcard_latest_sorted_set(b"rank")?, 2);
+
+        let mut winner = database.begin_optimistic(12, DurabilityClass::Strict)?;
+        let mut loser = database.begin_optimistic(12, DurabilityClass::Strict)?;
+        winner.zadd(b"rank".to_vec(), 3.0, b"race".to_vec())?;
+        loser.zadd(b"rank".to_vec(), 4.0, b"race".to_vec())?;
+        database.commit_optimistic(winner)?;
+        assert!(matches!(
+            database.commit_optimistic(loser),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.zscore_latest_sorted_set(b"rank", b"race")?,
+            Some(3.0)
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.recovery_report().committed_transactions, 4);
+        assert_eq!(reopened.zcard_latest_sorted_set(b"rank")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_dual_index_corruption_fails_complete_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"corrupt".to_vec())?;
+        seed.zadd(b"corrupt".to_vec(), 1.0, b"alpha".to_vec())?;
+        seed.zadd(b"corrupt".to_vec(), 2.0, b"beta".to_vec())?;
+        seed.commit()?;
+
+        let roots = database.coordinator.snapshot(11)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forgeries = [
+            (
+                super::structure_sorted_set_meta_key(b"corrupt")?,
+                super::encode_sorted_set_metadata(3),
+            ),
+            (
+                super::structure_sorted_set_member_key(b"corrupt", b"beta")?,
+                super::encode_sorted_set_score(super::canonical_sorted_set_score(3.0)?),
+            ),
+            (
+                super::structure_sorted_set_order_key(
+                    b"corrupt",
+                    super::canonical_sorted_set_score(1.0)?,
+                    b"alpha",
+                )?,
+                super::structure_tombstone_value(),
+            ),
+        ];
+        for (key, value) in forgeries {
+            let forged_tree = hyphae_native_btree::BTree::from_root(root)
+                .upsert(&mut database.pages, Csn::new(1)?, key, value)?
+                .tree;
+            let mut forged_roots = roots
+                .iter_roots()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            forged_roots.insert(
+                super::SLOT_STRUCTURE,
+                forged_tree
+                    .root()
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+            );
+            let forged = hyphae_native_mvcc::RootSet::committed(
+                roots
+                    .visible_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                roots.catalog_version(),
+                roots
+                    .wal_anchor()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                forged_roots,
+                roots.blob_generation(),
+            )?;
+            assert!(matches!(
+                super::load_structure_state(&database.pages, &database.blobs, &forged),
+                Err(NativeRuntimeError::InvalidStructureTree)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_sorted_set_commit_boundary_recovers_prior_or_complete_dual_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_sorted_set(b"crash-rank".to_vec())?;
+            seed.zadd(b"crash-rank".to_vec(), 1.0, b"prior".to_vec())?;
+            seed.commit()?;
+
+            let mut mutate = database.begin(11, DurabilityClass::Strict)?;
+            mutate.zadd(b"crash-rank".to_vec(), 2.0, b"complete".to_vec())?;
+            mutate.zadd(b"crash-rank".to_vec(), 3.0, b"prior".to_vec())?;
+            let result = mutate.commit_with_interruption(boundary);
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(
+                    reopened.zrange_latest_sorted_set(b"crash-rank", 0, -1)?,
+                    [SortedSetEntry::new(b"prior".to_vec(), 1.0)?]
+                ),
+                Some(2) => assert_eq!(
+                    reopened.zrange_latest_sorted_set(b"crash-rank", 0, -1)?,
+                    [
+                        SortedSetEntry::new(b"complete".to_vec(), 2.0)?,
+                        SortedSetEntry::new(b"prior".to_vec(), 3.0)?,
+                    ]
+                ),
+                other => {
+                    return Err(format!(
+                        "unexpected recovered sorted-set CSN {other:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_sorted_set_ranges_retain_snapshots_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_sorted_set(b"large-rank".to_vec())?;
+        for index in 0..2_048_u32 {
+            seed.zadd(
+                b"large-rank".to_vec(),
+                f64::from(index),
+                index.to_be_bytes().to_vec(),
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+        let historical = database.snapshot(101)?;
+
+        let target = 1_024_u32.to_be_bytes();
+        let removed = 1_025_u32.to_be_bytes();
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        mutate.zadd(b"large-rank".to_vec(), -1.0, target.to_vec())?;
+        assert!(mutate.zrem(b"large-rank".to_vec(), removed.to_vec())?);
+        mutate.commit()?;
+
+        assert_eq!(historical.zscore(b"large-rank", &target)?, Some(1_024.0));
+        assert_eq!(historical.zcard(b"large-rank")?, 2_048);
+        assert_eq!(database.zcard_latest_sorted_set(b"large-rank")?, 2_047);
+        assert_eq!(
+            database.zrange_latest_sorted_set(b"large-rank", 0, 1)?,
+            [
+                SortedSetEntry::new(target.to_vec(), -1.0)?,
+                SortedSetEntry::new(0_u32.to_be_bytes().to_vec(), 0.0)?,
+            ]
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.zcard_latest_sorted_set(b"large-rank")?, 2_047);
+        assert_eq!(
+            reopened.zscore_latest_sorted_set(b"large-rank", &target)?,
+            Some(-1.0)
+        );
+        assert_eq!(
+            reopened.zscore_latest_sorted_set(b"large-rank", &removed)?,
+            None
         );
         Ok(())
     }
