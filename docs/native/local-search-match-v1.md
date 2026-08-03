@@ -1,6 +1,7 @@
 # Native local SEARCH MATCH v1
 
-Status: contract frozen; implementation and direct-Linux evidence pending.
+Status: implemented over the serial UDS session; direct-Linux evidence
+recorded; complete search and performance gates remain open.
 
 This contract adds the first search-engine operation to the serial
 filesystem-backed `HYPHLCL1` session. It carries a catalog object identity,
@@ -134,6 +135,12 @@ closure. It must disclose corpus size, term distribution, result count,
 response bytes, warmup, sample count, CPU affinity, virtualization,
 filesystem, maxima, and missing cold/saturation/allocation/hardware-counter
 lanes.
+
+The matched
+[direct-Linux evidence](../gates/evidence/native-local-search-match-linux-2026-08-03.md)
+binds canonical codecs, physical execution, request-local recovery, reopen
+equivalence, and separately measured embedded/PING/UDS distributions to exact
+commits and raw receipt hashes.
 
 ## Boundary
 

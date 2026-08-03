@@ -151,6 +151,18 @@ subtractive transport estimate, timing decomposition, cold/saturation/
 interference/allocation/counter matrix, group scheduler, or regression
 threshold.
 
+The
+[local SEARCH MATCH receipt](../gates/evidence/native-local-search-match-linux-2026-08-03.md)
+uses a 2,048-document, height-two physical inverted index and one rare-term
+hit. Across three release runs, median embedded MATCH p50/p99 was
+`23.346/32.704 us`; persistent PING was `23.358/33.728 us`; and the complete
+32-byte MATCH result round trip was `56.150/68.327 us`. All three bounded
+surfaces remain in microseconds. Their independent percentiles are not
+subtracted to infer engine or transport cost. The virtualized, warm,
+concurrency-one observation lacks cold/saturation/interference/allocation/
+counter lanes, a Windows named-pipe counterpart, and an accepted regression
+threshold, so it does not pass G4, G6, or G7.
+
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5
 added one explicitly typed hash with 2,048 independent 64-byte fields and

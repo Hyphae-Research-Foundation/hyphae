@@ -655,6 +655,18 @@ and physical-durability work rather than satisfying G7. Group durability,
 replay/idempotency, explicit transactions, SQL/search operations, complete
 session semantics, Windows named pipes, and the G7 matrix remain open.
 
+The [native local SEARCH MATCH
+evidence](evidence/native-local-search-match-linux-2026-08-03.md) adds the
+first search-engine operation to that UDS session. It binds a nonzero catalog
+identity, bounded UTF-8 query, visible all-engine CSN, positive finite BM25
+scores, and strict score/document ordering to the physical inverted index.
+Across three direct-Linux runs over 2,048 documents, median physical MATCH
+p50/p99 was `23.346/32.704 us`; the complete one-hit UDS round trip was
+`56.150/68.327 us`, with independent PING at `23.358/33.728 us`. The receipt
+does not subtract those distributions or close G4/G6/G7. SQL, document
+mutation, ANN/hybrid search, streaming, Windows named pipes, concurrency,
+saturation, allocation, and hardware-counter lanes remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit

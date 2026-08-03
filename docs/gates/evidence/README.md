@@ -725,3 +725,14 @@ detectable.
   The read routes remain in the microsecond domain, while memory SET is
   hundreds of microseconds and strict SET is milliseconds. The receipt exposes
   that deficit and is not a regression threshold or G0/G1/G3/G6/G7 closure.
+
+## Native local SEARCH MATCH on Linux
+
+- `native-local-search-match-linux-2026-08-03.md` binds the first local
+  search-engine operation to its canonical request/result contract, visible
+  CSN, physical inverted-index route, failure recovery, reopen proof, exact
+  Linux source, and validation logs.
+- `native-local-search-match-linux.json` records three release observations of
+  embedded physical MATCH, persistent PING, and persistent one-hit MATCH.
+  They remain in the microsecond domain but do not establish a regression
+  threshold or close G0/G1/G4/G6/G7.
