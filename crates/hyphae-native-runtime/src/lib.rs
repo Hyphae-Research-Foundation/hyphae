@@ -27,6 +27,8 @@ mod local_transaction;
 #[cfg(unix)]
 mod local_uds;
 mod model;
+#[cfg(test)]
+mod search_lifecycle_equivalence;
 mod set_algebra;
 #[cfg(test)]
 mod set_algebra_equivalence;
@@ -74,12 +76,16 @@ pub use local_protocol::{
 };
 pub use local_search::{
     LOCAL_SEARCH_MATCH_HEADER_SIZE, LOCAL_SEARCH_RESULTS_HEADER_SIZE,
-    LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE, LocalSearchCodecError, LocalSearchMatchHit,
-    LocalSearchMatchRequest, LocalSearchMatchResults, LocalTransactionIndexDocumentRequest,
-    MAX_LOCAL_SEARCH_DOCUMENT_BYTES, MAX_LOCAL_SEARCH_DOCUMENT_ID_BYTES, MAX_LOCAL_SEARCH_HITS,
-    MAX_LOCAL_SEARCH_QUERY_BYTES, decode_local_search_match, decode_local_search_match_results,
-    decode_local_transaction_index_document, encode_local_search_match,
-    encode_local_search_match_results, encode_local_transaction_index_document,
+    LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE, LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE,
+    LocalSearchCodecError, LocalSearchMatchHit, LocalSearchMatchRequest, LocalSearchMatchResults,
+    LocalTransactionDeleteDocumentRequest, LocalTransactionIndexDocumentRequest,
+    LocalTransactionReplaceDocumentRequest, MAX_LOCAL_SEARCH_DOCUMENT_BYTES,
+    MAX_LOCAL_SEARCH_DOCUMENT_ID_BYTES, MAX_LOCAL_SEARCH_HITS, MAX_LOCAL_SEARCH_QUERY_BYTES,
+    decode_local_search_match, decode_local_search_match_results,
+    decode_local_transaction_delete_document, decode_local_transaction_index_document,
+    decode_local_transaction_replace_document, encode_local_search_match,
+    encode_local_search_match_results, encode_local_transaction_delete_document,
+    encode_local_transaction_index_document, encode_local_transaction_replace_document,
 };
 #[cfg(unix)]
 pub use local_session::{LocalDataSession, LocalSessionError};
@@ -282,7 +288,9 @@ pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
 pub const MAX_SET_MEMBER_BATCH_SIZE: usize = 4_096;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
 const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
+type SearchTermFrequencies = BTreeMap<Vec<u8>, u32>;
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
+const SEARCH_FORMAT_VALUE_V2: &[u8] = b"HYSEABT2";
 const SEARCH_INDEX_META_PREFIX: u8 = 1;
 const SEARCH_DOCUMENT_PREFIX: u8 = 2;
 const SEARCH_TERM_META_PREFIX: u8 = 3;
@@ -291,6 +299,9 @@ const SEARCH_INDEX_META_MAGIC: &[u8; 8] = b"HYIDX001";
 const SEARCH_DOCUMENT_MAGIC: &[u8; 8] = b"HYDOCS01";
 const SEARCH_TERM_META_MAGIC: &[u8; 8] = b"HYTERM01";
 const SEARCH_POSTING_MAGIC: &[u8; 8] = b"HYPOST01";
+const SEARCH_DOCUMENT_TOMBSTONE: &[u8; 8] = b"HYDOCT01";
+const SEARCH_TERM_META_TOMBSTONE: &[u8; 8] = b"HYTERMT1";
+const SEARCH_POSTING_TOMBSTONE: &[u8; 8] = b"HYPOSTT1";
 type PhysicalStructureEntries = Vec<(Vec<u8>, Vec<u8>)>;
 const SEARCH_INDEX_META_SIZE: usize = 24;
 const SEARCH_DOCUMENT_HEADER_SIZE: usize = 24;
@@ -381,6 +392,26 @@ impl StructureFormat {
 enum SearchFormat {
     InlineStateV1,
     InvertedBTreeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalSearchFormat {
+    V1,
+    V2,
+}
+
+impl PhysicalSearchFormat {
+    const fn admits_tombstones(self) -> bool {
+        matches!(self, Self::V2)
+    }
+
+    fn decode(marker: &[u8]) -> Result<Self, NativeRuntimeError> {
+        match marker {
+            SEARCH_FORMAT_VALUE_V1 => Ok(Self::V1),
+            SEARCH_FORMAT_VALUE_V2 => Ok(Self::V2),
+            _ => Err(NativeRuntimeError::InvalidSearchTree),
+        }
+    }
 }
 
 /// Native runtime or recovery failure.
@@ -6365,6 +6396,7 @@ impl NativeDatabase {
             .root(SLOT_SEARCH)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
+        let format = physical_search_format(&self.pages, tree)?;
         let metadata = tree
             .get_cached_pinned(
                 &self.pages,
@@ -6389,7 +6421,11 @@ impl NativeDatabase {
             else {
                 continue;
             };
-            let document_frequency = decode_search_term_metadata(term_metadata.bytes())?;
+            let Some(document_frequency) =
+                decode_live_search_term_metadata(term_metadata.bytes(), format)?
+            else {
+                continue;
+            };
             if document_frequency == 0 || document_frequency > document_count {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
@@ -6397,17 +6433,19 @@ impl NativeDatabase {
             let posting_prefix = search_posting_prefix(index, term.as_bytes())?;
             let postings =
                 tree.scan_prefix_cached(&self.pages, &self.buffer_pool, &posting_prefix)?;
-            if u64::try_from(postings.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?
-                != document_frequency
-            {
-                return Err(NativeRuntimeError::InvalidSearchTree);
-            }
+            let mut live_postings = 0_u64;
             for (key, encoded_frequency) in postings {
                 let document_id = key
                     .strip_prefix(posting_prefix.as_slice())
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?
                     .to_vec();
-                let term_frequency = decode_search_posting(&encoded_frequency)?;
+                let Some(term_frequency) = decode_live_search_posting(&encoded_frequency, format)?
+                else {
+                    continue;
+                };
+                live_postings = live_postings
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
                 let document_length = if let Some(length) = document_lengths.get(&document_id) {
                     *length
                 } else {
@@ -6418,6 +6456,9 @@ impl NativeDatabase {
                             &search_document_key(index, &document_id)?,
                         )?
                         .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                    if is_search_document_tombstone(document.bytes()) {
+                        return Err(NativeRuntimeError::InvalidSearchTree);
+                    }
                     let (length, _, _) = decode_search_document_header(document.bytes())?;
                     document_lengths.insert(document_id.clone(), length);
                     length
@@ -6429,20 +6470,11 @@ impl NativeDatabase {
                     average_length,
                 );
             }
+            if live_postings != document_frequency {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
         }
-        let mut hits = scores
-            .into_iter()
-            .filter(|(_, score)| *score > 0.0)
-            .map(|(document_id, score)| MatchHit { document_id, score })
-            .collect::<Vec<_>>();
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.document_id.cmp(&right.document_id))
-        });
-        hits.truncate(limit);
-        Ok((visible_csn, hits))
+        Ok((visible_csn, rank_match_hits(scores, limit)))
     }
 
     /// Executes approximate vector search against the current committed
@@ -6685,21 +6717,43 @@ impl NativeDatabase {
         text: String,
     ) -> Result<(), NativeRuntimeError> {
         self.require_delta_batch(batch)?;
-        self.hydrate_delta_search_index(batch, index)?;
-        batch.state.catalog.require(index, EngineKind::Search)?;
-        let root = batch
-            .snapshot
-            .roots()
-            .root(SLOT_SEARCH)
-            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let document_key = search_document_key(index, &document_id)?;
-        if BTree::from_root(root)
-            .get_cached_pinned(&self.pages, &self.buffer_pool, &document_key)?
-            .is_some()
-        {
-            return Err(ModelError::DuplicateDocumentId.into());
-        }
+        self.hydrate_delta_search_document(batch, index, &document_id)?;
         batch.index_document(index, document_id, text)
+    }
+
+    /// Stages replacement of one exact lexical document in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, unknown index or document,
+    /// invalid identity bounds, or physical corruption.
+    pub fn stage_delta_replace_document(
+        &self,
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        document_id: Vec<u8>,
+        text: String,
+    ) -> Result<(), NativeRuntimeError> {
+        self.require_delta_batch(batch)?;
+        self.hydrate_delta_search_document(batch, index, &document_id)?;
+        batch.replace_document(index, document_id, text)
+    }
+
+    /// Stages deletion of one exact lexical document in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, unknown index or document,
+    /// invalid identity bounds, or physical corruption.
+    pub fn stage_delta_delete_document(
+        &self,
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        document_id: Vec<u8>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.require_delta_batch(batch)?;
+        self.hydrate_delta_search_document(batch, index, &document_id)?;
+        batch.delete_document(index, document_id)
     }
 
     fn require_delta_batch(&self, batch: &NativeWriteBatch) -> Result<(), NativeRuntimeError> {
@@ -6814,6 +6868,56 @@ impl NativeDatabase {
         }
         batch.state.catalog.create(object)?;
         batch.state.search.create_index(index)?;
+        Ok(())
+    }
+
+    fn hydrate_delta_search_document(
+        &self,
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        document_id: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let identity = (index, document_id.to_vec());
+        if batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .search_documents
+            .contains(&identity)
+        {
+            return Ok(());
+        }
+        self.hydrate_delta_search_index(batch, index)?;
+        batch.state.catalog.require(index, EngineKind::Search)?;
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let format = physical_search_format(&self.pages, tree)?;
+        let document_key = search_document_key(index, document_id)?;
+        if let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &document_key)?
+        {
+            if is_search_document_tombstone(encoded.bytes()) {
+                if !format.admits_tombstones() {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+            } else {
+                let (text, _) = decode_search_document(encoded.bytes(), &self.blobs)?;
+                batch
+                    .state
+                    .search
+                    .index_document(index, document_id.to_vec(), text)?;
+            }
+        }
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .search_documents
+            .insert(identity);
         Ok(())
     }
 
@@ -8180,6 +8284,7 @@ fn read_list_range_from_tail(
 struct DeltaOverlay {
     relational_rows: BTreeSet<(ObjectId, Vec<u8>)>,
     structure_scalars: BTreeSet<Vec<u8>>,
+    search_documents: BTreeSet<(ObjectId, Vec<u8>)>,
     unique_probes: BTreeSet<DeltaUniqueProbe>,
 }
 
@@ -10740,6 +10845,64 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Replaces one existing text document and all derived lexical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown collection or document, invalid
+    /// ownership, invalid UTF-8 state, or an oversized physical identity.
+    pub fn replace_document(
+        &mut self,
+        index: ObjectId,
+        document_id: impl Into<Vec<u8>>,
+        text: impl Into<String>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.state.catalog.require(index, EngineKind::Search)?;
+        let document_id = document_id.into();
+        let text = text.into();
+        validate_search_document_identity(&document_id, &text)?;
+        self.state
+            .search
+            .replace_document(index, &document_id, text.clone())?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::ReplaceDocument,
+            target: Some(index),
+            key: document_id,
+            value: text.into_bytes(),
+            expires_at_micros: None,
+        });
+        self.dirty[3] = true;
+        Ok(())
+    }
+
+    /// Deletes one existing text document and all derived lexical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown collection or document, invalid
+    /// ownership, or an oversized physical identity.
+    pub fn delete_document(
+        &mut self,
+        index: ObjectId,
+        document_id: impl Into<Vec<u8>>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.state.catalog.require(index, EngineKind::Search)?;
+        let document_id = document_id.into();
+        validate_search_document_identity(&document_id, "")?;
+        self.state.search.delete_document(index, &document_id)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::DeleteDocument,
+            target: Some(index),
+            key: document_id,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[3] = true;
+        Ok(())
+    }
+
     /// Matches text against the snapshot plus private writes.
     ///
     /// # Errors
@@ -11442,62 +11605,80 @@ fn apply_mutations_to_state(
             Opcode::CompactStructure | Opcode::VacuumPageGeneration => {
                 validate_maintenance_mutation(mutation)?;
             }
-            Opcode::CreateIndex => {
-                let index = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let object = decode_search_creation(index, mutation)?;
-                state.catalog.create(object)?;
-                state.search.create_index(index)?;
-            }
-            Opcode::IndexDocument => {
-                let index = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let text = std::str::from_utf8(&mutation.value)
-                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
-                validate_search_document_identity(&mutation.key, text)
-                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
-                state.catalog.require(index, EngineKind::Search)?;
+            Opcode::CreateIndex
+            | Opcode::IndexDocument
+            | Opcode::ReplaceDocument
+            | Opcode::DeleteDocument
+            | Opcode::CreateAnnIndex
+            | Opcode::UpsertVector
+            | Opcode::DeleteVector => apply_search_mutation_to_state(state, mutation)?,
+        }
+    }
+    Ok(())
+}
+
+fn apply_search_mutation_to_state(
+    state: &mut MaterializedState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    let index = mutation
+        .target
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    match mutation.opcode {
+        Opcode::CreateIndex => {
+            let object = decode_search_creation(index, mutation)?;
+            state.catalog.create(object)?;
+            state.search.create_index(index)?;
+        }
+        Opcode::IndexDocument | Opcode::ReplaceDocument => {
+            let text = std::str::from_utf8(&mutation.value)
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+            validate_search_document_identity(&mutation.key, text)
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+            state.catalog.require(index, EngineKind::Search)?;
+            if mutation.opcode == Opcode::IndexDocument {
                 state
                     .search
                     .index_document(index, mutation.key.clone(), text.to_owned())?;
-            }
-            Opcode::CreateAnnIndex => {
-                let index = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                let object = decode_ann_creation(index, mutation)?;
-                let CatalogObject::Search(definition) = &object else {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                };
-                let definition = ann_store::definition_from_search(definition)?;
-                state.catalog.create(object)?;
-                state.ann.create(definition)?;
-            }
-            Opcode::UpsertVector => {
-                let index = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                state.ann.upsert(
-                    index,
-                    ann_store::decode_object_identity(&mutation.key)?,
-                    ann_store::private_mutation_csn()?,
-                    ann_store::decode_vector_mutation(&mutation.value)?,
-                )?;
-            }
-            Opcode::DeleteVector => {
-                let index = mutation
-                    .target
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-                if !state
-                    .ann
-                    .delete(index, ann_store::decode_object_identity(&mutation.key)?)?
-                {
-                    return Err(NativeRuntimeError::InvalidPreparedMutation);
-                }
+            } else {
+                state
+                    .search
+                    .replace_document(index, &mutation.key, text.to_owned())?;
             }
         }
+        Opcode::DeleteDocument => {
+            if !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            validate_search_document_identity(&mutation.key, "")
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+            state.catalog.require(index, EngineKind::Search)?;
+            state.search.delete_document(index, &mutation.key)?;
+        }
+        Opcode::CreateAnnIndex => {
+            let object = decode_ann_creation(index, mutation)?;
+            let CatalogObject::Search(definition) = &object else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            let definition = ann_store::definition_from_search(definition)?;
+            state.catalog.create(object)?;
+            state.ann.create(definition)?;
+        }
+        Opcode::UpsertVector => state.ann.upsert(
+            index,
+            ann_store::decode_object_identity(&mutation.key)?,
+            ann_store::private_mutation_csn()?,
+            ann_store::decode_vector_mutation(&mutation.value)?,
+        )?,
+        Opcode::DeleteVector => {
+            if !state
+                .ann
+                .delete(index, ann_store::decode_object_identity(&mutation.key)?)?
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
     Ok(())
 }
@@ -12212,6 +12393,7 @@ fn commit_engine_roots(
             commit_csn,
             &SearchMutationContext {
                 format: search_format,
+                blobs,
                 catalog: &batch.state.catalog,
                 state: &batch.state.search,
                 mutations: &batch.mutations,
@@ -12819,9 +13001,15 @@ fn validate_delta_write_batch_shape(
                 }
                 EngineKind::Search => {
                     expected_dirty[3] = true;
-                    mutation.target.is_some()
-                        && mutation.opcode == Opcode::IndexDocument
-                        && mutation.expires_at_micros.is_none()
+                    mutation.target.is_some_and(|index| {
+                        delta
+                            .search_documents
+                            .contains(&(index, mutation.key.clone()))
+                    }) && matches!(
+                        mutation.opcode,
+                        Opcode::IndexDocument | Opcode::ReplaceDocument | Opcode::DeleteDocument
+                    ) && mutation.expires_at_micros.is_none()
+                        && (mutation.opcode != Opcode::DeleteDocument || mutation.value.is_empty())
                 }
                 EngineKind::Kernel => false,
             });
@@ -12892,7 +13080,10 @@ fn stage_large_values(
                 )
                 && mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT)
             || (mutation.engine == EngineKind::Search
-                && mutation.opcode == Opcode::IndexDocument
+                && matches!(
+                    mutation.opcode,
+                    Opcode::IndexDocument | Opcode::ReplaceDocument
+                )
                 && mutation.value.len() > SEARCH_INLINE_VALUE_LIMIT);
         if large {
             stage_blob_value(blobs, &mut staged, &mutation.value, synchronize)?;
@@ -13194,7 +13385,10 @@ fn wal_mutations(
                     blob_references,
                 )?;
             } else if mutation.engine == EngineKind::Search
-                && mutation.opcode == Opcode::IndexDocument
+                && matches!(
+                    mutation.opcode,
+                    Opcode::IndexDocument | Opcode::ReplaceDocument
+                )
             {
                 let text = std::str::from_utf8(&mutation.value)
                     .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
@@ -14400,6 +14594,16 @@ fn validate_search_document_identity(
     Ok(())
 }
 
+fn physical_search_format(
+    pages: &PageStore,
+    tree: BTree,
+) -> Result<PhysicalSearchFormat, NativeRuntimeError> {
+    let marker = tree
+        .get(pages, SEARCH_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    PhysicalSearchFormat::decode(&marker)
+}
+
 fn search_index_meta_key(index: ObjectId) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
     key.push(SEARCH_INDEX_META_PREFIX);
@@ -14560,6 +14764,25 @@ fn decode_search_document(
     Ok((text, token_count))
 }
 
+fn is_search_document_tombstone(encoded: &[u8]) -> bool {
+    encoded == SEARCH_DOCUMENT_TOMBSTONE
+}
+
+fn decode_live_search_document(
+    encoded: &[u8],
+    blobs: &BlobStore,
+    format: PhysicalSearchFormat,
+) -> Result<Option<(String, u64)>, NativeRuntimeError> {
+    if is_search_document_tombstone(encoded) {
+        return if format.admits_tombstones() {
+            Ok(None)
+        } else {
+            Err(NativeRuntimeError::InvalidSearchTree)
+        };
+    }
+    decode_search_document(encoded, blobs).map(Some)
+}
+
 fn encode_search_term_metadata(document_frequency: u64) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(SEARCH_TERM_META_SIZE);
     encoded.extend_from_slice(SEARCH_TERM_META_MAGIC);
@@ -14576,6 +14799,28 @@ fn decode_search_term_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError
     let mut document_frequency = [0_u8; 8];
     document_frequency.copy_from_slice(&encoded[8..16]);
     Ok(u64::from_le_bytes(document_frequency))
+}
+
+fn is_search_term_metadata_tombstone(encoded: &[u8]) -> bool {
+    encoded == SEARCH_TERM_META_TOMBSTONE
+}
+
+fn decode_live_search_term_metadata(
+    encoded: &[u8],
+    format: PhysicalSearchFormat,
+) -> Result<Option<u64>, NativeRuntimeError> {
+    if is_search_term_metadata_tombstone(encoded) {
+        return if format.admits_tombstones() {
+            Ok(None)
+        } else {
+            Err(NativeRuntimeError::InvalidSearchTree)
+        };
+    }
+    let document_frequency = decode_search_term_metadata(encoded)?;
+    if document_frequency == 0 {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    Ok(Some(document_frequency))
 }
 
 fn encode_search_posting(term_frequency: u32) -> Vec<u8> {
@@ -14602,10 +14847,44 @@ fn decode_search_posting(encoded: &[u8]) -> Result<u32, NativeRuntimeError> {
     Ok(term_frequency)
 }
 
+fn is_search_posting_tombstone(encoded: &[u8]) -> bool {
+    encoded == SEARCH_POSTING_TOMBSTONE
+}
+
+fn decode_live_search_posting(
+    encoded: &[u8],
+    format: PhysicalSearchFormat,
+) -> Result<Option<u32>, NativeRuntimeError> {
+    if is_search_posting_tombstone(encoded) {
+        return if format.admits_tombstones() {
+            Ok(None)
+        } else {
+            Err(NativeRuntimeError::InvalidSearchTree)
+        };
+    }
+    decode_search_posting(encoded).map(Some)
+}
+
 fn search_count_f64(value: u64) -> Result<f64, NativeRuntimeError> {
     u32::try_from(value)
         .map(f64::from)
         .map_err(|_| NativeRuntimeError::InvalidSearchTree)
+}
+
+fn rank_match_hits(scores: BTreeMap<Vec<u8>, f64>, limit: usize) -> Vec<MatchHit> {
+    let mut hits = scores
+        .into_iter()
+        .filter(|(_, score)| *score > 0.0)
+        .map(|(document_id, score)| MatchHit { document_id, score })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.document_id.cmp(&right.document_id))
+    });
+    hits.truncate(limit);
+    hits
 }
 
 fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
@@ -16238,6 +16517,7 @@ fn compact_structure_tree(
 
 fn search_tree_after_mutations(
     pages: &mut PageStore,
+    blobs: &BlobStore,
     root: Option<PageId>,
     creating_csn: Csn,
     catalog: &CatalogState,
@@ -16257,15 +16537,29 @@ fn search_tree_after_mutations(
     }
     for mutation in mutations.iter().filter(|mutation| {
         mutation.engine == EngineKind::Search
-            && matches!(mutation.opcode, Opcode::CreateIndex | Opcode::IndexDocument)
+            && matches!(
+                mutation.opcode,
+                Opcode::CreateIndex
+                    | Opcode::IndexDocument
+                    | Opcode::ReplaceDocument
+                    | Opcode::DeleteDocument
+            )
     }) {
-        tree = apply_search_tree_mutation(pages, tree, creating_csn, mutation, blob_references)?;
+        tree = apply_search_tree_mutation(
+            pages,
+            blobs,
+            tree,
+            creating_csn,
+            mutation,
+            blob_references,
+        )?;
     }
     ann_store::apply_tree_mutations(pages, tree, creating_csn, catalog, mutations)
 }
 
 fn apply_search_tree_mutation(
     pages: &mut PageStore,
+    blobs: &BlobStore,
     tree: BTree,
     creating_csn: Csn,
     mutation: &Mutation,
@@ -16300,13 +16594,39 @@ fn apply_search_tree_mutation(
                 blob_references,
             )
         }
+        Opcode::ReplaceDocument if mutation.expires_at_micros.is_none() => {
+            lifecycle_document_in_search_tree(
+                pages,
+                blobs,
+                tree,
+                creating_csn,
+                index,
+                mutation,
+                Some(&mutation.value),
+                blob_references,
+            )
+        }
+        Opcode::DeleteDocument
+            if mutation.expires_at_micros.is_none() && mutation.value.is_empty() =>
+        {
+            lifecycle_document_in_search_tree(
+                pages,
+                blobs,
+                tree,
+                creating_csn,
+                index,
+                mutation,
+                None,
+                blob_references,
+            )
+        }
         _ => Err(NativeRuntimeError::InvalidSearchTree),
     }
 }
 
 fn index_document_in_search_tree(
     pages: &mut PageStore,
-    mut tree: BTree,
+    tree: BTree,
     creating_csn: Csn,
     index: ObjectId,
     mutation: &Mutation,
@@ -16320,89 +16640,219 @@ fn index_document_in_search_tree(
         .get(pages, &metadata_key)?
         .ok_or(NativeRuntimeError::InvalidSearchTree)?;
     let (document_count, total_document_terms) = decode_search_index_metadata(&metadata)?;
+    let format = physical_search_format(pages, tree)?;
+    let document_key = search_document_key(index, &mutation.key)?;
+    if let Some(existing) = tree.get(pages, &document_key)?
+        && (!format.admits_tombstones() || !is_search_document_tombstone(&existing))
+    {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    let (token_count, frequencies) = search_term_frequencies(text)?;
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        document_key,
+        search_document_storage_value(&mutation.value, token_count, blob_references)?,
+    );
+    for (term, term_frequency) in frequencies {
+        let term_key = search_term_meta_key(index, &term)?;
+        let document_frequency = tree
+            .get(pages, &term_key)?
+            .map(|encoded| decode_live_search_term_metadata(&encoded, format))
+            .transpose()?
+            .flatten()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let posting_key = search_posting_key(index, &term, &mutation.key)?;
+        if let Some(encoded) = tree.get(pages, &posting_key)?
+            && decode_live_search_posting(&encoded, format)?.is_some()
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        entries.insert(term_key, encode_search_term_metadata(document_frequency));
+        entries.insert(posting_key, encode_search_posting(term_frequency));
+    }
+    entries.insert(
+        metadata_key,
+        encode_search_index_metadata(
+            document_count
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+            total_document_terms
+                .checked_add(token_count)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+        ),
+    );
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_document_in_search_tree(
+    pages: &mut PageStore,
+    blobs: &BlobStore,
+    tree: BTree,
+    creating_csn: Csn,
+    index: ObjectId,
+    mutation: &Mutation,
+    replacement: Option<&[u8]>,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let format = physical_search_format(pages, tree)?;
+    let document_key = search_document_key(index, &mutation.key)?;
+    let encoded_document = tree
+        .get(pages, &document_key)?
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let (old_text, old_token_count) =
+        decode_live_search_document(&encoded_document, blobs, format)?
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let (verified_old_count, old_frequencies) = search_term_frequencies(&old_text)?;
+    if verified_old_count != old_token_count {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    let (new_token_count, new_frequencies) = if let Some(replacement) = replacement {
+        let replacement =
+            std::str::from_utf8(replacement).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        validate_search_document_identity(&mutation.key, replacement)?;
+        search_term_frequencies(replacement)?
+    } else {
+        (0, BTreeMap::new())
+    };
+    let metadata_key = search_index_meta_key(index);
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let (document_count, total_document_terms) = decode_search_index_metadata(&metadata)?;
+    let next_document_count = if replacement.is_some() {
+        document_count
+    } else {
+        document_count
+            .checked_sub(1)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?
+    };
+    let next_total_document_terms = total_document_terms
+        .checked_sub(old_token_count)
+        .and_then(|total| total.checked_add(new_token_count))
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+
+    let mut entries = BTreeMap::new();
+    entries.insert(SEARCH_FORMAT_KEY.to_vec(), SEARCH_FORMAT_VALUE_V2.to_vec());
+    entries.insert(
+        document_key,
+        if let Some(replacement) = replacement {
+            search_document_storage_value(replacement, new_token_count, blob_references)?
+        } else {
+            SEARCH_DOCUMENT_TOMBSTONE.to_vec()
+        },
+    );
+    entries.insert(
+        metadata_key,
+        encode_search_index_metadata(next_document_count, next_total_document_terms),
+    );
+    append_search_lifecycle_term_entries(
+        pages,
+        tree,
+        format,
+        index,
+        &mutation.key,
+        (&old_frequencies, &new_frequencies),
+        &mut entries,
+    )?;
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
+}
+
+fn append_search_lifecycle_term_entries(
+    pages: &PageStore,
+    tree: BTree,
+    format: PhysicalSearchFormat,
+    index: ObjectId,
+    document_id: &[u8],
+    frequencies: (&SearchTermFrequencies, &SearchTermFrequencies),
+    entries: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<(), NativeRuntimeError> {
+    let (old_frequencies, new_frequencies) = frequencies;
+    let terms = old_frequencies
+        .keys()
+        .chain(new_frequencies.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for term in terms {
+        let old_frequency = old_frequencies.get(&term).copied();
+        let new_frequency = new_frequencies.get(&term).copied();
+        let term_key = search_term_meta_key(index, &term)?;
+        let current_document_frequency = tree
+            .get(pages, &term_key)?
+            .map(|encoded| decode_live_search_term_metadata(&encoded, format))
+            .transpose()?
+            .flatten();
+        let posting_key = search_posting_key(index, &term, document_id)?;
+        let current_term_frequency = tree
+            .get(pages, &posting_key)?
+            .map(|encoded| decode_live_search_posting(&encoded, format))
+            .transpose()?
+            .flatten();
+        let next_document_frequency = match (old_frequency, new_frequency) {
+            (Some(old), Some(new)) => {
+                if current_term_frequency != Some(old) {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                entries.insert(posting_key, encode_search_posting(new));
+                current_document_frequency.ok_or(NativeRuntimeError::InvalidSearchTree)?
+            }
+            (Some(old), None) => {
+                if current_term_frequency != Some(old) {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                entries.insert(posting_key, SEARCH_POSTING_TOMBSTONE.to_vec());
+                current_document_frequency
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?
+                    .checked_sub(1)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?
+            }
+            (None, Some(new)) => {
+                if current_term_frequency.is_some() {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                entries.insert(posting_key, encode_search_posting(new));
+                current_document_frequency
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?
+            }
+            (None, None) => return Err(NativeRuntimeError::InvalidSearchTree),
+        };
+        entries.insert(
+            term_key,
+            if next_document_frequency == 0 {
+                SEARCH_TERM_META_TOMBSTONE.to_vec()
+            } else {
+                encode_search_term_metadata(next_document_frequency)
+            },
+        );
+    }
+    Ok(())
+}
+
+fn search_term_frequencies(text: &str) -> Result<(u64, SearchTermFrequencies), NativeRuntimeError> {
     let tokens = analyze(text);
     let token_count =
         u64::try_from(tokens.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-    tree = tree
-        .insert_unique(
-            pages,
-            creating_csn,
-            search_document_key(index, &mutation.key)?,
-            search_document_storage_value(&mutation.value, token_count, blob_references)?,
-        )?
-        .tree;
-    let mut frequencies = BTreeMap::<String, u32>::new();
+    let mut frequencies = BTreeMap::new();
     for token in tokens {
-        let frequency = frequencies.entry(token).or_default();
+        let frequency = frequencies.entry(token.into_bytes()).or_insert(0_u32);
         *frequency = frequency
             .checked_add(1)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
     }
-    for (term, term_frequency) in frequencies {
-        tree = insert_search_posting(
-            pages,
-            tree,
-            creating_csn,
-            index,
-            term.as_bytes(),
-            &mutation.key,
-            term_frequency,
-        )?;
-    }
-    Ok(tree
-        .upsert(
-            pages,
-            creating_csn,
-            metadata_key,
-            encode_search_index_metadata(
-                document_count
-                    .checked_add(1)
-                    .ok_or(NativeRuntimeError::InvalidSearchTree)?,
-                total_document_terms
-                    .checked_add(token_count)
-                    .ok_or(NativeRuntimeError::InvalidSearchTree)?,
-            ),
-        )?
-        .tree)
-}
-
-fn insert_search_posting(
-    pages: &mut PageStore,
-    mut tree: BTree,
-    creating_csn: Csn,
-    index: ObjectId,
-    term: &[u8],
-    document_id: &[u8],
-    term_frequency: u32,
-) -> Result<BTree, NativeRuntimeError> {
-    let term_key = search_term_meta_key(index, term)?;
-    let document_frequency = tree
-        .get(pages, &term_key)?
-        .map(|encoded| decode_search_term_metadata(&encoded))
-        .transpose()?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-    tree = tree
-        .upsert(
-            pages,
-            creating_csn,
-            term_key,
-            encode_search_term_metadata(document_frequency),
-        )?
-        .tree;
-    Ok(tree
-        .insert_unique(
-            pages,
-            creating_csn,
-            search_posting_key(index, term, document_id)?,
-            encode_search_posting(term_frequency),
-        )?
-        .tree)
+    Ok((token_count, frequencies))
 }
 
 struct SearchMutationContext<'a> {
     format: SearchFormat,
+    blobs: &'a BlobStore,
     catalog: &'a CatalogState,
     state: &'a SearchState,
     mutations: &'a [Mutation],
@@ -16434,6 +16884,7 @@ fn search_root_after_mutations(
         }
         SearchFormat::InvertedBTreeV1 => Ok(search_tree_after_mutations(
             pages,
+            context.blobs,
             root,
             creating_csn,
             context.catalog,
@@ -18948,9 +19399,10 @@ fn load_search_state(
     let Some((format_key, format_value)) = iterator.next() else {
         return Err(NativeRuntimeError::InvalidSearchTree);
     };
-    if format_key != SEARCH_FORMAT_KEY || format_value != SEARCH_FORMAT_VALUE_V1 {
+    if format_key != SEARCH_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
+    let format = PhysicalSearchFormat::decode(&format_value)?;
     let mut indexes = BTreeMap::<ObjectId, BTreeMap<Vec<u8>, String>>::new();
     let mut index_metadata = BTreeMap::<ObjectId, (u64, u64)>::new();
     let mut term_metadata = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
@@ -18973,7 +19425,11 @@ fn load_search_state(
                 let documents = indexes
                     .get_mut(&index)
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                let (text, _) = decode_search_document(&value, blobs)?;
+                validate_search_document_identity(document_id, "")
+                    .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+                let Some((text, _)) = decode_live_search_document(&value, blobs, format)? else {
+                    continue;
+                };
                 validate_search_document_identity(document_id, &text)
                     .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
                 if documents.insert(document_id.to_vec(), text).is_some() {
@@ -18982,26 +19438,36 @@ fn load_search_state(
             }
             Some(SEARCH_TERM_META_PREFIX) => {
                 let (index, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
-                if !indexes.contains_key(&index)
-                    || !is_canonical_search_term(term)
-                    || term_metadata
-                        .insert((index, term.to_vec()), decode_search_term_metadata(&value)?)
-                        .is_some()
+                if !indexes.contains_key(&index) || !is_canonical_search_term(term) {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let Some(document_frequency) = decode_live_search_term_metadata(&value, format)?
+                else {
+                    continue;
+                };
+                if term_metadata
+                    .insert((index, term.to_vec()), document_frequency)
+                    .is_some()
                 {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
             }
             Some(SEARCH_POSTING_PREFIX) => {
                 let (index, term, document_id) = decode_search_posting_key(&key)?;
+                if !indexes.contains_key(&index)
+                    || !is_canonical_search_term(term)
+                    || validate_search_document_identity(document_id, "").is_err()
+                {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let Some(term_frequency) = decode_live_search_posting(&value, format)? else {
+                    continue;
+                };
                 if !indexes
                     .get(&index)
                     .is_some_and(|documents| documents.contains_key(document_id))
-                    || !is_canonical_search_term(term)
                     || postings
-                        .insert(
-                            (index, term.to_vec(), document_id.to_vec()),
-                            decode_search_posting(&value)?,
-                        )
+                        .insert((index, term.to_vec(), document_id.to_vec()), term_frequency)
                         .is_some()
                 {
                     return Err(NativeRuntimeError::InvalidSearchTree);
@@ -19116,7 +19582,7 @@ fn search_format_for_root(
             let marker = BTree::from_root(root)
                 .get(pages, SEARCH_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-            if marker == SEARCH_FORMAT_VALUE_V1 {
+            if marker == SEARCH_FORMAT_VALUE_V1 || marker == SEARCH_FORMAT_VALUE_V2 {
                 Ok(SearchFormat::InvertedBTreeV1)
             } else {
                 Err(NativeRuntimeError::InvalidSearchTree)

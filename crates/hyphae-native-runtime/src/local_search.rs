@@ -14,6 +14,8 @@ pub const LOCAL_SEARCH_MATCH_HEADER_SIZE: usize = 28;
 pub const LOCAL_SEARCH_RESULTS_HEADER_SIZE: usize = 16;
 /// Canonical fixed header width for one transaction-bound indexed document.
 pub const LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE: usize = 40;
+/// Canonical fixed header width for one transaction-bound document deletion.
+pub const LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE: usize = 36;
 /// Maximum UTF-8 bytes admitted for one local lexical query.
 pub const MAX_LOCAL_SEARCH_QUERY_BYTES: usize = 4_096;
 /// Maximum result count admitted by one local lexical request.
@@ -26,6 +28,8 @@ pub const MAX_LOCAL_SEARCH_DOCUMENT_BYTES: usize = 65_536;
 const SEARCH_VERSION: u8 = 1;
 const MATCH_OPCODE: u8 = 1;
 pub(crate) const TRANSACTION_INDEX_DOCUMENT_OPCODE: u8 = 2;
+pub(crate) const TRANSACTION_REPLACE_DOCUMENT_OPCODE: u8 = 3;
+pub(crate) const TRANSACTION_DELETE_DOCUMENT_OPCODE: u8 = 4;
 const MATCH_RESULTS_TAG: u8 = 1;
 const MATCH_HIT_HEADER_SIZE: usize = 12;
 
@@ -51,6 +55,30 @@ pub struct LocalTransactionIndexDocumentRequest<'payload> {
     pub document_id: &'payload [u8],
     /// UTF-8 document text indexed by the native analyzer.
     pub text: &'payload str,
+}
+
+/// Borrowed canonical transaction-bound lexical replacement request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalTransactionReplaceDocumentRequest<'payload> {
+    /// Matching connection-local transaction handle.
+    pub handle: NonZeroU64,
+    /// Stable search collection identity.
+    pub index: ObjectId,
+    /// Stable binary document identity.
+    pub document_id: &'payload [u8],
+    /// Replacement UTF-8 text indexed by the native analyzer.
+    pub text: &'payload str,
+}
+
+/// Borrowed canonical transaction-bound lexical deletion request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalTransactionDeleteDocumentRequest<'payload> {
+    /// Matching connection-local transaction handle.
+    pub handle: NonZeroU64,
+    /// Stable search collection identity.
+    pub index: ObjectId,
+    /// Stable binary document identity.
+    pub document_id: &'payload [u8],
 }
 
 /// Borrowed canonical local lexical hit.
@@ -281,6 +309,163 @@ pub fn decode_local_transaction_index_document(
         index,
         document_id: &payload[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE..text_start],
         text,
+    })
+}
+
+/// Encodes one canonical transaction-bound lexical replacement.
+///
+/// # Errors
+///
+/// Returns a typed error for handle, collection, document, UTF-8 length, or
+/// frame-bound violations before growing the reusable buffer.
+pub fn encode_local_transaction_replace_document<'buffer>(
+    buffer: &'buffer mut Vec<u8>,
+    request: LocalTransactionReplaceDocumentRequest<'_>,
+    maximum_payload: usize,
+) -> Result<&'buffer [u8], LocalSearchCodecError> {
+    validate_document_id_length(request.document_id.len())?;
+    validate_document_length(request.text.len())?;
+    let document_id_length = u32::try_from(request.document_id.len())
+        .map_err(|_| LocalSearchCodecError::DocumentIdTooLarge)?;
+    let text_length =
+        u32::try_from(request.text.len()).map_err(|_| LocalSearchCodecError::DocumentTooLarge)?;
+    let encoded_length = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE
+        .checked_add(request.document_id.len())
+        .and_then(|length| length.checked_add(request.text.len()))
+        .ok_or(LocalSearchCodecError::PayloadTooLarge)?;
+    if encoded_length > maximum_payload {
+        return Err(LocalSearchCodecError::PayloadTooLarge);
+    }
+    buffer.resize(encoded_length, 0);
+    buffer[..LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE].fill(0);
+    buffer[0] = SEARCH_VERSION;
+    buffer[1] = TRANSACTION_REPLACE_DOCUMENT_OPCODE;
+    buffer[4..12].copy_from_slice(&request.handle.get().to_le_bytes());
+    buffer[12..28].copy_from_slice(&request.index.get().to_le_bytes());
+    buffer[28..32].copy_from_slice(&document_id_length.to_le_bytes());
+    buffer[32..36].copy_from_slice(&text_length.to_le_bytes());
+    let text_start = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + request.document_id.len();
+    buffer[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE..text_start]
+        .copy_from_slice(request.document_id);
+    buffer[text_start..].copy_from_slice(request.text.as_bytes());
+    Ok(buffer)
+}
+
+/// Decodes one canonical transaction-bound lexical replacement.
+///
+/// # Errors
+///
+/// Returns a typed error for every noncanonical version, opcode, reserved,
+/// identity, UTF-8, document, or length boundary.
+pub fn decode_local_transaction_replace_document(
+    payload: &[u8],
+) -> Result<LocalTransactionReplaceDocumentRequest<'_>, LocalSearchCodecError> {
+    if payload.len() < LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE {
+        return Err(LocalSearchCodecError::Truncated);
+    }
+    if payload[0] != SEARCH_VERSION {
+        return Err(LocalSearchCodecError::UnsupportedVersion(payload[0]));
+    }
+    if payload[1] != TRANSACTION_REPLACE_DOCUMENT_OPCODE {
+        return Err(LocalSearchCodecError::UnknownOpcode(payload[1]));
+    }
+    if payload[2..4] != [0, 0] || payload[36..40] != [0, 0, 0, 0] {
+        return Err(LocalSearchCodecError::ReservedBytes);
+    }
+    let handle = NonZeroU64::new(read_u64(payload, 4))
+        .ok_or(LocalSearchCodecError::InvalidTransactionHandle)?;
+    let index = ObjectId::new(read_u128(payload, 12))
+        .map_err(|_| LocalSearchCodecError::InvalidObjectId)?;
+    let document_id_length = read_u32(payload, 28)?;
+    validate_document_id_length(document_id_length)?;
+    let text_length = read_u32(payload, 32)?;
+    validate_document_length(text_length)?;
+    let body_length = document_id_length
+        .checked_add(text_length)
+        .ok_or(LocalSearchCodecError::PayloadTooLarge)?;
+    require_payload_length(
+        payload,
+        LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE,
+        body_length,
+    )?;
+    let text_start = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + document_id_length;
+    let text = std::str::from_utf8(&payload[text_start..])
+        .map_err(|_| LocalSearchCodecError::InvalidUtf8)?;
+    Ok(LocalTransactionReplaceDocumentRequest {
+        handle,
+        index,
+        document_id: &payload[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE..text_start],
+        text,
+    })
+}
+
+/// Encodes one canonical transaction-bound lexical deletion.
+///
+/// # Errors
+///
+/// Returns a typed error for handle, collection, document identity, length, or
+/// frame-bound violations before growing the reusable buffer.
+pub fn encode_local_transaction_delete_document<'buffer>(
+    buffer: &'buffer mut Vec<u8>,
+    request: LocalTransactionDeleteDocumentRequest<'_>,
+    maximum_payload: usize,
+) -> Result<&'buffer [u8], LocalSearchCodecError> {
+    validate_document_id_length(request.document_id.len())?;
+    let document_id_length = u32::try_from(request.document_id.len())
+        .map_err(|_| LocalSearchCodecError::DocumentIdTooLarge)?;
+    let encoded_length = LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE
+        .checked_add(request.document_id.len())
+        .ok_or(LocalSearchCodecError::PayloadTooLarge)?;
+    if encoded_length > maximum_payload {
+        return Err(LocalSearchCodecError::PayloadTooLarge);
+    }
+    buffer.resize(encoded_length, 0);
+    buffer[..LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE].fill(0);
+    buffer[0] = SEARCH_VERSION;
+    buffer[1] = TRANSACTION_DELETE_DOCUMENT_OPCODE;
+    buffer[4..12].copy_from_slice(&request.handle.get().to_le_bytes());
+    buffer[12..28].copy_from_slice(&request.index.get().to_le_bytes());
+    buffer[28..32].copy_from_slice(&document_id_length.to_le_bytes());
+    buffer[LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE..].copy_from_slice(request.document_id);
+    Ok(buffer)
+}
+
+/// Decodes one canonical transaction-bound lexical deletion.
+///
+/// # Errors
+///
+/// Returns a typed error for every noncanonical version, opcode, reserved,
+/// identity, document length, or trailing-byte boundary.
+pub fn decode_local_transaction_delete_document(
+    payload: &[u8],
+) -> Result<LocalTransactionDeleteDocumentRequest<'_>, LocalSearchCodecError> {
+    if payload.len() < LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE {
+        return Err(LocalSearchCodecError::Truncated);
+    }
+    if payload[0] != SEARCH_VERSION {
+        return Err(LocalSearchCodecError::UnsupportedVersion(payload[0]));
+    }
+    if payload[1] != TRANSACTION_DELETE_DOCUMENT_OPCODE {
+        return Err(LocalSearchCodecError::UnknownOpcode(payload[1]));
+    }
+    if payload[2..4] != [0, 0] || payload[32..36] != [0, 0, 0, 0] {
+        return Err(LocalSearchCodecError::ReservedBytes);
+    }
+    let handle = NonZeroU64::new(read_u64(payload, 4))
+        .ok_or(LocalSearchCodecError::InvalidTransactionHandle)?;
+    let index = ObjectId::new(read_u128(payload, 12))
+        .map_err(|_| LocalSearchCodecError::InvalidObjectId)?;
+    let document_id_length = read_u32(payload, 28)?;
+    validate_document_id_length(document_id_length)?;
+    require_payload_length(
+        payload,
+        LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE,
+        document_id_length,
+    )?;
+    Ok(LocalTransactionDeleteDocumentRequest {
+        handle,
+        index,
+        document_id: &payload[LOCAL_TRANSACTION_SEARCH_DELETE_HEADER_SIZE..],
     })
 }
 

@@ -60,6 +60,8 @@ pub(crate) enum ModelError {
     StructureIntegerOverflow,
     #[error("native search document ID already exists")]
     DuplicateDocumentId,
+    #[error("native search document ID does not exist")]
+    MissingDocumentId,
     #[error("native state payload contains a duplicate canonical entry")]
     DuplicateEncodedEntry,
     #[error(transparent)]
@@ -1726,6 +1728,38 @@ impl SearchState {
         if documents.insert(document_id, text).is_some() {
             return Err(ModelError::DuplicateDocumentId);
         }
+        Ok(())
+    }
+
+    pub(crate) fn replace_document(
+        &mut self,
+        index: ObjectId,
+        document_id: &[u8],
+        text: String,
+    ) -> Result<(), ModelError> {
+        let documents = self
+            .indexes
+            .get_mut(&index)
+            .ok_or(ModelError::UnknownObject)?;
+        let document = documents
+            .get_mut(document_id)
+            .ok_or(ModelError::MissingDocumentId)?;
+        *document = text;
+        Ok(())
+    }
+
+    pub(crate) fn delete_document(
+        &mut self,
+        index: ObjectId,
+        document_id: &[u8],
+    ) -> Result<(), ModelError> {
+        let documents = self
+            .indexes
+            .get_mut(&index)
+            .ok_or(ModelError::UnknownObject)?;
+        documents
+            .remove(document_id)
+            .ok_or(ModelError::MissingDocumentId)?;
         Ok(())
     }
 

@@ -13,21 +13,27 @@ use crate::{
     LocalFailureCode, LocalOperationCodecError, LocalSearchCodecError, LocalSearchMatchRequest,
     LocalSqlColumn, LocalSqlPreparedReceipt, LocalStructureCommitReceipt, LocalStructureRequest,
     LocalStructureSetRequest, LocalTransactionBeginReceipt, LocalTransactionCommitReceipt,
-    LocalTransactionEngine, LocalTransactionIndexDocumentRequest, LocalTransactionRollbackReceipt,
-    LocalTransactionSqlDmlRequest, LocalTransactionStageReceipt,
+    LocalTransactionDeleteDocumentRequest, LocalTransactionEngine,
+    LocalTransactionIndexDocumentRequest, LocalTransactionReplaceDocumentRequest,
+    LocalTransactionRollbackReceipt, LocalTransactionSqlDmlRequest, LocalTransactionStageReceipt,
     LocalTransactionStructureSetRequest, LocalTransportError, LocalTtlValue,
     MAX_LOCAL_PREPARED_STATEMENTS, MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS,
     MAX_LOCAL_SQL_ROWS, MAX_LOCAL_TRANSACTION_OPERATIONS, NativeDatabase, NativeRuntimeError,
     NativeSchedulerClock, NativeWriteBatch, PreparedStatement, SqlError, SqlResult, Ttl,
     UdsFrameConnection, decode_local_search_match, decode_local_sql_execute,
     decode_local_sql_prepare, decode_local_structure_request, decode_local_transaction_begin,
-    decode_local_transaction_commit, decode_local_transaction_index_document,
+    decode_local_transaction_commit, decode_local_transaction_delete_document,
+    decode_local_transaction_index_document, decode_local_transaction_replace_document,
     decode_local_transaction_rollback, decode_local_transaction_sql_dml, encode_local_failure,
     encode_local_search_match_results, encode_local_sql_prepared_receipt, encode_local_sql_rows,
     encode_local_structure_commit_receipt, encode_local_transaction_begin_receipt,
     encode_local_transaction_commit_receipt, encode_local_transaction_rollback_receipt,
     encode_local_transaction_stage_receipt, encode_local_ttl, encode_local_value,
-    local_search::TRANSACTION_INDEX_DOCUMENT_OPCODE, local_sql::EXECUTE_TRANSACTION_DML_OPCODE,
+    local_search::{
+        TRANSACTION_DELETE_DOCUMENT_OPCODE, TRANSACTION_INDEX_DOCUMENT_OPCODE,
+        TRANSACTION_REPLACE_DOCUMENT_OPCODE,
+    },
+    local_sql::EXECUTE_TRANSACTION_DML_OPCODE,
 };
 
 /// Failure of one serial engine-bearing local session.
@@ -488,21 +494,66 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         maximum_payload: usize,
     ) -> Result<(), LocalSessionError> {
         let request_buffer = std::mem::take(&mut self.request_buffer);
-        let result = if request_buffer.get(1) == Some(&TRANSACTION_INDEX_DOCUMENT_OPCODE) {
-            match decode_local_transaction_index_document(&request_buffer) {
-                Ok(request) => self.serve_transaction_index_document(
-                    connection,
-                    stream_id,
-                    request_id,
-                    maximum_payload,
-                    request,
-                ),
-                Err(_) => self.send_failure(
-                    connection,
-                    stream_id,
-                    request_id,
-                    LocalFailureCode::InvalidRequest,
-                ),
+        let result = if let Some(opcode) = request_buffer.get(1).copied()
+            && matches!(
+                opcode,
+                TRANSACTION_INDEX_DOCUMENT_OPCODE
+                    | TRANSACTION_REPLACE_DOCUMENT_OPCODE
+                    | TRANSACTION_DELETE_DOCUMENT_OPCODE
+            ) {
+            match opcode {
+                TRANSACTION_INDEX_DOCUMENT_OPCODE => {
+                    match decode_local_transaction_index_document(&request_buffer) {
+                        Ok(request) => self.serve_transaction_index_document(
+                            connection,
+                            stream_id,
+                            request_id,
+                            maximum_payload,
+                            request,
+                        ),
+                        Err(_) => self.send_failure(
+                            connection,
+                            stream_id,
+                            request_id,
+                            LocalFailureCode::InvalidRequest,
+                        ),
+                    }
+                }
+                TRANSACTION_REPLACE_DOCUMENT_OPCODE => {
+                    match decode_local_transaction_replace_document(&request_buffer) {
+                        Ok(request) => self.serve_transaction_replace_document(
+                            connection,
+                            stream_id,
+                            request_id,
+                            maximum_payload,
+                            request,
+                        ),
+                        Err(_) => self.send_failure(
+                            connection,
+                            stream_id,
+                            request_id,
+                            LocalFailureCode::InvalidRequest,
+                        ),
+                    }
+                }
+                TRANSACTION_DELETE_DOCUMENT_OPCODE => {
+                    match decode_local_transaction_delete_document(&request_buffer) {
+                        Ok(request) => self.serve_transaction_delete_document(
+                            connection,
+                            stream_id,
+                            request_id,
+                            maximum_payload,
+                            request,
+                        ),
+                        Err(_) => self.send_failure(
+                            connection,
+                            stream_id,
+                            request_id,
+                            LocalFailureCode::InvalidRequest,
+                        ),
+                    }
+                }
+                _ => unreachable!("transaction search opcode was prevalidated"),
             }
         } else if self.active_transaction.is_some() {
             self.send_failure(
@@ -623,6 +674,119 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
                 request.index,
                 request.document_id.to_vec(),
                 request.text.to_owned(),
+            )
+            .map_err(|_| LocalFailureCode::EngineFailure)?;
+        let operation_ordinal = advance_staged_operations(active)?;
+        Ok(LocalTransactionStageReceipt {
+            engine: LocalTransactionEngine::Search,
+            handle: request.handle,
+            operation_ordinal,
+            rows_affected: 1,
+        })
+    }
+
+    fn serve_transaction_replace_document(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+        request: LocalTransactionReplaceDocumentRequest<'_>,
+    ) -> Result<(), LocalSessionError> {
+        if maximum_payload < LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::ResponseTooLarge,
+            );
+        }
+        let receipt = match self.stage_transaction_replace_document(request) {
+            Ok(receipt) => receipt,
+            Err(code) => return self.send_failure(connection, stream_id, request_id, code),
+        };
+        let Ok(response) =
+            encode_local_transaction_stage_receipt(&mut self.response_buffer, receipt)
+        else {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        };
+        connection.send(FrameKind::Receipt, stream_id, request_id, response)?;
+        Ok(())
+    }
+
+    fn stage_transaction_replace_document(
+        &mut self,
+        request: LocalTransactionReplaceDocumentRequest<'_>,
+    ) -> Result<LocalTransactionStageReceipt, LocalFailureCode> {
+        let Self {
+            database,
+            active_transaction,
+            ..
+        } = self;
+        let active = active_transaction_for_handle(active_transaction, request.handle)?;
+        ensure_transaction_stage_capacity(active.staged_operations)?;
+        database
+            .stage_delta_replace_document(
+                &mut active.batch,
+                request.index,
+                request.document_id.to_vec(),
+                request.text.to_owned(),
+            )
+            .map_err(|_| LocalFailureCode::EngineFailure)?;
+        let operation_ordinal = advance_staged_operations(active)?;
+        Ok(LocalTransactionStageReceipt {
+            engine: LocalTransactionEngine::Search,
+            handle: request.handle,
+            operation_ordinal,
+            rows_affected: 1,
+        })
+    }
+
+    fn serve_transaction_delete_document(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+        request: LocalTransactionDeleteDocumentRequest<'_>,
+    ) -> Result<(), LocalSessionError> {
+        if maximum_payload < LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::ResponseTooLarge,
+            );
+        }
+        let receipt = match self.stage_transaction_delete_document(request) {
+            Ok(receipt) => receipt,
+            Err(code) => return self.send_failure(connection, stream_id, request_id, code),
+        };
+        let Ok(response) =
+            encode_local_transaction_stage_receipt(&mut self.response_buffer, receipt)
+        else {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        };
+        connection.send(FrameKind::Receipt, stream_id, request_id, response)?;
+        Ok(())
+    }
+
+    fn stage_transaction_delete_document(
+        &mut self,
+        request: LocalTransactionDeleteDocumentRequest<'_>,
+    ) -> Result<LocalTransactionStageReceipt, LocalFailureCode> {
+        let Self {
+            database,
+            active_transaction,
+            ..
+        } = self;
+        let active = active_transaction_for_handle(active_transaction, request.handle)?;
+        ensure_transaction_stage_capacity(active.staged_operations)?;
+        database
+            .stage_delta_delete_document(
+                &mut active.batch,
+                request.index,
+                request.document_id.to_vec(),
             )
             .map_err(|_| LocalFailureCode::EngineFailure)?;
         let operation_ordinal = advance_staged_operations(active)?;

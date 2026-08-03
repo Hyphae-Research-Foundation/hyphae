@@ -930,18 +930,20 @@ mod unix {
 
     use hyphae_native_runtime::{
         CommitBoundary, FrameKind, LocalDataSession, LocalFailureCode, LocalSessionError,
-        LocalTransactionBeginReceipt, LocalTransactionCommitReceipt, LocalTransactionEngine,
-        LocalTransactionIndexDocumentRequest, LocalTransactionRollbackReceipt,
-        LocalTransactionStageReceipt, LocalTransactionStructureSetRequest,
-        MAX_LOCAL_TRANSACTION_OPERATIONS, NativeDatabase, NativeRuntimeError, NativeSchedulerClock,
-        NativeSnapshot, NativeWriteBatch, SqlResult, Ttl, UdsFrameConnection, UdsFrameListener,
-        decode_local_failure, decode_local_transaction_begin_receipt,
-        decode_local_transaction_commit_receipt, decode_local_transaction_rollback_receipt,
-        decode_local_transaction_stage_receipt, encode_local_search_match,
-        encode_local_sql_prepare, encode_local_structure_get, encode_local_transaction_begin,
-        encode_local_transaction_commit, encode_local_transaction_index_document,
-        encode_local_transaction_rollback, encode_local_transaction_sql_dml,
-        encode_local_transaction_structure_set,
+        LocalTransactionBeginReceipt, LocalTransactionCommitReceipt,
+        LocalTransactionDeleteDocumentRequest, LocalTransactionEngine,
+        LocalTransactionIndexDocumentRequest, LocalTransactionReplaceDocumentRequest,
+        LocalTransactionRollbackReceipt, LocalTransactionStageReceipt,
+        LocalTransactionStructureSetRequest, MAX_LOCAL_TRANSACTION_OPERATIONS, NativeDatabase,
+        NativeRuntimeError, NativeSchedulerClock, NativeSnapshot, NativeWriteBatch, SqlResult, Ttl,
+        UdsFrameConnection, UdsFrameListener, decode_local_failure,
+        decode_local_transaction_begin_receipt, decode_local_transaction_commit_receipt,
+        decode_local_transaction_rollback_receipt, decode_local_transaction_stage_receipt,
+        encode_local_search_match, encode_local_sql_prepare, encode_local_structure_get,
+        encode_local_transaction_begin, encode_local_transaction_commit,
+        encode_local_transaction_delete_document, encode_local_transaction_index_document,
+        encode_local_transaction_replace_document, encode_local_transaction_rollback,
+        encode_local_transaction_sql_dml, encode_local_transaction_structure_set,
     };
     use hyphae_native_types::{Csn, DurabilityClass, ObjectId, ScalarValue, TransactionId};
 
@@ -1261,6 +1263,48 @@ mod unix {
             Ok(decode_local_transaction_stage_receipt(&response)?)
         }
 
+        fn stage_search_replace(
+            &mut self,
+            handle: NonZeroU64,
+            index: ObjectId,
+            document_id: &[u8],
+            text: &str,
+        ) -> Result<LocalTransactionStageReceipt, TestError> {
+            let payload = encode_local_transaction_replace_document(
+                &mut self.buffer,
+                LocalTransactionReplaceDocumentRequest {
+                    handle,
+                    index,
+                    document_id,
+                    text,
+                },
+                MAXIMUM_PAYLOAD,
+            )?
+            .to_vec();
+            let response = self.exchange(FrameKind::Search, FrameKind::Receipt, &payload)?;
+            Ok(decode_local_transaction_stage_receipt(&response)?)
+        }
+
+        fn stage_search_delete(
+            &mut self,
+            handle: NonZeroU64,
+            index: ObjectId,
+            document_id: &[u8],
+        ) -> Result<LocalTransactionStageReceipt, TestError> {
+            let payload = encode_local_transaction_delete_document(
+                &mut self.buffer,
+                LocalTransactionDeleteDocumentRequest {
+                    handle,
+                    index,
+                    document_id,
+                },
+                MAXIMUM_PAYLOAD,
+            )?
+            .to_vec();
+            let response = self.exchange(FrameKind::Search, FrameKind::Receipt, &payload)?;
+            Ok(decode_local_transaction_stage_receipt(&response)?)
+        }
+
         fn commit(
             &mut self,
             handle: NonZeroU64,
@@ -1497,6 +1541,67 @@ mod unix {
         client.stage_sql(handle, id, text)?;
         client.stage_structure(handle, b"joint-key", b"discarded", None)?;
         client.stage_search(handle, index, b"joint-doc", text)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_search_lifecycle_preserves_ordinal_after_missing_document() -> Result<(), TestError> {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let socket = temporary.path().join("hyphae.sock");
+        let mut seeded = seed_database(&data)?;
+        let mut documents = seeded.database.begin(91, DurabilityClass::Strict)?;
+        documents.index_document(seeded.index, b"replace".to_vec(), "old token")?;
+        documents.index_document(seeded.index, b"delete".to_vec(), "retired token")?;
+        documents.commit()?;
+
+        let index = seeded.index;
+        let clock = Arc::new(CountingClock(AtomicUsize::new(0)));
+        let server = spawn_server(seeded.database, &socket, Arc::clone(&clock))?;
+        let mut client = SessionClient::connect(&socket)?;
+        let begun = client.begin(DurabilityClass::Memory)?;
+        assert_eq!(
+            client
+                .stage_search_replace(begun.handle, index, b"replace", "current token")?
+                .operation_ordinal,
+            1
+        );
+        let missing = encode_local_transaction_delete_document(
+            &mut client.buffer,
+            LocalTransactionDeleteDocumentRequest {
+                handle: begun.handle,
+                index,
+                document_id: b"missing",
+            },
+            MAXIMUM_PAYLOAD,
+        )?
+        .to_vec();
+        client.expect_failure(FrameKind::Search, &missing, LocalFailureCode::EngineFailure)?;
+        assert_eq!(
+            client
+                .stage_search_delete(begun.handle, index, b"delete")?
+                .operation_ordinal,
+            2
+        );
+        client.commit(begun.handle, 2)?;
+        client.close()?;
+        join_server(server)?;
+
+        assert_eq!(clock.samples(), 1);
+        let reopened = NativeDatabase::open(&data)?;
+        assert_eq!(
+            reopened
+                .match_latest_text(index, "current", 10)?
+                .into_iter()
+                .map(|hit| hit.document_id)
+                .collect::<Vec<_>>(),
+            [b"replace".to_vec()]
+        );
+        assert!(
+            reopened
+                .match_latest_text(index, "old retired", 10)?
+                .is_empty()
+        );
         Ok(())
     }
 
