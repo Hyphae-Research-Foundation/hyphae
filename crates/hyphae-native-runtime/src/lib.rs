@@ -11551,14 +11551,16 @@ fn decode_hash_field_value_at(
     blobs: &BlobStore,
     logical_time_micros: i64,
 ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-    decode_hash_field_entry(encoded, blobs).map(|entry| {
-        entry.and_then(|entry| {
-            entry
+    match decode_structure_value(encoded, blobs)? {
+        Some(entry)
+            if entry
                 .expires_at_micros
-                .is_none_or(|expiry| expiry > logical_time_micros)
-                .then_some(entry.value)
-        })
-    })
+                .is_none_or(|expiry| expiry > logical_time_micros) =>
+        {
+            Ok(Some(entry.value))
+        }
+        Some(_) | None => Ok(None),
+    }
 }
 
 fn decode_hash_scan_entry(
@@ -12322,7 +12324,7 @@ fn create_set_in_tree(
 
 fn set_hash_field_in_tree(
     pages: &mut PageStore,
-    tree: BTree,
+    mut tree: BTree,
     creating_csn: Csn,
     mutation: &Mutation,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -12347,6 +12349,24 @@ fn set_hash_field_in_tree(
         .transpose()?
         .flatten();
     let value = structure_storage_value(&mutation.value, None, blob_references)?;
+    if prior_expiry.is_none() {
+        tree = tree.upsert(pages, creating_csn, field_key, value)?.tree;
+        if added {
+            metadata.field_count = metadata
+                .field_count
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            tree = tree
+                .upsert(
+                    pages,
+                    creating_csn,
+                    metadata_key,
+                    encode_hash_metadata_state(metadata),
+                )?
+                .tree;
+        }
+        return Ok(tree);
+    }
     let mut entries = Vec::with_capacity(3);
     entries.push((field_key, value));
     if let Some(expiry) = prior_expiry {
@@ -12356,13 +12376,7 @@ fn set_hash_field_in_tree(
         }
         entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
     }
-    if added {
-        metadata.field_count = metadata
-            .field_count
-            .checked_add(1)
-            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-        entries.push((metadata_key, encode_hash_metadata_state(metadata)));
-    }
+    debug_assert!(!added);
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(NativeRuntimeError::InvalidStructureTree);
