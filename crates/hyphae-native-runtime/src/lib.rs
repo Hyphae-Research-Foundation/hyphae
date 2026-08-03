@@ -14355,9 +14355,9 @@ fn list_retirement_entries(
     let metadata =
         decode_live_list_metadata(&encoded)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
     if let Some(logical_time_micros) = due_at_micros
-        && !metadata
+        && metadata
             .expires_at_micros
-            .is_some_and(|expiry| expiry <= logical_time_micros)
+            .is_none_or(|expiry| expiry > logical_time_micros)
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }

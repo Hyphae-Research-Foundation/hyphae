@@ -1015,6 +1015,88 @@ mod tests {
         )
     }
 
+    fn complete_transaction_mutations()
+    -> Result<Vec<Mutation>, hyphae_native_types::NativeTypeError> {
+        let mut hash_field = 4_u32.to_be_bytes().to_vec();
+        hash_field.extend_from_slice(b"hashfield");
+        let mut set_member = 3_u32.to_be_bytes().to_vec();
+        set_member.extend_from_slice(b"setmember");
+        let mut sorted_set_member = 6_u32.to_be_bytes().to_vec();
+        sorted_set_member.extend_from_slice(b"sortedmember");
+        Ok(vec![
+            mutation(
+                EngineKind::Relational,
+                Opcode::InsertRow,
+                Some(ObjectId::new(1)?),
+                b"pk",
+                b"row",
+                None,
+            ),
+            structure_mutation(Opcode::SetValue, b"key", b"value", Some(50)),
+            structure_mutation(Opcode::ExpireValue, b"key", b"value", Some(i64::MAX)),
+            structure_mutation(Opcode::DeleteValue, b"old-key", b"", None),
+            structure_mutation(Opcode::CreateHash, b"hash", b"", None),
+            structure_mutation(Opcode::ExpireHash, b"hash", b"", Some(i64::MIN)),
+            structure_mutation(Opcode::DeleteHash, b"retired-hash", b"", None),
+            structure_mutation(Opcode::SetHashField, &hash_field, b"value", None),
+            structure_mutation(Opcode::ExpireHashField, &hash_field, b"", Some(i64::MAX)),
+            structure_mutation(Opcode::DeleteHashField, &hash_field, b"", None),
+            structure_mutation(Opcode::CreateSet, b"set", b"", None),
+            structure_mutation(Opcode::AddSetMember, &set_member, b"", None),
+            structure_mutation(Opcode::DeleteSetMember, &set_member, b"", None),
+            structure_mutation(Opcode::ExpireSet, b"set", b"", Some(42)),
+            structure_mutation(Opcode::DeleteSet, b"retired-set", b"", None),
+            structure_mutation(Opcode::CreateList, b"list", b"", None),
+            structure_mutation(Opcode::ExpireList, b"list", b"", Some(43)),
+            structure_mutation(Opcode::DeleteList, b"retired-list", b"", None),
+            structure_mutation(Opcode::PushListHead, b"list", b"head", None),
+            structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
+            structure_mutation(Opcode::PopListHead, b"list", b"head", None),
+            structure_mutation(Opcode::PopListTail, b"list", b"tail", None),
+            structure_mutation(Opcode::CreateSortedSet, b"sorted", b"", None),
+            structure_mutation(
+                Opcode::UpsertSortedSetMember,
+                &sorted_set_member,
+                &20.0_f64.to_bits().to_be_bytes(),
+                None,
+            ),
+            structure_mutation(Opcode::DeleteSortedSetMember, &sorted_set_member, b"", None),
+            structure_mutation(Opcode::CompactStructure, b"", b"", None),
+            mutation(
+                EngineKind::Search,
+                Opcode::IndexDocument,
+                Some(ObjectId::new(2)?),
+                b"doc",
+                b"native search",
+                None,
+            ),
+            mutation(
+                EngineKind::Search,
+                Opcode::CreateAnnIndex,
+                Some(ObjectId::new(3)?),
+                b"",
+                b"catalog-definition",
+                None,
+            ),
+            mutation(
+                EngineKind::Search,
+                Opcode::UpsertVector,
+                Some(ObjectId::new(3)?),
+                &ObjectId::new(4)?.get().to_be_bytes(),
+                &[0, 0, 128, 63, 0, 0, 0, 0],
+                None,
+            ),
+            mutation(
+                EngineKind::Search,
+                Opcode::DeleteVector,
+                Some(ObjectId::new(3)?),
+                &ObjectId::new(5)?.get().to_be_bytes(),
+                b"",
+                None,
+            ),
+        ])
+    }
+
     fn commit_manifest(
         page_generation: PageGeneration,
         retention_floor_csn: Csn,
@@ -1126,84 +1208,7 @@ mod tests {
 
     #[test]
     fn complete_transaction_round_trips() -> Result<(), Box<dyn std::error::Error>> {
-        let mut hash_field = 4_u32.to_be_bytes().to_vec();
-        hash_field.extend_from_slice(b"hashfield");
-        let mut set_member = 3_u32.to_be_bytes().to_vec();
-        set_member.extend_from_slice(b"setmember");
-        let mut sorted_set_member = 6_u32.to_be_bytes().to_vec();
-        sorted_set_member.extend_from_slice(b"sortedmember");
-        let mutations = vec![
-            mutation(
-                EngineKind::Relational,
-                Opcode::InsertRow,
-                Some(ObjectId::new(1)?),
-                b"pk",
-                b"row",
-                None,
-            ),
-            structure_mutation(Opcode::SetValue, b"key", b"value", Some(50)),
-            structure_mutation(Opcode::ExpireValue, b"key", b"value", Some(i64::MAX)),
-            structure_mutation(Opcode::DeleteValue, b"old-key", b"", None),
-            structure_mutation(Opcode::CreateHash, b"hash", b"", None),
-            structure_mutation(Opcode::ExpireHash, b"hash", b"", Some(i64::MIN)),
-            structure_mutation(Opcode::DeleteHash, b"retired-hash", b"", None),
-            structure_mutation(Opcode::SetHashField, &hash_field, b"value", None),
-            structure_mutation(Opcode::ExpireHashField, &hash_field, b"", Some(i64::MAX)),
-            structure_mutation(Opcode::DeleteHashField, &hash_field, b"", None),
-            structure_mutation(Opcode::CreateSet, b"set", b"", None),
-            structure_mutation(Opcode::AddSetMember, &set_member, b"", None),
-            structure_mutation(Opcode::DeleteSetMember, &set_member, b"", None),
-            structure_mutation(Opcode::ExpireSet, b"set", b"", Some(42)),
-            structure_mutation(Opcode::DeleteSet, b"retired-set", b"", None),
-            structure_mutation(Opcode::CreateList, b"list", b"", None),
-            structure_mutation(Opcode::ExpireList, b"list", b"", Some(43)),
-            structure_mutation(Opcode::DeleteList, b"retired-list", b"", None),
-            structure_mutation(Opcode::PushListHead, b"list", b"head", None),
-            structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
-            structure_mutation(Opcode::PopListHead, b"list", b"head", None),
-            structure_mutation(Opcode::PopListTail, b"list", b"tail", None),
-            structure_mutation(Opcode::CreateSortedSet, b"sorted", b"", None),
-            structure_mutation(
-                Opcode::UpsertSortedSetMember,
-                &sorted_set_member,
-                &20.0_f64.to_bits().to_be_bytes(),
-                None,
-            ),
-            structure_mutation(Opcode::DeleteSortedSetMember, &sorted_set_member, b"", None),
-            structure_mutation(Opcode::CompactStructure, b"", b"", None),
-            mutation(
-                EngineKind::Search,
-                Opcode::IndexDocument,
-                Some(ObjectId::new(2)?),
-                b"doc",
-                b"native search",
-                None,
-            ),
-            mutation(
-                EngineKind::Search,
-                Opcode::CreateAnnIndex,
-                Some(ObjectId::new(3)?),
-                b"",
-                b"catalog-definition",
-                None,
-            ),
-            mutation(
-                EngineKind::Search,
-                Opcode::UpsertVector,
-                Some(ObjectId::new(3)?),
-                &ObjectId::new(4)?.get().to_be_bytes(),
-                &[0, 0, 128, 63, 0, 0, 0, 0],
-                None,
-            ),
-            mutation(
-                EngineKind::Search,
-                Opcode::DeleteVector,
-                Some(ObjectId::new(3)?),
-                &ObjectId::new(5)?.get().to_be_bytes(),
-                b"",
-                None,
-            ),
-        ];
+        let mutations = complete_transaction_mutations()?;
         let roots = test_roots()?;
         let pending = encode_transaction(&TransactionPlan {
             transaction_id: TransactionId::new(1)?,
