@@ -137,6 +137,20 @@ outside G7 because it has 100,000 warm observations, concurrency one,
 virtualized hardware, an owned value that may allocate, no cold/saturation/
 interference/counter lanes, and no Windows named-pipe counterpart.
 
+The
+[structure SET and TTL receipt](../gates/evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
+keeps read and mutation surfaces separate. Across three release runs, median
+physical TTL p50/p99 was `0.832/0.886 us`; persistent GET and TTL round trips
+were `23.546/34.286 us` and `23.487/34.489 us`. A one-key, 64-byte memory
+`SET` with relative TTL measured `377.113/401.059 us`; strict `SET` measured
+`6,738.743/6,928.074 us`. The strict lane includes the selected page/WAL
+synchronization promise and is intentionally not folded into an execution
+claim. The memory lane is also above a microsecond mutation objective, so this
+receipt records a performance deficit rather than a pass. It supplies no
+subtractive transport estimate, timing decomposition, cold/saturation/
+interference/allocation/counter matrix, group scheduler, or regression
+threshold.
+
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5
 added one explicitly typed hash with 2,048 independent 64-byte fields and

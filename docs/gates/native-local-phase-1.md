@@ -641,6 +641,20 @@ interference/allocation/hardware-counter matrix. `SET`, TTL commands, SQL,
 search, transactions, complete session semantics, and Windows named pipes
 remain open.
 
+The [native local structure SET and TTL
+evidence](evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
+extends that serial session with canonical binary mutation/TTL payloads,
+strict and memory durability receipts, exact transaction ID/CSN identity,
+controlled expiry, request-local recovery, and strict reopen equivalence.
+Across three direct-Linux runs, median physical TTL p50/p99 was
+`0.832/0.886 us`; persistent GET and TTL round trips were
+`23.546/34.286 us` and `23.487/34.489 us`. Memory `SET` was
+`377.113/401.059 us`, while strict `SET` was
+`6,738.743/6,928.074 us`. Those mutation results expose unfinished hot-path
+and physical-durability work rather than satisfying G7. Group durability,
+replay/idempotency, explicit transactions, SQL/search operations, complete
+session semantics, Windows named pipes, and the G7 matrix remain open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit

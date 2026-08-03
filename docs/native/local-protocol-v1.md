@@ -67,10 +67,13 @@ one stream with explicit total length and final digest.
 The transaction ID returned by `BEGIN` can carry SQL, structure and search
 operations on the same connection/session.
 
-The first implemented engine-bearing subset is
-[native local structure GET v1](local-structure-get-v1.md). It uses the
-canonical frame header and a deliberately minimal serial session; it does not
-imply that the complete message families or transaction state are implemented.
+The implemented engine-bearing subset now includes
+[native local structure GET v1](local-structure-get-v1.md) and
+[native local structure SET and TTL v1](local-structure-set-ttl-v1.md). They
+use the canonical frame header and a deliberately minimal serial session.
+Each `SET` owns one implicit native transaction; the complete message families,
+explicit transaction state, group scheduling, and multiplexing are not
+implemented.
 
 ## Multiplexing and flow control
 

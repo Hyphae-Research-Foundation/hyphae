@@ -85,6 +85,13 @@ scalar `GET` requests against the current physical structure root. That
 engine-bearing extension is serial and bounded; it does not implement the
 complete production session.
 
+The next
+[native local structure SET and TTL](local-structure-set-ttl-v1.md) extension
+uses the same serial connection for one-transaction scalar mutations and
+physical TTL reads. It admits strict and memory durability, rejects group
+durability until scheduler integration, and returns exact transaction/CSN
+receipts. It still is not the complete production session.
+
 ## Failure behavior
 
 The implementation must fail closed for:

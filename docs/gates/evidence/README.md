@@ -713,3 +713,15 @@ detectable.
   of embedded physical `GET`, persistent `PING`, and persistent engine-bearing
   `GET`. The bounded p50/p99 targets are met, but the receipt is not a
   regression threshold or G0/G1/G6/G7 closure.
+
+## Native local structure SET and TTL on Linux
+
+- `native-local-structure-set-ttl-linux-2026-08-03.md` binds the frozen binary
+  contract, u128 transaction receipt correction, implicit native commits,
+  controlled expiry, failure recovery, strict reopen proof, and direct-Linux
+  validation to exact commits and logs.
+- `native-local-structure-set-ttl-linux.json` records three release
+  observations of physical TTL, persistent GET/TTL, and memory/strict SET.
+  The read routes remain in the microsecond domain, while memory SET is
+  hundreds of microseconds and strict SET is milliseconds. The receipt exposes
+  that deficit and is not a regression threshold or G0/G1/G3/G6/G7 closure.

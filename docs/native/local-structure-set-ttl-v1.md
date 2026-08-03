@@ -1,6 +1,7 @@
 # Native local structure SET and TTL v1
 
-Status: contract frozen; implementation and direct-Linux evidence pending.
+Status: implemented over the serial UDS session; direct-Linux evidence
+recorded; complete local-product and performance gates remain open.
 
 This contract extends the first engine-bearing local session with one native
 scalar mutation and one TTL query. It does not add a compatibility command
@@ -193,6 +194,13 @@ durability. The first receipt is an observation, not a regression threshold
 or G7 closure. It must disclose mutation cardinality, key/value size, warmup,
 sample count, CPU affinity, virtualization, filesystem, maxima, and missing
 cold/saturation/allocation/hardware-counter lanes.
+
+The matched
+[direct-Linux evidence](../gates/evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
+binds the codecs, serial execution, recovery behavior, and five separately
+measured latency surfaces to exact commits and raw receipt hashes. The
+observed mutation routes do not meet a microsecond mutation objective and do
+not establish a regression threshold.
 
 ## Boundary
 

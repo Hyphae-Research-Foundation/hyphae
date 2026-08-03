@@ -1,0 +1,291 @@
+{
+  "schema": "hyphae.native.local-structure-set-ttl-evidence.v1",
+  "status": "observation-not-regression-gate",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-structure-set-ttl",
+  "contract_commit": "9666b5a946dccc8da2939e0846aea99ce983c431",
+  "contract_correction_commit": "b01d6e17d798a12f55727d6ba9e363819d1e3791",
+  "implementation_commit": "253e11e5dc89c41f2369af4c5a366287c21aca53",
+  "source_commit": "8ce45eb91d5ee87c296204685f1a82d5140515ef",
+  "source_tree": "5a58f60010508daf306e949716f37ec904866bbc",
+  "harness_commit": "8ce45eb91d5ee87c296204685f1a82d5140515ef",
+  "harness": "crates/hyphae-native-runtime/examples/uds_structure_set_ttl_smoke.rs",
+  "harness_sha256": "edfc651f42e4f2407d3c559b15d3555099899f6ed6d0ff5ad1e0b2186f62d5ca",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_structure_set_ttl --no-run",
+    "expected_result": "E0432 unresolved imports for the frozen SET/TTL codecs and general structure session",
+    "log_sha256": "49deec64b2f6587a9a2e92964e9063d75620f90c461d286192ebac52e923f5c9"
+  },
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "physical_cores_visible": 4,
+    "memory_gib": 30,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [
+      2,
+      3
+    ],
+    "cpu_governor": "unavailable",
+    "wsl_in_execution_path": false
+  },
+  "workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "maximum_payload_bytes": 128,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "target_key": 1024,
+    "key_bytes": 4,
+    "value_bytes": 64,
+    "relative_ttl_micros": 60000000,
+    "warm_state": true,
+    "read_warmup": 10000,
+    "read_observations": 100000,
+    "memory_set_warmup": 1000,
+    "memory_set_observations": 10000,
+    "strict_set_warmup": 16,
+    "strict_set_observations": 256,
+    "dataset_digest_blake3": "b1fd6494926976e3604c7f42c02d47d38feca9b4423d70721915d6d79ccf2f4b"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "2b65f72bcc45a5bb795e911e96b2787bab2c22c54916b6246090cb10eb3fd883",
+      "embedded_physical_ttl": {
+        "p50_nanos": 832,
+        "p95_nanos": 867,
+        "p99_nanos": 886,
+        "p999_nanos": 4505,
+        "maximum_nanos": 22355,
+        "throughput_per_second": 1150779.384
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23546,
+        "p95_nanos": 23971,
+        "p99_nanos": 33797,
+        "p999_nanos": 37755,
+        "maximum_nanos": 121342,
+        "throughput_per_second": 42827.937
+      },
+      "persistent_structure_ttl_round_trip": {
+        "p50_nanos": 23487,
+        "p95_nanos": 23905,
+        "p99_nanos": 34489,
+        "p999_nanos": 37651,
+        "maximum_nanos": 122774,
+        "throughput_per_second": 42717.137
+      },
+      "persistent_structure_set_memory_round_trip_64b": {
+        "p50_nanos": 377986,
+        "p95_nanos": 396671,
+        "p99_nanos": 401059,
+        "p999_nanos": 479580,
+        "maximum_nanos": 601276,
+        "throughput_per_second": 2611.466
+      },
+      "persistent_structure_set_strict_round_trip_64b": {
+        "p50_nanos": 6731272,
+        "p95_nanos": 6886954,
+        "p99_nanos": 6940559,
+        "p999_nanos": 6960779,
+        "maximum_nanos": 6961613,
+        "throughput_per_second": 148.537
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "735fa0bdfdc4290fd7e06aae4274bbf2518f9562d428c9c52398b664d68a91b9",
+      "embedded_physical_ttl": {
+        "p50_nanos": 829,
+        "p95_nanos": 862,
+        "p99_nanos": 883,
+        "p999_nanos": 4549,
+        "maximum_nanos": 24017,
+        "throughput_per_second": 1150483.865
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23494,
+        "p95_nanos": 23926,
+        "p99_nanos": 34286,
+        "p999_nanos": 37684,
+        "maximum_nanos": 105212,
+        "throughput_per_second": 43571.268
+      },
+      "persistent_structure_ttl_round_trip": {
+        "p50_nanos": 23479,
+        "p95_nanos": 23886,
+        "p99_nanos": 34600,
+        "p999_nanos": 37765,
+        "maximum_nanos": 119892,
+        "throughput_per_second": 43106.106
+      },
+      "persistent_structure_set_memory_round_trip_64b": {
+        "p50_nanos": 377113,
+        "p95_nanos": 396345,
+        "p99_nanos": 409379,
+        "p999_nanos": 602590,
+        "maximum_nanos": 668837,
+        "throughput_per_second": 2612.986
+      },
+      "persistent_structure_set_strict_round_trip_64b": {
+        "p50_nanos": 6744689,
+        "p95_nanos": 6870519,
+        "p99_nanos": 6903161,
+        "p999_nanos": 6939291,
+        "maximum_nanos": 6959673,
+        "throughput_per_second": 148.359
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "59887b6bbb26d7122fd162d3790b29c51a4facf9746c754d478f809864b5edd6",
+      "embedded_physical_ttl": {
+        "p50_nanos": 837,
+        "p95_nanos": 869,
+        "p99_nanos": 890,
+        "p999_nanos": 4701,
+        "maximum_nanos": 26982,
+        "throughput_per_second": 1143617.825
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23618,
+        "p95_nanos": 24047,
+        "p99_nanos": 34418,
+        "p999_nanos": 37863,
+        "maximum_nanos": 119277,
+        "throughput_per_second": 42571.393
+      },
+      "persistent_structure_ttl_round_trip": {
+        "p50_nanos": 23540,
+        "p95_nanos": 23963,
+        "p99_nanos": 34342,
+        "p999_nanos": 37784,
+        "maximum_nanos": 633714,
+        "throughput_per_second": 42677.201
+      },
+      "persistent_structure_set_memory_round_trip_64b": {
+        "p50_nanos": 376722,
+        "p95_nanos": 395668,
+        "p99_nanos": 400902,
+        "p999_nanos": 497677,
+        "maximum_nanos": 647865,
+        "throughput_per_second": 2618.620
+      },
+      "persistent_structure_set_strict_round_trip_64b": {
+        "p50_nanos": 6738743,
+        "p95_nanos": 6878384,
+        "p99_nanos": 6928074,
+        "p999_nanos": 6947070,
+        "maximum_nanos": 7078042,
+        "throughput_per_second": 148.531
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "embedded_physical_ttl": {
+      "p50_nanos": 832,
+      "p95_nanos": 867,
+      "p99_nanos": 886,
+      "p999_nanos": 4549,
+      "maximum_nanos": 24017,
+      "throughput_per_second": 1150483.865
+    },
+    "persistent_structure_get_round_trip_64b": {
+      "p50_nanos": 23546,
+      "p95_nanos": 23971,
+      "p99_nanos": 34286,
+      "p999_nanos": 37755,
+      "maximum_nanos": 119277,
+      "throughput_per_second": 42827.937
+    },
+    "persistent_structure_ttl_round_trip": {
+      "p50_nanos": 23487,
+      "p95_nanos": 23905,
+      "p99_nanos": 34489,
+      "p999_nanos": 37765,
+      "maximum_nanos": 122774,
+      "throughput_per_second": 42717.137
+    },
+    "persistent_structure_set_memory_round_trip_64b": {
+      "p50_nanos": 377113,
+      "p95_nanos": 396345,
+      "p99_nanos": 401059,
+      "p999_nanos": 497677,
+      "maximum_nanos": 647865,
+      "throughput_per_second": 2612.986
+    },
+    "persistent_structure_set_strict_round_trip_64b": {
+      "p50_nanos": 6738743,
+      "p95_nanos": 6878384,
+      "p99_nanos": 6928074,
+      "p999_nanos": 6947070,
+      "maximum_nanos": 6961613,
+      "throughput_per_second": 148.531
+    }
+  },
+  "performance_observation": {
+    "physical_ttl_microsecond_domain": true,
+    "local_get_and_ttl_microsecond_domain": true,
+    "memory_set_microsecond_objective_met": false,
+    "strict_set_includes_physical_durability": true,
+    "strict_set_has_universal_microsecond_promise": false,
+    "independent_percentiles_subtracted": false,
+    "regression_threshold_established": false,
+    "g7_gate_passed": false
+  },
+  "verification": {
+    "status": "passed-direct-linux",
+    "workspace_tests_passed": 648,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_unit_tests_passed": 332,
+    "structure_get_integration_tests_passed": 5,
+    "structure_set_ttl_integration_tests_passed": 6,
+    "documentation_markdown_files": 237,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "1c096c7b85320043faae7f95fcae20d387b9193e3a5e89a22d33d8458e27c1f7",
+    "targeted_test_log_sha256": "517da8da7dc14fd15a1cf378a4f5557d1067465e09fdfc94b5b22dea7e71475c",
+    "clippy_log_sha256": "bfc0236e7664df6e9da3ee14f45d7beda0de304f3e2c8a1d6f505794b29e78c7",
+    "rustdoc_log_sha256": "af6664beb508e112d56c7fcfe072f2671d93d067c519fb03b111aff4cc0666dc",
+    "release_check_log_sha256": "e84a41aa560f77c20cd003db76ada1536570cc444b576f391dce05cbcebb684c",
+    "documentation_log_sha256": "6ee0b7b3c51d77da4a17c3d88e817f3716dbc732503cf8533d279d0789940196",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diff_check_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "engine_operation": true,
+    "memory_mutation": true,
+    "strict_reopen_equivalence": true,
+    "literal_power_loss": false,
+    "group_durability": false,
+    "replay_idempotency": false,
+    "explicit_transaction_state": false,
+    "sql_or_search_operation": false,
+    "cold_state": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "windows_named_pipe": false,
+    "complete_handshake": false,
+    "multiplexing": false,
+    "g0_closed": false,
+    "g1_closed": false,
+    "g3_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "regression_threshold": false
+  }
+}
