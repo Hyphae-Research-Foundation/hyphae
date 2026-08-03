@@ -23,7 +23,9 @@ struct TemporaryDirectory(PathBuf);
 impl TemporaryDirectory {
     fn create() -> Result<Self, Box<dyn std::error::Error>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        // Hosted macOS exposes a TMPDIR long enough to exceed sockaddr_un's
+        // pathname limit once the socket name is appended.
+        let path = Path::new("/tmp").join(format!(
             "hyphae-native-local-uds-test-{}-{timestamp}",
             std::process::id()
         ));
