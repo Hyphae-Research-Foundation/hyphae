@@ -1,6 +1,7 @@
 # Native hash field commands v1
 
-Status: accepted implementation target.
+Status: implemented; evidence recorded in
+[Native hash field commands evidence on Linux — 2026-08-03](../gates/evidence/native-hash-field-commands-linux-2026-08-03.md).
 
 This contract extends
 [Native structure-engine semantics v1](structures-semantics-v1.md) and

@@ -140,6 +140,18 @@ inside its frozen 10% gate. The checked
 [receipt](../gates/evidence/native-hash-ttl-linux-2026-08-03.md) remains a
 warm, concurrency-one observation and does not pass G7.
 
+Bounded hash field commands use a third direct-Linux harness over one
+2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
+`0.853 us` per field, compared with `47.334 us` total and `1.479 us` per
+field for 32 singular physical calls. The batch reduced total p50 by 42.325%
+and raised call throughput by 73.337% within this process and corpus.
+Snapshot/private batches observed about `0.062 us` p50 per field. Memory
+`HSET_MANY(32)` commit observed p50 `4.638 ms`, strict commit `14.558 ms`,
+memory `HDELETE_MANY(32)` `6.829 ms`, and memory/strict signed field
+increments `1.476 ms`/`7.817 ms`. The checked
+[receipt](../gates/evidence/native-hash-field-commands-linux-2026-08-03.md)
+separates warm reads from publication and durability and does not pass G7.
+
 Schema v7 adds 2,048 rows under one unique text secondary index and measures
 one complete exact-key call per timer sample. The buffered physical
 index-to-row route observed p50 `8.514 us` and p99 `22.144 us`; the

@@ -300,6 +300,15 @@ commit before its tag can be published.
   TTL, physical `HGET`, memory/strict expiry commit, hash cleanup, and a
   matched parent/current persistent-read control. It remains outside complete
   G3 and G7.
+- [Native hash field commands evidence —
+  2026-08-03](native-hash-field-commands-linux-2026-08-03.md) binds bounded
+  multi-field read/set/delete, a signed field counter, canonical mutation
+  order, failure atomicity, field conflicts, lifecycle fencing, crash
+  boundaries, and reached-corruption checks to direct Linux.
+- `native-hash-field-commands-linux.json` records snapshot/private/physical
+  batch reads, a same-corpus singular-read control, memory/strict mutations,
+  and a matched parent/current persistent-read control. It remains outside
+  complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

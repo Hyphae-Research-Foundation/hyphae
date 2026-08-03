@@ -147,9 +147,15 @@ evidence](evidence/native-hash-ttl-linux-2026-08-03.md) adds absolute
 whole-family expiry, persistent/expiring metadata compatibility, typed shared
 expiry indexing, logical absence, cross-family key reuse, lifecycle
 conflicts, mixed scalar/hash scheduler cleanup, crash boundaries, compaction,
-and matched direct-Linux latency. Pattern/reverse scans, multi-field commands,
-field counters, randomized model testing, other collection-family TTL, the
-complete G3 suite, and G7 remain open.
+and matched direct-Linux latency.
+
+The [native hash field command
+evidence](evidence/native-hash-field-commands-linux-2026-08-03.md) adds
+bounded positional multi-read, canonical atomic multi-set/delete, signed field
+counters, failure atomicity, field/lifecycle conflicts, crash boundaries,
+reached-corruption checks, and separated direct-Linux latency. Pattern/reverse
+scans, floating counters, randomized model testing, other collection-family
+TTL, the complete G3 suite, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -641,11 +647,12 @@ multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes with bounded
 exact-byte iteration, exact binary sets with member-granular conflicts,
 chunked-deque lists, and dual-index sorted sets with bounded bidirectional
-score/rank ranges, member-rank lookup, and whole-hash delete/recreate. It still
-lacks hash TTL/pattern/reverse scans/multi-field commands, set and sorted-set
+score/rank ranges, member-rank lookup, whole-hash delete/recreate and TTL,
+bounded multi-field hash commands, and signed hash-field counters. It still
+lacks hash pattern/reverse scans, floating counters, set and sorted-set
 algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
-empty-expiry backoff, model tests, and a user-facing historical-retention
-policy required to close G3. Ordered cleanup,
+empty-expiry backoff, randomized model tests, and a user-facing
+historical-retention policy required to close G3. Ordered cleanup,
 current-root compaction, and page-generation vacuum provide exact first
 amplification measurements, not the complete memory-amplification gate.
 

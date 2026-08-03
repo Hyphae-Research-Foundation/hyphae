@@ -1,0 +1,177 @@
+{
+  "schema": "hyphae.native.hash-field-commands-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-hash-field-commands",
+  "stacked_parent_commit": "6df7c8020a460bcd99848a654043197c8c57f1c7",
+  "contract_commit": "616515df36fba0a2dd9b0b8c51babe73f28b2fd8",
+  "runtime_commit": "714b5781ba3949b01b46636e321cff8afe2f6c6f",
+  "benchmark_commit": "c406d15bc1b4fbda031d4a41b999863644f1a182",
+  "benchmark_tree": "4cdfe21518b632d477fbb14572c50e76ef377dc0",
+  "benchmark_harness_sha256": "105db2d2b4d35babb9ea72b072af5a7f0c313ab52a49cf8357469045d41b2f3d",
+  "control_harness_sha256": "8d03592813a5607be4ff1f63c7fced8c059a59a37ebd524c4098f1b9ed05b0eb",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "hash_field_commands_smoke": {
+    "schema": "hyphae.native.hash-field-commands-smoke.v1",
+    "hash_fields": 2048,
+    "batch_fields": 32,
+    "read_observations": 100000,
+    "read_warmup": 10000,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "operations": {
+      "snapshot_hget_many_32": {
+        "fields_per_call": 32,
+        "p50_nanos": 1982,
+        "p95_nanos": 2029,
+        "p99_nanos": 2063,
+        "p999_nanos": 11685,
+        "maximum_nanos": 117570,
+        "p50_nanos_per_field": 61.938,
+        "throughput_per_second": 490676.891
+      },
+      "private_hget_many_32": {
+        "fields_per_call": 32,
+        "p50_nanos": 1975,
+        "p95_nanos": 2024,
+        "p99_nanos": 2055,
+        "p999_nanos": 11308,
+        "maximum_nanos": 34770,
+        "p50_nanos_per_field": 61.719,
+        "throughput_per_second": 492513.276
+      },
+      "physical_hget_many_32": {
+        "fields_per_call": 32,
+        "p50_nanos": 27300,
+        "p95_nanos": 27933,
+        "p99_nanos": 37193,
+        "p999_nanos": 50936,
+        "maximum_nanos": 150915,
+        "p50_nanos_per_field": 853.125,
+        "throughput_per_second": 36081.579
+      },
+      "physical_32_single_hget": {
+        "fields_per_call": 32,
+        "p50_nanos": 47334,
+        "p95_nanos": 55974,
+        "p99_nanos": 57596,
+        "p999_nanos": 86072,
+        "maximum_nanos": 162589,
+        "p50_nanos_per_field": 1479.188,
+        "throughput_per_second": 20815.896
+      },
+      "memory_hset_many_32_commit": {
+        "fields_per_call": 32,
+        "p50_nanos": 4637727,
+        "p95_nanos": 4932568,
+        "p99_nanos": 5224094,
+        "p999_nanos": 5224094,
+        "maximum_nanos": 5245597,
+        "p50_nanos_per_field": 144928.969,
+        "throughput_per_second": 213.002
+      },
+      "strict_hset_many_32_commit": {
+        "fields_per_call": 32,
+        "p50_nanos": 14557616,
+        "p95_nanos": 14722006,
+        "p99_nanos": 14722006,
+        "p999_nanos": 14722006,
+        "maximum_nanos": 292663400,
+        "p50_nanos_per_field": 454925.5,
+        "throughput_per_second": 31.589
+      },
+      "memory_hdelete_many_32_commit": {
+        "fields_per_call": 32,
+        "p50_nanos": 6829260,
+        "p95_nanos": 7022780,
+        "p99_nanos": 7022780,
+        "p999_nanos": 7022780,
+        "maximum_nanos": 7072876,
+        "p50_nanos_per_field": 213414.375,
+        "throughput_per_second": 145.455
+      },
+      "memory_hincrement_commit": {
+        "fields_per_call": 1,
+        "p50_nanos": 1476303,
+        "p95_nanos": 1497458,
+        "p99_nanos": 1498462,
+        "p999_nanos": 1498462,
+        "maximum_nanos": 1502011,
+        "p50_nanos_per_field": 1476303.0,
+        "throughput_per_second": 677.211
+      },
+      "strict_hincrement_commit": {
+        "fields_per_call": 1,
+        "p50_nanos": 7816713,
+        "p95_nanos": 8079934,
+        "p99_nanos": 8079934,
+        "p999_nanos": 8079934,
+        "maximum_nanos": 224390766,
+        "p50_nanos_per_field": 7816713.0,
+        "throughput_per_second": 46.993
+      }
+    },
+    "physical_batch_vs_singles_change_percent": {
+      "p50": -42.325,
+      "p95": -50.096,
+      "p99": -35.424,
+      "p999": -40.822,
+      "throughput": 73.337
+    }
+  },
+  "matched_persistent_hget_control": {
+    "hash_fields": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "parent": {
+      "commit": "6df7c8020a460bcd99848a654043197c8c57f1c7",
+      "p50_nanos": 1393,
+      "p95_nanos": 1640,
+      "p99_nanos": 1710,
+      "p999_nanos": 2435,
+      "maximum_nanos": 6227,
+      "throughput_per_second": 707814.279
+    },
+    "current": {
+      "commit": "c406d15bc1b4fbda031d4a41b999863644f1a182",
+      "p50_nanos": 1371,
+      "p95_nanos": 1623,
+      "p99_nanos": 1693,
+      "p999_nanos": 2917,
+      "maximum_nanos": 8119,
+      "throughput_per_second": 718104.183
+    },
+    "change_percent": {
+      "p50": -1.579,
+      "p95": -1.037,
+      "p99": -0.994,
+      "p999": 19.795,
+      "throughput": 1.454
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "boundaries": [
+    "Warm concurrency-one observations are not a universal latency SLO.",
+    "Strict commits include ext4/EBS page, blob, and WAL synchronization.",
+    "Commit results include transaction preparation, B+tree copy-on-write, WAL, root publication, and selected durability.",
+    "The matched control freezes p50 and p95 only; its p99.9 change remains disclosed and open.",
+    "The observation does not close saturation, cold-cache, allocation, RSS, hardware-counter, memory-amplification, complete G3, or G7 gates."
+  ]
+}
