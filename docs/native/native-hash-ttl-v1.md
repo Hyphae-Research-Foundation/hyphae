@@ -1,6 +1,7 @@
 # Native whole-hash TTL v1
 
-Status: accepted implementation target.
+Status: implemented; evidence recorded in
+[Native whole-hash TTL evidence on Linux — 2026-08-03](../gates/evidence/native-hash-ttl-linux-2026-08-03.md).
 
 This contract extends
 [Native structure-engine semantics v1](structures-semantics-v1.md),

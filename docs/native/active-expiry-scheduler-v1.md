@@ -2,6 +2,8 @@
 
 Status: implemented; evidence recorded in
 [Native active-expiry scheduler evidence — 2026-08-02](../gates/evidence/native-active-expiry-scheduler-2026-08-02.md)
+and extended to mixed scalar/hash cleanup in
+[Native whole-hash TTL evidence on Linux — 2026-08-03](../gates/evidence/native-hash-ttl-linux-2026-08-03.md).
 
 Active expiry is physical structure maintenance owned by the native commit
 scheduler. It removes due scalar values and whole hashes through one typed

@@ -140,9 +140,16 @@ evidence](evidence/native-hash-lifecycle-linux-2026-08-02.md) adds typed
 dependency that preserves disjoint-field admission, metadata/field prefix
 tombstoning, fail-closed replay, compaction, all seven singleton commit crash
 boundaries, and latency separated into private, memory-publication, and strict
-durability surfaces. Hash TTL, pattern/reverse scans, multi-field commands,
-field counters, randomized model testing, the complete G3 suite, and G7 remain
-open.
+durability surfaces.
+
+The [native whole-hash TTL
+evidence](evidence/native-hash-ttl-linux-2026-08-03.md) adds absolute
+whole-family expiry, persistent/expiring metadata compatibility, typed shared
+expiry indexing, logical absence, cross-family key reuse, lifecycle
+conflicts, mixed scalar/hash scheduler cleanup, crash boundaries, compaction,
+and matched direct-Linux latency. Pattern/reverse scans, multi-field commands,
+field counters, randomized model testing, other collection-family TTL, the
+complete G3 suite, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement

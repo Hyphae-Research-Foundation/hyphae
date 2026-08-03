@@ -1,0 +1,154 @@
+{
+  "schema": "hyphae.native.hash-ttl-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-hash-ttl",
+  "benchmark_introduction_commit": "d2149451bc03d6733f3514b0d1ebfac6457cf270",
+  "runtime_benchmark_commit": "f2c731210025217d9454243bb4bc5768f842e938",
+  "runtime_benchmark_tree": "1959e92f40c0a1f24c5defd2090c78b33d08cbc5",
+  "control_harness_commit": "ad42f8592145f3257ad51915799a5a266ffcd06d",
+  "control_parent_commit": "a8174f68e866578083c7062e8640f0b0fb9aa3f8",
+  "source_tree_after_control_harness": "ad9abe4be4f958531b24fafde7cd5c1e4d0c4fea",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "hash_ttl_smoke": {
+    "schema": "hyphae.native.hash-ttl-smoke.v1",
+    "hash_fields": 2048,
+    "read_observations": 200000,
+    "read_operations_per_observation": 32,
+    "read_warmup": 20000,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "cleanup_hashes": 16,
+    "cleanup_fields_per_hash": 256,
+    "operations": {
+      "persistent_hash_hget_physical": {
+        "p50_nanos": 1351,
+        "p95_nanos": 1612,
+        "p99_nanos": 1676,
+        "p999_nanos": 2366,
+        "maximum_nanos": 4711,
+        "throughput_per_second": 728925.306
+      },
+      "persistent_hash_ttl_materialized_snapshot": {
+        "p50_nanos": 7,
+        "p95_nanos": 8,
+        "p99_nanos": 8,
+        "p999_nanos": 16,
+        "maximum_nanos": 479,
+        "throughput_per_second": 111805789.989
+      },
+      "expiring_hash_ttl_private_batch": {
+        "p50_nanos": 12,
+        "p95_nanos": 13,
+        "p99_nanos": 16,
+        "p999_nanos": 27,
+        "maximum_nanos": 402,
+        "throughput_per_second": 72813327.324
+      },
+      "expiring_hash_ttl_materialized_snapshot": {
+        "p50_nanos": 12,
+        "p95_nanos": 13,
+        "p99_nanos": 14,
+        "p999_nanos": 26,
+        "maximum_nanos": 413,
+        "throughput_per_second": 73885884.844
+      },
+      "expiring_hash_ttl_physical": {
+        "p50_nanos": 631,
+        "p95_nanos": 639,
+        "p99_nanos": 908,
+        "p999_nanos": 1089,
+        "maximum_nanos": 5718,
+        "throughput_per_second": 1561113.669
+      },
+      "expiring_hash_hget_physical": {
+        "p50_nanos": 1364,
+        "p95_nanos": 1506,
+        "p99_nanos": 1656,
+        "p999_nanos": 2043,
+        "maximum_nanos": 5963,
+        "throughput_per_second": 725062.22
+      },
+      "expire_hash_memory_commit": {
+        "p50_nanos": 1391193,
+        "p95_nanos": 1422920,
+        "p99_nanos": 1454486,
+        "p999_nanos": 1454486,
+        "maximum_nanos": 1604583,
+        "throughput_per_second": 715.02
+      },
+      "expire_hash_strict_commit": {
+        "p50_nanos": 8354593,
+        "p95_nanos": 10896683,
+        "p99_nanos": 10896683,
+        "p999_nanos": 10896683,
+        "maximum_nanos": 116534430,
+        "throughput_per_second": 64.579
+      },
+      "expire_hash_cleanup_256_fields_memory": {
+        "p50_nanos": 613951,
+        "p95_nanos": 675995,
+        "p99_nanos": 675995,
+        "p999_nanos": 675995,
+        "maximum_nanos": 679878,
+        "throughput_per_second": 1620.352
+      }
+    }
+  },
+  "matched_persistent_hget_control": {
+    "harness_sha256": "24fcc0ce3c8277b58df9e59409f2dfe0338e6c108cf4920fba4cda8421219f5d",
+    "hash_fields": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "parent": {
+      "commit": "a8174f68e866578083c7062e8640f0b0fb9aa3f8",
+      "p50_nanos": 1350,
+      "p95_nanos": 1487,
+      "p99_nanos": 1639,
+      "p999_nanos": 1854,
+      "maximum_nanos": 4778,
+      "throughput_per_second": 731891.111
+    },
+    "current": {
+      "commit": "ad42f8592145f3257ad51915799a5a266ffcd06d",
+      "p50_nanos": 1391,
+      "p95_nanos": 1582,
+      "p99_nanos": 1686,
+      "p999_nanos": 2750,
+      "maximum_nanos": 4860,
+      "throughput_per_second": 708651.979
+    },
+    "change_percent": {
+      "p50": 3.037,
+      "p95": 6.389,
+      "p99": 2.868,
+      "p999": 48.328,
+      "throughput": -3.175
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "boundaries": [
+    "Warm embedded/current-root observations are not a universal latency SLO.",
+    "Strict commit includes ext4/EBS page and WAL synchronization.",
+    "Cleanup cost is cardinality-sensitive and uses 256 live fields per hash.",
+    "The matched read control is concurrency-one and does not close saturation, cold-cache, allocation, RSS, hardware-counter, or G7 gates.",
+    "The p99.9 control delta is reported but was not a frozen gate."
+  ]
+}

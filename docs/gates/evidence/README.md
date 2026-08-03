@@ -291,6 +291,15 @@ commit before its tag can be published.
   separated private/memory/strict latency to one source commit.
 - `native-hash-lifecycle-linux.json` is its direct-Linux release observation
   over 0-, 64-, and 2,048-field hashes. It remains outside complete G3 and G7.
+- [Native whole-hash TTL evidence —
+  2026-08-03](native-hash-ttl-linux-2026-08-03.md) binds absolute whole-family
+  expiry, compatible `HYHSHM01`/`HYHSHM02` metadata, a typed shared expiry
+  index, deterministic visibility, cross-family reuse, lifecycle conflicts,
+  mixed active cleanup, crash boundaries, and compaction to direct Linux.
+- `native-hash-ttl-linux.json` records separated private/snapshot/physical
+  TTL, physical `HGET`, memory/strict expiry commit, hash cleanup, and a
+  matched parent/current persistent-read control. It remains outside complete
+  G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

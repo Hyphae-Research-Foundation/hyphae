@@ -129,6 +129,17 @@ must enumerate and tombstone the complete live field prefix, and strict
 timings include ext4/EBS synchronization. They are not a universal
 microsecond-path claim and do not pass G7.
 
+Whole-hash TTL uses a second direct-Linux harness that separates logical TTL
+reads from physical reads, commits, and cardinality-sensitive cleanup. On a
+2,048-field hash, materialized `TTL_HASH` observed p50 `0.012 us`, physical
+`TTL_HASH` p50 `0.631 us`, and physical expiring-hash `HGET` p50 `1.364 us`.
+Memory expiry commit observed p50 `1.391 ms`, strict expiry commit p50 `8.355
+ms`, and cleanup of a 256-field hash p50 `0.614 ms`. The matched persistent
+`HGET` parent/current control changed by +3.037% at p50 and +6.389% at p95,
+inside its frozen 10% gate. The checked
+[receipt](../gates/evidence/native-hash-ttl-linux-2026-08-03.md) remains a
+warm, concurrency-one observation and does not pass G7.
+
 Schema v7 adds 2,048 rows under one unique text secondary index and measures
 one complete exact-key call per timer sample. The buffered physical
 index-to-row route observed p50 `8.514 us` and p99 `22.144 us`; the
