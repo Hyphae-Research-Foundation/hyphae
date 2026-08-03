@@ -280,6 +280,57 @@ An empty or inverted intersection returns no rows. A null in either complete
 endpoint makes that comparison `UNKNOWN` and returns no rows after full
 parameter and type validation. A second lower or upper endpoint for the same
 selected index is rejected rather than silently replaced.
+
+The next ordered composite-secondary slice is an equality prefix followed by
+a range on the immediately following index column:
+
+```text
+SELECT <projection>
+FROM <table>
+WHERE <first-secondary-index-column> = <scalar>
+  [AND <next-secondary-index-column> = <scalar> ...]
+  AND <immediately-following-secondary-index-column>
+      { > | >= | < | <= } <scalar>
+  [AND <immediately-following-secondary-index-column>
+      { > | >= | < | <= } <scalar>]
+  [AND <residual-filter> ...]
+[ORDER BY <complete-secondary-index-column-list-in-catalog-order>]
+LIMIT <nonnegative-integer>
+```
+
+The equality set must cover a nonempty strict left prefix of one persisted
+`HYRIDX02` index. The range column must be exactly the next column in that
+index. Predicate text order may differ from catalog order. Skipped, duplicate,
+non-index, `OR`-nested, and `NOT`-nested equality terms do not extend the
+prefix. At most one lower and one upper range predicate are admitted;
+duplicate endpoints for the selected shape fail with `HYSQL014`. A complete
+secondary equality keeps the existing exact-lookup plan.
+
+Binding encodes the equality prefix once. An inclusive lower endpoint appends
+the encoded range component and includes that byte prefix. An exclusive lower
+endpoint starts at its binary successor, excluding every trailing-index and
+primary-key tie under that component. An exclusive upper endpoint excludes
+the appended prefix; an inclusive upper endpoint excludes its binary
+successor. Missing endpoints use the equality-prefix interval. Empty,
+inverted, or SQL-null bounds return no rows after complete parameter and type
+validation.
+
+`LIMIT` is mandatory and counts rows whose complete residual filter is
+`TRUE`. `ORDER BY`, when present, must name the complete ascending secondary
+index column list. Equal complete index keys remain ordered by canonical
+primary-key bytes. `EXPLAIN` reports
+`SecondaryIndexPrefixRangeScan(table=<id>,index=<id>,prefix_columns=<count>,range_column=<id>,lower=<kind>,upper=<kind>,limit=<n>)`
+and appends `,residual=true` only when terms remain.
+
+Private transactions, retained snapshots, current-root physical execution,
+and reopen must return equivalent rows. Current-root execution traverses only
+the bound `HYRIDX02` interval and stops after the output limit. Legacy
+`HYRIDX01` metadata never advertises this access; a legal bounded primary-key
+fallback remains available. Malformed ordered identities, forged projections,
+wrong arity/types, null prefixes, adjacent-prefix leakage, and physical
+corruption fail or return empty exactly as specified before any partial result
+is returned.
+
 Unique indexes reject duplicate non-null composite keys before statement or
 commit publication. The current SQL spelling always uses `NULLS DISTINCT`:
 any null component exempts the composite key from uniqueness, while ordinary
@@ -364,9 +415,9 @@ executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
 remaining literal families, casts, descending scans, offsets, and constraints
 beyond primary key/nullability and the first unique index remain pending.
-Secondary equality prefixes followed by a range, index unions/intersections,
-and ranges over a legacy length-first secondary layout remain pending. Typed
-mutation does
+Secondary equality-prefix ranges are specified above but remain pending.
+Index unions/intersections and ranges over a legacy length-first secondary
+layout remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate general
 expressions, or update multiple rows. Multi-range, bitmap, and cost-based
 access selection remain pending.
