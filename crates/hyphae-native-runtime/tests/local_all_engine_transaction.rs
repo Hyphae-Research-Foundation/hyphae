@@ -6,8 +6,11 @@ use std::num::NonZeroU64;
 
 use hyphae_native_runtime::{
     LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE, LOCAL_TRANSACTION_BEGIN_SIZE,
-    LOCAL_TRANSACTION_COMMIT_SIZE, LOCAL_TRANSACTION_ROLLBACK_SIZE, LocalFailureCode,
-    LocalOperationCodecError, LocalSearchCodecError, LocalSqlCodecError,
+    LOCAL_TRANSACTION_COMMIT_RECEIPT_SIZE, LOCAL_TRANSACTION_COMMIT_SIZE,
+    LOCAL_TRANSACTION_ROLLBACK_RECEIPT_SIZE, LOCAL_TRANSACTION_ROLLBACK_SIZE,
+    LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE, LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE,
+    LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE, LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE,
+    LocalFailureCode, LocalOperationCodecError, LocalSearchCodecError, LocalSqlCodecError,
     LocalTransactionBeginReceipt, LocalTransactionCodecError, LocalTransactionCommitReceipt,
     LocalTransactionEngine, LocalTransactionIndexDocumentRequest, LocalTransactionRollbackReceipt,
     LocalTransactionStageReceipt, LocalTransactionStructureSetRequest,
@@ -25,6 +28,12 @@ use hyphae_native_runtime::{
     encode_local_transaction_stage_receipt, encode_local_transaction_structure_set,
 };
 use hyphae_native_types::{Csn, DurabilityClass, ObjectId, ScalarValue, TransactionId};
+
+const _: () = {
+    assert!(LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE == LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE);
+    assert!(LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE > LOCAL_TRANSACTION_ROLLBACK_RECEIPT_SIZE);
+    assert!(LOCAL_TRANSACTION_COMMIT_RECEIPT_SIZE > LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE);
+};
 
 #[test]
 fn transaction_control_payloads_match_frozen_goldens() -> Result<(), Box<dyn std::error::Error>> {
@@ -160,6 +169,141 @@ fn transaction_engine_payloads_round_trip_canonical_values()
 }
 
 #[test]
+fn transaction_commit_and_rollback_payloads_match_frozen_goldens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(7).ok_or("nonzero handle")?;
+    let mut buffer = Vec::new();
+    let mut expected_commit = [0_u8; LOCAL_TRANSACTION_COMMIT_SIZE];
+    expected_commit[0] = 1;
+    expected_commit[1] = 1;
+    expected_commit[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_commit[12..20].copy_from_slice(&3_u64.to_le_bytes());
+    assert_eq!(
+        encode_local_transaction_commit(&mut buffer, handle, 3)?,
+        expected_commit
+    );
+
+    let committed = LocalTransactionCommitReceipt {
+        durability: DurabilityClass::Strict,
+        handle,
+        transaction_id: TransactionId::new(23)?,
+        commit_csn: Csn::new(17)?,
+        staged_operations: 3,
+    };
+    let mut expected_committed = [0_u8; LOCAL_TRANSACTION_COMMIT_RECEIPT_SIZE];
+    expected_committed[0] = 1;
+    expected_committed[1] = 3;
+    expected_committed[2] = 1;
+    expected_committed[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_committed[12..28].copy_from_slice(&23_u128.to_le_bytes());
+    expected_committed[28..36].copy_from_slice(&17_u64.to_le_bytes());
+    expected_committed[36..40].copy_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        encode_local_transaction_commit_receipt(&mut buffer, committed)?,
+        expected_committed
+    );
+
+    let mut expected_rollback = [0_u8; LOCAL_TRANSACTION_ROLLBACK_SIZE];
+    expected_rollback[0] = 1;
+    expected_rollback[1] = 1;
+    expected_rollback[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    assert_eq!(
+        encode_local_transaction_rollback(&mut buffer, handle),
+        expected_rollback
+    );
+    let rolled_back = LocalTransactionRollbackReceipt {
+        handle,
+        discarded_operations: 3,
+    };
+    let mut expected_rolled_back = [0_u8; LOCAL_TRANSACTION_ROLLBACK_RECEIPT_SIZE];
+    expected_rolled_back[0] = 1;
+    expected_rolled_back[1] = 4;
+    expected_rolled_back[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_rolled_back[12..20].copy_from_slice(&3_u64.to_le_bytes());
+    assert_eq!(
+        encode_local_transaction_rollback_receipt(&mut buffer, rolled_back)?,
+        expected_rolled_back
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_engine_payloads_match_frozen_goldens() -> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(7).ok_or("nonzero handle")?;
+    let index = ObjectId::new(19)?;
+    let mut buffer = Vec::new();
+    let structure = LocalTransactionStructureSetRequest {
+        handle,
+        key: b"k",
+        value: b"v",
+        relative_ttl_micros: Some(9),
+    };
+    let mut expected_structure = vec![0_u8; LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE + 2];
+    expected_structure[0] = 1;
+    expected_structure[1] = 4;
+    expected_structure[2] = 1;
+    expected_structure[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_structure[12..16].copy_from_slice(&1_u32.to_le_bytes());
+    expected_structure[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    expected_structure[20..28].copy_from_slice(&9_i64.to_le_bytes());
+    expected_structure[32..].copy_from_slice(b"kv");
+    assert_eq!(
+        encode_local_transaction_structure_set(&mut buffer, structure, usize::MAX)?,
+        expected_structure
+    );
+
+    let statement = "DELETE FROM events WHERE id = 1";
+    let mut expected_sql = vec![0_u8; LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE + statement.len()];
+    expected_sql[0] = 1;
+    expected_sql[1] = 2;
+    expected_sql[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_sql[12..16].copy_from_slice(&u32::try_from(statement.len())?.to_le_bytes());
+    expected_sql[24..].copy_from_slice(statement.as_bytes());
+    assert_eq!(
+        encode_local_transaction_sql_dml(&mut buffer, handle, statement, &[], usize::MAX)?,
+        expected_sql
+    );
+
+    let document = LocalTransactionIndexDocumentRequest {
+        handle,
+        index,
+        document_id: b"d",
+        text: "x",
+    };
+    let mut expected_document = vec![0_u8; LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + 2];
+    expected_document[0] = 1;
+    expected_document[1] = 2;
+    expected_document[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_document[12..28].copy_from_slice(&index.get().to_le_bytes());
+    expected_document[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    expected_document[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    expected_document[40..].copy_from_slice(b"dx");
+    assert_eq!(
+        encode_local_transaction_index_document(&mut buffer, document, usize::MAX)?,
+        expected_document
+    );
+
+    let staged = LocalTransactionStageReceipt {
+        engine: LocalTransactionEngine::Search,
+        handle,
+        operation_ordinal: 3,
+        rows_affected: 1,
+    };
+    let mut expected_staged = [0_u8; LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE];
+    expected_staged[0] = 1;
+    expected_staged[1] = 2;
+    expected_staged[2] = 3;
+    expected_staged[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    expected_staged[12..20].copy_from_slice(&3_u64.to_le_bytes());
+    expected_staged[20..28].copy_from_slice(&1_u64.to_le_bytes());
+    assert_eq!(
+        encode_local_transaction_stage_receipt(&mut buffer, staged)?,
+        expected_staged
+    );
+    Ok(())
+}
+
+#[test]
 fn transaction_control_codecs_reject_noncanonical_boundaries()
 -> Result<(), Box<dyn std::error::Error>> {
     let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
@@ -249,6 +393,213 @@ fn transaction_control_codecs_reject_noncanonical_boundaries()
 }
 
 #[test]
+fn transaction_commit_and_rollback_codecs_reject_noncanonical_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let mut buffer = Vec::new();
+    let commit = encode_local_transaction_commit(&mut buffer, handle, 3)?.to_vec();
+    for length in 0..LOCAL_TRANSACTION_COMMIT_SIZE {
+        assert!(matches!(
+            decode_local_transaction_commit(&commit[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    let mut invalid = commit.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_commit(&invalid),
+        Err(LocalTransactionCodecError::LengthMismatch)
+    ));
+    for range in [2..4, 4..12, 20..24] {
+        invalid = commit.clone();
+        if range == (4..12) {
+            invalid[range].fill(0);
+            assert!(matches!(
+                decode_local_transaction_commit(&invalid),
+                Err(LocalTransactionCodecError::InvalidIdentity)
+            ));
+        } else {
+            invalid[range.start] = 1;
+            assert!(matches!(
+                decode_local_transaction_commit(&invalid),
+                Err(LocalTransactionCodecError::ReservedBytes)
+            ));
+        }
+    }
+
+    let rollback = encode_local_transaction_rollback(&mut buffer, handle).to_vec();
+    for length in 0..LOCAL_TRANSACTION_ROLLBACK_SIZE {
+        assert!(matches!(
+            decode_local_transaction_rollback(&rollback[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    invalid = rollback.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_rollback(&invalid),
+        Err(LocalTransactionCodecError::LengthMismatch)
+    ));
+    invalid = rollback.clone();
+    invalid[4..12].fill(0);
+    assert!(matches!(
+        decode_local_transaction_rollback(&invalid),
+        Err(LocalTransactionCodecError::InvalidIdentity)
+    ));
+    for offset in [2, 12] {
+        invalid = rollback.clone();
+        invalid[offset] = 1;
+        assert!(matches!(
+            decode_local_transaction_rollback(&invalid),
+            Err(LocalTransactionCodecError::ReservedBytes)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_begin_and_stage_receipts_reject_noncanonical_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let mut buffer = Vec::new();
+    let begun = encode_local_transaction_begin_receipt(
+        &mut buffer,
+        LocalTransactionBeginReceipt {
+            durability: DurabilityClass::Memory,
+            handle,
+            read_csn: Some(Csn::new(1)?),
+            logical_time_micros: 10,
+        },
+    )?
+    .to_vec();
+    for length in 0..LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE {
+        assert!(matches!(
+            decode_local_transaction_begin_receipt(&begun[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    let mut invalid = begun.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_begin_receipt(&invalid),
+        Err(LocalTransactionCodecError::LengthMismatch)
+    ));
+    invalid = begun.clone();
+    invalid[4..12].fill(0);
+    assert!(matches!(
+        decode_local_transaction_begin_receipt(&invalid),
+        Err(LocalTransactionCodecError::InvalidIdentity)
+    ));
+    invalid = begun.clone();
+    invalid[12..20].fill(0);
+    assert_eq!(
+        decode_local_transaction_begin_receipt(&invalid)?.read_csn,
+        None
+    );
+
+    let staged = encode_local_transaction_stage_receipt(
+        &mut buffer,
+        LocalTransactionStageReceipt {
+            engine: LocalTransactionEngine::Search,
+            handle,
+            operation_ordinal: 1,
+            rows_affected: 1,
+        },
+    )?
+    .to_vec();
+    for length in 0..LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE {
+        assert!(matches!(
+            decode_local_transaction_stage_receipt(&staged[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    invalid = staged.clone();
+    invalid[2] = 9;
+    assert!(matches!(
+        decode_local_transaction_stage_receipt(&invalid),
+        Err(LocalTransactionCodecError::UnknownEngine(9))
+    ));
+    for range in [4..12, 12..20] {
+        invalid = staged.clone();
+        invalid[range].fill(0);
+        assert!(matches!(
+            decode_local_transaction_stage_receipt(&invalid),
+            Err(LocalTransactionCodecError::InvalidIdentity
+                | LocalTransactionCodecError::InvalidOperationCount)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_commit_and_rollback_receipts_reject_noncanonical_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let mut buffer = Vec::new();
+    let committed = encode_local_transaction_commit_receipt(
+        &mut buffer,
+        LocalTransactionCommitReceipt {
+            durability: DurabilityClass::Strict,
+            handle,
+            transaction_id: TransactionId::new(1)?,
+            commit_csn: Csn::new(1)?,
+            staged_operations: 1,
+        },
+    )?
+    .to_vec();
+    for length in 0..LOCAL_TRANSACTION_COMMIT_RECEIPT_SIZE {
+        assert!(matches!(
+            decode_local_transaction_commit_receipt(&committed[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    let mut invalid = committed.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_commit_receipt(&invalid),
+        Err(LocalTransactionCodecError::LengthMismatch)
+    ));
+    for range in [4..12, 12..28, 28..36, 36..40] {
+        invalid = committed.clone();
+        invalid[range].fill(0);
+        assert!(matches!(
+            decode_local_transaction_commit_receipt(&invalid),
+            Err(LocalTransactionCodecError::InvalidIdentity
+                | LocalTransactionCodecError::InvalidOperationCount)
+        ));
+    }
+
+    let rolled_back = encode_local_transaction_rollback_receipt(
+        &mut buffer,
+        LocalTransactionRollbackReceipt {
+            handle,
+            discarded_operations: 1,
+        },
+    )?
+    .to_vec();
+    for length in 0..LOCAL_TRANSACTION_ROLLBACK_RECEIPT_SIZE {
+        assert!(matches!(
+            decode_local_transaction_rollback_receipt(&rolled_back[..length]),
+            Err(LocalTransactionCodecError::Truncated)
+        ));
+    }
+    invalid = rolled_back.clone();
+    invalid[4..12].fill(0);
+    assert!(matches!(
+        decode_local_transaction_rollback_receipt(&invalid),
+        Err(LocalTransactionCodecError::InvalidIdentity)
+    ));
+    invalid = rolled_back;
+    invalid[12..20]
+        .copy_from_slice(&u64::try_from(MAX_LOCAL_TRANSACTION_OPERATIONS + 1)?.to_le_bytes());
+    assert!(matches!(
+        decode_local_transaction_rollback_receipt(&invalid),
+        Err(LocalTransactionCodecError::InvalidOperationCount)
+    ));
+    Ok(())
+}
+
+#[test]
 fn transaction_structure_and_search_codecs_enforce_physical_bounds()
 -> Result<(), Box<dyn std::error::Error>> {
     let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
@@ -332,6 +683,135 @@ fn transaction_structure_and_search_codecs_enforce_physical_bounds()
 }
 
 #[test]
+fn transaction_structure_codec_rejects_noncanonical_payloads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let mut buffer = Vec::new();
+    let canonical = encode_local_transaction_structure_set(
+        &mut buffer,
+        LocalTransactionStructureSetRequest {
+            handle,
+            key: b"k",
+            value: b"v",
+            relative_ttl_micros: Some(9),
+        },
+        usize::MAX,
+    )?
+    .to_vec();
+    for length in 0..canonical.len() {
+        assert!(matches!(
+            decode_local_transaction_structure_set(&canonical[..length]),
+            Err(LocalOperationCodecError::Truncated | LocalOperationCodecError::LengthMismatch)
+        ));
+    }
+    let mut invalid = canonical.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_structure_set(&invalid),
+        Err(LocalOperationCodecError::LengthMismatch)
+    ));
+    for (offset, value) in [(0, 2), (1, 5)] {
+        invalid = canonical.clone();
+        invalid[offset] = value;
+        assert!(matches!(
+            decode_local_transaction_structure_set(&invalid),
+            Err(LocalOperationCodecError::UnsupportedVersion(2)
+                | LocalOperationCodecError::UnknownStructureOpcode(5))
+        ));
+    }
+    for offset in [3, 28] {
+        invalid = canonical.clone();
+        invalid[offset] = 1;
+        assert!(matches!(
+            decode_local_transaction_structure_set(&invalid),
+            Err(LocalOperationCodecError::ReservedBytes)
+        ));
+    }
+    invalid = canonical.clone();
+    invalid[4..12].fill(0);
+    assert!(matches!(
+        decode_local_transaction_structure_set(&invalid),
+        Err(LocalOperationCodecError::InvalidIdentity)
+    ));
+    invalid = canonical.clone();
+    invalid[2] = 2;
+    assert!(matches!(
+        decode_local_transaction_structure_set(&invalid),
+        Err(LocalOperationCodecError::UnknownExpiryMode(2))
+    ));
+    invalid = canonical;
+    invalid[12..16].copy_from_slice(&2_u32.to_le_bytes());
+    assert!(matches!(
+        decode_local_transaction_structure_set(&invalid),
+        Err(LocalOperationCodecError::LengthMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn transaction_search_codec_rejects_noncanonical_payloads() -> Result<(), Box<dyn std::error::Error>>
+{
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let index = ObjectId::new(1)?;
+    let mut buffer = Vec::new();
+    let canonical = encode_local_transaction_index_document(
+        &mut buffer,
+        LocalTransactionIndexDocumentRequest {
+            handle,
+            index,
+            document_id: b"d",
+            text: "λ",
+        },
+        usize::MAX,
+    )?
+    .to_vec();
+    for length in 0..canonical.len() {
+        assert!(matches!(
+            decode_local_transaction_index_document(&canonical[..length]),
+            Err(LocalSearchCodecError::Truncated | LocalSearchCodecError::LengthMismatch)
+        ));
+    }
+    let mut invalid = canonical.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_index_document(&invalid),
+        Err(LocalSearchCodecError::LengthMismatch)
+    ));
+    for offset in [2, 36] {
+        invalid = canonical.clone();
+        invalid[offset] = 1;
+        assert!(matches!(
+            decode_local_transaction_index_document(&invalid),
+            Err(LocalSearchCodecError::ReservedBytes)
+        ));
+    }
+    for range in [4..12, 12..28] {
+        invalid = canonical.clone();
+        invalid[range].fill(0);
+        assert!(matches!(
+            decode_local_transaction_index_document(&invalid),
+            Err(LocalSearchCodecError::InvalidTransactionHandle
+                | LocalSearchCodecError::InvalidObjectId)
+        ));
+    }
+    invalid = canonical.clone();
+    invalid[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    invalid.truncate(LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + 2);
+    invalid[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + 1] = 0xff;
+    assert!(matches!(
+        decode_local_transaction_index_document(&invalid),
+        Err(LocalSearchCodecError::InvalidUtf8)
+    ));
+    invalid = canonical;
+    invalid[28..32].copy_from_slice(&2_u32.to_le_bytes());
+    assert!(matches!(
+        decode_local_transaction_index_document(&invalid),
+        Err(LocalSearchCodecError::LengthMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
 fn transaction_sql_codec_enforces_statement_and_parameter_bounds()
 -> Result<(), Box<dyn std::error::Error>> {
     let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
@@ -371,6 +851,69 @@ fn transaction_sql_codec_enforces_statement_and_parameter_bounds()
     Ok(())
 }
 
+#[test]
+fn transaction_sql_codec_rejects_noncanonical_payloads() -> Result<(), Box<dyn std::error::Error>> {
+    let handle = NonZeroU64::new(1).ok_or("nonzero handle")?;
+    let statement = "DELETE FROM events WHERE id = ?";
+    let mut buffer = Vec::new();
+    let canonical = encode_local_transaction_sql_dml(
+        &mut buffer,
+        handle,
+        statement,
+        &[ScalarValue::Signed(1)],
+        usize::MAX,
+    )?
+    .to_vec();
+    for length in 0..canonical.len() {
+        assert!(matches!(
+            decode_local_transaction_sql_dml(&canonical[..length]),
+            Err(LocalSqlCodecError::Truncated
+                | LocalSqlCodecError::LengthMismatch
+                | LocalSqlCodecError::InvalidScalar)
+        ));
+    }
+    let mut invalid = canonical.clone();
+    invalid.push(0);
+    assert!(matches!(
+        decode_local_transaction_sql_dml(&invalid),
+        Err(LocalSqlCodecError::LengthMismatch)
+    ));
+    for offset in [2, 20] {
+        invalid = canonical.clone();
+        invalid[offset] = 1;
+        assert!(matches!(
+            decode_local_transaction_sql_dml(&invalid),
+            Err(LocalSqlCodecError::ReservedBytes)
+        ));
+    }
+    invalid = canonical.clone();
+    invalid[4..12].fill(0);
+    assert!(matches!(
+        decode_local_transaction_sql_dml(&invalid),
+        Err(LocalSqlCodecError::InvalidIdentity)
+    ));
+    invalid = canonical.clone();
+    invalid[12..16].fill(0);
+    assert!(matches!(
+        decode_local_transaction_sql_dml(&invalid),
+        Err(LocalSqlCodecError::EmptyStatement)
+    ));
+    invalid = canonical.clone();
+    invalid[LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE] = 0xff;
+    assert!(matches!(
+        decode_local_transaction_sql_dml(&invalid),
+        Err(LocalSqlCodecError::InvalidUtf8)
+    ));
+    invalid = canonical;
+    let scalar_offset = LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE + statement.len();
+    invalid[scalar_offset] = 0xff;
+    assert!(matches!(
+        decode_local_transaction_sql_dml(&invalid),
+        Err(LocalSqlCodecError::UnknownScalarTag(0xff))
+    ));
+    Ok(())
+}
+
 #[cfg(unix)]
 mod unix {
     use std::{
@@ -386,7 +929,7 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        CommitBoundary, FrameKind, LocalDataSession, LocalFailureCode,
+        CommitBoundary, FrameKind, LocalDataSession, LocalFailureCode, LocalSessionError,
         LocalTransactionBeginReceipt, LocalTransactionCommitReceipt, LocalTransactionEngine,
         LocalTransactionIndexDocumentRequest, LocalTransactionRollbackReceipt,
         LocalTransactionStageReceipt, LocalTransactionStructureSetRequest,
@@ -558,7 +1101,16 @@ mod unix {
         socket: &Path,
         clock: Arc<CountingClock>,
     ) -> Result<thread::JoinHandle<Result<(), ServerError>>, TestError> {
-        let listener = UdsFrameListener::bind(socket, MAXIMUM_PAYLOAD)?;
+        spawn_server_with_payload(database, socket, clock, MAXIMUM_PAYLOAD)
+    }
+
+    fn spawn_server_with_payload(
+        database: NativeDatabase,
+        socket: &Path,
+        clock: Arc<CountingClock>,
+        maximum_payload: usize,
+    ) -> Result<thread::JoinHandle<Result<(), ServerError>>, TestError> {
+        let listener = UdsFrameListener::bind(socket, maximum_payload)?;
         Ok(thread::spawn(move || {
             let mut database = database;
             let mut connection = listener.accept()?;
@@ -584,7 +1136,11 @@ mod unix {
 
     impl SessionClient {
         fn connect(socket: &Path) -> Result<Self, TestError> {
-            let mut connection = UdsFrameConnection::connect(socket, MAXIMUM_PAYLOAD)?;
+            Self::connect_with_payload(socket, MAXIMUM_PAYLOAD)
+        }
+
+        fn connect_with_payload(socket: &Path, maximum_payload: usize) -> Result<Self, TestError> {
+            let mut connection = UdsFrameConnection::connect(socket, maximum_payload)?;
             connection.send(FrameKind::Hello, 0, 1, b"")?;
             let welcome = connection
                 .receive()?
@@ -945,6 +1501,45 @@ mod unix {
     }
 
     #[test]
+    fn peer_loss_discards_the_complete_private_batch() -> Result<(), TestError> {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let socket = temporary.path().join("hyphae.sock");
+        let seeded = seed_database(&data)?;
+        let index = seeded.index;
+        let seed_csn = seeded.seed_csn;
+        let clock = Arc::new(CountingClock(AtomicUsize::new(0)));
+        let server_clock = Arc::clone(&clock);
+        let listener = UdsFrameListener::bind(&socket, MAXIMUM_PAYLOAD)?;
+        let server = thread::spawn(move || {
+            let mut database = seeded.database;
+            let mut connection = listener.accept()?;
+            let result =
+                LocalDataSession::new(&mut database, server_clock.as_ref()).serve(&mut connection);
+            if !matches!(result, Err(LocalSessionError::PeerClosed)) {
+                return Err::<(), ServerError>("peer loss did not terminate fail-closed".into());
+            }
+            listener.close()?;
+            Ok(())
+        });
+        let mut client = SessionClient::connect(&socket)?;
+        let begun = client.begin(DurabilityClass::Strict)?;
+        stage_discarded_transaction(&mut client, begun.handle, index, 6, "peer-loss-token")?;
+        drop(client);
+        join_server(server)?;
+
+        assert_eq!(clock.samples(), 1);
+        let reopened = NativeDatabase::open(&data)?;
+        let snapshot = reopened.snapshot(100)?;
+        assert_eq!(snapshot.visible_csn(), Some(seed_csn));
+        assert_eq!(
+            observe(&snapshot, index, 6, b"joint-key", "peer-loss-token")?,
+            expected_absent()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rollback_and_close_discard_complete_private_batches() -> Result<(), TestError> {
         let temporary = TemporaryDirectory::create()?;
         let data = temporary.path().join("data");
@@ -983,6 +1578,63 @@ mod unix {
             observe(&snapshot, index, 3, b"joint-key", "close-token")?,
             expected_absent()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn begin_receipt_preflight_precedes_clock_and_batch_creation() -> Result<(), TestError> {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let socket = temporary.path().join("small.sock");
+        let seeded = seed_database(&data)?;
+        let seed_csn = seeded.seed_csn;
+        let clock = Arc::new(CountingClock(AtomicUsize::new(0)));
+        let server = spawn_server_with_payload(seeded.database, &socket, Arc::clone(&clock), 31)?;
+        let mut client = SessionClient::connect_with_payload(&socket, 31)?;
+        let mut buffer = Vec::new();
+        let begin = encode_local_transaction_begin(&mut buffer, DurabilityClass::Strict)?.to_vec();
+        client.expect_failure(FrameKind::Begin, &begin, LocalFailureCode::ResponseTooLarge)?;
+        client.close()?;
+        join_server(server)?;
+
+        assert_eq!(clock.samples(), 0);
+        let reopened = NativeDatabase::open(&data)?;
+        assert_eq!(reopened.snapshot(100)?.visible_csn(), Some(seed_csn));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_receipt_preflight_preserves_the_active_batch_for_rollback() -> Result<(), TestError> {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let socket = temporary.path().join("small.sock");
+        let seeded = seed_database(&data)?;
+        let seed_csn = seeded.seed_csn;
+        let clock = Arc::new(CountingClock(AtomicUsize::new(0)));
+        let server = spawn_server_with_payload(seeded.database, &socket, Arc::clone(&clock), 39)?;
+        let mut client = SessionClient::connect_with_payload(&socket, 39)?;
+        let begun = client.begin(DurabilityClass::Memory)?;
+        assert_eq!(
+            client
+                .stage_structure(begun.handle, b"", b"", None)?
+                .operation_ordinal,
+            1
+        );
+        let commit = encode_local_transaction_commit(&mut client.buffer, begun.handle, 1)?.to_vec();
+        client.expect_failure(
+            FrameKind::Commit,
+            &commit,
+            LocalFailureCode::ResponseTooLarge,
+        )?;
+        assert_eq!(client.rollback(begun.handle)?.discarded_operations, 1);
+        client.close()?;
+        join_server(server)?;
+
+        assert_eq!(clock.samples(), 1);
+        let reopened = NativeDatabase::open(&data)?;
+        let snapshot = reopened.snapshot(100)?;
+        assert_eq!(snapshot.visible_csn(), Some(seed_csn));
+        assert_eq!(snapshot.get(b""), None);
         Ok(())
     }
 
