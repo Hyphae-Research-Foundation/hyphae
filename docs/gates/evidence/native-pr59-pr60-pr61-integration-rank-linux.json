@@ -1,0 +1,18 @@
+{
+  "schema": "hyphae-native-sorted-set-rank-smoke-v1",
+  "mode": "release-warm-concurrency-1",
+  "observations": 10000,
+  "warmup": 1000,
+  "members": 2048,
+  "member_bytes": 64,
+  "dataset_blake3": "b9dd892604bceb9c03720bf0f0322a1b18148ae3cc6cbf4c8d988697da2b71ab",
+  "structure_tree_height": 2,
+  "metrics": {
+    "zrank_head_physical": {"p50_nanos": 15351, "p95_nanos": 33338, "p99_nanos": 37097, "p999_nanos": 51828, "max_nanos": 84178, "throughput_per_second": 50406.975},
+    "zrevrank_tail_physical": {"p50_nanos": 10631, "p95_nanos": 22653, "p99_nanos": 23674, "p999_nanos": 39579, "max_nanos": 135465, "throughput_per_second": 80787.524},
+    "zrank_middle_physical": {"p50_nanos": 153990, "p95_nanos": 345273, "p99_nanos": 371435, "p999_nanos": 380457, "max_nanos": 452522, "throughput_per_second": 5685.430},
+    "zrevrank_middle_physical": {"p50_nanos": 134938, "p95_nanos": 285296, "p99_nanos": 329137, "p999_nanos": 341459, "max_nanos": 438501, "throughput_per_second": 6630.092},
+    "zrank_tail_physical": {"p50_nanos": 288196, "p95_nanos": 556433, "p99_nanos": 670167, "p999_nanos": 686383, "max_nanos": 693905, "throughput_per_second": 3164.559},
+    "zrevrank_head_physical": {"p50_nanos": 276051, "p95_nanos": 415660, "p99_nanos": 584366, "p999_nanos": 615757, "max_nanos": 637391, "throughput_per_second": 3372.182}
+  }
+}

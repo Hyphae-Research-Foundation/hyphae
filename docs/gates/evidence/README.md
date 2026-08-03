@@ -259,6 +259,16 @@ commit before its tag can be published.
   one source commit.
 - `native-sorted-set-rank-linux.json` is its direct-Linux position-sensitive
   release observation over 2,048 members. It remains outside G3 and G7.
+- [PR #59–#61 direct-Linux integration evidence —
+  2026-08-02](native-pr59-pr60-pr61-integration-linux-2026-08-02.md) proves
+  exact ancestry for the SQL secondary-prefix, sorted-set score-range, and
+  sorted-set member-rank heads; combined runtime/documentation resolution;
+  direct-Linux gates; and same-corpus latency observations.
+- `native-pr59-pr60-pr61-integration-sql-linux.json`,
+  `native-pr59-pr60-pr61-integration-score-linux.json`, and
+  `native-pr59-pr60-pr61-integration-rank-linux.json` are the clean
+  single-process observations from the integrated source commit. They remain
+  outside G2, G3, and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed
