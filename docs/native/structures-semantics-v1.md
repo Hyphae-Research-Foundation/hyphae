@@ -273,7 +273,7 @@ freezes complete deletion and typed same-transaction recreation with additive
 WAL opcode `DELETE_LIST=35`. The
 [native whole-list TTL v1](native-list-ttl-v1.md) contract freezes absolute
 complete-list expiry, explicit logical-time reads, due-incarnation reuse,
-additive WAL opcode `EXPIRE_LIST=36`, `HYLIST02` metadata, top-level expiry
+additive WAL opcode `EXPIRE_LIST=36`, `HYLSTM02` metadata, top-level expiry
 marker `4`, shared cleanup, corruption boundaries, and direct-Linux evidence
 requirements. Blocking pop, insertion by index, trimming, moving between
 lists, and element mutation remain pending.

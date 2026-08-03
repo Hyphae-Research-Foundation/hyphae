@@ -107,7 +107,7 @@ Persistent lists remain in the native namespaces:
 | `0x07` | ordered list chunks |
 | `0x0b` | ordered top-level expiry index |
 
-Persistent metadata retains the existing 32-byte `HYLIST01` encoding:
+Persistent metadata retains the existing 32-byte `HYLSTM01` encoding:
 
 ```text
 magic[8] | length:u64_le | head_chunk:i64_le | tail_chunk:i64_le
@@ -116,7 +116,7 @@ magic[8] | length:u64_le | head_chunk:i64_le | tail_chunk:i64_le
 Expiring metadata uses a new 40-byte encoding:
 
 ```text
-HYLIST02[8] | length:u64_le | head_chunk:i64_le | tail_chunk:i64_le
+HYLSTM02[8] | length:u64_le | head_chunk:i64_le | tail_chunk:i64_le
 | expires_at_micros:i64_le
 ```
 
