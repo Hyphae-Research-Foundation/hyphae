@@ -6,10 +6,10 @@ Status: first equality-prefix plus immediately-following-column range over an
 ordered native secondary index; G0, G2, and G7 remain open
 
 Source commit:
-`0f3eb1f06ee99db50f2847d098471229605bfd2c`
+`f2a22eb97f499f367de08031b1dfa61cbc90ce60`
 
 Source tree:
-`4c5736804457c750991c327727b6bea90c9d76b1`
+`152eb2fc4f790545b8425459114851c5c98204fe`
 
 Source branch: `codex/sql-secondary-prefix-range`
 
@@ -127,8 +127,13 @@ That run was stopped before completion after review found that the Clippy
 refactor had also changed inherited measurement order. Commit `319e3bc`
 restores the schema-v15 order and measures the isolated new route last.
 Implementation commit `0f3eb1f` then fixed the overlapping-index planner bug
-exposed by the original failed corpus. Only the receipt from `0f3eb1f` is
-admitted below.
+exposed by the original failed corpus. Its first admitted clean receipt
+measured 51.170 us p50, missing the provisional 50 us target by 1.170 us.
+Performance commit `f2a22eb` removed a duplicate complete-row decode, resolved
+secondary-index columns once per execution, validated the stored index key
+without rebuilding it, and skipped predicate reevaluation only when the
+planner proved that no residual remained. The same correctness matrix stayed
+green. Only the optimized receipt from `f2a22eb` is admitted below.
 
 ## Mechanical validation
 
@@ -170,7 +175,7 @@ not local evidence.
 The machine-readable schema-v16 receipt
 `native-microsecond-smoke-secondary-prefix-range-linux.json` was produced
 from the clean source commit above. Its SHA-256 is
-`f3a37d3627c3a939bea70ef724c96944e349cc0ccb6989af7441630cf8085795`.
+`28e5543eed88c1f5aeed5fcf2f089b2558d88107da049d881fb535d961055de1`.
 Both new paths use an isolated height-2 relational B+tree with 2,048 rows, warm state,
 memory durability, concurrency one, `LIMIT 10`, 1,000 warmups, and 10,000
 single-call observations. The benchmark fails if the indexed and unindexed
@@ -178,29 +183,31 @@ paths do not return the same ten rows.
 
 | Operation | p50 | p95 | p99 | p99.9 | Throughput |
 |---|---:|---:|---:|---:|---:|
-| Physical composite secondary prefix range | 51.170 us | 95.429 us | 106.508 us | 122.937 us | 18,014 ops/s |
-| Equivalent unindexed PK scan | 12,532.035 us | 14,371.501 us | 15,554.570 us | 17,884.625 us | 78 ops/s |
+| Physical composite secondary prefix range | 46.535 us | 92.188 us | 98.370 us | 116.189 us | 19,114 ops/s |
+| Equivalent unindexed PK scan | 12,197.704 us | 12,976.263 us | 14,248.056 us | 16,622.108 us | 81 ops/s |
 
 Within this process and corpus, the native index reduces p50 by
-99.592% and p99 by 99.315%; the corresponding ratios are 244.910x and
-146.041x. This differential identifies removed
+99.618% and p99 by 99.310%; the corresponding ratios are 262.119x and
+144.841x. This differential identifies removed
 algorithmic work. It is not a universal latency promise.
 
 The inherited schema-v15 corpus and measurement order are unchanged. Against
 `native-microsecond-smoke-lineage-ext4-linux.json`, no inherited route shows
-a material absolute regression: the largest p50 increase is 0.248 us
-(BM25 top-1), and the largest p99 increase is 6.512 us (complete ordered
-secondary range). Large percentage changes on sub-microsecond paths remain
-at or below 0.132 us absolute.
+a material median regression: the largest p50 increase is 0.315 us
+(primary-key scan). The largest inherited p99 increase is 15.522 us
+(primary-key range plus residual), whose observed p99 remains 53.713 us.
+The optimized complete ordered secondary range improved from the prior
+schema-v16 receipt by 9.497% at p50 and 43.344% at p99; the composite prefix
+range improved by 9.058% and 7.641%.
 Run-to-run variance, the second database's setup cost outside timed regions,
 and shared-host noise still prevent treating one receipt as a release gate.
 
-The indexed observation misses the p50 half of the provisional phase-1
-bounded indexed-SQL target by 1.170 us (2.34%) and meets its p99 250 us half.
-This is an operator observation, not G2 or G7: it excludes cold pages, fsync,
-proofs, named-pipe or UDS transport, allocation/RSS, saturation,
-interference, other key widths/cardinalities, tombstone-heavy intervals,
-cancellation, and long-running cursors.
+The indexed observation meets both halves of the provisional phase-1 bounded
+indexed-SQL target: p50 at or below 50 us and p99 at or below 250 us. This is
+an operator observation, not G2 or G7: it excludes cold pages, fsync, proofs,
+named-pipe or UDS transport, allocation/RSS, saturation, interference, other
+key widths/cardinalities, tombstone-heavy intervals, cancellation, and
+long-running cursors.
 
 ## Remaining boundary
 

@@ -1,7 +1,7 @@
 {
   "schema": "hyphae.native.microsecond-smoke.v16",
   "status": "observation-not-gate",
-  "commit": "0f3eb1f06ee99db50f2847d098471229605bfd2c",
+  "commit": "f2a22eb97f499f367de08031b1dfa61cbc90ce60",
   "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
   "target": "x86_64-linux",
   "profile": "release",
@@ -52,164 +52,164 @@
   "operations": {
     "embedded_structure_get_64b": {
       "p50_us": 0.059,
-      "p95_us": 0.060,
-      "p99_us": 0.113,
-      "p99_9_us": 0.334,
-      "throughput_ops_s": 16200630
+      "p95_us": 0.111,
+      "p99_us": 0.147,
+      "p99_9_us": 0.362,
+      "throughput_ops_s": 15249602
     },
     "buffered_structure_btree_get_64b_multilevel": {
-      "p50_us": 1.032,
-      "p95_us": 1.301,
-      "p99_us": 2.107,
-      "p99_9_us": 2.529,
-      "throughput_ops_s": 937447
+      "p50_us": 1.042,
+      "p95_us": 1.835,
+      "p99_us": 2.527,
+      "p99_9_us": 2.967,
+      "throughput_ops_s": 884558
     },
     "embedded_hash_hget_64b_materialized_scaled_snapshot": {
-      "p50_us": 0.125,
-      "p95_us": 0.128,
-      "p99_us": 0.132,
-      "p99_9_us": 0.409,
-      "throughput_ops_s": 7764616
+      "p50_us": 0.127,
+      "p95_us": 0.265,
+      "p99_us": 0.309,
+      "p99_9_us": 0.555,
+      "throughput_ops_s": 7074710
     },
     "buffered_hash_hget_64b_multilevel": {
-      "p50_us": 1.813,
-      "p95_us": 2.082,
-      "p99_us": 2.349,
-      "p99_9_us": 4.115,
-      "throughput_ops_s": 541397
+      "p50_us": 1.821,
+      "p95_us": 3.196,
+      "p99_us": 4.434,
+      "p99_9_us": 4.904,
+      "throughput_ops_s": 506335
     },
     "embedded_set_sismember_materialized_scaled_snapshot": {
-      "p50_us": 0.120,
-      "p95_us": 0.123,
-      "p99_us": 0.126,
-      "p99_9_us": 0.403,
-      "throughput_ops_s": 8132084
+      "p50_us": 0.122,
+      "p95_us": 0.217,
+      "p99_us": 0.300,
+      "p99_9_us": 0.509,
+      "throughput_ops_s": 7538166
     },
     "buffered_set_sismember_multilevel": {
-      "p50_us": 2.572,
-      "p95_us": 2.847,
-      "p99_us": 3.372,
-      "p99_9_us": 5.308,
-      "throughput_ops_s": 381882
+      "p50_us": 2.568,
+      "p95_us": 3.811,
+      "p99_us": 6.201,
+      "p99_9_us": 6.673,
+      "throughput_ops_s": 363427
     },
     "buffered_inverted_btree_bm25_match_top1_rare_term": {
-      "p50_us": 29.282,
-      "p95_us": 45.023,
-      "p99_us": 56.236,
-      "p99_9_us": 71.707,
-      "throughput_ops_s": 32184
+      "p50_us": 29.215,
+      "p95_us": 29.722,
+      "p99_us": 38.608,
+      "p99_9_us": 50.308,
+      "throughput_ops_s": 33752
     },
     "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
-      "p50_us": 0.059,
-      "p95_us": 0.103,
-      "p99_us": 0.140,
-      "p99_9_us": 0.352,
-      "throughput_ops_s": 15476609
+      "p50_us": 0.058,
+      "p95_us": 0.061,
+      "p99_us": 0.062,
+      "p99_9_us": 0.328,
+      "throughput_ops_s": 16596764
     },
     "buffered_relational_btree_pk_multilevel": {
-      "p50_us": 1.781,
-      "p95_us": 2.421,
-      "p99_us": 4.165,
-      "p99_9_us": 4.619,
-      "throughput_ops_s": 527315
+      "p50_us": 1.788,
+      "p95_us": 2.056,
+      "p99_us": 2.174,
+      "p99_9_us": 3.803,
+      "throughput_ops_s": 549954
     },
     "buffered_relational_btree_pk_scan_limit10_multilevel": {
-      "p50_us": 18.695,
-      "p95_us": 19.994,
-      "p99_us": 29.881,
-      "p99_9_us": 37.074,
-      "throughput_ops_s": 52134
+      "p50_us": 18.796,
+      "p95_us": 33.021,
+      "p99_us": 36.457,
+      "p99_9_us": 51.741,
+      "throughput_ops_s": 49340
     },
     "physical_prepared_sql_pk_scan_limit10_multilevel": {
-      "p50_us": 21.587,
-      "p95_us": 22.467,
-      "p99_us": 31.759,
-      "p99_9_us": 39.335,
-      "throughput_ops_s": 45394
+      "p50_us": 21.692,
+      "p95_us": 34.749,
+      "p99_us": 41.816,
+      "p99_9_us": 55.374,
+      "throughput_ops_s": 43387
     },
     "buffered_relational_btree_pk_range_limit10_multilevel": {
-      "p50_us": 18.650,
-      "p95_us": 19.026,
-      "p99_us": 28.113,
-      "p99_9_us": 33.953,
-      "throughput_ops_s": 52816
+      "p50_us": 18.624,
+      "p95_us": 30.109,
+      "p99_us": 36.791,
+      "p99_9_us": 49.216,
+      "throughput_ops_s": 50560
     },
     "physical_prepared_sql_pk_range_limit10_multilevel": {
-      "p50_us": 23.607,
-      "p95_us": 23.991,
-      "p99_us": 33.232,
-      "p99_9_us": 39.936,
-      "throughput_ops_s": 41763
+      "p50_us": 23.903,
+      "p95_us": 39.140,
+      "p99_us": 46.430,
+      "p99_9_us": 61.907,
+      "throughput_ops_s": 39176
     },
     "physical_prepared_sql_pk_range_residual_boolean_limit10_multilevel": {
-      "p50_us": 28.511,
-      "p95_us": 29.025,
-      "p99_us": 38.224,
-      "p99_9_us": 46.829,
-      "throughput_ops_s": 34567
+      "p50_us": 28.802,
+      "p95_us": 41.252,
+      "p99_us": 53.713,
+      "p99_9_us": 67.222,
+      "throughput_ops_s": 33007
     },
     "physical_prepared_sql_pk_prefix_limit10_multilevel": {
-      "p50_us": 21.405,
-      "p95_us": 21.817,
-      "p99_us": 31.230,
-      "p99_9_us": 39.908,
-      "throughput_ops_s": 45884
+      "p50_us": 21.463,
+      "p95_us": 33.791,
+      "p99_us": 41.410,
+      "p99_9_us": 54.351,
+      "throughput_ops_s": 43949
     },
     "physical_prepared_sql_pk_prefix_range_limit10_multilevel": {
-      "p50_us": 21.566,
-      "p95_us": 21.964,
-      "p99_us": 31.130,
-      "p99_9_us": 37.789,
-      "throughput_ops_s": 45677
+      "p50_us": 21.505,
+      "p95_us": 32.803,
+      "p99_us": 41.799,
+      "p99_9_us": 55.234,
+      "throughput_ops_s": 43912
     },
     "buffered_relational_btree_secondary_exact_unique_multilevel": {
-      "p50_us": 18.289,
-      "p95_us": 32.765,
-      "p99_us": 36.875,
-      "p99_9_us": 52.452,
-      "throughput_ops_s": 50742
+      "p50_us": 18.228,
+      "p95_us": 18.597,
+      "p99_us": 28.638,
+      "p99_9_us": 33.824,
+      "throughput_ops_s": 53914
     },
     "physical_prepared_sql_secondary_exact_unique_multilevel": {
-      "p50_us": 19.176,
-      "p95_us": 30.627,
-      "p99_us": 37.990,
-      "p99_9_us": 51.645,
-      "throughput_ops_s": 49036
+      "p50_us": 18.890,
+      "p95_us": 19.249,
+      "p99_us": 29.209,
+      "p99_9_us": 34.301,
+      "throughput_ops_s": 52103
     },
     "physical_prepared_sql_unindexed_text_range_pk_scan_limit10_multilevel": {
-      "p50_us": 11057.682,
-      "p95_us": 11919.891,
-      "p99_us": 13222.387,
-      "p99_9_us": 15576.183,
-      "throughput_ops_s": 89
+      "p50_us": 11229.336,
+      "p95_us": 12979.623,
+      "p99_us": 15027.820,
+      "p99_9_us": 17858.501,
+      "throughput_ops_s": 87
     },
     "physical_prepared_sql_secondary_range_limit10_multilevel": {
-      "p50_us": 42.160,
-      "p95_us": 73.152,
-      "p99_us": 89.632,
-      "p99_9_us": 105.850,
-      "throughput_ops_s": 21930
+      "p50_us": 38.156,
+      "p95_us": 44.871,
+      "p99_us": 50.782,
+      "p99_9_us": 57.399,
+      "throughput_ops_s": 25722
     },
     "physical_prepared_sql_unindexed_secondary_prefix_range_pk_scan_limit10_multilevel": {
-      "p50_us": 12532.035,
-      "p95_us": 14371.501,
-      "p99_us": 15554.570,
-      "p99_9_us": 17884.625,
-      "throughput_ops_s": 78
+      "p50_us": 12197.704,
+      "p95_us": 12976.263,
+      "p99_us": 14248.056,
+      "p99_9_us": 16622.108,
+      "throughput_ops_s": 81
     },
     "physical_prepared_sql_secondary_prefix_range_limit10_multilevel": {
-      "p50_us": 51.170,
-      "p95_us": 95.429,
-      "p99_us": 106.508,
-      "p99_9_us": 122.937,
-      "throughput_ops_s": 18014
+      "p50_us": 46.535,
+      "p95_us": 92.188,
+      "p99_us": 98.370,
+      "p99_9_us": 116.189,
+      "throughput_ops_s": 19114
     },
     "local_frame_decode_plus_structure_dispatch_64b": {
-      "p50_us": 0.100,
-      "p95_us": 0.162,
-      "p99_us": 0.253,
-      "p99_9_us": 0.467,
-      "throughput_ops_s": 9092594
+      "p50_us": 0.099,
+      "p95_us": 0.106,
+      "p99_us": 0.165,
+      "p99_9_us": 0.383,
+      "throughput_ops_s": 9657773
     }
   }
 }

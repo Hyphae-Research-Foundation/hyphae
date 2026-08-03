@@ -441,9 +441,12 @@ behavior, private/retained/current/reopened equivalence, legacy fallback,
 false-plan rejection, and fail-closed malformed identities and forged
 projections. Its schema-v16 Linux observation uses a second isolated native
 database so the inherited schema-v15 corpus and measurement order remain
-unchanged. This is an operator observation, not G2 or G7; overlapping-index
-cost selection, descending and streaming execution, and the complete
-correctness and performance matrices remain open.
+unchanged. After eliminating duplicate row decoding, it measured 46.535
+microseconds p50 and 98.370 microseconds p99, meeting both halves of the
+provisional bounded indexed-SQL target in this one warm scenario. This is an
+operator observation, not G2 or G7; overlapping-index cost selection,
+descending and streaming execution, and the complete correctness and
+performance matrices remain open.
 
 The [native ext4 Linux baseline
 evidence](evidence/native-ext4-linux-baseline-2026-08-02.md) executes the
