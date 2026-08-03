@@ -474,6 +474,7 @@ pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
     pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     pub(crate) hash_expiries: BTreeMap<Vec<u8>, i64>,
+    pub(crate) hash_field_expiries: BTreeMap<(Vec<u8>, Vec<u8>), i64>,
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
@@ -578,6 +579,8 @@ impl StructureState {
 
     pub(crate) fn delete_hash(&mut self, key: &[u8]) -> bool {
         self.hash_expiries.remove(key);
+        self.hash_field_expiries
+            .retain(|(hash, _), _| hash.as_slice() != key);
         self.hashes.remove(key).is_some()
     }
 
@@ -621,10 +624,66 @@ impl StructureState {
         true
     }
 
+    pub(crate) fn hash_field_expiry(&self, key: &[u8], field: &[u8]) -> Option<i64> {
+        self.hash_field_expiries
+            .get(&(key.to_vec(), field.to_vec()))
+            .copied()
+    }
+
+    pub(crate) fn expire_hash_field(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        expires_at_micros: i64,
+        logical_time_micros: i64,
+    ) -> Option<bool> {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        if self.hget_at(key, field, logical_time_micros).is_none() {
+            return Some(false);
+        }
+        Some(self.set_hash_field_expiry(key, field, expires_at_micros))
+    }
+
+    pub(crate) fn set_hash_field_expiry(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        expires_at_micros: i64,
+    ) -> bool {
+        if self
+            .hashes
+            .get(key)
+            .is_none_or(|fields| !fields.contains_key(field))
+        {
+            return false;
+        }
+        self.hash_field_expiries
+            .insert((key.to_vec(), field.to_vec()), expires_at_micros);
+        true
+    }
+
     pub(crate) fn hset(&mut self, key: &[u8], field: Vec<u8>, value: Vec<u8>) -> Option<bool> {
-        self.hashes
-            .get_mut(key)
-            .map(|fields| fields.insert(field, value).is_none())
+        let fields = self.hashes.get_mut(key)?;
+        self.hash_field_expiries
+            .remove(&(key.to_vec(), field.clone()));
+        Some(fields.insert(field, value).is_none())
+    }
+
+    pub(crate) fn hset_at(
+        &mut self,
+        key: &[u8],
+        field: Vec<u8>,
+        value: Vec<u8>,
+        logical_time_micros: i64,
+    ) -> Option<bool> {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        let added = self.hget_at(key, &field, logical_time_micros).is_none();
+        self.hset(key, field, value)?;
+        Some(added)
     }
 
     pub(crate) fn hset_many(
@@ -635,8 +694,27 @@ impl StructureState {
         let fields = self.hashes.get_mut(key)?;
         let mut added = 0;
         for (field, value) in updates {
+            self.hash_field_expiries
+                .remove(&(key.to_vec(), field.clone()));
             added += usize::from(fields.insert(field.clone(), value.clone()).is_none());
         }
+        Some(added)
+    }
+
+    pub(crate) fn hset_many_at(
+        &mut self,
+        key: &[u8],
+        updates: &[(Vec<u8>, Vec<u8>)],
+        logical_time_micros: i64,
+    ) -> Option<usize> {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        let added = updates
+            .iter()
+            .filter(|(field, _)| self.hget_at(key, field, logical_time_micros).is_none())
+            .count();
+        self.hset_many(key, updates)?;
         Some(added)
     }
 
@@ -653,9 +731,14 @@ impl StructureState {
         field: &[u8],
         logical_time_micros: i64,
     ) -> Option<&[u8]> {
-        self.hash_is_visible(key, logical_time_micros)
-            .then(|| self.hget(key, field))
-            .flatten()
+        if !self.hash_is_visible(key, logical_time_micros)
+            || self
+                .hash_field_expiry(key, field)
+                .is_some_and(|expiry| expiry <= logical_time_micros)
+        {
+            return None;
+        }
+        self.hget(key, field)
     }
 
     pub(crate) fn hget_many_at(
@@ -667,31 +750,41 @@ impl StructureState {
         if !self.hash_is_visible(key, logical_time_micros) {
             return None;
         }
-        let hash = self.hashes.get(key)?;
         Some(
             fields
                 .iter()
-                .map(|field| hash.get(field).cloned())
+                .map(|field| {
+                    self.hget_at(key, field, logical_time_micros)
+                        .map(<[u8]>::to_vec)
+                })
                 .collect(),
         )
     }
 
     pub(crate) fn hdelete(&mut self, key: &[u8], field: &[u8]) -> Option<bool> {
-        self.hashes
-            .get_mut(key)
-            .map(|fields| fields.remove(field).is_some())
+        let fields = self.hashes.get_mut(key)?;
+        let deleted = fields.remove(field).is_some();
+        if deleted {
+            self.hash_field_expiries
+                .remove(&(key.to_vec(), field.to_vec()));
+        }
+        Some(deleted)
     }
 
     pub(crate) fn hdelete_many(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Option<usize> {
         let hash = self.hashes.get_mut(key)?;
-        Some(
-            fields
-                .iter()
-                .filter(|field| hash.remove(field.as_slice()).is_some())
-                .count(),
-        )
+        let mut deleted = 0;
+        for field in fields {
+            if hash.remove(field.as_slice()).is_some() {
+                self.hash_field_expiries
+                    .remove(&(key.to_vec(), field.clone()));
+                deleted += 1;
+            }
+        }
+        Some(deleted)
     }
 
+    #[cfg(test)]
     pub(crate) fn hincrement_i64(
         &mut self,
         key: &[u8],
@@ -708,34 +801,49 @@ impl StructureState {
             .checked_add(delta)
             .ok_or(ModelError::StructureIntegerOverflow)?;
         hash.insert(field.to_vec(), value.to_string().into_bytes());
+        self.hash_field_expiries
+            .remove(&(key.to_vec(), field.to_vec()));
         Ok(Some(value))
     }
 
+    pub(crate) fn hincrement_i64_at(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        delta: i64,
+        logical_time_micros: i64,
+    ) -> Result<Option<i64>, ModelError> {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return Ok(None);
+        }
+        let base = self
+            .hget_at(key, field, logical_time_micros)
+            .map_or(Ok(0), parse_canonical_hash_i64)?;
+        let value = base
+            .checked_add(delta)
+            .ok_or(ModelError::StructureIntegerOverflow)?;
+        self.hset(key, field.to_vec(), value.to_string().into_bytes());
+        Ok(Some(value))
+    }
+
+    #[cfg(test)]
     pub(crate) fn hlen(&self, key: &[u8]) -> Option<usize> {
         self.hashes.get(key).map(BTreeMap::len)
     }
 
     pub(crate) fn hlen_at(&self, key: &[u8], logical_time_micros: i64) -> Option<usize> {
-        self.hash_is_visible(key, logical_time_micros)
-            .then(|| self.hlen(key))
-            .flatten()
-    }
-
-    pub(crate) fn hscan(
-        &self,
-        key: &[u8],
-        start_after: Option<&[u8]>,
-        limit: usize,
-    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        let fields = self.hashes.get(key)?;
-        Some(
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.hashes.get(key).map(|fields| {
             fields
-                .iter()
-                .filter(|(field, _)| start_after.is_none_or(|cursor| field.as_slice() > cursor))
-                .take(limit)
-                .map(|(field, value)| (field.clone(), value.clone()))
-                .collect(),
-        )
+                .keys()
+                .filter(|field| {
+                    self.hash_field_expiry(key, field)
+                        .is_none_or(|expiry| expiry > logical_time_micros)
+                })
+                .count()
+        })
     }
 
     pub(crate) fn hscan_at(
@@ -745,9 +853,22 @@ impl StructureState {
         limit: usize,
         logical_time_micros: i64,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.hash_is_visible(key, logical_time_micros)
-            .then(|| self.hscan(key, start_after, limit))
-            .flatten()
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        let fields = self.hashes.get(key)?;
+        Some(
+            fields
+                .iter()
+                .filter(|(field, _)| start_after.is_none_or(|cursor| field.as_slice() > cursor))
+                .filter(|(field, _)| {
+                    self.hash_field_expiry(key, field)
+                        .is_none_or(|expiry| expiry > logical_time_micros)
+                })
+                .take(limit)
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        )
     }
 
     pub(crate) fn hscan_match_at<F, E>(
@@ -787,7 +908,10 @@ impl StructureState {
                     visited: 0,
                 }));
             }
-            let entries = if matcher(request.leading_literal_prefix)? {
+            let visible = self
+                .hash_field_expiry(key, request.leading_literal_prefix)
+                .is_none_or(|expiry| expiry > request.logical_time_micros);
+            let entries = if visible && matcher(request.leading_literal_prefix)? {
                 vec![(request.leading_literal_prefix.to_vec(), value.clone())]
             } else {
                 Vec::new()
@@ -812,7 +936,10 @@ impl StructureState {
         {
             visited += 1;
             let continuation = Some(field.clone());
-            if matcher(field)? {
+            let visible = self
+                .hash_field_expiry(key, field)
+                .is_none_or(|expiry| expiry > request.logical_time_micros);
+            if visible && matcher(field)? {
                 entries.push((field.clone(), value.clone()));
                 if entries.len() == request.output_limit {
                     return Ok(Some(HashPatternModelPage {
@@ -840,6 +967,7 @@ impl StructureState {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn hscan_reverse(
         &self,
         key: &[u8],
@@ -865,9 +993,23 @@ impl StructureState {
         limit: usize,
         logical_time_micros: i64,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.hash_is_visible(key, logical_time_micros)
-            .then(|| self.hscan_reverse(key, start_before, limit))
-            .flatten()
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        let fields = self.hashes.get(key)?;
+        Some(
+            fields
+                .iter()
+                .rev()
+                .filter(|(field, _)| start_before.is_none_or(|cursor| field.as_slice() < cursor))
+                .filter(|(field, _)| {
+                    self.hash_field_expiry(key, field)
+                        .is_none_or(|expiry| expiry > logical_time_micros)
+                })
+                .take(limit)
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        )
     }
 
     pub(crate) fn create_set(&mut self, key: Vec<u8>) -> bool {
@@ -1158,6 +1300,20 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn ttl_hash_field_micros(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<TtlValue> {
+        self.hget_at(key, field, logical_time_micros).map(|_| {
+            self.hash_field_expiry(key, field)
+                .map_or(TtlValue::Persistent, |expiry| {
+                    TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
+                })
+        })
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         if !self.hashes.is_empty()
             || !self.hash_expiries.is_empty()
@@ -1199,6 +1355,7 @@ impl StructureState {
             entries,
             hashes: BTreeMap::new(),
             hash_expiries: BTreeMap::new(),
+            hash_field_expiries: BTreeMap::new(),
             sets: BTreeMap::new(),
             lists: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
@@ -1791,6 +1948,47 @@ mod tests {
         assert_eq!(empty_progress.visited, 1);
         assert_eq!(empty_progress.stop, HashPatternModelStop::VisitLimit);
         Ok(())
+    }
+
+    #[test]
+    fn hash_field_ttl_is_logical_and_replacement_clears_it() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"profile".to_vec()));
+        assert_eq!(
+            structures.hset(b"profile", b"name".to_vec(), b"Mario".to_vec()),
+            Some(true)
+        );
+        assert_eq!(
+            structures.expire_hash_field(b"profile", b"name", 20, 10),
+            Some(true)
+        );
+        assert_eq!(
+            structures.ttl_hash_field_micros(b"profile", b"name", 10),
+            Some(TtlValue::Remaining(10))
+        );
+        assert_eq!(
+            structures.hget_at(b"profile", b"name", 19),
+            Some(b"Mario".as_slice())
+        );
+        assert_eq!(structures.hget_at(b"profile", b"name", 20), None);
+        assert_eq!(structures.hlen_at(b"profile", 20), Some(0));
+        assert_eq!(
+            structures.hscan_at(b"profile", None, 10, 20),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            structures.hset_at(b"profile", b"name".to_vec(), b"mario".to_vec(), 20),
+            Some(true)
+        );
+        assert_eq!(structures.hash_field_expiry(b"profile", b"name"), None);
+        assert_eq!(
+            structures.hget_at(b"profile", b"name", 20),
+            Some(b"mario".as_slice())
+        );
+        assert_eq!(
+            structures.ttl_hash_field_micros(b"profile", b"name", 20),
+            Some(TtlValue::Persistent)
+        );
     }
 
     #[test]

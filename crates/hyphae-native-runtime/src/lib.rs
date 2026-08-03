@@ -144,6 +144,7 @@ const STRUCTURE_SORTED_SET_META_PREFIX: u8 = 8;
 const STRUCTURE_SORTED_SET_MEMBER_PREFIX: u8 = 9;
 const STRUCTURE_SORTED_SET_ORDER_PREFIX: u8 = 10;
 const STRUCTURE_EXPIRY_PREFIX: u8 = 11;
+const STRUCTURE_HASH_FIELD_EXPIRY_PREFIX: u8 = 12;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_HASH_EXPIRING_META_MAGIC: &[u8; 8] = b"HYHSHM02";
@@ -169,6 +170,7 @@ const STRUCTURE_VALUE_BLOB: u8 = 1;
 const STRUCTURE_EXPIRY_TOMBSTONE: u8 = 0;
 const STRUCTURE_EXPIRY_LIVE: u8 = 1;
 const STRUCTURE_HASH_EXPIRY_LIVE: u8 = 2;
+const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 /// Maximum field positions admitted by one native hash multi-field call.
 pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
@@ -183,6 +185,7 @@ const SEARCH_INDEX_META_MAGIC: &[u8; 8] = b"HYIDX001";
 const SEARCH_DOCUMENT_MAGIC: &[u8; 8] = b"HYDOCS01";
 const SEARCH_TERM_META_MAGIC: &[u8; 8] = b"HYTERM01";
 const SEARCH_POSTING_MAGIC: &[u8; 8] = b"HYPOST01";
+type PhysicalStructureEntries = Vec<(Vec<u8>, Vec<u8>)>;
 const SEARCH_INDEX_META_SIZE: usize = 24;
 const SEARCH_DOCUMENT_HEADER_SIZE: usize = 24;
 const SEARCH_TERM_META_SIZE: usize = 16;
@@ -985,12 +988,21 @@ pub struct ExpirySweepReceipt {
 enum DueStructureKind {
     Scalar,
     Hash,
+    HashField,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DueStructureKey {
     kind: DueStructureKind,
     key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrderedDueStructure {
+    expiry: i64,
+    namespace_order: u8,
+    identity: Vec<u8>,
+    due: DueStructureKey,
 }
 
 /// Result of one current-root structure reachability compaction.
@@ -1297,6 +1309,19 @@ impl NativeSnapshot {
             .structures
             .ttl_hash_micros(key, self.metadata.logical_time_micros)
         {
+            None => Ttl::Missing,
+            Some(TtlValue::Persistent) => Ttl::Persistent,
+            Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
+        }
+    }
+
+    /// Returns one hash field's TTL state at snapshot logical time.
+    pub fn ttl_hash_field(&self, key: &[u8], field: &[u8]) -> Ttl {
+        match self.state.structures.ttl_hash_field_micros(
+            key,
+            field,
+            self.metadata.logical_time_micros,
+        ) {
             None => Ttl::Missing,
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
@@ -3030,6 +3055,7 @@ impl NativeDatabase {
                     opcode: match due.kind {
                         DueStructureKind::Scalar => Opcode::DeleteValue,
                         DueStructureKind::Hash => Opcode::DeleteHash,
+                        DueStructureKind::HashField => Opcode::DeleteHashField,
                     },
                     target: None,
                     key: due.key,
@@ -3235,6 +3261,29 @@ impl NativeDatabase {
             return Ok((Vec::new(), false));
         };
         let tree = BTree::from_root(root);
+        let mut due = self.due_top_level_structure_keys(tree, logical_time_micros, max_keys)?;
+        due.extend(self.due_hash_field_keys(tree, logical_time_micros, max_keys)?);
+        due.sort_unstable_by(|left, right| {
+            (&left.expiry, &left.namespace_order, &left.identity).cmp(&(
+                &right.expiry,
+                &right.namespace_order,
+                &right.identity,
+            ))
+        });
+        let more_due = due.len() > max_keys;
+        due.truncate(max_keys);
+        Ok((
+            due.into_iter().map(|ordered| ordered.due).collect(),
+            more_due,
+        ))
+    }
+
+    fn due_top_level_structure_keys(
+        &self,
+        tree: BTree,
+        logical_time_micros: i64,
+        max_keys: usize,
+    ) -> Result<Vec<OrderedDueStructure>, NativeRuntimeError> {
         let mut due = Vec::with_capacity(max_keys.saturating_add(1));
         let mut failure = None;
         let _outcome = tree.visit_prefix_cached(
@@ -3255,7 +3304,12 @@ impl NativeDatabase {
                     if let Some(due_key) =
                         self.validate_due_structure_key(tree, expiry, key, marker)?
                     {
-                        due.push(due_key);
+                        due.push(OrderedDueStructure {
+                            expiry,
+                            namespace_order: 0,
+                            identity: due_key.key.clone(),
+                            due: due_key,
+                        });
                     }
                     Ok(if due.len() > max_keys {
                         ControlFlow::Break(())
@@ -3275,9 +3329,66 @@ impl NativeDatabase {
         if let Some(error) = failure {
             return Err(error);
         }
-        let more_due = due.len() > max_keys;
-        due.truncate(max_keys);
-        Ok((due, more_due))
+        Ok(due)
+    }
+
+    fn due_hash_field_keys(
+        &self,
+        tree: BTree,
+        logical_time_micros: i64,
+        max_keys: usize,
+    ) -> Result<Vec<OrderedDueStructure>, NativeRuntimeError> {
+        let mut due = Vec::with_capacity(max_keys.saturating_add(1));
+        let mut failure = None;
+        let _field_outcome = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &[STRUCTURE_HASH_FIELD_EXPIRY_PREFIX],
+            None,
+            |physical_key, marker| {
+                let result = (|| {
+                    let (expiry, key, field) = decode_structure_hash_field_expiry_identity(
+                        physical_key
+                            .get(1..)
+                            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+                    )?;
+                    if expiry > logical_time_micros {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    if let Some(due_key) = self.validate_due_hash_field(
+                        tree,
+                        expiry,
+                        key,
+                        field,
+                        marker,
+                        logical_time_micros,
+                    )? {
+                        due.push(OrderedDueStructure {
+                            expiry,
+                            namespace_order: 1,
+                            identity: due_key.key.clone(),
+                            due: due_key,
+                        });
+                    }
+                    Ok(if due.len() > max_keys {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
+                })();
+                match result {
+                    Ok(control) => control,
+                    Err(error) => {
+                        failure = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(due)
     }
 
     fn validate_due_structure_key(
@@ -3321,6 +3432,51 @@ impl NativeDatabase {
         Ok(Some(DueStructureKey {
             kind,
             key: key.to_vec(),
+        }))
+    }
+
+    fn validate_due_hash_field(
+        &self,
+        tree: BTree,
+        expiry: i64,
+        key: &[u8],
+        field: &[u8],
+        marker: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Option<DueStructureKey>, NativeRuntimeError> {
+        match marker {
+            [STRUCTURE_EXPIRY_TOMBSTONE] => return Ok(None),
+            [STRUCTURE_HASH_FIELD_EXPIRY_LIVE] => {}
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        }
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_hash_meta_key(key),
+            )?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let metadata = decode_live_hash_metadata(metadata.bytes())?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if metadata
+            .expires_at_micros
+            .is_some_and(|hash_expiry| hash_expiry <= logical_time_micros)
+        {
+            return Ok(None);
+        }
+        let field_value = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_hash_field_key(key, field)?,
+            )?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if structure_value_expiry(field_value.bytes())? != Some(expiry) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(Some(DueStructureKey {
+            kind: DueStructureKind::HashField,
+            key: hash_field_identity(key, field)?,
         }))
     }
 
@@ -3429,7 +3585,9 @@ impl NativeDatabase {
             &self.buffer_pool,
             &structure_hash_field_key(key, field)?,
         )?
-        .map(|encoded| decode_hash_field_value(encoded.bytes(), &self.blobs))
+        .map(|encoded| {
+            decode_hash_field_value_at(encoded.bytes(), &self.blobs, logical_time_micros)
+        })
         .transpose()
         .map(Option::flatten)
     }
@@ -3493,7 +3651,9 @@ impl NativeDatabase {
                     &self.buffer_pool,
                     &structure_hash_field_key(key, field)?,
                 )?
-                .map(|encoded| decode_hash_field_value(encoded.bytes(), &self.blobs))
+                .map(|encoded| {
+                    decode_hash_field_value_at(encoded.bytes(), &self.blobs, logical_time_micros)
+                })
                 .transpose()?
                 .flatten();
             values.push(value);
@@ -3576,7 +3736,45 @@ impl NativeDatabase {
         if !count.is_visible_at(logical_time_micros) {
             return Err(NativeRuntimeError::UnknownStructureHash);
         }
-        usize::try_from(count.field_count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
+        let declared_count = usize::try_from(count.field_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let prefix = structure_hash_field_key(key, &[])?;
+        let mut physical_count = 0_usize;
+        let mut visible_count = 0_usize;
+        let mut failure = None;
+        let _ = tree.visit_prefix_range_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            |_physical_key, encoded| {
+                match decode_hash_field_entry(encoded, &self.blobs) {
+                    Ok(Some(entry)) => {
+                        physical_count += 1;
+                        if entry
+                            .expires_at_micros
+                            .is_none_or(|expiry| expiry > logical_time_micros)
+                        {
+                            visible_count += 1;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if physical_count != declared_count {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(visible_count)
     }
 
     /// Returns one current physical hash family's TTL at explicit logical
@@ -3611,6 +3809,49 @@ impl NativeDatabase {
             return Ok(Ttl::Missing);
         };
         Ok(match metadata.expires_at_micros {
+            None => Ttl::Persistent,
+            Some(expiry) if expiry > logical_time_micros => {
+                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
+            }
+            Some(_) => Ttl::Missing,
+        })
+    }
+
+    /// Returns one current physical hash field's TTL at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid identity, another
+    /// structure kind, a missing hash, or malformed physical state.
+    pub fn ttl_latest_hash_field(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Ttl, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        validate_hash_field_identity(key, field)?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        self.visible_hash_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_field_key(key, field)?,
+        )?
+        else {
+            return Ok(Ttl::Missing);
+        };
+        let Some(entry) = decode_hash_field_entry(encoded.bytes(), &self.blobs)? else {
+            return Ok(Ttl::Missing);
+        };
+        Ok(match entry.expires_at_micros {
             None => Ttl::Persistent,
             Some(expiry) if expiry > logical_time_micros => {
                 Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
@@ -3724,21 +3965,30 @@ impl NativeDatabase {
             lower,
             Bound::Unbounded,
             |physical_key, encoded| {
-                let decoded = decode_hash_scan_entry(physical_key, encoded, key, &self.blobs);
-                let Some(entry) = (match decoded {
+                let decoded = decode_hash_scan_entry(
+                    physical_key,
+                    encoded,
+                    key,
+                    &self.blobs,
+                    logical_time_micros,
+                );
+                let (physical_live, entry) = match decoded {
                     Ok(entry) => entry,
                     Err(error) => {
                         failure = Some(error);
                         return ControlFlow::Break(());
                     }
-                }) else {
+                };
+                if physical_live {
+                    live_count += 1;
+                    if live_count > declared_count {
+                        failure = Some(NativeRuntimeError::InvalidStructureTree);
+                        return ControlFlow::Break(());
+                    }
+                }
+                let Some(entry) = entry else {
                     return ControlFlow::Continue(());
                 };
-                live_count += 1;
-                if live_count > declared_count {
-                    failure = Some(NativeRuntimeError::InvalidStructureTree);
-                    return ControlFlow::Break(());
-                }
                 if entries.len() < limit {
                     entries.push(entry);
                 }
@@ -3849,21 +4099,30 @@ impl NativeDatabase {
             Bound::Unbounded,
             upper,
             |physical_key, encoded| {
-                let decoded = decode_hash_scan_entry(physical_key, encoded, key, &self.blobs);
-                let Some(entry) = (match decoded {
+                let decoded = decode_hash_scan_entry(
+                    physical_key,
+                    encoded,
+                    key,
+                    &self.blobs,
+                    logical_time_micros,
+                );
+                let (physical_live, entry) = match decoded {
                     Ok(entry) => entry,
                     Err(error) => {
                         failure = Some(error);
                         return ControlFlow::Break(());
                     }
-                }) else {
+                };
+                if physical_live {
+                    live_count += 1;
+                    if live_count > declared_count {
+                        failure = Some(NativeRuntimeError::InvalidStructureTree);
+                        return ControlFlow::Break(());
+                    }
+                }
+                let Some(entry) = entry else {
                     return ControlFlow::Continue(());
                 };
-                live_count += 1;
-                if live_count > declared_count {
-                    failure = Some(NativeRuntimeError::InvalidStructureTree);
-                    return ControlFlow::Break(());
-                }
                 entries.push(entry);
                 if entries.len() == limit && !verify_complete {
                     ControlFlow::Break(())
@@ -3943,9 +4202,15 @@ impl NativeDatabase {
         let declared_count = usize::try_from(metadata.field_count)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
         if request.compiled().is_exact_literal() {
-            return self.hash_pattern_exact_in_tree(tree, key, request, declared_count);
+            return self.hash_pattern_exact_in_tree(
+                tree,
+                key,
+                request,
+                declared_count,
+                logical_time_micros,
+            );
         }
-        self.hash_pattern_range_in_tree(tree, key, request, declared_count)
+        self.hash_pattern_range_in_tree(tree, key, request, declared_count, logical_time_micros)
     }
 
     fn hash_pattern_exact_in_tree(
@@ -3954,6 +4219,7 @@ impl NativeDatabase {
         key: &[u8],
         request: &HashPatternScanRequest,
         declared_count: usize,
+        logical_time_micros: i64,
     ) -> Result<HashPatternScanPage, NativeRuntimeError> {
         let field = request.compiled().leading_literal_prefix();
         if request.start_after().is_some_and(|cursor| field <= cursor) {
@@ -3977,7 +4243,7 @@ impl NativeDatabase {
                 0,
             ));
         };
-        let Some(value) = decode_hash_field_value(encoded.bytes(), &self.blobs)? else {
+        let Some(entry) = decode_hash_field_entry(encoded.bytes(), &self.blobs)? else {
             return Ok(HashPatternScanPage::new(
                 Vec::new(),
                 None,
@@ -3989,12 +4255,24 @@ impl NativeDatabase {
         if declared_count == 0 {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
+        if entry
+            .expires_at_micros
+            .is_some_and(|expiry| expiry <= logical_time_micros)
+        {
+            return Ok(HashPatternScanPage::new(
+                Vec::new(),
+                None,
+                HashPatternScanStop::Exhausted,
+                1,
+                0,
+            ));
+        }
         let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
         if !request.compiled().matches(field, &mut budget)? {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(HashPatternScanPage::new(
-            vec![HashFieldEntry::new(field.to_vec(), value)],
+            vec![HashFieldEntry::new(field.to_vec(), entry.value)],
             None,
             HashPatternScanStop::Exhausted,
             1,
@@ -4008,6 +4286,7 @@ impl NativeDatabase {
         key: &[u8],
         request: &HashPatternScanRequest,
         declared_count: usize,
+        logical_time_micros: i64,
     ) -> Result<HashPatternScanPage, NativeRuntimeError> {
         let hash_prefix = structure_hash_field_key(key, &[])?;
         let literal_prefix = request.compiled().leading_literal_prefix();
@@ -4045,6 +4324,7 @@ impl NativeDatabase {
             key,
             request,
             declared_count,
+            logical_time_micros,
             HashPatternPhysicalRange {
                 prefix: &hash_prefix,
                 lower,
@@ -4059,6 +4339,7 @@ impl NativeDatabase {
         key: &[u8],
         request: &HashPatternScanRequest,
         declared_count: usize,
+        logical_time_micros: i64,
         range: HashPatternPhysicalRange<'_>,
     ) -> Result<HashPatternScanPage, NativeRuntimeError> {
         let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
@@ -4085,21 +4366,34 @@ impl NativeDatabase {
                 };
                 visited += 1;
                 continuation = Some(field.to_vec());
-                let value = match decode_hash_field_value(encoded, &self.blobs) {
+                let entry = match decode_hash_field_entry(encoded, &self.blobs) {
                     Ok(value) => value,
                     Err(error) => {
                         failure = Some(error);
                         return ControlFlow::Break(());
                     }
                 };
-                if let Some(value) = value {
+                if let Some(entry) = entry {
                     live_count += 1;
                     if live_count > declared_count {
                         failure = Some(NativeRuntimeError::InvalidStructureTree);
                         return ControlFlow::Break(());
                     }
+                    if entry
+                        .expires_at_micros
+                        .is_some_and(|expiry| expiry <= logical_time_micros)
+                    {
+                        return if visited == request.visit_limit() {
+                            stop = HashPatternScanStop::VisitLimit;
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        };
+                    }
                     match request.compiled().matches(field, &mut budget) {
-                        Ok(true) => entries.push(HashFieldEntry::new(field.to_vec(), value)),
+                        Ok(true) => {
+                            entries.push(HashFieldEntry::new(field.to_vec(), entry.value));
+                        }
                         Ok(false) => {}
                         Err(error) => {
                             failure = Some(error.into());
@@ -7058,6 +7352,19 @@ impl NativeWriteBatch {
         }
     }
 
+    /// Returns one hash field's TTL state through private writes.
+    pub fn ttl_hash_field(&self, key: &[u8], field: &[u8]) -> Ttl {
+        match self.state.structures.ttl_hash_field_micros(
+            key,
+            field,
+            self.snapshot.logical_time_micros,
+        ) {
+            None => Ttl::Missing,
+            Some(TtlValue::Persistent) => Ttl::Persistent,
+            Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
+        }
+    }
+
     /// Creates one explicitly typed empty native hash.
     ///
     /// Hashes are not encoded in legacy whole-state structure roots.
@@ -7129,6 +7436,60 @@ impl NativeWriteBatch {
             opcode: Opcode::ExpireHash,
             target: None,
             key,
+            value: Vec::new(),
+            expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Replaces one visible hash field's absolute expiry.
+    ///
+    /// Returns false without adding a mutation when the hash or field is
+    /// missing or logically expired at this transaction's logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid identity, or another
+    /// live structure kind.
+    pub fn expire_hash_field(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        expires_at_micros: i64,
+    ) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        let field = field.into();
+        validate_hash_field_identity(&key, &field)?;
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let _identity = structure_hash_field_expiry_key(expires_at_micros, &key, &field)?;
+        let updated = self
+            .state
+            .structures
+            .expire_hash_field(
+                &key,
+                &field,
+                expires_at_micros,
+                self.snapshot.logical_time_micros,
+            )
+            .unwrap_or(false);
+        if !updated {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::ExpireHashField,
+            target: None,
+            key: hash_field_identity(&key, &field)?,
             value: Vec::new(),
             expires_at_micros: Some(expires_at_micros),
         });
@@ -7213,7 +7574,12 @@ impl NativeWriteBatch {
         let added = self
             .state
             .structures
-            .hset(&key, field.clone(), value.clone())
+            .hset_at(
+                &key,
+                field.clone(),
+                value.clone(),
+                self.snapshot.logical_time_micros,
+            )
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Structure,
@@ -7267,7 +7633,7 @@ impl NativeWriteBatch {
         let added = self
             .state
             .structures
-            .hset_many(&key, &updates)
+            .hset_many_at(&key, &updates, self.snapshot.logical_time_micros)
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         if !mutations.is_empty() {
             self.mutations.extend(mutations);
@@ -7301,7 +7667,7 @@ impl NativeWriteBatch {
         let value = self
             .state
             .structures
-            .hincrement_i64(&key, &field, delta)
+            .hincrement_i64_at(&key, &field, delta, self.snapshot.logical_time_micros)
             .map_err(|error| map_hash_counter_model_error(&error))?
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         self.mutations.push(Mutation {
@@ -7394,6 +7760,14 @@ impl NativeWriteBatch {
         {
             return Err(NativeRuntimeError::UnknownStructureHash);
         }
+        if self
+            .state
+            .structures
+            .hget_at(&key, &field, self.snapshot.logical_time_micros)
+            .is_none()
+        {
+            return Ok(false);
+        }
         let deleted = self
             .state
             .structures
@@ -7460,7 +7834,7 @@ impl NativeWriteBatch {
         let deleted = self
             .state
             .structures
-            .hdelete_many(&key, &fields)
+            .hdelete_many(&key, &deleted_fields)
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         debug_assert_eq!(deleted, mutations.len());
         if !mutations.is_empty() {
@@ -8667,6 +9041,7 @@ fn apply_structure_mutation(
         Opcode::CreateHash
         | Opcode::DeleteHash
         | Opcode::ExpireHash
+        | Opcode::ExpireHashField
         | Opcode::SetHashField
         | Opcode::DeleteHashField => apply_hash_mutation(state, mutation)?,
         Opcode::CreateSet | Opcode::AddSetMember | Opcode::DeleteSetMember => {
@@ -8716,6 +9091,18 @@ fn apply_hash_mutation(
                 || !mutation.value.is_empty()
                 || !state.set_hash_expiry(&mutation.key, expires_at_micros)
             {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::ExpireHashField => {
+            let Some(expires_at_micros) = mutation.expires_at_micros else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            if mutation.target.is_some() || !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let (key, field) = decode_hash_field_identity(&mutation.key)?;
+            if !state.set_hash_field_expiry(key, field, expires_at_micros) {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
@@ -8886,6 +9273,7 @@ fn apply_mutations_to_state(
             | Opcode::CreateHash
             | Opcode::DeleteHash
             | Opcode::ExpireHash
+            | Opcode::ExpireHashField
             | Opcode::SetHashField
             | Opcode::DeleteHashField
             | Opcode::CreateSet
@@ -9111,7 +9499,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 identity.extend_from_slice(&mutation.key);
                 identity
             }
-            Opcode::SetHashField | Opcode::DeleteHashField => {
+            Opcode::SetHashField | Opcode::DeleteHashField | Opcode::ExpireHashField => {
                 let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
                 identity.push(1);
                 identity.extend_from_slice(&mutation.key);
@@ -9171,7 +9559,7 @@ fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     for mutation in mutations {
         if matches!(
             mutation.opcode,
-            Opcode::SetHashField | Opcode::DeleteHashField
+            Opcode::SetHashField | Opcode::DeleteHashField | Opcode::ExpireHashField
         ) && let Ok((hash_key, _)) = decode_hash_field_identity(&mutation.key)
         {
             let mut identity = Vec::with_capacity(hash_key.len().saturating_add(1));
@@ -10112,7 +10500,10 @@ fn validate_write_batch_shape(
             let valid_mutations = !batch.mutations.is_empty()
                 && batch.mutations.iter().all(|mutation| {
                     mutation.engine == EngineKind::Structure
-                        && matches!(mutation.opcode, Opcode::DeleteValue | Opcode::DeleteHash)
+                        && matches!(
+                            mutation.opcode,
+                            Opcode::DeleteValue | Opcode::DeleteHash | Opcode::DeleteHashField
+                        )
                         && mutation.target.is_none()
                         && mutation.value.is_empty()
                         && mutation.expires_at_micros.is_none()
@@ -10393,6 +10784,11 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
             [STRUCTURE_EXPIRY_LIVE | STRUCTURE_HASH_EXPIRY_LIVE] => Ok(false),
             _ => Err(NativeRuntimeError::InvalidStructureTree),
         },
+        Some(STRUCTURE_HASH_FIELD_EXPIRY_PREFIX) => match value {
+            [STRUCTURE_EXPIRY_TOMBSTONE] => Ok(true),
+            [STRUCTURE_HASH_FIELD_EXPIRY_LIVE] => Ok(false),
+            _ => Err(NativeRuntimeError::InvalidStructureTree),
+        },
         Some(
             STRUCTURE_SET_META_PREFIX
             | STRUCTURE_LIST_META_PREFIX
@@ -10536,6 +10932,41 @@ fn decode_structure_expiry_identity(identity: &[u8]) -> Result<(i64, &[u8]), Nat
     Ok((expires_at_micros, &identity[8..]))
 }
 
+fn structure_hash_field_expiry_key(
+    expires_at_micros: i64,
+    key: &[u8],
+    field: &[u8],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let identity = collection_member_identity(key, field)?;
+    if identity
+        .len()
+        .checked_add(9)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let sortable = expires_at_micros.cast_unsigned() ^ (1_u64 << 63);
+    let mut encoded = Vec::with_capacity(identity.len().saturating_add(9));
+    encoded.push(STRUCTURE_HASH_FIELD_EXPIRY_PREFIX);
+    encoded.extend_from_slice(&sortable.to_be_bytes());
+    encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn decode_structure_hash_field_expiry_identity(
+    identity: &[u8],
+) -> Result<(i64, &[u8], &[u8]), NativeRuntimeError> {
+    let timestamp = identity
+        .get(..8)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut sortable = [0_u8; 8];
+    sortable.copy_from_slice(timestamp);
+    let expires_at_micros = (u64::from_be_bytes(sortable) ^ (1_u64 << 63)).cast_signed();
+    let (key, field) = decode_hash_field_identity(&identity[8..])
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    Ok((expires_at_micros, key, field))
+}
+
 fn structure_value_expiry(encoded: &[u8]) -> Result<Option<i64>, NativeRuntimeError> {
     if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
         || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
@@ -10571,6 +11002,24 @@ fn structure_value_expiry(encoded: &[u8]) -> Result<Option<i64>, NativeRuntimeEr
         0 if expiry == 0 => Ok(None),
         _ => Err(NativeRuntimeError::InvalidStructureTree),
     }
+}
+
+fn replace_structure_value_expiry(
+    encoded: &[u8],
+    expires_at_micros: Option<i64>,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    structure_value_expiry(encoded)?;
+    let mut updated = encoded.to_vec();
+    updated[8] = if expires_at_micros.is_some() {
+        STRUCTURE_VALUE_HAS_EXPIRY
+    } else {
+        0
+    };
+    updated[16..24].copy_from_slice(&expires_at_micros.unwrap_or(0).to_le_bytes());
+    Ok(updated)
 }
 
 fn structure_hash_meta_key(key: &[u8]) -> Vec<u8> {
@@ -11082,15 +11531,34 @@ fn decode_live_hash_metadata(encoded: &[u8]) -> Result<Option<HashMetadata>, Nat
     }
 }
 
+fn decode_hash_field_entry(
+    encoded: &[u8],
+    blobs: &BlobStore,
+) -> Result<Option<StructureEntry>, NativeRuntimeError> {
+    decode_structure_value(encoded, blobs)
+}
+
+#[cfg(test)]
 fn decode_hash_field_value(
     encoded: &[u8],
     blobs: &BlobStore,
 ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-    match decode_structure_value(encoded, blobs)? {
-        Some(entry) if entry.expires_at_micros.is_none() => Ok(Some(entry.value)),
-        Some(_) => Err(NativeRuntimeError::InvalidStructureTree),
-        None => Ok(None),
-    }
+    decode_hash_field_entry(encoded, blobs).map(|entry| entry.map(|entry| entry.value))
+}
+
+fn decode_hash_field_value_at(
+    encoded: &[u8],
+    blobs: &BlobStore,
+    logical_time_micros: i64,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    decode_hash_field_entry(encoded, blobs).map(|entry| {
+        entry.and_then(|entry| {
+            entry
+                .expires_at_micros
+                .is_none_or(|expiry| expiry > logical_time_micros)
+                .then_some(entry.value)
+        })
+    })
 }
 
 fn decode_hash_scan_entry(
@@ -11098,10 +11566,19 @@ fn decode_hash_scan_entry(
     encoded: &[u8],
     expected_hash: &[u8],
     blobs: &BlobStore,
-) -> Result<Option<HashFieldEntry>, NativeRuntimeError> {
+    logical_time_micros: i64,
+) -> Result<(bool, Option<HashFieldEntry>), NativeRuntimeError> {
     let field = decode_hash_scan_field_identity(physical_key, expected_hash)?;
-    decode_hash_field_value(encoded, blobs)
-        .map(|value| value.map(|value| HashFieldEntry::new(field.to_vec(), value)))
+    let Some(entry) = decode_hash_field_entry(encoded, blobs)? else {
+        return Ok((false, None));
+    };
+    let visible = entry
+        .expires_at_micros
+        .is_none_or(|expiry| expiry > logical_time_micros);
+    Ok((
+        true,
+        visible.then(|| HashFieldEntry::new(field.to_vec(), entry.value)),
+    ))
 }
 
 fn decode_hash_scan_field_identity<'key>(
@@ -11712,13 +12189,16 @@ fn delete_hash_in_tree(
     let physical_fields = tree.scan_prefix(pages, &field_prefix)?;
     let capacity = physical_fields
         .len()
-        .checked_add(usize::from(declared_metadata.expires_at_micros.is_some()))
+        .checked_mul(2)
+        .and_then(|value| {
+            value.checked_add(usize::from(declared_metadata.expires_at_micros.is_some()))
+        })
         .and_then(|value| value.checked_add(1))
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
     let mut live_count = 0_u64;
     let mut tombstones = Vec::with_capacity(capacity);
     for (physical_key, value) in physical_fields {
-        let (hash_key, _) = decode_hash_field_identity(
+        let (hash_key, field) = decode_hash_field_identity(
             physical_key
                 .get(1..)
                 .ok_or(NativeRuntimeError::InvalidStructureTree)?,
@@ -11730,8 +12210,13 @@ fn delete_hash_in_tree(
         if is_structure_tombstone(&value) {
             continue;
         }
-        if structure_value_expiry(&value)?.is_some() {
-            return Err(NativeRuntimeError::InvalidStructureTree);
+        if let Some(expiry) = structure_value_expiry(&value)? {
+            let expiry_key = structure_hash_field_expiry_key(expiry, hash_key, field)?;
+            if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE])
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            tombstones.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
         }
         live_count = live_count
             .checked_add(1)
@@ -11750,6 +12235,9 @@ fn delete_hash_in_tree(
     }
     tombstones.push((metadata_key, structure_tombstone_value()));
     tombstones.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if tombstones.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
     Ok(tree
         .upsert_sorted_batch(pages, creating_csn, tombstones)?
         .tree)
@@ -11834,7 +12322,7 @@ fn create_set_in_tree(
 
 fn set_hash_field_in_tree(
     pages: &mut PageStore,
-    mut tree: BTree,
+    tree: BTree,
     creating_csn: Csn,
     mutation: &Mutation,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -11849,31 +12337,92 @@ fn set_hash_field_in_tree(
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
     let mut metadata = decode_hash_metadata_state(&metadata)?;
     let field_key = structure_hash_field_key(key, field)?;
-    let added = tree
-        .get(pages, &field_key)?
-        .is_none_or(|value| is_structure_tombstone(&value));
+    let existing = tree.get(pages, &field_key)?;
+    let added = existing
+        .as_ref()
+        .is_none_or(|value| is_structure_tombstone(value));
+    let prior_expiry = existing
+        .as_deref()
+        .map(structure_value_expiry)
+        .transpose()?
+        .flatten();
     let value = structure_storage_value(&mutation.value, None, blob_references)?;
-    tree = tree.upsert(pages, creating_csn, field_key, value)?.tree;
+    let mut entries = Vec::with_capacity(3);
+    entries.push((field_key, value));
+    if let Some(expiry) = prior_expiry {
+        let expiry_key = structure_hash_field_expiry_key(expiry, key, field)?;
+        if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
     if added {
         metadata.field_count = metadata
             .field_count
             .checked_add(1)
             .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-        tree = tree
-            .upsert(
-                pages,
-                creating_csn,
-                metadata_key,
-                encode_hash_metadata_state(metadata),
-            )?
-            .tree;
+        entries.push((metadata_key, encode_hash_metadata_state(metadata)));
     }
-    Ok(tree)
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
+}
+
+fn expire_hash_field_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let Some(expires_at_micros) = mutation.expires_at_micros else {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    };
+    if !mutation.value.is_empty() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (key, field) = decode_hash_field_identity(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &structure_hash_meta_key(key))?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    decode_live_hash_metadata(&metadata)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let field_key = structure_hash_field_key(key, field)?;
+    let encoded = tree
+        .get(pages, &field_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if is_structure_tombstone(&encoded) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let previous_expiry = structure_value_expiry(&encoded)?;
+    let new_expiry_key = structure_hash_field_expiry_key(expires_at_micros, key, field)?;
+    let mut entries = Vec::with_capacity(3);
+    if let Some(previous_expiry) = previous_expiry
+        && previous_expiry != expires_at_micros
+    {
+        let previous_expiry_key = structure_hash_field_expiry_key(previous_expiry, key, field)?;
+        if tree.get(pages, &previous_expiry_key)?.as_deref()
+            != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE])
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((previous_expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
+    entries.push((
+        field_key,
+        replace_structure_value_expiry(&encoded, Some(expires_at_micros))?,
+    ));
+    entries.push((new_expiry_key, vec![STRUCTURE_HASH_FIELD_EXPIRY_LIVE]));
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
 fn delete_hash_field_in_tree(
     pages: &mut PageStore,
-    mut tree: BTree,
+    tree: BTree,
     creating_csn: Csn,
     mutation: &Mutation,
 ) -> Result<BTree, NativeRuntimeError> {
@@ -11893,21 +12442,27 @@ fn delete_hash_field_in_tree(
     if is_structure_tombstone(&field_value) {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
-    tree = tree
-        .upsert(pages, creating_csn, field_key, structure_tombstone_value())?
-        .tree;
+    let prior_expiry = structure_value_expiry(&field_value)?;
     metadata.field_count = metadata
         .field_count
         .checked_sub(1)
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    Ok(tree
-        .upsert(
-            pages,
-            creating_csn,
-            metadata_key,
-            encode_hash_metadata_state(metadata),
-        )?
-        .tree)
+    let mut entries = vec![
+        (field_key, structure_tombstone_value()),
+        (metadata_key, encode_hash_metadata_state(metadata)),
+    ];
+    if let Some(expiry) = prior_expiry {
+        let expiry_key = structure_hash_field_expiry_key(expiry, key, field)?;
+        if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
 fn add_set_member_in_tree(
@@ -12422,6 +12977,7 @@ fn apply_structure_tree_mutation(
         Opcode::CreateHash => create_hash_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteHash => delete_hash_in_tree(pages, tree, creating_csn, mutation),
         Opcode::ExpireHash => expire_hash_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::ExpireHashField => expire_hash_field_in_tree(pages, tree, creating_csn, mutation),
         Opcode::SetHashField => {
             set_hash_field_in_tree(pages, tree, creating_csn, mutation, blob_references)
         }
@@ -12605,6 +13161,7 @@ fn physical_expiry_tree_after_mutations(
 ) -> Result<BTree, NativeRuntimeError> {
     let tree = BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?);
     let mut physical_entries = Vec::new();
+    let mut hash_field_decrements = BTreeMap::<Vec<u8>, u64>::new();
     for mutation in mutations {
         if mutation.engine != EngineKind::Structure
             || mutation.target.is_some()
@@ -12613,69 +13170,29 @@ fn physical_expiry_tree_after_mutations(
         {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        match mutation.opcode {
+        let entries = match mutation.opcode {
             Opcode::DeleteValue => {
-                let scalar_key = structure_key(&mutation.key);
-                let scalar = tree
-                    .get(pages, &scalar_key)?
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                let expiry = structure_value_expiry(&scalar)?
-                    .filter(|expiry| *expiry <= logical_time_micros)
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
-                if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_EXPIRY_LIVE]) {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
-                physical_entries.push((scalar_key, structure_tombstone_value()));
-                physical_entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+                physical_scalar_expiry_entries(pages, tree, logical_time_micros, mutation)?
             }
             Opcode::DeleteHash => {
-                let metadata_key = structure_hash_meta_key(&mutation.key);
-                let encoded = tree
-                    .get(pages, &metadata_key)?
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                let metadata = decode_live_hash_metadata(&encoded)?
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                let expiry = metadata
-                    .expires_at_micros
-                    .filter(|expiry| *expiry <= logical_time_micros)
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
-                if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_EXPIRY_LIVE]) {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
-                let field_prefix = structure_hash_field_key(&mutation.key, &[])?;
-                let mut live_count = 0_u64;
-                for (field_key, value) in tree.scan_prefix(pages, &field_prefix)? {
-                    let (hash_key, _) = decode_hash_field_identity(
-                        field_key
-                            .get(1..)
-                            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
-                    )
-                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-                    if hash_key != mutation.key {
-                        return Err(NativeRuntimeError::InvalidStructureTree);
-                    }
-                    if is_structure_tombstone(&value) {
-                        continue;
-                    }
-                    if structure_value_expiry(&value)?.is_some() {
-                        return Err(NativeRuntimeError::InvalidStructureTree);
-                    }
-                    live_count = live_count
-                        .checked_add(1)
-                        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                    physical_entries.push((field_key, structure_tombstone_value()));
-                }
-                if live_count != metadata.field_count {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
-                physical_entries.push((metadata_key, structure_tombstone_value()));
-                physical_entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+                physical_hash_expiry_entries(pages, tree, logical_time_micros, mutation)?
             }
+            Opcode::DeleteHashField => physical_hash_field_expiry_entries(
+                pages,
+                tree,
+                logical_time_micros,
+                mutation,
+                &mut hash_field_decrements,
+            )?,
             _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
-        }
+        };
+        physical_entries.extend(entries);
     }
+    physical_entries.extend(hash_field_expiry_metadata_entries(
+        pages,
+        tree,
+        hash_field_decrements,
+    )?);
     physical_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     if physical_entries
         .windows(2)
@@ -12686,6 +13203,142 @@ fn physical_expiry_tree_after_mutations(
     Ok(tree
         .upsert_sorted_batch(pages, creating_csn, physical_entries)?
         .tree)
+}
+
+fn physical_scalar_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let scalar_key = structure_key(&mutation.key);
+    let scalar = tree
+        .get(pages, &scalar_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry = structure_value_expiry(&scalar)?
+        .filter(|expiry| *expiry <= logical_time_micros)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(vec![
+        (scalar_key, structure_tombstone_value()),
+        (expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]),
+    ])
+}
+
+fn physical_hash_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let metadata_key = structure_hash_meta_key(&mutation.key);
+    let encoded = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let metadata =
+        decode_live_hash_metadata(&encoded)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry = metadata
+        .expires_at_micros
+        .filter(|expiry| *expiry <= logical_time_micros)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let field_prefix = structure_hash_field_key(&mutation.key, &[])?;
+    let mut live_count = 0_u64;
+    let mut entries = Vec::new();
+    for (field_key, value) in tree.scan_prefix(pages, &field_prefix)? {
+        let (hash_key, field) = decode_hash_field_identity(
+            field_key
+                .get(1..)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        )
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if hash_key != mutation.key {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if is_structure_tombstone(&value) {
+            continue;
+        }
+        if let Some(field_expiry) = structure_value_expiry(&value)? {
+            let field_expiry_key = structure_hash_field_expiry_key(field_expiry, hash_key, field)?;
+            if tree.get(pages, &field_expiry_key)?.as_deref()
+                != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE])
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            entries.push((field_expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+        }
+        live_count = live_count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        entries.push((field_key, structure_tombstone_value()));
+    }
+    if live_count != metadata.field_count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    entries.push((metadata_key, structure_tombstone_value()));
+    entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    Ok(entries)
+}
+
+fn physical_hash_field_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+    decrements: &mut BTreeMap<Vec<u8>, u64>,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let (hash_key, field) = decode_hash_field_identity(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &structure_hash_meta_key(hash_key))?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    decode_live_hash_metadata(&metadata)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let field_key = structure_hash_field_key(hash_key, field)?;
+    let field_value = tree
+        .get(pages, &field_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry = structure_value_expiry(&field_value)?
+        .filter(|expiry| *expiry <= logical_time_micros)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry_key = structure_hash_field_expiry_key(expiry, hash_key, field)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_HASH_FIELD_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let decrement = decrements.entry(hash_key.to_vec()).or_default();
+    *decrement = decrement
+        .checked_add(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    Ok(vec![
+        (field_key, structure_tombstone_value()),
+        (expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]),
+    ])
+}
+
+fn hash_field_expiry_metadata_entries(
+    pages: &PageStore,
+    tree: BTree,
+    decrements: BTreeMap<Vec<u8>, u64>,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let mut entries = Vec::with_capacity(decrements.len());
+    for (hash_key, decrement) in decrements {
+        let metadata_key = structure_hash_meta_key(&hash_key);
+        let encoded = tree
+            .get(pages, &metadata_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let mut metadata =
+            decode_live_hash_metadata(&encoded)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        metadata.field_count = metadata
+            .field_count
+            .checked_sub(decrement)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        entries.push((metadata_key, encode_hash_metadata_state(metadata)));
+    }
+    Ok(entries)
 }
 
 fn compact_structure_tree(
@@ -14825,6 +15478,7 @@ struct StructureTreeDecoder {
     hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     hash_counts: BTreeMap<Vec<u8>, u64>,
     hash_expiries: BTreeMap<Vec<u8>, i64>,
+    hash_field_expiries: BTreeMap<(Vec<u8>, Vec<u8>), i64>,
     retired_hashes: BTreeSet<Vec<u8>>,
     sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     set_counts: BTreeMap<Vec<u8>, u64>,
@@ -14834,6 +15488,7 @@ struct StructureTreeDecoder {
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
     expiry_index: BTreeMap<(i64, Vec<u8>), u8>,
+    hash_field_expiry_index: BTreeSet<(i64, Vec<u8>, Vec<u8>)>,
 }
 
 impl StructureTreeDecoder {
@@ -14879,13 +15534,17 @@ impl StructureTreeDecoder {
                 let (hash, field) = decode_hash_field_identity(&key[1..])
                     .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
                 if let Some(fields) = self.hashes.get_mut(hash) {
-                    if let Some(value) = decode_hash_field_value(value, blobs)?
-                        && fields.insert(field.to_vec(), value).is_some()
+                    if let Some(entry) = decode_hash_field_entry(value, blobs)?
+                        && (entry.expires_at_micros.is_some_and(|expiry| {
+                            self.hash_field_expiries
+                                .insert((hash.to_vec(), field.to_vec()), expiry)
+                                .is_some()
+                        }) || fields.insert(field.to_vec(), entry.value).is_some())
                     {
                         return Err(NativeRuntimeError::InvalidStructureTree);
                     }
                 } else if !self.retired_hashes.contains(hash)
-                    || decode_hash_field_value(value, blobs)?.is_some()
+                    || decode_hash_field_entry(value, blobs)?.is_some()
                 {
                     return Err(NativeRuntimeError::InvalidStructureTree);
                 }
@@ -14912,6 +15571,19 @@ impl StructureTreeDecoder {
                             .expiry_index
                             .insert((expiry, structure_key.to_vec()), *marker)
                             .is_none() => {}
+                    _ => return Err(NativeRuntimeError::InvalidStructureTree),
+                }
+            }
+            Some(STRUCTURE_HASH_FIELD_EXPIRY_PREFIX) => {
+                let (expiry, hash, field) = decode_structure_hash_field_expiry_identity(&key[1..])?;
+                match value {
+                    [STRUCTURE_EXPIRY_TOMBSTONE] => {}
+                    [STRUCTURE_HASH_FIELD_EXPIRY_LIVE]
+                        if self.hash_field_expiry_index.insert((
+                            expiry,
+                            hash.to_vec(),
+                            field.to_vec(),
+                        )) => {}
                     _ => return Err(NativeRuntimeError::InvalidStructureTree),
                 }
             }
@@ -15063,6 +15735,7 @@ impl StructureTreeDecoder {
             hashes,
             hash_counts,
             hash_expiries,
+            hash_field_expiries,
             retired_hashes: _,
             sets,
             set_counts,
@@ -15072,6 +15745,7 @@ impl StructureTreeDecoder {
             sorted_set_counts,
             sorted_set_order,
             expiry_index,
+            hash_field_expiry_index,
             require_expiry_index,
         } = self;
         validate_hash_counts(&hashes, hash_counts)?;
@@ -15080,13 +15754,18 @@ impl StructureTreeDecoder {
         validate_sorted_sets(&sorted_sets, &sorted_set_counts, sorted_set_order)?;
         if require_expiry_index {
             validate_expiry_index(&entries, &hash_expiries, &expiry_index)?;
-        } else if !expiry_index.is_empty() {
+            validate_hash_field_expiry_index(&hash_field_expiries, &hash_field_expiry_index)?;
+        } else if !expiry_index.is_empty()
+            || !hash_field_expiries.is_empty()
+            || !hash_field_expiry_index.is_empty()
+        {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(StructureState {
             entries,
             hashes,
             hash_expiries,
+            hash_field_expiries,
             sets,
             lists,
             sorted_sets,
@@ -15222,6 +15901,20 @@ fn validate_expiry_index(
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
     }
+    if *actual != expected {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+fn validate_hash_field_expiry_index(
+    expected: &BTreeMap<(Vec<u8>, Vec<u8>), i64>,
+    actual: &BTreeSet<(i64, Vec<u8>, Vec<u8>)>,
+) -> Result<(), NativeRuntimeError> {
+    let expected = expected
+        .iter()
+        .map(|((hash, field), expiry)| (*expiry, hash.clone(), field.clone()))
+        .collect::<BTreeSet<_>>();
     if *actual != expected {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
@@ -30727,6 +31420,136 @@ mod tests {
             super::load_state(&database.pages, &database.blobs, &forged_orphan),
             Err(NativeRuntimeError::InvalidAnnTree)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn hash_field_ttl_matches_private_snapshot_physical_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"profile".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"name".to_vec(), b"Mario".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"city".to_vec(), b"Medellin".to_vec())?;
+        assert_eq!(
+            seed.ttl_hash_field(b"profile", b"name"),
+            super::Ttl::Persistent
+        );
+        assert!(seed.expire_hash_field(b"profile".to_vec(), b"name".to_vec(), 20)?);
+        assert_eq!(
+            seed.ttl_hash_field(b"profile", b"name"),
+            super::Ttl::RemainingMicros(10)
+        );
+        assert!(!seed.expire_hash_field(b"profile".to_vec(), b"missing".to_vec(), 20)?);
+        seed.commit()?;
+
+        let historical = database.snapshot(19)?;
+        assert_eq!(
+            historical.ttl_hash_field(b"profile", b"name"),
+            super::Ttl::RemainingMicros(1)
+        );
+        assert_eq!(
+            historical.hget(b"profile", b"name")?,
+            Some(b"Mario".as_slice())
+        );
+        assert_eq!(
+            database.ttl_latest_hash_field(b"profile", b"name", 19)?,
+            super::Ttl::RemainingMicros(1)
+        );
+        assert_eq!(database.hget_latest_hash_at(b"profile", b"name", 20)?, None);
+        assert_eq!(database.hlen_latest_hash_at(b"profile", 20)?, 1);
+        assert_eq!(
+            database
+                .hscan_latest_hash_at(b"profile", None, 10, 20)?
+                .into_iter()
+                .map(|entry| entry.field)
+                .collect::<Vec<_>>(),
+            vec![b"city".to_vec()]
+        );
+
+        let mut replace = database.begin(20, DurabilityClass::Strict)?;
+        assert_eq!(
+            replace.hset(b"profile".to_vec(), b"name".to_vec(), b"Sol".to_vec())?,
+            super::HashSetOutcome::Added
+        );
+        assert_eq!(
+            replace.ttl_hash_field(b"profile", b"name"),
+            super::Ttl::Persistent
+        );
+        replace.commit()?;
+        assert_eq!(database.hlen_latest_hash_at(b"profile", 21)?, 2);
+        assert_eq!(
+            database.hget_latest_hash_at(b"profile", b"name", 21)?,
+            Some(b"Sol".to_vec())
+        );
+        assert_eq!(
+            database.ttl_latest_hash_field(b"profile", b"name", 21)?,
+            super::Ttl::Persistent
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.hlen_latest_hash_at(b"profile", 21)?, 2);
+        assert_eq!(
+            reopened.hget_latest_hash_at(b"profile", b"name", 21)?,
+            Some(b"Sol".to_vec())
+        );
+        assert_eq!(
+            historical.hget(b"profile", b"name")?,
+            Some(b"Mario".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_batches_hash_fields_under_one_bounded_csn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"session".to_vec())?;
+        for (field, value) in [
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ] {
+            seed.hset(b"session".to_vec(), field.clone(), value)?;
+            assert!(seed.expire_hash_field(b"session".to_vec(), field, 10)?);
+        }
+        seed.hset(b"session".to_vec(), b"c".to_vec(), b"3".to_vec())?;
+        seed.commit()?;
+
+        let first = database.expire_due_structures(10, 1, DurabilityClass::Memory)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(first.more_due);
+        assert!(first.commit.is_some());
+        let second = database.expire_due_structures(10, 2, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 1);
+        assert!(!second.more_due);
+        assert!(second.commit.is_some());
+        assert_eq!(database.hlen_latest_hash_at(b"session", 10)?, 1);
+        assert_eq!(
+            database.hget_latest_hash_at(b"session", b"c", 10)?,
+            Some(b"3".to_vec())
+        );
+        assert_eq!(
+            database
+                .expire_due_structures(10, 2, DurabilityClass::Strict)?
+                .commit,
+            None
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.hlen_latest_hash_at(b"session", 10)?, 1);
+        assert_eq!(
+            reopened.ttl_latest_hash_field(b"session", b"a", 10)?,
+            super::Ttl::Missing
+        );
+        assert_eq!(
+            reopened.ttl_latest_hash_field(b"session", b"b", 10)?,
+            super::Ttl::Missing
+        );
         Ok(())
     }
 }

@@ -68,6 +68,7 @@ pub(crate) enum Opcode {
     VacuumPageGeneration = 29,
     DeleteHash = 30,
     ExpireHash = 31,
+    ExpireHashField = 32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -629,6 +630,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         }
         value if value == Opcode::DeleteHash as u8 => (Opcode::DeleteHash, EngineKind::Structure),
         value if value == Opcode::ExpireHash as u8 => (Opcode::ExpireHash, EngineKind::Structure),
+        value if value == Opcode::ExpireHashField as u8 => {
+            (Opcode::ExpireHashField, EngineKind::Structure)
+        }
         value if value == Opcode::CreateSet as u8 => (Opcode::CreateSet, EngineKind::Structure),
         value if value == Opcode::AddSetMember as u8 => {
             (Opcode::AddSetMember, EngineKind::Structure)
@@ -749,6 +753,7 @@ fn validate_mutation_shape(
         | Opcode::CreateHash
         | Opcode::DeleteHash
         | Opcode::ExpireHash
+        | Opcode::ExpireHashField
         | Opcode::SetHashField
         | Opcode::DeleteHashField
         | Opcode::CreateSet
@@ -800,7 +805,9 @@ fn validate_mutation_shape(
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::ExpireHash if value_length != 0 || expires_at_micros.is_none() => {
+        Opcode::ExpireHash | Opcode::ExpireHashField
+            if value_length != 0 || expires_at_micros.is_none() =>
+        {
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::PushListHead
@@ -835,6 +842,7 @@ fn validate_mutation_identity(
         opcode,
         Opcode::SetHashField
             | Opcode::DeleteHashField
+            | Opcode::ExpireHashField
             | Opcode::AddSetMember
             | Opcode::DeleteSetMember
             | Opcode::UpsertSortedSetMember
@@ -1017,6 +1025,15 @@ mod tests {
         })
     }
 
+    fn test_roots() -> Result<[PageId; super::ROOT_COUNT], hyphae_native_types::NativeTypeError> {
+        Ok([
+            PageId::new(1)?,
+            PageId::new(2)?,
+            PageId::new(3)?,
+            PageId::new(4)?,
+        ])
+    }
+
     #[test]
     fn generation_one_commit_manifest_keeps_the_v1_golden_encoding()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1117,6 +1134,7 @@ mod tests {
             structure_mutation(Opcode::ExpireHash, b"hash", b"", Some(i64::MIN)),
             structure_mutation(Opcode::DeleteHash, b"retired-hash", b"", None),
             structure_mutation(Opcode::SetHashField, &hash_field, b"value", None),
+            structure_mutation(Opcode::ExpireHashField, &hash_field, b"", Some(i64::MAX)),
             structure_mutation(Opcode::DeleteHashField, &hash_field, b"", None),
             structure_mutation(Opcode::CreateSet, b"set", b"", None),
             structure_mutation(Opcode::AddSetMember, &set_member, b"", None),
@@ -1168,12 +1186,7 @@ mod tests {
                 None,
             ),
         ];
-        let roots = [
-            PageId::new(1)?,
-            PageId::new(2)?,
-            PageId::new(3)?,
-            PageId::new(4)?,
-        ];
+        let roots = test_roots()?;
         let pending = encode_transaction(&TransactionPlan {
             transaction_id: TransactionId::new(1)?,
             read_csn: None,
@@ -1192,7 +1205,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 25);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 26);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -1229,6 +1242,32 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutation_shape(Opcode::ExpireHash, false, 0, None, b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn hash_field_expiry_requires_compound_identity_and_explicit_expiry() {
+        let mut field = 4_u32.to_be_bytes().to_vec();
+        field.extend_from_slice(b"hashfield");
+        assert!(
+            validate_mutation_shape(Opcode::ExpireHashField, false, 0, Some(i64::MIN), &field,)
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHashField, true, 0, Some(10), &field),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHashField, false, 1, Some(10), &field),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHashField, false, 0, None, &field),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHashField, false, 0, Some(10), b"\0"),
             Err(WalSemanticError::InvalidBody)
         ));
     }
