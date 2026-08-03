@@ -652,16 +652,16 @@ primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes with bounded
-exact-byte iteration, exact binary sets with member-granular conflicts,
-chunked-deque lists, and dual-index sorted sets with bounded bidirectional
-score/rank ranges, member-rank lookup, whole-hash delete/recreate and TTL,
-bounded multi-field hash commands, and signed hash-field counters. It still
-lacks hash pattern scans, floating counters, set and sorted-set
+ascending, descending, and binary-glob iteration, exact binary sets with
+member-granular conflicts, chunked-deque lists, and dual-index sorted sets
+with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
+delete/recreate and TTL, bounded multi-field hash commands, and signed
+hash-field counters. It still lacks floating counters, set and sorted-set
 algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
 empty-expiry backoff, randomized model tests, and a user-facing
-historical-retention policy required to close G3. Ordered cleanup,
-current-root compaction, and page-generation vacuum provide exact first
-amplification measurements, not the complete memory-amplification gate.
+historical-retention policy required to close G3. Ordered cleanup, current-root
+compaction, and page-generation vacuum provide exact first amplification
+measurements, not the complete memory-amplification gate.
 
 ## G1 substrate exit
 

@@ -317,6 +317,16 @@ commit before its tag can be published.
 - `native-hash-reverse-scan-linux.json` records the native reverse visitor
   against a full ascending materialize/reverse/truncate fallback plus repeated
   pinned parent/current HGET controls. It remains outside complete G3 and G7.
+- [Native hash pattern-scan evidence —
+  2026-08-03](native-hash-pattern-scan-linux-2026-08-03.md) binds one bounded
+  binary-glob grammar, exact and leading-prefix physical routes, sparse
+  empty-page progress, matcher budgets, TTL/reopen equivalence, early stop,
+  and reached-corruption handling to direct Linux.
+- `native-hash-pattern-scan-linux.json` records a 32-visit prunable-prefix
+  route, a 1,985-visit leading-wildcard route, their full-HSCAN application
+  fallbacks, and repeated pinned parent/current HGET controls. It preserves
+  the leading-wildcard slowdown as an explicit optimization target and
+  remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed
