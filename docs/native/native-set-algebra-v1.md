@@ -1,6 +1,7 @@
 # Native set algebra v1
 
-Status: contract frozen; implementation and evidence pending.
+Status: contract implemented and evidenced on direct Linux; hosted CI remains
+separate from the local receipt.
 
 This contract adds bounded read-only algebra to Hyphae's existing native
 binary set family. It does not wrap Valkey, add a sidecar, project through SQL,
@@ -183,3 +184,6 @@ or G7.
 The small-set hot path is a measured microsecond-first objective, not a
 universal bound. Large union output and large first/smallest-set scans are
 cardinality-sensitive by definition.
+
+The implementation and measured gate are bound by the
+[native set algebra Linux evidence](../gates/evidence/native-set-algebra-linux-2026-08-03.md).

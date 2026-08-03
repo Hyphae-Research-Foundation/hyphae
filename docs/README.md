@@ -133,6 +133,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native hash pattern-scan Linux evidence — 2026-08-03](gates/evidence/native-hash-pattern-scan-linux-2026-08-03.md)
 - [Native hash field TTL Linux evidence — 2026-08-03](gates/evidence/native-hash-field-ttl-linux-2026-08-03.md)
 - [Native hash randomized-model Linux evidence — 2026-08-03](gates/evidence/native-hash-randomized-model-linux-2026-08-03.md)
+- [Native set algebra Linux evidence — 2026-08-03](gates/evidence/native-set-algebra-linux-2026-08-03.md)
 - [Native durable scalar-expiry evidence — 2026-08-01](gates/evidence/native-expiry-2026-08-01.md)
 - [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native ordered B+tree batch COW evidence — 2026-08-02](gates/evidence/native-btree-batch-cow-2026-08-02.md)

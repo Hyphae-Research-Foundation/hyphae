@@ -220,7 +220,9 @@ The read-only algebra extension is frozen separately in
 [Native set algebra v1](native-set-algebra-v1.md). It defines bounded
 exact-byte union, intersection, and ordered difference without a sidecar,
 serialized compatibility protocol, write opcode, or destination-set mutation.
-Its implementation and evidence remain open.
+Its private-batch, retained-snapshot, current-root physical, restart,
+corruption, and direct-Linux latency evidence is recorded in the
+[native set algebra receipt](../gates/evidence/native-set-algebra-linux-2026-08-03.md).
 
 `CREATE_LIST` establishes a binary chunked deque before element mutation.
 `LPUSH` and `RPUSH` insert one exact binary value and return the new length.

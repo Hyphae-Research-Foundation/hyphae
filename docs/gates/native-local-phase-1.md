@@ -187,10 +187,16 @@ contract correction exposed by the corpus. Other structure-family models,
 concurrent histories, memory amplification, complete G3, and G7 remain open.
 
 The [native set algebra
-contract](../native/native-set-algebra-v1.md) freezes bounded exact-byte
-`UNION`, `INTERSECTION`, and ordered `DIFFERENCE` over private, retained, and
-current-root physical set state. Its implementation, corruption, restart, and
-latency evidence remain open; the contract alone does not satisfy G3.
+evidence](evidence/native-set-algebra-linux-2026-08-03.md) implements the
+frozen bounded exact-byte `UNION`, `INTERSECTION`, and ordered `DIFFERENCE`
+contract over private, retained, and current-root physical set state. It binds
+logical-time expiry, restart equivalence, deterministic smallest-set
+intersection, reached-corruption failures, hard output/visit limits, and
+direct-Linux latency. Small embedded cases measured 1.838–6.013 microseconds
+at p50; current-root physical cases measured 61.645–93.838 microseconds at
+p50. Large union and difference remained cardinality-sensitive at 2.605 and
+6.784 milliseconds p50. Store variants, set TTL, sorted-set algebra/TTL,
+streams, complete G3, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -685,7 +691,7 @@ member-granular conflicts, chunked-deque lists, and dual-index sorted sets
 with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
 delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
 counters, and independent absolute field TTL. It still lacks floating
-counters, set and sorted-set algebra/TTL, relative/conditional field expiry,
+counters, set TTL, sorted-set algebra/TTL, relative/conditional field expiry,
 field persist/batches, subtree-count order-statistic acceleration, streams,
 adaptive empty-expiry backoff, randomized model tests, and a user-facing
 historical-retention policy required to close G3. Ordered cleanup,
