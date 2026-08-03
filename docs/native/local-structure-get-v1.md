@@ -1,6 +1,7 @@
 # Native local structure GET v1
 
-Status: contract frozen; implementation and direct-Linux evidence pending.
+Status: implemented experimentally; direct-Linux correctness and latency
+evidence recorded. The complete local product and G7 matrix remain pending.
 
 This contract carries the first real native-engine operation over Hyphae's
 filesystem-backed Unix-domain transport. It reads one scalar structure value
@@ -130,6 +131,10 @@ The first receipt uses warm state and concurrency one. It is an observation,
 not a regression threshold or G7 closure. It must disclose warmup, sample
 count, value size, tree height, CPU affinity, virtualization, maxima, and all
 missing cold/saturation/allocation/hardware-counter lanes.
+
+The exact implementation, failure-path tests, host disclosure, three raw
+release observations, and latency summary are bound by the
+[direct-Linux structure GET evidence](../gates/evidence/native-local-structure-get-linux-2026-08-03.md).
 
 ## Boundary
 

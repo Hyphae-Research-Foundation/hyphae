@@ -79,9 +79,10 @@ implements the first reviewable vertical. Steps 1 through 4 and the
 reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers
 five in-process commit boundaries and four manifest/checkpoint boundaries, but
 not blobs, group commit, filesystem reordering, or sector-level power loss.
-Step 7 now has a first filesystem-backed UDS framing and persistent-ping
-receipt on direct Linux. Windows named-pipe transport, the complete session,
-and SQL/structure/search payloads through the transport remain open.
+Step 7 now has filesystem-backed UDS framing, persistent-ping, and the first
+engine-bearing scalar structure `GET` receipt on direct Linux. Windows
+named-pipe transport, the complete session, writes/TTL, SQL, search, and the
+full performance matrix remain open.
 
 The follow-on [row, B+tree, and checkpoint
 evidence](evidence/native-row-tree-checkpoint-2026-08-01.md) binds canonical
@@ -623,8 +624,22 @@ permissions, identity-safe cleanup, and an ordered persistent connection.
 Three direct-Linux release observations put the median persistent `PING`
 round trip at p50 `23.261 us`, p99 `35.290 us`, and p99.9 `44.631 us`. This
 removes the explicit no-UDS-receipt deficit from the minimal G1 vertical, but
-does not carry an engine operation, close Windows named-pipe or complete
-session semantics, establish a regression threshold, or close G1, G6, or G7.
+does not close Windows named-pipe or complete session semantics, establish a
+regression threshold, or close G1, G6, or G7.
+
+The [native local structure GET
+evidence](evidence/native-local-structure-get-linux-2026-08-03.md) adds the
+first engine-bearing UDS operation. Canonical binary payloads, stable
+request-local failures, server-authoritative TTL time, and direct physical
+B+tree reads retain stream/request identity on one persistent connection.
+Across three direct-Linux release runs, the median embedded physical read was
+p50/p99 `0.816/1.588 us`; the complete `STRUCTURE GET` round trip was
+`23.466/35.939 us`. This bounded observation is below the provisional
+`25/100 us` local-protocol target, but it is warm, virtualized, concurrency
+one, may allocate the returned value, and lacks the G7 cold/saturation/
+interference/allocation/hardware-counter matrix. `SET`, TTL commands, SQL,
+search, transactions, complete session semantics, and Windows named pipes
+remain open.
 
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size

@@ -2,9 +2,10 @@
 
 Status: normative target contract; the allocation-free borrowed frame decoder,
 encoder, version/kind validation, bounds, CRC32C, and first filesystem-backed
-Unix-domain-socket framed transport are implemented experimentally. Windows
-named-pipe transport, the complete handshake, and session flow control remain
-pending.
+Unix-domain-socket framed transport are implemented experimentally. The first
+canonical scalar structure `GET` also executes through that transport. Windows
+named-pipe transport, writes, SQL/search payloads, the complete handshake,
+transactions, and session flow control remain pending.
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.
@@ -65,6 +66,11 @@ one stream with explicit total length and final digest.
 
 The transaction ID returned by `BEGIN` can carry SQL, structure and search
 operations on the same connection/session.
+
+The first implemented engine-bearing subset is
+[native local structure GET v1](local-structure-get-v1.md). It uses the
+canonical frame header and a deliberately minimal serial session; it does not
+imply that the complete message families or transaction state are implemented.
 
 ## Multiplexing and flow control
 

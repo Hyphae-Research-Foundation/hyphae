@@ -702,3 +702,14 @@ detectable.
   median statistics. It measures framing plus a kernel UDS round trip, not an
   engine operation, durability, saturation, Windows named-pipe behavior, or a
   G1/G6/G7 gate closure.
+
+## Native local structure GET on Linux
+
+- `native-local-structure-get-linux-2026-08-03.md` binds the first
+  engine-bearing `HYPHLCL1` operation to its frozen binary contract, physical
+  B+tree execution, TTL clock authority, failure tests, exact Linux source,
+  and validation logs.
+- `native-local-structure-get-linux.json` records three release observations
+  of embedded physical `GET`, persistent `PING`, and persistent engine-bearing
+  `GET`. The bounded p50/p99 targets are met, but the receipt is not a
+  regression threshold or G0/G1/G6/G7 closure.

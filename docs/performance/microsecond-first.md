@@ -1,7 +1,7 @@
 # Microsecond-first performance contract
 
-Status: target contract; versioned local smoke observations exist, but no
-target gate has passed
+Status: target contract; one bounded structure-point observation meets its
+provisional p50/p99 targets, but no G7 performance gate has passed
 
 Hyphae's local ecosystem is designed around bounded hot paths measured in
 microseconds. This is not a claim that every query, transport, or durable
@@ -119,10 +119,23 @@ scheduling tails. The route measures frame encode/write, kernel transport,
 server read/decode/echo, client read/decode, and scheduling together. It does
 not execute a structure `GET`; therefore it is transport budget evidence,
 not a pass of the 25-us/100-us native structure-point target. Its roughly
-23.3-us p50 consumes nearly that entire provisional p50 budget and makes the
-next engine-bearing transport vertical a deliberate performance constraint.
-The virtualized, warm, concurrency-one run is neither a regression threshold
-nor G7 closure.
+23.3-us p50 consumed nearly that entire provisional p50 budget and made the
+engine-bearing transport vertical a deliberate performance constraint. The
+virtualized, warm, concurrency-one run is neither a regression threshold nor
+G7 closure.
+
+The follow-on
+[engine-bearing structure GET receipt](../gates/evidence/native-local-structure-get-linux-2026-08-03.md)
+uses the same host and affinity with a fresh height-two physical B+tree of
+2,048 scalar keys and 64-byte values. Across three release runs, the median
+embedded physical read observed p50/p99 `0.816/1.588 us`; persistent `PING`
+observed `23.338/35.457 us`; and the complete persistent `STRUCTURE GET`
+observed `23.466/35.939 us`. Both embedded and local-protocol bounded
+observations are below their provisional p50/p99 targets. Independent
+percentiles are not subtracted to infer execution cost. The receipt remains
+outside G7 because it has 100,000 warm observations, concurrency one,
+virtualized hardware, an owned value that may allocate, no cold/saturation/
+interference/counter lanes, and no Windows named-pipe counterpart.
 
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5

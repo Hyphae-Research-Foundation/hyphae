@@ -1,7 +1,8 @@
 # Native local UDS transport v1
 
-Status: implemented for Unix; direct-Linux receipt recorded. Windows named
-pipe and complete session semantics remain pending.
+Status: implemented for Unix; transport-only and first engine-bearing
+direct-Linux receipts recorded. Windows named pipe and complete session
+semantics remain pending.
 
 This contract adds the first real transport beneath Hyphae's native local
 protocol. It carries canonical `HYPHLCL1` frames over one Unix domain socket
@@ -10,8 +11,8 @@ hop. Embedded engine calls remain direct Rust calls.
 
 This is a G1 transport vertical, not the complete G6 daemon. Windows named
 pipes, authorization policy, general session state, multiplexing, streaming,
-flow control, cancellation, and database operation payloads remain separate
-contracts.
+flow control, cancellation, and all database operation payloads beyond the
+first scalar structure `GET` remain separate contracts.
 
 ## Portable framed I/O
 
@@ -77,6 +78,13 @@ connection:
 This session exists to prove framing and UDS transport. It does not negotiate
 the complete production handshake or authorize database operations.
 
+The follow-on
+[native local structure GET](local-structure-get-v1.md) session retains the
+same minimal handshake and persistent `PING` control, then executes canonical
+scalar `GET` requests against the current physical structure root. That
+engine-bearing extension is serial and bounded; it does not implement the
+complete production session.
+
 ## Failure behavior
 
 The implementation must fail closed for:
@@ -122,5 +130,5 @@ release observations, and latency summary are bound by the
 
 Passing this slice removes the explicit “no UDS transport receipt” deficit
 from the G1 minimal vertical. It does not by itself close G0, the rest of G1,
-G6, or G7, and it does not expose SQL, structure, or search operations through
-the socket.
+G6, or G7. One scalar structure `GET` is now exposed through the socket; SQL,
+structure writes and TTL commands, search, and transaction state are not.
