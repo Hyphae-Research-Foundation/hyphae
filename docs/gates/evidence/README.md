@@ -277,6 +277,13 @@ commit before its tag can be published.
   commit.
 - `native-sorted-set-reverse-range-linux.json` is its direct-Linux release
   observation over 2,048 members. It remains outside G3 and G7.
+- [Native bounded hash-scan evidence —
+  2026-08-02](native-hash-scan-linux-2026-08-02.md) binds exact binary field
+  order, exclusive cursor behavior, execution-mode equivalence, bounded
+  physical prefix traversal, live-only result accounting, and fail-closed
+  reached-state decoding to one source commit.
+- `native-hash-scan-linux.json` is its direct-Linux release observation over
+  2,048 fields. It remains outside G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

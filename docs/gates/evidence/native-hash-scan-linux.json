@@ -1,0 +1,26 @@
+{
+  "schema": "hyphae-native-hash-scan-smoke-v1",
+  "status": "observation-not-gate",
+  "source_commit": "0134fcbfb93875d9978c70555cbe17d7dcbc54e8",
+  "source_tree": "862c82568ef4bc9287914fcaa59ca25a4f452a2e",
+  "source_branch": "codex/native-hash-field-scan",
+  "environment": "aws-m6i.2xlarge-ubuntu-24.04.4-linux-6.17.0-1019-aws-ext4-ebs",
+  "profile": "release",
+  "durability": "strict-seed-and-reopen",
+  "cpu_affinity": "logical-cpu-2",
+  "warm_state": true,
+  "concurrency": 1,
+  "mode": "release-warm-concurrency-1",
+  "observations": 10000,
+  "warmup": 1000,
+  "fields": 2048,
+  "field_bytes": 64,
+  "value_bytes": 64,
+  "dataset_blake3": "05c3111356c90c0cfd8d5dbb5e12c2eb66e8eaa3d5e955db8ba6234f88c86c65",
+  "structure_tree_height": 2,
+  "metrics": {
+    "hscan_head_10_physical": {"p50_nanos": 7166, "p95_nanos": 7403, "p99_nanos": 14194, "p999_nanos": 18147, "max_nanos": 50440, "throughput_per_second": 136173.020},
+    "hscan_middle_10_physical": {"p50_nanos": 7531, "p95_nanos": 7862, "p99_nanos": 16288, "p999_nanos": 20797, "max_nanos": 32239, "throughput_per_second": 127073.012},
+    "hscan_tail_10_physical": {"p50_nanos": 9899, "p95_nanos": 10240, "p99_nanos": 19045, "p999_nanos": 22150, "max_nanos": 46653, "throughput_per_second": 99073.700}
+  }
+}

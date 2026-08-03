@@ -118,6 +118,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native sorted-set member-rank Linux evidence — 2026-08-02](gates/evidence/native-sorted-set-ranks-linux-2026-08-02.md)
 - [PR #59–#61 direct-Linux integration evidence — 2026-08-02](gates/evidence/native-pr59-pr60-pr61-integration-linux-2026-08-02.md)
 - [Native sorted-set reverse-range Linux evidence — 2026-08-02](gates/evidence/native-sorted-set-reverse-ranges-linux-2026-08-02.md)
+- [Native bounded hash-scan Linux evidence — 2026-08-02](gates/evidence/native-hash-scan-linux-2026-08-02.md)
 - [Native durable scalar-expiry evidence — 2026-08-01](gates/evidence/native-expiry-2026-08-01.md)
 - [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native ordered B+tree batch COW evidence — 2026-08-02](gates/evidence/native-btree-batch-cow-2026-08-02.md)

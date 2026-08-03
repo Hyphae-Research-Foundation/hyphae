@@ -126,6 +126,16 @@ cardinality metadata, field tombstones, field-granular conflict/rebase,
 multilevel scale, corruption rejection, crash recovery, and direct `HGET`
 latency to one source commit.
 
+The [native bounded hash-scan
+evidence](evidence/native-hash-scan-linux-2026-08-02.md) adds exact binary
+field iteration across private, retained, current-root, and reopened
+execution. Its exclusive field cursor remains valid after deletion, zero
+limit validates type and existence, and the physical route maps the cursor
+into the hash-field B+tree prefix, skips tombstones, and stops at the requested
+live count. Whole-hash delete/recreate, hash TTL, pattern/reverse scans,
+multi-field commands, field counters, model testing, the complete G3 suite,
+and G7 remain open.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with
@@ -613,10 +623,11 @@ Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
-conditional writes, signed counters, independent-field hashes, exact binary
-sets with member-granular conflicts, chunked-deque lists, and dual-index
-sorted sets with bounded bidirectional score/rank ranges and member-rank
-lookup. It still lacks whole-hash lifecycle/iteration, set and sorted-set
+conditional writes, signed counters, independent-field hashes with bounded
+exact-byte iteration, exact binary sets with member-granular conflicts,
+chunked-deque lists, and dual-index sorted sets with bounded bidirectional
+score/rank ranges and member-rank lookup. It still lacks whole-hash lifecycle,
+hash TTL/pattern/reverse scans/multi-field commands, set and sorted-set
 algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
 empty-expiry backoff, model tests, and a user-facing historical-retention
 policy required to close G3. Ordered cleanup,
