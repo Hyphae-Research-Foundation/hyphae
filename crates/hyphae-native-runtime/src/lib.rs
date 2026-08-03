@@ -19914,6 +19914,520 @@ mod tests {
         Ok(())
     }
 
+    const SECONDARY_PREFIX_RANGE_QUERY: &str = "SELECT id, tenant, sequence FROM events
+        WHERE sequence < ? AND tenant = ? AND sequence >= ?
+        ORDER BY tenant, sequence LIMIT 10";
+
+    fn secondary_prefix_range_parameters(tenant: SqlValue) -> [SqlValue; 3] {
+        [SqlValue::Signed(3), tenant, SqlValue::Signed(1)]
+    }
+
+    fn secondary_prefix_range_rows(ids_and_sequences: &[(i64, i64)]) -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["id".to_owned(), "tenant".to_owned(), "sequence".to_owned()],
+            rows: ids_and_sequences
+                .iter()
+                .map(|(id, sequence)| {
+                    vec![
+                        SqlValue::Signed(*id),
+                        SqlValue::Text("a".to_owned()),
+                        SqlValue::Signed(*sequence),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_secondary_prefix_range_boundaries(
+        query: &mut NativeWriteBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ordered = "ORDER BY tenant, sequence LIMIT 10";
+        for (predicate, parameters, expected) in [
+            (
+                "tenant = ? AND sequence > ? AND sequence <= ?",
+                vec![
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(2),
+                ],
+                vec![(2, 2)],
+            ),
+            (
+                "sequence < ? AND tenant = ? AND sequence >= ?",
+                vec![
+                    SqlValue::Signed(3),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(2),
+                ],
+                vec![(2, 2)],
+            ),
+            (
+                "tenant = ? AND sequence > ? AND sequence <= ?",
+                vec![
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(2),
+                    SqlValue::Signed(2),
+                ],
+                vec![],
+            ),
+            (
+                "tenant = ? AND sequence >= ?",
+                vec![SqlValue::Text("a".to_owned()), SqlValue::Signed(2)],
+                vec![(2, 2)],
+            ),
+            (
+                "tenant = ? AND sequence <= ?",
+                vec![SqlValue::Text("a".to_owned()), SqlValue::Signed(1)],
+                vec![(1, 1)],
+            ),
+        ] {
+            assert_eq!(
+                query.execute_sql(
+                    &format!(
+                        "SELECT id, tenant, sequence FROM events
+                         WHERE {predicate} {ordered}"
+                    ),
+                    &parameters,
+                )?,
+                secondary_prefix_range_rows(&expected),
+                "unexpected secondary prefix range for {predicate}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_secondary_prefix_range_binding_failures(
+        database: &NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plan = database.prepare_sql_latest(SECONDARY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(
+                &plan,
+                &secondary_prefix_range_parameters(SqlValue::Null),
+            )?,
+            secondary_prefix_range_rows(&[])
+        );
+        assert_eq!(
+            database.execute_prepared_latest(
+                &plan,
+                &[
+                    SqlValue::Signed(3),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Null,
+                ],
+            )?,
+            secondary_prefix_range_rows(&[])
+        );
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &[
+                    SqlValue::Signed(3),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(1),
+                ],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &[
+                    SqlValue::Signed(3),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Text("wrong".to_owned()),
+                ],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &plan,
+                &[SqlValue::Signed(3), SqlValue::Text("a".to_owned())],
+            ),
+            Err(SqlError::ParameterMismatch)
+        ));
+        for statement in [
+            "SELECT id FROM events
+             WHERE tenant = ? AND sequence > ? AND sequence >= ?
+             ORDER BY tenant, sequence LIMIT 10",
+            "SELECT id FROM events
+             WHERE tenant = ? AND sequence < ? AND sequence <= ?
+             ORDER BY tenant, sequence LIMIT 10",
+        ] {
+            assert!(matches!(
+                database.prepare_sql_latest(statement),
+                Err(SqlError::InvalidSecondaryIndexRange)
+            ));
+        }
+        let wrong_order = database.prepare_sql_latest(
+            "SELECT id FROM events
+             WHERE tenant = ? AND sequence >= ?
+             ORDER BY sequence LIMIT 10",
+        );
+        assert!(
+            matches!(wrong_order, Err(SqlError::InvalidSecondaryIndexRange)),
+            "unexpected secondary prefix-range ORDER BY result: {wrong_order:?}"
+        );
+        let zero_limit = database.prepare_sql_latest(
+            "SELECT id, tenant, sequence FROM events
+             WHERE tenant = ? AND sequence >= ?
+             ORDER BY tenant, sequence LIMIT 0",
+        )?;
+        assert!(matches!(
+            database.execute_prepared_latest(
+                &zero_limit,
+                &[
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Text("wrong".to_owned()),
+                ],
+            ),
+            Err(SqlError::TypeMismatch)
+        ));
+        assert_eq!(
+            database.execute_prepared_latest(
+                &zero_limit,
+                &[SqlValue::Text("a".to_owned()), SqlValue::Signed(1)],
+            )?,
+            secondary_prefix_range_rows(&[])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_secondary_prefix_range_matches_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (table, index) = seed_composite_secondary_range(&mut database)?;
+        let mut boundaries = database.begin_sql(19, DurabilityClass::Memory)?;
+        assert_secondary_prefix_range_boundaries(&mut boundaries)?;
+        assert_eq!(
+            boundaries.execute_sql(
+                "EXPLAIN SELECT id, tenant, sequence FROM events
+                 WHERE tenant = ? AND sequence >= ? AND sequence < ? AND payload = ?
+                 ORDER BY tenant, sequence LIMIT 1",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexPrefixRangeScan(table={table},index={index},\
+                     prefix_columns=1,range_column=3,lower=inclusive,\
+                     upper=exclusive,limit=1,residual=true)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            boundaries.execute_sql(
+                "SELECT id, tenant, sequence FROM events
+                 WHERE tenant = ? AND sequence >= ? AND sequence < ? AND payload = ?
+                 ORDER BY tenant, sequence LIMIT 1",
+                &[
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(1),
+                    SqlValue::Signed(3),
+                    SqlValue::Text("a-2".to_owned()),
+                ],
+            )?,
+            secondary_prefix_range_rows(&[(2, 2)])
+        );
+        boundaries.rollback();
+        let retained = database.snapshot(20)?;
+        let retained_plan = retained.prepare_sql(SECONDARY_PREFIX_RANGE_QUERY)?;
+
+        let mut private = database.begin_sql(21, DurabilityClass::Memory)?;
+        assert_eq!(
+            private.execute_sql(
+                "EXPLAIN SELECT id FROM events
+                 WHERE sequence < ? AND tenant = ? AND sequence >= ?
+                 ORDER BY tenant, sequence LIMIT 10",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexPrefixRangeScan(table={table},index={index},\
+                     prefix_columns=1,range_column=3,lower=inclusive,\
+                     upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        private.execute_sql(
+            "INSERT INTO events (id, tenant, sequence, payload) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(5),
+                SqlValue::Text("a".to_owned()),
+                SqlValue::Signed(2),
+                SqlValue::Text("a-private".to_owned()),
+            ],
+        )?;
+        let parameters = secondary_prefix_range_parameters(SqlValue::Text("a".to_owned()));
+        assert_eq!(
+            private.execute_sql(SECONDARY_PREFIX_RANGE_QUERY, &parameters)?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2), (5, 2)])
+        );
+        private.commit()?;
+
+        assert_eq!(
+            retained.execute_prepared(&retained_plan, &parameters)?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2)])
+        );
+        let latest_plan = database.prepare_sql_latest(SECONDARY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            database.execute_prepared_latest(&latest_plan, &parameters)?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2), (5, 2)])
+        );
+        assert_secondary_prefix_range_binding_failures(&database)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(SECONDARY_PREFIX_RANGE_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2), (5, 2)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_prefix_range_does_not_skip_index_columns() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE compound_events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                shard BIGINT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing compound-secondary table identity".into());
+        };
+        seed.execute_sql(
+            "INSERT INTO compound_events (id, tenant, sequence, shard)
+             VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(1),
+                SqlValue::Text("a".to_owned()),
+                SqlValue::Signed(1),
+                SqlValue::Signed(1),
+            ],
+        )?;
+        seed.execute_sql(
+            "CREATE INDEX compound_order
+             ON compound_events (tenant, sequence, shard)",
+            &[],
+        )?;
+        seed.commit()?;
+
+        let mut explain = database.begin_sql(11, DurabilityClass::Memory)?;
+        for predicate in [
+            "tenant = ? AND shard >= ?",
+            "tenant = ? AND tenant = ? AND sequence >= ?",
+        ] {
+            assert_eq!(
+                explain.execute_sql(
+                    &format!(
+                        "EXPLAIN SELECT id FROM compound_events
+                         WHERE {predicate}
+                         ORDER BY id LIMIT 10"
+                    ),
+                    &[],
+                )?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(format!(
+                        "PrimaryKeyScan(table={table},limit=10,residual=true)"
+                    ))]],
+                },
+                "planner skipped or duplicated a secondary equality-prefix column"
+            );
+        }
+        explain.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_prefix_range_selects_a_valid_overlapping_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE overlapping_events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing overlapping-index table identity".into());
+        };
+        for (id, tenant, sequence) in [(1_i64, "a", 1_i64), (2, "a", 2), (3, "aa", 1)] {
+            seed.execute_sql(
+                "INSERT INTO overlapping_events (id, tenant, sequence) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Signed(sequence),
+                ],
+            )?;
+        }
+        seed.execute_sql(
+            "CREATE INDEX overlapping_sequence
+             ON overlapping_events (sequence)",
+            &[],
+        )?;
+        let created = seed.execute_sql(
+            "CREATE INDEX overlapping_tenant_sequence
+             ON overlapping_events (tenant, sequence)",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(compound_index),
+            ..
+        } = created
+        else {
+            return Err("missing overlapping compound-index identity".into());
+        };
+        seed.commit()?;
+
+        let statement = "SELECT id, tenant, sequence FROM overlapping_events
+            WHERE sequence >= ? AND tenant = ? AND sequence < ?
+            ORDER BY tenant, sequence LIMIT 10";
+        let mut query = database.begin_sql(11, DurabilityClass::Memory)?;
+        assert_eq!(
+            query.execute_sql(&format!("EXPLAIN {statement}"), &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexPrefixRangeScan(table={table},index={compound_index},\
+                     prefix_columns=1,range_column=3,lower=inclusive,\
+                     upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            query.execute_sql(
+                statement,
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(3),
+                ],
+            )?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2)])
+        );
+        query.rollback();
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_composite_secondary_layout_rejects_prefix_range_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE legacy_events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing legacy-composite table identity".into());
+        };
+        for (id, tenant, sequence) in [(1_i64, "a", 1_i64), (2, "a", 2), (3, "aa", 1)] {
+            seed.execute_sql(
+                "INSERT INTO legacy_events (id, tenant, sequence) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Signed(sequence),
+                ],
+            )?;
+        }
+        let created = seed.execute_sql(
+            "CREATE INDEX legacy_event_order ON legacy_events (tenant, sequence)",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(index),
+            ..
+        } = created
+        else {
+            return Err("missing legacy-composite index identity".into());
+        };
+        seed.state
+            .relational
+            .indexes
+            .get_mut(&index)
+            .ok_or("missing private legacy-composite index")?
+            .layout = super::SecondaryIndexLayout::LegacyLengthFirstV1;
+        seed.commit()?;
+
+        let assert_legacy =
+            |database: &mut NativeDatabase| -> Result<(), Box<dyn std::error::Error>> {
+                let exact = database.prepare_sql_latest(
+                    "SELECT id FROM legacy_events
+                     WHERE tenant = ? AND sequence = ?",
+                )?;
+                assert_eq!(
+                    database.execute_prepared_latest(
+                        &exact,
+                        &[SqlValue::Text("a".to_owned()), SqlValue::Signed(2)],
+                    )?,
+                    SqlResult::Rows {
+                        columns: vec!["id".to_owned()],
+                        rows: vec![vec![SqlValue::Signed(2)]],
+                    }
+                );
+                let mut explain = database.begin_sql(11, DurabilityClass::Memory)?;
+                assert_eq!(
+                    explain.execute_sql(
+                        "EXPLAIN SELECT id FROM legacy_events
+                         WHERE tenant = ? AND sequence >= ?
+                         ORDER BY id LIMIT 10",
+                        &[],
+                    )?,
+                    SqlResult::Rows {
+                        columns: vec!["plan".to_owned()],
+                        rows: vec![vec![SqlValue::Text(format!(
+                            "PrimaryKeyScan(table={table},limit=10,residual=true)"
+                        ))]],
+                    }
+                );
+                explain.rollback();
+                Ok(())
+            };
+        assert_legacy(&mut database)?;
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_legacy(&mut reopened)?;
+        Ok(())
+    }
+
     #[test]
     fn legacy_secondary_layout_keeps_exact_lookup_and_rejects_range_planning()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -20094,6 +20608,79 @@ mod tests {
         assert!(
             matches!(result, Err(SqlError::InvalidStoredRow)),
             "unexpected forged secondary projection result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_secondary_prefix_range_rejects_a_malformed_ordered_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_, index) = seed_composite_secondary_range(&mut database)?;
+        let plan = database.prepare_sql_latest(SECONDARY_PREFIX_RANGE_QUERY)?;
+        let mut malformed =
+            SqlValue::Text("a".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        malformed.extend_from_slice(
+            &SqlValue::Signed(2)
+                .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?,
+        );
+        malformed.extend_from_slice(&u32::MAX.to_be_bytes());
+        let physical_key = super::relational_secondary_entry_key(index, &malformed)?;
+        forge_relational_entry(
+            &mut database,
+            physical_key,
+            vec![super::RELATIONAL_SECONDARY_ENTRY_LIVE],
+        )?;
+
+        let result = database.execute_prepared_latest(
+            &plan,
+            &secondary_prefix_range_parameters(SqlValue::Text("a".to_owned())),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SqlError::Runtime(NativeRuntimeError::InvalidRelationalTree))
+            ),
+            "unexpected malformed secondary prefix-range result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_secondary_prefix_range_rejects_a_forged_row_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let (_, index) = seed_composite_secondary_range(&mut database)?;
+        let plan = database.prepare_sql_latest(SECONDARY_PREFIX_RANGE_QUERY)?;
+        let mut index_key =
+            SqlValue::Text("a".to_owned()).encode_ordered_component(&LogicalType::Text)?;
+        index_key.extend_from_slice(
+            &SqlValue::Signed(2)
+                .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?,
+        );
+        let primary_key = SqlValue::Signed(1)
+            .encode_ordered_component(&LogicalType::Signed(IntegerWidth::Bits64))?;
+        let identity = super::secondary_index_entry_identity(
+            super::SecondaryIndexLayout::OrderedV2,
+            &index_key,
+            &primary_key,
+        )?;
+        let physical_key = super::relational_secondary_entry_key(index, &identity)?;
+        forge_relational_entry(
+            &mut database,
+            physical_key,
+            vec![super::RELATIONAL_SECONDARY_ENTRY_LIVE],
+        )?;
+
+        let result = database.execute_prepared_latest(
+            &plan,
+            &secondary_prefix_range_parameters(SqlValue::Text("a".to_owned())),
+        );
+        assert!(
+            matches!(result, Err(SqlError::InvalidStoredRow)),
+            "unexpected forged secondary prefix projection result: {result:?}"
         );
         Ok(())
     }
