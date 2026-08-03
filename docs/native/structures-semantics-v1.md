@@ -122,6 +122,15 @@ complete hash. `HSET` returns added versus updated, `HGET` reads one field,
 expired hashes return false from `EXPIRE_HASH`; due hashes are absent to every
 hash operation before physical cleanup.
 
+`HGET_MANY` preserves caller positions and duplicate reads. `HSET_MANY` and
+`HDELETE_MANY` reject duplicate exact fields, sort accepted fields into
+canonical mutation order, and return added or deleted field counts.
+`HINCRBY` applies checked `i64` arithmetic to canonical signed-decimal field
+bytes and starts a missing field at zero. These bounded operations validate
+all inputs before changing private state, preserve whole-hash expiry, and use
+the existing field WAL mutations and conflict identities. Their complete
+contract is [Native hash field commands v1](native-hash-field-commands-v1.md).
+
 `HSCAN` returns at most `limit` live field/value pairs in ascending exact
 field-byte order. `start_after` is an optional exclusive field cursor, not an
 opaque server token: the caller resumes with the last returned field. `None`
