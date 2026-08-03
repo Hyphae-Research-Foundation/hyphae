@@ -495,6 +495,12 @@ pub(crate) enum SortedSetRankState {
     Present { forward: usize, reverse: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SortedSetDirection {
+    Ascending,
+    Descending,
+}
+
 impl StructureState {
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
@@ -725,6 +731,25 @@ impl StructureState {
         start: i64,
         stop: i64,
     ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        self.sorted_set_rank_range(key, start, stop, SortedSetDirection::Ascending)
+    }
+
+    pub(crate) fn zrevrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        self.sorted_set_rank_range(key, start, stop, SortedSetDirection::Descending)
+    }
+
+    fn sorted_set_rank_range(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        direction: SortedSetDirection,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
         let members = self.sorted_sets.get(key)?;
         let Some((start, stop)) = normalize_list_range(members.len(), start, stop) else {
             return Some(Vec::new());
@@ -734,6 +759,9 @@ impl StructureState {
             .map(|(member, score)| (*score, member))
             .collect::<Vec<_>>();
         ordered.sort_unstable();
+        if direction == SortedSetDirection::Descending {
+            ordered.reverse();
+        }
         Some(
             ordered[start..=stop]
                 .iter()
@@ -750,6 +778,43 @@ impl StructureState {
         offset: usize,
         limit: usize,
     ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        self.sorted_set_score_range(
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    pub(crate) fn zrevrange_by_score(
+        &self,
+        key: &[u8],
+        lower: Bound<SortedSetScore>,
+        upper: Bound<SortedSetScore>,
+        offset: usize,
+        limit: usize,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        self.sorted_set_score_range(
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Descending,
+        )
+    }
+
+    fn sorted_set_score_range(
+        &self,
+        key: &[u8],
+        lower: Bound<SortedSetScore>,
+        upper: Bound<SortedSetScore>,
+        offset: usize,
+        limit: usize,
+        direction: SortedSetDirection,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
         let members = self.sorted_sets.get(key)?;
         if limit == 0 || sorted_set_score_range_is_empty(&lower, &upper) {
             return Some(Vec::new());
@@ -759,6 +824,9 @@ impl StructureState {
             .map(|(member, score)| (*score, member))
             .collect::<Vec<_>>();
         ordered.sort_unstable();
+        if direction == SortedSetDirection::Descending {
+            ordered.reverse();
+        }
         Some(
             ordered
                 .into_iter()

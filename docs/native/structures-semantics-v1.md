@@ -4,12 +4,11 @@ Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
 buffered reads, large immutable blobs, dual-index sorted sets, bounded
-sorted-set score ranges, and bidirectional sorted-set member ranks are
-implemented in the convergence slice; the ordered durable scalar-expiry index
-and bounded cleanup are
+sorted-set score ranges, bidirectional sorted-set member ranks, and reverse
+sorted-set rank/score ranges are implemented in the convergence slice; the
+ordered durable scalar-expiry index and bounded cleanup are
 implemented; an engine-owned background timer, version-bearing responses, and
-the remaining structure families remain pending. Reverse sorted-set range
-output is frozen below as a target contract but is not yet implemented.
+the remaining structure families remain pending.
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -192,8 +191,9 @@ ignore tombstones without charging rank or offset and stop without
 materializing the complete sorted set. Malformed metadata, identities, scores,
 or live markers fail the complete call rather than returning a partial result.
 
-These two reverse-range operations are frozen target behavior in this contract
-revision; their implementation and evidence remain pending.
+These two reverse-range operations are implemented across the private,
+snapshot, current-root, and reopened read surfaces. Their release evidence is
+tracked separately from this normative contract.
 
 `ZRANK` returns a live member's zero-based position in that exact ascending
 score/member order. `ZREVRANK` returns its zero-based position after reversing

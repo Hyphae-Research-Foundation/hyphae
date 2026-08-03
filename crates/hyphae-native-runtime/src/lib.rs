@@ -86,9 +86,9 @@ thread_local! {
 use crate::{
     model::{
         CatalogState, ListPop, ModelError, RelationState, SearchState, SecondaryIndexLayout,
-        SortedSetMemberState, SortedSetRankState, SortedSetScore, StructureEntry, StructureState,
-        TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
-        sorted_set_score_range_is_empty,
+        SortedSetDirection, SortedSetMemberState, SortedSetRankState, SortedSetScore,
+        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
+        normalize_list_range, sorted_set_score_range_is_empty,
     },
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
@@ -1383,23 +1383,33 @@ impl NativeSnapshot {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        if self.state.structures.entries.contains_key(key)
-            || self.state.structures.hashes.contains_key(key)
-            || self.state.structures.sets.contains_key(key)
-            || self.state.structures.lists.contains_key(key)
-        {
-            return Err(NativeRuntimeError::StructureKindMismatch);
-        }
-        self.state
-            .structures
-            .zrange(key, start, stop)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(member, score)| SortedSetEntry { member, score })
-                    .collect()
-            })
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        sorted_set_rank_range_from_state(
+            &self.state.structures,
+            key,
+            start,
+            stop,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    /// Returns an inclusive signed-rank range in descending sorted-set order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrevrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        sorted_set_rank_range_from_state(
+            &self.state.structures,
+            key,
+            start,
+            stop,
+            SortedSetDirection::Descending,
+        )
     }
 
     /// Returns a bounded ascending score range from this snapshot.
@@ -1419,24 +1429,43 @@ impl NativeSnapshot {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        let (lower, upper) = canonical_sorted_set_score_bounds(lower, upper)?;
-        if self.state.structures.entries.contains_key(key)
-            || self.state.structures.hashes.contains_key(key)
-            || self.state.structures.sets.contains_key(key)
-            || self.state.structures.lists.contains_key(key)
-        {
-            return Err(NativeRuntimeError::StructureKindMismatch);
-        }
-        self.state
-            .structures
-            .zrange_by_score(key, lower, upper, offset, limit)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(member, score)| SortedSetEntry { member, score })
-                    .collect()
-            })
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        sorted_set_score_range_from_state(
+            &self.state.structures,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    /// Returns a bounded descending score range from this snapshot.
+    ///
+    /// `offset` counts live members in descending order inside the score
+    /// interval, and at most `limit` entries are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for `NaN` bounds, another structure family, or a
+    /// missing sorted set.
+    pub fn zrevrange_by_score(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        sorted_set_score_range_from_state(
+            &self.state.structures,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Descending,
+        )
     }
 
     /// Executes deterministic native lexical matching.
@@ -3586,6 +3615,35 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        self.sorted_set_rank_range_latest(key, start, stop, SortedSetDirection::Ascending)
+    }
+
+    /// Reads an inclusive signed-rank range in descending order through the
+    /// ordered physical index.
+    ///
+    /// Traversal starts at the ordered prefix tail, stops after the last
+    /// requested live rank, and does not materialize the complete sorted set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata/index state.
+    pub fn zrevrange_latest_sorted_set(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        self.sorted_set_rank_range_latest(key, start, stop, SortedSetDirection::Descending)
+    }
+
+    fn sorted_set_rank_range_latest(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        direction: SortedSetDirection,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -3595,6 +3653,17 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
+        self.sorted_set_rank_range_in_tree(tree, key, start, stop, direction)
+    }
+
+    fn sorted_set_rank_range_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        direction: SortedSetDirection,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
         let metadata_key = structure_sorted_set_meta_key(key)?;
         let Some(metadata) =
             tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
@@ -3610,40 +3679,52 @@ impl NativeDatabase {
         let mut live_rank = 0_usize;
         let mut entries = Vec::with_capacity(range_stop - range_start + 1);
         let mut failure = None;
-        let _visit = tree.visit_prefix_cached(
-            &self.pages,
-            &self.buffer_pool,
-            &prefix,
-            None,
-            |physical_key, value| {
-                let decoded = (|| {
-                    let (_, score, member) = decode_sorted_set_order_identity(&physical_key[1..])?;
-                    let live = decode_set_member_value(value)?;
-                    Ok::<_, NativeRuntimeError>((score, member, live))
-                })();
-                let (score, member, live) = match decoded {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        failure = Some(error);
-                        return ControlFlow::Break(());
-                    }
-                };
-                if !live {
-                    return ControlFlow::Continue(());
-                }
-                if live_rank >= range_start {
-                    entries.push(SortedSetEntry {
-                        member: member.to_vec(),
-                        score,
-                    });
-                }
-                if live_rank == range_stop {
+        let mut visitor = |physical_key: &[u8], value: &[u8]| {
+            let decoded = (|| {
+                let (_, score, member) = decode_sorted_set_order_identity(&physical_key[1..])?;
+                let live = decode_set_member_value(value)?;
+                Ok::<_, NativeRuntimeError>((score, member, live))
+            })();
+            let (score, member, live) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    failure = Some(error);
                     return ControlFlow::Break(());
                 }
-                live_rank += 1;
-                ControlFlow::Continue(())
-            },
-        )?;
+            };
+            if !live {
+                return ControlFlow::Continue(());
+            }
+            if live_rank >= range_start {
+                entries.push(SortedSetEntry {
+                    member: member.to_vec(),
+                    score,
+                });
+            }
+            if live_rank == range_stop {
+                return ControlFlow::Break(());
+            }
+            live_rank += 1;
+            ControlFlow::Continue(())
+        };
+        let _visit = match direction {
+            SortedSetDirection::Ascending => tree.visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &mut visitor,
+            )?,
+            SortedSetDirection::Descending => tree.visit_prefix_range_cached_reverse(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                &mut visitor,
+            )?,
+        };
         if let Some(error) = failure {
             return Err(error);
         }
@@ -3671,6 +3752,54 @@ impl NativeDatabase {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        self.sorted_set_score_range_latest(
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    /// Reads a bounded descending score range through the ordered physical
+    /// sorted-set index.
+    ///
+    /// Traversal prunes by the canonical score bytes, counts offset only
+    /// across live entries in descending order, and stops after `limit`
+    /// results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for `NaN` bounds, legacy storage, another structure
+    /// family, a missing sorted set, or malformed metadata/index state.
+    pub fn zrevrange_by_score_latest_sorted_set(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        self.sorted_set_score_range_latest(
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Descending,
+        )
+    }
+
+    fn sorted_set_score_range_latest(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+        direction: SortedSetDirection,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -3681,6 +3810,19 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
+        self.sorted_set_score_range_in_tree(tree, key, (lower, upper), offset, limit, direction)
+    }
+
+    fn sorted_set_score_range_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        bounds: (Bound<SortedSetScore>, Bound<SortedSetScore>),
+        offset: usize,
+        limit: usize,
+        direction: SortedSetDirection,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        let (lower, upper) = bounds;
         let metadata_key = structure_sorted_set_meta_key(key)?;
         let Some(metadata) =
             tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
@@ -3719,37 +3861,48 @@ impl NativeDatabase {
         let mut skipped = 0_usize;
         let mut entries = Vec::new();
         let mut failure = None;
-        let _visit = tree.visit_prefix_range_cached(
-            &self.pages,
-            &self.buffer_pool,
-            &prefix,
-            lower_bound,
-            upper_bound,
-            |physical_key, value| {
-                let (score, member) =
-                    match decode_live_sorted_set_order_entry(key, physical_key, value) {
-                        Ok(Some(decoded)) => decoded,
-                        Ok(None) => return ControlFlow::Continue(()),
-                        Err(error) => {
-                            failure = Some(error);
-                            return ControlFlow::Break(());
-                        }
-                    };
-                if skipped < offset {
-                    skipped += 1;
-                    return ControlFlow::Continue(());
+        let mut visitor = |physical_key: &[u8], value: &[u8]| {
+            let (score, member) = match decode_live_sorted_set_order_entry(key, physical_key, value)
+            {
+                Ok(Some(decoded)) => decoded,
+                Ok(None) => return ControlFlow::Continue(()),
+                Err(error) => {
+                    failure = Some(error);
+                    return ControlFlow::Break(());
                 }
-                entries.push(SortedSetEntry {
-                    member: member.to_vec(),
-                    score,
-                });
-                if entries.len() == limit {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            },
-        )?;
+            };
+            if skipped < offset {
+                skipped += 1;
+                return ControlFlow::Continue(());
+            }
+            entries.push(SortedSetEntry {
+                member: member.to_vec(),
+                score,
+            });
+            if entries.len() == limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let _visit = match direction {
+            SortedSetDirection::Ascending => tree.visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                lower_bound,
+                upper_bound,
+                &mut visitor,
+            )?,
+            SortedSetDirection::Descending => tree.visit_prefix_range_cached_reverse(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                lower_bound,
+                upper_bound,
+                &mut visitor,
+            )?,
+        };
         if let Some(error) = failure {
             return Err(error);
         }
@@ -6475,23 +6628,34 @@ impl NativeWriteBatch {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        if self.state.structures.entries.contains_key(key)
-            || self.state.structures.hashes.contains_key(key)
-            || self.state.structures.sets.contains_key(key)
-            || self.state.structures.lists.contains_key(key)
-        {
-            return Err(NativeRuntimeError::StructureKindMismatch);
-        }
-        self.state
-            .structures
-            .zrange(key, start, stop)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(member, score)| SortedSetEntry { member, score })
-                    .collect()
-            })
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        sorted_set_rank_range_from_state(
+            &self.state.structures,
+            key,
+            start,
+            stop,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    /// Returns an inclusive signed-rank range in descending private
+    /// sorted-set order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zrevrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        sorted_set_rank_range_from_state(
+            &self.state.structures,
+            key,
+            start,
+            stop,
+            SortedSetDirection::Descending,
+        )
     }
 
     /// Returns a bounded ascending score range from private sorted-set state.
@@ -6511,24 +6675,43 @@ impl NativeWriteBatch {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        let (lower, upper) = canonical_sorted_set_score_bounds(lower, upper)?;
-        if self.state.structures.entries.contains_key(key)
-            || self.state.structures.hashes.contains_key(key)
-            || self.state.structures.sets.contains_key(key)
-            || self.state.structures.lists.contains_key(key)
-        {
-            return Err(NativeRuntimeError::StructureKindMismatch);
-        }
-        self.state
-            .structures
-            .zrange_by_score(key, lower, upper, offset, limit)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(member, score)| SortedSetEntry { member, score })
-                    .collect()
-            })
-            .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+        sorted_set_score_range_from_state(
+            &self.state.structures,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Ascending,
+        )
+    }
+
+    /// Returns a bounded descending score range from private sorted-set state.
+    ///
+    /// `offset` counts live members in descending order inside the score
+    /// interval, and at most `limit` entries are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for `NaN` bounds, another structure family, or a
+    /// missing sorted set.
+    pub fn zrevrange_by_score(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+        sorted_set_score_range_from_state(
+            &self.state.structures,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            SortedSetDirection::Descending,
+        )
     }
 
     /// Creates one native text search collection.
@@ -8880,6 +9063,63 @@ fn canonical_sorted_set_score_bounds(
         canonical_sorted_set_score_bound(lower)?,
         canonical_sorted_set_score_bound(upper)?,
     ))
+}
+
+fn sorted_set_rank_range_from_state(
+    structures: &StructureState,
+    key: &[u8],
+    start: i64,
+    stop: i64,
+    direction: SortedSetDirection,
+) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+    if structures.entries.contains_key(key)
+        || structures.hashes.contains_key(key)
+        || structures.sets.contains_key(key)
+        || structures.lists.contains_key(key)
+    {
+        return Err(NativeRuntimeError::StructureKindMismatch);
+    }
+    let entries = match direction {
+        SortedSetDirection::Ascending => structures.zrange(key, start, stop),
+        SortedSetDirection::Descending => structures.zrevrange(key, start, stop),
+    }
+    .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
+    Ok(entries
+        .into_iter()
+        .map(|(member, score)| SortedSetEntry { member, score })
+        .collect())
+}
+
+fn sorted_set_score_range_from_state(
+    structures: &StructureState,
+    key: &[u8],
+    lower: Bound<f64>,
+    upper: Bound<f64>,
+    offset: usize,
+    limit: usize,
+    direction: SortedSetDirection,
+) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+    let (lower, upper) = canonical_sorted_set_score_bounds(lower, upper)?;
+    if structures.entries.contains_key(key)
+        || structures.hashes.contains_key(key)
+        || structures.sets.contains_key(key)
+        || structures.lists.contains_key(key)
+    {
+        return Err(NativeRuntimeError::StructureKindMismatch);
+    }
+    let entries = match direction {
+        SortedSetDirection::Ascending => {
+            structures.zrange_by_score(key, lower, upper, offset, limit)
+        }
+        SortedSetDirection::Descending => {
+            structures.zrevrange_by_score(key, lower, upper, offset, limit)
+        }
+    }
+    .ok_or(NativeRuntimeError::UnknownStructureSortedSet)?;
+    Ok(entries
+        .into_iter()
+        .map(|(member, score)| SortedSetEntry { member, score })
+        .collect())
 }
 
 fn sorted_set_rank_from_state(
@@ -16985,6 +17225,329 @@ mod tests {
             reopened.zrange_latest_sorted_set(b"leaderboard", -1, -1)?,
             [SortedSetEntry::new(b"bravo".to_vec(), 20.0)?]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_reverse_ranges_match_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"reverse-range".to_vec())?;
+        for (score, member) in [
+            (1.0, b"alpha".as_slice()),
+            (2.0, b"bravo".as_slice()),
+            (2.0, b"charlie".as_slice()),
+            (3.0, b"delta".as_slice()),
+            (4.0, b"echo".as_slice()),
+        ] {
+            seed.zadd(b"reverse-range".to_vec(), score, member.to_vec())?;
+        }
+        let initial = [
+            SortedSetEntry::new(b"echo".to_vec(), 4.0)?,
+            SortedSetEntry::new(b"delta".to_vec(), 3.0)?,
+            SortedSetEntry::new(b"charlie".to_vec(), 2.0)?,
+            SortedSetEntry::new(b"bravo".to_vec(), 2.0)?,
+            SortedSetEntry::new(b"alpha".to_vec(), 1.0)?,
+        ];
+        assert_eq!(seed.zrevrange(b"reverse-range", 0, -1)?, initial);
+        assert_eq!(
+            seed.zrevrange_by_score(
+                b"reverse-range",
+                Bound::Included(2.0),
+                Bound::Included(3.0),
+                1,
+                2,
+            )?,
+            initial[2..4]
+        );
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert!(mutate.zrem(b"reverse-range".to_vec(), b"delta".to_vec())?);
+        mutate.zadd(b"reverse-range".to_vec(), 5.0, b"alpha".to_vec())?;
+        mutate.zadd(b"reverse-range".to_vec(), 2.0, b"foxtrot".to_vec())?;
+        let current = [
+            SortedSetEntry::new(b"alpha".to_vec(), 5.0)?,
+            SortedSetEntry::new(b"echo".to_vec(), 4.0)?,
+            SortedSetEntry::new(b"foxtrot".to_vec(), 2.0)?,
+            SortedSetEntry::new(b"charlie".to_vec(), 2.0)?,
+            SortedSetEntry::new(b"bravo".to_vec(), 2.0)?,
+        ];
+        assert_eq!(mutate.zrevrange(b"reverse-range", 0, -1)?, current);
+        mutate.commit()?;
+
+        assert_eq!(
+            historical.zrevrange(b"reverse-range", -2, -1)?,
+            initial[3..5]
+        );
+        assert_eq!(
+            database.zrevrange_latest_sorted_set(b"reverse-range", 0, -1)?,
+            current
+        );
+        assert_eq!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"reverse-range",
+                Bound::Included(2.0),
+                Bound::Included(4.0),
+                1,
+                2,
+            )?,
+            current[2..4]
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.zrevrange_latest_sorted_set(b"reverse-range", 0, -1)?,
+            current
+        );
+        assert_eq!(
+            reopened.zrevrange_by_score_latest_sorted_set(
+                b"reverse-range",
+                Bound::Included(2.0),
+                Bound::Included(4.0),
+                1,
+                2,
+            )?,
+            current[2..4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_sorted_set_ranges_validate_bounds_types_and_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_score_range_fixture(&mut database)?;
+        mutate_score_range_fixture(&mut database)?;
+
+        assert_eq!(
+            database.zrevrange_latest_sorted_set(b"score-range", 1, 4)?,
+            [
+                SortedSetEntry::new(b"d".to_vec(), 10.0)?,
+                SortedSetEntry::new(b"e".to_vec(), 5.0)?,
+                SortedSetEntry::new(b"g".to_vec(), 0.0)?,
+                SortedSetEntry::new(b"b".to_vec(), -1.0)?,
+            ]
+        );
+        assert_eq!(
+            database.zrevrange_latest_sorted_set(b"score-range", -2, -1)?,
+            [
+                SortedSetEntry::new(b"b".to_vec(), -1.0)?,
+                SortedSetEntry::new(b"a".to_vec(), f64::NEG_INFINITY)?,
+            ]
+        );
+        assert!(
+            database
+                .zrevrange_latest_sorted_set(b"score-range", 2, 1)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"score-range",
+                Bound::Included(-1.0),
+                Bound::Included(10.0),
+                1,
+                3,
+            )?,
+            [
+                SortedSetEntry::new(b"e".to_vec(), 5.0)?,
+                SortedSetEntry::new(b"g".to_vec(), 0.0)?,
+                SortedSetEntry::new(b"b".to_vec(), -1.0)?,
+            ]
+        );
+        assert_eq!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"score-range",
+                Bound::Included(f64::INFINITY),
+                Bound::Included(f64::INFINITY),
+                0,
+                10,
+            )?,
+            [SortedSetEntry::new(b"f".to_vec(), f64::INFINITY)?]
+        );
+        assert!(
+            database
+                .zrevrange_by_score_latest_sorted_set(
+                    b"score-range",
+                    Bound::Included(5.0),
+                    Bound::Included(-1.0),
+                    0,
+                    10,
+                )?
+                .is_empty()
+        );
+        assert!(matches!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"score-range",
+                Bound::Included(f64::NAN),
+                Bound::Unbounded,
+                0,
+                0,
+            ),
+            Err(NativeRuntimeError::StructureScoreNotCanonical)
+        ));
+        assert!(matches!(
+            database.zrevrange_latest_sorted_set(b"missing", 0, -1),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        assert!(matches!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"scalar",
+                Bound::Unbounded,
+                Bound::Unbounded,
+                0,
+                0,
+            ),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_reverse_sorted_set_ranges_prune_skip_tombstones_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_sorted_set(b"multilevel-reverse-range".to_vec())?;
+        for index in 0..2_048_u32 {
+            seed.zadd(
+                b"multilevel-reverse-range".to_vec(),
+                f64::from(index / 2),
+                index.to_be_bytes().to_vec(),
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert!(mutate.zrem(
+            b"multilevel-reverse-range".to_vec(),
+            1_028_u32.to_be_bytes().to_vec(),
+        )?);
+        mutate.commit()?;
+
+        let head = [2_047_u32, 2_046, 2_045]
+            .into_iter()
+            .map(|index| SortedSetEntry::new(index.to_be_bytes().to_vec(), f64::from(index / 2)))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            database.zrevrange_latest_sorted_set(b"multilevel-reverse-range", 0, 2)?,
+            head
+        );
+
+        let bounded = [1_027_u32, 1_026, 1_025, 1_024]
+            .into_iter()
+            .map(|index| SortedSetEntry::new(index.to_be_bytes().to_vec(), f64::from(index / 2)))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"multilevel-reverse-range",
+                Bound::Included(512.0),
+                Bound::Excluded(515.0),
+                1,
+                4,
+            )?,
+            bounded
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.zrevrange_latest_sorted_set(b"multilevel-reverse-range", 0, 2)?,
+            head
+        );
+        assert_eq!(
+            reopened.zrevrange_by_score_latest_sorted_set(
+                b"multilevel-reverse-range",
+                Bound::Included(512.0),
+                Bound::Excluded(515.0),
+                1,
+                4,
+            )?,
+            bounded
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_reverse_sorted_set_ranges_fail_closed_on_forged_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"reverse-forgery".to_vec())?;
+        seed.zadd(b"reverse-forgery".to_vec(), 1.0, b"alpha".to_vec())?;
+        seed.zadd(b"reverse-forgery".to_vec(), 2.0, b"bravo".to_vec())?;
+        seed.zadd(b"reverse-forgery".to_vec(), 3.0, b"charlie".to_vec())?;
+        seed.commit()?;
+
+        let root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let invalid_marker_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::structure_sorted_set_order_key(
+                    b"reverse-forgery",
+                    super::canonical_sorted_set_score(3.0)?,
+                    b"charlie",
+                )?,
+                vec![0xff],
+            )?
+            .tree;
+        assert!(matches!(
+            database.sorted_set_rank_range_in_tree(
+                invalid_marker_tree,
+                b"reverse-forgery",
+                0,
+                0,
+                super::SortedSetDirection::Descending,
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        assert!(matches!(
+            database.sorted_set_score_range_in_tree(
+                invalid_marker_tree,
+                b"reverse-forgery",
+                (
+                    Bound::Included(super::canonical_sorted_set_score(1.0)?),
+                    Bound::Included(super::canonical_sorted_set_score(3.0)?),
+                ),
+                0,
+                1,
+                super::SortedSetDirection::Descending,
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let invalid_length_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(2)?,
+                super::structure_sorted_set_meta_key(b"reverse-forgery")?,
+                super::encode_sorted_set_metadata(4),
+            )?
+            .tree;
+        assert!(matches!(
+            database.sorted_set_rank_range_in_tree(
+                invalid_length_tree,
+                b"reverse-forgery",
+                0,
+                -1,
+                super::SortedSetDirection::Descending,
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
         Ok(())
     }
 
