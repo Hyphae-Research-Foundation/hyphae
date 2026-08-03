@@ -531,6 +531,17 @@ loop/mapping resources. This closes the singleton/checkpoint block-ordering
 slice, not literal EBS power removal, group commit, retention, maintenance,
 migration, resource exhaustion, or the complete G1 matrix.
 
+The [native durable snapshot-pin
+evidence](evidence/native-snapshot-pins-linux-2026-08-02.md) adds an immutable
+`HYPIN001` registry and exact named retention across relational, structure/TTL,
+lexical, ANN, catalog, page, blob, manifest, and WAL authority. Three pinned
+page generations reopen beside a fourth active generation; middle and final
+unpin collections report exact removed/retained bytes. Schema-v3 process
+evidence extends the existing harness to 13 `SIGKILL` cycles and proves staged
+pin absence versus published pin completeness. The direct Linux workspace
+funnel is green, but hosted CI, mutation testing, physical power loss, offline
+promotion, and the broader G1 matrix remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -546,7 +557,7 @@ retained suffix. Explicit single-root maintenance now collects blobs
 unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
-along with multi-generation pin-aware retention,
+along with automated pin lifecycle policy and quotas,
 composite secondary equality-prefix ranges and streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
@@ -560,8 +571,8 @@ conditional writes, signed counters, independent-field hashes, exact binary
 sets with member-granular conflicts, chunked-deque lists, and dual-index
 sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
 algebra/TTL, score/reverse/rank sorted-set operations, streams, adaptive
-empty-expiry backoff, model tests, and configurable historical retention
-required to close G3. Ordered cleanup,
+empty-expiry backoff, model tests, and a user-facing historical-retention
+policy required to close G3. Ordered cleanup,
 current-root compaction, and page-generation vacuum provide exact first
 amplification measurements, not the complete memory-amplification gate.
 

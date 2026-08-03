@@ -511,6 +511,20 @@ detectable.
   singleton results and records four checkpoint authority outcomes. It
   remains process-crash evidence, not physical power-loss evidence.
 
+## Native durable snapshot pins on Linux
+
+- `native-snapshot-pins-linux-2026-08-02.md` binds the `HYPIN001` registry,
+  exact all-engine historical materialization, three retained page
+  generations, pin-aware WAL/blob blocking, explicit unpin/collection, and
+  direct Linux gates to source commit `01355d0`.
+- `native-snapshot-pins-linux.json` records three pin publications and
+  historical materializations, four-generation reopen, vacuum observations,
+  and exact retained/removed file bytes on AWS Linux/ext4.
+- `native-snapshot-pins-process-crash-linux.json` is schema v3 of the existing
+  process harness: seven commit, four checkpoint, and two snapshot-pin
+  `SIGKILL`/reopen scenarios. It remains process-crash evidence, not physical
+  power-loss evidence.
+
 ## Native block-layer power-loss replay on Linux
 
 - `native-block-power-loss-replay-linux-2026-08-02.md` binds seven singleton

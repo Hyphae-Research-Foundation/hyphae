@@ -191,11 +191,12 @@ manifest payload evidence remain separate.
 
 V1 does not:
 
-- retain restartable history below the current root;
+- retain restartable history below the current root unless a verified
+  [durable snapshot pin](snapshot-pins-v1.md) names the exact manifest;
 - rewrite a retained manifest's predecessor digest;
 - merge multiple manifests into one new format;
 - prune manifests newer than the anchor;
 - collect immutable blobs or page generations;
-- define replica, snapshot, archive, or incremental-backup pin registration;
+- define replica, archive, or incremental-backup pin registration;
 - replace the WAL as transaction authority; or
 - close G1 or G7 without the broader recovery and physical durability matrix.

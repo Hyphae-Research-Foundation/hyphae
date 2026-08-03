@@ -1,0 +1,112 @@
+{
+  "schema": "hyphae.native.process-crash-matrix.v3",
+  "status": "process-crash-not-power-loss",
+  "source_commit": "01355d0a1e4538284b0ae8b0fa82c195d4469647",
+  "environment": "aws-m6i.2xlarge-ext4-ebs",
+  "target": "x86_64-linux",
+  "durability": "strict",
+  "all_engine_csn": 1,
+  "commit_boundaries": [
+    {
+      "boundary": "blob-staged",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "blob-promoted",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-appended",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-synchronized",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-appended",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-synchronized",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "root-published",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    }
+  ],
+  "checkpoint_boundaries": [
+    {
+      "boundary": "manifest-staged",
+      "manifest_count": 0,
+      "checkpoint_count": 0,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "manifest-published",
+      "manifest_count": 1,
+      "checkpoint_count": 0,
+      "unanchored_manifest_suffix": 1,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-appended",
+      "manifest_count": 1,
+      "checkpoint_count": 1,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-synchronized",
+      "manifest_count": 1,
+      "checkpoint_count": 1,
+      "unanchored_manifest_suffix": 0,
+      "recovered_temporary_manifests": 0,
+      "termination": "signal-9"
+    }
+  ],
+  "snapshot_pin_boundaries": [
+    {
+      "boundary": "record-synchronized",
+      "expected_pin": "absent",
+      "recovered_pin_count": 0,
+      "pin_directory_files": 0,
+      "retained_page_generations": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "record-published",
+      "expected_pin": "complete",
+      "recovered_pin_count": 1,
+      "pin_directory_files": 1,
+      "retained_page_generations": 1,
+      "termination": "signal-9"
+    }
+  ]
+}

@@ -44,8 +44,9 @@ fails closed on cycles or discontinuities. Historical roots retain their
 original pages until explicit current-root vacuum advances the page generation
 and retention floor. Closing a version never mutates bytes reachable through
 an older snapshot. Materialized in-process snapshots survive vacuum;
-restartable pre-floor roots and multi-generation retention are not yet
-implemented.
+restartable pre-floor roots survive only when explicitly registered through a
+verified [durable snapshot pin](snapshot-pins-v1.md). Unpinned operation keeps
+the current-root retention floor.
 
 ## Snapshot-isolation conflicts
 

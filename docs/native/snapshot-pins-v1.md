@@ -1,8 +1,8 @@
 # Native durable snapshot pins v1
 
-Status: normative proposed contract; acceptance criteria are frozen before
-implementation; executable red/green evidence, crash coverage, direct Linux
-receipts, and hosted CI remain pending
+Status: implemented candidate on `codex/native-snapshot-pins`; the frozen
+acceptance criteria have executable red/green coverage, direct Linux/ext4
+receipts, and real process-kill coverage; hosted CI and review remain pending
 
 This protocol turns a current all-engine root set into a durable, named
 historical snapshot that remains reopenable after process restart and later
@@ -231,6 +231,30 @@ pre-implementation source. Green requires formatter, locked Clippy with
 warnings denied, targeted codec/registry/runtime tests, the full affected
 workspace lane, documentation checks, crash scenarios, and clean diff/status.
 If mutation tooling remains unavailable, Gate 4 stays explicitly not run.
+
+## Implementation evidence
+
+The first implementation is bound to three reviewable source commits:
+
+- `74a726f` freezes this contract before production behavior exists;
+- `c78686b` adds the canonical pin record, durable registry, historical
+  materialization, pin-aware page/WAL/blob retention, and public APIs; and
+- `6cd4269` adds the complete failure, multi-generation, vacuum-interruption,
+  retention-blocking, and real process-kill test matrix.
+
+The release benchmark and both checked receipts are bound to source commit
+`01355d0a1e4538284b0ae8b0fa82c195d4469647` and tree
+`8a271664ecbb6e5a2b6021eb5dfcc5c03952465c`:
+
+- [direct Linux snapshot-pin evidence](../gates/evidence/native-snapshot-pins-linux-2026-08-02.md);
+- [multi-generation latency and byte receipt](../gates/evidence/native-snapshot-pins-linux.json);
+- [13-boundary process-crash receipt](../gates/evidence/native-snapshot-pins-process-crash-linux.json).
+
+The affected runtime suite has 206 passing tests. The complete locked workspace
+test and Clippy lanes pass on the direct Linux host. The two new live process
+boundaries terminate with signal 9 and recover an absent staged pin or one
+complete published pin. Mutation tooling was not configured and was not run.
+Physical power-loss and hosted CI remain separate gates.
 
 ## Non-goals
 

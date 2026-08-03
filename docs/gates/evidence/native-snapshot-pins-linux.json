@@ -1,0 +1,57 @@
+{
+  "schema": "hyphae.native.snapshot-pins.v1",
+  "status": "observation-not-gate",
+  "source_commit": "01355d0a1e4538284b0ae8b0fa82c195d4469647",
+  "source_tree": "8a271664ecbb6e5a2b6021eb5dfcc5c03952465c",
+  "rustc": "rustc-1.96.0-(ac68faa20-2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "filesystem": "aws-m6i.2xlarge-ext4-ebs",
+  "concurrency": 1,
+  "pinned_generations": 3,
+  "active_generation": 4,
+  "reopen_latency_ns": 2241694,
+  "final_reopen_latency_ns": 1316766,
+  "vacuum_latency_ns": [10600091, 10283201, 10457868],
+  "pins": [
+    {
+      "id": "00000000000000000000000000000001",
+      "page_generation": 1,
+      "publish_latency_ns": 15147653,
+      "materialize_latency_ns": 465657
+    },
+    {
+      "id": "00000000000000000000000000000002",
+      "page_generation": 2,
+      "publish_latency_ns": 14120765,
+      "materialize_latency_ns": 467309
+    },
+    {
+      "id": "00000000000000000000000000000003",
+      "page_generation": 3,
+      "publish_latency_ns": 13784026,
+      "materialize_latency_ns": 459946
+    }
+  ],
+  "middle_unpin_collection": {
+    "removed_files": 1,
+    "removed_bytes": 327680,
+    "retained_files": 3,
+    "retained_bytes": 999424,
+    "parent_directory_sync_supported": true
+  },
+  "repeated_collection": {
+    "removed_files": 0,
+    "removed_bytes": 0,
+    "retained_files": 3,
+    "retained_bytes": 999424,
+    "parent_directory_sync_supported": true
+  },
+  "final_unpin_collection": {
+    "removed_files": 2,
+    "removed_bytes": 917504,
+    "retained_files": 1,
+    "retained_bytes": 81920,
+    "parent_directory_sync_supported": true
+  }
+}
