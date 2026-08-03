@@ -1047,6 +1047,15 @@ impl TransactionDml {
         }
     }
 
+    pub(crate) fn relation_name(&self) -> Result<&str, SqlError> {
+        match &self.statement {
+            Statement::Insert { name, .. }
+            | Statement::Update { name, .. }
+            | Statement::Delete { name, .. } => Ok(name),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
     pub(crate) fn primary_key(
         &self,
         transaction: &NativeWriteBatch,

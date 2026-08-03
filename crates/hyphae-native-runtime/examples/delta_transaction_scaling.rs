@@ -84,6 +84,7 @@ struct PhysicalDelta {
     appends: u64,
     wal_bytes: u64,
     full_state_loads: u64,
+    full_catalog_loads: u64,
 }
 
 fn physical_delta(
@@ -107,6 +108,10 @@ fn physical_delta(
             .process_full_state_loads
             .checked_sub(before.process_full_state_loads)
             .ok_or("full-state load counter regressed")?,
+        full_catalog_loads: after
+            .process_full_catalog_loads
+            .checked_sub(before.process_full_catalog_loads)
+            .ok_or("full-catalog load counter regressed")?,
     })
 }
 
@@ -121,6 +126,7 @@ struct Samples {
     appends: Vec<u64>,
     wal_bytes: Vec<u64>,
     full_state_loads: Vec<u64>,
+    full_catalog_loads: Vec<u64>,
 }
 
 impl Samples {
@@ -136,6 +142,7 @@ impl Samples {
             appends: Vec::with_capacity(capacity),
             wal_bytes: Vec::with_capacity(capacity),
             full_state_loads: Vec::with_capacity(capacity),
+            full_catalog_loads: Vec::with_capacity(capacity),
         }
     }
 
@@ -144,6 +151,7 @@ impl Samples {
         self.appends.push(delta.appends);
         self.wal_bytes.push(delta.wal_bytes);
         self.full_state_loads.push(delta.full_state_loads);
+        self.full_catalog_loads.push(delta.full_catalog_loads);
     }
 }
 
@@ -382,7 +390,8 @@ fn print_rows(
         print_distribution("physical_page_reads", row.samples.reads, true)?;
         print_distribution("page_appends", row.samples.appends, true)?;
         print_distribution("wal_bytes_appended", row.samples.wal_bytes, true)?;
-        print_distribution("full_state_loads", row.samples.full_state_loads, false)?;
+        print_distribution("full_state_loads", row.samples.full_state_loads, true)?;
+        print_distribution("full_catalog_loads", row.samples.full_catalog_loads, false)?;
         println!("      }}");
         println!("    }}{}", if offset + 1 == length { "" } else { "," });
     }
