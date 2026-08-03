@@ -692,3 +692,13 @@ detectable.
   barriers, normal ext4 journal recovery, native reopen, and exact cleanup.
   Its status is deliberately `block-replay-not-physical-device-cut`; literal
   EC2/EBS power removal and device-firmware behavior remain outside the claim.
+
+## Native local UDS transport on Linux
+
+- `native-local-uds-linux-2026-08-03.md` binds the first filesystem-backed
+  `HYPHLCL1` transport to exact contract, implementation, harness, failure
+  tests, direct-Linux host disclosure, and validation logs.
+- `native-local-uds-linux.json` records three release observations and their
+  median statistics. It measures framing plus a kernel UDS round trip, not an
+  engine operation, durability, saturation, Windows named-pipe behavior, or a
+  G1/G6/G7 gate closure.

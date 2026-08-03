@@ -79,8 +79,9 @@ implements the first reviewable vertical. Steps 1 through 4 and the
 reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers
 five in-process commit boundaries and four manifest/checkpoint boundaries, but
 not blobs, group commit, filesystem reordering, or sector-level power loss.
-Step 7 has an embedded and frame-codec smoke only; no named-pipe/UDS transport
-receipt.
+Step 7 now has a first filesystem-backed UDS framing and persistent-ping
+receipt on direct Linux. Windows named-pipe transport, the complete session,
+and SQL/structure/search payloads through the transport remain open.
 
 The follow-on [row, B+tree, and checkpoint
 evidence](evidence/native-row-tree-checkpoint-2026-08-01.md) binds canonical
@@ -613,6 +614,17 @@ observes p50/p99 `0.104/0.121 us`. This satisfies the first latency
 observation for that source tree but does not time the one-CSN commit, strict
 durability, UDS/named-pipe transport, or power loss and closes neither G1 nor
 G7.
+
+The [native local UDS
+evidence](evidence/native-local-uds-linux-2026-08-03.md) adds the first real
+filesystem-backed transport below `HYPHLCL1`: bounded reusable frame buffers,
+fail-closed truncation and allocation checks, exact `0600` endpoint
+permissions, identity-safe cleanup, and an ordered persistent connection.
+Three direct-Linux release observations put the median persistent `PING`
+round trip at p50 `23.261 us`, p99 `35.290 us`, and p99.9 `44.631 us`. This
+removes the explicit no-UDS-receipt deficit from the minimal G1 vertical, but
+does not carry an engine operation, close Windows named-pipe or complete
+session semantics, establish a regression threshold, or close G1, G6, or G7.
 
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size

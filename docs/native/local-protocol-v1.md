@@ -1,9 +1,10 @@
 # Native local protocol v1
 
 Status: normative target contract; the allocation-free borrowed frame decoder,
-encoder, version/kind validation, bounds, and CRC32C are implemented
-experimentally; named-pipe/UDS transport and session flow control remain
-pending
+encoder, version/kind validation, bounds, CRC32C, and first filesystem-backed
+Unix-domain-socket framed transport are implemented experimentally. Windows
+named-pipe transport, the complete handshake, and session flow control remain
+pending.
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.

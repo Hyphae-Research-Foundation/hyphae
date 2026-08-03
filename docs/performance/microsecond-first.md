@@ -107,6 +107,23 @@ dispatch. Neither is a passing receipt: the corpus is tiny, concurrency is
 one, scheduling is uncontrolled, hardware/allocation counters and real
 named-pipe/UDS transport are absent, and the clean run is virtualized.
 
+The first real
+[filesystem-backed UDS receipt](../gates/evidence/native-local-uds-linux-2026-08-03.md)
+uses three release runs on the AWS Linux devbox, one persistent connection,
+two pinned CPUs, 10,000 warmups, and 100,000 measured 32-byte `PING`
+round trips per run. The median run statistics are p50 `23.261 us`, p95
+`29.060 us`, p99 `35.290 us`, p99.9 `44.631 us`, and throughput
+`42,771.042 round trips/s`. Individual-run maxima were `1.069968 ms`,
+`0.132348 ms`, and `0.846969 ms`, so the observation does not erase
+scheduling tails. The route measures frame encode/write, kernel transport,
+server read/decode/echo, client read/decode, and scheduling together. It does
+not execute a structure `GET`; therefore it is transport budget evidence,
+not a pass of the 25-us/100-us native structure-point target. Its roughly
+23.3-us p50 consumes nearly that entire provisional p50 budget and makes the
+next engine-bearing transport vertical a deliberate performance constraint.
+The virtualized, warm, concurrency-one run is neither a regression threshold
+nor G7 closure.
+
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5
 added one explicitly typed hash with 2,048 independent 64-byte fields and

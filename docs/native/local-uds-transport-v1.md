@@ -1,6 +1,7 @@
 # Native local UDS transport v1
 
-Status: contract frozen; implementation and direct-Linux evidence pending.
+Status: implemented for Unix; direct-Linux receipt recorded. Windows named
+pipe and complete session semantics remain pending.
 
 This contract adds the first real transport beneath Hyphae's native local
 protocol. It carries canonical `HYPHLCL1` frames over one Unix domain socket
@@ -112,6 +113,10 @@ client encode/write, kernel UDS transport, server read/decode/echo, client
 read/decode, and scheduling together. It does not infer engine execution,
 queueing, fsync, cold start, saturation, allocation, RSS, hardware counters,
 named-pipe behavior, or complete G7.
+
+The exact implementation, failure-path tests, host disclosure, three raw
+release observations, and latency summary are bound by the
+[direct-Linux UDS evidence](../gates/evidence/native-local-uds-linux-2026-08-03.md).
 
 ## Boundaries
 
