@@ -1,0 +1,234 @@
+{
+  "schema": "hyphae.native.local-sql-select-evidence.v1",
+  "status": "observation-not-regression-gate",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-sql-select",
+  "contract_commit": "83de5e8edd665094175a8a3f938c369cc1a68d3f",
+  "implementation_commit": "642dbdbdec611725c1be3523961bee2115c10df2",
+  "source_commit": "2bf6d341c31c9b2acaef5c3087515d3d7fe42220",
+  "source_tree": "6f2324a860f0e117c14b4d6f2b2018c761bee66c",
+  "harness_commit": "2bf6d341c31c9b2acaef5c3087515d3d7fe42220",
+  "harness": "crates/hyphae-native-runtime/examples/uds_sql_select_smoke.rs",
+  "harness_sha256": "8df8ce5c4ec1ffd6fd7efb5169bd8a7ea6453b94253543622dd79cf90bfc855a",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_sql_select --no-run --locked",
+    "expected_result": "E0432 unresolved imports for the frozen SQL codecs and session behavior",
+    "log_sha256": "32aed72a281259228b5ede63944527bebac90b478d0004469b6eaafe08fa9454"
+  },
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "physical_cores_visible": 4,
+    "memory_gib": 30,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [
+      2,
+      3
+    ],
+    "cpu_governor": "unavailable",
+    "wsl_in_execution_path": false
+  },
+  "workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "maximum_payload_bytes": 256,
+    "relational_rows": 2048,
+    "relational_tree_height": 2,
+    "query_bytes": 53,
+    "parameter_count": 1,
+    "parameter_type": "signed integer",
+    "result_columns": 2,
+    "result_rows": 1,
+    "execute_request_bytes": 32,
+    "result_bytes": 104,
+    "ping_bytes": 32,
+    "warm_state": true,
+    "durability": "memory",
+    "warmup_per_operation": 10000,
+    "observations_per_operation": 100000,
+    "dataset_digest_blake3": "fb1f1ab9e40e05d136a6e38d6a3392611c395454b1d75b4b1bead9d449920f88"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "678dd1757d792fd8a5af9165873c5c76b30798fb06f8e895b43011e194dd0204",
+      "embedded_physical_prepared_primary_key_select": {
+        "p50_nanos": 1878,
+        "p95_nanos": 1965,
+        "p99_nanos": 2022,
+        "p999_nanos": 10836,
+        "maximum_nanos": 30045,
+        "throughput_per_second": 517446.586
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23365,
+        "p95_nanos": 23784,
+        "p99_nanos": 34019,
+        "p999_nanos": 36745,
+        "maximum_nanos": 139366,
+        "throughput_per_second": 43587.854
+      },
+      "persistent_sql_execute_round_trip_one_row": {
+        "p50_nanos": 21924,
+        "p95_nanos": 22330,
+        "p99_nanos": 32960,
+        "p999_nanos": 38142,
+        "maximum_nanos": 262086,
+        "throughput_per_second": 45525.144
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "cdb000e254ec420d01ed930ccad7685158ba7d66c43e638e9e804f4a39d93386",
+      "embedded_physical_prepared_primary_key_select": {
+        "p50_nanos": 1882,
+        "p95_nanos": 1964,
+        "p99_nanos": 2027,
+        "p999_nanos": 10825,
+        "maximum_nanos": 16043,
+        "throughput_per_second": 516660.797
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23380,
+        "p95_nanos": 23781,
+        "p99_nanos": 33780,
+        "p999_nanos": 36653,
+        "maximum_nanos": 187533,
+        "throughput_per_second": 43038.547
+      },
+      "persistent_sql_execute_round_trip_one_row": {
+        "p50_nanos": 21932,
+        "p95_nanos": 22367,
+        "p99_nanos": 32976,
+        "p999_nanos": 38060,
+        "maximum_nanos": 133040,
+        "throughput_per_second": 45415.039
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "8e9a364ed8fc64ff04ec0e01157e73d985fde627ace777aeb419a62e1140fdfc",
+      "embedded_physical_prepared_primary_key_select": {
+        "p50_nanos": 1874,
+        "p95_nanos": 1955,
+        "p99_nanos": 2019,
+        "p999_nanos": 10826,
+        "maximum_nanos": 24263,
+        "throughput_per_second": 516047.458
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23275,
+        "p95_nanos": 23683,
+        "p99_nanos": 33155,
+        "p999_nanos": 36582,
+        "maximum_nanos": 120309,
+        "throughput_per_second": 43865.813
+      },
+      "persistent_sql_execute_round_trip_one_row": {
+        "p50_nanos": 21902,
+        "p95_nanos": 22295,
+        "p99_nanos": 33011,
+        "p999_nanos": 37850,
+        "maximum_nanos": 129184,
+        "throughput_per_second": 45422.552
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "embedded_physical_prepared_primary_key_select": {
+      "p50_nanos": 1878,
+      "p95_nanos": 1964,
+      "p99_nanos": 2022,
+      "p999_nanos": 10826,
+      "maximum_nanos": 24263,
+      "throughput_per_second": 516660.797
+    },
+    "persistent_ping_round_trip_32b": {
+      "p50_nanos": 23365,
+      "p95_nanos": 23781,
+      "p99_nanos": 33780,
+      "p999_nanos": 36653,
+      "maximum_nanos": 139366,
+      "throughput_per_second": 43587.854
+    },
+    "persistent_sql_execute_round_trip_one_row": {
+      "p50_nanos": 21924,
+      "p95_nanos": 22330,
+      "p99_nanos": 32976,
+      "p999_nanos": 38060,
+      "maximum_nanos": 133040,
+      "throughput_per_second": 45422.552
+    }
+  },
+  "performance_observation": {
+    "embedded_select_microsecond_domain": true,
+    "local_select_microsecond_domain": true,
+    "uds_p50_lower_than_ping_p50": true,
+    "negative_overhead_claimed": false,
+    "independent_percentiles_subtracted": false,
+    "regression_threshold_established": false,
+    "g7_gate_passed": false
+  },
+  "verification": {
+    "status": "passed-direct-linux",
+    "workspace_tests_passed": 664,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_unit_tests_passed": 333,
+    "structure_get_integration_tests_passed": 5,
+    "structure_set_ttl_integration_tests_passed": 6,
+    "search_match_integration_tests_passed": 6,
+    "sql_select_integration_tests_passed": 9,
+    "documentation_markdown_files": 241,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "4151e2cae5776364d41fb1a915bb78f2d86fdbebd8ac671efa682e17bd69184b",
+    "targeted_test_log_sha256": "512a2207ae0a4c21006ff69d0babd1c8835f731f2a183ad0b0fd01846a5be2d3",
+    "clippy_log_sha256": "011c759e3e7bbec6a51fea60f484ecf1eb80ffabb103fdc9c2e0179ef26c7644",
+    "rustdoc_log_sha256": "429332ac918ecc0637964f3fd178252fd6a7877889a8f5f6727020adb9a6a649",
+    "release_check_log_sha256": "92434e198f27984c035c376ec77a7cf9e6ebdde782f8ccb1336ae3329b66ddb7",
+    "documentation_log_sha256": "d09b189d52b4e168485982c9d03c385dc33792d91ef852a6567751e6b9fb2ed0",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diff_check_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "prepared_select": true,
+    "physical_primary_key_lookup": true,
+    "physical_secondary_index_lookup": true,
+    "bounded_indexed_join": true,
+    "canonical_typed_parameters": true,
+    "canonical_schema_and_rows": true,
+    "visible_csn": true,
+    "ddl_or_dml_over_protocol": false,
+    "explicit_transaction_state": false,
+    "deallocate": false,
+    "pagination_or_streaming": false,
+    "cold_state": false,
+    "concurrency_8_or_32": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "windows_named_pipe": false,
+    "complete_handshake": false,
+    "multiplexing": false,
+    "g0_closed": false,
+    "g1_closed": false,
+    "g2_closed": false,
+    "g5_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "regression_threshold": false
+  }
+}

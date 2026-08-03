@@ -1,11 +1,12 @@
 # Native local protocol v1
 
 Status: normative target contract; the allocation-free borrowed frame decoder,
-encoder, version/kind validation, bounds, CRC32C, and first filesystem-backed
-Unix-domain-socket framed transport are implemented experimentally. The first
-canonical scalar structure `GET` also executes through that transport. Windows
-named-pipe transport, writes, SQL/search payloads, the complete handshake,
-transactions, and session flow control remain pending.
+encoder, version/kind validation, bounds, CRC32C, and filesystem-backed
+Unix-domain-socket framed transport are implemented experimentally. Canonical
+structure `GET`, `SET`, and TTL operations, lexical `SEARCH MATCH`, and
+prepared SQL `SELECT` execute through that transport. Windows named pipes, the
+complete handshake, explicit transactions, session flow control, and
+multiplexing remain pending.
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.
@@ -79,8 +80,15 @@ The implemented search subset is
 [native local SEARCH MATCH v1](local-search-match-v1.md). It carries one
 catalog object identity and bounded UTF-8 query directly to the physical
 inverted index, with the all-engine visible CSN in the canonical result.
-The serial handle is now `LocalDataSession`; SQL, explicit transaction state,
-complete flow control, and multiplexing remain pending.
+
+The implemented relational subset is
+[native local SQL SELECT v1](local-sql-select-v1.md). It prepares bounded
+session-local plans and executes canonical typed parameters directly against
+the physical current-root relational paths. Results preserve logical schema,
+typed rows, and the visible all-engine CSN.
+
+The serial handle is `LocalDataSession`; DDL/DML over the protocol, explicit
+transaction state, complete flow control, and multiplexing remain pending.
 
 ## Multiplexing and flow control
 

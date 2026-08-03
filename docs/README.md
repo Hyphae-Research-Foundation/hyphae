@@ -86,6 +86,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local structure GET Linux evidence](gates/evidence/native-local-structure-get-linux-2026-08-03.md)
 - [Native local structure SET and TTL Linux evidence](gates/evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
 - [Native local SEARCH MATCH Linux evidence](gates/evidence/native-local-search-match-linux-2026-08-03.md)
+- [Native local SQL SELECT Linux evidence](gates/evidence/native-local-sql-select-linux-2026-08-03.md)
 - [Native clean-room and dependency inventory](native/dependency-inventory.md)
 - [Structured query semantics v1](query/reference-semantics-v1.md)
 - [Exact retrieval semantics v1](retrieval/reference-semantics-v1.md)

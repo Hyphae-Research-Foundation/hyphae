@@ -79,10 +79,10 @@ implements the first reviewable vertical. Steps 1 through 4 and the
 reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers
 five in-process commit boundaries and four manifest/checkpoint boundaries, but
 not blobs, group commit, filesystem reordering, or sector-level power loss.
-Step 7 now has filesystem-backed UDS framing, persistent-ping, and the first
-engine-bearing scalar structure `GET` receipt on direct Linux. Windows
-named-pipe transport, the complete session, writes/TTL, SQL, search, and the
-full performance matrix remain open.
+Step 7 now has filesystem-backed UDS framing, persistent PING, structure
+`GET`/`SET`/TTL, lexical `SEARCH MATCH`, and prepared SQL `SELECT` receipts
+on direct Linux. Windows named-pipe transport, the complete session, explicit
+all-engine transactions, and the full performance matrix remain open.
 
 The follow-on [row, B+tree, and checkpoint
 evidence](evidence/native-row-tree-checkpoint-2026-08-01.md) binds canonical
@@ -663,9 +663,24 @@ scores, and strict score/document ordering to the physical inverted index.
 Across three direct-Linux runs over 2,048 documents, median physical MATCH
 p50/p99 was `23.346/32.704 us`; the complete one-hit UDS round trip was
 `56.150/68.327 us`, with independent PING at `23.358/33.728 us`. The receipt
-does not subtract those distributions or close G4/G6/G7. SQL, document
-mutation, ANN/hybrid search, streaming, Windows named pipes, concurrency,
-saturation, allocation, and hardware-counter lanes remain open.
+does not subtract those distributions or close G4/G6/G7. SQL operations
+beyond bounded prepared SELECT, document mutation, ANN/hybrid search,
+streaming, Windows named pipes, concurrency, saturation, allocation, and
+hardware-counter lanes remain open.
+
+The [native local SQL SELECT
+evidence](evidence/native-local-sql-select-linux-2026-08-03.md) adds the first
+relational-engine operation to the same UDS session. It retains bounded
+prepared plans and canonical typed parameters, then returns the complete
+logical schema, typed rows, and visible all-engine CSN from direct physical
+primary, secondary, bounded-scan/range, and indexed-join access paths. Across
+three direct-Linux runs over 2,048 rows, median embedded prepared primary-key
+SELECT p50/p99 was `1.878/2.022 us`; the one-row UDS EXECUTE round trip was
+`21.924/32.976 us`, with independent PING at `23.365/33.780 us`. The UDS p50
+being lower than PING is not negative overhead: independent percentiles are
+not subtracted. DDL/DML over the protocol, explicit all-engine transactions,
+streaming, Windows named pipes, concurrency, saturation, allocation, hardware
+counters, and complete G2/G5/G6/G7 evidence remain open.
 
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size

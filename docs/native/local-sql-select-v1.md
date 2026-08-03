@@ -1,7 +1,9 @@
 # Native local SQL SELECT v1
 
-Status: normative implementation target; compiler-reaching red gate and
-direct-Linux evidence pending.
+Status: implemented for the experimental serial UDS session; the
+compiler-reaching red gate and [direct-Linux evidence][sql-linux-evidence]
+were recorded on 2026-08-03. DDL, DML, explicit transactions, streaming, and
+the complete G2/G6/G7 evidence remain pending.
 
 This contract exposes the existing catalog-bound, physical current-root SQL
 `SELECT` executor through the serial `HYPHLCL1` local session. A client
@@ -231,3 +233,5 @@ transport. It does not expose DDL or DML over the protocol, SQL transactions,
 deallocation, pagination, streaming row batches, cancellation, Windows named
 pipes, authorization, or the complete G2/G6/G7 evidence. Those remain
 separate contract-first slices.
+
+[sql-linux-evidence]: ../gates/evidence/native-local-sql-select-linux-2026-08-03.md
