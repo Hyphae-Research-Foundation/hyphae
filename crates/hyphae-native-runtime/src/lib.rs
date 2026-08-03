@@ -5169,10 +5169,7 @@ impl NativeDatabase {
             &self.buffer_pool,
             &structure_list_meta_key(key)?,
         )? {
-            Some(encoded) => {
-                decode_list_metadata(encoded.bytes())?;
-                true
-            }
+            Some(encoded) => decode_live_list_metadata(encoded.bytes())?.is_some(),
             None => false,
         };
         let sorted_set = match tree.get_cached_pinned(
@@ -5374,12 +5371,16 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        let Some(metadata) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_list_meta_key(key)?,
-        )?
-        else {
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_list_meta_key(key)?,
+            )?
+            .map(|encoded| decode_live_list_metadata(encoded.bytes()))
+            .transpose()?
+            .flatten();
+        let Some(metadata) = metadata else {
             if tree
                 .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
                 .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
@@ -5415,8 +5416,7 @@ impl NativeDatabase {
             }
             return Err(NativeRuntimeError::UnknownStructureList);
         };
-        usize::try_from(decode_list_metadata(metadata.bytes())?.length)
-            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+        usize::try_from(metadata.length).map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
 
     /// Reads an inclusive signed-index range through physical list chunks.
@@ -5441,15 +5441,17 @@ impl NativeDatabase {
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
         let metadata_key = structure_list_meta_key(key)?;
-        let Some(encoded_metadata) =
-            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
-        else {
+        let metadata = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+            .map(|encoded| decode_live_list_metadata(encoded.bytes()))
+            .transpose()?
+            .flatten();
+        let Some(metadata) = metadata else {
             return match self.llen_latest_list(key) {
                 Err(error) => Err(error),
                 Ok(_) => Err(NativeRuntimeError::InvalidStructureTree),
             };
         };
-        let metadata = decode_list_metadata(encoded_metadata.bytes())?;
         let length = usize::try_from(metadata.length)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
         let Some((range_start, range_stop)) = normalize_list_range(length, start, stop) else {

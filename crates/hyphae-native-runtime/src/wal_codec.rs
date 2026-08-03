@@ -1305,6 +1305,7 @@ mod tests {
 
     #[test]
     fn list_mutations_reject_targets_expiry_and_nonempty_creation() {
+        assert!(validate_mutation_shape(Opcode::DeleteList, false, 0, None, b"list").is_ok());
         assert!(matches!(
             validate_mutation_shape(Opcode::CreateList, false, 1, None, b"list"),
             Err(WalSemanticError::InvalidBody)
@@ -1321,6 +1322,13 @@ mod tests {
             validate_mutation_shape(Opcode::PopListTail, true, 0, None, b"list"),
             Err(WalSemanticError::InvalidBody)
         ));
+        for result in [
+            validate_mutation_shape(Opcode::DeleteList, true, 0, None, b"list"),
+            validate_mutation_shape(Opcode::DeleteList, false, 1, None, b"list"),
+            validate_mutation_shape(Opcode::DeleteList, false, 0, Some(10), b"list"),
+        ] {
+            assert!(matches!(result, Err(WalSemanticError::InvalidBody)));
+        }
     }
 
     #[test]
