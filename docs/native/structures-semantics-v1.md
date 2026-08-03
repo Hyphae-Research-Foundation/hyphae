@@ -156,6 +156,14 @@ lifecycle, conflict-fence, crash, compaction, and separated durability-latency
 evidence are bound in the
 [native hash-lifecycle receipt](../gates/evidence/native-hash-lifecycle-linux-2026-08-02.md).
 
+`HSCAN_REVERSE` is the descending counterpart. `start_before` is an optional
+exclusive exact-field cursor, `None` starts at the greatest field, and
+`Some(empty)` has no lower field to return. The physical route maps that cursor
+to an exclusive upper B+tree bound and uses the native reverse visitor; it
+cannot implement descending output by materializing and reversing an
+ascending scan. Its complete contract is
+[Native reverse hash scan v1](native-hash-reverse-scan-v1.md).
+
 An empty hash remains a typed hash after its last field is deleted.
 `DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
 all of its fields become absent at one CSN while retained snapshots preserve
