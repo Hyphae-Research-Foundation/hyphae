@@ -10,6 +10,8 @@
 mod ann_store;
 mod directory;
 mod group_commit;
+#[cfg(test)]
+mod hash_model_equivalence;
 mod hash_pattern;
 mod local_protocol;
 mod model;
@@ -3821,8 +3823,8 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, an invalid identity, another
-    /// structure kind, a missing hash, or malformed physical state.
+    /// Returns an error for legacy storage, an invalid identity, or malformed
+    /// physical state.
     pub fn ttl_latest_hash_field(
         &self,
         key: &[u8],
@@ -3839,7 +3841,23 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        self.visible_hash_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let Some(encoded_metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )?
+        else {
+            return Ok(Ttl::Missing);
+        };
+        let Some(metadata) = decode_live_hash_metadata(encoded_metadata.bytes())? else {
+            return Ok(Ttl::Missing);
+        };
+        if metadata
+            .expires_at_micros
+            .is_some_and(|expiry| expiry <= logical_time_micros)
+        {
+            return Ok(Ttl::Missing);
+        }
         let Some(encoded) = tree.get_cached_pinned(
             &self.pages,
             &self.buffer_pool,
@@ -31512,6 +31530,39 @@ mod tests {
         assert_eq!(
             historical.hget(b"profile", b"name")?,
             Some(b"Mario".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_hash_field_ttl_treats_absent_due_and_non_hash_keys_as_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"expired".to_vec())?;
+        seed.hset(b"expired".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+        assert!(seed.expire_hash(b"expired".to_vec(), 20)?);
+        seed.create_set(b"set".to_vec())?;
+        seed.commit()?;
+
+        for key in [
+            b"absent".as_slice(),
+            b"expired".as_slice(),
+            b"set".as_slice(),
+        ] {
+            assert_eq!(
+                database.ttl_latest_hash_field(key, b"field", 20)?,
+                super::Ttl::Missing,
+                "unexpected physical hash field TTL for key {key:?}"
+            );
+        }
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.ttl_latest_hash_field(b"expired", b"field", 20)?,
+            super::Ttl::Missing
         );
         Ok(())
     }
