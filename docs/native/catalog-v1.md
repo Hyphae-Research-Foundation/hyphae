@@ -5,8 +5,9 @@ structure/search definitions, catalogued vector metric/HNSW configuration,
 their canonical `HYCOBJ01` codec, and full-definition `HYCAT002` runtime
 persistence are implemented experimentally. Scalable `HYCAT003` B+tree
 persistence, immutable definition blobs and buffered ID/name lookup are also
-implemented experimentally. DDL evolution, constraints, and dependency
-tracking remain pending.
+implemented experimentally. `HYCAT004` bounded relation-to-secondary-index
+lookup is specified below and remains an implementation gate. DDL evolution,
+constraints, and general dependency tracking remain pending.
 
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
@@ -174,6 +175,38 @@ rewriting immutable definition blobs.
 `HYCAT003` removes the single-page object-count limit. It does not add drop
 history, dependency edges, background blob reclamation or schema evolution.
 
+## Bounded relational-index lookup
+
+`HYCAT004` preserves the `HYCAT003` object, name, and value encodings and adds
+one derived dependency namespace:
+
+| Key | Value |
+|---|---|
+| `00` | ASCII `HYCAT004` |
+| `01 \|\| object_id_be` | one `HYCVAL01` definition envelope |
+| `02 \|\| qualified_lookup` | the same 16-byte big-endian `ObjectId` |
+| `03 \|\| relation_id_be \|\| secondary_index_id_be` | empty |
+
+Every live `SecondaryIndex` definition has exactly one dependency entry. Its
+relation and index IDs must match the decoded definition, the relation must
+resolve to a live `Relation`, and no other object kind may have a dependency
+entry. Missing, duplicate, extra, nonempty, wrong-length, dangling, or
+cross-linked dependency entries fail closed.
+
+The relation prefix `03 || relation_id_be` permits one bounded B+tree range
+read for only that relation's secondary-index IDs. A delta SQL transaction
+resolves its relation through the name namespace, loads that relation through
+the object namespace, ranges only its dependency prefix, and point-loads the
+referenced index definitions. Beginning a delta transaction does not scan or
+decode unrelated catalog definitions.
+
+`HYCAT001`, `HYCAT002`, and `HYCAT003` roots remain readable. A legacy root may
+fall back to validated full reconstruction when relation dependencies are
+required. The next catalog mutation writes a new immutable `HYCAT004` root;
+retained snapshots keep their original root and semantics. New directories
+write `HYCAT004` from their first catalog publication. The migration never
+rewrites an existing root in place.
+
 ## Required definitions
 
 ### Relation
@@ -247,3 +280,9 @@ copy-on-write page amplification; every normal commit interruption boundary;
 page-generation vacuum; reopen equivalence; and source-bound Windows/WSL2
 latency receipts. Missing-entry permutations, mutation testing, cold-cache,
 concurrency, saturation and p99.9 evidence remain open.
+
+`HYCAT004` exit evidence must add canonical dependency-key bytes, full
+dependency-set reconstruction, malformed/missing/extra/cross-linked rejection,
+V3 fallback plus V4 migration, retained V3 snapshot readability, buffered
+relation-prefix lookup, and a delta hot-path counter proving that unrelated
+catalog definitions are not decoded.
