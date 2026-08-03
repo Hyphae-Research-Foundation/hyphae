@@ -54,16 +54,21 @@ pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
 };
 pub use local_operation::{
-    LOCAL_OPERATION_HEADER_SIZE, LocalFailureCode, LocalOperationCodecError, LocalValue,
-    MAX_LOCAL_STRUCTURE_KEY_BYTES, decode_local_failure, decode_local_structure_get,
-    decode_local_value, encode_local_failure, encode_local_structure_get, encode_local_value,
+    LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LOCAL_STRUCTURE_SET_HEADER_SIZE,
+    LOCAL_TTL_PAYLOAD_SIZE, LocalFailureCode, LocalOperationCodecError,
+    LocalStructureCommitReceipt, LocalStructureRequest, LocalStructureSetRequest, LocalTtlValue,
+    LocalValue, MAX_LOCAL_STRUCTURE_KEY_BYTES, decode_local_failure,
+    decode_local_structure_commit_receipt, decode_local_structure_get,
+    decode_local_structure_request, decode_local_ttl, decode_local_value, encode_local_failure,
+    encode_local_structure_commit_receipt, encode_local_structure_get, encode_local_structure_set,
+    encode_local_structure_ttl, encode_local_ttl, encode_local_value,
 };
 pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE, LocalFrameIo,
     LocalProtocolError, LocalTransportError, decode_frame, encode_frame,
 };
 #[cfg(unix)]
-pub use local_session::{LocalSessionError, LocalStructureGetSession};
+pub use local_session::{LocalSessionError, LocalStructureSession};
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use set_algebra::{

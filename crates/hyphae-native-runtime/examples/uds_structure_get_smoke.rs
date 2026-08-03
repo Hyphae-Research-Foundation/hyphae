@@ -18,7 +18,7 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        FrameKind, LocalStructureGetSession, LocalValue, NativeDatabase, NativeSchedulerClock,
+        FrameKind, LocalStructureSession, LocalValue, NativeDatabase, NativeSchedulerClock,
         UdsFrameConnection, UdsFrameListener, decode_local_value, encode_local_structure_get,
     };
     use hyphae_native_types::DurabilityClass;
@@ -226,14 +226,14 @@ mod unix {
     type ServerHandle = thread::JoinHandle<ServerResult>;
 
     fn start_server(
-        database: NativeDatabase,
+        mut database: NativeDatabase,
         socket: &Path,
     ) -> Result<(UdsFrameConnection, ServerHandle), Box<dyn std::error::Error>> {
         let listener = UdsFrameListener::bind(socket, MAXIMUM_PAYLOAD)?;
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
             let clock = FixedClock;
-            LocalStructureGetSession::new(&database, &clock).serve(&mut connection)?;
+            LocalStructureSession::new(&mut database, &clock).serve(&mut connection)?;
             listener.close()?;
             Ok(())
         });

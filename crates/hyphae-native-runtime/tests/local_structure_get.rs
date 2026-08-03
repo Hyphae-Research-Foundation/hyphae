@@ -103,8 +103,8 @@ fn local_operation_codecs_reject_every_noncanonical_boundary()
         Err(LocalOperationCodecError::PayloadTooLarge)
     ));
     assert!(matches!(
-        decode_local_failure(&[1, 6, 0, 0]),
-        Err(LocalOperationCodecError::UnknownFailureCode(6))
+        decode_local_failure(&[1, 8, 0, 0]),
+        Err(LocalOperationCodecError::UnknownFailureCode(8))
     ));
     Ok(())
 }
@@ -120,8 +120,8 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        FrameKind, LocalSessionError, LocalStructureGetSession, NativeDatabase,
-        NativeSchedulerClock, UdsFrameConnection, UdsFrameListener,
+        FrameKind, LocalSessionError, LocalStructureSession, NativeDatabase, NativeSchedulerClock,
+        UdsFrameConnection, UdsFrameListener,
     };
     use hyphae_native_types::DurabilityClass;
 
@@ -224,7 +224,7 @@ mod unix {
             move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
                 let mut connection = listener.accept()?;
                 let clock = CountingClock::new(100);
-                let mut session = LocalStructureGetSession::new(&database, &clock);
+                let mut session = LocalStructureSession::new(&mut database, &clock);
                 session.serve(&mut connection)?;
                 listener.close()?;
                 Ok(clock.samples.load(Ordering::Relaxed))
@@ -305,13 +305,13 @@ mod unix {
         let temporary = TemporaryDirectory::create()?;
         let data = temporary.path().join("small-data");
         let socket = temporary.path().join("small.sock");
-        let database = NativeDatabase::create(data)?;
+        let mut database = NativeDatabase::create(data)?;
         let listener = UdsFrameListener::bind(&socket, 7)?;
         let server = thread::spawn(move || {
             let result = (|| -> Result<(), LocalSessionError> {
                 let mut connection = listener.accept()?;
                 let clock = CountingClock::new(0);
-                LocalStructureGetSession::new(&database, &clock).serve(&mut connection)
+                LocalStructureSession::new(&mut database, &clock).serve(&mut connection)
             })();
             let _ignored = listener.close();
             matches!(result, Err(LocalSessionError::PayloadBoundTooSmall))
@@ -331,12 +331,12 @@ mod unix {
         let temporary = TemporaryDirectory::create()?;
         let data = temporary.path().join("handshake-data");
         let socket = temporary.path().join("handshake.sock");
-        let database = NativeDatabase::create(data)?;
+        let mut database = NativeDatabase::create(data)?;
         let listener = UdsFrameListener::bind(&socket, 64)?;
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
             let clock = CountingClock::new(0);
-            let result = LocalStructureGetSession::new(&database, &clock).serve(&mut connection);
+            let result = LocalStructureSession::new(&mut database, &clock).serve(&mut connection);
             listener.close()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                 matches!(result, Err(LocalSessionError::InvalidHandshake)),

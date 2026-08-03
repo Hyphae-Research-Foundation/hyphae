@@ -159,9 +159,10 @@ The session remains deliberately bounded:
 6. request-local failures permit the next complete frame to execute.
 
 The session owns exclusive mutable access to one `NativeDatabase` for its
-lifetime. Pipelining, multiplexed execution, concurrent group admission,
-explicit `BEGIN`/`COMMIT`, cancellation, deadlines, authorization, and Windows
-named pipes remain separate contracts.
+lifetime and replaces the experimental GET-specific session handle before
+release. Pipelining, multiplexed execution, concurrent group admission,
+explicit `BEGIN`/`COMMIT`, cancellation, deadlines, authorization, and
+Windows named pipes remain separate contracts.
 
 ## Verification gates
 
