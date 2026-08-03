@@ -63,6 +63,7 @@ HSET(key, field, value)
 HGET(key, field)
 HDELETE(key, field)
 HLEN(key)
+HSCAN(key, start_after, limit)
 CREATE_SET(key)
 SADD(key, member)
 SISMEMBER(key, member)
@@ -110,9 +111,31 @@ error. Either failure adds no mutation.
 
 `CREATE_HASH` establishes the key's family before field mutation. `HSET`
 returns added versus updated, `HGET` reads one field, `HDELETE` publishes a
-field tombstone, and `HLEN` reads durable cardinality. An empty hash remains a
-typed hash after its last field is deleted; whole-hash delete/recreate is not
-implemented yet.
+field tombstone, and `HLEN` reads durable cardinality.
+
+`HSCAN` returns at most `limit` live field/value pairs in ascending exact
+field-byte order. `start_after` is an optional exclusive field cursor, not an
+opaque server token: the caller resumes with the last returned field. `None`
+starts at the first field, while `Some(empty)` resumes after a real empty
+field. A cursor does not need to remain live; its bytes still define the
+exclusive lower bound. A zero limit validates the key kind and hash existence
+before returning an empty result.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+execution must return identical entries for the same visible state. The
+physical route maps `start_after` directly into the hash-field B+tree
+namespace, skips field tombstones without charging the limit, and stops after
+the requested number of live entries. It must not materialize the complete
+hash. A reached malformed identity, field envelope, expiry, or blob fails the
+complete call rather than returning a partial result. Pattern matching,
+reverse iteration, and whole-hash materialization are outside this first
+bounded scan contract.
+
+This `HSCAN` contract is frozen before implementation. Its red/green and
+physical-pruning evidence are tracked separately from this normative file.
+
+An empty hash remains a typed hash after its last field is deleted;
+whole-hash delete/recreate is not implemented yet.
 
 Scalar mutation of a hash key fails with a kind error. Concurrent scalar
 creation and hash creation over the same absent key conflict. Once the hash
