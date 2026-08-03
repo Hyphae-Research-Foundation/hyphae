@@ -54,6 +54,10 @@ pub(crate) enum ModelError {
     UniqueSecondaryIndexViolation,
     #[error("legacy native structure state cannot encode collection families")]
     UnsupportedLegacyStructureFamily,
+    #[error("native hash field value is not a canonical signed 64-bit integer")]
+    StructureValueNotInteger,
+    #[error("native signed 64-bit hash field counter overflow")]
+    StructureIntegerOverflow,
     #[error("native search document ID already exists")]
     DuplicateDocumentId,
     #[error("native state payload contains a duplicate canonical entry")]
@@ -598,6 +602,19 @@ impl StructureState {
             .map(|fields| fields.insert(field, value).is_none())
     }
 
+    pub(crate) fn hset_many(
+        &mut self,
+        key: &[u8],
+        updates: &[(Vec<u8>, Vec<u8>)],
+    ) -> Option<usize> {
+        let fields = self.hashes.get_mut(key)?;
+        let mut added = 0;
+        for (field, value) in updates {
+            added += usize::from(fields.insert(field.clone(), value.clone()).is_none());
+        }
+        Some(added)
+    }
+
     pub(crate) fn hget(&self, key: &[u8], field: &[u8]) -> Option<&[u8]> {
         self.hashes
             .get(key)
@@ -616,10 +633,57 @@ impl StructureState {
             .flatten()
     }
 
+    pub(crate) fn hget_many_at(
+        &self,
+        key: &[u8],
+        fields: &[Vec<u8>],
+        logical_time_micros: i64,
+    ) -> Option<Vec<Option<Vec<u8>>>> {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        let hash = self.hashes.get(key)?;
+        Some(
+            fields
+                .iter()
+                .map(|field| hash.get(field).cloned())
+                .collect(),
+        )
+    }
+
     pub(crate) fn hdelete(&mut self, key: &[u8], field: &[u8]) -> Option<bool> {
         self.hashes
             .get_mut(key)
             .map(|fields| fields.remove(field).is_some())
+    }
+
+    pub(crate) fn hdelete_many(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Option<usize> {
+        let hash = self.hashes.get_mut(key)?;
+        Some(
+            fields
+                .iter()
+                .filter(|field| hash.remove(field.as_slice()).is_some())
+                .count(),
+        )
+    }
+
+    pub(crate) fn hincrement_i64(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        delta: i64,
+    ) -> Result<Option<i64>, ModelError> {
+        let Some(hash) = self.hashes.get_mut(key) else {
+            return Ok(None);
+        };
+        let base = hash
+            .get(field)
+            .map_or(Ok(0), |value| parse_canonical_hash_i64(value))?;
+        let value = base
+            .checked_add(delta)
+            .ok_or(ModelError::StructureIntegerOverflow)?;
+        hash.insert(field.to_vec(), value.to_string().into_bytes());
+        Ok(Some(value))
     }
 
     pub(crate) fn hlen(&self, key: &[u8]) -> Option<usize> {
@@ -995,6 +1059,17 @@ impl StructureState {
             sorted_sets: BTreeMap::new(),
         })
     }
+}
+
+fn parse_canonical_hash_i64(value: &[u8]) -> Result<i64, ModelError> {
+    let text = std::str::from_utf8(value).map_err(|_| ModelError::StructureValueNotInteger)?;
+    let parsed = text
+        .parse::<i64>()
+        .map_err(|_| ModelError::StructureValueNotInteger)?;
+    if parsed.to_string().as_bytes() != value {
+        return Err(ModelError::StructureValueNotInteger);
+    }
+    Ok(parsed)
 }
 
 pub(crate) fn normalize_list_range(length: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
@@ -1445,6 +1520,43 @@ mod tests {
             Some(TtlValue::Persistent)
         );
         assert_eq!(structures.hget_at(b"profile", b"name", 10), None);
+    }
+
+    #[test]
+    fn hash_field_commands_form_one_atomic_model_transition() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"profile".to_vec()));
+        assert_eq!(
+            structures.hset_many(
+                b"profile",
+                &[
+                    (b"age".to_vec(), b"40".to_vec()),
+                    (b"name".to_vec(), b"Mario".to_vec()),
+                ],
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            structures.hincrement_i64(b"profile", b"age", 2),
+            Ok(Some(42))
+        );
+        assert_eq!(
+            structures.hget_many_at(
+                b"profile",
+                &[b"name".to_vec(), b"missing".to_vec(), b"name".to_vec()],
+                9,
+            ),
+            Some(vec![Some(b"Mario".to_vec()), None, Some(b"Mario".to_vec()),])
+        );
+        assert_eq!(
+            structures.hdelete_many(b"profile", &[b"missing".to_vec(), b"name".to_vec()]),
+            Some(1)
+        );
+        assert!(structures.expire_hash(b"profile", 10, 9));
+        assert_eq!(
+            structures.hget_many_at(b"profile", &[b"age".to_vec()], 10),
+            None
+        );
     }
 
     #[test]
