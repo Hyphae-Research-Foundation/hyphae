@@ -1,8 +1,8 @@
 # Native local all-engine transaction v1
 
 Status: normative implemented contract with direct-Linux baseline evidence;
-the lexical replacement/deletion extension is implementation-gated and awaits
-its sealed performance and hosted-stack receipts.
+the lexical replacement/deletion extension has direct-Linux implementation
+and performance receipts and awaits its hosted-stack receipts.
 
 This contract exposes one explicit serial local transaction over the existing
 detached `NativeWriteBatch`. One batch captures a single immutable all-engine

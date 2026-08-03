@@ -715,9 +715,25 @@ appends, one 65,536-byte WAL block, and zero complete state/catalog loads.
 This closes the bounded delta slice and removes the known materialization
 bottleneck. It does not close G1, G5, G6, or G7: memory commit remains outside
 the microsecond domain, and cold/concurrent/saturated performance,
-per-operation allocation bounds, mutable lexical documents, cross-engine SQL
-operators, backup/restore, replication, and complete phase evidence remain
-open.
+per-operation allocation bounds, cross-engine SQL operators, backup/restore,
+replication, and complete phase evidence remain open.
+
+The [native lexical document lifecycle
+evidence](evidence/native-search-document-lifecycle-linux-2026-08-03.md)
+adds exact replacement and deletion to the point-resolved lexical delta and
+local transaction surface. Search WAL opcodes `37` and `38`, the atomic
+`HYSEABT1` to `HYSEABT2` upgrade, exact document/term/posting tombstones,
+same-document conflict identity, historical BM25 equivalence, fourteen commit
+interruptions, large-blob reclamation, and fail-closed V1/malformed tombstones
+are implementation-gated. Across three CPU-0 direct-Linux runs, staging p50
+remained between `22.469 us` and `141.813 us`. At 4,096 unrelated documents,
+median memory commit p50 was `1.295983 ms` for replacement and `1.033210 ms`
+for deletion; strict commit p50 was `9.670471/8.966219 ms`. Every measured
+transaction appended one 65,536-byte WAL block and performed zero complete
+engine-state or catalog loads. This removes mutable lexical documents from
+the bounded-delta gap but closes no complete gate; hosted stack checks, search
+tombstone compaction, broad query semantics, cross-engine SQL, and complete
+phase evidence remain open.
 
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
