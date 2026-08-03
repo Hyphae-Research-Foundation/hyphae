@@ -516,3 +516,204 @@ fn sync_directory(directory: &Path) -> Result<(), std::io::Error> {
 fn sync_directory(directory: &Path) -> Result<(), std::io::Error> {
     fs::metadata(directory).map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use hyphae_native_manifest::RootManifest;
+    use hyphae_native_mvcc::{RootSet, RootSlot, WalAnchor};
+    use hyphae_native_types::{
+        CatalogVersion, Csn, DirectoryUuid, EngineKind, HistoryEpoch, LineageIdentity, Lsn,
+        ManifestGeneration, PageGeneration, PageId,
+    };
+
+    use super::{
+        CHECKSUM_END, CHECKSUM_START, MAGIC, SnapshotPin, SnapshotPinError, SnapshotPinId,
+        SnapshotPinStore, parse_stable_filename, parse_temporary_filename,
+    };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn create() -> Result<Self, std::io::Error> {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "hyphae-native-snapshot-pins-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ignored = fs::remove_dir_all(self.path());
+        }
+    }
+
+    fn lineage(marker: u8) -> Result<LineageIdentity, Box<dyn std::error::Error>> {
+        let mut uuid = [marker; 16];
+        uuid[6] = (uuid[6] & 0x0f) | 0x70;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        Ok(LineageIdentity::new(
+            DirectoryUuid::new(uuid)?,
+            HistoryEpoch::FIRST,
+        ))
+    }
+
+    fn root_set(marker: u8) -> Result<RootSet, Box<dyn std::error::Error>> {
+        let roots = [
+            (EngineKind::Kernel, 1_u64),
+            (EngineKind::Relational, 2),
+            (EngineKind::Structure, 3),
+            (EngineKind::Search, 4),
+        ]
+        .into_iter()
+        .map(|(engine, page)| {
+            Ok((
+                RootSlot {
+                    engine,
+                    partition: 0,
+                },
+                PageId::new(page)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, hyphae_native_types::NativeTypeError>>()?;
+        Ok(RootSet::committed_with_storage(
+            Csn::new(7)?,
+            CatalogVersion::new(3)?,
+            WalAnchor::new(Lsn::new(131_184)?, [marker; 32])?,
+            roots,
+            0,
+            PageGeneration::new(2)?,
+            Csn::new(5)?,
+        )?)
+    }
+
+    fn pin(marker: u8) -> Result<SnapshotPin, Box<dyn std::error::Error>> {
+        let lineage = lineage(marker)?;
+        let roots = root_set(marker)?;
+        let manifest = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(9)?,
+            [marker.wrapping_add(1); 32],
+            &roots,
+            lineage,
+        )?;
+        Ok(SnapshotPin::from_manifest(
+            SnapshotPinId::new(u128::from(marker))?,
+            -42,
+            lineage,
+            &manifest,
+            &roots,
+        )?)
+    }
+
+    #[test]
+    fn pin_identity_and_filenames_are_canonical() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            SnapshotPinId::new(0),
+            Err(SnapshotPinError::InvalidIdentity)
+        ));
+        let id = SnapshotPinId::new(0xabc)?;
+        assert_eq!(id.to_string(), "00000000000000000000000000000abc");
+        assert_eq!(
+            parse_stable_filename("pin-00000000000000000000000000000abc.hypin"),
+            Some(id)
+        );
+        assert_eq!(
+            parse_temporary_filename("pin-00000000000000000000000000000abc.hypin.tmp"),
+            Some(id)
+        );
+        assert_eq!(
+            parse_stable_filename("pin-00000000000000000000000000000ABC.hypin"),
+            None
+        );
+        assert_eq!(parse_stable_filename("pin-0abc.hypin"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn pin_record_round_trips_and_rejects_noncanonical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pin = pin(7)?;
+        let encoded = pin.encode();
+        assert_eq!(&encoded[..8], MAGIC);
+        assert_eq!(encoded.len(), 240);
+        assert_eq!(SnapshotPin::decode(&encoded)?, pin);
+
+        let mut extended = encoded.to_vec();
+        extended.push(0);
+        assert!(matches!(
+            SnapshotPin::decode(&extended),
+            Err(SnapshotPinError::InvalidLength)
+        ));
+
+        let mut reserved = encoded;
+        reserved[12] = 1;
+        assert!(matches!(
+            SnapshotPin::decode(&reserved),
+            Err(SnapshotPinError::InvalidPreamble)
+        ));
+
+        let mut checksum = encoded;
+        checksum[CHECKSUM_END - 1] ^= 1;
+        assert!(matches!(
+            SnapshotPin::decode(&checksum),
+            Err(SnapshotPinError::ChecksumMismatch)
+        ));
+
+        let mut zero_digest = encoded;
+        zero_digest[112..144].fill(0);
+        let checksum = blake3::hash(&zero_digest[..CHECKSUM_START]);
+        zero_digest[CHECKSUM_START..CHECKSUM_END].copy_from_slice(checksum.as_bytes());
+        assert!(matches!(
+            SnapshotPin::decode(&zero_digest),
+            Err(SnapshotPinError::InvalidIdentity)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pin_store_ignores_stages_publishes_once_and_enforces_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let pin = pin(9)?;
+        let store = SnapshotPinStore::create(temporary.path())?;
+        let _stage = store.stage(pin.clone(), true)?;
+        drop(store);
+
+        let mut reopened = SnapshotPinStore::open_or_create(temporary.path(), lineage(9)?)?;
+        assert_eq!(reopened.len(), 0);
+        assert_eq!(reopened.cleanup_temporaries()?, 1);
+        assert_eq!(reopened.cleanup_temporaries()?, 0);
+
+        let stage = reopened.stage(pin.clone(), true)?;
+        assert_eq!(reopened.publish(stage, true)?, pin);
+        assert!(matches!(
+            reopened.stage(pin.clone(), true),
+            Err(SnapshotPinError::PublicationTargetExists)
+        ));
+        drop(reopened);
+
+        let stable = SnapshotPinStore::open_or_create(temporary.path(), lineage(9)?)?;
+        assert_eq!(stable.iter().cloned().collect::<Vec<_>>(), vec![pin]);
+        assert!(matches!(
+            SnapshotPinStore::open_or_create(temporary.path(), lineage(8)?),
+            Err(SnapshotPinError::LineageMismatch)
+        ));
+        Ok(())
+    }
+}

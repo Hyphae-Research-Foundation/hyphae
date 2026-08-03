@@ -20,7 +20,8 @@ use std::{
 };
 
 use hyphae_native_runtime::{
-    CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, NativeTransaction, Ttl,
+    CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, NativeTransaction,
+    SnapshotPinBoundary, SnapshotPinId, Ttl,
 };
 use hyphae_native_types::{Csn, DurabilityClass, ObjectId};
 
@@ -30,6 +31,7 @@ const VERIFY_POWER_LOSS_MODE: &str = "--verify-power-loss";
 const READY_PREFIX: &str = "hyphae-native-crash-ready:";
 const COMMIT_FAMILY: &str = "commit";
 const CHECKPOINT_FAMILY: &str = "checkpoint";
+const SNAPSHOT_PIN_FAMILY: &str = "snapshot-pin";
 const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
 const TABLE_ID: u128 = 1;
@@ -51,6 +53,15 @@ const CHECKPOINT_BOUNDARIES: [(&str, CheckpointBoundary); 4] = [
     ("wal-appended", CheckpointBoundary::WalAppended),
     ("wal-synchronized", CheckpointBoundary::WalSynchronized),
 ];
+
+const SNAPSHOT_PIN_BOUNDARIES: [(&str, SnapshotPinBoundary); 2] = [
+    (
+        "record-synchronized",
+        SnapshotPinBoundary::RecordSynchronized,
+    ),
+    ("record-published", SnapshotPinBoundary::RecordPublished),
+];
+const SNAPSHOT_PIN_ID: u128 = 1;
 
 struct TemporaryDirectory(PathBuf);
 
@@ -88,6 +99,15 @@ struct CheckpointObservation {
     checkpoint_count: usize,
     unanchored_manifest_suffix: usize,
     recovered_temporary_manifests: usize,
+    termination: String,
+}
+
+struct SnapshotPinObservation {
+    name: &'static str,
+    expected_pin: &'static str,
+    recovered_pin_count: usize,
+    pin_directory_files: usize,
+    retained_page_generations: usize,
     termination: String,
 }
 
@@ -166,6 +186,7 @@ fn run_child(family: &str, directory: &Path, boundary_name: &str) -> Result<(), 
     match family {
         COMMIT_FAMILY => run_commit_child(directory, boundary_name)?,
         CHECKPOINT_FAMILY => run_checkpoint_child(directory, boundary_name)?,
+        SNAPSHOT_PIN_FAMILY => run_snapshot_pin_child(directory, boundary_name)?,
         other => return Err(failure(format!("unknown boundary family: {other}"))),
     }
 
@@ -207,17 +228,36 @@ fn run_checkpoint_child(directory: &Path, boundary_name: &str) -> Result<(), Box
     Ok(())
 }
 
+fn run_snapshot_pin_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
+    let boundary = parse_snapshot_pin_boundary(boundary_name)
+        .ok_or_else(|| failure(format!("unknown snapshot-pin boundary: {boundary_name}")))?;
+    let mut database = NativeDatabase::create(directory)?;
+    stage_vertical(&mut database)?.commit()?;
+    let pin = SnapshotPinId::new(SNAPSHOT_PIN_ID)?;
+    match database.pin_current_with_interruption(pin, 150, boundary) {
+        Err(NativeRuntimeError::InjectedSnapshotPinCrash(found)) if found == boundary => {}
+        other => {
+            return Err(failure(format!(
+                "snapshot-pin boundary {boundary_name} returned an unexpected result: {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run_parent(source_commit: &str, environment: &str) -> Result<(), Box<dyn Error>> {
     let executable = std::env::current_exe()?;
     let temporary = TemporaryDirectory::create()?;
     fs::create_dir_all(temporary.path())?;
     let commit_observations = run_commit_matrix(&executable, temporary.path())?;
     let checkpoint_observations = run_checkpoint_matrix(&executable, temporary.path())?;
+    let snapshot_pin_observations = run_snapshot_pin_matrix(&executable, temporary.path())?;
     print_receipt(
         source_commit,
         environment,
         &commit_observations,
         &checkpoint_observations,
+        &snapshot_pin_observations,
     );
     Ok(())
 }
@@ -267,6 +307,56 @@ fn run_checkpoint_matrix(
             checkpoint_count: report.checkpoint_count,
             unanchored_manifest_suffix: report.unanchored_manifest_suffix,
             recovered_temporary_manifests: report.recovered_temporary_manifests,
+            termination,
+        });
+    }
+    Ok(observations)
+}
+
+fn run_snapshot_pin_matrix(
+    executable: &Path,
+    root: &Path,
+) -> Result<Vec<SnapshotPinObservation>, Box<dyn Error>> {
+    let mut observations = Vec::with_capacity(SNAPSHOT_PIN_BOUNDARIES.len());
+    for (name, boundary) in SNAPSHOT_PIN_BOUNDARIES {
+        let directory = root.join(format!("{SNAPSHOT_PIN_FAMILY}-{name}"));
+        let termination =
+            kill_child_at_boundary(executable, SNAPSHOT_PIN_FAMILY, &directory, name)?;
+        let database = NativeDatabase::open(&directory)?;
+        validate_recovered_state(&database, true)?;
+        let expected_pin = boundary == SnapshotPinBoundary::RecordPublished;
+        let expected_count = usize::from(expected_pin);
+        require_equal(
+            "recovered snapshot pin count",
+            &database.snapshot_pin_count(),
+            &expected_count,
+        )?;
+        validate_recovered_snapshot_pin(&database, expected_pin)?;
+        let pin_directory_files = fs::read_dir(directory.join("pins"))?
+            .filter_map(Result::ok)
+            .count();
+        require_equal(
+            "snapshot pin directory file count",
+            &pin_directory_files,
+            &expected_count,
+        )?;
+        let retained_page_generations = fs::read_dir(&directory)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name == "pages.hydb"
+                    || name
+                        .strip_suffix(".hydb")
+                        .is_some_and(|stem| stem.starts_with("pages-"))
+            })
+            .count();
+        require_equal("retained page generations", &retained_page_generations, &1)?;
+        observations.push(SnapshotPinObservation {
+            name,
+            expected_pin: if expected_pin { "complete" } else { "absent" },
+            recovered_pin_count: database.snapshot_pin_count(),
+            pin_directory_files,
+            retained_page_generations,
             termination,
         });
     }
@@ -368,6 +458,53 @@ fn validate_recovered_state(
         }
     }
     Ok(())
+}
+
+fn validate_recovered_snapshot_pin(
+    database: &NativeDatabase,
+    expected_present: bool,
+) -> Result<(), Box<dyn Error>> {
+    let pin = SnapshotPinId::new(SNAPSHOT_PIN_ID)?;
+    if !expected_present {
+        if !matches!(
+            database.open_pinned_snapshot(pin),
+            Err(NativeRuntimeError::UnknownSnapshotPin)
+        ) {
+            return Err(failure("temporary snapshot pin became authority"));
+        }
+        return Ok(());
+    }
+
+    let table = ObjectId::new(TABLE_ID)?;
+    let index = ObjectId::new(SEARCH_INDEX_ID)?;
+    let snapshot = database.open_pinned_snapshot(pin)?;
+    require_equal(
+        "pinned visible CSN",
+        &snapshot.visible_csn(),
+        &Some(Csn::new(1)?),
+    )?;
+    require_equal(
+        "pinned relational value",
+        &snapshot.select(table, b"mario"),
+        &Some(large_value().as_slice()),
+    )?;
+    require_equal(
+        "pinned structure value",
+        &snapshot.get(b"session"),
+        &Some(b"open".as_slice()),
+    )?;
+    require_equal(
+        "pinned structure TTL",
+        &snapshot.ttl(b"session"),
+        &Ttl::RemainingMicros(50),
+    )?;
+    let matches = snapshot.match_text(index, "crash", 1)?;
+    require_equal("pinned lexical match count", &matches.len(), &1)?;
+    require_equal(
+        "pinned lexical document",
+        &matches[0].document_id.as_slice(),
+        &b"doc-1".as_slice(),
+    )
 }
 
 fn validate_checkpoint_recovery(
@@ -562,9 +699,10 @@ fn print_receipt(
     environment: &str,
     commit_observations: &[CommitObservation],
     checkpoint_observations: &[CheckpointObservation],
+    snapshot_pin_observations: &[SnapshotPinObservation],
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v2\",");
+    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v3\",");
     println!("  \"status\": \"process-crash-not-power-loss\",");
     println!("  \"source_commit\": \"{source_commit}\",");
     println!("  \"environment\": \"{environment}\",");
@@ -625,6 +763,32 @@ fn print_receipt(
         println!("      \"termination\": \"{}\"", observation.termination);
         println!("    }}{suffix}");
     }
+    println!("  ],");
+    println!("  \"snapshot_pin_boundaries\": [");
+    for (index, observation) in snapshot_pin_observations.iter().enumerate() {
+        let suffix = if index + 1 == snapshot_pin_observations.len() {
+            ""
+        } else {
+            ","
+        };
+        println!("    {{");
+        println!("      \"boundary\": \"{}\",", observation.name);
+        println!("      \"expected_pin\": \"{}\",", observation.expected_pin);
+        println!(
+            "      \"recovered_pin_count\": {},",
+            observation.recovered_pin_count
+        );
+        println!(
+            "      \"pin_directory_files\": {},",
+            observation.pin_directory_files
+        );
+        println!(
+            "      \"retained_page_generations\": {},",
+            observation.retained_page_generations
+        );
+        println!("      \"termination\": \"{}\"", observation.termination);
+        println!("    }}{suffix}");
+    }
     println!("  ]");
     println!("}}");
 }
@@ -637,6 +801,12 @@ fn parse_commit_boundary(name: &str) -> Option<CommitBoundary> {
 
 fn parse_checkpoint_boundary(name: &str) -> Option<CheckpointBoundary> {
     CHECKPOINT_BOUNDARIES
+        .iter()
+        .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
+}
+
+fn parse_snapshot_pin_boundary(name: &str) -> Option<SnapshotPinBoundary> {
+    SNAPSHOT_PIN_BOUNDARIES
         .iter()
         .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
 }
@@ -692,10 +862,11 @@ fn failure(message: impl Into<String>) -> Box<dyn Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKPOINT_BOUNDARIES, COMMIT_BOUNDARIES, expects_power_loss_complete_state,
+        CHECKPOINT_BOUNDARIES, COMMIT_BOUNDARIES, SNAPSHOT_PIN_BOUNDARIES,
+        expects_power_loss_complete_state, parse_snapshot_pin_boundary,
         power_loss_checkpoint_counts,
     };
-    use hyphae_native_runtime::{CheckpointBoundary, CommitBoundary};
+    use hyphae_native_runtime::{CheckpointBoundary, CommitBoundary, SnapshotPinBoundary};
 
     #[test]
     fn power_loss_commit_authority_starts_at_synchronized_wal() {
@@ -718,5 +889,18 @@ mod tests {
         assert!(!expects_power_loss_complete_state(
             CommitBoundary::WalAppended
         ));
+    }
+
+    #[test]
+    fn snapshot_pin_boundary_names_are_complete_and_exact() {
+        assert_eq!(
+            SNAPSHOT_PIN_BOUNDARIES.map(|(name, _)| name),
+            ["record-synchronized", "record-published"]
+        );
+        assert_eq!(
+            parse_snapshot_pin_boundary("record-published"),
+            Some(SnapshotPinBoundary::RecordPublished)
+        );
+        assert_eq!(parse_snapshot_pin_boundary("published"), None);
     }
 }

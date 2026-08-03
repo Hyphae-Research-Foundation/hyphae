@@ -461,6 +461,9 @@ pub enum NativeRuntimeError {
     /// A deterministic checkpoint interruption was requested.
     #[error("native checkpoint interrupted at {0:?}; reopen the data directory")]
     InjectedCheckpointCrash(CheckpointBoundary),
+    /// A deterministic snapshot-pin interruption was requested.
+    #[error("native snapshot pin interrupted at {0:?}; reopen the data directory")]
+    InjectedSnapshotPinCrash(SnapshotPinBoundary),
     /// A deterministic page-vacuum interruption was requested.
     #[error("native page vacuum interrupted at {0:?}; reopen the data directory")]
     InjectedVacuumCrash(VacuumBoundary),
@@ -542,6 +545,15 @@ pub enum CheckpointBoundary {
     WalAppended,
     /// The manifest and its WAL checkpoint record are synchronized.
     WalSynchronized,
+}
+
+/// Deterministic durable snapshot-pin boundary used by the crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPinBoundary {
+    /// The complete pin record is synchronized only under its temporary name.
+    RecordSynchronized,
+    /// The immutable pin record is renamed and its directory synchronized.
+    RecordPublished,
 }
 
 /// Deterministic WAL-retention boundary used by the crash matrix.
@@ -1864,6 +1876,34 @@ impl NativeDatabase {
         id: SnapshotPinId,
         logical_time_micros: i64,
     ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        self.pin_current_at(id, logical_time_micros, None)
+    }
+
+    /// Checkpoints and pins the current state with one deterministic
+    /// interruption.
+    ///
+    /// After an injected interruption the caller must drop this handle and
+    /// reopen the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedSnapshotPinCrash`] at the
+    /// requested boundary, or the same errors as [`Self::pin_current`].
+    pub fn pin_current_with_interruption(
+        &mut self,
+        id: SnapshotPinId,
+        logical_time_micros: i64,
+        boundary: SnapshotPinBoundary,
+    ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        self.pin_current_at(id, logical_time_micros, Some(boundary))
+    }
+
+    fn pin_current_at(
+        &mut self,
+        id: SnapshotPinId,
+        logical_time_micros: i64,
+        interruption: Option<SnapshotPinBoundary>,
+    ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
         if self.snapshot_pins.get(id).is_some() {
             return Err(NativeRuntimeError::SnapshotPinExists);
         }
@@ -1896,7 +1936,9 @@ impl NativeDatabase {
                 SnapshotPinError::PublicationTargetExists => NativeRuntimeError::SnapshotPinExists,
                 error => NativeRuntimeError::SnapshotPin(error),
             })?;
+        interrupt_snapshot_pin(interruption, SnapshotPinBoundary::RecordSynchronized)?;
         let pin = self.snapshot_pins.publish(staged, true)?;
+        interrupt_snapshot_pin(interruption, SnapshotPinBoundary::RecordPublished)?;
         Ok(snapshot_pin_receipt(&pin))
     }
 
@@ -7230,6 +7272,17 @@ fn interrupt_checkpoint(
 ) -> Result<(), NativeRuntimeError> {
     if requested == Some(current) {
         Err(NativeRuntimeError::InjectedCheckpointCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
+fn interrupt_snapshot_pin(
+    requested: Option<SnapshotPinBoundary>,
+    current: SnapshotPinBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedSnapshotPinCrash(current))
     } else {
         Ok(())
     }
@@ -13016,13 +13069,13 @@ mod tests {
         NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
         NativeSchedulerClock, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
         RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary,
-        Vector, VectorMetric, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary,
-        ZAddOutcome, binary_relation_definition, catalog_definition_storage_value,
-        catalog_name_identity, catalog_name_key, catalog_object_key, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
-        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
+        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
+        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
+        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
+        rebuild_page_generation, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -13630,51 +13683,21 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn durable_snapshot_pin_reopens_old_state_and_releases_its_page_generation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TestDirectory::new();
-        let mut database = NativeDatabase::create(temporary.path())?;
+    fn assert_reopened_pinned_all_engine_state(
+        database: &NativeDatabase,
+        pin_id: SnapshotPinId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let table = ObjectId::new(1)?;
         let search = ObjectId::new(2)?;
-        let pin_id = SnapshotPinId::new(1)?;
-
-        let mut seed = database.begin(40, DurabilityClass::Strict)?;
-        seed.create_relation(table, "pinned_rows")?;
-        seed.insert(table, b"key".to_vec(), b"old-row".to_vec())?;
-        seed.set(b"expiring".to_vec(), b"old-value".to_vec(), Some(1_000))?;
-        seed.create_search_index(search, "pinned_search")?;
-        seed.index_document(search, b"old-doc".to_vec(), "old lexical state")?;
-        seed.commit()?;
-
-        let pin = database.pin_current(pin_id, 500)?;
-        assert_eq!(pin.id, pin_id);
-        assert_eq!(pin.visible_csn, Csn::new(1)?);
-        assert_eq!(pin.page_generation, PageGeneration::FIRST);
-
-        for version in 1..=8 {
-            let mut update = database.begin(500 + version, DurabilityClass::Strict)?;
-            update.update(
-                table,
-                b"key".to_vec(),
-                format!("new-row-{version}").into_bytes(),
-            )?;
-            if version == 1 {
-                update.set(b"expiring".to_vec(), b"new-value".to_vec(), Some(2_000))?;
-                update.index_document(search, b"new-doc".to_vec(), "new lexical state")?;
-            }
-            update.commit()?;
-        }
-        assert!(database.vacuum_pages()?.applied);
-        assert!(temporary.path().join(PAGE_FILE).exists());
-        drop(database);
-
-        let mut reopened = NativeDatabase::open(temporary.path())?;
+        let vectors = ObjectId::new(3)?;
+        let old_best = ObjectId::new(101)?;
+        let new_best = ObjectId::new(102)?;
+        let query = Vector::new([1.0, 0.0, 0.0])?;
         assert_eq!(
-            reopened.select_latest_relational(table, b"key")?,
+            database.select_latest_relational(table, b"key")?,
             Some(b"new-row-8".to_vec())
         );
-        let pinned = reopened.open_pinned_snapshot(pin_id)?;
+        let pinned = database.open_pinned_snapshot(pin_id)?;
         assert_eq!(pinned.visible_csn(), Some(Csn::new(1)?));
         assert_eq!(pinned.select(table, b"key"), Some(b"old-row".as_slice()));
         assert_eq!(
@@ -13687,9 +13710,90 @@ mod tests {
             b"old-doc"
         );
         assert!(pinned.match_text(search, "new", 1)?.is_empty());
+        assert_eq!(
+            pinned.search_vector_exact(vectors, &query, 2)?[0].object_id,
+            old_best
+        );
+        assert_eq!(
+            database.search_vector_exact_latest(vectors, &query, 2)?[0].object_id,
+            new_best
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn durable_snapshot_pin_reopens_old_state_and_releases_its_page_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let vectors = ObjectId::new(3)?;
+        let old_best = ObjectId::new(101)?;
+        let new_best = ObjectId::new(102)?;
+        let pin_id = SnapshotPinId::new(1)?;
+        let mut seed = database.begin(40, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pinned_rows")?;
+        seed.insert(table, b"key".to_vec(), b"old-row".to_vec())?;
+        seed.set(b"expiring".to_vec(), b"old-value".to_vec(), Some(1_000))?;
+        seed.create_search_index(search, "pinned_search")?;
+        seed.index_document(search, b"old-doc".to_vec(), "old lexical state")?;
+        seed.create_vector_index(
+            vectors,
+            "pinned_vectors",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        seed.upsert_vectors(
+            vectors,
+            [
+                (old_best, Vector::new([1.0, 0.0, 0.0])?),
+                (new_best, Vector::new([0.0, 1.0, 0.0])?),
+            ],
+        )?;
+        seed.commit()?;
+        let pin = database.pin_current(pin_id, 500)?;
+        assert_eq!(pin.id, pin_id);
+        assert_eq!(pin.visible_csn, Csn::new(1)?);
+        assert_eq!(pin.page_generation, PageGeneration::FIRST);
+        assert!(matches!(
+            database.pin_current(pin_id, 500),
+            Err(NativeRuntimeError::SnapshotPinExists)
+        ));
+
+        for version in 1..=8 {
+            let mut update = database.begin(500 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("new-row-{version}").into_bytes(),
+            )?;
+            if version == 1 {
+                update.set(b"expiring".to_vec(), b"new-value".to_vec(), Some(2_000))?;
+                update.index_document(search, b"new-doc".to_vec(), "new lexical state")?;
+                update.upsert_vectors(
+                    vectors,
+                    [
+                        (old_best, Vector::new([0.0, 1.0, 0.0])?),
+                        (new_best, Vector::new([1.0, 0.0, 0.0])?),
+                    ],
+                )?;
+            }
+            update.commit()?;
+        }
+        assert!(database.vacuum_pages()?.applied);
+        assert!(temporary.path().join(PAGE_FILE).exists());
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_reopened_pinned_all_engine_state(&reopened, pin_id)?;
         let unpinned = reopened.unpin(pin_id)?;
         assert_eq!(unpinned.id, pin_id);
+        assert!(matches!(
+            reopened.unpin(pin_id),
+            Err(NativeRuntimeError::UnknownSnapshotPin)
+        ));
         assert!(temporary.path().join(PAGE_FILE).exists());
         let collection = reopened.collect_retired_page_generations()?;
         assert_eq!(collection.removed_files, 1);
@@ -13698,6 +13802,405 @@ mod tests {
             reopened.open_pinned_snapshot(pin_id),
             Err(NativeRuntimeError::UnknownSnapshotPin)
         ));
+        Ok(())
+    }
+
+    fn create_closed_pinned_directory(
+        pin: SnapshotPinId,
+    ) -> Result<TestDirectory, Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pin_corruption")?;
+        seed.insert(table, b"key".to_vec(), b"pinned-value".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pin, 20)?;
+        drop(database);
+        Ok(temporary)
+    }
+
+    fn canonical_pin_path(path: &Path, pin: SnapshotPinId) -> PathBuf {
+        path.join("pins").join(format!("pin-{pin}.hypin"))
+    }
+
+    #[test]
+    fn snapshot_pin_namespace_and_records_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let pin = SnapshotPinId::new(31)?;
+
+        let truncated = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(truncated.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes.pop();
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(truncated.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidLength)
+        ));
+
+        let extended = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(extended.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes.push(0);
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(extended.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidLength)
+        ));
+
+        let reserved = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(reserved.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes[12] = 1;
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(reserved.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidPreamble)
+        ));
+
+        let checksum = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(checksum.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes[239] ^= 1;
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(checksum.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::ChecksumMismatch)
+        ));
+
+        let renamed = create_closed_pinned_directory(pin)?;
+        fs::rename(
+            canonical_pin_path(renamed.path(), pin),
+            canonical_pin_path(renamed.path(), SnapshotPinId::new(32)?),
+        )?;
+        assert!(matches!(
+            expected_open_error(renamed.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::FilenameIdentityMismatch)
+        ));
+
+        let unexpected = create_closed_pinned_directory(pin)?;
+        fs::write(
+            unexpected.path().join("pins").join("notes.txt"),
+            b"not authority",
+        )?;
+        assert!(matches!(
+            expected_open_error(unexpected.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::UnexpectedDirectoryEntry)
+        ));
+
+        let non_file = create_closed_pinned_directory(pin)?;
+        fs::create_dir(non_file.path().join("pins").join("pin-directory"))?;
+        assert!(matches!(
+            expected_open_error(non_file.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::UnexpectedDirectoryEntry)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_corrupt_pinned_physical_authority_fails_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pin = SnapshotPinId::new(41)?;
+        let missing_manifest = create_closed_pinned_directory(pin)?;
+        fs::remove_file(
+            missing_manifest
+                .path()
+                .join("roots")
+                .join("manifest-0000000000000001.hyroot"),
+        )?;
+        assert!(expected_open_error(missing_manifest.path()).is_ok());
+
+        for corrupt in [false, true] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "missing_pinned_page")?;
+            seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+            seed.commit()?;
+            database.pin_current(pin, 20)?;
+            for version in 1..=5 {
+                let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("after-{version}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+            assert!(database.vacuum_pages()?.applied);
+            drop(database);
+
+            if corrupt {
+                let mut page_bytes = fs::read(temporary.path().join(PAGE_FILE))?;
+                page_bytes[0] ^= 1;
+                fs::write(temporary.path().join(PAGE_FILE), page_bytes)?;
+            } else {
+                fs::remove_file(temporary.path().join(PAGE_FILE))?;
+            }
+            assert!(matches!(
+                expected_open_error(temporary.path())?,
+                NativeRuntimeError::InvalidSnapshotPinAuthority
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn three_pinned_generations_reopen_and_collect_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let pins = [
+            SnapshotPinId::new(11)?,
+            SnapshotPinId::new(12)?,
+            SnapshotPinId::new(13)?,
+        ];
+
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "multi_generation_pins")?;
+        seed.insert(table, b"key".to_vec(), b"generation-1".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pins[0], 100)?;
+
+        let mut expected_csn = 1_u64;
+        for (generation, pin) in [(2_u64, pins[1]), (3, pins[2])] {
+            for update_index in 0..5 {
+                expected_csn += 1;
+                let mut update =
+                    database.begin(100 + i64::try_from(expected_csn)?, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("generation-{generation}-update-{update_index}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+            expected_csn += 1;
+            let vacuum = database.vacuum_pages()?;
+            assert!(vacuum.applied);
+            assert_eq!(vacuum.active_generation, PageGeneration::new(generation)?);
+            database.pin_current(pin, 100 + i64::try_from(expected_csn)?)?;
+        }
+
+        for update_index in 0..5 {
+            expected_csn += 1;
+            let mut update =
+                database.begin(100 + i64::try_from(expected_csn)?, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("generation-4-update-{update_index}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        let active = database.vacuum_pages()?;
+        assert!(active.applied);
+        assert_eq!(active.active_generation, PageGeneration::new(4)?);
+        assert_eq!(database.snapshot_pin_count(), 3);
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.snapshot_pin_count(), 3);
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[0])?
+                .select(table, b"key"),
+            Some(b"generation-1".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[1])?
+                .select(table, b"key"),
+            Some(b"generation-2-update-4".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[2])?
+                .select(table, b"key"),
+            Some(b"generation-3-update-4".as_slice())
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"generation-4-update-4".to_vec())
+        );
+
+        reopened.unpin(pins[1])?;
+        let collection = reopened.collect_retired_page_generations()?;
+        assert_eq!(collection.removed_files, 1);
+        assert!(temporary.path().join(PAGE_FILE).exists());
+        assert!(
+            !temporary
+                .path()
+                .join("pages-00000000000000000002.hydb")
+                .exists()
+        );
+        assert!(
+            temporary
+                .path()
+                .join("pages-00000000000000000003.hydb")
+                .exists()
+        );
+        assert!(
+            temporary
+                .path()
+                .join("pages-00000000000000000004.hydb")
+                .exists()
+        );
+        assert_eq!(
+            reopened.collect_retired_page_generations()?.removed_files,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_snapshot_pin_boundary_recovers_absent_or_complete_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            SnapshotPinBoundary::RecordSynchronized,
+            SnapshotPinBoundary::RecordPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let pin = SnapshotPinId::new(boundary as u128 + 1)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "pin_crash_matrix")?;
+            seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+            seed.commit()?;
+
+            assert!(matches!(
+                database.pin_current_with_interruption(pin, 20, boundary),
+                Err(NativeRuntimeError::InjectedSnapshotPinCrash(actual))
+                    if actual == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            if boundary == SnapshotPinBoundary::RecordSynchronized {
+                assert_eq!(reopened.snapshot_pin_count(), 0);
+                assert!(matches!(
+                    reopened.open_pinned_snapshot(pin),
+                    Err(NativeRuntimeError::UnknownSnapshotPin)
+                ));
+            } else {
+                assert_eq!(reopened.snapshot_pin_count(), 1);
+                assert_eq!(
+                    reopened.open_pinned_snapshot(pin)?.select(table, b"key"),
+                    Some(b"before".as_slice())
+                );
+            }
+            assert_eq!(
+                fs::read_dir(temporary.path().join("pins"))?.count(),
+                usize::from(boundary == SnapshotPinBoundary::RecordPublished)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_pin_blocks_destructive_retention_until_unpinned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let pin = SnapshotPinId::new(21)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pin_retention")?;
+        seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pin, 20)?;
+        for version in 1..=5 {
+            let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("after-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        assert!(database.vacuum_pages()?.applied);
+        database.checkpoint()?;
+        let wal_bytes = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+
+        assert!(matches!(
+            database.truncate_wal_at_retention_checkpoint(),
+            Err(NativeRuntimeError::SnapshotPinsBlockWalRetention)
+        ));
+        assert_eq!(
+            fs::metadata(temporary.path().join(WAL_FILE))?.len(),
+            wal_bytes
+        );
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::SnapshotPinsBlockBlobCollection)
+        ));
+
+        database.unpin(pin)?;
+        assert_eq!(
+            database.collect_retired_page_generations()?.removed_files,
+            1
+        );
+        database.truncate_wal_at_retention_checkpoint()?;
+        assert_eq!(database.collect_blobs()?.removed_files, 0);
+        drop(database);
+        assert_eq!(
+            NativeDatabase::open(temporary.path())?.snapshot_pin_count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_vacuum_boundary_preserves_a_durable_historical_pin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            VacuumBoundary::CandidateSynchronized,
+            VacuumBoundary::CandidatePublished,
+            VacuumBoundary::WalAppended,
+            VacuumBoundary::WalSynchronized,
+            VacuumBoundary::RootPublished,
+            VacuumBoundary::PriorGenerationRemoved,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let pin = SnapshotPinId::new(100 + boundary as u128)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "pinned_vacuum_boundary")?;
+            seed.insert(table, b"key".to_vec(), b"pinned".to_vec())?;
+            seed.commit()?;
+            database.pin_current(pin, 20)?;
+            for version in 1..=5 {
+                let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("current-{version}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+
+            assert!(matches!(
+                database.vacuum_pages_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedVacuumCrash(actual))
+                    if actual == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened.open_pinned_snapshot(pin)?.select(table, b"key"),
+                Some(b"pinned".as_slice())
+            );
+            assert_eq!(
+                reopened.select_latest_relational(table, b"key")?,
+                Some(b"current-5".to_vec())
+            );
+            assert!(temporary.path().join(PAGE_FILE).exists());
+        }
         Ok(())
     }
 
