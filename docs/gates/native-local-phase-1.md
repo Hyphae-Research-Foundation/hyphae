@@ -186,6 +186,12 @@ retains a perturbed-oracle negative control and the physical field-TTL
 contract correction exposed by the corpus. Other structure-family models,
 concurrent histories, memory amplification, complete G3, and G7 remain open.
 
+The [native set algebra
+contract](../native/native-set-algebra-v1.md) freezes bounded exact-byte
+`UNION`, `INTERSECTION`, and ordered `DIFFERENCE` over private, retained, and
+current-root physical set state. Its implementation, corruption, restart, and
+latency evidence remain open; the contract alone does not satisfy G3.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with
