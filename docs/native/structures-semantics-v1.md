@@ -8,7 +8,8 @@ sorted-set score ranges, and bidirectional sorted-set member ranks are
 implemented in the convergence slice; the ordered durable scalar-expiry index
 and bounded cleanup are
 implemented; an engine-owned background timer, version-bearing responses, and
-the remaining structure families remain pending
+the remaining structure families remain pending. Reverse sorted-set range
+output is frozen below as a target contract but is not yet implemented.
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -81,6 +82,9 @@ ZSCORE(key, member)
 ZREM(key, member)
 ZCARD(key)
 ZRANGE(key, start, stop)
+ZRANGE_BY_SCORE(key, lower, upper, offset, limit)
+ZREVRANGE(key, start, stop)
+ZREVRANGE_BY_SCORE(key, lower, upper, offset, limit)
 EXPIRE_DUE(logical_time, max_keys)
 ```
 
@@ -165,6 +169,31 @@ nonintersecting subtrees, ignores tombstones without charging offset, and
 stops after the requested live result count. It does not materialize the
 complete sorted set. Malformed ordered identities, scores, or live markers
 fail the complete call rather than returning a partial result.
+
+`ZREVRANGE` applies the same signed, inclusive `start` and `stop` rules to the
+descending score/member sequence. Negative indexes count back from the tail of
+that descending sequence. Reversing the result reverses the complete total
+order, including exact member-byte order between equal scores.
+
+`ZREVRANGE_BY_SCORE` accepts the same canonical lower and upper score bounds
+as `ZRANGE_BY_SCORE`; output direction never changes which argument is the
+lower or upper bound. It filters that interval, traverses matching live
+members in descending score/member order, applies `offset` in that descending
+order, and returns at most `limit` entries. Empty, inverted, equal-endpoint,
+zero-limit, infinity, and `NaN` behavior is identical to the ascending
+operation before output direction is considered.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+reverse execution must be identical. The physical rank route starts at the
+ordered prefix tail and stops after the last requested descending live rank.
+The physical score route applies the canonical score bounds to the same
+ordered namespace and visits only that bounded interval in reverse. Both
+ignore tombstones without charging rank or offset and stop without
+materializing the complete sorted set. Malformed metadata, identities, scores,
+or live markers fail the complete call rather than returning a partial result.
+
+These two reverse-range operations are frozen target behavior in this contract
+revision; their implementation and evidence remain pending.
 
 `ZRANK` returns a live member's zero-based position in that exact ascending
 score/member order. `ZREVRANK` returns its zero-based position after reversing
