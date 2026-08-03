@@ -284,6 +284,13 @@ commit before its tag can be published.
   reached-state decoding to one source commit.
 - `native-hash-scan-linux.json` is its direct-Linux release observation over
   2,048 fields. It remains outside G3 and G7.
+- [Native whole-hash lifecycle evidence —
+  2026-08-02](native-hash-lifecycle-linux-2026-08-02.md) binds typed
+  delete/recreate, lifecycle-fence concurrency, physical prefix tombstoning,
+  fail-closed replay, all seven singleton crash boundaries, compaction, and
+  separated private/memory/strict latency to one source commit.
+- `native-hash-lifecycle-linux.json` is its direct-Linux release observation
+  over 0-, 64-, and 2,048-field hashes. It remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

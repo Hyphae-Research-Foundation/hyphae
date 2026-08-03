@@ -265,12 +265,15 @@ The value envelope and legacy single-page compatibility are specified in
 `EXPIRE`, and `DELETE` rewrite only their copy-on-write leaf-to-root paths;
 `DELETE` stores the canonical scalar tombstone. Direct current reads traverse
 the buffer pool. Hash field changes rewrite their own field path plus the small
-hash metadata path rather than a whole serialized map. `HYSTRBT2` maintains
+hash metadata path rather than a whole serialized map. Whole-hash deletion
+enumerates its exact field prefix and submits live field plus metadata
+tombstones through one sorted copy-on-write batch. `HYSTRBT2` maintains
 the scalar expiry index in the same mutation path and validates it
 one-to-one on recovery. `HYSTRBT1` remains a compatibility format without
 that index. The current implementation has no general range/streaming cursor,
-expected-version response, whole-hash deletion, or layouts for the remaining
-collection families. The list layout rewrites metadata plus one packed end
+expected-version response, whole-family deletion for the remaining collection
+families, or layouts for unimplemented families. The list layout rewrites
+metadata plus one packed end
 chunk per push/pop; its exact metadata, chunk, tombstone, and
 corruption rules are specified in the structure contract.
 

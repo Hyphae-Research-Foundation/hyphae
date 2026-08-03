@@ -118,6 +118,17 @@ observed p50 `20.926 us` and p99 `71.596 us` in the checked
 Cross-schema latency is not a controlled comparison, and none of these
 observations passes G7.
 
+Whole-hash lifecycle uses a separate harness because complete deletion is
+cardinality-sensitive and mutating. The checked
+[direct-Linux receipt](../gates/evidence/native-hash-lifecycle-linux.json)
+separates an already-prepared private `DELETE_HASH` call from memory-durability
+physical publication and strict page/WAL synchronization. At 2,048 fields,
+private retirement observed p50 `54.106 us`, memory commit p50 `3.561 ms`, and
+strict commit p50 `12.299 ms`. These are distinct surfaces: the physical path
+must enumerate and tombstone the complete live field prefix, and strict
+timings include ext4/EBS synchronization. They are not a universal
+microsecond-path claim and do not pass G7.
+
 Schema v7 adds 2,048 rows under one unique text secondary index and measures
 one complete exact-key call per timer sample. The buffered physical
 index-to-row route observed p50 `8.514 us` and p99 `22.144 us`; the

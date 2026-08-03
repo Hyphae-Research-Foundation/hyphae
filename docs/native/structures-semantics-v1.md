@@ -136,7 +136,10 @@ bounded scan contract.
 
 This bounded `HSCAN` contract is implemented across private, retained,
 current-root, and reopened execution. Its red/green and physical-pruning
-evidence are tracked separately from this normative file.
+evidence are tracked separately from this normative file. Whole-hash
+lifecycle, conflict-fence, crash, compaction, and separated durability-latency
+evidence are bound in the
+[native hash-lifecycle receipt](../gates/evidence/native-hash-lifecycle-linux-2026-08-02.md).
 
 An empty hash remains a typed hash after its last field is deleted.
 `DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and

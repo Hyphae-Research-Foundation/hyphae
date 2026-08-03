@@ -132,9 +132,17 @@ field iteration across private, retained, current-root, and reopened
 execution. Its exclusive field cursor remains valid after deletion, zero
 limit validates type and existence, and the physical route maps the cursor
 into the hash-field B+tree prefix, skips tombstones, and stops at the requested
-live count. Whole-hash delete/recreate, hash TTL, pattern/reverse scans,
-multi-field commands, field counters, model testing, the complete G3 suite,
-and G7 remain open.
+live count.
+
+The [native whole-hash lifecycle
+evidence](evidence/native-hash-lifecycle-linux-2026-08-02.md) adds typed
+`DELETE_HASH`, same-transaction recreation, a non-publishing lifecycle
+dependency that preserves disjoint-field admission, metadata/field prefix
+tombstoning, fail-closed replay, compaction, all seven singleton commit crash
+boundaries, and latency separated into private, memory-publication, and strict
+durability surfaces. Hash TTL, pattern/reverse scans, multi-field commands,
+field counters, randomized model testing, the complete G3 suite, and G7 remain
+open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -626,8 +634,8 @@ multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes with bounded
 exact-byte iteration, exact binary sets with member-granular conflicts,
 chunked-deque lists, and dual-index sorted sets with bounded bidirectional
-score/rank ranges and member-rank lookup. It still lacks whole-hash lifecycle,
-hash TTL/pattern/reverse scans/multi-field commands, set and sorted-set
+score/rank ranges, member-rank lookup, and whole-hash delete/recreate. It still
+lacks hash TTL/pattern/reverse scans/multi-field commands, set and sorted-set
 algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
 empty-expiry backoff, model tests, and a user-facing historical-retention
 policy required to close G3. Ordered cleanup,

@@ -61,6 +61,9 @@ lists use bounded packed deque chunks, and sorted sets maintain both a
 member-to-score index and a score/member ordered index. Their mutations share
 the same WAL, MVCC root, conflict table, crash recovery, and strict reopen
 authority as scalar structure values; none is serialized as one scalar value.
+Whole-hash deletion publishes an incarnation fence, tombstones metadata and
+all live field paths under one CSN, and permits checked typed recreation
+without exposing retired fields.
 Legacy single-page structure roots remain readable and writable.
 New lexical-search roots use native collection, stored-document, term, and
 posting B+tree namespaces. Direct `MATCH` prunes to each query term's posting
