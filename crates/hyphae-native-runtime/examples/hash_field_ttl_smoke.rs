@@ -17,6 +17,8 @@ const HASH_FIELDS: u32 = 2_048;
 const READ_OBSERVATIONS: usize = 200_000;
 const READ_OPERATIONS_PER_OBSERVATION: usize = 32;
 const READ_WARMUP: usize = 20_000;
+const HLEN_OBSERVATIONS: usize = 10_000;
+const HLEN_WARMUP: usize = 1_000;
 const MEMORY_COMMIT_OBSERVATIONS: usize = 32;
 const STRICT_COMMIT_OBSERVATIONS: usize = 16;
 const CLEANUP_HASHES: u32 = 16;
@@ -57,11 +59,13 @@ struct Stats {
 
 struct ReadStats {
     persistent_hget: Stats,
+    persistent_hlen: Stats,
     persistent_snapshot_ttl: Stats,
     private_ttl: Stats,
     snapshot_ttl: Stats,
     physical_ttl: Stats,
     expiring_hget: Stats,
+    due_hlen: Stats,
 }
 
 struct MutationStats {
@@ -148,12 +152,20 @@ fn measure_reads(
     database: &mut NativeDatabase,
     target: &[u8],
 ) -> Result<ReadStats, Box<dyn std::error::Error>> {
+    let persistent_fields = usize::try_from(HASH_FIELDS)?;
+    let due_fields = usize::try_from(HASH_FIELDS - 1)?;
     let persistent_hget = measure(
         READ_OBSERVATIONS,
         READ_OPERATIONS_PER_OBSERVATION,
         READ_WARMUP,
         || database.hget_latest_hash(HASH_KEY, target),
     )?;
+    let persistent_hlen = measure(HLEN_OBSERVATIONS, 1, HLEN_WARMUP, || {
+        checked_hash_len(
+            database.hlen_latest_hash_at(HASH_KEY, 101),
+            persistent_fields,
+        )
+    })?;
     let persistent_snapshot = database.snapshot(101)?;
     let persistent_snapshot_ttl = measure(
         READ_OBSERVATIONS,
@@ -192,14 +204,33 @@ fn measure_reads(
         READ_WARMUP,
         || database.hget_latest_hash_at(HASH_KEY, target, 102),
     )?;
+    let due_hlen = measure(HLEN_OBSERVATIONS, 1, HLEN_WARMUP, || {
+        checked_hash_len(
+            database.hlen_latest_hash_at(HASH_KEY, 1_000_000),
+            due_fields,
+        )
+    })?;
     Ok(ReadStats {
         persistent_hget,
+        persistent_hlen,
         persistent_snapshot_ttl,
         private_ttl,
         snapshot_ttl,
         physical_ttl,
         expiring_hget,
+        due_hlen,
     })
+}
+
+fn checked_hash_len(
+    result: Result<usize, NativeRuntimeError>,
+    expected: usize,
+) -> Result<usize, NativeRuntimeError> {
+    let actual = result?;
+    if actual != expected {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok(actual)
 }
 
 fn checked_persistent_ttl(ttl: Ttl) -> Result<Ttl, NativeRuntimeError> {
@@ -320,6 +351,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"read_observations\": {READ_OBSERVATIONS},");
     println!("  \"read_operations_per_observation\": {READ_OPERATIONS_PER_OBSERVATION},");
     println!("  \"read_warmup\": {READ_WARMUP},");
+    println!("  \"hlen_observations\": {HLEN_OBSERVATIONS},");
+    println!("  \"hlen_warmup\": {HLEN_WARMUP},");
     println!("  \"memory_commit_observations\": {MEMORY_COMMIT_OBSERVATIONS},");
     println!("  \"strict_commit_observations\": {STRICT_COMMIT_OBSERVATIONS},");
     println!("  \"cleanup_hashes\": {CLEANUP_HASHES},");
@@ -328,6 +361,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_stats(
         "persistent_hash_field_hget_physical",
         reads.persistent_hget,
+        true,
+    );
+    print_stats(
+        "persistent_hash_hlen_no_due_physical",
+        reads.persistent_hlen,
         true,
     );
     print_stats(
@@ -351,6 +389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reads.expiring_hget,
         true,
     );
+    print_stats("expiring_hash_hlen_one_due_physical", reads.due_hlen, true);
     print_stats(
         "expire_hash_field_memory_commit",
         mutations.memory_commit,
