@@ -1,7 +1,8 @@
 # Native lexical tombstone compaction evidence
 
-Status: direct-Linux implementation, recovery, corruption, scaling, and
-allocation gates pass. Hosted cross-platform and release gates are pending.
+Status: direct-Linux implementation, recovery, corruption, scaling,
+allocation, and workspace gates pass. Hosted cross-platform and release gates
+are pending.
 
 Date: 2026-08-03
 
@@ -189,15 +190,29 @@ It is not an operation-only allocation budget.
 
 ## Full funnel and hosted status
 
-Pending at this evidence draft:
+At code-and-contract commit
+`984032f20369b29b62d72541f6d117080990d0ab`, this direct-Linux chain passed:
 
-- workspace formatting, all-target/all-feature tests, Clippy, rustdoc, and
-  documentation-link checks at the final seal commit;
+```text
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc \
+  --workspace --all-features --no-deps --locked
+cargo build --workspace --all-features --locked
+python3 tools/check_documentation.py --binary target/debug/hyphae
+python3 tools/run_documentation_examples.py --binary target/debug/hyphae
+```
+
+The documentation checker reported 249 Markdown files and 12 JSON examples.
+The final evidence-only seal is rechecked by the documentation checker.
+
+Still pending:
+
 - hosted Linux stable/MSRV, macOS, Windows, bounded fuzz, dependency/license,
   packaging, release assembly, public-conformance, optional-integration, soak,
   and release-readiness checks; and
-- a draft stacked PR targeting
-  `codex/native-search-document-lifecycle`.
+- a draft stacked PR targeting `codex/native-search-document-lifecycle`.
 
 No merge is authorized by this evidence.
 

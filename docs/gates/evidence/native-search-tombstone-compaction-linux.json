@@ -1,6 +1,6 @@
 {
   "schema": "hyphae.native.search-tombstone-compaction.evidence.v1",
-  "status": "direct-linux-green-hosted-pending",
+  "status": "direct-linux-workspace-green-hosted-pending",
   "date": "2026-08-03",
   "canonical_host": "mario@10.77.10.10",
   "canonical_repository": "/home/mario/celiumsai/hyphae",
@@ -216,5 +216,19 @@
     "peak_rss_including_heaptrack": "16.33M",
     "bytes_leaked_at_exit": 544,
     "scope": "whole harness process including deterministic corpus setup, file copies, opens, validation, compaction, and cleanup; not an operation-only allocation bound"
+  },
+  "direct_linux_workspace_funnel": {
+    "code_and_contract_commit": "984032f20369b29b62d72541f6d117080990d0ab",
+    "format": "pass",
+    "workspace_all_targets_all_features_tests": "pass",
+    "workspace_clippy_deny_warnings": "pass",
+    "workspace_rustdoc_deny_warnings": "pass",
+    "workspace_build_all_features": "pass",
+    "documentation_check": {
+      "status": "pass",
+      "markdown_files": 249,
+      "json_examples": 12
+    },
+    "documentation_examples": "pass"
   }
 }
