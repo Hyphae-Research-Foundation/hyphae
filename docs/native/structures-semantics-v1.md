@@ -147,6 +147,24 @@ cardinality. `ZRANGE` uses the same signed, inclusive rank interval as
 `LRANGE`; results are ascending by score with exact member bytes as the
 deterministic tie-breaker.
 
+`ZRANK` returns a live member's zero-based position in that exact ascending
+score/member order. `ZREVRANK` returns its zero-based position after reversing
+the complete total order, so equal-score members also reverse their bytewise
+order. A missing member returns no rank; a missing sorted set or another
+structure kind remains a typed error. Private transaction, retained snapshot,
+current-root physical, and reopened execution have identical results.
+
+Current-root rank lookup validates metadata and resolves the member's canonical
+score through the membership index before targeting its exact ordered identity.
+It walks the ordered `0x0a` namespace only through that target, ignores
+tombstones without charging rank, and stops when the live target is found. It
+does not materialize the complete sorted set. A missing or non-live target
+ordered entry, visited live target under a conflicting score, malformed
+visited identity, score, or marker, or impossible cardinality relationship
+fails the complete call. `ZREVRANK` derives its result from validated
+cardinality and forward rank. This first lookup contract does not add subtree
+live counts; order-statistic acceleration remains open.
+
 Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
 rejected before mutation. Negative zero is normalized to positive zero. These
 rules make one canonical score bit pattern per accepted numeric value. An
