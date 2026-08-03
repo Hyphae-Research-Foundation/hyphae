@@ -75,6 +75,7 @@ pub(crate) enum Opcode {
     ExpireList = 36,
     ReplaceDocument = 37,
     DeleteDocument = 38,
+    CompactSearch = 39,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,6 +685,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteDocument as u8 => {
             (Opcode::DeleteDocument, EngineKind::Search)
         }
+        value if value == Opcode::CompactSearch as u8 => {
+            (Opcode::CompactSearch, EngineKind::Search)
+        }
         value if value == Opcode::CreateAnnIndex as u8 => {
             (Opcode::CreateAnnIndex, EngineKind::Search)
         }
@@ -758,7 +762,7 @@ fn validate_mutation_shape(
 ) -> Result<(), WalSemanticError> {
     if matches!(
         opcode,
-        Opcode::CompactStructure | Opcode::VacuumPageGeneration
+        Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch
     ) {
         return validate_empty_maintenance_shape(has_target, value_length, expires_at_micros, key);
     }
@@ -1436,6 +1440,50 @@ mod tests {
             validate_mutation_shape(Opcode::CompactStructure, false, 0, Some(10), b""),
             Err(WalSemanticError::InvalidBody)
         ));
+    }
+
+    #[test]
+    fn search_compaction_requires_an_empty_search_maintenance_body() {
+        assert!(validate_mutation_shape(Opcode::CompactSearch, false, 0, None, b"").is_ok());
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactSearch, true, 0, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactSearch, false, 0, None, b"key"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactSearch, false, 1, None, b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::CompactSearch, false, 0, Some(10), b""),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn search_compaction_has_stable_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let compaction = mutation(
+            EngineKind::Search,
+            Opcode::CompactSearch,
+            None,
+            b"",
+            b"",
+            None,
+        );
+        let encoded = compaction.encode()?;
+        assert_eq!(
+            encoded,
+            [
+                b'H', b'Y', b'M', b'U', b'T', b'0', b'0', b'1', 39, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, compaction);
+        Ok(())
     }
 
     #[test]

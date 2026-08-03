@@ -28,6 +28,8 @@ mod local_transaction;
 mod local_uds;
 mod model;
 #[cfg(test)]
+mod search_compaction_equivalence;
+#[cfg(test)]
 mod search_lifecycle_equivalence;
 mod set_algebra;
 #[cfg(test)]
@@ -589,6 +591,9 @@ pub enum NativeRuntimeError {
     /// Structure reachability compaction requires the indexed V2 format.
     #[error("native structure compaction requires HYSTRBT2")]
     StructureCompactionUnsupported,
+    /// Search reachability compaction requires the native inverted B+tree.
+    #[error("native search compaction requires a HYSEABT search root")]
+    SearchCompactionUnsupported,
     /// A search document or analyzed term cannot fit one canonical B+tree key.
     #[error("native search identity exceeds the canonical B+tree key limit")]
     SearchIdentityTooLarge,
@@ -1181,6 +1186,25 @@ pub struct StructureCompactionReceipt {
     /// Live entries copied byte-for-byte into the replacement root.
     pub retained_entries: usize,
     /// Canonical tombstone entries omitted from the replacement root.
+    pub dropped_tombstones: usize,
+    /// B+tree node pages reachable from the captured root.
+    pub reachable_pages_before: usize,
+    /// B+tree node pages reachable from the resulting current root.
+    pub reachable_pages_after: usize,
+    /// New B+tree pages appended for the replacement root.
+    pub pages_appended: u64,
+    /// Native maintenance commit, absent when no tombstone existed.
+    pub commit: Option<CommitReceipt>,
+}
+
+/// Result of one current-root lexical tombstone compaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchCompactionReceipt {
+    /// Complete physical entries inspected in the captured search root.
+    pub scanned_entries: usize,
+    /// Live, metadata, and ANN entries copied byte-for-byte.
+    pub retained_entries: usize,
+    /// Canonical lexical tombstones omitted from the replacement root.
     pub dropped_tombstones: usize,
     /// B+tree node pages reachable from the captured root.
     pub reachable_pages_before: usize,
@@ -3614,6 +3638,127 @@ impl NativeDatabase {
         let reachable_pages_after =
             BTree::from_root(compacted_root).reachable_page_count(&self.pages)?;
         Ok(StructureCompactionReceipt {
+            scanned_entries: plan.scanned_entries,
+            retained_entries: plan.retained_entries.len(),
+            dropped_tombstones: plan.dropped_tombstones,
+            reachable_pages_before,
+            reachable_pages_after,
+            pages_appended,
+            commit: Some(commit),
+        })
+    }
+
+    /// Rebuilds the current native search root without reachable lexical tombstones.
+    ///
+    /// Live lexical, metadata, and ANN entries are retained byte-for-byte. A
+    /// root containing no tombstones is a no-op and advances neither the WAL
+    /// nor the global CSN. Superseded pages and source blobs remain subject to
+    /// their separate retention and collection protocols.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::SearchCompactionUnsupported`] for a
+    /// legacy inline search root, or a storage, corruption, synchronization,
+    /// transaction, or durability error.
+    pub fn compact_search(
+        &mut self,
+        durability: DurabilityClass,
+    ) -> Result<SearchCompactionReceipt, NativeRuntimeError> {
+        self.compact_search_at(durability, None)
+    }
+
+    fn compact_search_at(
+        &mut self,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<SearchCompactionReceipt, NativeRuntimeError> {
+        if self.search_format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::SearchCompactionUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_SEARCH) else {
+            return Ok(SearchCompactionReceipt {
+                scanned_entries: 0,
+                retained_entries: 0,
+                dropped_tombstones: 0,
+                reachable_pages_before: 0,
+                reachable_pages_after: 0,
+                pages_appended: 0,
+                commit: None,
+            });
+        };
+        let plan = plan_search_compaction(&self.pages, &self.blobs, root)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        ann_store::load(&self.pages, Some(root), &catalog)?;
+        let reachable_pages_before = BTree::from_root(root).reachable_page_count(&self.pages)?;
+        if plan.dropped_tombstones == 0 {
+            return Ok(SearchCompactionReceipt {
+                scanned_entries: plan.scanned_entries,
+                retained_entries: plan.retained_entries.len(),
+                dropped_tombstones: 0,
+                reachable_pages_before,
+                reachable_pages_after: reachable_pages_before,
+                pages_appended: 0,
+                commit: None,
+            });
+        }
+
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        if root_transaction.base_roots() != snapshot.roots() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let pages_before = self.pages.page_count();
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState::default(),
+                mutations: vec![Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::CompactSearch,
+                    target: None,
+                    key: Vec::new(),
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, false, true],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalSearchCompaction,
+                delta: None,
+            },
+        };
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+        let pages_appended = self
+            .pages
+            .page_count()
+            .checked_sub(pages_before)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let compacted_root = self
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let reachable_pages_after =
+            BTree::from_root(compacted_root).reachable_page_count(&self.pages)?;
+        Ok(SearchCompactionReceipt {
             scanned_entries: plan.scanned_entries,
             retained_entries: plan.retained_entries.len(),
             dropped_tombstones: plan.dropped_tombstones,
@@ -8317,6 +8462,7 @@ enum NativeWriteBatchMode {
     PhysicalAllEngineDelta,
     PhysicalStructureExpiry,
     PhysicalStructureCompaction,
+    PhysicalSearchCompaction,
 }
 
 #[derive(Debug)]
@@ -11602,7 +11748,7 @@ fn apply_mutations_to_state(
             | Opcode::DeleteSortedSetMember => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
-            Opcode::CompactStructure | Opcode::VacuumPageGeneration => {
+            Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch => {
                 validate_maintenance_mutation(mutation)?;
             }
             Opcode::CreateIndex
@@ -11687,6 +11833,7 @@ fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntim
     let expected_engine = match mutation.opcode {
         Opcode::CompactStructure => EngineKind::Structure,
         Opcode::VacuumPageGeneration => EngineKind::Kernel,
+        Opcode::CompactSearch => EngineKind::Search,
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     };
     if mutation.engine != expected_engine
@@ -11859,6 +12006,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 identity
             }
             Opcode::CompactStructure => vec![5],
+            Opcode::CompactSearch => vec![6],
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
@@ -12393,6 +12541,7 @@ fn commit_engine_roots(
             commit_csn,
             &SearchMutationContext {
                 format: search_format,
+                mode: batch.mode,
                 blobs,
                 catalog: &batch.state.catalog,
                 state: &batch.state.search,
@@ -12946,6 +13095,34 @@ fn validate_write_batch_shape(
                 && valid_formats
                 && valid_state
                 && batch.dirty == [false, false, true, false]
+                && valid_mutations
+            {
+                Ok(())
+            } else {
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            }
+        }
+        NativeWriteBatchMode::PhysicalSearchCompaction => {
+            let valid_roots = roots.iter().all(Option::is_some);
+            let valid_formats = search_format == SearchFormat::InvertedBTreeV1
+                && batch.search_format == SearchFormat::InvertedBTreeV1
+                && batch.structure_format == structure_format;
+            let valid_state = batch.state == MaterializedState::default();
+            let valid_mutations = matches!(
+                batch.mutations.as_slice(),
+                [Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::CompactSearch,
+                    target: None,
+                    key,
+                    value,
+                    expires_at_micros: None,
+                }] if key.is_empty() && value.is_empty()
+            );
+            if valid_roots
+                && valid_formats
+                && valid_state
+                && batch.dirty == [false, false, false, true]
                 && valid_mutations
             {
                 Ok(())
@@ -16515,6 +16692,78 @@ fn compact_structure_tree(
     Ok(compacted)
 }
 
+struct SearchCompactionPlan {
+    state: SearchState,
+    scanned_entries: usize,
+    retained_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    dropped_tombstones: usize,
+}
+
+fn plan_search_compaction(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<SearchCompactionPlan, NativeRuntimeError> {
+    let state = load_search_state_root(pages, blobs, root)?;
+    let tree = BTree::from_root(root);
+    let format = physical_search_format(pages, tree)?;
+    let entries = tree.scan(pages)?;
+    let scanned_entries = entries.len();
+    let mut retained_entries = Vec::with_capacity(scanned_entries);
+    let mut dropped_tombstones = 0_usize;
+    for (key, value) in entries {
+        if compactable_search_tombstone(format, &key, &value) {
+            dropped_tombstones = dropped_tombstones
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        } else {
+            retained_entries.push((key, value));
+        }
+    }
+    Ok(SearchCompactionPlan {
+        state,
+        scanned_entries,
+        retained_entries,
+        dropped_tombstones,
+    })
+}
+
+fn compactable_search_tombstone(format: PhysicalSearchFormat, key: &[u8], value: &[u8]) -> bool {
+    if format != PhysicalSearchFormat::V2 {
+        return false;
+    }
+    match key.first().copied() {
+        Some(SEARCH_DOCUMENT_PREFIX) => is_search_document_tombstone(value),
+        Some(SEARCH_TERM_META_PREFIX) => is_search_term_metadata_tombstone(value),
+        Some(SEARCH_POSTING_PREFIX) => is_search_posting_tombstone(value),
+        _ => false,
+    }
+}
+
+fn compact_search_tree(
+    pages: &mut PageStore,
+    blobs: &BlobStore,
+    root: Option<PageId>,
+    creating_csn: Csn,
+) -> Result<BTree, NativeRuntimeError> {
+    let root = root.ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let plan = plan_search_compaction(pages, blobs, root)?;
+    if plan.dropped_tombstones == 0 {
+        return Ok(BTree::from_root(root));
+    }
+    let compacted = BTree::empty()
+        .upsert_sorted_batch(pages, creating_csn, plan.retained_entries)?
+        .tree;
+    let compacted_root = compacted
+        .root()
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let compacted_state = load_search_state_root(pages, blobs, compacted_root)?;
+    if compacted_state != plan.state {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    Ok(compacted)
+}
+
 fn search_tree_after_mutations(
     pages: &mut PageStore,
     blobs: &BlobStore,
@@ -16852,6 +17101,7 @@ fn search_term_frequencies(text: &str) -> Result<(u64, SearchTermFrequencies), N
 
 struct SearchMutationContext<'a> {
     format: SearchFormat,
+    mode: NativeWriteBatchMode,
     blobs: &'a BlobStore,
     catalog: &'a CatalogState,
     state: &'a SearchState,
@@ -16865,6 +17115,12 @@ fn search_root_after_mutations(
     creating_csn: Csn,
     context: &SearchMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
+    if context.mode == NativeWriteBatchMode::PhysicalSearchCompaction {
+        if context.format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        return Ok(compact_search_tree(pages, context.blobs, root, creating_csn)?.root());
+    }
     match context.format {
         SearchFormat::InlineStateV1 => {
             if context.mutations.iter().any(|mutation| {
@@ -19387,6 +19643,14 @@ fn load_search_state(
     let Some(root) = roots.root(SLOT_SEARCH) else {
         return Ok(SearchState::default());
     };
+    load_search_state_root(pages, blobs, root)
+}
+
+fn load_search_state_root(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<SearchState, NativeRuntimeError> {
     let page = pages.read(root)?;
     if page.kind() == PageKind::SearchDelta {
         return Ok(SearchState::decode(page.payload())?);
