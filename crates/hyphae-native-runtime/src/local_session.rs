@@ -3,12 +3,13 @@
 use thiserror::Error;
 
 use crate::{
-    FrameKind, LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LocalFailureCode,
-    LocalOperationCodecError, LocalStructureCommitReceipt, LocalStructureRequest,
-    LocalStructureSetRequest, LocalTransportError, LocalTtlValue, NativeDatabase,
-    NativeSchedulerClock, Ttl, UdsFrameConnection, decode_local_structure_request,
-    encode_local_failure, encode_local_structure_commit_receipt, encode_local_ttl,
-    encode_local_value,
+    FrameKind, LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE,
+    LOCAL_SEARCH_RESULTS_HEADER_SIZE, LocalFailureCode, LocalOperationCodecError,
+    LocalSearchCodecError, LocalSearchMatchRequest, LocalStructureCommitReceipt,
+    LocalStructureRequest, LocalStructureSetRequest, LocalTransportError, LocalTtlValue,
+    NativeDatabase, NativeSchedulerClock, Ttl, UdsFrameConnection, decode_local_search_match,
+    decode_local_structure_request, encode_local_failure, encode_local_search_match_results,
+    encode_local_structure_commit_receipt, encode_local_ttl, encode_local_value,
 };
 
 /// Failure of one serial engine-bearing local session.
@@ -28,8 +29,8 @@ pub enum LocalSessionError {
     InvalidHandshake,
 }
 
-/// Serial local session exposing scalar `GET`, `SET`, and `TTL`.
-pub struct LocalStructureSession<'database, Clock: NativeSchedulerClock + ?Sized> {
+/// Serial local session exposing scalar operations and lexical `MATCH`.
+pub struct LocalDataSession<'database, Clock: NativeSchedulerClock + ?Sized> {
     database: &'database mut NativeDatabase,
     clock: &'database Clock,
     request_buffer: Vec<u8>,
@@ -37,7 +38,7 @@ pub struct LocalStructureSession<'database, Clock: NativeSchedulerClock + ?Sized
     echo_buffer: Vec<u8>,
 }
 
-impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalStructureSession<'database, Clock> {
+impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database, Clock> {
     /// Creates one reusable serial session over the supplied database and
     /// logical-time authority.
     pub fn new(database: &'database mut NativeDatabase, clock: &'database Clock) -> Self {
@@ -50,7 +51,7 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalStructureSession<'dat
         }
     }
 
-    /// Serves one minimal `HELLO`, `PING`/structure, `CLOSE` session.
+    /// Serves one minimal `HELLO`, `PING`/structure/search, `CLOSE` session.
     ///
     /// Request-local codec and engine failures are returned to the peer and
     /// do not terminate the session.
@@ -84,6 +85,11 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalStructureSession<'dat
                         request_id,
                         maximum_payload,
                     )?;
+                }
+                FrameKind::Search => {
+                    self.request_buffer.clear();
+                    self.request_buffer.extend_from_slice(frame.payload);
+                    self.serve_search_request(connection, stream_id, request_id, maximum_payload)?;
                 }
                 FrameKind::Close => {
                     self.echo_buffer.clear();
@@ -274,6 +280,74 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalStructureSession<'dat
                 LocalFailureCode::ResponseTooLarge,
             );
         }
+        connection.send(FrameKind::Value, stream_id, request_id, response)?;
+        Ok(())
+    }
+
+    fn serve_search_request(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+    ) -> Result<(), LocalSessionError> {
+        let request_buffer = std::mem::take(&mut self.request_buffer);
+        let result = match decode_local_search_match(&request_buffer) {
+            Ok(request) => {
+                self.serve_search_match(connection, stream_id, request_id, maximum_payload, request)
+            }
+            Err(_) => self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::InvalidRequest,
+            ),
+        };
+        self.request_buffer = request_buffer;
+        result
+    }
+
+    fn serve_search_match(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+        request: LocalSearchMatchRequest<'_>,
+    ) -> Result<(), LocalSessionError> {
+        if maximum_payload < LOCAL_SEARCH_RESULTS_HEADER_SIZE {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::ResponseTooLarge,
+            );
+        }
+        let Ok((visible_csn, hits)) =
+            self.database
+                .match_latest_text_with_csn(request.index, request.query, request.limit)
+        else {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        };
+        let response = match encode_local_search_match_results(
+            &mut self.response_buffer,
+            visible_csn,
+            &hits,
+            maximum_payload,
+        ) {
+            Ok(response) => response,
+            Err(LocalSearchCodecError::PayloadTooLarge) => {
+                return self.send_failure(
+                    connection,
+                    stream_id,
+                    request_id,
+                    LocalFailureCode::ResponseTooLarge,
+                );
+            }
+            Err(_) => {
+                return self.send_engine_failure(connection, stream_id, request_id);
+            }
+        };
         connection.send(FrameKind::Value, stream_id, request_id, response)?;
         Ok(())
     }

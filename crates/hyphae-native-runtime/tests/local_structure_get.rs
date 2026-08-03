@@ -120,7 +120,7 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        FrameKind, LocalSessionError, LocalStructureSession, NativeDatabase, NativeSchedulerClock,
+        FrameKind, LocalDataSession, LocalSessionError, NativeDatabase, NativeSchedulerClock,
         UdsFrameConnection, UdsFrameListener,
     };
     use hyphae_native_types::DurabilityClass;
@@ -224,7 +224,7 @@ mod unix {
             move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
                 let mut connection = listener.accept()?;
                 let clock = CountingClock::new(100);
-                let mut session = LocalStructureSession::new(&mut database, &clock);
+                let mut session = LocalDataSession::new(&mut database, &clock);
                 session.serve(&mut connection)?;
                 listener.close()?;
                 Ok(clock.samples.load(Ordering::Relaxed))
@@ -277,7 +277,7 @@ mod unix {
             LocalFailureCode::ResponseTooLarge
         );
 
-        client.send(FrameKind::Search, 10, 9, b"")?;
+        client.send(FrameKind::Prepare, 10, 9, b"")?;
         let unexpected = receive_response(&mut client, FrameKind::Failure, 10, 9)?;
         assert_eq!(
             decode_local_failure(&unexpected)?,
@@ -311,7 +311,7 @@ mod unix {
             let result = (|| -> Result<(), LocalSessionError> {
                 let mut connection = listener.accept()?;
                 let clock = CountingClock::new(0);
-                LocalStructureSession::new(&mut database, &clock).serve(&mut connection)
+                LocalDataSession::new(&mut database, &clock).serve(&mut connection)
             })();
             let _ignored = listener.close();
             matches!(result, Err(LocalSessionError::PayloadBoundTooSmall))
@@ -336,7 +336,7 @@ mod unix {
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
             let clock = CountingClock::new(0);
-            let result = LocalStructureSession::new(&mut database, &clock).serve(&mut connection);
+            let result = LocalDataSession::new(&mut database, &clock).serve(&mut connection);
             listener.close()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                 matches!(result, Err(LocalSessionError::InvalidHandshake)),

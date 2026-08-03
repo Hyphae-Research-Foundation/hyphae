@@ -353,7 +353,7 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        FrameKind, LocalStructureSession, LocalValue, NativeDatabase, NativeSchedulerClock, Ttl,
+        FrameKind, LocalDataSession, LocalValue, NativeDatabase, NativeSchedulerClock, Ttl,
         UdsFrameConnection, UdsFrameListener, decode_local_failure,
         decode_local_structure_commit_receipt, decode_local_ttl, decode_local_value,
         encode_local_structure_get, encode_local_structure_set, encode_local_structure_ttl,
@@ -634,7 +634,7 @@ mod unix {
         let listener = UdsFrameListener::bind(&socket, MAXIMUM_PAYLOAD)?;
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
-            let mut session = LocalStructureSession::new(&mut database, server_clock.as_ref());
+            let mut session = LocalDataSession::new(&mut database, server_clock.as_ref());
             session.serve(&mut connection)?;
             listener.close()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -688,8 +688,7 @@ mod unix {
         let listener = UdsFrameListener::bind(&socket, 20)?;
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
-            LocalStructureSession::new(&mut database, server_clock.as_ref())
-                .serve(&mut connection)?;
+            LocalDataSession::new(&mut database, server_clock.as_ref()).serve(&mut connection)?;
             listener.close()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });

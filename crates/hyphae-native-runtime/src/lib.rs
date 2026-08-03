@@ -19,6 +19,7 @@ mod list_lifecycle_equivalence;
 mod list_ttl_equivalence;
 mod local_operation;
 mod local_protocol;
+mod local_search;
 #[cfg(unix)]
 mod local_session;
 #[cfg(unix)]
@@ -67,8 +68,14 @@ pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE, LocalFrameIo,
     LocalProtocolError, LocalTransportError, decode_frame, encode_frame,
 };
+pub use local_search::{
+    LOCAL_SEARCH_MATCH_HEADER_SIZE, LOCAL_SEARCH_RESULTS_HEADER_SIZE, LocalSearchCodecError,
+    LocalSearchMatchHit, LocalSearchMatchRequest, LocalSearchMatchResults, MAX_LOCAL_SEARCH_HITS,
+    MAX_LOCAL_SEARCH_QUERY_BYTES, decode_local_search_match, decode_local_search_match_results,
+    encode_local_search_match, encode_local_search_match_results,
+};
 #[cfg(unix)]
-pub use local_session::{LocalSessionError, LocalStructureSession};
+pub use local_session::{LocalDataSession, LocalSessionError};
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use set_algebra::{
@@ -6168,10 +6175,27 @@ impl NativeDatabase {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
+        self.match_latest_text_with_csn(index, query, limit)
+            .map(|(_, hits)| hits)
+    }
+
+    pub(crate) fn match_latest_text_with_csn(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<(Csn, Vec<MatchHit>), NativeRuntimeError> {
         if self.search_format == SearchFormat::InlineStateV1 {
-            return self.snapshot(0)?.match_text(index, query, limit);
+            let snapshot = self.snapshot(0)?;
+            let visible_csn = snapshot
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return Ok((visible_csn, snapshot.match_text(index, query, limit)?));
         }
         let snapshot = self.coordinator.snapshot(0)?;
+        let visible_csn = snapshot
+            .visible_csn
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let root = snapshot
             .roots()
             .root(SLOT_SEARCH)
@@ -6188,7 +6212,7 @@ impl NativeDatabase {
             decode_search_index_metadata(metadata.bytes())?;
         let query_tokens: BTreeSet<String> = analyze(query).into_iter().collect();
         if query_tokens.is_empty() || limit == 0 || document_count == 0 {
-            return Ok(Vec::new());
+            return Ok((visible_csn, Vec::new()));
         }
         let document_count_f64 = search_count_f64(document_count)?;
         let average_length = search_count_f64(total_document_terms)? / document_count_f64;
@@ -6254,7 +6278,7 @@ impl NativeDatabase {
                 .then_with(|| left.document_id.cmp(&right.document_id))
         });
         hits.truncate(limit);
-        Ok(hits)
+        Ok((visible_csn, hits))
     }
 
     /// Executes approximate vector search against the current committed

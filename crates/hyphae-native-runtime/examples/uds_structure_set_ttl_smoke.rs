@@ -18,7 +18,7 @@ mod unix {
     };
 
     use hyphae_native_runtime::{
-        FrameKind, LocalStructureCommitReceipt, LocalStructureSession, LocalTtlValue, LocalValue,
+        FrameKind, LocalDataSession, LocalStructureCommitReceipt, LocalTtlValue, LocalValue,
         NativeDatabase, NativeSchedulerClock, UdsFrameConnection, UdsFrameListener,
         decode_local_structure_commit_receipt, decode_local_ttl, decode_local_value,
         encode_local_structure_get, encode_local_structure_set, encode_local_structure_ttl,
@@ -163,7 +163,7 @@ mod unix {
         let server = thread::spawn(move || {
             let mut connection = listener.accept()?;
             let clock = FixedClock;
-            LocalStructureSession::new(&mut database, &clock).serve(&mut connection)?;
+            LocalDataSession::new(&mut database, &clock).serve(&mut connection)?;
             listener.close()?;
             Ok(())
         });
