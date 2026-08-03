@@ -1136,6 +1136,7 @@ fn execute_secondary_index_range_snapshot(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         range,
         limit,
@@ -1162,28 +1163,19 @@ fn execute_secondary_index_range_snapshot(
     if index_state.layout != SecondaryIndexLayout::OrderedV2 || index_state.relation != *table {
         return Err(SqlError::InvalidCatalogObject);
     }
+    let index_columns = secondary_index_column_indices(relation, index_definition)?;
+    let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
     for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
         for primary_key in primary_keys {
             let stored = snapshot
                 .select(*table, primary_key)
                 .ok_or(SqlError::InvalidStoredRow)?;
-            validate_secondary_index_row(
-                relation,
-                index_definition,
-                index_key,
-                primary_key,
-                stored,
-            )?;
-            if let Some(row) = materialize_filtered_row(
-                relation,
-                projection,
-                false,
-                primary_key,
-                stored,
-                Some(filter),
-                parameters,
-            )? {
+            let values = decode_complete_row(relation, false, primary_key, stored)?;
+            validate_secondary_index_values(relation, &index_columns, index_key, &values)?;
+            if let Some(row) =
+                materialize_decoded_row(relation, projection, &values, row_filter, parameters)?
+            {
                 rows.push(row);
                 if rows.len() == *limit {
                     return Ok(rows_result(output_columns, rows));
@@ -1208,6 +1200,7 @@ fn execute_secondary_index_range_latest(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         range,
         limit,
@@ -1225,6 +1218,8 @@ fn execute_secondary_index_range_latest(
     if key_range_is_empty(&lower, &upper) || *limit == 0 {
         return Ok(empty_rows_result(output_columns));
     }
+    let index_columns = secondary_index_column_indices(relation, index_definition)?;
+    let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
     database
         .visit_secondary_index_range_at(
@@ -1236,22 +1231,11 @@ fn execute_secondary_index_range_latest(
                 if matched_table != *table {
                     return Err(SqlError::InvalidCatalogObject);
                 }
-                validate_secondary_index_row(
-                    relation,
-                    index_definition,
-                    index_key,
-                    primary_key,
-                    stored,
-                )?;
-                if let Some(row) = materialize_filtered_row(
-                    relation,
-                    projection,
-                    false,
-                    primary_key,
-                    stored,
-                    Some(filter),
-                    parameters,
-                )? {
+                let values = decode_complete_row(relation, false, primary_key, stored)?;
+                validate_secondary_index_values(relation, &index_columns, index_key, &values)?;
+                if let Some(row) =
+                    materialize_decoded_row(relation, projection, &values, row_filter, parameters)?
+                {
                     rows.push(row);
                     if rows.len() == *limit {
                         return Ok(ControlFlow::Break(()));
@@ -3234,9 +3218,9 @@ fn execute_select(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         access,
-        ..
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -3246,6 +3230,7 @@ fn execute_select(
         definition,
         projection: &projection,
         filter: filter.as_ref(),
+        residual,
         parameters,
     };
     let rows = match access {
@@ -3306,6 +3291,7 @@ struct TransactionSelectContext<'context> {
     definition: &'context RelationDefinition,
     projection: &'context [usize],
     filter: Option<&'context BoundFilterExpression>,
+    residual: bool,
     parameters: &'context [SqlValue],
 }
 
@@ -3413,6 +3399,8 @@ impl TransactionSelectContext<'_> {
         {
             return Err(SqlError::InvalidCatalogObject);
         }
+        let index_columns = secondary_index_column_indices(self.definition, definition)?;
+        let row_filter = if self.residual { self.filter } else { None };
         let mut rows = Vec::with_capacity(limit.min(256));
         for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
             for primary_key in primary_keys {
@@ -3420,20 +3408,18 @@ impl TransactionSelectContext<'_> {
                     .transaction
                     .select(self.table, primary_key)
                     .ok_or(SqlError::InvalidStoredRow)?;
-                validate_secondary_index_row(
+                let values = decode_complete_row(self.definition, false, primary_key, stored)?;
+                validate_secondary_index_values(
                     self.definition,
-                    definition,
+                    &index_columns,
                     index_key,
-                    primary_key,
-                    stored,
+                    &values,
                 )?;
-                if let Some(row) = materialize_filtered_row(
+                if let Some(row) = materialize_decoded_row(
                     self.definition,
                     self.projection,
-                    false,
-                    primary_key,
-                    stored,
-                    self.filter,
+                    &values,
+                    row_filter,
                     self.parameters,
                 )? {
                     rows.push(row);
@@ -5299,23 +5285,28 @@ fn bind_secondary_index_prefix_upper(
     }
 }
 
-fn validate_secondary_index_row(
+fn validate_secondary_index_values(
     relation: &RelationDefinition,
-    index: &SecondaryIndexDefinition,
+    index_columns: &[usize],
     stored_index_key: &[u8],
-    primary_key: &[u8],
-    stored: &[u8],
+    values: &[SqlValue],
 ) -> Result<(), SqlError> {
-    let values = decode_complete_row(relation, false, primary_key, stored)?;
-    let mut actual_index_key = Vec::new();
-    for column in secondary_index_column_indices(relation, index)? {
-        actual_index_key.extend_from_slice(
-            &values[column]
-                .encode_ordered_component(&relation.columns[column].logical_type)
-                .map_err(|_| SqlError::InvalidStoredRow)?,
-        );
+    let mut offset = 0_usize;
+    for &column in index_columns {
+        let component = values
+            .get(column)
+            .ok_or(SqlError::InvalidStoredRow)?
+            .encode_ordered_component(&relation.columns[column].logical_type)
+            .map_err(|_| SqlError::InvalidStoredRow)?;
+        let end = offset
+            .checked_add(component.len())
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if stored_index_key.get(offset..end) != Some(component.as_slice()) {
+            return Err(SqlError::InvalidStoredRow);
+        }
+        offset = end;
     }
-    if actual_index_key == stored_index_key {
+    if offset == stored_index_key.len() {
         Ok(())
     } else {
         Err(SqlError::InvalidStoredRow)
@@ -5562,8 +5553,18 @@ fn materialize_filtered_row(
     parameters: &[SqlValue],
 ) -> Result<Option<Vec<SqlValue>>, SqlError> {
     let values = decode_complete_row(definition, legacy_binary, primary_key, stored)?;
+    materialize_decoded_row(definition, projection, &values, filter, parameters)
+}
+
+fn materialize_decoded_row(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    values: &[SqlValue],
+    filter: Option<&BoundFilterExpression>,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<SqlValue>>, SqlError> {
     if let Some(expression) = filter
-        && evaluate_filter(definition, expression, &values, parameters)? != TruthValue::True
+        && evaluate_filter(definition, expression, values, parameters)? != TruthValue::True
     {
         return Ok(None);
     }
