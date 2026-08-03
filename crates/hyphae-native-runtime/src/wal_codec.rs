@@ -69,6 +69,8 @@ pub(crate) enum Opcode {
     DeleteHash = 30,
     ExpireHash = 31,
     ExpireHashField = 32,
+    ExpireSet = 33,
+    DeleteSet = 34,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -640,6 +642,8 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteSetMember as u8 => {
             (Opcode::DeleteSetMember, EngineKind::Structure)
         }
+        value if value == Opcode::ExpireSet as u8 => (Opcode::ExpireSet, EngineKind::Structure),
+        value if value == Opcode::DeleteSet as u8 => (Opcode::DeleteSet, EngineKind::Structure),
         value if value == Opcode::CreateList as u8 => (Opcode::CreateList, EngineKind::Structure),
         value if value == Opcode::PushListHead as u8 => {
             (Opcode::PushListHead, EngineKind::Structure)
@@ -759,6 +763,8 @@ fn validate_mutation_shape(
         | Opcode::CreateSet
         | Opcode::AddSetMember
         | Opcode::DeleteSetMember
+        | Opcode::ExpireSet
+        | Opcode::DeleteSet
         | Opcode::CreateList
         | Opcode::PushListHead
         | Opcode::PushListTail
@@ -795,6 +801,7 @@ fn validate_mutation_shape(
         | Opcode::CreateSet
         | Opcode::AddSetMember
         | Opcode::DeleteSetMember
+        | Opcode::DeleteSet
         | Opcode::CreateList
         | Opcode::CreateSortedSet
         | Opcode::DeleteSortedSetMember
@@ -805,7 +812,7 @@ fn validate_mutation_shape(
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::ExpireHash | Opcode::ExpireHashField
+        Opcode::ExpireHash | Opcode::ExpireHashField | Opcode::ExpireSet
             if value_length != 0 || expires_at_micros.is_none() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -1139,6 +1146,8 @@ mod tests {
             structure_mutation(Opcode::CreateSet, b"set", b"", None),
             structure_mutation(Opcode::AddSetMember, &set_member, b"", None),
             structure_mutation(Opcode::DeleteSetMember, &set_member, b"", None),
+            structure_mutation(Opcode::ExpireSet, b"set", b"", Some(42)),
+            structure_mutation(Opcode::DeleteSet, b"retired-set", b"", None),
             structure_mutation(Opcode::CreateList, b"list", b"", None),
             structure_mutation(Opcode::PushListHead, b"list", b"head", None),
             structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
@@ -1205,7 +1214,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 26);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 28);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -1270,6 +1279,24 @@ mod tests {
             validate_mutation_shape(Opcode::ExpireHashField, false, 0, Some(10), b"\0"),
             Err(WalSemanticError::InvalidBody)
         ));
+    }
+
+    #[test]
+    fn set_lifecycle_mutations_require_canonical_shapes() {
+        assert!(
+            validate_mutation_shape(Opcode::ExpireSet, false, 0, Some(i64::MIN), b"set").is_ok()
+        );
+        assert!(validate_mutation_shape(Opcode::DeleteSet, false, 0, None, b"set").is_ok());
+        for result in [
+            validate_mutation_shape(Opcode::ExpireSet, true, 0, Some(10), b"set"),
+            validate_mutation_shape(Opcode::ExpireSet, false, 1, Some(10), b"set"),
+            validate_mutation_shape(Opcode::ExpireSet, false, 0, None, b"set"),
+            validate_mutation_shape(Opcode::DeleteSet, true, 0, None, b"set"),
+            validate_mutation_shape(Opcode::DeleteSet, false, 1, None, b"set"),
+            validate_mutation_shape(Opcode::DeleteSet, false, 0, Some(10), b"set"),
+        ] {
+            assert!(matches!(result, Err(WalSemanticError::InvalidBody)));
+        }
     }
 
     #[test]

@@ -152,13 +152,34 @@ impl SetAlgebraResult {
 
 pub(crate) fn evaluate_materialized_set_algebra(
     sets: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_expiries: &BTreeMap<Vec<u8>, i64>,
+    logical_time_micros: i64,
     request: &SetAlgebraRequest,
 ) -> Result<SetAlgebraResult, SetAlgebraError> {
     match request.operation() {
-        SetAlgebraOperation::Union => materialized_union(sets, request),
-        SetAlgebraOperation::Intersection => materialized_intersection(sets, request),
-        SetAlgebraOperation::Difference => materialized_difference(sets, request),
+        SetAlgebraOperation::Union => {
+            materialized_union(sets, set_expiries, logical_time_micros, request)
+        }
+        SetAlgebraOperation::Intersection => {
+            materialized_intersection(sets, set_expiries, logical_time_micros, request)
+        }
+        SetAlgebraOperation::Difference => {
+            materialized_difference(sets, set_expiries, logical_time_micros, request)
+        }
     }
+}
+
+fn visible_set<'sets>(
+    sets: &'sets BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_expiries: &BTreeMap<Vec<u8>, i64>,
+    logical_time_micros: i64,
+    key: &[u8],
+) -> Option<&'sets BTreeSet<Vec<u8>>> {
+    set_expiries
+        .get(key)
+        .is_none_or(|expiry| *expiry > logical_time_micros)
+        .then(|| sets.get(key))
+        .flatten()
 }
 
 pub(crate) struct SetAlgebraExecution<'request> {
@@ -206,11 +227,13 @@ impl<'request> SetAlgebraExecution<'request> {
 
 fn materialized_union(
     sets: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_expiries: &BTreeMap<Vec<u8>, i64>,
+    logical_time_micros: i64,
     request: &SetAlgebraRequest,
 ) -> Result<SetAlgebraResult, SetAlgebraError> {
     let mut execution = SetAlgebraExecution::new(request);
     for key in request.keys() {
-        if let Some(members) = sets.get(key) {
+        if let Some(members) = visible_set(sets, set_expiries, logical_time_micros, key) {
             for member in members {
                 execution.consume_visit()?;
                 execution.insert(member)?;
@@ -222,11 +245,13 @@ fn materialized_union(
 
 fn materialized_intersection(
     sets: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_expiries: &BTreeMap<Vec<u8>, i64>,
+    logical_time_micros: i64,
     request: &SetAlgebraRequest,
 ) -> Result<SetAlgebraResult, SetAlgebraError> {
     let mut sources = Vec::with_capacity(request.keys().len());
     for (position, key) in request.keys().iter().enumerate() {
-        let Some(members) = sets.get(key) else {
+        let Some(members) = visible_set(sets, set_expiries, logical_time_micros, key) else {
             return Ok(SetAlgebraExecution::new(request).finish());
         };
         if members.is_empty() {
@@ -247,8 +272,7 @@ fn materialized_intersection(
                 continue;
             }
             execution.consume_visit()?;
-            if !sets
-                .get(key)
+            if !visible_set(sets, set_expiries, logical_time_micros, key)
                 .is_some_and(|members| members.contains(member))
             {
                 present_everywhere = false;
@@ -264,9 +288,12 @@ fn materialized_intersection(
 
 fn materialized_difference(
     sets: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    set_expiries: &BTreeMap<Vec<u8>, i64>,
+    logical_time_micros: i64,
     request: &SetAlgebraRequest,
 ) -> Result<SetAlgebraResult, SetAlgebraError> {
-    let Some(first) = sets.get(&request.keys()[0]) else {
+    let Some(first) = visible_set(sets, set_expiries, logical_time_micros, &request.keys()[0])
+    else {
         return Ok(SetAlgebraExecution::new(request).finish());
     };
     let mut execution = SetAlgebraExecution::new(request);
@@ -275,8 +302,7 @@ fn materialized_difference(
         let mut subtracted = false;
         for key in &request.keys()[1..] {
             execution.consume_visit()?;
-            if sets
-                .get(key)
+            if visible_set(sets, set_expiries, logical_time_micros, key)
                 .is_some_and(|members| members.contains(member))
             {
                 subtracted = true;

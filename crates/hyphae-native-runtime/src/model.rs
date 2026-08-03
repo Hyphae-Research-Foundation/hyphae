@@ -476,6 +476,7 @@ pub(crate) struct StructureState {
     pub(crate) hash_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) hash_field_expiries: BTreeMap<(Vec<u8>, Vec<u8>), i64>,
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    pub(crate) set_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
 }
@@ -1025,20 +1026,104 @@ impl StructureState {
         true
     }
 
+    pub(crate) fn delete_set(&mut self, key: &[u8]) -> bool {
+        self.set_expiries.remove(key);
+        self.sets.remove(key).is_some()
+    }
+
+    pub(crate) fn set_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.sets.contains_key(key)
+            && self
+                .set_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
+    }
+
+    pub(crate) fn set_is_expired(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.sets.contains_key(key)
+            && self
+                .set_expiries
+                .get(key)
+                .is_some_and(|expiry| *expiry <= logical_time_micros)
+    }
+
+    pub(crate) fn set_expiry(&self, key: &[u8]) -> Option<i64> {
+        self.set_expiries.get(key).copied()
+    }
+
+    pub(crate) fn expire_set(
+        &mut self,
+        key: &[u8],
+        expires_at_micros: i64,
+        logical_time_micros: i64,
+    ) -> bool {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return false;
+        }
+        self.set_set_expiry(key, expires_at_micros)
+    }
+
+    pub(crate) fn set_set_expiry(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.sets.contains_key(key) {
+            return false;
+        }
+        self.set_expiries.insert(key.to_vec(), expires_at_micros);
+        true
+    }
+
     pub(crate) fn sadd(&mut self, key: &[u8], member: Vec<u8>) -> Option<bool> {
         self.sets.get_mut(key).map(|members| members.insert(member))
+    }
+
+    pub(crate) fn sadd_at(
+        &mut self,
+        key: &[u8],
+        member: Vec<u8>,
+        logical_time_micros: i64,
+    ) -> Option<bool> {
+        self.set_is_visible(key, logical_time_micros)
+            .then(|| self.sadd(key, member))
+            .flatten()
     }
 
     pub(crate) fn sismember(&self, key: &[u8], member: &[u8]) -> Option<bool> {
         self.sets.get(key).map(|members| members.contains(member))
     }
 
+    pub(crate) fn sismember_at(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<bool> {
+        self.set_is_visible(key, logical_time_micros)
+            .then(|| self.sismember(key, member))
+            .flatten()
+    }
+
     pub(crate) fn srem(&mut self, key: &[u8], member: &[u8]) -> Option<bool> {
         self.sets.get_mut(key).map(|members| members.remove(member))
     }
 
+    pub(crate) fn srem_at(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<bool> {
+        self.set_is_visible(key, logical_time_micros)
+            .then(|| self.srem(key, member))
+            .flatten()
+    }
+
     pub(crate) fn scard(&self, key: &[u8]) -> Option<usize> {
         self.sets.get(key).map(BTreeSet::len)
+    }
+
+    pub(crate) fn scard_at(&self, key: &[u8], logical_time_micros: i64) -> Option<usize> {
+        self.set_is_visible(key, logical_time_micros)
+            .then(|| self.scard(key))
+            .flatten()
     }
 
     pub(crate) fn create_list(&mut self, key: Vec<u8>) -> bool {
@@ -1314,10 +1399,19 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn ttl_set_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
+        self.set_is_visible(key, logical_time_micros).then(|| {
+            self.set_expiry(key).map_or(TtlValue::Persistent, |expiry| {
+                TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
+            })
+        })
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         if !self.hashes.is_empty()
             || !self.hash_expiries.is_empty()
             || !self.sets.is_empty()
+            || !self.set_expiries.is_empty()
             || !self.lists.is_empty()
             || !self.sorted_sets.is_empty()
         {
@@ -1357,6 +1451,7 @@ impl StructureState {
             hash_expiries: BTreeMap::new(),
             hash_field_expiries: BTreeMap::new(),
             sets: BTreeMap::new(),
+            set_expiries: BTreeMap::new(),
             lists: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
         })
@@ -1823,6 +1918,32 @@ mod tests {
             Some(TtlValue::Persistent)
         );
         assert_eq!(structures.hget_at(b"profile", b"name", 10), None);
+    }
+
+    #[test]
+    fn whole_set_ttl_is_a_logical_incarnation_boundary() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_set(b"members".to_vec()));
+        assert_eq!(
+            structures.sadd_at(b"members", b"one".to_vec(), 0),
+            Some(true)
+        );
+        assert!(structures.expire_set(b"members", 10, 0));
+        assert_eq!(
+            structures.ttl_set_micros(b"members", 9),
+            Some(TtlValue::Remaining(1))
+        );
+        assert_eq!(structures.sismember_at(b"members", b"one", 9), Some(true));
+        assert_eq!(structures.ttl_set_micros(b"members", 10), None);
+        assert_eq!(structures.scard_at(b"members", 10), None);
+        assert!(!structures.expire_set(b"members", 20, 10));
+        assert!(structures.delete_set(b"members"));
+        assert!(structures.create_set(b"members".to_vec()));
+        assert_eq!(
+            structures.ttl_set_micros(b"members", 10),
+            Some(TtlValue::Persistent)
+        );
+        assert_eq!(structures.sismember_at(b"members", b"one", 10), Some(false));
     }
 
     #[test]
