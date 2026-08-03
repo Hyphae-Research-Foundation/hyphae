@@ -219,6 +219,15 @@ compaction, page vacuum, and direct-Linux cardinality-sensitive latency.
 Generic `DEL`, protocol compatibility, process-kill/block replay, complete
 G3, and G7 remain open.
 
+The [native whole-list lifecycle
+evidence](evidence/native-list-lifecycle-linux-2026-08-03.md) adds
+`DELETE_LIST=35` over the native chunked deque. It proves complete metadata
+and chunk retirement, retained history, all typed recreations, whole-list
+first-committer-wins conflicts, 14 singleton crash boundaries, multichunk
+blob retirement, fail-closed corruption, compaction, page vacuum, blob
+collection, reopen, and direct-Linux cardinality-sensitive latency. List TTL,
+blocking operations, streams, complete G3, and G7 remain open.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with

@@ -369,6 +369,16 @@ commit before its tag can be published.
   deletion plus Memory and Strict publication for empty, 64-member, and
   2,048-member sets. It remains outside process-kill/power-loss evidence,
   complete G3, and G7.
+- [Native whole-list lifecycle evidence —
+  2026-08-03](native-list-lifecycle-linux-2026-08-03.md) binds explicit
+  complete-list deletion, all implemented typed recreations, whole-list
+  conflicts, 14 singleton crash boundaries, multichunk/blob retirement,
+  corruption rejection, compaction, vacuum, blob collection, and reopen to
+  direct Linux.
+- `native-list-lifecycle-linux.json` records private deletion plus Memory and
+  Strict publication for empty, 64-element, and 2,048-element lists. It
+  remains outside list TTL, process-kill/power-loss evidence, complete G3,
+  and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

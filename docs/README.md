@@ -141,6 +141,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native whole-set TTL Linux evidence — 2026-08-03](gates/evidence/native-set-ttl-linux-2026-08-03.md)
 - [Native set member commands Linux evidence — 2026-08-03](gates/evidence/native-set-commands-linux-2026-08-03.md)
 - [Native whole-set lifecycle Linux evidence — 2026-08-03](gates/evidence/native-set-lifecycle-linux-2026-08-03.md)
+- [Native whole-list lifecycle Linux evidence — 2026-08-03](gates/evidence/native-list-lifecycle-linux-2026-08-03.md)
 - [Native durable scalar-expiry evidence — 2026-08-01](gates/evidence/native-expiry-2026-08-01.md)
 - [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native ordered B+tree batch COW evidence — 2026-08-02](gates/evidence/native-btree-batch-cow-2026-08-02.md)

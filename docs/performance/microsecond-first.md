@@ -163,6 +163,16 @@ keeps private, unsynchronized publication, and synchronized publication as
 separate surfaces. It does not infer synchronization time by subtracting
 independent runs and does not pass G7.
 
+Whole-list lifecycle uses the same three-surface methodology over chunked
+deques. At 2,048 four-byte elements, private `DELETE_LIST` preparation
+observed p50 `34.036 us`, Memory commit p50 `1.201 ms`, and Strict commit p50
+`8.719 ms`. Empty-list preparation observed p50 `0.095 us`; empty Strict
+publication observed p50 `6.499 ms` including ext4/EBS synchronization. The
+checked
+[receipt](../gates/evidence/native-list-lifecycle-linux-2026-08-03.md)
+does not infer synchronization time by subtracting independent routes and
+does not pass G7.
+
 Bounded hash field commands use a third direct-Linux harness over one
 2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
 `0.853 us` per field, compared with `47.334 us` total and `1.479 us` per

@@ -1,0 +1,127 @@
+{
+  "schema": "hyphae.native.list-lifecycle-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-list-lifecycle",
+  "stacked_parent_commit": "ca52da51aaeba4c66d0ddbc79e4856b599701fa8",
+  "contract_commit": "bc56d12b17ce2ae595b0a18093d168e4bac71a20",
+  "runtime_commit": "2c4e7779d293cf43993bc5fb92afb8e360697a8e",
+  "test_hardening_commit": "2b489799f95acc859789fb467da4865e04c49c15",
+  "benchmark_commit": "9c6008eba6dadbaf00da5bfc77a0ccb261578e55",
+  "benchmark_tree": "e771b7dd607e90cf13f8873d28f571d49b158b8c",
+  "benchmark_harness_sha256": "aeaa873be656fabd9387d85f82b9723b81a1516729f67f940099872954b346d5",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "list_lifecycle_smoke": {
+    "schema": "hyphae-native-list-lifecycle-smoke-v1",
+    "raw_sha256": "34ec68405082b91e7e3183f83b4d19f3e8d67b6e8a5b903db9ae93968d7e99fb",
+    "command": "HYPHAE_LIST_LIFECYCLE_OBSERVATIONS=31 target/release/examples/list_lifecycle_smoke",
+    "observations_per_route": 31,
+    "element_encoding": "u32-big-endian",
+    "timing_boundary": {
+      "private_delete_list": "materialized DELETE_LIST call only; transaction begin occurs before the timer and every sample rolls back",
+      "memory_commit": "physical B+tree and WAL publication without explicit page or WAL synchronization; begin and DELETE_LIST occur before the timer",
+      "strict_commit": "physical B+tree and WAL publication with page and WAL synchronization; begin and DELETE_LIST occur before the timer",
+      "component_note": "the singleton public receipt does not expose per-component timing; independent Memory and Strict observations are not subtracted"
+    },
+    "metrics": [
+      {
+        "elements": 0,
+        "private_delete_list": {
+          "p50_nanos": 95,
+          "p95_nanos": 185,
+          "p99_nanos": 247,
+          "max_nanos": 1071
+        },
+        "memory_commit": {
+          "p50_nanos": 179524,
+          "p95_nanos": 193514,
+          "p99_nanos": 196437,
+          "max_nanos": 202736
+        },
+        "strict_commit": {
+          "p50_nanos": 6498502,
+          "p95_nanos": 6703481,
+          "p99_nanos": 6707871,
+          "max_nanos": 6892480
+        }
+      },
+      {
+        "elements": 64,
+        "private_delete_list": {
+          "p50_nanos": 608,
+          "p95_nanos": 708,
+          "p99_nanos": 718,
+          "max_nanos": 1269
+        },
+        "memory_commit": {
+          "p50_nanos": 291132,
+          "p95_nanos": 313038,
+          "p99_nanos": 319283,
+          "max_nanos": 336256
+        },
+        "strict_commit": {
+          "p50_nanos": 6928888,
+          "p95_nanos": 7073716,
+          "p99_nanos": 7120756,
+          "max_nanos": 7165023
+        }
+      },
+      {
+        "elements": 2048,
+        "private_delete_list": {
+          "p50_nanos": 34036,
+          "p95_nanos": 41019,
+          "p99_nanos": 42944,
+          "max_nanos": 44114
+        },
+        "memory_commit": {
+          "p50_nanos": 1201087,
+          "p95_nanos": 1600197,
+          "p99_nanos": 1632169,
+          "max_nanos": 1723797
+        },
+        "strict_commit": {
+          "p50_nanos": 8719348,
+          "p95_nanos": 9772904,
+          "p99_nanos": 10047452,
+          "max_nanos": 10560011
+        }
+      }
+    ]
+  },
+  "verification": {
+    "focused_tests": 9,
+    "runtime_tests": 321,
+    "all_seven_singleton_boundaries": [
+      "delete",
+      "delete_and_recreate"
+    ],
+    "workspace_all_targets_all_features_locked": "passed",
+    "clippy_all_targets_all_features_locked_deny_warnings": "passed",
+    "documentation": "passed after evidence indexing",
+    "format": "passed",
+    "release_example_check": "passed"
+  },
+  "open_gates": [
+    "hosted CI",
+    "list TTL",
+    "process-kill replay",
+    "block-level power-loss replay",
+    "complete G3",
+    "G7"
+  ]
+}
