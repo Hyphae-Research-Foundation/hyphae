@@ -125,6 +125,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native whole-hash lifecycle Linux evidence — 2026-08-02](gates/evidence/native-hash-lifecycle-linux-2026-08-02.md)
 - [Native whole-hash TTL Linux evidence — 2026-08-03](gates/evidence/native-hash-ttl-linux-2026-08-03.md)
 - [Native hash field commands Linux evidence — 2026-08-03](gates/evidence/native-hash-field-commands-linux-2026-08-03.md)
+- [Native reverse hash-scan Linux evidence — 2026-08-03](gates/evidence/native-hash-reverse-scan-linux-2026-08-03.md)
 - [Native durable scalar-expiry evidence — 2026-08-01](gates/evidence/native-expiry-2026-08-01.md)
 - [Native scalar-expiry physical fast-path evidence — 2026-08-01](gates/evidence/native-expiry-fast-path-2026-08-01.md)
 - [Native ordered B+tree batch COW evidence — 2026-08-02](gates/evidence/native-btree-batch-cow-2026-08-02.md)

@@ -153,9 +153,16 @@ The [native hash field command
 evidence](evidence/native-hash-field-commands-linux-2026-08-03.md) adds
 bounded positional multi-read, canonical atomic multi-set/delete, signed field
 counters, failure atomicity, field/lifecycle conflicts, crash boundaries,
-reached-corruption checks, and separated direct-Linux latency. Pattern/reverse
-scans, floating counters, randomized model testing, other collection-family
-TTL, the complete G3 suite, and G7 remain open.
+reached-corruption checks, and separated direct-Linux latency.
+
+The [native reverse hash-scan
+evidence](evidence/native-hash-reverse-scan-linux-2026-08-03.md) adds
+descending exact-byte scans over private, retained, and physical state;
+exclusive live/dead cursors; whole-hash TTL; height-two reverse B+tree
+pruning; early stop; fail-closed reached corruption; and a direct-Linux
+comparison against full ascending materialization. Pattern scans, floating
+counters, randomized model testing, other collection-family TTL, the complete
+G3 suite, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement

@@ -1,0 +1,186 @@
+{
+  "schema": "hyphae.native.hash-reverse-scan-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-hash-reverse-scan",
+  "stacked_parent_commit": "dccf9336cacb30af33cbfbe20fbc13c80f346f19",
+  "contract_commit": "8d25ed673cb22c9c80e589ef6cd9db49edf29f42",
+  "runtime_commit": "fc708223ec4f6435ad1fde6644bdd35dd522e9b5",
+  "benchmark_commit": "de54334b524ba6d7aeafddc0e8e4fda302849f17",
+  "benchmark_tree": "09cf3210dc621a6f6f11b4ab243378ec7cdeb7a2",
+  "benchmark_harness_sha256": "08d26e166a9e9190187e43ec3803fc108470dcc2a8bd2a0ecf2d143db6f75aa1",
+  "benchmark_output_sha256": "d2b16efa7936e46290fdc87b79fbac6f90870997c3b0ebf632ea6445df787851",
+  "control_harness_sha256": "8d03592813a5607be4ff1f63c7fced8c059a59a37ebd524c4098f1b9ed05b0eb",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "hash_reverse_scan_smoke": {
+    "schema": "hyphae.native.hash-reverse-scan-smoke.v1",
+    "hash_fields": 2048,
+    "page_fields": 32,
+    "field_bytes": 64,
+    "value_bytes": 64,
+    "observations_per_route": 10000,
+    "warmup_per_route": 1000,
+    "dataset_blake3": "05c3111356c90c0cfd8d5dbb5e12c2eb66e8eaa3d5e955db8ba6234f88c86c65",
+    "structure_tree_height": 2,
+    "operations": {
+      "reverse_top_32_physical": {
+        "p50_nanos": 11514,
+        "p95_nanos": 11778,
+        "p99_nanos": 21259,
+        "p999_nanos": 27789,
+        "maximum_nanos": 37596,
+        "throughput_per_second": 84792.374
+      },
+      "reverse_middle_32_physical": {
+        "p50_nanos": 12488,
+        "p95_nanos": 12742,
+        "p99_nanos": 21677,
+        "p999_nanos": 23772,
+        "maximum_nanos": 39711,
+        "throughput_per_second": 78760.921
+      },
+      "ascending_all_reverse_truncate_32_fallback": {
+        "p50_nanos": 390204,
+        "p95_nanos": 408188,
+        "p99_nanos": 423701,
+        "p999_nanos": 621503,
+        "maximum_nanos": 780671,
+        "throughput_per_second": 2532.782
+      }
+    },
+    "reverse_top_improvement_percent": {
+      "p50": 97.049,
+      "p95": 97.115,
+      "p99": 94.983,
+      "throughput": 3247.796
+    }
+  },
+  "matched_persistent_hget_control": {
+    "hash_fields": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "initial_unpinned_diagnostic": {
+      "execution_order": [
+        "parent",
+        "current"
+      ],
+      "parent": {
+        "p50_nanos": 1369,
+        "p95_nanos": 1605,
+        "p99_nanos": 1690,
+        "p999_nanos": 2550,
+        "maximum_nanos": 5736,
+        "throughput_per_second": 719887.031
+      },
+      "current": {
+        "p50_nanos": 1458,
+        "p95_nanos": 1727,
+        "p99_nanos": 1775,
+        "p999_nanos": 2763,
+        "maximum_nanos": 7950,
+        "throughput_per_second": 676036.539
+      },
+      "change_percent": {
+        "p50": 6.501,
+        "p95": 7.601,
+        "p99": 5.030,
+        "p999": 8.353,
+        "throughput": -6.091
+      }
+    },
+    "pinned_cpu": 2,
+    "pinned_rounds": [
+      {
+        "round": 2,
+        "execution_order": [
+          "current",
+          "parent"
+        ],
+        "current": {
+          "p50_nanos": 1372,
+          "p95_nanos": 1603,
+          "p99_nanos": 1692,
+          "p999_nanos": 2615,
+          "throughput_per_second": 718556.536
+        },
+        "parent": {
+          "p50_nanos": 1369,
+          "p95_nanos": 1602,
+          "p99_nanos": 1690,
+          "p999_nanos": 2496,
+          "throughput_per_second": 719997.985
+        }
+      },
+      {
+        "round": 3,
+        "execution_order": [
+          "current",
+          "parent"
+        ],
+        "current": {
+          "p50_nanos": 1371,
+          "p95_nanos": 1591,
+          "p99_nanos": 1684,
+          "p999_nanos": 2186,
+          "throughput_per_second": 719528.480
+        },
+        "parent": {
+          "p50_nanos": 1373,
+          "p95_nanos": 1600,
+          "p99_nanos": 1687,
+          "p999_nanos": 2613,
+          "throughput_per_second": 718085.878
+        }
+      }
+    ],
+    "pinned_two_round_median": {
+      "parent": {
+        "p50_nanos": 1371.0,
+        "p95_nanos": 1601.0,
+        "p99_nanos": 1688.5,
+        "p999_nanos": 2554.5,
+        "throughput_per_second": 719041.932
+      },
+      "current": {
+        "p50_nanos": 1371.5,
+        "p95_nanos": 1597.0,
+        "p99_nanos": 1688.0,
+        "p999_nanos": 2400.5,
+        "throughput_per_second": 719042.508
+      },
+      "change_percent": {
+        "p50": 0.036,
+        "p95": -0.250,
+        "p99": -0.030,
+        "p999": -6.029,
+        "throughput": 0.000
+      }
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true,
+      "basis": "median of two alternating candidate-parent rounds pinned to CPU 2"
+    }
+  },
+  "boundaries": [
+    "Warm concurrency-one observations are not a universal latency SLO.",
+    "The full-materialization fallback deliberately visits all 2,048 fields before reversing and truncating.",
+    "The initial unpinned control is retained as a diagnostic and triggered pinned repeated sampling.",
+    "The matched control freezes p50 and p95 only.",
+    "The observation does not close pattern scans, field TTL, local-protocol exposure, randomized model equivalence, saturation, cold-cache, allocation, RSS, hardware-counter, memory-amplification, complete G3, or G7 gates."
+  ]
+}

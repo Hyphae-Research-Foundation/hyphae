@@ -309,6 +309,14 @@ commit before its tag can be published.
   batch reads, a same-corpus singular-read control, memory/strict mutations,
   and a matched parent/current persistent-read control. It remains outside
   complete G3 and G7.
+- [Native reverse hash-scan evidence —
+  2026-08-03](native-hash-reverse-scan-linux-2026-08-03.md) binds descending
+  exact-byte order, exclusive live/dead cursors, private/snapshot/physical
+  equivalence, whole-hash TTL, height-two reverse pruning, early stop, and
+  reached-corruption handling to direct Linux.
+- `native-hash-reverse-scan-linux.json` records the native reverse visitor
+  against a full ascending materialize/reverse/truncate fallback plus repeated
+  pinned parent/current HGET controls. It remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed
