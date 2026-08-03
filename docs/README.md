@@ -75,6 +75,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)
 - [Native search-engine semantics v1](native/search-semantics-v1.md)
+- [Native lexical document lifecycle v1](native/search-document-lifecycle-v1.md)
 - [Native ANN semantics v1](native/ann-semantics-v1.md)
 - [Native local protocol v1](native/local-protocol-v1.md)
 - [Native local UDS transport v1](native/local-uds-transport-v1.md)
