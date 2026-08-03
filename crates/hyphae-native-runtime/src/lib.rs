@@ -20257,6 +20257,86 @@ mod tests {
     }
 
     #[test]
+    fn secondary_prefix_range_selects_a_valid_overlapping_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let created = seed.execute_sql(
+            "CREATE TABLE overlapping_events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                sequence BIGINT NOT NULL
+            )",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = created
+        else {
+            return Err("missing overlapping-index table identity".into());
+        };
+        for (id, tenant, sequence) in [(1_i64, "a", 1_i64), (2, "a", 2), (3, "aa", 1)] {
+            seed.execute_sql(
+                "INSERT INTO overlapping_events (id, tenant, sequence) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Signed(sequence),
+                ],
+            )?;
+        }
+        seed.execute_sql(
+            "CREATE INDEX overlapping_sequence
+             ON overlapping_events (sequence)",
+            &[],
+        )?;
+        let created = seed.execute_sql(
+            "CREATE INDEX overlapping_tenant_sequence
+             ON overlapping_events (tenant, sequence)",
+            &[],
+        )?;
+        let SqlResult::Command {
+            object_id: Some(compound_index),
+            ..
+        } = created
+        else {
+            return Err("missing overlapping compound-index identity".into());
+        };
+        seed.commit()?;
+
+        let statement = "SELECT id, tenant, sequence FROM overlapping_events
+            WHERE sequence >= ? AND tenant = ? AND sequence < ?
+            ORDER BY tenant, sequence LIMIT 10";
+        let mut query = database.begin_sql(11, DurabilityClass::Memory)?;
+        assert_eq!(
+            query.execute_sql(&format!("EXPLAIN {statement}"), &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexPrefixRangeScan(table={table},index={compound_index},\
+                     prefix_columns=1,range_column=3,lower=inclusive,\
+                     upper=exclusive,limit=10)"
+                ))]],
+            }
+        );
+        assert_eq!(
+            query.execute_sql(
+                statement,
+                &[
+                    SqlValue::Signed(1),
+                    SqlValue::Text("a".to_owned()),
+                    SqlValue::Signed(3),
+                ],
+            )?,
+            secondary_prefix_range_rows(&[(1, 1), (2, 2)])
+        );
+        query.rollback();
+        Ok(())
+    }
+
+    #[test]
     fn legacy_composite_secondary_layout_rejects_prefix_range_planning()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();

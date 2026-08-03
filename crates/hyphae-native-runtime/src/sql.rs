@@ -4380,6 +4380,7 @@ fn bind_secondary_index_range_access(
     limit: Option<usize>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<Option<(SelectAccess, usize)>, SqlError> {
+    let mut matched_invalid_order = false;
     for (index, object) in &catalog.objects {
         let CatalogObject::SecondaryIndex(index_definition) = object else {
             continue;
@@ -4400,7 +4401,14 @@ fn bind_secondary_index_range_access(
             range
         };
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
-        validate_secondary_index_order(definition, order_by, &columns)?;
+        match validate_secondary_index_order(definition, order_by, &columns) {
+            Ok(()) => {}
+            Err(SqlError::InvalidSecondaryIndexRange) => {
+                matched_invalid_order = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
         return Ok(Some((
             SelectAccess::SecondaryIndexRangeScan {
                 index: *index,
@@ -4410,7 +4418,11 @@ fn bind_secondary_index_range_access(
             used_terms,
         )));
     }
-    Ok(None)
+    if matched_invalid_order {
+        Err(SqlError::InvalidSecondaryIndexRange)
+    } else {
+        Ok(None)
+    }
 }
 
 fn bind_secondary_index_range_shape(
