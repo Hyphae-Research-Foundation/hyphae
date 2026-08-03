@@ -160,6 +160,11 @@ impl UdsFrameConnection {
         })
     }
 
+    /// Returns the strict per-frame payload bound for this connection.
+    pub const fn maximum_payload(&self) -> usize {
+        self.frame_io.maximum_payload()
+    }
+
     /// Sends one complete native local frame.
     ///
     /// # Errors

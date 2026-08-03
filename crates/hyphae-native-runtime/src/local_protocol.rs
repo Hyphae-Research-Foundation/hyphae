@@ -163,6 +163,11 @@ impl LocalFrameIo {
         })
     }
 
+    /// Returns the strict per-frame payload bound for this byte stream.
+    pub const fn maximum_payload(&self) -> usize {
+        self.maximum_payload
+    }
+
     /// Reads and validates one complete frame.
     ///
     /// Clean EOF is returned only when no header byte was read. The returned
