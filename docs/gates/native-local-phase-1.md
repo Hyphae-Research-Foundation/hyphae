@@ -198,6 +198,15 @@ p50. Large union and difference remained cardinality-sensitive at 2.605 and
 6.784 milliseconds p50. Store variants, set TTL, sorted-set algebra/TTL,
 streams, complete G3, and G7 remain open.
 
+The [native whole-set TTL
+contract](../native/native-set-ttl-v1.md) freezes absolute complete-set
+expiry across membership, cardinality, bounded algebra, snapshots, physical
+reads, restart, lifecycle conflicts, due-key reuse, shared active cleanup, and
+compaction. It reserves additive WAL opcodes `EXPIRE_SET=33` and internal
+`DELETE_SET=34`, plus backward-readable `HYSETM02` metadata and top-level
+expiry marker `3`. Implementation, crash, corruption, and latency evidence
+remain open; the contract alone does not satisfy G3.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with

@@ -68,6 +68,8 @@ HDELETE(key, field)
 HLEN(key)
 HSCAN(key, start_after, limit)
 CREATE_SET(key)
+EXPIRE_SET(key, expires_at)
+TTL_SET(key)
 SADD(key, member)
 SISMEMBER(key, member)
 SREM(key, member)
@@ -209,7 +211,8 @@ same logical hash.
 true only when it adds a missing member, `SISMEMBER` reports exact membership,
 `SREM` returns true only when it removes a live member, and `SCARD` reads the
 durable exact cardinality. An empty set remains typed after its last member is
-removed; whole-set deletion and per-member TTL are outside this slice.
+removed; public manual whole-set deletion and per-member TTL are outside this
+slice.
 
 Scalar, hash, and set kinds are mutually exclusive for one user key.
 Concurrent creation of different kinds over the same absent key conflicts.
@@ -223,6 +226,13 @@ serialized compatibility protocol, write opcode, or destination-set mutation.
 Its private-batch, retained-snapshot, current-root physical, restart,
 corruption, and direct-Linux latency evidence is recorded in the
 [native set algebra receipt](../gates/evidence/native-set-algebra-linux-2026-08-03.md).
+
+The [native whole-set TTL v1](native-set-ttl-v1.md) contract freezes absolute
+complete-set expiry, explicit logical-time reads, lifecycle conflicts,
+due-incarnation reuse, WAL opcodes `EXPIRE_SET=33` and internal
+`DELETE_SET=34`, `HYSETM02` metadata, the top-level expiry marker `3`, shared
+active cleanup, corruption boundaries, and evidence requirements. Its
+implementation and evidence remain open.
 
 `CREATE_LIST` establishes a binary chunked deque before element mutation.
 `LPUSH` and `RPUSH` insert one exact binary value and return the new length.
