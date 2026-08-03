@@ -569,6 +569,23 @@ impl StructureState {
         self.hashes.get(key).map(BTreeMap::len)
     }
 
+    pub(crate) fn hscan(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let fields = self.hashes.get(key)?;
+        Some(
+            fields
+                .iter()
+                .filter(|(field, _)| start_after.is_none_or(|cursor| field.as_slice() > cursor))
+                .take(limit)
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
     pub(crate) fn create_set(&mut self, key: Vec<u8>) -> bool {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)

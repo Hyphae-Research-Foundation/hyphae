@@ -131,8 +131,9 @@ complete call rather than returning a partial result. Pattern matching,
 reverse iteration, and whole-hash materialization are outside this first
 bounded scan contract.
 
-This `HSCAN` contract is frozen before implementation. Its red/green and
-physical-pruning evidence are tracked separately from this normative file.
+This bounded `HSCAN` contract is implemented across private, retained,
+current-root, and reopened execution. Its red/green and physical-pruning
+evidence are tracked separately from this normative file.
 
 An empty hash remains a typed hash after its last field is deleted;
 whole-hash delete/recreate is not implemented yet.

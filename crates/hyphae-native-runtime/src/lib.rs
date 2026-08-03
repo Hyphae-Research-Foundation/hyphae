@@ -646,6 +646,37 @@ pub enum HashSetOutcome {
     Updated,
 }
 
+/// One native hash field/value pair in exact field-byte order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashFieldEntry {
+    field: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl HashFieldEntry {
+    /// Creates one owned binary field/value pair.
+    pub const fn new(field: Vec<u8>, value: Vec<u8>) -> Self {
+        Self { field, value }
+    }
+
+    /// Returns the exact binary field.
+    pub fn field(&self) -> &[u8] {
+        &self.field
+    }
+
+    /// Returns the exact binary value.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+fn hash_field_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<HashFieldEntry> {
+    entries
+        .into_iter()
+        .map(|(field, value)| HashFieldEntry::new(field, value))
+        .collect()
+}
+
 /// Result of one native sorted-set member upsert.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ZAddOutcome {
@@ -1231,6 +1262,34 @@ impl NativeSnapshot {
         self.state
             .structures
             .hlen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
+    }
+
+    /// Scans one bounded ascending range of hash fields in this snapshot.
+    ///
+    /// `start_after` is an exclusive exact-field cursor. A zero `limit`
+    /// validates the hash and returns no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure kind or a missing hash.
+    pub fn hscan(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hscan(key, start_after, limit)
+            .map(hash_field_entries)
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
@@ -3165,6 +3224,141 @@ impl NativeDatabase {
         };
         usize::try_from(decode_hash_metadata(metadata.bytes())?)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Scans one bounded current hash-field range without materializing the
+    /// complete hash.
+    ///
+    /// `start_after` is an exclusive exact-field cursor. A zero `limit`
+    /// validates the hash and returns no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another structure kind, a missing
+    /// hash, or malformed reached metadata, identity, value, page, or blob.
+    pub fn hscan_latest_hash(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.hash_scan_in_tree(BTree::from_root(root), key, start_after, limit)
+    }
+
+    fn hash_scan_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )?
+        else {
+            return self.hash_missing_or_kind_error(tree, key);
+        };
+        let declared_count = usize::try_from(decode_hash_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = structure_hash_field_key(key, &[])?;
+        let lower_key = start_after
+            .map(|field| structure_hash_field_key(key, field))
+            .transpose()?;
+        let lower = lower_key
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let verify_complete = start_after.is_none() && limit >= declared_count;
+        let mut live_count = 0_usize;
+        let mut entries = Vec::with_capacity(limit.min(declared_count).min(256));
+        let mut failure = None;
+        let outcome = tree.visit_prefix_range_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            lower,
+            Bound::Unbounded,
+            |physical_key, encoded| {
+                let decoded = decode_hash_scan_entry(physical_key, encoded, key, &self.blobs);
+                let Some(entry) = (match decoded {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }) else {
+                    return ControlFlow::Continue(());
+                };
+                live_count += 1;
+                if live_count > declared_count {
+                    failure = Some(NativeRuntimeError::InvalidStructureTree);
+                    return ControlFlow::Break(());
+                }
+                if entries.len() < limit {
+                    entries.push(entry);
+                }
+                if entries.len() == limit && !verify_complete {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if verify_complete && (outcome != ControlFlow::Continue(()) || live_count != declared_count)
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(entries)
+    }
+
+    fn hash_missing_or_kind_error<T>(
+        &self,
+        tree: BTree,
+        key: &[u8],
+    ) -> Result<T, NativeRuntimeError> {
+        let scalar = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+            .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let set = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
+            .is_some();
+        let list = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_list_meta_key(key)?,
+            )?
+            .is_some();
+        let sorted_set = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_sorted_set_meta_key(key)?,
+            )?
+            .is_some();
+        if scalar || set || list || sorted_set {
+            Err(NativeRuntimeError::StructureKindMismatch)
+        } else {
+            Err(NativeRuntimeError::UnknownStructureHash)
+        }
     }
 
     /// Tests membership directly through the current physical set namespace.
@@ -6096,6 +6290,34 @@ impl NativeWriteBatch {
         self.state
             .structures
             .hlen(key)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
+    }
+
+    /// Scans one bounded ascending range of fields through private writes.
+    ///
+    /// `start_after` is an exclusive exact-field cursor. A zero `limit`
+    /// validates the hash and returns no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure kind or a missing hash.
+    pub fn hscan(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hscan(key, start_after, limit)
+            .map(hash_field_entries)
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
@@ -9412,6 +9634,27 @@ fn decode_hash_field_value(
         Some(_) => Err(NativeRuntimeError::InvalidStructureTree),
         None => Ok(None),
     }
+}
+
+fn decode_hash_scan_entry(
+    physical_key: &[u8],
+    encoded: &[u8],
+    expected_hash: &[u8],
+    blobs: &BlobStore,
+) -> Result<Option<HashFieldEntry>, NativeRuntimeError> {
+    if physical_key.first().copied() != Some(STRUCTURE_HASH_FIELD_PREFIX) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let identity = physical_key
+        .get(1..)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (hash, field) = decode_hash_field_identity(identity)
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    if hash != expected_hash {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    decode_hash_field_value(encoded, blobs)
+        .map(|value| value.map(|value| HashFieldEntry::new(field.to_vec(), value)))
 }
 
 fn encode_set_metadata(member_count: u64) -> Vec<u8> {
@@ -13737,7 +13980,7 @@ mod tests {
         CATALOG_VALUE_MAGIC, CatalogName, CatalogObject, CatalogState, CheckpointBoundary,
         ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
         GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
-        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
+        HashFieldEntry, HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
         NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
         NativeSchedulerClock, NativeTransaction, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
         PageStore, RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
@@ -16641,6 +16884,194 @@ mod tests {
             Some(b"Mario".to_vec())
         );
         assert_eq!(reopened.hget_latest_hash(b"profile", b"age")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn hash_scan_matches_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"scan-map".to_vec())?;
+        for (field, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (b"a".as_slice(), b"one".as_slice()),
+            (b"a\0".as_slice(), b"two".as_slice()),
+            (b"b".as_slice(), b"three".as_slice()),
+            (b"z".as_slice(), b"four".as_slice()),
+        ] {
+            seed.hset(b"scan-map".to_vec(), field.to_vec(), value.to_vec())?;
+        }
+        let initial = [
+            HashFieldEntry::new(b"".to_vec(), b"empty".to_vec()),
+            HashFieldEntry::new(b"a".to_vec(), b"one".to_vec()),
+            HashFieldEntry::new(b"a\0".to_vec(), b"two".to_vec()),
+            HashFieldEntry::new(b"b".to_vec(), b"three".to_vec()),
+            HashFieldEntry::new(b"z".to_vec(), b"four".to_vec()),
+        ];
+        assert_eq!(seed.hscan(b"scan-map", None, 10)?, initial);
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        mutate.hset(b"scan-map".to_vec(), b"a".to_vec(), b"updated".to_vec())?;
+        assert!(mutate.hdelete(b"scan-map".to_vec(), b"b".to_vec())?);
+        mutate.hset(b"scan-map".to_vec(), b"c".to_vec(), b"new".to_vec())?;
+        let current_after_a = [
+            HashFieldEntry::new(b"a\0".to_vec(), b"two".to_vec()),
+            HashFieldEntry::new(b"c".to_vec(), b"new".to_vec()),
+            HashFieldEntry::new(b"z".to_vec(), b"four".to_vec()),
+        ];
+        assert_eq!(
+            mutate.hscan(b"scan-map", Some(b"a".as_slice()), 3)?,
+            current_after_a
+        );
+        mutate.commit()?;
+
+        assert_eq!(
+            historical.hscan(b"scan-map", Some(b"a".as_slice()), 10)?,
+            initial[2..]
+        );
+        assert_eq!(
+            database.hscan_latest_hash(b"scan-map", Some(b"a".as_slice()), 3)?,
+            current_after_a
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_latest_hash(b"scan-map", Some(b"a".as_slice()), 3)?,
+            current_after_a
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hash_scan_validates_types_zero_limit_empty_cursor_and_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"scan".to_vec())?;
+        seed.hset(b"scan".to_vec(), b"".to_vec(), b"empty".to_vec())?;
+        seed.hset(b"scan".to_vec(), b"a".to_vec(), b"one".to_vec())?;
+        seed.hset(b"scan".to_vec(), b"b".to_vec(), b"two".to_vec())?;
+        seed.create_hash(b"empty".to_vec())?;
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"scan".to_vec(), b"a".to_vec())?);
+        mutate.commit()?;
+
+        assert_eq!(
+            database.hscan_latest_hash(b"scan", Some(b"".as_slice()), 10)?,
+            [HashFieldEntry::new(b"b".to_vec(), b"two".to_vec())]
+        );
+        assert!(
+            database
+                .hscan_latest_hash(b"scan", Some(b"z".as_slice()), 10)?
+                .is_empty()
+        );
+        assert!(database.hscan_latest_hash(b"scan", None, 0)?.is_empty());
+        assert!(database.hscan_latest_hash(b"empty", None, 10)?.is_empty());
+        assert!(matches!(
+            database.hscan_latest_hash(b"missing", None, 0),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_latest_hash(b"scalar", None, 0),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_hash_scan_prunes_skips_tombstones_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_hash(b"large-scan".to_vec())?;
+        for index in 0..2_048_u32 {
+            seed.hset(
+                b"large-scan".to_vec(),
+                index.to_be_bytes().to_vec(),
+                vec![u8::try_from(index % 251)?; 64],
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"large-scan".to_vec(), 1_025_u32.to_be_bytes().to_vec(),)?);
+        mutate.commit()?;
+        let expected = [1_024_u32, 1_026, 1_027, 1_028]
+            .into_iter()
+            .map(|index| {
+                Ok(HashFieldEntry::new(
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 251)?; 64],
+                ))
+            })
+            .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+        assert_eq!(
+            database.hscan_latest_hash(
+                b"large-scan",
+                Some(1_023_u32.to_be_bytes().as_slice()),
+                4,
+            )?,
+            expected
+        );
+
+        let root = database
+            .coordinator
+            .snapshot(103)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let invalid_value_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::structure_hash_field_key(b"large-scan", &1_024_u32.to_be_bytes())?,
+                vec![0xff],
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_scan_in_tree(
+                invalid_value_tree,
+                b"large-scan",
+                Some(1_023_u32.to_be_bytes().as_slice()),
+                1,
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let invalid_count_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(2)?,
+                super::structure_hash_meta_key(b"large-scan"),
+                super::encode_hash_metadata(0),
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_scan_in_tree(invalid_count_tree, b"large-scan", None, 1),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_latest_hash(
+                b"large-scan",
+                Some(1_023_u32.to_be_bytes().as_slice()),
+                4,
+            )?,
+            expected
+        );
         Ok(())
     }
 
