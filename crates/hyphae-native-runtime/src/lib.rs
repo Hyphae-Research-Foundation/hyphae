@@ -164,6 +164,8 @@ use thiserror::Error;
 #[cfg(test)]
 thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELTA_LATEST_VERSION_PAGE_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 use crate::{
@@ -6499,7 +6501,21 @@ impl NativeDatabase {
         let (table, primary_key) = sql::transaction_dml_primary_key(batch, statement, parameters)?;
         self.hydrate_delta_relational_row(batch, table, &primary_key)
             .map_err(SqlError::from)?;
-        batch.execute_sql_dml(statement, parameters)
+        let candidate = sql::transaction_dml_candidate_row(batch, statement, parameters)?;
+        let unique_probes = candidate
+            .as_deref()
+            .map(|row| self.validate_delta_unique_projections(batch, table, &primary_key, row))
+            .transpose()
+            .map_err(sql::map_runtime_error)?
+            .unwrap_or_default();
+        let result = batch.execute_sql_dml(statement, parameters)?;
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .unique_probes
+            .extend(unique_probes);
+        Ok(result)
     }
 
     /// Stages one scalar `SET` in a delta batch.
@@ -6641,6 +6657,15 @@ impl NativeDatabase {
             return Ok(());
         }
         if let Some(row) = self.select_relational_at(&batch.snapshot, table, primary_key)? {
+            let projections = secondary_index_projections(&batch.state.catalog, table, &row)?;
+            for projection in projections {
+                batch.state.relational.insert_secondary_index(
+                    projection.index,
+                    projection.key,
+                    primary_key.to_vec(),
+                    projection.contains_null,
+                )?;
+            }
             batch
                 .state
                 .relational
@@ -6656,6 +6681,63 @@ impl NativeDatabase {
             .relational_rows
             .insert(identity);
         Ok(())
+    }
+
+    fn validate_delta_unique_projections(
+        &self,
+        batch: &NativeWriteBatch,
+        table: ObjectId,
+        primary_key: &[u8],
+        row: &[u8],
+    ) -> Result<Vec<DeltaUniqueProbe>, NativeRuntimeError> {
+        let mut probes = Vec::new();
+        for projection in secondary_index_projections(&batch.state.catalog, table, row)? {
+            let Some(CatalogObject::SecondaryIndex(definition)) =
+                batch.state.catalog.object(projection.index)
+            else {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            };
+            if !definition.unique || (projection.contains_null && definition.nulls_distinct) {
+                continue;
+            }
+            let local_entries = batch
+                .state
+                .relational
+                .indexes
+                .get(&projection.index)
+                .and_then(|index| index.entries.get(&projection.key));
+            if local_entries.is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|existing| existing.as_slice() != primary_key)
+            }) {
+                return Err(NativeRuntimeError::UniqueSecondaryIndexViolation);
+            }
+            for existing in
+                self.select_secondary_index_at(&batch.snapshot, projection.index, &projection.key)?
+            {
+                if existing.primary_key == primary_key {
+                    continue;
+                }
+                let identity = (table, existing.primary_key.clone());
+                let loaded = batch
+                    .delta
+                    .as_ref()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                    .relational_rows
+                    .contains(&identity);
+                let retained =
+                    local_entries.is_some_and(|entries| entries.contains(&existing.primary_key));
+                if !loaded || retained {
+                    return Err(NativeRuntimeError::UniqueSecondaryIndexViolation);
+                }
+            }
+            probes.push(DeltaUniqueProbe {
+                index: projection.index,
+                key: projection.key,
+            });
+        }
+        Ok(probes)
     }
 
     fn hydrate_delta_scalar(
@@ -6678,24 +6760,88 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        let collection_exists = [
-            structure_hash_meta_key(key),
-            structure_set_meta_key(key),
-            structure_list_meta_key(key)?,
-            structure_sorted_set_meta_key(key)?,
-        ]
-        .into_iter()
-        .map(|metadata_key| tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|encoded| encoded.is_some_and(|encoded| !is_structure_tombstone(encoded.bytes())));
-        if collection_exists {
-            return Err(NativeRuntimeError::StructureKindMismatch);
+        let mut collection_kinds = 0_u8;
+        if let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )? && let Some(metadata) = decode_live_hash_metadata(encoded.bytes())?
+        {
+            collection_kinds += 1;
+            batch
+                .state
+                .structures
+                .hashes
+                .insert(key.to_vec(), BTreeMap::new());
+            if let Some(expiry) = metadata.expires_at_micros {
+                batch
+                    .state
+                    .structures
+                    .hash_expiries
+                    .insert(key.to_vec(), expiry);
+            }
+        }
+        if let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
+            && let Some(metadata) = decode_live_set_metadata(encoded.bytes())?
+        {
+            collection_kinds += 1;
+            batch
+                .state
+                .structures
+                .sets
+                .insert(key.to_vec(), BTreeSet::new());
+            if let Some(expiry) = metadata.expires_at_micros {
+                batch
+                    .state
+                    .structures
+                    .set_expiries
+                    .insert(key.to_vec(), expiry);
+            }
+        }
+        if let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_list_meta_key(key)?,
+        )? && let Some(metadata) = decode_live_list_metadata(encoded.bytes())?
+        {
+            collection_kinds += 1;
+            batch
+                .state
+                .structures
+                .lists
+                .insert(key.to_vec(), VecDeque::new());
+            if let Some(expiry) = metadata.expires_at_micros {
+                batch
+                    .state
+                    .structures
+                    .list_expiries
+                    .insert(key.to_vec(), expiry);
+            }
+        }
+        if let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_sorted_set_meta_key(key)?,
+        )? {
+            decode_sorted_set_metadata(encoded.bytes())?;
+            collection_kinds += 1;
+            batch
+                .state
+                .structures
+                .sorted_sets
+                .insert(key.to_vec(), BTreeMap::new());
+        }
+        if collection_kinds > 1 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
         }
         if let Some(encoded) =
             tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
             && let Some(entry) = decode_structure_value(encoded.bytes(), &self.blobs)?
         {
+            if collection_kinds != 0 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
             batch.state.structures.entries.insert(key.to_vec(), entry);
         }
         batch
@@ -6828,7 +6974,7 @@ impl NativeDatabase {
                 retention_floor_csn,
             });
         }
-        let validation_keys = mutation_validation_keys(&batch.mutations);
+        let validation_keys = write_batch_validation_keys(&batch);
         self.conflicts
             .validate(conflict_read_csn, &validation_keys)?;
 
@@ -7809,6 +7955,13 @@ fn read_list_range_from_tail(
 struct DeltaOverlay {
     relational_rows: BTreeSet<(ObjectId, Vec<u8>)>,
     structure_scalars: BTreeSet<Vec<u8>>,
+    unique_probes: BTreeSet<DeltaUniqueProbe>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DeltaUniqueProbe {
+    index: ObjectId,
+    key: Vec<u8>,
 }
 
 /// Detached private write set over one immutable all-engine snapshot.
@@ -10594,8 +10747,8 @@ impl NativeTransaction<'_> {
     }
 
     fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
-        let write_keys = mutation_write_keys(&self.batch.mutations);
-        let validation_keys = mutation_validation_keys(&self.batch.mutations);
+        let write_keys = write_batch_write_keys(&self.batch);
+        let validation_keys = write_batch_validation_keys(&self.batch);
         self.conflicts
             .validate(self.conflict_read_csn, &validation_keys)?;
         Ok(write_keys)
@@ -11328,6 +11481,29 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
         }
     }
     keys
+}
+
+fn write_batch_write_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
+    let mut keys = mutation_write_keys(&batch.mutations);
+    if let Some(delta) = &batch.delta {
+        keys.extend(delta.unique_probes.iter().map(delta_unique_write_key));
+    }
+    keys
+}
+
+fn write_batch_validation_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
+    let mut keys = mutation_validation_keys(&batch.mutations);
+    if let Some(delta) = &batch.delta {
+        keys.extend(delta.unique_probes.iter().map(delta_unique_write_key));
+    }
+    keys
+}
+
+fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
+    let mut identity = Vec::with_capacity(probe.key.len().saturating_add(1));
+    identity.push(6);
+    identity.extend_from_slice(&probe.key);
+    WriteKey::new(EngineKind::Relational, Some(probe.index), identity)
 }
 
 fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
@@ -12310,8 +12486,15 @@ fn validate_write_batch_shape(
                         EngineKind::Structure => {
                             expected_dirty[2] = true;
                             mutation.target.is_none()
-                                && mutation.opcode == Opcode::SetValue
                                 && delta.structure_scalars.contains(&mutation.key)
+                                && match mutation.opcode {
+                                    Opcode::SetValue => true,
+                                    Opcode::DeleteHash | Opcode::DeleteSet | Opcode::DeleteList => {
+                                        mutation.value.is_empty()
+                                            && mutation.expires_at_micros.is_none()
+                                    }
+                                    _ => false,
+                                }
                         }
                         EngineKind::Search => {
                             expected_dirty[3] = true;
@@ -12321,9 +12504,18 @@ fn validate_write_batch_shape(
                         }
                         EngineKind::Kernel => false,
                     });
+            let valid_unique_probes = delta.unique_probes.iter().all(|probe| {
+                !probe.key.is_empty()
+                    && matches!(
+                        batch.state.catalog.object(probe.index),
+                        Some(CatalogObject::SecondaryIndex(definition))
+                            if definition.unique
+                    )
+            });
             if valid_roots
                 && valid_formats
                 && valid_mutations
+                && valid_unique_probes
                 && batch.dirty == expected_dirty
                 && !batch.dirty[0]
                 && batch.state.ann == ann_store::AnnState::default()
@@ -16081,7 +16273,7 @@ fn relational_tree_after_mutations(
         let old_projections = if mutation.opcode == Opcode::InsertRow {
             Vec::new()
         } else {
-            let old_row = relational_tree_row(
+            let old_row = relational_tree_latest_row(
                 pages,
                 blobs,
                 tree,
@@ -16143,7 +16335,7 @@ fn relational_tree_after_mutations(
     Ok(tree)
 }
 
-fn relational_tree_row(
+fn relational_tree_latest_row(
     pages: &PageStore,
     blobs: &BlobStore,
     tree: BTree,
@@ -16160,9 +16352,37 @@ fn relational_tree_row(
             decode_relational_row(table, primary_key, &encoded, visible_csn, blobs)
         }
         RelationalFormat::VersionChainV2 => {
-            decode_relational_chain(pages, table, primary_key, &encoded, visible_csn, blobs)
+            decode_relational_chain_head(pages, table, primary_key, &encoded, visible_csn, blobs)
         }
     }
+}
+
+fn decode_relational_chain_head(
+    pages: &PageStore,
+    table: ObjectId,
+    primary_key: &[u8],
+    encoded: &[u8],
+    visible_csn: Option<Csn>,
+    blobs: &BlobStore,
+) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+    let page_id = RowVersionPointer::decode(encoded)?.page_id;
+    let page = pages.read(page_id)?;
+    #[cfg(test)]
+    DELTA_LATEST_VERSION_PAGE_READS.set(
+        DELTA_LATEST_VERSION_PAGE_READS
+            .get()
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?,
+    );
+    if page.kind() != PageKind::VersionChain {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    let row = RowRecordView::decode(page.payload())?;
+    validate_version_page(&page, row, table, primary_key, visible_csn, None)?;
+    if !row.is_visible_at(visible_csn) {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    decode_relational_row_value(row, primary_key, blobs)
 }
 
 fn write_secondary_index_projection_markers(
@@ -21107,6 +21327,98 @@ mod tests {
             database.get_latest_structure(b"physical-expiry", i64::MIN)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_all_engine_hot_path_does_not_materialize_complete_engine_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(100)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                body TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql("INSERT INTO events (id, body) VALUES (1, 'seed')", &[])?;
+        seed.set(b"joint-key".to_vec(), b"seed".to_vec(), None)?;
+        seed.create_search_index(index, "documents")?;
+        seed.commit()?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        let delta_commit = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+            database.stage_delta_sql_dml(
+                &mut delta,
+                "UPDATE events SET body = ? WHERE id = ?",
+                &[SqlValue::Text("delta".to_owned()), SqlValue::Signed(1)],
+            )?;
+            database.stage_delta_set(&mut delta, b"joint-key".to_vec(), b"delta".to_vec(), None)?;
+            database.stage_delta_index_document(
+                &mut delta,
+                index,
+                b"doc-1".to_vec(),
+                "delta native".to_owned(),
+            )?;
+            Ok(database.commit_optimistic(delta)?)
+        })();
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        let committed = delta_commit?;
+
+        assert_eq!(
+            database.snapshot(2)?.visible_csn(),
+            Some(committed.commit_csn)
+        );
+        assert_eq!(
+            database.get_latest_structure(b"joint-key", 2)?,
+            Some(b"delta".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_latest_update_reads_only_the_version_chain_head()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                body TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql("INSERT INTO events (id, body) VALUES (1, 'version-0')", &[])?;
+        seed.commit()?;
+
+        for version in 1..=32 {
+            let mut delta =
+                database.begin_optimistic_delta(version + 1, DurabilityClass::Memory)?;
+            database.stage_delta_sql_dml(
+                &mut delta,
+                "UPDATE events SET body = ? WHERE id = ?",
+                &[
+                    SqlValue::Text(format!("version-{version}")),
+                    SqlValue::Signed(1),
+                ],
+            )?;
+            database.commit_optimistic(delta)?;
+        }
+
+        let mut delta = database.begin_optimistic_delta(40, DurabilityClass::Memory)?;
+        database.stage_delta_sql_dml(
+            &mut delta,
+            "UPDATE events SET body = 'latest' WHERE id = 1",
+            &[],
+        )?;
+        super::DELTA_LATEST_VERSION_PAGE_READS.set(0);
+        database.commit_optimistic(delta)?;
+        assert_eq!(super::DELTA_LATEST_VERSION_PAGE_READS.get(), 1);
         Ok(())
     }
 

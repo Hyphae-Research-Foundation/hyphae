@@ -1119,6 +1119,69 @@ pub(crate) fn transaction_dml_primary_key(
     }
 }
 
+pub(crate) fn transaction_dml_candidate_row(
+    transaction: &NativeWriteBatch,
+    statement: &str,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    match parse(statement)? {
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => {
+            let (_, definition) = relation_named(&transaction.state.catalog, &name)?;
+            let resolved =
+                resolve_mutation_operands(definition, &values, parameter_count, parameters)?;
+            let values = bind_insert_values(definition, &values, &resolved)?;
+            if is_legacy_binary_relation(definition) {
+                Ok(Some(legacy_binary_value(values[1], false)?))
+            } else {
+                Ok(Some(encode_tuple(definition, &values)?))
+            }
+        }
+        Statement::Update {
+            name,
+            assignments,
+            predicates,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
+            let assignment_columns = bind_update_columns(definition, &assignments)?;
+            let predicate_columns = bind_primary_key_columns(definition, &predicates)?;
+            let assignment_values =
+                resolve_mutation_operands(definition, &assignments, parameter_count, parameters)?;
+            let predicate_values =
+                resolve_mutation_operands(definition, &predicates, parameter_count, parameters)?;
+            let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+            let Some(stored) = transaction.select(table, &primary_key) else {
+                return Ok(None);
+            };
+            if is_legacy_binary_relation(definition) {
+                if assignment_columns.as_slice() != [1] {
+                    return Err(SqlError::InvalidSyntax);
+                }
+                Ok(Some(legacy_binary_value(assignment_values.first(), false)?))
+            } else {
+                let assignments =
+                    bind_update_assignments(definition, &assignment_columns, &assignment_values)?;
+                Ok(Some(encode_updated_tuple(
+                    definition,
+                    &assignments,
+                    stored,
+                )?))
+            }
+        }
+        Statement::Delete { .. } => Ok(None),
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
+    }
+}
+
 fn execute_bound_snapshot(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,
@@ -5950,7 +6013,7 @@ fn secondary_index_by_id(
     }
 }
 
-fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
+pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
     match error {
         NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
         error => SqlError::Runtime(error),
