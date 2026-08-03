@@ -476,6 +476,10 @@ fn measure_operations(
         inputs.secondary_range_prepared,
         inputs.secondary_range_parameters,
     );
+    let (search_btree, prepared_sql, relational_btree) =
+        measure_inherited_point_routes(database, snapshot, inputs);
+    let (secondary_btree, secondary_prepared_sql) = measure_secondary_exact_pair(database, inputs);
+    let codec_dispatch = measure_codec_dispatch(snapshot, inputs);
     let (secondary_prefix_range_scan, secondary_prefix_range_physical) =
         measure_secondary_range_pair(
             secondary_prefix_database,
@@ -483,7 +487,6 @@ fn measure_operations(
             inputs.secondary_prefix_range_prepared,
             inputs.secondary_prefix_range_parameters,
         );
-    let (secondary_btree, secondary_prepared_sql) = measure_secondary_exact_pair(database, inputs);
     Ok(OperationStats {
         structure,
         structure_btree,
@@ -491,35 +494,9 @@ fn measure_operations(
         hash_btree,
         set,
         set_btree,
-        search_btree: measure_counted(
-            || {
-                black_box(
-                    database
-                        .match_latest_text(
-                            inputs.search_index,
-                            black_box(SEARCH_QUERY),
-                            black_box(1),
-                        )
-                        .is_ok(),
-                );
-            },
-            SEARCH_OBSERVATIONS,
-            SEARCH_OPERATIONS_PER_OBSERVATION,
-        ),
-        prepared_sql: measure(|| {
-            black_box(
-                snapshot
-                    .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))
-                    .is_ok(),
-            );
-        }),
-        relational_btree: measure(|| {
-            black_box(
-                database
-                    .select_latest_relational(inputs.table, black_box(inputs.relational_target))
-                    .is_ok(),
-            );
-        }),
+        search_btree,
+        prepared_sql,
+        relational_btree,
         relational_scan,
         prepared_sql_scan,
         relational_range,
@@ -533,11 +510,48 @@ fn measure_operations(
         secondary_range_physical,
         secondary_prefix_range_scan,
         secondary_prefix_range_physical,
-        codec_dispatch: measure(|| {
-            if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
-                black_box(snapshot.get(black_box(decoded.payload)));
-            }
-        }),
+        codec_dispatch,
+    })
+}
+
+fn measure_inherited_point_routes(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats, Stats) {
+    let search = measure_counted(
+        || {
+            black_box(
+                database
+                    .match_latest_text(inputs.search_index, black_box(SEARCH_QUERY), black_box(1))
+                    .is_ok(),
+            );
+        },
+        SEARCH_OBSERVATIONS,
+        SEARCH_OPERATIONS_PER_OBSERVATION,
+    );
+    let prepared = measure(|| {
+        black_box(
+            snapshot
+                .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))
+                .is_ok(),
+        );
+    });
+    let relational = measure(|| {
+        black_box(
+            database
+                .select_latest_relational(inputs.table, black_box(inputs.relational_target))
+                .is_ok(),
+        );
+    });
+    (search, prepared, relational)
+}
+
+fn measure_codec_dispatch(snapshot: &NativeSnapshot, inputs: &BenchmarkInputs<'_>) -> Stats {
+    measure(|| {
+        if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
+            black_box(snapshot.get(black_box(decoded.payload)));
+        }
     })
 }
 
