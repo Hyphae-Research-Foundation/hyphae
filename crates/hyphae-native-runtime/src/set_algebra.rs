@@ -344,10 +344,28 @@ mod tests {
             SetAlgebraRequest::try_new(
                 SetAlgebraOperation::Intersection,
                 vec![b"set".to_vec()],
+                MAX_SET_ALGEBRA_OUTPUT_MEMBERS + 1,
+                1
+            ),
+            Err(SetAlgebraError::InvalidOutputLimit { .. })
+        ));
+        assert!(matches!(
+            SetAlgebraRequest::try_new(
+                SetAlgebraOperation::Intersection,
+                vec![b"set".to_vec()],
                 1,
                 0
             ),
             Err(SetAlgebraError::InvalidVisitLimit { requested: 0 })
+        ));
+        assert!(matches!(
+            SetAlgebraRequest::try_new(
+                SetAlgebraOperation::Intersection,
+                vec![b"set".to_vec()],
+                1,
+                MAX_SET_ALGEBRA_VISITS + 1
+            ),
+            Err(SetAlgebraError::InvalidVisitLimit { .. })
         ));
         Ok(())
     }
