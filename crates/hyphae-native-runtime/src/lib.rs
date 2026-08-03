@@ -21,6 +21,8 @@ mod set_algebra_equivalence;
 #[cfg(test)]
 mod set_commands_equivalence;
 #[cfg(test)]
+mod set_lifecycle_equivalence;
+#[cfg(test)]
 mod set_ttl_equivalence;
 mod snapshot_pins;
 mod sql;
@@ -8833,6 +8835,48 @@ impl NativeWriteBatch {
             key,
             value: Vec::new(),
             expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Deletes one complete native set without changing retained snapshots.
+    ///
+    /// Returns false without adding a mutation when the key is absent. A
+    /// successful deletion retires the set incarnation and permits checked
+    /// recreation later in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or another live structure kind.
+    pub fn delete_set(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self
+            .state
+            .structures
+            .set_is_visible(&key, self.snapshot.logical_time_micros)
+        {
+            return Ok(false);
+        }
+        let removed = self.state.structures.delete_set(&key);
+        debug_assert!(removed);
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
         });
         self.dirty[2] = true;
         Ok(true)
