@@ -244,6 +244,14 @@ commit before its tag can be published.
 - `native-sorted-set-wsl2.json` is its clean release observation for physical
   `ZCARD`, middle-member `ZSCORE`, and ten-entry head `ZRANGE` over 2,048
   members. It remains outside G3 and G7.
+- [Native sorted-set score-range evidence —
+  2026-08-02](native-sorted-set-score-ranges-linux-2026-08-02.md) binds
+  inclusive, exclusive, unbounded, empty, and inverted score bounds, live
+  offset/limit semantics, direct physical pruning, execution-mode
+  equivalence, and fail-closed decoding to one source commit.
+- `native-sorted-set-score-range-linux.json` is its direct-Linux release
+  observation for a ten-member middle score range over 2,048 members. It
+  remains outside G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

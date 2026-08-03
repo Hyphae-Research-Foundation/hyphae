@@ -4,10 +4,10 @@ Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
 buffered reads, large immutable blobs, and dual-index sorted sets are
-implemented in the convergence slice; the ordered durable scalar-expiry index
-and bounded cleanup are implemented; an engine-owned background timer,
-version-bearing responses, and the remaining structure families remain
-pending
+implemented in the convergence slice, including bounded sorted-set score
+ranges; the ordered durable scalar-expiry index and bounded cleanup are
+implemented; an engine-owned background timer, version-bearing responses, and
+the remaining structure families remain pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -44,8 +44,8 @@ conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
 counters, explicitly created binary hash/maps, exact binary sets, and
-chunked-deque lists. Sorted sets, streams, bitmaps, sketches, geo indexes, and
-typed registers remain targets.
+chunked-deque lists, plus dual-index sorted sets with bounded score ranges.
+Streams, bitmaps, sketches, geo indexes, and typed registers remain targets.
 
 ## First vertical operations
 
@@ -146,6 +146,23 @@ updated, or unchanged. `ZSCORE` returns the exact canonical score for a member,
 cardinality. `ZRANGE` uses the same signed, inclusive rank interval as
 `LRANGE`; results are ascending by score with exact member bytes as the
 deterministic tie-breaker.
+
+`ZRANGE_BY_SCORE` accepts independently inclusive, exclusive, or unbounded
+minimum and maximum scores plus a nonnegative `offset` and `limit`. Results
+remain ascending by score and exact member bytes. Offset counts only live
+members inside the score interval, and execution returns at most `limit`
+members. A zero limit still validates the sorted-set kind, existence, and
+both score bounds before returning an empty result. Equal inclusive endpoints
+select that exact score; every other equal-endpoint combination, or a lower
+endpoint greater than the upper endpoint, returns an empty result.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+execution have identical results. Current-root execution maps the canonical
+score bounds directly onto the ordered `0x0a` B+tree namespace, prunes
+nonintersecting subtrees, ignores tombstones without charging offset, and
+stops after the requested live result count. It does not materialize the
+complete sorted set. Malformed ordered identities, scores, or live markers
+fail the complete call rather than returning a partial result.
 
 Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
 rejected before mutation. Negative zero is normalized to positive zero. These

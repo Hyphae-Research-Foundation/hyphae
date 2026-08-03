@@ -5,6 +5,7 @@
 use std::{
     fs,
     hint::black_box,
+    ops::Bound,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -90,6 +91,8 @@ fn member(index: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 fn warm(database: &NativeDatabase, middle_member: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let score_lower = f64::from(MEMBERS / 2);
+    let score_upper = f64::from(MEMBERS / 2 + 10);
     for _ in 0..WARMUP {
         black_box(database.zcard_latest_sorted_set(black_box(SORTED_SET_KEY))?);
         black_box(
@@ -97,6 +100,13 @@ fn warm(database: &NativeDatabase, middle_member: &[u8]) -> Result<(), Box<dyn s
                 .zscore_latest_sorted_set(black_box(SORTED_SET_KEY), black_box(middle_member))?,
         );
         black_box(database.zrange_latest_sorted_set(black_box(SORTED_SET_KEY), 0, 9)?);
+        black_box(database.zrange_by_score_latest_sorted_set(
+            black_box(SORTED_SET_KEY),
+            black_box(Bound::Included(score_lower)),
+            black_box(Bound::Excluded(score_upper)),
+            0,
+            10,
+        )?);
     }
     Ok(())
 }
@@ -114,6 +124,30 @@ fn print_stats(name: &str, stats: Stats, trailing_comma: bool) {
         stats.throughput_per_second,
         if trailing_comma { "," } else { "" }
     );
+}
+
+fn validate_score_range(
+    database: &NativeDatabase,
+    middle_member: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let score_range = database.zrange_by_score_latest_sorted_set(
+        SORTED_SET_KEY,
+        Bound::Included(f64::from(MEMBERS / 2)),
+        Bound::Excluded(f64::from(MEMBERS / 2 + 10)),
+        0,
+        10,
+    )?;
+    if score_range.len() != 10
+        || score_range
+            .first()
+            .is_none_or(|entry| entry.member() != middle_member)
+        || score_range
+            .last()
+            .is_none_or(|entry| entry.score().to_bits() != f64::from(MEMBERS / 2 + 9).to_bits())
+    {
+        return Err("physical score range returned the wrong benchmark cohort".into());
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("reopened benchmark sorted-set cardinality is wrong".into());
     }
     let middle_member = member(MEMBERS / 2)?;
+    validate_score_range(&database, &middle_member)?;
     warm(&database, &middle_member)?;
     let zcard = measure(
         || {
@@ -165,9 +200,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OBSERVATIONS,
         1,
     )?;
+    let score_lower = f64::from(MEMBERS / 2);
+    let score_upper = f64::from(MEMBERS / 2 + 10);
+    let zrange_by_score_middle_10 = measure(
+        || {
+            black_box(database.zrange_by_score_latest_sorted_set(
+                black_box(SORTED_SET_KEY),
+                black_box(Bound::Included(score_lower)),
+                black_box(Bound::Excluded(score_upper)),
+                0,
+                10,
+            )?);
+            Ok(())
+        },
+        OBSERVATIONS,
+        1,
+    )?;
 
     println!("{{");
-    println!("  \"schema\": \"hyphae-native-sorted-set-smoke-v1\",");
+    println!("  \"schema\": \"hyphae-native-sorted-set-smoke-v2\",");
     println!("  \"mode\": \"release-warm-concurrency-1\",");
     println!("  \"observations\": {OBSERVATIONS},");
     println!("  \"warmup\": {WARMUP},");
@@ -184,7 +235,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"metrics\": {{");
     print_stats("zcard_physical", zcard, true);
     print_stats("zscore_middle_physical", zscore_middle, true);
-    print_stats("zrange_head_10_physical", zrange_head_10, false);
+    print_stats("zrange_head_10_physical", zrange_head_10, true);
+    print_stats(
+        "zrange_by_score_middle_10_physical",
+        zrange_by_score_middle_10,
+        false,
+    );
     println!("  }}");
     println!("}}");
     Ok(())
