@@ -1,0 +1,117 @@
+{
+  "schema": "hyphae.native.hash-randomized-model-evidence.v1",
+  "status": "direct-linux-semantic-observation",
+  "source_branch": "codex/native-hash-model-equivalence",
+  "stacked_base_commit": "1544a4faca3902046181df58d8b7bef883f81d96",
+  "contract_commit": "3af6c63d4e9ef1020d71ba2adbc9f86c48a2ef4e",
+  "implementation_commit": "0cf10e92f73eb5701c1de20aff975a7041a8cc2d",
+  "coverage_reporting_commit": "316310f37d56c7ea3bd9228a1a29a78525b467d0",
+  "source_tree": "107b7946eab646609243fe17ac2472d4e0e8ee65",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "profile": "test",
+  "harness_sha256": "292cdfdd20da9aceeef8748508836d8eaea8239514a08966a8418a2b58717d13",
+  "generator": {
+    "algorithm": "SplitMix64",
+    "wall_clock_independent": true,
+    "seeds": [
+      "0x4859504841450001",
+      "0x4859504841450002",
+      "0x4859504841450003",
+      "0x4859504841450004",
+      "0x4859504841450005",
+      "0x4859504841450006",
+      "0x4859504841450007",
+      "0x4859504841450008",
+      "0x4859504841450009",
+      "0x485950484145000a",
+      "0x485950484145000b",
+      "0x485950484145000c",
+      "0x485950484145000d",
+      "0x485950484145000e",
+      "0x485950484145000f",
+      "0x4859504841450010"
+    ],
+    "steps_per_seed": 256,
+    "hash_keys": 4,
+    "hash_fields": 32
+  },
+  "execution": {
+    "durability": "memory",
+    "actions": 4096,
+    "action_counts": {
+      "create_hash": 370,
+      "delete_hash": 267,
+      "expire_hash": 295,
+      "hset": 729,
+      "hset_many": 405,
+      "hdelete": 352,
+      "hdelete_many": 304,
+      "hincrement": 322,
+      "expire_field": 413,
+      "advance_time": 382,
+      "probe": 257
+    },
+    "comparisons": 4524373,
+    "private_audits": 4096,
+    "retained_snapshot_audits": 4096,
+    "materialized_snapshot_audits": 4096,
+    "physical_audits": 4240,
+    "reopens": 128,
+    "rust_test_elapsed_seconds": 51.36,
+    "command_elapsed_seconds": 52.94
+  },
+  "negative_control": {
+    "test": "hash_model_equivalence::perturbed_hash_oracle_reports_exact_trace_location",
+    "passed": true,
+    "required_diagnostics": [
+      "seed",
+      "seed_ordinal",
+      "step",
+      "logical_time",
+      "action",
+      "surface",
+      "hex_identity"
+    ]
+  },
+  "discovered_divergence": {
+    "surface": "current-root-physical",
+    "operation": "ttl_hash_field",
+    "prior_result": "UnknownStructureHash",
+    "contracted_result": "Missing",
+    "covered_cases": [
+      "absent_hash",
+      "due_hash",
+      "non_hash_key",
+      "reopen"
+    ]
+  },
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "gates": {
+    "native_runtime_tests": {
+      "passed": 275,
+      "failed": 0
+    },
+    "workspace_all_targets_all_features": "passed",
+    "clippy_all_targets_all_features_deny_warnings": "passed",
+    "documentation": {
+      "status": "passed",
+      "markdown_files": 219,
+      "json_examples": 12
+    }
+  },
+  "boundaries": [
+    "The fixed corpus is deterministic evidence over its declared distribution, not exhaustive state-space proof.",
+    "Memory durability restart equivalence is not strict-fsync, process-kill, EC2-stop, or physical-power-loss evidence.",
+    "Concurrent optimistic histories, scheduler fairness, allocation and RSS, other collection-family models, local-protocol exposure, complete G3, and G7 remain open.",
+    "Hosted CI is not claimed by this local receipt."
+  ]
+}

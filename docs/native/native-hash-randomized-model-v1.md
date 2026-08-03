@@ -1,6 +1,9 @@
 # Native hash randomized-model gate v1
 
-Status: contract frozen; implementation and evidence pending.
+Status: implemented and evidenced on direct Linux; hosted CI pending.
+
+Evidence:
+[native hash randomized-model Linux receipt](../gates/evidence/native-hash-randomized-model-linux-2026-08-03.md).
 
 This gate defines a deterministic state-machine comparison between the
 independent logical `StructureState` model and the native hash engine's

@@ -175,15 +175,16 @@ per-field expiry, the accepted WAL opcode `EXPIRE_HASH_FIELD=32`, the ordered
 `0x0c` namespace, visibility across every hash read surface, expiry-clearing
 mutations, field/lifecycle conflicts, combined active cleanup, crash
 boundaries, compaction, and matched direct-Linux latency. Relative and
-conditional field expiry, field persist/batches, floating counters,
-randomized model testing, other collection-family TTL, the complete G3 suite,
-and G7 remain open.
+conditional field expiry, field persist/batches, floating counters, other
+collection-family TTL, the complete G3 suite, and G7 remain open.
 
 The [native hash randomized-model
-gate](../native/native-hash-randomized-model-v1.md) freezes a dependency-free,
-replayable state-machine corpus over private, retained, physical, and reopened
-execution. Its implementation and evidence remain open; the contract alone
-does not satisfy the G3 randomized-model requirement.
+evidence](evidence/native-hash-randomized-model-linux-2026-08-03.md) executes
+the frozen dependency-free state machine across 16 fixed seeds, 4,096 actions,
+4,524,373 comparisons, every hash read surface, and 128 reopen cycles. It also
+retains a perturbed-oracle negative control and the physical field-TTL
+contract correction exposed by the corpus. Other structure-family models,
+concurrent histories, memory amplification, complete G3, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
