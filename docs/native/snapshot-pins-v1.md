@@ -108,9 +108,10 @@ The record is exactly 240 bytes:
 | 208 | 32 | BLAKE3 checksum of bytes `0..208` |
 
 Every unsigned integer except the pin ID is little-endian. Zero pin IDs, CSNs,
-generations, floors, LSNs, digests, or checksums are invalid. The visible CSN
-must be at least the retention floor. Reserved bytes must be zero. Decode
-requires the exact record length; trailing bytes are corruption.
+page/manifest generations, floors, LSNs, digests, or checksums are invalid.
+Blob generation may be zero before the first immutable blob is committed. The
+visible CSN must be at least the retention floor. Reserved bytes must be zero.
+Decode requires the exact record length; trailing bytes are corruption.
 
 The filename ID and payload ID must match. Directory enumeration sorts by pin
 ID so recovery reports and collection behavior are deterministic.

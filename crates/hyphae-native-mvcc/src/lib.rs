@@ -366,6 +366,31 @@ impl Snapshot {
     pub fn roots(&self) -> &RootSet {
         &self.roots
     }
+
+    /// Materializes snapshot metadata from one independently verified
+    /// committed root set.
+    ///
+    /// This constructor is for durable historical authorities whose pages and
+    /// WAL/manifest binding were validated outside the live coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root set is not committed.
+    pub fn from_committed_root(
+        roots: RootSet,
+        logical_time_micros: i64,
+    ) -> Result<Self, MvccError> {
+        let visible_csn = roots.visible_csn.ok_or(MvccError::UncommittedRootSet)?;
+        if roots.wal_anchor.is_none() {
+            return Err(MvccError::UncommittedRootSet);
+        }
+        Ok(Self {
+            visible_csn: Some(visible_csn),
+            catalog_version: roots.catalog_version,
+            logical_time_micros,
+            roots: Arc::new(roots),
+        })
+    }
 }
 
 /// Half-open MVCC version interval.
