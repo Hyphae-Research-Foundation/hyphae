@@ -656,7 +656,7 @@ exact-byte iteration, exact binary sets with member-granular conflicts,
 chunked-deque lists, and dual-index sorted sets with bounded bidirectional
 score/rank ranges, member-rank lookup, whole-hash delete/recreate and TTL,
 bounded multi-field hash commands, and signed hash-field counters. It still
-lacks hash pattern/reverse scans, floating counters, set and sorted-set
+lacks hash pattern scans, floating counters, set and sorted-set
 algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
 empty-expiry backoff, randomized model tests, and a user-facing
 historical-retention policy required to close G3. Ordered cleanup,
