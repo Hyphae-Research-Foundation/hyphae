@@ -172,12 +172,13 @@ leading literal prefix for B+tree pruning and falls back to a bounded hash
 prefix scan only for leading-wildcard patterns. Its complete contract is
 [Native hash pattern scan v1](native-hash-pattern-scan-v1.md).
 
-Independent absolute field expiry is frozen separately in
-[Native hash field TTL v1](native-hash-field-ttl-v1.md). That contract reserves
-one collision-free field-expiry namespace, field-granular WAL/conflict
-semantics, logical visibility across every hash read surface, and combined
-active cleanup. It is not an implemented capability until its executable
-evidence is recorded.
+Independent absolute field expiry is specified in
+[Native hash field TTL v1](native-hash-field-ttl-v1.md). It uses one
+collision-free field-expiry namespace, field-granular WAL/conflict semantics,
+logical visibility across every hash read surface, and combined active
+cleanup. Its implementation, failure-boundary, equivalence, and direct-Linux
+latency evidence are bound in the
+[native hash field TTL receipt](../gates/evidence/native-hash-field-ttl-linux-2026-08-03.md).
 
 An empty hash remains a typed hash after its last field is deleted.
 `DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
@@ -325,6 +326,7 @@ B+tree:
 | `0x09` | prefix + sorted-set-member identity | canonical `HYZSCR01` score or structure tombstone |
 | `0x0a` | prefix + sorted-set key + sortable score + member | canonical empty persistent `HYSTRV01` value or structure tombstone |
 | `0x0b` | prefix + sortable expiry + binary structure key | typed one-byte live marker or tombstone |
+| `0x0c` | prefix + sortable expiry + compound hash-field identity | one-byte live field-expiry marker or tombstone |
 
 The exact value envelope is:
 

@@ -1,6 +1,7 @@
 # Native hash field TTL v1
 
-Status: contract frozen; implementation and evidence pending.
+Status: implemented; direct-Linux evidence is recorded in the
+[native hash field TTL receipt](../gates/evidence/native-hash-field-ttl-linux-2026-08-03.md).
 
 This contract extends
 [Native structure-engine semantics v1](structures-semantics-v1.md),

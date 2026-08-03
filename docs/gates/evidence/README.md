@@ -327,6 +327,16 @@ commit before its tag can be published.
   fallbacks, and repeated pinned parent/current HGET controls. It preserves
   the leading-wildcard slowdown as an explicit optimization target and
   remains outside complete G3 and G7.
+- [Native hash field TTL evidence —
+  2026-08-03](native-hash-field-ttl-linux-2026-08-03.md) binds absolute
+  per-field expiry, compatible `HYSTRV01` envelopes, accepted WAL opcode 32,
+  the collision-free `0x0c` index, all hash read surfaces, field/lifecycle
+  conflicts, bounded combined cleanup, crash boundaries, and compaction to
+  direct Linux.
+- `native-hash-field-ttl-linux.json` records separated TTL, `HGET`, no-due and
+  due `HLEN`, memory/strict mutation, 64-field cleanup, and repeated isolated
+  parent/current HGET controls. It retains invalid preliminary observations
+  as exclusions and remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

@@ -259,6 +259,7 @@ namespace:
 | `0x09` | prefix + length-delimited sorted-set key + member | `HYZSCR01` canonical score |
 | `0x0a` | prefix + sorted-set key + sortable score + member | persistent empty `HYSTRV01` marker |
 | `0x0b` | prefix + sortable expiry + structure key | typed one-byte live marker or tombstone |
+| `0x0c` | prefix + sortable expiry + compound hash-field identity | one-byte live field-expiry marker or tombstone |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,

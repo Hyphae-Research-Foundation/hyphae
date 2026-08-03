@@ -160,9 +160,24 @@ evidence](evidence/native-hash-reverse-scan-linux-2026-08-03.md) adds
 descending exact-byte scans over private, retained, and physical state;
 exclusive live/dead cursors; whole-hash TTL; height-two reverse B+tree
 pruning; early stop; fail-closed reached corruption; and a direct-Linux
-comparison against full ascending materialization. Pattern scans, floating
-counters, randomized model testing, other collection-family TTL, the complete
-G3 suite, and G7 remain open.
+comparison against full ascending materialization.
+
+The [native hash pattern-scan
+evidence](evidence/native-hash-pattern-scan-linux-2026-08-03.md) adds one
+bounded binary-glob grammar with independent output, visit, and matcher-step
+budgets; exact and leading-prefix physical routes; empty-page progress;
+TTL/reopen equivalence; and reached-corruption handling. Its receipt retains
+the negative leading-wildcard result as an optimization target.
+
+The [native hash field TTL
+evidence](evidence/native-hash-field-ttl-linux-2026-08-03.md) adds absolute
+per-field expiry, the accepted WAL opcode `EXPIRE_HASH_FIELD=32`, the ordered
+`0x0c` namespace, visibility across every hash read surface, expiry-clearing
+mutations, field/lifecycle conflicts, combined active cleanup, crash
+boundaries, compaction, and matched direct-Linux latency. Relative and
+conditional field expiry, field persist/batches, floating counters,
+randomized model testing, other collection-family TTL, the complete G3 suite,
+and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -655,11 +670,12 @@ conditional writes, signed counters, independent-field hashes with bounded
 ascending, descending, and binary-glob iteration, exact binary sets with
 member-granular conflicts, chunked-deque lists, and dual-index sorted sets
 with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
-delete/recreate and TTL, bounded multi-field hash commands, and signed
-hash-field counters. It still lacks floating counters, set and sorted-set
-algebra/TTL, per-field TTL, subtree-count order-statistic acceleration,
-streams, adaptive empty-expiry backoff, randomized model tests, and a
-user-facing historical-retention policy required to close G3. Ordered cleanup,
+delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
+counters, and independent absolute field TTL. It still lacks floating
+counters, set and sorted-set algebra/TTL, relative/conditional field expiry,
+field persist/batches, subtree-count order-statistic acceleration, streams,
+adaptive empty-expiry backoff, randomized model tests, and a user-facing
+historical-retention policy required to close G3. Ordered cleanup,
 current-root compaction, and page-generation vacuum provide exact first
 amplification measurements, not the complete memory-amplification gate.
 
