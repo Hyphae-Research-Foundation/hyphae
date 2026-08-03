@@ -66,6 +66,7 @@ pub(crate) enum Opcode {
     DeleteSortedSetMember = 27,
     CompactStructure = 28,
     VacuumPageGeneration = 29,
+    DeleteHash = 30,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +626,7 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteHashField as u8 => {
             (Opcode::DeleteHashField, EngineKind::Structure)
         }
+        value if value == Opcode::DeleteHash as u8 => (Opcode::DeleteHash, EngineKind::Structure),
         value if value == Opcode::CreateSet as u8 => (Opcode::CreateSet, EngineKind::Structure),
         value if value == Opcode::AddSetMember as u8 => {
             (Opcode::AddSetMember, EngineKind::Structure)
@@ -743,6 +745,7 @@ fn validate_mutation_shape(
         | Opcode::DeleteValue
         | Opcode::ExpireValue
         | Opcode::CreateHash
+        | Opcode::DeleteHash
         | Opcode::SetHashField
         | Opcode::DeleteHashField
         | Opcode::CreateSet
@@ -779,6 +782,7 @@ fn validate_mutation_shape(
         }
         Opcode::DeleteValue
         | Opcode::CreateHash
+        | Opcode::DeleteHash
         | Opcode::DeleteHashField
         | Opcode::CreateSet
         | Opcode::AddSetMember
@@ -1106,6 +1110,7 @@ mod tests {
             structure_mutation(Opcode::ExpireValue, b"key", b"value", Some(i64::MAX)),
             structure_mutation(Opcode::DeleteValue, b"old-key", b"", None),
             structure_mutation(Opcode::CreateHash, b"hash", b"", None),
+            structure_mutation(Opcode::DeleteHash, b"retired-hash", b"", None),
             structure_mutation(Opcode::SetHashField, &hash_field, b"value", None),
             structure_mutation(Opcode::DeleteHashField, &hash_field, b"", None),
             structure_mutation(Opcode::CreateSet, b"set", b"", None),
@@ -1182,7 +1187,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 23);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 24);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }

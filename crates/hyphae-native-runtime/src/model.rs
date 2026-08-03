@@ -546,6 +546,10 @@ impl StructureState {
         true
     }
 
+    pub(crate) fn delete_hash(&mut self, key: &[u8]) -> bool {
+        self.hashes.remove(key).is_some()
+    }
+
     pub(crate) fn hset(&mut self, key: &[u8], field: Vec<u8>, value: Vec<u8>) -> Option<bool> {
         self.hashes
             .get_mut(key)

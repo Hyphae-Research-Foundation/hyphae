@@ -3157,7 +3157,9 @@ impl NativeDatabase {
             }
             return Err(NativeRuntimeError::UnknownStructureHash);
         };
-        decode_hash_metadata(metadata.bytes())?;
+        if decode_live_hash_metadata(metadata.bytes())?.is_none() {
+            return self.hash_missing_or_kind_error(tree, key);
+        }
         tree.get_cached_pinned(
             &self.pages,
             &self.buffer_pool,
@@ -3222,8 +3224,10 @@ impl NativeDatabase {
             }
             return Err(NativeRuntimeError::UnknownStructureHash);
         };
-        usize::try_from(decode_hash_metadata(metadata.bytes())?)
-            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+        let Some(count) = decode_live_hash_metadata(metadata.bytes())? else {
+            return self.hash_missing_or_kind_error(tree, key);
+        };
+        usize::try_from(count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
 
     /// Scans one bounded current hash-field range without materializing the
@@ -3268,7 +3272,10 @@ impl NativeDatabase {
         else {
             return self.hash_missing_or_kind_error(tree, key);
         };
-        let declared_count = usize::try_from(decode_hash_metadata(metadata.bytes())?)
+        let Some(declared_count) = decode_live_hash_metadata(metadata.bytes())? else {
+            return self.hash_missing_or_kind_error(tree, key);
+        };
+        let declared_count = usize::try_from(declared_count)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -3396,6 +3403,9 @@ impl NativeDatabase {
                     &self.buffer_pool,
                     &structure_hash_meta_key(key),
                 )?
+                .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
+                .transpose()?
+                .flatten()
                 .is_some();
             let list_exists = tree
                 .get_cached_pinned(
@@ -3458,6 +3468,9 @@ impl NativeDatabase {
                     &self.buffer_pool,
                     &structure_hash_meta_key(key),
                 )?
+                .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
+                .transpose()?
+                .flatten()
                 .is_some();
             let list_exists = tree
                 .get_cached_pinned(
@@ -3516,6 +3529,9 @@ impl NativeDatabase {
                         &self.buffer_pool,
                         &structure_hash_meta_key(key),
                     )?
+                    .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
+                    .transpose()?
+                    .flatten()
                     .is_some()
                 || tree
                     .get_cached_pinned(
@@ -4120,6 +4136,9 @@ impl NativeDatabase {
                 &self.buffer_pool,
                 &structure_hash_meta_key(key),
             )?
+            .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
+            .transpose()?
+            .flatten()
             .is_some();
         let set = tree
             .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
@@ -4478,8 +4497,9 @@ impl NativeDatabase {
                 retention_floor_csn,
             });
         }
-        let write_keys = mutation_write_keys(&batch.mutations);
-        self.conflicts.validate(conflict_read_csn, &write_keys)?;
+        let validation_keys = mutation_validation_keys(&batch.mutations);
+        self.conflicts
+            .validate(conflict_read_csn, &validation_keys)?;
 
         let mut state = load_state(&self.pages, &self.blobs, root_transaction.base_roots())?;
         apply_mutations_to_state(&mut state, &batch.mutations)?;
@@ -6168,6 +6188,42 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Deletes one complete native hash without changing retained snapshots.
+    ///
+    /// Returns false without adding a mutation when the key is absent. A
+    /// successful deletion retires the hash incarnation and permits checked
+    /// recreation later in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or another live structure kind.
+    pub fn delete_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self.state.structures.delete_hash(&key) {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteHash,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Inserts or replaces one field in an existing native hash.
     ///
     /// # Errors
@@ -7228,8 +7284,9 @@ impl NativeTransaction<'_> {
 
     fn validated_write_keys(&self) -> Result<Vec<WriteKey>, WriteConflict> {
         let write_keys = mutation_write_keys(&self.batch.mutations);
+        let validation_keys = mutation_validation_keys(&self.batch.mutations);
         self.conflicts
-            .validate(self.conflict_read_csn, &write_keys)?;
+            .validate(self.conflict_read_csn, &validation_keys)?;
         Ok(write_keys)
     }
 
@@ -7393,11 +7450,45 @@ fn apply_structure_mutation(
                 mutation.expires_at_micros,
             );
         }
+        Opcode::CreateHash
+        | Opcode::DeleteHash
+        | Opcode::SetHashField
+        | Opcode::DeleteHashField => apply_hash_mutation(state, mutation)?,
+        Opcode::CreateSet | Opcode::AddSetMember | Opcode::DeleteSetMember => {
+            apply_set_mutation(state, mutation)?;
+        }
+        Opcode::CreateList
+        | Opcode::PushListHead
+        | Opcode::PushListTail
+        | Opcode::PopListHead
+        | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
+        Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
+            apply_sorted_set_mutation(state, mutation)?;
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn apply_hash_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    match mutation.opcode {
         Opcode::CreateHash => {
             if mutation.target.is_some()
                 || !mutation.value.is_empty()
                 || mutation.expires_at_micros.is_some()
                 || !state.create_hash(mutation.key.clone())
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::DeleteHash => {
+            if mutation.target.is_some()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+                || !state.delete_hash(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
@@ -7425,17 +7516,6 @@ fn apply_structure_mutation(
             if state.hdelete(key, field) != Some(true) {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
-        }
-        Opcode::CreateSet | Opcode::AddSetMember | Opcode::DeleteSetMember => {
-            apply_set_mutation(state, mutation)?;
-        }
-        Opcode::CreateList
-        | Opcode::PushListHead
-        | Opcode::PushListTail
-        | Opcode::PopListHead
-        | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
-        Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
-            apply_sorted_set_mutation(state, mutation)?;
         }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
@@ -7578,6 +7658,7 @@ fn apply_mutations_to_state(
             | Opcode::DeleteValue
             | Opcode::ExpireValue
             | Opcode::CreateHash
+            | Opcode::DeleteHash
             | Opcode::SetHashField
             | Opcode::DeleteHashField
             | Opcode::CreateSet
@@ -7789,6 +7870,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::DeleteValue
             | Opcode::ExpireValue
             | Opcode::CreateHash
+            | Opcode::DeleteHash
             | Opcode::CreateSet
             | Opcode::CreateList
             | Opcode::CreateSortedSet
@@ -7851,6 +7933,27 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             name_key.extend_from_slice(&[2, mutation.engine as u8]);
             name_key.extend_from_slice(name_identity);
             keys.push(WriteKey::new(EngineKind::Kernel, None, name_key));
+        }
+    }
+    keys
+}
+
+fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
+    let mut keys = mutation_write_keys(mutations);
+    for mutation in mutations {
+        if matches!(
+            mutation.opcode,
+            Opcode::SetHashField | Opcode::DeleteHashField
+        ) && let Ok((hash_key, _)) = decode_hash_field_identity(&mutation.key)
+        {
+            let mut identity = Vec::with_capacity(hash_key.len().saturating_add(1));
+            identity.push(0);
+            identity.extend_from_slice(hash_key);
+            keys.push(WriteKey::new(
+                EngineKind::Structure,
+                mutation.target,
+                identity,
+            ));
         }
     }
     keys
@@ -7982,7 +8085,8 @@ fn group_admission_rejection(
         });
     }
     let write_keys = mutation_write_keys(&batch.mutations);
-    conflicts.validate(batch.snapshot.visible_csn, &write_keys)?;
+    let validation_keys = mutation_validation_keys(&batch.mutations);
+    conflicts.validate(batch.snapshot.visible_csn, &validation_keys)?;
     Ok(write_keys)
 }
 
@@ -9062,11 +9166,17 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
             _ => Err(NativeRuntimeError::InvalidStructureTree),
         },
         Some(
-            STRUCTURE_HASH_META_PREFIX
-            | STRUCTURE_SET_META_PREFIX
+            STRUCTURE_SET_META_PREFIX
             | STRUCTURE_LIST_META_PREFIX
             | STRUCTURE_SORTED_SET_META_PREFIX,
         ) => Ok(false),
+        Some(STRUCTURE_HASH_META_PREFIX) => {
+            if is_structure_tombstone(value) {
+                Ok(true)
+            } else {
+                decode_hash_metadata(value).map(|_| false)
+            }
+        }
         _ => Err(NativeRuntimeError::InvalidStructureTree),
     }
 }
@@ -9623,6 +9733,14 @@ fn decode_hash_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
     let mut count = [0_u8; 8];
     count.copy_from_slice(&encoded[8..16]);
     Ok(u64::from_le_bytes(count))
+}
+
+fn decode_live_hash_metadata(encoded: &[u8]) -> Result<Option<u64>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        Ok(None)
+    } else {
+        decode_hash_metadata(encoded).map(Some)
+    }
 }
 
 fn decode_hash_field_value(
@@ -10191,7 +10309,12 @@ fn create_hash_in_tree(
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     let metadata_key = structure_hash_meta_key(&mutation.key);
-    if tree.get(pages, &metadata_key)?.is_some()
+    if tree
+        .get(pages, &metadata_key)?
+        .map(|value| decode_live_hash_metadata(&value))
+        .transpose()?
+        .flatten()
+        .is_some()
         || tree
             .get(pages, &structure_set_meta_key(&mutation.key))?
             .is_some()
@@ -10211,7 +10334,61 @@ fn create_hash_in_tree(
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     Ok(tree
-        .insert_unique(pages, creating_csn, metadata_key, encode_hash_metadata(0))?
+        .upsert(pages, creating_csn, metadata_key, encode_hash_metadata(0))?
+        .tree)
+}
+
+fn delete_hash_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_hash_meta_key(&mutation.key);
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let declared_count =
+        decode_live_hash_metadata(&metadata)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let field_prefix = structure_hash_field_key(&mutation.key, &[])?;
+    let physical_fields = tree.scan_prefix(pages, &field_prefix)?;
+    let capacity = physical_fields
+        .len()
+        .checked_add(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut live_count = 0_u64;
+    let mut tombstones = Vec::with_capacity(capacity);
+    for (physical_key, value) in physical_fields {
+        let (hash_key, _) = decode_hash_field_identity(
+            physical_key
+                .get(1..)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        )
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if hash_key != mutation.key {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if is_structure_tombstone(&value) {
+            continue;
+        }
+        if structure_value_expiry(&value)?.is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        live_count = live_count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        tombstones.push((physical_key, structure_tombstone_value()));
+    }
+    if live_count != declared_count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tombstones.push((metadata_key, structure_tombstone_value()));
+    tombstones.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, tombstones)?
         .tree)
 }
 
@@ -10228,6 +10405,9 @@ fn create_set_in_tree(
     if tree.get(pages, &metadata_key)?.is_some()
         || tree
             .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .map(|value| decode_live_hash_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
@@ -10413,6 +10593,9 @@ fn create_list_in_tree(
     if tree.get(pages, &metadata_key)?.is_some()
         || tree
             .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .map(|value| decode_live_hash_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_set_meta_key(&mutation.key))?
@@ -10449,6 +10632,9 @@ fn create_sorted_set_in_tree(
     if tree.get(pages, &metadata_key)?.is_some()
         || tree
             .get(pages, &structure_hash_meta_key(&mutation.key))?
+            .map(|value| decode_live_hash_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_set_meta_key(&mutation.key))?
@@ -10829,6 +11015,7 @@ fn apply_structure_tree_mutation(
     }
     match mutation.opcode {
         Opcode::CreateHash => create_hash_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteHash => delete_hash_in_tree(pages, tree, creating_csn, mutation),
         Opcode::SetHashField => {
             set_hash_field_in_tree(pages, tree, creating_csn, mutation, blob_references)
         }
@@ -10898,6 +11085,9 @@ fn upsert_scalar_structure_mutation(
     };
     if tree
         .get(pages, &structure_hash_meta_key(&mutation.key))?
+        .map(|value| decode_live_hash_metadata(&value))
+        .transpose()?
+        .flatten()
         .is_some()
         || tree
             .get(pages, &structure_set_meta_key(&mutation.key))?
@@ -12481,7 +12671,8 @@ fn replay_conflicts(
     let mut conflicts = ConflictTable::default();
     for recovered in commits {
         let keys = mutation_write_keys(&recovered.mutations);
-        conflicts.validate(recovered.manifest.read_csn, &keys)?;
+        let validation_keys = mutation_validation_keys(&recovered.mutations);
+        conflicts.validate(recovered.manifest.read_csn, &validation_keys)?;
         conflicts.publish_committed(recovered.manifest.commit_csn, keys);
     }
     Ok(conflicts)
@@ -13172,6 +13363,7 @@ struct StructureTreeDecoder {
     entries: BTreeMap<Vec<u8>, StructureEntry>,
     hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
     hash_counts: BTreeMap<Vec<u8>, u64>,
+    retired_hashes: BTreeSet<Vec<u8>>,
     sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     set_counts: BTreeMap<Vec<u8>, u64>,
     list_metadata: BTreeMap<Vec<u8>, ListMetadata>,
@@ -13199,25 +13391,33 @@ impl StructureTreeDecoder {
             }
             Some(STRUCTURE_HASH_META_PREFIX) => {
                 let hash = key[1..].to_vec();
-                if self.entries.contains_key(&hash)
-                    || self.hashes.insert(hash.clone(), BTreeMap::new()).is_some()
-                    || self
-                        .hash_counts
-                        .insert(hash, decode_hash_metadata(value)?)
-                        .is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
+                match decode_live_hash_metadata(value)? {
+                    None => {
+                        if !self.retired_hashes.insert(hash) {
+                            return Err(NativeRuntimeError::InvalidStructureTree);
+                        }
+                    }
+                    Some(count) => {
+                        if self.entries.contains_key(&hash)
+                            || self.hashes.insert(hash.clone(), BTreeMap::new()).is_some()
+                            || self.hash_counts.insert(hash, count).is_some()
+                        {
+                            return Err(NativeRuntimeError::InvalidStructureTree);
+                        }
+                    }
                 }
             }
             Some(STRUCTURE_HASH_FIELD_PREFIX) => {
                 let (hash, field) = decode_hash_field_identity(&key[1..])
                     .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-                let fields = self
-                    .hashes
-                    .get_mut(hash)
-                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                if let Some(value) = decode_hash_field_value(value, blobs)?
-                    && fields.insert(field.to_vec(), value).is_some()
+                if let Some(fields) = self.hashes.get_mut(hash) {
+                    if let Some(value) = decode_hash_field_value(value, blobs)?
+                        && fields.insert(field.to_vec(), value).is_some()
+                    {
+                        return Err(NativeRuntimeError::InvalidStructureTree);
+                    }
+                } else if !self.retired_hashes.contains(hash)
+                    || decode_hash_field_value(value, blobs)?.is_some()
                 {
                     return Err(NativeRuntimeError::InvalidStructureTree);
                 }
@@ -13391,6 +13591,7 @@ impl StructureTreeDecoder {
             entries,
             hashes,
             hash_counts,
+            retired_hashes: _,
             sets,
             set_counts,
             list_metadata,
@@ -16884,6 +17085,104 @@ mod tests {
             Some(b"Mario".to_vec())
         );
         assert_eq!(reopened.hget_latest_hash(b"profile", b"age")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn whole_hash_delete_recreates_without_retired_fields_and_preserves_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"profile".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"name".to_vec(), b"old".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"role".to_vec(), b"admin".to_vec())?;
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut replace = database.begin(12, DurabilityClass::Strict)?;
+        assert!(replace.delete_hash(b"profile".to_vec())?);
+        assert!(!replace.delete_hash(b"profile".to_vec())?);
+        replace.create_hash(b"profile".to_vec())?;
+        replace.hset(b"profile".to_vec(), b"name".to_vec(), b"new".to_vec())?;
+        replace.commit()?;
+
+        assert_eq!(historical.hlen(b"profile")?, 2);
+        assert_eq!(
+            historical.hget(b"profile", b"role")?,
+            Some(b"admin".as_slice())
+        );
+        assert_eq!(database.hlen_latest_hash(b"profile")?, 1);
+        assert_eq!(
+            database.hget_latest_hash(b"profile", b"name")?,
+            Some(b"new".to_vec())
+        );
+        assert_eq!(database.hget_latest_hash(b"profile", b"role")?, None);
+
+        let mut change_kind = database.begin(14, DurabilityClass::Strict)?;
+        assert!(change_kind.delete_hash(b"profile".to_vec())?);
+        change_kind.set(b"profile".to_vec(), b"scalar".to_vec(), None)?;
+        change_kind.commit()?;
+        assert_eq!(
+            database.get_latest_structure(b"profile", 15)?,
+            Some(b"scalar".to_vec())
+        );
+        let mut mismatch = database.begin(16, DurabilityClass::Strict)?;
+        assert!(matches!(
+            mismatch.delete_hash(b"profile".to_vec()),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        mismatch.rollback();
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"profile", 17)?,
+            Some(b"scalar".to_vec())
+        );
+        assert!(matches!(
+            reopened.hlen_latest_hash(b"profile"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn hash_lifecycle_fence_rejects_stale_fields_without_serializing_live_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.commit()?;
+
+        let mut stale_field = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        stale_field.hset(b"map".to_vec(), b"stale".to_vec(), b"value".to_vec())?;
+        let mut delete = database.begin_optimistic(11, DurabilityClass::Strict)?;
+        assert!(delete.delete_hash(b"map".to_vec())?);
+        database.commit_optimistic(delete)?;
+        assert!(matches!(
+            database.commit_optimistic(stale_field),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert!(matches!(
+            database.hlen_latest_hash(b"map"),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+
+        let mut recreate = database.begin(12, DurabilityClass::Strict)?;
+        recreate.create_hash(b"map".to_vec())?;
+        recreate.commit()?;
+        let mut admitted_field = database.begin_optimistic(13, DurabilityClass::Strict)?;
+        admitted_field.hset(b"map".to_vec(), b"admitted".to_vec(), b"value".to_vec())?;
+        let mut later_delete = database.begin_optimistic(13, DurabilityClass::Strict)?;
+        assert!(later_delete.delete_hash(b"map".to_vec())?);
+        database.commit_optimistic(admitted_field)?;
+        database.commit_optimistic(later_delete)?;
+        assert!(matches!(
+            database.hlen_latest_hash(b"map"),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
         Ok(())
     }
 
