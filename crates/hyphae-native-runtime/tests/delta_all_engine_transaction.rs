@@ -18,7 +18,7 @@ struct TemporaryDirectory(PathBuf);
 impl TemporaryDirectory {
     fn create() -> Result<Self, TestError> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = Path::new("/tmp").join(format!(
+        let path = std::env::temp_dir().join(format!(
             "hy-delta-transaction-{}-{timestamp}",
             std::process::id()
         ));

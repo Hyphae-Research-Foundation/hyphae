@@ -87,6 +87,13 @@ thread-local fail guards for both full engine state and full catalog state.
 The complete 339-test parallel unit suite then passed on the canonical host.
 No product path or measured runtime changed.
 
+The following hosted run passed Linux stable, Linux MSRV, and macOS, then
+exposed that the new delta integration fixture had hardcoded `/tmp`. All five
+delta tests therefore failed before database creation on Windows. The final
+fixture uses `std::env::temp_dir()`; its five tests and the complete workspace
+funnel pass on the canonical host. This is test portability, not a runtime
+behavior change.
+
 ## Direct-Linux environment
 
 - canonical host `mario@10.77.10.10`;
@@ -260,11 +267,11 @@ Validation-log SHA-256:
 - formatting:
   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
 - workspace tests:
-  `53c1bc8b248f66e8d10dab689b2c5c6578c248d476f6b8391e64f3edabfc4997`;
+  `7f713383a244a6b893542be11db4e275358af39e4cdbf4914e696bcc8c1ca186`;
 - Clippy:
-  `f48a3e75c03cd93e64a911a44bc7aaea3a3a4c081c61f43d9436b1b208bebb7c`;
+  `117e9ff8b79ba6677c9b4e40b06c92a37fb6b85580506c855d5e6eb696c86c50`;
 - Rustdoc:
-  `2219fd09845721a4c57e93c116e3641e0a705b97b7b66e9a63254bdda0eef0ff`;
+  `3b98e7a1a36300527a1db23296e77f2ca7f427275644b6f49c0b88f53e03c4e6`;
 - documentation:
   `9c13e4b996060e3e4b444fdff10579d327b6d22e097f7beb84a51809aba246ec`;
 - machine-readable receipt:
