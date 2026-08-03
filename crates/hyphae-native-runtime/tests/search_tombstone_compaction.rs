@@ -5,6 +5,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,9 +18,11 @@ struct TemporaryDirectory(PathBuf);
 
 impl TemporaryDirectory {
     fn create() -> Result<Self, TestError> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hy-search-compaction-{}-{timestamp}",
+            "hy-search-compaction-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path)?;
