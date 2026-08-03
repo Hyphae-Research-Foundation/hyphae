@@ -18,6 +18,8 @@ mod list_lifecycle_equivalence;
 #[cfg(test)]
 mod list_ttl_equivalence;
 mod local_protocol;
+#[cfg(unix)]
+mod local_uds;
 mod model;
 mod set_algebra;
 #[cfg(test)]
@@ -49,9 +51,11 @@ pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
 };
 pub use local_protocol::{
-    DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE,
-    LocalProtocolError, decode_frame, encode_frame,
+    DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE, LocalFrameIo,
+    LocalProtocolError, LocalTransportError, decode_frame, encode_frame,
 };
+#[cfg(unix)]
+pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use set_algebra::{
     MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,
     SetAlgebraOperation, SetAlgebraRequest, SetAlgebraResult,
