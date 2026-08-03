@@ -75,6 +75,12 @@ Each `SET` owns one implicit native transaction; the complete message families,
 explicit transaction state, group scheduling, and multiplexing are not
 implemented.
 
+The next frozen subset is
+[native local SEARCH MATCH v1](local-search-match-v1.md). It carries one
+catalog object identity and bounded UTF-8 query directly to the physical
+inverted index, with the all-engine visible CSN in the canonical result.
+Implementation and direct-Linux evidence remain pending.
+
 ## Multiplexing and flow control
 
 Request IDs are unique per connection while active. Stream IDs allow

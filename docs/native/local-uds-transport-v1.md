@@ -92,6 +92,12 @@ physical TTL reads. It admits strict and memory durability, rejects group
 durability until scheduler integration, and returns exact transaction/CSN
 receipts. It still is not the complete production session.
 
+The frozen
+[native local SEARCH MATCH](local-search-match-v1.md) extension adds one
+bounded physical inverted-index query and returns its visible all-engine CSN.
+It remains pending implementation and does not make the serial session a
+complete production daemon.
+
 ## Failure behavior
 
 The implementation must fail closed for:
