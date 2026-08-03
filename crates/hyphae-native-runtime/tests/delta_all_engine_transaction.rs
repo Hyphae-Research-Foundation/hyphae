@@ -291,3 +291,73 @@ fn delta_set_preserves_collection_collision_and_expired_reuse_semantics() -> Res
     );
     Ok(())
 }
+
+#[test]
+fn delta_overlay_resolves_prior_writes_for_all_three_engines() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let index = ObjectId::new(100)?;
+    let mut database = NativeDatabase::create(temporary.path().join("data"))?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.execute_sql(
+        "CREATE TABLE events (
+            id BIGINT PRIMARY KEY,
+            body TEXT NOT NULL
+        )",
+        &[],
+    )?;
+    seed.create_search_index(index, "documents")?;
+    seed.commit()?;
+
+    let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+    database.stage_delta_sql_dml(
+        &mut delta,
+        "INSERT INTO events (id, body) VALUES (?, ?)",
+        &[
+            ScalarValue::Signed(1),
+            ScalarValue::Text("first".to_owned()),
+        ],
+    )?;
+    database.stage_delta_sql_dml(
+        &mut delta,
+        "UPDATE events SET body = ? WHERE id = ?",
+        &[
+            ScalarValue::Text("second".to_owned()),
+            ScalarValue::Signed(1),
+        ],
+    )?;
+    database.stage_delta_set(&mut delta, b"key".to_vec(), b"first".to_vec(), None)?;
+    database.stage_delta_set(&mut delta, b"key".to_vec(), b"second".to_vec(), None)?;
+    database.stage_delta_index_document(
+        &mut delta,
+        index,
+        b"doc".to_vec(),
+        "first document".to_owned(),
+    )?;
+    assert!(matches!(
+        database.stage_delta_index_document(
+            &mut delta,
+            index,
+            b"doc".to_vec(),
+            "replacement".to_owned(),
+        ),
+        Err(NativeRuntimeError::Model(_))
+    ));
+    database.commit_optimistic(delta)?;
+
+    let snapshot = database.snapshot(2)?;
+    let prepared = snapshot.prepare_sql("SELECT body FROM events WHERE id = 1")?;
+    let SqlResult::Rows { rows, .. } = snapshot.execute_prepared(&prepared, &[])? else {
+        return Err("SELECT did not return rows".into());
+    };
+    assert_eq!(rows, vec![vec![ScalarValue::Text("second".to_owned())]]);
+    assert_eq!(snapshot.get(b"key"), Some(b"second".as_slice()));
+    assert_eq!(
+        snapshot
+            .match_text(index, "first", 10)?
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect::<Vec<_>>(),
+        [b"doc".to_vec()]
+    );
+    Ok(())
+}

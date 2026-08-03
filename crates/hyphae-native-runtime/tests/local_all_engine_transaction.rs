@@ -1582,6 +1582,65 @@ mod unix {
     }
 
     #[test]
+    fn semantic_failure_preserves_prior_operation_and_next_ordinal() -> Result<(), TestError> {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let socket = temporary.path().join("hyphae.sock");
+        let seeded = seed_database(&data)?;
+        let index = seeded.index;
+        let clock = Arc::new(CountingClock(AtomicUsize::new(0)));
+        let server = spawn_server(seeded.database, &socket, Arc::clone(&clock))?;
+        let mut client = SessionClient::connect(&socket)?;
+        let begun = client.begin(DurabilityClass::Memory)?;
+
+        assert_eq!(
+            client
+                .stage_structure(begun.handle, b"retained-key", b"retained-value", None)?
+                .operation_ordinal,
+            1
+        );
+        let invalid_sql = encode_local_transaction_sql_dml(
+            &mut client.buffer,
+            begun.handle,
+            SELECT_EVENT,
+            &[ScalarValue::Signed(1)],
+            MAXIMUM_PAYLOAD,
+        )?
+        .to_vec();
+        client.expect_failure(
+            FrameKind::Execute,
+            &invalid_sql,
+            LocalFailureCode::SqlInvalid,
+        )?;
+        assert_eq!(
+            client
+                .stage_search(begun.handle, index, b"retained-doc", "retained token",)?
+                .operation_ordinal,
+            2
+        );
+        client.commit(begun.handle, 2)?;
+        client.close()?;
+        join_server(server)?;
+
+        assert_eq!(clock.samples(), 1);
+        let reopened = NativeDatabase::open(&data)?;
+        let snapshot = reopened.snapshot(100)?;
+        assert_eq!(
+            snapshot.get(b"retained-key"),
+            Some(b"retained-value".as_slice())
+        );
+        assert_eq!(
+            snapshot
+                .match_text(index, "retained", 10)?
+                .into_iter()
+                .map(|hit| hit.document_id)
+                .collect::<Vec<_>>(),
+            [b"retained-doc".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn begin_receipt_preflight_precedes_clock_and_batch_creation() -> Result<(), TestError> {
         let temporary = TemporaryDirectory::create()?;
         let data = temporary.path().join("data");

@@ -21905,6 +21905,51 @@ mod tests {
     }
 
     #[test]
+    fn retained_historical_root_reads_only_its_visible_version_head()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let table = ObjectId::new(1)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_relation(table, "events")?;
+        seed.insert(table, b"key".to_vec(), b"version-0".to_vec())?;
+        seed.commit()?;
+        let historical = database.coordinator.snapshot(1)?;
+
+        for version in 1..=32 {
+            let mut update = database.begin(version + 1, DurabilityClass::Memory)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("version-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+
+        let root = historical
+            .roots()
+            .root(super::SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let encoded = BTree::from_root(root)
+            .get(&database.pages, &super::relational_row_key(table, b"key"))?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        super::DELTA_LATEST_VERSION_PAGE_READS.set(0);
+        assert_eq!(
+            super::decode_relational_chain_head(
+                &database.pages,
+                table,
+                b"key",
+                &encoded,
+                historical.visible_csn,
+                &database.blobs,
+            )?,
+            Some(b"version-0".to_vec())
+        );
+        assert_eq!(super::DELTA_LATEST_VERSION_PAGE_READS.get(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn hystrbt2_cleanup_coalesces_physical_copy_on_write_paths()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -34249,6 +34294,78 @@ mod tests {
                 primary_key,
                 &pointer,
                 Some(Csn::new(1)?),
+                &blobs,
+            ),
+            Err(NativeRuntimeError::InvalidRelationalTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn head_read_stops_before_corrupt_older_version_but_full_verification_rejects_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        fs::create_dir_all(temporary.path())?;
+        let mut pages =
+            hyphae_native_pages::PageStore::create(temporary.path().join("older-pages.hydb"))?;
+        let blobs = hyphae_native_blobs::BlobStore::create(temporary.path())?;
+        let table = ObjectId::new(23)?;
+        let primary_key = b"key";
+        let older = hyphae_native_records::RowRecord::new(
+            super::relational_row_id(table, b"wrong-key")?,
+            Csn::new(1)?,
+            Some(Csn::new(2)?),
+            vec![
+                Some(primary_key.to_vec()),
+                Some([super::RELATIONAL_VALUE_INLINE, b'o'].to_vec()),
+            ],
+        )?;
+        let older_page = pages.append(
+            hyphae_native_pages::PageKind::VersionChain,
+            Some(Csn::new(1)?),
+            None,
+            older.encode()?,
+        )?;
+        let current = hyphae_native_records::RowRecord::new(
+            super::relational_row_id(table, primary_key)?,
+            Csn::new(2)?,
+            None,
+            vec![
+                Some(primary_key.to_vec()),
+                Some([super::RELATIONAL_VALUE_INLINE, b'n'].to_vec()),
+            ],
+        )?;
+        let current_page = pages.append(
+            hyphae_native_pages::PageKind::VersionChain,
+            Some(Csn::new(2)?),
+            Some(older_page),
+            current.encode()?,
+        )?;
+        let pointer = hyphae_native_records::RowVersionPointer {
+            page_id: current_page,
+        }
+        .encode();
+
+        super::DELTA_LATEST_VERSION_PAGE_READS.set(0);
+        assert_eq!(
+            super::decode_relational_chain_head(
+                &pages,
+                table,
+                primary_key,
+                &pointer,
+                Some(Csn::new(2)?),
+                &blobs,
+            )?,
+            Some(b"n".to_vec())
+        );
+        assert_eq!(super::DELTA_LATEST_VERSION_PAGE_READS.get(), 1);
+        assert!(matches!(
+            super::decode_relational_chain(
+                &pages,
+                table,
+                primary_key,
+                &pointer,
+                Some(Csn::new(2)?),
                 &blobs,
             ),
             Err(NativeRuntimeError::InvalidRelationalTree)
