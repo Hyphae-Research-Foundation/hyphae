@@ -201,7 +201,7 @@ fn document_id(prefix: &str, sequence: u64) -> Vec<u8> {
     format!("{prefix}-{sequence:08}").into_bytes()
 }
 
-fn seed_database(path: &Path, population: u64) -> Result<NativeDatabase, BenchmarkError> {
+fn seed_database(path: &Path, population: u64) -> Result<(), BenchmarkError> {
     let mut database = NativeDatabase::create(path)?;
     let index = ObjectId::new(SEARCH_INDEX)?;
     let mut seed = database.begin(1, DurabilityClass::Strict)?;
@@ -221,11 +221,28 @@ fn seed_database(path: &Path, population: u64) -> Result<NativeDatabase, Benchma
         )?;
     }
     seed.commit()?;
-    Ok(database)
+    drop(database);
+    Ok(())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), BenchmarkError> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else {
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn measure_configuration(
     root: &Path,
+    baseline: &Path,
     population: u64,
     operation: Operation,
     durability: DurabilityClass,
@@ -234,7 +251,8 @@ fn measure_configuration(
         "population-{population}-{}-{durability:?}",
         operation.name()
     ));
-    let mut database = seed_database(&path, population)?;
+    copy_directory(baseline, &path)?;
+    let mut database = NativeDatabase::open(&path)?;
     let index = ObjectId::new(SEARCH_INDEX)?;
     let mut samples = Samples::new()?;
     for sequence in 0..OBSERVATIONS {
@@ -273,10 +291,12 @@ fn measure_configuration(
 fn collect_rows(root: &Path) -> Result<Vec<ResultRow>, BenchmarkError> {
     let mut rows = Vec::new();
     for population in POPULATIONS {
+        let baseline = root.join(format!("population-{population}-baseline"));
+        seed_database(&baseline, population)?;
         for operation in [Operation::Replace, Operation::Delete] {
             for durability in [DurabilityClass::Memory, DurabilityClass::Strict] {
                 rows.push(measure_configuration(
-                    root, population, operation, durability,
+                    root, &baseline, population, operation, durability,
                 )?);
             }
         }
