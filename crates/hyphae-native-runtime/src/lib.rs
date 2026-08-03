@@ -15752,6 +15752,7 @@ mod tests {
             Some(
                 super::STRUCTURE_ENTRY_PREFIX
                 | super::STRUCTURE_HASH_FIELD_PREFIX
+                | super::STRUCTURE_HASH_META_PREFIX
                 | super::STRUCTURE_SET_MEMBER_PREFIX
                 | super::STRUCTURE_LIST_CHUNK_PREFIX
                 | super::STRUCTURE_SORTED_SET_MEMBER_PREFIX
@@ -16473,6 +16474,41 @@ mod tests {
     }
 
     #[test]
+    fn whole_hash_tombstones_compact_without_resurrecting_retired_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"retired".to_vec())?;
+        seed.hset(b"retired".to_vec(), b"first".to_vec(), b"one".to_vec())?;
+        seed.hset(b"retired".to_vec(), b"second".to_vec(), b"two".to_vec())?;
+        seed.commit()?;
+
+        let mut replace = database.begin(2, DurabilityClass::Strict)?;
+        assert!(replace.delete_hash(b"retired".to_vec())?);
+        replace.set(b"retired".to_vec(), b"scalar".to_vec(), None)?;
+        replace.commit()?;
+        let receipt = database.compact_structure(DurabilityClass::Strict)?;
+        assert_eq!(receipt.dropped_tombstones, 3);
+        assert_eq!(
+            database.get_latest_structure(b"retired", 3)?,
+            Some(b"scalar".to_vec())
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"retired", 4)?,
+            Some(b"scalar".to_vec())
+        );
+        assert!(matches!(
+            reopened.hlen_latest_hash(b"retired"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn structure_compaction_is_noop_on_empty_and_rejects_legacy_without_writes()
     -> Result<(), Box<dyn std::error::Error>> {
         let empty_directory = TestDirectory::new();
@@ -17183,6 +17219,81 @@ mod tests {
             database.hlen_latest_hash(b"map"),
             Err(NativeRuntimeError::UnknownStructureHash)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_hash_lifecycle_commit_boundary_recovers_prior_or_complete_incarnation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"map".to_vec())?;
+            seed.hset(b"map".to_vec(), b"old".to_vec(), b"before".to_vec())?;
+            seed.commit()?;
+
+            let mut replace = database.begin(12, DurabilityClass::Strict)?;
+            assert!(replace.delete_hash(b"map".to_vec())?);
+            replace.create_hash(b"map".to_vec())?;
+            replace.hset(b"map".to_vec(), b"new".to_vec(), b"after".to_vec())?;
+            assert!(matches!(
+                replace.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => {
+                    assert!(matches!(
+                        boundary,
+                        CommitBoundary::BlobStaged
+                            | CommitBoundary::BlobPromoted
+                            | CommitBoundary::PageAppended
+                            | CommitBoundary::PageSynchronized
+                    ));
+                    assert_eq!(reopened.hlen_latest_hash(b"map")?, 1);
+                    assert_eq!(
+                        reopened.hget_latest_hash(b"map", b"old")?,
+                        Some(b"before".to_vec())
+                    );
+                    assert_eq!(reopened.hget_latest_hash(b"map", b"new")?, None);
+                }
+                Some(2) => {
+                    assert!(matches!(
+                        boundary,
+                        CommitBoundary::WalAppended
+                            | CommitBoundary::WalSynchronized
+                            | CommitBoundary::RootPublished
+                    ));
+                    assert_eq!(reopened.hlen_latest_hash(b"map")?, 1);
+                    assert_eq!(reopened.hget_latest_hash(b"map", b"old")?, None);
+                    assert_eq!(
+                        reopened.hget_latest_hash(b"map", b"new")?,
+                        Some(b"after".to_vec())
+                    );
+                }
+                found => {
+                    return Err(format!(
+                        "unexpected recovered hash lifecycle CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 

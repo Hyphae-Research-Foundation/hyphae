@@ -1193,6 +1193,23 @@ mod tests {
     }
 
     #[test]
+    fn whole_hash_delete_rejects_target_value_and_expiry() {
+        assert!(validate_mutation_shape(Opcode::DeleteHash, false, 0, None, b"hash").is_ok());
+        assert!(matches!(
+            validate_mutation_shape(Opcode::DeleteHash, true, 0, None, b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::DeleteHash, false, 1, None, b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::DeleteHash, false, 0, Some(10), b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
     fn list_mutations_reject_targets_expiry_and_nonempty_creation() {
         assert!(matches!(
             validate_mutation_shape(Opcode::CreateList, false, 1, None, b"list"),
