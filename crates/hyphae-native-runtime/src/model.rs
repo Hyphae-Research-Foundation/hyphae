@@ -1208,6 +1208,10 @@ impl StructureState {
         true
     }
 
+    pub(crate) fn delete_list(&mut self, key: &[u8]) -> bool {
+        self.lists.remove(key).is_some()
+    }
+
     pub(crate) fn lpush(&mut self, key: &[u8], value: Vec<u8>) -> Option<usize> {
         self.lists.get_mut(key).map(|values| {
             values.push_front(value);

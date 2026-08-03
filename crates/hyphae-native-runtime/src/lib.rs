@@ -13,6 +13,8 @@ mod group_commit;
 #[cfg(test)]
 mod hash_model_equivalence;
 mod hash_pattern;
+#[cfg(test)]
+mod list_lifecycle_equivalence;
 mod local_protocol;
 mod model;
 mod set_algebra;
@@ -9216,6 +9218,43 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Deletes one complete native list without changing retained snapshots.
+    ///
+    /// Returns false without adding a mutation when the key is absent. A
+    /// successful deletion retires the list incarnation and permits checked
+    /// recreation later in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or another live structure kind.
+    pub fn delete_list(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        structure_list_meta_key(&key)?;
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self.state.structures.delete_list(&key) {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteList,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Pushes one binary value at the head and returns the new list length.
     ///
     /// # Errors
@@ -10124,6 +10163,7 @@ fn apply_structure_mutation(
             apply_set_mutation(state, mutation)?;
         }
         Opcode::CreateList
+        | Opcode::DeleteList
         | Opcode::PushListHead
         | Opcode::PushListTail
         | Opcode::PopListHead
@@ -10262,6 +10302,11 @@ fn apply_list_mutation(
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
+        Opcode::DeleteList => {
+            if !mutation.value.is_empty() || !state.delete_list(&mutation.key) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
         Opcode::PushListHead => {
             if state.lpush(&mutation.key, mutation.value.clone()).is_none() {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -10378,6 +10423,7 @@ fn apply_mutations_to_state(
             | Opcode::AddSetMember
             | Opcode::DeleteSetMember
             | Opcode::CreateList
+            | Opcode::DeleteList
             | Opcode::PushListHead
             | Opcode::PushListTail
             | Opcode::PopListHead
@@ -10589,6 +10635,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::ExpireSet
             | Opcode::DeleteSet
             | Opcode::CreateList
+            | Opcode::DeleteList
             | Opcode::CreateSortedSet
             | Opcode::PushListHead
             | Opcode::PushListTail
@@ -11908,7 +11955,14 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
             [STRUCTURE_HASH_FIELD_EXPIRY_LIVE] => Ok(false),
             _ => Err(NativeRuntimeError::InvalidStructureTree),
         },
-        Some(STRUCTURE_LIST_META_PREFIX | STRUCTURE_SORTED_SET_META_PREFIX) => Ok(false),
+        Some(STRUCTURE_LIST_META_PREFIX) => {
+            if is_structure_tombstone(value) {
+                Ok(true)
+            } else {
+                decode_list_metadata(value).map(|_| false)
+            }
+        }
+        Some(STRUCTURE_SORTED_SET_META_PREFIX) => Ok(false),
         Some(STRUCTURE_HASH_META_PREFIX) => {
             if is_structure_tombstone(value) {
                 Ok(true)
@@ -12332,6 +12386,17 @@ fn structure_list_chunk_key(key: &[u8], chunk_id: i64) -> Result<Vec<u8>, Native
     let mut encoded = Vec::with_capacity(identity.len().saturating_add(1));
     encoded.push(STRUCTURE_LIST_CHUNK_PREFIX);
     encoded.extend_from_slice(&identity);
+    Ok(encoded)
+}
+
+fn structure_list_chunk_prefix(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    structure_list_meta_key(key)?;
+    let key_length =
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(5));
+    encoded.push(STRUCTURE_LIST_CHUNK_PREFIX);
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(key);
     Ok(encoded)
 }
 
@@ -13015,6 +13080,14 @@ fn decode_list_metadata(encoded: &[u8]) -> Result<ListMetadata, NativeRuntimeErr
     Ok(metadata)
 }
 
+fn decode_live_list_metadata(encoded: &[u8]) -> Result<Option<ListMetadata>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        Ok(None)
+    } else {
+        decode_list_metadata(encoded).map(Some)
+    }
+}
+
 fn validate_list_element_envelope(encoded: &[u8]) -> Result<(), NativeRuntimeError> {
     if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
         || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
@@ -13417,6 +13490,9 @@ fn create_hash_in_tree(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .map(|value| decode_live_list_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
@@ -13572,6 +13648,9 @@ fn create_set_in_tree(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .map(|value| decode_live_list_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
@@ -13931,7 +14010,12 @@ fn create_list_in_tree(
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     let metadata_key = structure_list_meta_key(&mutation.key)?;
-    if tree.get(pages, &metadata_key)?.is_some()
+    if tree
+        .get(pages, &metadata_key)?
+        .map(|value| decode_live_list_metadata(&value))
+        .transpose()?
+        .flatten()
+        .is_some()
         || tree
             .get(pages, &structure_hash_meta_key(&mutation.key))?
             .map(|value| decode_live_hash_metadata(&value))
@@ -13954,13 +14038,93 @@ fn create_list_in_tree(
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     Ok(tree
-        .insert_unique(
+        .upsert(
             pages,
             creating_csn,
             metadata_key,
             encode_list_metadata(ListMetadata::empty()),
         )?
         .tree)
+}
+
+fn delete_list_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_list_meta_key(&mutation.key)?;
+    let encoded = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let metadata =
+        decode_live_list_metadata(&encoded)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let chunk_prefix = structure_list_chunk_prefix(&mutation.key)?;
+    let physical_chunks = tree.scan_prefix(pages, &chunk_prefix)?;
+    let capacity = physical_chunks
+        .len()
+        .checked_add(1)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut entries = Vec::with_capacity(capacity);
+    let mut live_chunks = BTreeSet::new();
+    let mut element_count = 0_u64;
+    for (physical_key, value) in physical_chunks {
+        let identity = physical_key
+            .get(1..)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let (list, chunk_id) = decode_list_chunk_identity(identity)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if list != mutation.key {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if let Some(elements) = decode_list_chunk_storage(&value)? {
+            let chunk_length = u64::try_from(elements.len())
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+            if chunk_length == 0 || !live_chunks.insert(chunk_id) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            element_count = element_count
+                .checked_add(chunk_length)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            entries.push((physical_key, structure_tombstone_value()));
+        }
+    }
+    if element_count != metadata.length {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if metadata.length == 0 {
+        if !live_chunks.is_empty() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    } else {
+        let mut expected = metadata.head_chunk;
+        loop {
+            if !live_chunks.contains(&expected) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            if expected == metadata.tail_chunk {
+                break;
+            }
+            expected = expected
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        }
+        let expected_chunks = metadata
+            .tail_chunk
+            .checked_sub(metadata.head_chunk)
+            .and_then(|distance| distance.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if live_chunks.len() != expected_chunks {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    entries.push((metadata_key, structure_tombstone_value()));
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
 fn create_sorted_set_in_tree(
@@ -13988,6 +14152,9 @@ fn create_sorted_set_in_tree(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .map(|value| decode_live_list_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_key(&mutation.key))?
@@ -14382,6 +14549,7 @@ fn apply_structure_tree_mutation(
             delete_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
         }
         Opcode::CreateList => create_list_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteList => delete_list_in_tree(pages, tree, creating_csn, mutation),
         Opcode::PushListHead | Opcode::PushListTail => push_list_in_tree(
             pages,
             tree,
@@ -14448,6 +14616,9 @@ fn upsert_scalar_structure_mutation(
             .is_some()
         || tree
             .get(pages, &structure_list_meta_key(&mutation.key)?)?
+            .map(|value| decode_live_list_metadata(&value))
+            .transpose()?
+            .flatten()
             .is_some()
         || tree
             .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
@@ -16929,6 +17100,7 @@ struct StructureTreeDecoder {
     retired_sets: BTreeSet<Vec<u8>>,
     list_metadata: BTreeMap<Vec<u8>, ListMetadata>,
     list_chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
+    retired_lists: BTreeSet<Vec<u8>>,
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
@@ -17154,15 +17326,21 @@ impl StructureTreeDecoder {
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let list = key.to_vec();
-        if self.entries.contains_key(&list)
-            || self.hashes.contains_key(&list)
-            || self.sets.contains_key(&list)
-            || self
-                .list_metadata
-                .insert(list, decode_list_metadata(value)?)
-                .is_some()
-        {
-            return Err(NativeRuntimeError::InvalidStructureTree);
+        match decode_live_list_metadata(value)? {
+            None => {
+                if !self.retired_lists.insert(list) {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
+            Some(metadata) => {
+                if self.entries.contains_key(&list)
+                    || self.hashes.contains_key(&list)
+                    || self.sets.contains_key(&list)
+                    || self.list_metadata.insert(list, metadata).is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+            }
         }
         Ok(())
     }
@@ -17173,16 +17351,18 @@ impl StructureTreeDecoder {
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let (list, chunk_id) = decode_list_chunk_identity(identity)?;
-        if !self.list_metadata.contains_key(list) {
-            return Err(NativeRuntimeError::InvalidStructureTree);
-        }
-        if let Some(elements) = decode_list_chunk_storage(value)?
-            && self
-                .list_chunks
-                .entry(list.to_vec())
-                .or_default()
-                .insert(chunk_id, elements)
-                .is_some()
+        if self.list_metadata.contains_key(list) {
+            if let Some(elements) = decode_list_chunk_storage(value)?
+                && self
+                    .list_chunks
+                    .entry(list.to_vec())
+                    .or_default()
+                    .insert(chunk_id, elements)
+                    .is_some()
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        } else if !self.retired_lists.contains(list) || decode_list_chunk_storage(value)?.is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -17203,6 +17383,7 @@ impl StructureTreeDecoder {
             retired_sets: _,
             list_metadata,
             list_chunks,
+            retired_lists: _,
             sorted_sets,
             sorted_set_counts,
             sorted_set_order,
