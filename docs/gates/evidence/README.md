@@ -252,6 +252,13 @@ commit before its tag can be published.
 - `native-sorted-set-score-range-linux.json` is its direct-Linux release
   observation for a ten-member middle score range over 2,048 members. It
   remains outside G3 and G7.
+- [Native sorted-set member-rank evidence —
+  2026-08-02](native-sorted-set-ranks-linux-2026-08-02.md) binds
+  bidirectional zero-based ranks, reverse physical B+tree traversal,
+  execution-mode equivalence, live-only counting, and fail-closed decoding to
+  one source commit.
+- `native-sorted-set-rank-linux.json` is its direct-Linux position-sensitive
+  release observation over 2,048 members. It remains outside G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

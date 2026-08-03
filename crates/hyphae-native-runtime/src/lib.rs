@@ -86,8 +86,9 @@ thread_local! {
 use crate::{
     model::{
         CatalogState, ListPop, ModelError, RelationState, SearchState, SecondaryIndexLayout,
-        SortedSetMemberState, SortedSetScore, StructureEntry, StructureState, TtlValue, analyze,
-        bm25_idf, bm25_term_score, normalize_list_range, sorted_set_score_range_is_empty,
+        SortedSetMemberState, SortedSetRankState, SortedSetScore, StructureEntry, StructureState,
+        TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
+        sorted_set_score_range_is_empty,
     },
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
@@ -1351,6 +1352,24 @@ impl NativeSnapshot {
             .structures
             .zcard(key)
             .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
+    }
+
+    /// Returns one member's zero-based ascending sorted-set rank.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrank(&self, key: &[u8], member: &[u8]) -> Result<Option<usize>, NativeRuntimeError> {
+        sorted_set_rank_from_state(&self.state.structures, key, member, false)
+    }
+
+    /// Returns one member's zero-based descending sorted-set rank.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrevrank(&self, key: &[u8], member: &[u8]) -> Result<Option<usize>, NativeRuntimeError> {
+        sorted_set_rank_from_state(&self.state.structures, key, member, true)
     }
 
     /// Returns an inclusive signed-rank range from one native sorted set.
@@ -3406,6 +3425,150 @@ impl NativeDatabase {
         };
         usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Reads one member's zero-based ascending rank through both physical
+    /// sorted-set indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata/index state.
+    pub fn zrank_latest_sorted_set(
+        &self,
+        key: &[u8],
+        member: &[u8],
+    ) -> Result<Option<usize>, NativeRuntimeError> {
+        self.sorted_set_rank_latest(key, member, false)
+    }
+
+    /// Reads one member's zero-based descending rank through both physical
+    /// sorted-set indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing sorted
+    /// set, or malformed metadata/index state.
+    pub fn zrevrank_latest_sorted_set(
+        &self,
+        key: &[u8],
+        member: &[u8],
+    ) -> Result<Option<usize>, NativeRuntimeError> {
+        self.sorted_set_rank_latest(key, member, true)
+    }
+
+    fn sorted_set_rank_latest(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        reverse: bool,
+    ) -> Result<Option<usize>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.sorted_set_rank_in_tree(BTree::from_root(root), key, member, reverse)
+    }
+
+    fn sorted_set_rank_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        member: &[u8],
+        reverse: bool,
+    ) -> Result<Option<usize>, NativeRuntimeError> {
+        let metadata_key = structure_sorted_set_meta_key(key)?;
+        let Some(metadata) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(tree, key);
+        };
+        let length = usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let member_key = structure_sorted_set_member_key(key, member)?;
+        let Some(encoded_score) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &member_key)?
+        else {
+            return Ok(None);
+        };
+        let Some(score) = decode_sorted_set_score(encoded_score.bytes())? else {
+            return Ok(None);
+        };
+        if length == 0 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let target = structure_sorted_set_order_key(key, score, member)?;
+        let prefix = structure_sorted_set_order_prefix(key)?;
+        let mut live_rank = 0_usize;
+        let mut rank = None;
+        let mut failure = None;
+        let mut visitor = |physical_key: &[u8], value: &[u8]| {
+            let decoded = (|| {
+                let (found_key, found_score, found_member) =
+                    decode_sorted_set_order_identity(&physical_key[1..])?;
+                let live = decode_set_member_value(value)?;
+                Ok::<_, NativeRuntimeError>((found_key, found_score, found_member, live))
+            })();
+            let (found_key, found_score, found_member, live) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    failure = Some(error);
+                    return ControlFlow::Break(());
+                }
+            };
+            if found_key != key || (live && found_member == member && found_score != score) {
+                failure = Some(NativeRuntimeError::InvalidStructureTree);
+                return ControlFlow::Break(());
+            }
+            if physical_key == target.as_slice() {
+                if !live || found_score != score || found_member != member {
+                    failure = Some(NativeRuntimeError::InvalidStructureTree);
+                    return ControlFlow::Break(());
+                }
+                if live_rank >= length {
+                    failure = Some(NativeRuntimeError::InvalidStructureTree);
+                    return ControlFlow::Break(());
+                }
+                rank = Some(live_rank);
+                return ControlFlow::Break(());
+            }
+            if live {
+                live_rank += 1;
+                if live_rank >= length {
+                    failure = Some(NativeRuntimeError::InvalidStructureTree);
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        };
+        let _visit = if reverse {
+            tree.visit_prefix_range_cached_reverse(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                Bound::Included(target.as_slice()),
+                Bound::Unbounded,
+                &mut visitor,
+            )?
+        } else {
+            tree.visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                Bound::Unbounded,
+                Bound::Included(target.as_slice()),
+                &mut visitor,
+            )?
+        };
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        rank.map(Some)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)
     }
 
     /// Reads an inclusive signed-rank range through the ordered physical index.
@@ -6283,6 +6446,24 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureSortedSet)
     }
 
+    /// Returns one member's zero-based ascending private sorted-set rank.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrank(&self, key: &[u8], member: &[u8]) -> Result<Option<usize>, NativeRuntimeError> {
+        sorted_set_rank_from_state(&self.state.structures, key, member, false)
+    }
+
+    /// Returns one member's zero-based descending private sorted-set rank.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another structure family or a missing sorted set.
+    pub fn zrevrank(&self, key: &[u8], member: &[u8]) -> Result<Option<usize>, NativeRuntimeError> {
+        sorted_set_rank_from_state(&self.state.structures, key, member, true)
+    }
+
     /// Returns an inclusive signed-rank range from private sorted-set state.
     ///
     /// # Errors
@@ -8699,6 +8880,29 @@ fn canonical_sorted_set_score_bounds(
         canonical_sorted_set_score_bound(lower)?,
         canonical_sorted_set_score_bound(upper)?,
     ))
+}
+
+fn sorted_set_rank_from_state(
+    structures: &StructureState,
+    key: &[u8],
+    member: &[u8],
+    reverse: bool,
+) -> Result<Option<usize>, NativeRuntimeError> {
+    if structures.entries.contains_key(key)
+        || structures.hashes.contains_key(key)
+        || structures.sets.contains_key(key)
+        || structures.lists.contains_key(key)
+    {
+        return Err(NativeRuntimeError::StructureKindMismatch);
+    }
+    match structures.sorted_set_ranks(key, member) {
+        SortedSetRankState::MissingSet => Err(NativeRuntimeError::UnknownStructureSortedSet),
+        SortedSetRankState::MissingMember => Ok(None),
+        SortedSetRankState::Present {
+            forward,
+            reverse: reverse_rank,
+        } => Ok(Some(if reverse { reverse_rank } else { forward })),
+    }
 }
 
 fn structure_sorted_set_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
@@ -16453,6 +16657,266 @@ mod tests {
             reopened.lrange_latest_list(b"queue", 0, -1)?,
             [b"one".to_vec(), b"three".to_vec()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_ranks_match_private_snapshot_latest_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"ranked".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 1.0, b"alpha".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 2.0, b"bravo".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 2.0, b"charlie".to_vec())?;
+        assert_eq!(seed.zrank(b"ranked", b"alpha")?, Some(0));
+        assert_eq!(seed.zrank(b"ranked", b"charlie")?, Some(2));
+        assert_eq!(seed.zrevrank(b"ranked", b"charlie")?, Some(0));
+        assert_eq!(seed.zrevrank(b"ranked", b"alpha")?, Some(2));
+        assert_eq!(seed.zrank(b"ranked", b"missing")?, None);
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        mutate.zadd(b"ranked".to_vec(), 0.0, b"charlie".to_vec())?;
+        assert!(mutate.zrem(b"ranked".to_vec(), b"alpha".to_vec())?);
+        mutate.zadd(b"ranked".to_vec(), 2.0, b"delta".to_vec())?;
+        assert_eq!(mutate.zrank(b"ranked", b"bravo")?, Some(1));
+        assert_eq!(mutate.zrevrank(b"ranked", b"bravo")?, Some(1));
+        mutate.commit()?;
+
+        assert_eq!(historical.zrank(b"ranked", b"charlie")?, Some(2));
+        assert_eq!(historical.zrevrank(b"ranked", b"charlie")?, Some(0));
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"ranked", b"delta")?,
+            Some(2)
+        );
+        assert_eq!(
+            database.zrevrank_latest_sorted_set(b"ranked", b"delta")?,
+            Some(0)
+        );
+        assert_eq!(database.zrank_latest_sorted_set(b"ranked", b"alpha")?, None);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.zrank_latest_sorted_set(b"ranked", b"charlie")?,
+            Some(0)
+        );
+        assert_eq!(
+            reopened.zrevrank_latest_sorted_set(b"ranked", b"charlie")?,
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_ranks_validate_types_missing_members_and_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"ranked".to_vec())?;
+        seed.create_sorted_set(b"empty".to_vec())?;
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        seed.zadd(b"ranked".to_vec(), 1.0, b"alpha".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 2.0, b"bravo".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 3.0, b"charlie".to_vec())?;
+        assert_eq!(seed.zrank(b"empty", b"missing")?, None);
+        assert!(matches!(
+            seed.zrank(b"scalar", b"member"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            seed.zrevrank(b"absent", b"member"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        seed.commit()?;
+
+        let mut mutate = database.begin(11, DurabilityClass::Strict)?;
+        mutate.zadd(b"ranked".to_vec(), 4.0, b"bravo".to_vec())?;
+        assert!(mutate.zrem(b"ranked".to_vec(), b"alpha".to_vec())?);
+        mutate.commit()?;
+
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"ranked", b"charlie")?,
+            Some(0)
+        );
+        assert_eq!(
+            database.zrevrank_latest_sorted_set(b"ranked", b"charlie")?,
+            Some(1)
+        );
+        assert_eq!(database.zrank_latest_sorted_set(b"ranked", b"alpha")?, None);
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"empty", b"missing")?,
+            None
+        );
+        assert!(matches!(
+            database.zrank_latest_sorted_set(b"scalar", b"member"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.zrevrank_latest_sorted_set(b"absent", b"member"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_sorted_set_ranks_ignore_tombstones_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_sorted_set(b"large-rank".to_vec())?;
+        for index in 0..2_048_u32 {
+            seed.zadd(
+                b"large-rank".to_vec(),
+                f64::from(index),
+                index.to_be_bytes().to_vec(),
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+        let historical = database.snapshot(101)?;
+
+        let target = 1_024_u32.to_be_bytes();
+        let later = 1_536_u32.to_be_bytes();
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        mutate.zadd(b"large-rank".to_vec(), -1.0, target.to_vec())?;
+        assert!(mutate.zrem(b"large-rank".to_vec(), 0_u32.to_be_bytes().to_vec())?);
+        assert!(mutate.zrem(b"large-rank".to_vec(), 1_023_u32.to_be_bytes().to_vec())?);
+        mutate.zadd(b"large-rank".to_vec(), -2.0, b"new-first".to_vec())?;
+        assert_eq!(mutate.zrank(b"large-rank", &target)?, Some(1));
+        mutate.commit()?;
+
+        assert_eq!(historical.zrank(b"large-rank", &target)?, Some(1_024));
+        assert_eq!(historical.zrevrank(b"large-rank", &target)?, Some(1_023));
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"large-rank", &target)?,
+            Some(1)
+        );
+        assert_eq!(
+            database.zrevrank_latest_sorted_set(b"large-rank", &target)?,
+            Some(2_045)
+        );
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"large-rank", &later)?,
+            Some(1_535)
+        );
+        assert_eq!(
+            database.zrevrank_latest_sorted_set(b"large-rank", &later)?,
+            Some(511)
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.zrank_latest_sorted_set(b"large-rank", &later)?,
+            Some(1_535)
+        );
+        assert_eq!(
+            reopened.zrevrank_latest_sorted_set(b"large-rank", &target)?,
+            Some(2_045)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_sorted_set_ranks_fail_closed_on_forged_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"ranked".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 1.0, b"alpha".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 2.0, b"bravo".to_vec())?;
+        seed.zadd(b"ranked".to_vec(), 3.0, b"charlie".to_vec())?;
+        seed.commit()?;
+
+        let roots = database.coordinator.snapshot(11)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let target_score = super::canonical_sorted_set_score(2.0)?;
+        let forgeries = [
+            (
+                super::structure_sorted_set_order_key(b"ranked", target_score, b"bravo")?,
+                super::structure_tombstone_value(),
+                false,
+            ),
+            (
+                super::structure_sorted_set_order_key(b"ranked", target_score, b"bravo")?,
+                super::structure_tombstone_value(),
+                true,
+            ),
+            (
+                super::structure_sorted_set_order_key(
+                    b"ranked",
+                    super::canonical_sorted_set_score(0.0)?,
+                    b"bravo",
+                )?,
+                super::set_member_live_value(),
+                false,
+            ),
+            (
+                super::structure_sorted_set_order_key(
+                    b"ranked",
+                    super::canonical_sorted_set_score(4.0)?,
+                    b"bravo",
+                )?,
+                super::set_member_live_value(),
+                true,
+            ),
+            (
+                super::structure_sorted_set_order_key(
+                    b"ranked",
+                    super::canonical_sorted_set_score(1.0)?,
+                    b"alpha",
+                )?,
+                vec![0xff],
+                false,
+            ),
+            (
+                super::structure_sorted_set_order_key(
+                    b"ranked",
+                    super::canonical_sorted_set_score(3.0)?,
+                    b"charlie",
+                )?,
+                vec![0xff],
+                true,
+            ),
+            (
+                super::structure_sorted_set_meta_key(b"ranked")?,
+                super::encode_sorted_set_metadata(0),
+                false,
+            ),
+            (
+                super::structure_sorted_set_meta_key(b"ranked")?,
+                super::encode_sorted_set_metadata(0),
+                true,
+            ),
+            (
+                super::structure_sorted_set_member_key(b"ranked", b"bravo")?,
+                vec![0xff],
+                false,
+            ),
+            (
+                super::structure_sorted_set_member_key(b"ranked", b"bravo")?,
+                vec![0xff],
+                true,
+            ),
+        ];
+        for (key, value, reverse) in forgeries {
+            let forged_tree = hyphae_native_btree::BTree::from_root(root)
+                .upsert(&mut database.pages, Csn::new(1)?, key, value)?
+                .tree;
+            assert!(matches!(
+                database.sorted_set_rank_in_tree(forged_tree, b"ranked", b"bravo", reverse),
+                Err(NativeRuntimeError::InvalidStructureTree)
+            ));
+        }
         Ok(())
     }
 

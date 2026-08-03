@@ -3,9 +3,10 @@
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
-buffered reads, large immutable blobs, and dual-index sorted sets are
-implemented in the convergence slice, including bounded sorted-set score
-ranges; the ordered durable scalar-expiry index and bounded cleanup are
+buffered reads, large immutable blobs, dual-index sorted sets, bounded
+sorted-set score ranges, and bidirectional sorted-set member ranks are
+implemented in the convergence slice; the ordered durable scalar-expiry index
+and bounded cleanup are
 implemented; an engine-owned background timer, version-bearing responses, and
 the remaining structure families remain pending
 
@@ -44,8 +45,9 @@ conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
 counters, explicitly created binary hash/maps, exact binary sets, and
-chunked-deque lists, plus dual-index sorted sets with bounded score ranges.
-Streams, bitmaps, sketches, geo indexes, and typed registers remain targets.
+chunked-deque lists, plus dual-index sorted sets with bidirectional member-rank
+lookup and bounded score ranges. Streams, bitmaps, sketches, geo indexes, and
+typed registers remain targets.
 
 ## First vertical operations
 
@@ -163,6 +165,24 @@ nonintersecting subtrees, ignores tombstones without charging offset, and
 stops after the requested live result count. It does not materialize the
 complete sorted set. Malformed ordered identities, scores, or live markers
 fail the complete call rather than returning a partial result.
+
+`ZRANK` returns a live member's zero-based position in that exact ascending
+score/member order. `ZREVRANK` returns its zero-based position after reversing
+the complete total order, so equal-score members also reverse their bytewise
+order. A missing member returns no rank; a missing sorted set or another
+structure kind remains a typed error. Private transaction, retained snapshot,
+current-root physical, and reopened execution have identical results.
+
+Current-root rank lookup validates metadata and resolves the member's
+canonical score through the membership index before targeting its exact
+ordered identity. `ZRANK` walks the ordered `0x0a` namespace ascending through
+that target; `ZREVRANK` walks it descending through the target. Both ignore
+tombstones without charging rank, stop when the live target is found, and do
+not materialize the complete sorted set. A missing or non-live target ordered
+entry, visited live target under a conflicting score, malformed visited
+identity, score, or marker, or a live rank reaching the declared cardinality
+fails the complete call. This first lookup contract does not add subtree live
+counts; order-statistic acceleration remains open.
 
 Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
 rejected before mutation. Negative zero is normalized to positive zero. These
