@@ -1032,6 +1032,44 @@ pub(crate) fn execute_transaction(
     }
 }
 
+pub(crate) fn execute_transaction_dml(
+    transaction: &mut NativeWriteBatch,
+    statement: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    match parse(statement)? {
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => execute_insert(transaction, &name, &values, parameter_count, parameters),
+        Statement::Update {
+            name,
+            assignments,
+            predicates,
+            parameter_count,
+        } => execute_update(
+            transaction,
+            &name,
+            &assignments,
+            &predicates,
+            parameter_count,
+            parameters,
+        ),
+        Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } => execute_delete(transaction, &name, &predicates, parameter_count, parameters),
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
+    }
+}
+
 fn execute_bound_snapshot(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,

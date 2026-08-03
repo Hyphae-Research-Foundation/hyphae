@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_btree::BTREE_MAX_KEY_SIZE;
+use std::num::NonZeroU64;
+
 use hyphae_native_types::{Csn, DurabilityClass, TransactionId};
 use thiserror::Error;
 
@@ -8,6 +10,8 @@ use thiserror::Error;
 pub const LOCAL_OPERATION_HEADER_SIZE: usize = 8;
 /// Canonical header width for one local scalar `SET`.
 pub const LOCAL_STRUCTURE_SET_HEADER_SIZE: usize = 20;
+/// Fixed request header for one transaction-bound scalar `SET`.
+pub const LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE: usize = 32;
 /// Canonical fixed width for one local TTL response.
 pub const LOCAL_TTL_PAYLOAD_SIZE: usize = 12;
 /// Canonical fixed width for one local mutation commit receipt.
@@ -19,6 +23,7 @@ const OPERATION_VERSION: u8 = 1;
 const STRUCTURE_GET_OPCODE: u8 = 1;
 const STRUCTURE_SET_OPCODE: u8 = 2;
 const STRUCTURE_TTL_OPCODE: u8 = 3;
+const TRANSACTION_STRUCTURE_SET_OPCODE: u8 = 4;
 const PERSISTENT_EXPIRY_MODE: u8 = 0;
 const RELATIVE_EXPIRY_MODE: u8 = 1;
 const MISSING_VALUE_TAG: u8 = 0;
@@ -57,6 +62,18 @@ pub enum LocalFailureCode {
     SqlResourceLimit = 11,
     /// A session-local prepared SQL plan does not exist.
     UnknownPrepared = 12,
+    /// Another or non-transaction operation arrived while a transaction is active.
+    TransactionActive = 13,
+    /// A transaction-bound operation arrived without an active transaction.
+    TransactionInactive = 14,
+    /// A transaction handle or expected operation count differs.
+    TransactionMismatch = 15,
+    /// Commit was requested without a staged operation.
+    TransactionEmpty = 16,
+    /// A local transaction handle or operation bound was exhausted.
+    TransactionResourceLimit = 17,
+    /// Optimistic transaction validation detected a write conflict.
+    TransactionConflict = 18,
 }
 
 impl TryFrom<u8> for LocalFailureCode {
@@ -76,6 +93,12 @@ impl TryFrom<u8> for LocalFailureCode {
             10 => Ok(Self::SqlCatalogChanged),
             11 => Ok(Self::SqlResourceLimit),
             12 => Ok(Self::UnknownPrepared),
+            13 => Ok(Self::TransactionActive),
+            14 => Ok(Self::TransactionInactive),
+            15 => Ok(Self::TransactionMismatch),
+            16 => Ok(Self::TransactionEmpty),
+            17 => Ok(Self::TransactionResourceLimit),
+            18 => Ok(Self::TransactionConflict),
             _ => Err(LocalOperationCodecError::UnknownFailureCode(value)),
         }
     }
@@ -103,6 +126,19 @@ pub struct LocalStructureSetRequest<'payload> {
     pub durability: DurabilityClass,
 }
 
+/// Borrowed canonical transaction-bound scalar `SET` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalTransactionStructureSetRequest<'payload> {
+    /// Matching connection-local transaction handle.
+    pub handle: NonZeroU64,
+    /// Binary scalar key.
+    pub key: &'payload [u8],
+    /// Binary scalar value, including a valid empty value.
+    pub value: &'payload [u8],
+    /// Positive relative TTL applied to the fixed `BEGIN` time, or persistent.
+    pub relative_ttl_micros: Option<i64>,
+}
+
 /// Decoded local structure request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalStructureRequest<'payload> {
@@ -112,6 +148,8 @@ pub enum LocalStructureRequest<'payload> {
     Set(LocalStructureSetRequest<'payload>),
     /// Read one scalar TTL state.
     Ttl(&'payload [u8]),
+    /// Stage one scalar value in an active explicit transaction.
+    TransactionSet(LocalTransactionStructureSetRequest<'payload>),
 }
 
 /// Canonical local TTL response.
@@ -282,6 +320,87 @@ pub fn encode_local_structure_set<'buffer>(
     Ok(buffer)
 }
 
+/// Encodes one canonical transaction-bound scalar `SET`.
+///
+/// # Errors
+///
+/// Returns a typed error for key, TTL, length, or frame-bound violations
+/// before growing the reusable buffer.
+pub fn encode_local_transaction_structure_set<'buffer>(
+    buffer: &'buffer mut Vec<u8>,
+    request: LocalTransactionStructureSetRequest<'_>,
+    maximum_payload: usize,
+) -> Result<&'buffer [u8], LocalOperationCodecError> {
+    validate_key_length(request.key.len())?;
+    let (expiry_mode, relative_ttl_micros) = encode_expiry(request.relative_ttl_micros)?;
+    let key_length =
+        u32::try_from(request.key.len()).map_err(|_| LocalOperationCodecError::KeyTooLarge)?;
+    let value_length = u32::try_from(request.value.len())
+        .map_err(|_| LocalOperationCodecError::PayloadTooLarge)?;
+    let encoded_length = LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE
+        .checked_add(request.key.len())
+        .and_then(|length| length.checked_add(request.value.len()))
+        .ok_or(LocalOperationCodecError::PayloadTooLarge)?;
+    if encoded_length > maximum_payload {
+        return Err(LocalOperationCodecError::PayloadTooLarge);
+    }
+    buffer.resize(encoded_length, 0);
+    buffer[..LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE].fill(0);
+    buffer[0] = OPERATION_VERSION;
+    buffer[1] = TRANSACTION_STRUCTURE_SET_OPCODE;
+    buffer[2] = expiry_mode;
+    buffer[4..12].copy_from_slice(&request.handle.get().to_le_bytes());
+    buffer[12..16].copy_from_slice(&key_length.to_le_bytes());
+    buffer[16..20].copy_from_slice(&value_length.to_le_bytes());
+    buffer[20..28].copy_from_slice(&relative_ttl_micros.to_le_bytes());
+    let value_start = LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE + request.key.len();
+    buffer[LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE..value_start].copy_from_slice(request.key);
+    buffer[value_start..].copy_from_slice(request.value);
+    Ok(buffer)
+}
+
+/// Decodes one canonical transaction-bound scalar `SET`.
+///
+/// # Errors
+///
+/// Returns a typed error for every noncanonical version, opcode, reserved,
+/// handle, TTL, key, or length boundary.
+pub fn decode_local_transaction_structure_set(
+    payload: &[u8],
+) -> Result<LocalTransactionStructureSetRequest<'_>, LocalOperationCodecError> {
+    if payload.len() < LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE {
+        return Err(LocalOperationCodecError::Truncated);
+    }
+    validate_version(payload)?;
+    if payload[1] != TRANSACTION_STRUCTURE_SET_OPCODE {
+        return Err(LocalOperationCodecError::UnknownStructureOpcode(payload[1]));
+    }
+    if payload[3] != 0 || payload[28..32] != [0, 0, 0, 0] {
+        return Err(LocalOperationCodecError::ReservedBytes);
+    }
+    let handle =
+        NonZeroU64::new(read_u64(payload, 4)).ok_or(LocalOperationCodecError::InvalidIdentity)?;
+    let relative_ttl_micros = decode_expiry(payload[2], read_i64(payload, 20))?;
+    let key_length = read_u32(payload, 12)?;
+    validate_key_length(key_length)?;
+    let value_length = read_u32(payload, 16)?;
+    let body_length = key_length
+        .checked_add(value_length)
+        .ok_or(LocalOperationCodecError::PayloadTooLarge)?;
+    require_payload_length(
+        payload,
+        LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE,
+        body_length,
+    )?;
+    let value_start = LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE + key_length;
+    Ok(LocalTransactionStructureSetRequest {
+        handle,
+        key: &payload[LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE..value_start],
+        value: &payload[value_start..],
+        relative_ttl_micros,
+    })
+}
+
 /// Decodes and validates one canonical binary `STRUCTURE GET` payload.
 ///
 /// # Errors
@@ -313,6 +432,8 @@ pub fn decode_local_structure_request(
         STRUCTURE_TTL_OPCODE => {
             decode_point_request(payload, STRUCTURE_TTL_OPCODE).map(LocalStructureRequest::Ttl)
         }
+        TRANSACTION_STRUCTURE_SET_OPCODE => decode_local_transaction_structure_set(payload)
+            .map(LocalStructureRequest::TransactionSet),
         opcode => Err(LocalOperationCodecError::UnknownStructureOpcode(opcode)),
     }
 }

@@ -184,10 +184,10 @@ fn local_set_codec_rejects_noncanonical_headers_and_ttl() {
         Err(LocalOperationCodecError::UnsupportedVersion(2))
     ));
     request[0] = 1;
-    request[1] = 4;
+    request[1] = 5;
     assert!(matches!(
         decode_local_structure_request(&request),
-        Err(LocalOperationCodecError::UnknownStructureOpcode(4))
+        Err(LocalOperationCodecError::UnknownStructureOpcode(5))
     ));
     request[1] = 2;
     request[2] = 2;
@@ -334,8 +334,8 @@ fn local_ttl_and_receipt_codecs_reject_every_noncanonical_boundary() {
         Err(LocalOperationCodecError::InvalidIdentity)
     ));
     assert!(matches!(
-        decode_local_failure(&[1, 13, 0, 0]),
-        Err(LocalOperationCodecError::UnknownFailureCode(13))
+        decode_local_failure(&[1, 19, 0, 0]),
+        Err(LocalOperationCodecError::UnknownFailureCode(19))
     ));
 }
 

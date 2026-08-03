@@ -23,6 +23,7 @@ mod local_search;
 #[cfg(unix)]
 mod local_session;
 mod local_sql;
+mod local_transaction;
 #[cfg(unix)]
 mod local_uds;
 mod model;
@@ -57,35 +58,56 @@ pub use hyphae_native_ann::{
 };
 pub use local_operation::{
     LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LOCAL_STRUCTURE_SET_HEADER_SIZE,
-    LOCAL_TTL_PAYLOAD_SIZE, LocalFailureCode, LocalOperationCodecError,
-    LocalStructureCommitReceipt, LocalStructureRequest, LocalStructureSetRequest, LocalTtlValue,
-    LocalValue, MAX_LOCAL_STRUCTURE_KEY_BYTES, decode_local_failure,
-    decode_local_structure_commit_receipt, decode_local_structure_get,
-    decode_local_structure_request, decode_local_ttl, decode_local_value, encode_local_failure,
-    encode_local_structure_commit_receipt, encode_local_structure_get, encode_local_structure_set,
-    encode_local_structure_ttl, encode_local_ttl, encode_local_value,
+    LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE, LOCAL_TTL_PAYLOAD_SIZE, LocalFailureCode,
+    LocalOperationCodecError, LocalStructureCommitReceipt, LocalStructureRequest,
+    LocalStructureSetRequest, LocalTransactionStructureSetRequest, LocalTtlValue, LocalValue,
+    MAX_LOCAL_STRUCTURE_KEY_BYTES, decode_local_failure, decode_local_structure_commit_receipt,
+    decode_local_structure_get, decode_local_structure_request,
+    decode_local_transaction_structure_set, decode_local_ttl, decode_local_value,
+    encode_local_failure, encode_local_structure_commit_receipt, encode_local_structure_get,
+    encode_local_structure_set, encode_local_structure_ttl, encode_local_transaction_structure_set,
+    encode_local_ttl, encode_local_value,
 };
 pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE, LocalFrameIo,
     LocalProtocolError, LocalTransportError, decode_frame, encode_frame,
 };
 pub use local_search::{
-    LOCAL_SEARCH_MATCH_HEADER_SIZE, LOCAL_SEARCH_RESULTS_HEADER_SIZE, LocalSearchCodecError,
-    LocalSearchMatchHit, LocalSearchMatchRequest, LocalSearchMatchResults, MAX_LOCAL_SEARCH_HITS,
+    LOCAL_SEARCH_MATCH_HEADER_SIZE, LOCAL_SEARCH_RESULTS_HEADER_SIZE,
+    LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE, LocalSearchCodecError, LocalSearchMatchHit,
+    LocalSearchMatchRequest, LocalSearchMatchResults, LocalTransactionIndexDocumentRequest,
+    MAX_LOCAL_SEARCH_DOCUMENT_BYTES, MAX_LOCAL_SEARCH_DOCUMENT_ID_BYTES, MAX_LOCAL_SEARCH_HITS,
     MAX_LOCAL_SEARCH_QUERY_BYTES, decode_local_search_match, decode_local_search_match_results,
-    encode_local_search_match, encode_local_search_match_results,
+    decode_local_transaction_index_document, encode_local_search_match,
+    encode_local_search_match_results, encode_local_transaction_index_document,
 };
 #[cfg(unix)]
 pub use local_session::{LocalDataSession, LocalSessionError};
 pub use local_sql::{
     LOCAL_SQL_EXECUTE_HEADER_SIZE, LOCAL_SQL_PREPARE_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE,
-    LOCAL_SQL_ROWS_HEADER_SIZE, LocalSqlCodecError, LocalSqlColumn, LocalSqlExecuteRequest,
-    LocalSqlPreparedReceipt, LocalSqlRows, MAX_LOCAL_PREPARED_STATEMENTS,
-    MAX_LOCAL_SQL_COLUMN_NAME_BYTES, MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS,
-    MAX_LOCAL_SQL_ROWS, MAX_LOCAL_SQL_STATEMENT_BYTES, MAX_LOCAL_SQL_TYPE_DESCRIPTOR_BYTES,
-    decode_local_sql_execute, decode_local_sql_prepare, decode_local_sql_prepared_receipt,
-    decode_local_sql_rows, encode_local_sql_execute, encode_local_sql_prepare,
-    encode_local_sql_prepared_receipt, encode_local_sql_rows,
+    LOCAL_SQL_ROWS_HEADER_SIZE, LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE, LocalSqlCodecError,
+    LocalSqlColumn, LocalSqlExecuteRequest, LocalSqlPreparedReceipt, LocalSqlRows,
+    LocalTransactionSqlDmlRequest, MAX_LOCAL_PREPARED_STATEMENTS, MAX_LOCAL_SQL_COLUMN_NAME_BYTES,
+    MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS, MAX_LOCAL_SQL_ROWS,
+    MAX_LOCAL_SQL_STATEMENT_BYTES, MAX_LOCAL_SQL_TYPE_DESCRIPTOR_BYTES, decode_local_sql_execute,
+    decode_local_sql_prepare, decode_local_sql_prepared_receipt, decode_local_sql_rows,
+    decode_local_transaction_sql_dml, encode_local_sql_execute, encode_local_sql_prepare,
+    encode_local_sql_prepared_receipt, encode_local_sql_rows, encode_local_transaction_sql_dml,
+};
+pub use local_transaction::{
+    LOCAL_TRANSACTION_BEGIN_RECEIPT_SIZE, LOCAL_TRANSACTION_BEGIN_SIZE,
+    LOCAL_TRANSACTION_COMMIT_RECEIPT_SIZE, LOCAL_TRANSACTION_COMMIT_SIZE,
+    LOCAL_TRANSACTION_ROLLBACK_RECEIPT_SIZE, LOCAL_TRANSACTION_ROLLBACK_SIZE,
+    LOCAL_TRANSACTION_STAGE_RECEIPT_SIZE, LocalTransactionBeginReceipt, LocalTransactionCodecError,
+    LocalTransactionCommitReceipt, LocalTransactionEngine, LocalTransactionRollbackReceipt,
+    LocalTransactionStageReceipt, MAX_LOCAL_TRANSACTION_OPERATIONS, decode_local_transaction_begin,
+    decode_local_transaction_begin_receipt, decode_local_transaction_commit,
+    decode_local_transaction_commit_receipt, decode_local_transaction_rollback,
+    decode_local_transaction_rollback_receipt, decode_local_transaction_stage_receipt,
+    encode_local_transaction_begin, encode_local_transaction_begin_receipt,
+    encode_local_transaction_commit, encode_local_transaction_commit_receipt,
+    encode_local_transaction_rollback, encode_local_transaction_rollback_receipt,
+    encode_local_transaction_stage_receipt,
 };
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
@@ -7752,6 +7774,20 @@ impl NativeWriteBatch {
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
         sql::execute_transaction(self, statement, parameters)
+    }
+
+    /// Executes one transaction-bound SQL `INSERT`, `UPDATE`, or `DELETE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another statement family, invalid binding,
+    /// parameters, or native engine semantics.
+    pub fn execute_sql_dml(
+        &mut self,
+        statement: &str,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        sql::execute_transaction_dml(self, statement, parameters)
     }
 
     /// Creates one fixed-schema binary relation with a binary primary key.

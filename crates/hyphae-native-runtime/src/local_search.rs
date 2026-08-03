@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, num::NonZeroU64};
 
+use hyphae_native_btree::BTREE_MAX_KEY_SIZE;
 use hyphae_native_types::{Csn, ObjectId};
 use thiserror::Error;
 
@@ -11,13 +12,20 @@ use crate::MatchHit;
 pub const LOCAL_SEARCH_MATCH_HEADER_SIZE: usize = 28;
 /// Canonical fixed header width for one local lexical result.
 pub const LOCAL_SEARCH_RESULTS_HEADER_SIZE: usize = 16;
+/// Canonical fixed header width for one transaction-bound indexed document.
+pub const LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE: usize = 40;
 /// Maximum UTF-8 bytes admitted for one local lexical query.
 pub const MAX_LOCAL_SEARCH_QUERY_BYTES: usize = 4_096;
 /// Maximum result count admitted by one local lexical request.
 pub const MAX_LOCAL_SEARCH_HITS: usize = 1_024;
+/// Maximum transaction-bound binary document identity.
+pub const MAX_LOCAL_SEARCH_DOCUMENT_ID_BYTES: usize = BTREE_MAX_KEY_SIZE - 17;
+/// Maximum UTF-8 document text accepted by the local transaction surface.
+pub const MAX_LOCAL_SEARCH_DOCUMENT_BYTES: usize = 65_536;
 
 const SEARCH_VERSION: u8 = 1;
 const MATCH_OPCODE: u8 = 1;
+pub(crate) const TRANSACTION_INDEX_DOCUMENT_OPCODE: u8 = 2;
 const MATCH_RESULTS_TAG: u8 = 1;
 const MATCH_HIT_HEADER_SIZE: usize = 12;
 
@@ -30,6 +38,19 @@ pub struct LocalSearchMatchRequest<'payload> {
     pub query: &'payload str,
     /// Strictly positive bounded result limit.
     pub limit: usize,
+}
+
+/// Borrowed canonical transaction-bound lexical document request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalTransactionIndexDocumentRequest<'payload> {
+    /// Matching connection-local transaction handle.
+    pub handle: NonZeroU64,
+    /// Stable search collection identity.
+    pub index: ObjectId,
+    /// Stable binary document identity.
+    pub document_id: &'payload [u8],
+    /// UTF-8 document text indexed by the native analyzer.
+    pub text: &'payload str,
 }
 
 /// Borrowed canonical local lexical hit.
@@ -68,12 +89,21 @@ pub enum LocalSearchCodecError {
     /// The search object identity is zero.
     #[error("native local search object identity is invalid")]
     InvalidObjectId,
+    /// The transaction handle is zero.
+    #[error("native local search transaction handle is invalid")]
+    InvalidTransactionHandle,
     /// Query bytes are not valid UTF-8.
     #[error("native local search query is not UTF-8")]
     InvalidUtf8,
     /// The query exceeds the local CPU and memory guard.
     #[error("native local search query exceeds its canonical limit")]
     QueryTooLarge,
+    /// A transaction-bound document identity exceeds the physical key bound.
+    #[error("native local search document identity exceeds its canonical limit")]
+    DocumentIdTooLarge,
+    /// Transaction-bound document text exceeds its local CPU/memory bound.
+    #[error("native local search document text exceeds its canonical limit")]
+    DocumentTooLarge,
     /// The result limit is zero or above the local bound.
     #[error("native local search hit limit {0} is invalid")]
     InvalidLimit(usize),
@@ -164,6 +194,93 @@ pub fn decode_local_search_match(
         index,
         query,
         limit,
+    })
+}
+
+/// Encodes one canonical transaction-bound lexical document.
+///
+/// # Errors
+///
+/// Returns a typed error for handle, collection, document, UTF-8 length, or
+/// frame-bound violations before growing the reusable buffer.
+pub fn encode_local_transaction_index_document<'buffer>(
+    buffer: &'buffer mut Vec<u8>,
+    request: LocalTransactionIndexDocumentRequest<'_>,
+    maximum_payload: usize,
+) -> Result<&'buffer [u8], LocalSearchCodecError> {
+    validate_document_id_length(request.document_id.len())?;
+    validate_document_length(request.text.len())?;
+    let document_id_length = u32::try_from(request.document_id.len())
+        .map_err(|_| LocalSearchCodecError::DocumentIdTooLarge)?;
+    let text_length =
+        u32::try_from(request.text.len()).map_err(|_| LocalSearchCodecError::DocumentTooLarge)?;
+    let encoded_length = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE
+        .checked_add(request.document_id.len())
+        .and_then(|length| length.checked_add(request.text.len()))
+        .ok_or(LocalSearchCodecError::PayloadTooLarge)?;
+    if encoded_length > maximum_payload {
+        return Err(LocalSearchCodecError::PayloadTooLarge);
+    }
+    buffer.resize(encoded_length, 0);
+    buffer[..LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE].fill(0);
+    buffer[0] = SEARCH_VERSION;
+    buffer[1] = TRANSACTION_INDEX_DOCUMENT_OPCODE;
+    buffer[4..12].copy_from_slice(&request.handle.get().to_le_bytes());
+    buffer[12..28].copy_from_slice(&request.index.get().to_le_bytes());
+    buffer[28..32].copy_from_slice(&document_id_length.to_le_bytes());
+    buffer[32..36].copy_from_slice(&text_length.to_le_bytes());
+    let text_start = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + request.document_id.len();
+    buffer[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE..text_start]
+        .copy_from_slice(request.document_id);
+    buffer[text_start..].copy_from_slice(request.text.as_bytes());
+    Ok(buffer)
+}
+
+/// Decodes one canonical transaction-bound lexical document.
+///
+/// # Errors
+///
+/// Returns a typed error for every noncanonical version, opcode, reserved,
+/// identity, UTF-8, document, or length boundary.
+pub fn decode_local_transaction_index_document(
+    payload: &[u8],
+) -> Result<LocalTransactionIndexDocumentRequest<'_>, LocalSearchCodecError> {
+    if payload.len() < LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE {
+        return Err(LocalSearchCodecError::Truncated);
+    }
+    if payload[0] != SEARCH_VERSION {
+        return Err(LocalSearchCodecError::UnsupportedVersion(payload[0]));
+    }
+    if payload[1] != TRANSACTION_INDEX_DOCUMENT_OPCODE {
+        return Err(LocalSearchCodecError::UnknownOpcode(payload[1]));
+    }
+    if payload[2..4] != [0, 0] || payload[36..40] != [0, 0, 0, 0] {
+        return Err(LocalSearchCodecError::ReservedBytes);
+    }
+    let handle = NonZeroU64::new(read_u64(payload, 4))
+        .ok_or(LocalSearchCodecError::InvalidTransactionHandle)?;
+    let index = ObjectId::new(read_u128(payload, 12))
+        .map_err(|_| LocalSearchCodecError::InvalidObjectId)?;
+    let document_id_length = read_u32(payload, 28)?;
+    validate_document_id_length(document_id_length)?;
+    let text_length = read_u32(payload, 32)?;
+    validate_document_length(text_length)?;
+    let body_length = document_id_length
+        .checked_add(text_length)
+        .ok_or(LocalSearchCodecError::PayloadTooLarge)?;
+    require_payload_length(
+        payload,
+        LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE,
+        body_length,
+    )?;
+    let text_start = LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE + document_id_length;
+    let text = std::str::from_utf8(&payload[text_start..])
+        .map_err(|_| LocalSearchCodecError::InvalidUtf8)?;
+    Ok(LocalTransactionIndexDocumentRequest {
+        handle,
+        index,
+        document_id: &payload[LOCAL_TRANSACTION_SEARCH_DOCUMENT_HEADER_SIZE..text_start],
+        text,
     })
 }
 
@@ -332,6 +449,22 @@ fn validate_limit(limit: usize) -> Result<(), LocalSearchCodecError> {
         Ok(())
     } else {
         Err(LocalSearchCodecError::InvalidLimit(limit))
+    }
+}
+
+fn validate_document_id_length(length: usize) -> Result<(), LocalSearchCodecError> {
+    if length <= MAX_LOCAL_SEARCH_DOCUMENT_ID_BYTES {
+        Ok(())
+    } else {
+        Err(LocalSearchCodecError::DocumentIdTooLarge)
+    }
+}
+
+fn validate_document_length(length: usize) -> Result<(), LocalSearchCodecError> {
+    if length <= MAX_LOCAL_SEARCH_DOCUMENT_BYTES {
+        Ok(())
+    } else {
+        Err(LocalSearchCodecError::DocumentTooLarge)
     }
 }
 

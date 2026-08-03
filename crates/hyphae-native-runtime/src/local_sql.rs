@@ -13,6 +13,8 @@ use crate::SqlValue;
 pub const LOCAL_SQL_PREPARE_HEADER_SIZE: usize = 8;
 /// Fixed request header for one local SQL `EXECUTE`.
 pub const LOCAL_SQL_EXECUTE_HEADER_SIZE: usize = 16;
+/// Fixed request header for one transaction-bound SQL DML execution.
+pub const LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE: usize = 24;
 /// Fixed receipt size for one retained prepared statement.
 pub const LOCAL_SQL_PREPARED_RECEIPT_SIZE: usize = 32;
 /// Fixed header for one SQL row result.
@@ -35,6 +37,7 @@ pub const MAX_LOCAL_SQL_COLUMN_NAME_BYTES: usize = 4_096;
 const SQL_PAYLOAD_VERSION: u8 = 1;
 const PREPARE_SELECT_OPCODE: u8 = 1;
 const EXECUTE_PREPARED_SELECT_OPCODE: u8 = 1;
+pub(crate) const EXECUTE_TRANSACTION_DML_OPCODE: u8 = 2;
 const SQL_PREPARED_RECEIPT_TAG: u8 = 2;
 const SQL_ROWS_VALUE_TAG: u8 = 2;
 const SCALAR_RECORD_HEADER_SIZE: usize = 8;
@@ -78,6 +81,17 @@ pub struct LocalSqlPreparedReceipt {
 pub struct LocalSqlExecuteRequest {
     /// Nonzero identifier scoped to the current local session.
     pub plan_id: NonZeroU64,
+    /// Canonical primitive parameters in placeholder order.
+    pub parameters: Vec<SqlValue>,
+}
+
+/// One decoded transaction-bound SQL DML request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalTransactionSqlDmlRequest<'payload> {
+    /// Matching connection-local transaction handle.
+    pub handle: NonZeroU64,
+    /// One nonempty UTF-8 `INSERT`, `UPDATE`, or `DELETE`.
+    pub statement: &'payload str,
     /// Canonical primitive parameters in placeholder order.
     pub parameters: Vec<SqlValue>,
 }
@@ -335,6 +349,95 @@ pub fn decode_local_sql_execute(
     }
     Ok(LocalSqlExecuteRequest {
         plan_id,
+        parameters,
+    })
+}
+
+/// Encodes one canonical transaction-bound SQL DML request.
+///
+/// # Errors
+///
+/// Returns an error for empty/overlong SQL, too many parameters,
+/// noncanonical scalars, or a request exceeding the negotiated frame bound.
+pub fn encode_local_transaction_sql_dml<'buffer>(
+    buffer: &'buffer mut Vec<u8>,
+    handle: NonZeroU64,
+    statement: &str,
+    parameters: &[SqlValue],
+    maximum_payload: usize,
+) -> Result<&'buffer [u8], LocalSqlCodecError> {
+    validate_statement_length(statement.len())?;
+    validate_parameter_count(parameters.len())?;
+    ensure_payload_bound(LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE, maximum_payload)?;
+    let statement_length =
+        u32::try_from(statement.len()).map_err(|_| LocalSqlCodecError::StatementTooLarge)?;
+    let parameter_count =
+        u32::try_from(parameters.len()).map_err(|_| LocalSqlCodecError::ParameterCountExceeded)?;
+    let mut encoded_length = LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE
+        .checked_add(statement.len())
+        .ok_or(LocalSqlCodecError::PayloadTooLarge)?;
+    ensure_payload_bound(encoded_length, maximum_payload)?;
+    for parameter in parameters {
+        encoded_length = checked_payload_add(
+            encoded_length,
+            SCALAR_RECORD_HEADER_SIZE
+                .checked_add(scalar_payload_length(parameter)?)
+                .ok_or(LocalSqlCodecError::PayloadTooLarge)?,
+            maximum_payload,
+        )?;
+    }
+    buffer.resize(encoded_length, 0);
+    buffer.fill(0);
+    buffer[0] = SQL_PAYLOAD_VERSION;
+    buffer[1] = EXECUTE_TRANSACTION_DML_OPCODE;
+    buffer[4..12].copy_from_slice(&handle.get().to_le_bytes());
+    buffer[12..16].copy_from_slice(&statement_length.to_le_bytes());
+    buffer[16..20].copy_from_slice(&parameter_count.to_le_bytes());
+    let mut offset = LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE;
+    write_exact(buffer, &mut offset, statement.as_bytes())?;
+    for parameter in parameters {
+        encode_parameter_record(buffer, &mut offset, parameter)?;
+    }
+    debug_assert_eq!(offset, encoded_length);
+    Ok(buffer)
+}
+
+/// Decodes one canonical transaction-bound SQL DML request.
+///
+/// # Errors
+///
+/// Returns an error for malformed framing, handle, UTF-8, statement,
+/// parameter, scalar, or trailing-byte boundaries.
+pub fn decode_local_transaction_sql_dml(
+    payload: &[u8],
+) -> Result<LocalTransactionSqlDmlRequest<'_>, LocalSqlCodecError> {
+    require_header(payload, LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE)?;
+    validate_version_and_reserved(payload)?;
+    if payload[1] != EXECUTE_TRANSACTION_DML_OPCODE {
+        return Err(LocalSqlCodecError::UnknownExecuteOpcode(payload[1]));
+    }
+    if payload[20..24] != [0, 0, 0, 0] {
+        return Err(LocalSqlCodecError::ReservedBytes);
+    }
+    let handle =
+        NonZeroU64::new(read_u64(payload, 4)?).ok_or(LocalSqlCodecError::InvalidIdentity)?;
+    let statement_length = usize_from_u32(read_u32(payload, 12)?)?;
+    validate_statement_length(statement_length)?;
+    let parameter_count = usize_from_u32(read_u32(payload, 16)?)?;
+    validate_parameter_count(parameter_count)?;
+    let mut offset = LOCAL_TRANSACTION_SQL_DML_HEADER_SIZE;
+    let statement = std::str::from_utf8(take(payload, &mut offset, statement_length)?)
+        .map_err(|_| LocalSqlCodecError::InvalidUtf8)?;
+    let mut parameters = Vec::with_capacity(parameter_count);
+    for _ in 0..parameter_count {
+        parameters.push(decode_parameter_record(payload, &mut offset)?);
+    }
+    if offset != payload.len() {
+        return Err(LocalSqlCodecError::LengthMismatch);
+    }
+    Ok(LocalTransactionSqlDmlRequest {
+        handle,
+        statement,
         parameters,
     })
 }
