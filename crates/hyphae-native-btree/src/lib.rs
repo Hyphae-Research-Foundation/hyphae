@@ -541,6 +541,52 @@ impl BTree {
         )
     }
 
+    /// Visits one bounded prefix range in reverse canonical key order through
+    /// the buffer pool.
+    ///
+    /// `lower` and `upper` are full physical-key bounds. They are intersected
+    /// with the prefix namespace. Returning [`ControlFlow::Break`] from
+    /// `visitor` stops traversal without reading or materializing the
+    /// remaining range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, buffer-pool, codec, key-order, cycle, or
+    /// height failures in every node reached before traversal stops.
+    pub fn visit_prefix_range_cached_reverse<F>(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        prefix: &[u8],
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mut visitor: F,
+    ) -> Result<ControlFlow<()>, BTreeError>
+    where
+        F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+    {
+        let Some(root) = self.root else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let prefix_upper = prefix_upper_bound(prefix);
+        let mut visited = BTreeSet::new();
+        let mut last_key = None;
+        visit_prefix_range_node_cached_reverse(
+            CachedTreeRead { store, pool },
+            root,
+            CachedPrefixRange {
+                prefix,
+                prefix_upper: prefix_upper.as_deref(),
+                lower,
+                upper,
+            },
+            0,
+            &mut visited,
+            &mut last_key,
+            &mut visitor,
+        )
+    }
+
     /// Verifies the complete reachable tree and returns its entry count.
     ///
     /// # Errors
@@ -1568,6 +1614,98 @@ where
     Ok(ControlFlow::Continue(()))
 }
 
+#[derive(Clone, Copy)]
+struct CachedTreeRead<'a> {
+    store: &'a PageStore,
+    pool: &'a BufferPool,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPrefixRange<'a> {
+    prefix: &'a [u8],
+    prefix_upper: Option<&'a [u8]>,
+    lower: Bound<&'a [u8]>,
+    upper: Bound<&'a [u8]>,
+}
+
+fn visit_prefix_range_node_cached_reverse<F>(
+    read: CachedTreeRead<'_>,
+    page_id: PageId,
+    range: CachedPrefixRange<'_>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    last_key: &mut Option<Vec<u8>>,
+    visitor: &mut F,
+) -> Result<ControlFlow<()>, BTreeError>
+where
+    F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+{
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    let frame = read.pool.get_or_load(read.store, page_id)?;
+    match decode_page(frame.page())? {
+        Node::Leaf(entries) => {
+            for entry in entries.into_iter().rev() {
+                if entry.key.as_slice() < range.prefix {
+                    break;
+                }
+                if !entry.key.starts_with(range.prefix)
+                    || !key_satisfies_upper(&entry.key, range.upper)
+                {
+                    continue;
+                }
+                if !key_satisfies_lower(&entry.key, range.lower) {
+                    break;
+                }
+                if last_key
+                    .as_deref()
+                    .is_some_and(|previous| previous <= entry.key.as_slice())
+                {
+                    return Err(BTreeError::NoncanonicalKeyOrder);
+                }
+                last_key.replace(entry.key.clone());
+                if visitor(&entry.key, &entry.value).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate().rev() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                let ends_after_prefix =
+                    child_upper.is_none_or(|bound| bound.as_slice() > range.prefix);
+                let starts_before_prefix_upper = range
+                    .prefix_upper
+                    .is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                let intersects_bounds =
+                    child_intersects_bounds(child_lower, child_upper, range.lower, range.upper);
+                if ends_after_prefix
+                    && starts_before_prefix_upper
+                    && intersects_bounds
+                    && visit_prefix_range_node_cached_reverse(
+                        read,
+                        child,
+                        range,
+                        depth + 1,
+                        visited,
+                        last_key,
+                        visitor,
+                    )?
+                    .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 fn key_satisfies_lower(key: &[u8], lower: Bound<&[u8]>) -> bool {
     match lower {
         Bound::Included(bound) => key >= bound,
@@ -1999,6 +2137,96 @@ mod tests {
         )?;
         assert_eq!(outcome, ControlFlow::Continue(()));
         assert!(reversed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cached_reverse_prefix_range_visitor_honors_bounds_and_stops_early()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        for namespace in 0..4_u8 {
+            for index in 0..256_u32 {
+                let mut key = vec![namespace];
+                key.extend_from_slice(&index.to_be_bytes());
+                tree = tree
+                    .insert_unique(
+                        &mut store,
+                        Csn::new(u64::from(namespace) * 256 + u64::from(index) + 1)?,
+                        key,
+                        index.to_be_bytes().to_vec(),
+                    )?
+                    .tree;
+            }
+        }
+        assert!(tree.height(&store)? >= 2);
+        let pool = BufferPool::new(64, 4)?;
+        let key = |index: u32| {
+            let mut key = vec![2];
+            key.extend_from_slice(&index.to_be_bytes());
+            key
+        };
+
+        let lower = key(100);
+        let upper = key(110);
+        let mut half_open = Vec::new();
+        let outcome = tree.visit_prefix_range_cached_reverse(
+            &store,
+            &pool,
+            &[2],
+            Bound::Included(lower.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+            |_, value| {
+                half_open.push(value.to_vec());
+                ControlFlow::Continue(())
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        let decoded = half_open
+            .iter()
+            .map(|value| value.as_slice().try_into().map(u32::from_be_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(decoded, (100_u32..110).rev().collect::<Vec<_>>());
+
+        let inclusive_upper = key(105);
+        let mut stopped = Vec::new();
+        let outcome = tree.visit_prefix_range_cached_reverse(
+            &store,
+            &pool,
+            &[2],
+            Bound::Excluded(lower.as_slice()),
+            Bound::Included(inclusive_upper.as_slice()),
+            |_, value| {
+                stopped.push(value.to_vec());
+                if stopped.len() == 3 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Break(()));
+        let stopped = stopped
+            .iter()
+            .map(|value| value.as_slice().try_into().map(u32::from_be_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(stopped, [105, 104, 103]);
+
+        let mut empty = Vec::new();
+        let outcome = tree.visit_prefix_range_cached_reverse(
+            &store,
+            &pool,
+            &[2],
+            Bound::Included(key(200).as_slice()),
+            Bound::Included(key(100).as_slice()),
+            |key, _| {
+                empty.push(key.to_vec());
+                ControlFlow::Continue(())
+            },
+        )?;
+        assert_eq!(outcome, ControlFlow::Continue(()));
+        assert!(empty.is_empty());
         Ok(())
     }
 

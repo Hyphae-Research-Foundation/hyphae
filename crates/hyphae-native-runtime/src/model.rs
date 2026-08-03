@@ -487,6 +487,13 @@ pub(crate) enum SortedSetMemberState {
     Present(SortedSetScore),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SortedSetRankState {
+    MissingSet,
+    MissingMember,
+    Present { forward: usize, reverse: usize },
+}
+
 impl StructureState {
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
@@ -692,6 +699,23 @@ impl StructureState {
 
     pub(crate) fn zcard(&self, key: &[u8]) -> Option<usize> {
         self.sorted_sets.get(key).map(BTreeMap::len)
+    }
+
+    pub(crate) fn sorted_set_ranks(&self, key: &[u8], member: &[u8]) -> SortedSetRankState {
+        let Some(members) = self.sorted_sets.get(key) else {
+            return SortedSetRankState::MissingSet;
+        };
+        let Some(target_score) = members.get(member).copied() else {
+            return SortedSetRankState::MissingMember;
+        };
+        let forward = members
+            .iter()
+            .filter(|(candidate, score)| (**score, candidate.as_slice()) < (target_score, member))
+            .count();
+        SortedSetRankState::Present {
+            forward,
+            reverse: members.len() - forward - 1,
+        }
     }
 
     pub(crate) fn zrange(
