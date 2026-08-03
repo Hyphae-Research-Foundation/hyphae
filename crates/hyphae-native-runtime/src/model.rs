@@ -506,6 +506,31 @@ pub(crate) enum SortedSetDirection {
     Descending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HashPatternModelStop {
+    Exhausted,
+    OutputLimit,
+    VisitLimit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HashPatternModelPage {
+    pub(crate) entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) continuation: Option<Vec<u8>>,
+    pub(crate) stop: HashPatternModelStop,
+    pub(crate) visited: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HashPatternModelRequest<'request> {
+    pub(crate) leading_literal_prefix: &'request [u8],
+    pub(crate) exact_literal: bool,
+    pub(crate) start_after: Option<&'request [u8]>,
+    pub(crate) output_limit: usize,
+    pub(crate) visit_limit: usize,
+    pub(crate) logical_time_micros: i64,
+}
+
 impl StructureState {
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
@@ -723,6 +748,96 @@ impl StructureState {
         self.hash_is_visible(key, logical_time_micros)
             .then(|| self.hscan(key, start_after, limit))
             .flatten()
+    }
+
+    pub(crate) fn hscan_match_at<F, E>(
+        &self,
+        key: &[u8],
+        request: HashPatternModelRequest<'_>,
+        mut matcher: F,
+    ) -> Result<Option<HashPatternModelPage>, E>
+    where
+        F: FnMut(&[u8]) -> Result<bool, E>,
+    {
+        if !self.hash_is_visible(key, request.logical_time_micros) {
+            return Ok(None);
+        }
+        debug_assert!(request.output_limit > 0);
+        debug_assert!(request.visit_limit > 0);
+        let Some(fields) = self.hashes.get(key) else {
+            return Ok(None);
+        };
+        if request.exact_literal {
+            let Some(value) = fields.get(request.leading_literal_prefix) else {
+                return Ok(Some(HashPatternModelPage {
+                    entries: Vec::new(),
+                    continuation: None,
+                    stop: HashPatternModelStop::Exhausted,
+                    visited: 0,
+                }));
+            };
+            if request
+                .start_after
+                .is_some_and(|cursor| request.leading_literal_prefix <= cursor)
+            {
+                return Ok(Some(HashPatternModelPage {
+                    entries: Vec::new(),
+                    continuation: None,
+                    stop: HashPatternModelStop::Exhausted,
+                    visited: 0,
+                }));
+            }
+            let entries = if matcher(request.leading_literal_prefix)? {
+                vec![(request.leading_literal_prefix.to_vec(), value.clone())]
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(HashPatternModelPage {
+                entries,
+                continuation: None,
+                stop: HashPatternModelStop::Exhausted,
+                visited: 1,
+            }));
+        }
+        let mut entries = Vec::with_capacity(request.output_limit.min(request.visit_limit));
+        let mut visited = 0;
+        for (field, value) in fields
+            .iter()
+            .filter(|(field, _)| {
+                request
+                    .start_after
+                    .is_none_or(|cursor| field.as_slice() > cursor)
+            })
+            .filter(|(field, _)| field.starts_with(request.leading_literal_prefix))
+        {
+            visited += 1;
+            let continuation = Some(field.clone());
+            if matcher(field)? {
+                entries.push((field.clone(), value.clone()));
+                if entries.len() == request.output_limit {
+                    return Ok(Some(HashPatternModelPage {
+                        entries,
+                        continuation,
+                        stop: HashPatternModelStop::OutputLimit,
+                        visited,
+                    }));
+                }
+            }
+            if visited == request.visit_limit {
+                return Ok(Some(HashPatternModelPage {
+                    entries,
+                    continuation,
+                    stop: HashPatternModelStop::VisitLimit,
+                    visited,
+                }));
+            }
+        }
+        Ok(Some(HashPatternModelPage {
+            entries,
+            continuation: None,
+            stop: HashPatternModelStop::Exhausted,
+            visited,
+        }))
     }
 
     pub(crate) fn hscan_reverse(
@@ -1413,8 +1528,9 @@ mod tests {
     use hyphae_native_types::{EngineKind, ObjectId};
 
     use super::{
-        CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, ModelError, RelationState, SearchState,
-        StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
+        CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, HashPatternModelRequest,
+        HashPatternModelStop, ModelError, RelationState, SearchState, StructureState, TtlValue,
+        legacy_catalog_object, put_bytes, put_len,
     };
 
     #[test]
@@ -1623,6 +1739,58 @@ mod tests {
         );
         assert!(structures.expire_hash(b"map", 10, 9));
         assert_eq!(structures.hscan_reverse_at(b"map", None, 1, 10), None);
+    }
+
+    #[test]
+    fn hash_pattern_scan_pages_advance_across_nonmatches() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"map".to_vec()));
+        for field in [b"a".as_slice(), b"user:1", b"user:2", b"z"] {
+            assert_eq!(
+                structures.hset(b"map", field.to_vec(), field.to_vec()),
+                Some(true)
+            );
+        }
+
+        let first = structures
+            .hscan_match_at(
+                b"map",
+                HashPatternModelRequest {
+                    leading_literal_prefix: b"",
+                    exact_literal: false,
+                    start_after: None,
+                    output_limit: 1,
+                    visit_limit: 2,
+                    logical_time_micros: 9,
+                },
+                |field| Ok::<_, std::convert::Infallible>(field.starts_with(b"user:")),
+            )?
+            .ok_or("pattern scan lost the hash")?;
+        assert_eq!(first.entries, [(b"user:1".to_vec(), b"user:1".to_vec())]);
+        assert_eq!(first.continuation, Some(b"user:1".to_vec()));
+        assert_eq!(first.visited, 2);
+        assert_eq!(first.stop, HashPatternModelStop::OutputLimit);
+
+        let empty_progress = structures
+            .hscan_match_at(
+                b"map",
+                HashPatternModelRequest {
+                    leading_literal_prefix: b"",
+                    exact_literal: false,
+                    start_after: Some(b"user:2"),
+                    output_limit: 1,
+                    visit_limit: 1,
+                    logical_time_micros: 9,
+                },
+                |field| Ok::<_, std::convert::Infallible>(field.starts_with(b"user:")),
+            )?
+            .ok_or("pattern scan lost the hash")?;
+        assert!(empty_progress.entries.is_empty());
+        assert_eq!(empty_progress.continuation, Some(b"z".to_vec()));
+        assert_eq!(empty_progress.visited, 1);
+        assert_eq!(empty_progress.stop, HashPatternModelStop::VisitLimit);
+        Ok(())
     }
 
     #[test]

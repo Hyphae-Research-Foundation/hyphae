@@ -139,8 +139,12 @@ The physical route must not:
 - count nonmatching or tombstoned fields toward `output_limit`; or
 - continue into later leaves after reaching `output_limit` or `visit_limit`.
 
-Reached malformed metadata, identity, field envelope, expiry, blob, page
-order, or cycle fails the complete call rather than returning a partial page.
+Reached malformed metadata, field envelope, expiry, blob, page order, or cycle
+fails the complete call rather than returning a partial page. Inside the
+canonical per-hash field prefix, every remaining byte suffix is a valid binary
+field identity by construction; a cross-hash or truncated compound identity
+cannot enter the selected range. Oversized caller cursor or derived-prefix
+identities fail before traversal.
 When a cursor-free leading-wildcard traversal reaches physical exhaustion
 without a limit, the live count must equal hash metadata cardinality.
 
@@ -150,7 +154,7 @@ Every route validates in this order:
 
 1. pattern byte length and grammar;
 2. output, visit, and match-step limits;
-3. cursor compound identity;
+3. cursor and derived-prefix compound identities;
 4. structure kind, existence, and whole-hash visibility; and
 5. physical state reached by execution.
 
@@ -185,7 +189,8 @@ Implementation evidence must include:
   reopened equivalence;
 - whole-hash TTL visibility before, at, and after expiry;
 - height-two literal-prefix pruning and early stop;
-- fail-closed reached metadata, identity, value, and blob corruption;
+- fail-closed reached metadata, value, and blob corruption plus pre-traversal
+  rejection of oversized cursor/prefix identities;
 - a direct-Linux release comparison of a prunable prefix glob and a
   leading-wildcard glob against full `HSCAN` plus application filtering;
 - a matched parent/current persistent `HGET` control; and

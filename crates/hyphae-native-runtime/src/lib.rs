@@ -10,6 +10,7 @@
 mod ann_store;
 mod directory;
 mod group_commit;
+mod hash_pattern;
 mod local_protocol;
 mod model;
 mod snapshot_pins;
@@ -24,6 +25,10 @@ pub use group_commit::{
     MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, MIN_ACTIVE_EXPIRY_INTERVAL,
     NativeCommitCancellation, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
     NativeSchedulerClock, ScheduledCommitReceipt,
+};
+pub use hash_pattern::{
+    HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
+    MAX_HASH_PATTERN_BYTES, MAX_HASH_PATTERN_MATCH_STEPS,
 };
 pub use hyphae_native_ann::{
     HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
@@ -84,11 +89,13 @@ thread_local! {
 }
 
 use crate::{
+    hash_pattern::HashPatternMatchBudget,
     model::{
-        CatalogState, ListPop, ModelError, RelationState, SearchState, SecondaryIndexLayout,
-        SortedSetDirection, SortedSetMemberState, SortedSetRankState, SortedSetScore,
-        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
-        normalize_list_range, sorted_set_score_range_is_empty,
+        CatalogState, HashPatternModelPage, HashPatternModelRequest, HashPatternModelStop, ListPop,
+        ModelError, RelationState, SearchState, SecondaryIndexLayout, SortedSetDirection,
+        SortedSetMemberState, SortedSetRankState, SortedSetScore, StructureEntry, StructureState,
+        TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
+        sorted_set_score_range_is_empty,
     },
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
@@ -206,6 +213,13 @@ const SLOT_SEARCH: RootSlot = RootSlot {
 const ROOT_SLOTS: [RootSlot; 4] = [SLOT_CATALOG, SLOT_RELATIONAL, SLOT_STRUCTURE, SLOT_SEARCH];
 type PhysicalKeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
+#[derive(Clone, Copy)]
+struct HashPatternPhysicalRange<'key> {
+    prefix: &'key [u8],
+    lower: Bound<&'key [u8]>,
+    upper: Bound<&'key [u8]>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelationalFormat {
     InlineRowV1,
@@ -263,6 +277,9 @@ enum SearchFormat {
 /// Native runtime or recovery failure.
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
+    /// Native binary-glob compilation, request validation, or matching failed.
+    #[error(transparent)]
+    HashPattern(#[from] HashPatternError),
     /// Native ANN validation, construction, or query failed.
     #[error(transparent)]
     Ann(#[from] hyphae_native_ann::AnnError),
@@ -694,6 +711,21 @@ fn hash_field_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<HashFieldEntry> {
         .into_iter()
         .map(|(field, value)| HashFieldEntry::new(field, value))
         .collect()
+}
+
+fn hash_pattern_scan_page(page: HashPatternModelPage, match_steps: usize) -> HashPatternScanPage {
+    let stop = match page.stop {
+        HashPatternModelStop::Exhausted => HashPatternScanStop::Exhausted,
+        HashPatternModelStop::OutputLimit => HashPatternScanStop::OutputLimit,
+        HashPatternModelStop::VisitLimit => HashPatternScanStop::VisitLimit,
+    };
+    HashPatternScanPage::new(
+        hash_field_entries(page.entries),
+        page.continuation,
+        stop,
+        page.visited,
+        match_steps,
+    )
 }
 
 /// Result of one native sorted-set member upsert.
@@ -1403,6 +1435,45 @@ impl NativeSnapshot {
             .hscan_reverse_at(key, start_before, limit, self.metadata.logical_time_micros)
             .map(hash_field_entries)
             .ok_or(NativeRuntimeError::UnknownStructureHash)
+    }
+
+    /// Scans one bounded binary-glob page of hash fields in this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, exhausted matcher
+    /// budget, another structure kind, or a missing or expired hash.
+    pub fn hscan_match(
+        &self,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        validate_hash_pattern_identity(key, request)?;
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        let page = self
+            .state
+            .structures
+            .hscan_match_at(
+                key,
+                HashPatternModelRequest {
+                    leading_literal_prefix: request.compiled().leading_literal_prefix(),
+                    exact_literal: request.compiled().is_exact_literal(),
+                    start_after: request.start_after(),
+                    output_limit: request.output_limit(),
+                    visit_limit: request.visit_limit(),
+                    logical_time_micros: self.metadata.logical_time_micros,
+                },
+                |field| request.compiled().matches(field, &mut budget),
+            )?
+            .ok_or(NativeRuntimeError::UnknownStructureHash)?;
+        Ok(hash_pattern_scan_page(page, budget.used()))
     }
 
     /// Tests exact membership in an existing native set in this snapshot.
@@ -3809,6 +3880,263 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(entries)
+    }
+
+    /// Scans one bounded binary-glob page over the current physical hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, invalid request/key identities,
+    /// another structure kind, a missing hash, an exhausted matcher budget,
+    /// or malformed reached physical state.
+    pub fn hscan_match_latest_hash(
+        &self,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        self.hscan_match_latest_hash_at(key, request, i64::MIN)
+    }
+
+    /// Scans one bounded binary-glob page at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, invalid request/key identities,
+    /// another structure kind, a missing or expired hash, an exhausted
+    /// matcher budget, or malformed reached physical state.
+    pub fn hscan_match_latest_hash_at(
+        &self,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+        logical_time_micros: i64,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.hash_pattern_scan_in_tree_at(BTree::from_root(root), key, request, logical_time_micros)
+    }
+
+    #[cfg(test)]
+    fn hash_pattern_scan_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        self.hash_pattern_scan_in_tree_at(tree, key, request, i64::MIN)
+    }
+
+    fn hash_pattern_scan_in_tree_at(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+        logical_time_micros: i64,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        validate_hash_pattern_identity(key, request)?;
+        let metadata = self.visible_hash_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let declared_count = usize::try_from(metadata.field_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if request.compiled().is_exact_literal() {
+            return self.hash_pattern_exact_in_tree(tree, key, request, declared_count);
+        }
+        self.hash_pattern_range_in_tree(tree, key, request, declared_count)
+    }
+
+    fn hash_pattern_exact_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+        declared_count: usize,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        let field = request.compiled().leading_literal_prefix();
+        if request.start_after().is_some_and(|cursor| field <= cursor) {
+            return Ok(HashPatternScanPage::new(
+                Vec::new(),
+                None,
+                HashPatternScanStop::Exhausted,
+                0,
+                0,
+            ));
+        }
+        let physical_key = structure_hash_field_key(key, field)?;
+        let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &physical_key)?
+        else {
+            return Ok(HashPatternScanPage::new(
+                Vec::new(),
+                None,
+                HashPatternScanStop::Exhausted,
+                0,
+                0,
+            ));
+        };
+        let Some(value) = decode_hash_field_value(encoded.bytes(), &self.blobs)? else {
+            return Ok(HashPatternScanPage::new(
+                Vec::new(),
+                None,
+                HashPatternScanStop::Exhausted,
+                1,
+                0,
+            ));
+        };
+        if declared_count == 0 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        if !request.compiled().matches(field, &mut budget)? {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(HashPatternScanPage::new(
+            vec![HashFieldEntry::new(field.to_vec(), value)],
+            None,
+            HashPatternScanStop::Exhausted,
+            1,
+            budget.used(),
+        ))
+    }
+
+    fn hash_pattern_range_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+        declared_count: usize,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        let hash_prefix = structure_hash_field_key(key, &[])?;
+        let literal_prefix = request.compiled().leading_literal_prefix();
+        let range_lower = (!literal_prefix.is_empty())
+            .then(|| structure_hash_field_key(key, literal_prefix))
+            .transpose()?;
+        let range_upper = match range_lower.as_deref() {
+            Some(lower) => {
+                Some(byte_prefix_successor(lower).ok_or(NativeRuntimeError::InvalidStructureTree)?)
+            }
+            None => None,
+        };
+        let cursor_key = request
+            .start_after()
+            .map(|cursor| structure_hash_field_key(key, cursor))
+            .transpose()?;
+        if range_upper
+            .as_ref()
+            .is_some_and(|upper| cursor_key.as_ref().is_some_and(|cursor| cursor >= upper))
+        {
+            return Ok(HashPatternScanPage::new(
+                Vec::new(),
+                None,
+                HashPatternScanStop::Exhausted,
+                0,
+                0,
+            ));
+        }
+        let lower = hash_pattern_lower_bound(range_lower.as_deref(), cursor_key.as_deref());
+        let upper = range_upper
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        self.visit_hash_pattern_range(
+            tree,
+            key,
+            request,
+            declared_count,
+            HashPatternPhysicalRange {
+                prefix: &hash_prefix,
+                lower,
+                upper,
+            },
+        )
+    }
+
+    fn visit_hash_pattern_range(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+        declared_count: usize,
+        range: HashPatternPhysicalRange<'_>,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        let mut entries =
+            Vec::with_capacity(request.output_limit().min(request.visit_limit()).min(256));
+        let mut continuation = None;
+        let mut stop = HashPatternScanStop::Exhausted;
+        let mut visited = 0_usize;
+        let mut live_count = 0_usize;
+        let mut failure = None;
+        let outcome = tree.visit_prefix_range_cached(
+            &self.pages,
+            &self.buffer_pool,
+            range.prefix,
+            range.lower,
+            range.upper,
+            |physical_key, encoded| {
+                let field = match decode_hash_scan_field_identity(physical_key, key) {
+                    Ok(field) => field,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                visited += 1;
+                continuation = Some(field.to_vec());
+                let value = match decode_hash_field_value(encoded, &self.blobs) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if let Some(value) = value {
+                    live_count += 1;
+                    if live_count > declared_count {
+                        failure = Some(NativeRuntimeError::InvalidStructureTree);
+                        return ControlFlow::Break(());
+                    }
+                    match request.compiled().matches(field, &mut budget) {
+                        Ok(true) => entries.push(HashFieldEntry::new(field.to_vec(), value)),
+                        Ok(false) => {}
+                        Err(error) => {
+                            failure = Some(error.into());
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+                if entries.len() == request.output_limit() {
+                    stop = HashPatternScanStop::OutputLimit;
+                    ControlFlow::Break(())
+                } else if visited == request.visit_limit() {
+                    stop = HashPatternScanStop::VisitLimit;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if outcome == ControlFlow::Continue(()) {
+            continuation = None;
+        }
+        let verify_complete = outcome == ControlFlow::Continue(())
+            && request.start_after().is_none()
+            && request.compiled().leading_literal_prefix().is_empty();
+        if verify_complete && live_count != declared_count {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(HashPatternScanPage::new(
+            entries,
+            continuation,
+            stop,
+            visited,
+            budget.used(),
+        ))
     }
 
     fn visible_hash_metadata_in_tree_at(
@@ -7221,6 +7549,45 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
+    /// Scans one bounded binary-glob page through private hash writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, exhausted matcher
+    /// budget, another structure kind, or a missing or expired hash.
+    pub fn hscan_match(
+        &self,
+        key: &[u8],
+        request: &HashPatternScanRequest,
+    ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        validate_hash_pattern_identity(key, request)?;
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        let page = self
+            .state
+            .structures
+            .hscan_match_at(
+                key,
+                HashPatternModelRequest {
+                    leading_literal_prefix: request.compiled().leading_literal_prefix(),
+                    exact_literal: request.compiled().is_exact_literal(),
+                    start_after: request.start_after(),
+                    output_limit: request.output_limit(),
+                    visit_limit: request.visit_limit(),
+                    logical_time_micros: self.snapshot.logical_time_micros,
+                },
+                |field| request.compiled().matches(field, &mut budget),
+            )?
+            .ok_or(NativeRuntimeError::UnknownStructureHash)?;
+        Ok(hash_pattern_scan_page(page, budget.used()))
+    }
+
     /// Creates one explicitly typed empty native set.
     ///
     /// Sets are not encoded in legacy whole-state structure roots.
@@ -10455,6 +10822,17 @@ fn validate_hash_field_identity(key: &[u8], field: &[u8]) -> Result<(), NativeRu
     hash_field_identity(key, field).map(drop)
 }
 
+fn validate_hash_pattern_identity(
+    key: &[u8],
+    request: &HashPatternScanRequest,
+) -> Result<(), NativeRuntimeError> {
+    validate_hash_field_identity(key, request.compiled().leading_literal_prefix())?;
+    if let Some(cursor) = request.start_after() {
+        validate_hash_field_identity(key, cursor)?;
+    }
+    Ok(())
+}
+
 fn validate_hash_field_positions(key: &[u8], fields: &[Vec<u8>]) -> Result<(), NativeRuntimeError> {
     validate_hash_field_batch_size(fields.len())?;
     for field in fields {
@@ -10721,6 +11099,15 @@ fn decode_hash_scan_entry(
     expected_hash: &[u8],
     blobs: &BlobStore,
 ) -> Result<Option<HashFieldEntry>, NativeRuntimeError> {
+    let field = decode_hash_scan_field_identity(physical_key, expected_hash)?;
+    decode_hash_field_value(encoded, blobs)
+        .map(|value| value.map(|value| HashFieldEntry::new(field.to_vec(), value)))
+}
+
+fn decode_hash_scan_field_identity<'key>(
+    physical_key: &'key [u8],
+    expected_hash: &[u8],
+) -> Result<&'key [u8], NativeRuntimeError> {
     if physical_key.first().copied() != Some(STRUCTURE_HASH_FIELD_PREFIX) {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
@@ -10732,8 +11119,7 @@ fn decode_hash_scan_entry(
     if hash != expected_hash {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
-    decode_hash_field_value(encoded, blobs)
-        .map(|value| value.map(|value| HashFieldEntry::new(field.to_vec(), value)))
+    Ok(field)
 }
 
 fn encode_set_metadata(member_count: u64) -> Vec<u8> {
@@ -13093,6 +13479,18 @@ fn byte_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(successor)
 }
 
+fn hash_pattern_lower_bound<'key>(
+    literal_prefix: Option<&'key [u8]>,
+    cursor: Option<&'key [u8]>,
+) -> Bound<&'key [u8]> {
+    match (literal_prefix, cursor) {
+        (None, None) => Bound::Unbounded,
+        (None, Some(cursor)) => Bound::Excluded(cursor),
+        (Some(prefix), Some(cursor)) if cursor >= prefix => Bound::Excluded(cursor),
+        (Some(prefix), None | Some(_)) => Bound::Included(prefix),
+    }
+}
+
 fn bytes_within_bounds(value: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
     let above_lower = match lower {
         Bound::Included(lower) => value >= *lower,
@@ -15269,13 +15667,15 @@ mod tests {
         CATALOG_VALUE_MAGIC, CatalogName, CatalogObject, CatalogState, CheckpointBoundary,
         ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
         GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
-        HashFieldEntry, HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
-        NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
-        NativeSchedulerClock, NativeTransaction, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
-        PageStore, RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
-        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        HashFieldEntry, HashPatternError, HashPatternScanPage, HashPatternScanRequest,
+        HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError, Mutation,
+        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
+        NativeRuntimeError, NativeSchedulerClock, NativeTransaction, NativeWriteBatch,
+        ObjectHeader, Opcode, PAGE_FILE, PageStore, RelationDefinition, RelationalScanRow,
+        RootManifest, SLOT_CATALOG, SetCondition, SetOutcome, SnapshotPinBoundary,
+        SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue,
+        VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError, WalRetentionAnchor,
+        WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
         catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
         catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
         page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
@@ -19684,6 +20084,363 @@ mod tests {
         assert_eq!(
             reopened.hscan_reverse_latest_hash(b"large-reverse", None, 4)?,
             expected
+        );
+        Ok(())
+    }
+
+    fn assert_hash_pattern_cursor_routes(
+        database: &NativeDatabase,
+        complete: &HashPatternScanPage,
+        expected: &[HashFieldEntry],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let below =
+            HashPatternScanRequest::try_new(b"user:*", Some(b"a".to_vec()), 10, 10, 10_000)?;
+        let below_page = database.hscan_match_latest_hash(b"pattern-map", &below)?;
+        assert_eq!(&below_page, complete);
+        let inside =
+            HashPatternScanRequest::try_new(b"user:*", Some(b"user:\0".to_vec()), 10, 10, 10_000)?;
+        assert_eq!(
+            database
+                .hscan_match_latest_hash(b"pattern-map", &inside)?
+                .entries(),
+            &expected[2..]
+        );
+        let above =
+            HashPatternScanRequest::try_new(b"user:*", Some(b"z".to_vec()), 10, 10, 10_000)?;
+        let exhausted = database.hscan_match_latest_hash(b"pattern-map", &above)?;
+        assert!(exhausted.entries().is_empty());
+        assert_eq!(exhausted.stop(), HashPatternScanStop::Exhausted);
+        assert_eq!(exhausted.visited(), 0);
+
+        let exact = HashPatternScanRequest::try_new(b"user:1", None, 10, 10, 100)?;
+        let exact_page = database.hscan_match_latest_hash(b"pattern-map", &exact)?;
+        assert_eq!(exact_page.entries(), &expected[2..3]);
+        assert_eq!(exact_page.visited(), 1);
+        assert_eq!(exact_page.stop(), HashPatternScanStop::Exhausted);
+        let missing = HashPatternScanRequest::try_new(b"user:missing", None, 10, 10, 100)?;
+        assert_eq!(
+            database
+                .hscan_match_latest_hash(b"pattern-map", &missing)?
+                .visited(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hash_pattern_scan_matches_private_snapshot_physical_ttl_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"pattern-map".to_vec())?;
+        for field in [
+            b"".as_slice(),
+            b"a",
+            b"aaaaaaaa",
+            b"b",
+            b"user:",
+            b"user:\0",
+            b"user:1",
+            b"user:2",
+            b"z-match",
+        ] {
+            seed.hset(b"pattern-map".to_vec(), field.to_vec(), field.to_vec())?;
+        }
+        assert!(seed.expire_hash(b"pattern-map".to_vec(), 100)?);
+        let request = HashPatternScanRequest::try_new(b"user:*", None, 10, 10, 10_000)?;
+        let private = seed.hscan_match(b"pattern-map", &request)?;
+        let expected = [
+            HashFieldEntry::new(b"user:".to_vec(), b"user:".to_vec()),
+            HashFieldEntry::new(b"user:\0".to_vec(), b"user:\0".to_vec()),
+            HashFieldEntry::new(b"user:1".to_vec(), b"user:1".to_vec()),
+            HashFieldEntry::new(b"user:2".to_vec(), b"user:2".to_vec()),
+        ];
+        assert_eq!(private.entries(), expected);
+        assert_eq!(private.stop(), HashPatternScanStop::Exhausted);
+        assert_eq!(private.visited(), 4);
+        seed.commit()?;
+
+        let retained = database.snapshot(11)?;
+        assert_eq!(retained.hscan_match(b"pattern-map", &request)?, private);
+        assert_eq!(
+            database.hscan_match_latest_hash_at(b"pattern-map", &request, 99)?,
+            private
+        );
+        assert_hash_pattern_cursor_routes(&database, &private, &expected)?;
+        let leading_wildcard = HashPatternScanRequest::try_new(b"*match", None, 1, 1, 10_000)?;
+        let empty_progress = database.hscan_match_latest_hash(b"pattern-map", &leading_wildcard)?;
+        assert!(empty_progress.entries().is_empty());
+        assert_eq!(empty_progress.continuation(), Some(b"".as_slice()));
+        assert_eq!(empty_progress.stop(), HashPatternScanStop::VisitLimit);
+        let after_empty = HashPatternScanRequest::try_new(
+            b"*match",
+            empty_progress.continuation().map(<[u8]>::to_vec),
+            1,
+            1,
+            10_000,
+        )?;
+        assert_eq!(
+            database
+                .hscan_match_latest_hash(b"pattern-map", &after_empty)?
+                .continuation(),
+            Some(b"a".as_slice())
+        );
+        assert!(matches!(
+            database.hscan_match_latest_hash_at(b"pattern-map", &request, 100),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_match_latest_hash_at(b"pattern-map", &request, 101),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_match_latest_hash_at(b"pattern-map", &request, 99)?,
+            private
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hash_pattern_scan_advances_over_tombstones_and_validates_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"pattern".to_vec())?;
+        for field in [b"a".as_slice(), b"aaaaaaaa", b"b", b"c"] {
+            seed.hset(b"pattern".to_vec(), field.to_vec(), field.to_vec())?;
+        }
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"pattern".to_vec(), b"b".to_vec())?);
+        mutate.commit()?;
+
+        let tombstone =
+            HashPatternScanRequest::try_new(b"*", Some(b"aaaaaaaa".to_vec()), 2, 1, 100)?;
+        let physical = database.hscan_match_latest_hash(b"pattern", &tombstone)?;
+        assert!(physical.entries().is_empty());
+        assert_eq!(physical.continuation(), Some(b"b".as_slice()));
+        assert_eq!(physical.stop(), HashPatternScanStop::VisitLimit);
+        assert_eq!(physical.visited(), 1);
+        assert_eq!(physical.match_steps(), 0);
+
+        let snapshot = database.snapshot(13)?;
+        let materialized = snapshot.hscan_match(b"pattern", &tombstone)?;
+        assert_eq!(
+            materialized.entries(),
+            [HashFieldEntry::new(b"c".to_vec(), b"c".to_vec())]
+        );
+        let continued = HashPatternScanRequest::try_new(b"*", Some(b"b".to_vec()), 2, 2, 100)?;
+        assert_eq!(
+            database
+                .hscan_match_latest_hash(b"pattern", &continued)?
+                .entries(),
+            materialized.entries()
+        );
+
+        let low_budget = HashPatternScanRequest::try_new(b"*aaaaab", None, 1, 10, 1)?;
+        assert!(matches!(
+            database.hscan_match_latest_hash(b"pattern", &low_budget),
+            Err(NativeRuntimeError::HashPattern(
+                HashPatternError::MatchStepLimitExceeded { maximum: 1 }
+            ))
+        ));
+        let oversized = HashPatternScanRequest::try_new(b"*", Some(vec![0_u8; 65_536]), 1, 1, 100)?;
+        assert!(matches!(
+            database.hscan_match_latest_hash(b"pattern", &oversized),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        assert!(matches!(
+            snapshot.hscan_match(b"pattern", &oversized),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        let batch = database.begin(14, DurabilityClass::Memory)?;
+        assert!(matches!(
+            batch.hscan_match(b"pattern", &oversized),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        drop(batch);
+        let any = HashPatternScanRequest::try_new(b"*", None, 1, 1, 100)?;
+        assert!(matches!(
+            database.hscan_match_latest_hash(b"missing", &any),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_match_latest_hash(b"scalar", &any),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        Ok(())
+    }
+
+    fn grouped_pattern_field(group: &[u8], index: u32) -> Vec<u8> {
+        let mut field = Vec::with_capacity(group.len() + 4);
+        field.extend_from_slice(group);
+        field.extend_from_slice(&index.to_be_bytes());
+        field
+    }
+
+    fn assert_hash_pattern_pruning_boundaries(
+        database: &mut NativeDatabase,
+        tree: BTree,
+        request: &HashPatternScanRequest,
+        expected: &HashPatternScanPage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_lower_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::structure_hash_field_key(
+                    b"large-pattern",
+                    &grouped_pattern_field(b"group-a:", 0),
+                )?,
+                vec![0xff],
+            )?
+            .tree;
+        assert_eq!(
+            database.hash_pattern_scan_in_tree(invalid_lower_tree, b"large-pattern", request,)?,
+            expected.clone()
+        );
+
+        let invalid_later_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(2)?,
+                super::structure_hash_field_key(
+                    b"large-pattern",
+                    &grouped_pattern_field(b"group-b:", 100),
+                )?,
+                vec![0xff],
+            )?
+            .tree;
+        assert_eq!(
+            database.hash_pattern_scan_in_tree(invalid_later_tree, b"large-pattern", request,)?,
+            expected.clone()
+        );
+        let full = HashPatternScanRequest::try_new(b"group-b:*", None, 4_096, 4_096, 1_000_000)?;
+        assert!(matches!(
+            database.hash_pattern_scan_in_tree(invalid_later_tree, b"large-pattern", &full,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        Ok(())
+    }
+
+    fn assert_hash_pattern_corruption_boundaries(
+        database: &mut NativeDatabase,
+        tree: BTree,
+        request: &HashPatternScanRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let first_field = grouped_pattern_field(b"group-b:", 0);
+        let first_key = super::structure_hash_field_key(b"large-pattern", &first_field)?;
+        let invalid_reached_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(3)?,
+                first_key.clone(),
+                vec![0xff],
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_pattern_scan_in_tree(invalid_reached_tree, b"large-pattern", request,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let invalid_count_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(4)?,
+                super::structure_hash_meta_key(b"large-pattern"),
+                super::encode_hash_metadata(0),
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_pattern_scan_in_tree(invalid_count_tree, b"large-pattern", request,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let mut invalid_blob = tree
+            .get(&database.pages, &first_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let last = invalid_blob
+            .last_mut()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        *last ^= 1;
+        let invalid_blob_tree = tree
+            .upsert(&mut database.pages, Csn::new(5)?, first_key, invalid_blob)?
+            .tree;
+        assert!(
+            database
+                .hash_pattern_scan_in_tree(invalid_blob_tree, b"large-pattern", request,)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_hash_pattern_scan_prunes_stops_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let blob = vec![0x41; 9_000];
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_hash(b"large-pattern".to_vec())?;
+        for group in [b"group-a:".as_slice(), b"group-b:"] {
+            for index in 0..1_024_u32 {
+                let value = if group == b"group-b:" && index == 0 {
+                    blob.clone()
+                } else {
+                    vec![u8::try_from(index % 251)?; 64]
+                };
+                seed.hset(
+                    b"large-pattern".to_vec(),
+                    grouped_pattern_field(group, index),
+                    value,
+                )?;
+            }
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(
+            b"large-pattern".to_vec(),
+            grouped_pattern_field(b"group-b:", 1),
+        )?);
+        mutate.commit()?;
+        let request = HashPatternScanRequest::try_new(b"group-b:*", None, 4, 5, 10_000)?;
+        let page = database.hscan_match_latest_hash(b"large-pattern", &request)?;
+        assert_eq!(page.stop(), HashPatternScanStop::OutputLimit);
+        assert_eq!(page.visited(), 5);
+        assert_eq!(
+            page.entries()
+                .iter()
+                .map(|entry| entry.field().to_vec())
+                .collect::<Vec<_>>(),
+            [0_u32, 2, 3, 4]
+                .into_iter()
+                .map(|index| grouped_pattern_field(b"group-b:", index))
+                .collect::<Vec<_>>()
+        );
+
+        let root = database
+            .coordinator
+            .snapshot(103)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        assert_hash_pattern_pruning_boundaries(&mut database, tree, &request, &page)?;
+        assert_hash_pattern_corruption_boundaries(&mut database, tree, &request)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_match_latest_hash(b"large-pattern", &request)?,
+            page
         );
         Ok(())
     }
