@@ -172,6 +172,13 @@ leading literal prefix for B+tree pruning and falls back to a bounded hash
 prefix scan only for leading-wildcard patterns. Its complete contract is
 [Native hash pattern scan v1](native-hash-pattern-scan-v1.md).
 
+Independent absolute field expiry is frozen separately in
+[Native hash field TTL v1](native-hash-field-ttl-v1.md). That contract reserves
+one collision-free field-expiry namespace, field-granular WAL/conflict
+semantics, logical visibility across every hash read surface, and combined
+active cleanup. It is not an implemented capability until its executable
+evidence is recorded.
+
 An empty hash remains a typed hash after its last field is deleted.
 `DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
 all of its fields become absent at one CSN while retained snapshots preserve
@@ -376,9 +383,11 @@ and the remaining field bytes. The physical key prepends `0x03`. This encoding
 is unambiguous for empty or arbitrary binary keys and fields and keeps fields
 clustered by hash-key length/key/field order.
 
-Each field uses the same inline/blob `HYSTRV01` envelope but cannot carry an
-independent expiry; the family metadata carries the whole-hash expiry. A field
-delete stores the same canonical
+Each currently implemented field uses the same inline/blob `HYSTRV01` envelope
+without independent expiry; the family metadata carries the whole-hash
+expiry. The frozen field-TTL extension reuses the envelope's expiry flag but
+requires separate WAL, index, visibility, cleanup, and recovery evidence
+before it becomes available. A field delete stores the same canonical
 tombstone as a scalar delete. Recovery requires every field to have prior hash
 metadata and requires metadata cardinality to equal the exact number of live
 field envelopes. Orphan fields, malformed identities, expiry-bearing fields,

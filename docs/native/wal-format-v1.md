@@ -115,6 +115,13 @@ updates versioned hash metadata and the typed ordered expiry entry without
 copying fields into the WAL body. Expiry-driven physical cleanup reuses
 `DELETE HASH`.
 
+`EXPIRE HASH FIELD=32` is reserved by the frozen
+[Native hash field TTL v1](native-hash-field-ttl-v1.md) contract but is not a
+current accepted opcode until implementation and evidence land. It uses the
+canonical compound hash-key/field identity, no target, an empty value, and one
+explicit signed expiry. Replay preserves the admitted field value while
+deriving its collision-free field-expiry index update.
+
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances
 the global CSN and names the replacement structure root while retaining the
