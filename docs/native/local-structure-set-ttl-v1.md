@@ -91,7 +91,7 @@ is checked before buffer growth. Empty binary keys and values remain valid.
 
 ## Commit receipt
 
-A successful `SET` returns a `RECEIPT` frame with this fixed 20-byte payload:
+A successful `SET` returns a `RECEIPT` frame with this fixed 28-byte payload:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -99,8 +99,8 @@ A successful `SET` returns a `RECEIPT` frame with this fixed 20-byte payload:
 | 1 | 1 | receipt tag `1` (`SET_COMMITTED`) |
 | 2 | 1 | acknowledged durability |
 | 3 | 1 | reserved zero byte |
-| 4 | 8 | nonzero transaction ID, little-endian `u64` |
-| 12 | 8 | nonzero commit CSN, little-endian `u64` |
+| 4 | 16 | nonzero transaction ID, little-endian `u128` |
+| 20 | 8 | nonzero commit CSN, little-endian `u64` |
 
 The receipt's durability must equal the admitted request. The CSN is the same
 native commit sequence shared by every root affected by that transaction.
@@ -108,7 +108,9 @@ This first receipt omits catalog version, LSN, WAL digest, timing breakdown,
 and proof material; those remain available inside the native runtime and can
 be added only by a versioned payload.
 
-No success frame is sent before native commit publication. A transport failure
+The session rejects a `SET` before sampling time or opening a transaction when
+the negotiated frame maximum cannot hold the complete 28-byte receipt. No
+success frame is sent before native commit publication. A transport failure
 after publication but before the client receives the receipt is an ambiguous
 acknowledgement: the client must reconnect and read state. Request replay and
 idempotency tokens remain open session work.
@@ -175,6 +177,7 @@ The implementation gate requires:
 - exact-limit and one-past-limit key coverage;
 - strict and memory SET receipts with exact transaction ID, CSN, durability,
   stream ID, and request ID;
+- receipt-capacity rejection before clock sampling or physical mutation;
 - persistent, remaining, exactly expired, and missing TTL responses under a
   controlled server clock;
 - strict close, database reopen, and physical value/TTL equivalence;
