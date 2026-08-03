@@ -468,6 +468,19 @@ detectable.
   range and its deliberately expensive unindexed differential baseline
   separately and remains outside G7.
 
+## Native SQL composite secondary prefix ranges
+
+- `native-secondary-index-prefix-ranges-linux-2026-08-02.md` binds a strict
+  ordered-secondary equality prefix plus a range on the immediately following
+  index column to exact Linux source. It covers canonical bounds, remaining
+  suffixes and primary-key ties, residual-before-limit behavior, private/
+  retained/current/reopen equivalence, legacy fallback, false-plan rejection,
+  and fail-closed physical corruption.
+- `native-microsecond-smoke-secondary-prefix-range-linux.json` is its clean
+  schema-v16 ext4 release observation. The new indexed and unindexed routes
+  use a second isolated native database so the inherited schema-v15 corpus
+  and measurement order remain unchanged. It remains outside G7.
+
 ## Native ext4 Linux baseline
 
 - `native-ext4-linux-baseline-2026-08-02.md` binds the first native-Linux,

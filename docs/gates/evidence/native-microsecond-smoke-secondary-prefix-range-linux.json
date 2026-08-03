@@ -1,0 +1,215 @@
+{
+  "schema": "hyphae.native.microsecond-smoke.v16",
+  "status": "observation-not-gate",
+  "commit": "f2a22eb97f499f367de08031b1dfa61cbc90ce60",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "observations_per_operation": 1000000,
+  "operations_per_observation": 32,
+  "warmup_per_operation": 100000,
+  "search_observations": 100000,
+  "search_operations_per_observation": 1,
+  "secondary_observations": 100000,
+  "secondary_operations_per_observation": 1,
+  "secondary_range_observations": 10000,
+  "secondary_range_warmup": 1000,
+  "secondary_range_operations_per_observation": 1,
+  "secondary_range_lower_row_inclusive": 1024,
+  "secondary_range_upper_row_exclusive": 1034,
+  "secondary_range_lower_key_inclusive": "a",
+  "secondary_range_upper_key_exclusive": "b",
+  "secondary_prefix_target_tenant": "a",
+  "scan_limit": 10,
+  "range_lower_row_inclusive": 1024,
+  "range_upper_row_exclusive": 1034,
+  "prefix_rows_per_tenant": 1024,
+  "prefix_target_tenant": "a",
+  "prefix_lower_row_inclusive": 512,
+  "scan_observations": 100000,
+  "scan_operations_per_observation": 1,
+  "concurrency": 1,
+  "durability": "memory",
+  "warm_state": true,
+  "proofs": false,
+  "primary_relational_rows": 2049,
+  "secondary_index_rows": 2048,
+  "secondary_prefix_relational_rows": 2048,
+  "secondary_prefix_database": "isolated",
+  "secondary_prefix_relational_tree_height": 2,
+  "primary_key_prefix_rows": 2048,
+  "relational_rows": 6145,
+  "relational_tree_height": 2,
+  "structure_keys": 2048,
+  "structure_tree_height": 2,
+  "hash_fields": 2048,
+  "set_members": 2048,
+  "search_documents": 2048,
+  "search_tree_height": 2,
+  "search_query_document_frequency": 1,
+  "dataset_digest_blake3": "91759a0dd312afe6f7be5820e58d269fdf63af463b37ab5048e3e42a1c1186ad",
+  "transport_note": "codec plus embedded dispatch; no named-pipe transport",
+  "operations": {
+    "embedded_structure_get_64b": {
+      "p50_us": 0.059,
+      "p95_us": 0.111,
+      "p99_us": 0.147,
+      "p99_9_us": 0.362,
+      "throughput_ops_s": 15249602
+    },
+    "buffered_structure_btree_get_64b_multilevel": {
+      "p50_us": 1.042,
+      "p95_us": 1.835,
+      "p99_us": 2.527,
+      "p99_9_us": 2.967,
+      "throughput_ops_s": 884558
+    },
+    "embedded_hash_hget_64b_materialized_scaled_snapshot": {
+      "p50_us": 0.127,
+      "p95_us": 0.265,
+      "p99_us": 0.309,
+      "p99_9_us": 0.555,
+      "throughput_ops_s": 7074710
+    },
+    "buffered_hash_hget_64b_multilevel": {
+      "p50_us": 1.821,
+      "p95_us": 3.196,
+      "p99_us": 4.434,
+      "p99_9_us": 4.904,
+      "throughput_ops_s": 506335
+    },
+    "embedded_set_sismember_materialized_scaled_snapshot": {
+      "p50_us": 0.122,
+      "p95_us": 0.217,
+      "p99_us": 0.300,
+      "p99_9_us": 0.509,
+      "throughput_ops_s": 7538166
+    },
+    "buffered_set_sismember_multilevel": {
+      "p50_us": 2.568,
+      "p95_us": 3.811,
+      "p99_us": 6.201,
+      "p99_9_us": 6.673,
+      "throughput_ops_s": 363427
+    },
+    "buffered_inverted_btree_bm25_match_top1_rare_term": {
+      "p50_us": 29.215,
+      "p95_us": 29.722,
+      "p99_us": 38.608,
+      "p99_9_us": 50.308,
+      "throughput_ops_s": 33752
+    },
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot": {
+      "p50_us": 0.058,
+      "p95_us": 0.061,
+      "p99_us": 0.062,
+      "p99_9_us": 0.328,
+      "throughput_ops_s": 16596764
+    },
+    "buffered_relational_btree_pk_multilevel": {
+      "p50_us": 1.788,
+      "p95_us": 2.056,
+      "p99_us": 2.174,
+      "p99_9_us": 3.803,
+      "throughput_ops_s": 549954
+    },
+    "buffered_relational_btree_pk_scan_limit10_multilevel": {
+      "p50_us": 18.796,
+      "p95_us": 33.021,
+      "p99_us": 36.457,
+      "p99_9_us": 51.741,
+      "throughput_ops_s": 49340
+    },
+    "physical_prepared_sql_pk_scan_limit10_multilevel": {
+      "p50_us": 21.692,
+      "p95_us": 34.749,
+      "p99_us": 41.816,
+      "p99_9_us": 55.374,
+      "throughput_ops_s": 43387
+    },
+    "buffered_relational_btree_pk_range_limit10_multilevel": {
+      "p50_us": 18.624,
+      "p95_us": 30.109,
+      "p99_us": 36.791,
+      "p99_9_us": 49.216,
+      "throughput_ops_s": 50560
+    },
+    "physical_prepared_sql_pk_range_limit10_multilevel": {
+      "p50_us": 23.903,
+      "p95_us": 39.140,
+      "p99_us": 46.430,
+      "p99_9_us": 61.907,
+      "throughput_ops_s": 39176
+    },
+    "physical_prepared_sql_pk_range_residual_boolean_limit10_multilevel": {
+      "p50_us": 28.802,
+      "p95_us": 41.252,
+      "p99_us": 53.713,
+      "p99_9_us": 67.222,
+      "throughput_ops_s": 33007
+    },
+    "physical_prepared_sql_pk_prefix_limit10_multilevel": {
+      "p50_us": 21.463,
+      "p95_us": 33.791,
+      "p99_us": 41.410,
+      "p99_9_us": 54.351,
+      "throughput_ops_s": 43949
+    },
+    "physical_prepared_sql_pk_prefix_range_limit10_multilevel": {
+      "p50_us": 21.505,
+      "p95_us": 32.803,
+      "p99_us": 41.799,
+      "p99_9_us": 55.234,
+      "throughput_ops_s": 43912
+    },
+    "buffered_relational_btree_secondary_exact_unique_multilevel": {
+      "p50_us": 18.228,
+      "p95_us": 18.597,
+      "p99_us": 28.638,
+      "p99_9_us": 33.824,
+      "throughput_ops_s": 53914
+    },
+    "physical_prepared_sql_secondary_exact_unique_multilevel": {
+      "p50_us": 18.890,
+      "p95_us": 19.249,
+      "p99_us": 29.209,
+      "p99_9_us": 34.301,
+      "throughput_ops_s": 52103
+    },
+    "physical_prepared_sql_unindexed_text_range_pk_scan_limit10_multilevel": {
+      "p50_us": 11229.336,
+      "p95_us": 12979.623,
+      "p99_us": 15027.820,
+      "p99_9_us": 17858.501,
+      "throughput_ops_s": 87
+    },
+    "physical_prepared_sql_secondary_range_limit10_multilevel": {
+      "p50_us": 38.156,
+      "p95_us": 44.871,
+      "p99_us": 50.782,
+      "p99_9_us": 57.399,
+      "throughput_ops_s": 25722
+    },
+    "physical_prepared_sql_unindexed_secondary_prefix_range_pk_scan_limit10_multilevel": {
+      "p50_us": 12197.704,
+      "p95_us": 12976.263,
+      "p99_us": 14248.056,
+      "p99_9_us": 16622.108,
+      "throughput_ops_s": 81
+    },
+    "physical_prepared_sql_secondary_prefix_range_limit10_multilevel": {
+      "p50_us": 46.535,
+      "p95_us": 92.188,
+      "p99_us": 98.370,
+      "p99_9_us": 116.189,
+      "throughput_ops_s": 19114
+    },
+    "local_frame_decode_plus_structure_dispatch_64b": {
+      "p50_us": 0.099,
+      "p95_us": 0.106,
+      "p99_us": 0.165,
+      "p99_9_us": 0.383,
+      "throughput_ops_s": 9657773
+    }
+  }
+}
