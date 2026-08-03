@@ -1,0 +1,220 @@
+{
+  "schema": "hyphae.native.search-tombstone-compaction.evidence.v1",
+  "status": "direct-linux-green-hosted-pending",
+  "date": "2026-08-03",
+  "canonical_host": "mario@10.77.10.10",
+  "canonical_repository": "/home/mario/celiumsai/hyphae",
+  "branch": "codex/native-search-tombstone-compaction",
+  "implementation_commit": "fea5925dc37bb1b8c9dbecaca4bc407e5199d3b2",
+  "stack_base_commit": "95f70fe9cdbc5d8423a776e13cbbc3e3d3abee9b",
+  "compiler_red_gate": {
+    "sha256": "a3b6021e98dcf1a09138515da005743637a192c4b58de3b5618177084302a0cf",
+    "missing_symbols": [
+      "SearchCompactionReceipt",
+      "NativeDatabase::compact_search"
+    ]
+  },
+  "environment": {
+    "hostname": "ip-10-77-10-10",
+    "kernel": "Linux 6.17.0-1019-aws x86_64",
+    "cpu": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "logical_cpus": 8,
+    "benchmark_cpu_affinity": 0,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "profile": "release"
+  },
+  "benchmark": {
+    "harness": "crates/hyphae-native-runtime/examples/search_tombstone_compaction_scaling.rs",
+    "process_runs": 3,
+    "observations_per_configuration_per_run": 5,
+    "raw_run_sha256": [
+      "cc1e893b91b323830f516d23707f8d72f7c0c2b2aeb1184da1debcbfd3cc7e09",
+      "8579eed9a48aff4d63231e6a0cd2d0a281a1238e40d4bf1b2711630abcf798ac",
+      "5d7ad4f7bb972c31c5ede98c0f9c9d093ad09cf077499c429d11ff06b877cc42"
+    ],
+    "configurations": [
+      {
+        "population": 256,
+        "tombstone_percentage": 25,
+        "deleted_documents": 64,
+        "receipt": {
+          "scanned_entries": 1027,
+          "retained_entries": 771,
+          "dropped_tombstones": 256,
+          "reachable_pages_before": 143,
+          "reachable_pages_after": 5,
+          "pages_appended": 5
+        },
+        "validated_v1_plan_latency_nanos": {
+          "run_p50": [9925133, 10125123, 9848370],
+          "median_p50": 9925133,
+          "median_p95": 9995459,
+          "median_maximum": 10025561
+        },
+        "memory_compaction_latency_nanos": {
+          "run_p50": [15800872, 15818875, 15686236],
+          "median_p50": 15800872,
+          "median_p95": 15823299,
+          "median_maximum": 15990563
+        },
+        "strict_compaction_latency_nanos": {
+          "run_p50": [21605444, 21992794, 21745615],
+          "median_p50": 21745615,
+          "median_p95": 21755524,
+          "median_maximum": 22100815
+        },
+        "physical_p50": {
+          "validated_v1_plan_page_reads": 578,
+          "compaction_page_reads": 880,
+          "memory_page_appends": 5,
+          "strict_page_appends": 5,
+          "memory_wal_bytes": 65536,
+          "strict_wal_bytes": 65536,
+          "full_state_loads": 0,
+          "full_catalog_loads": 1
+        }
+      },
+      {
+        "population": 256,
+        "tombstone_percentage": 75,
+        "deleted_documents": 192,
+        "receipt": {
+          "scanned_entries": 1027,
+          "retained_entries": 259,
+          "dropped_tombstones": 768,
+          "reachable_pages_before": 143,
+          "reachable_pages_after": 3,
+          "pages_appended": 3
+        },
+        "validated_v1_plan_latency_nanos": {
+          "run_p50": [9858059, 10021109, 9951582],
+          "median_p50": 9951582,
+          "median_p95": 10036343,
+          "median_maximum": 10050914
+        },
+        "memory_compaction_latency_nanos": {
+          "run_p50": [14734019, 14922200, 14821368],
+          "median_p50": 14821368,
+          "median_p95": 14943150,
+          "median_maximum": 15003993
+        },
+        "strict_compaction_latency_nanos": {
+          "run_p50": [20683279, 20894385, 20597988],
+          "median_p50": 20683279,
+          "median_p95": 20718900,
+          "median_maximum": 21063902
+        },
+        "physical_p50": {
+          "validated_v1_plan_page_reads": 578,
+          "compaction_page_reads": 876,
+          "memory_page_appends": 3,
+          "strict_page_appends": 3,
+          "memory_wal_bytes": 65536,
+          "strict_wal_bytes": 65536,
+          "full_state_loads": 0,
+          "full_catalog_loads": 1
+        }
+      },
+      {
+        "population": 4096,
+        "tombstone_percentage": 25,
+        "deleted_documents": 1024,
+        "receipt": {
+          "scanned_entries": 16387,
+          "retained_entries": 12291,
+          "dropped_tombstones": 4096,
+          "reachable_pages_before": 209,
+          "reachable_pages_after": 52,
+          "pages_appended": 52
+        },
+        "validated_v1_plan_latency_nanos": {
+          "run_p50": [29919908, 29296034, 29428711],
+          "median_p50": 29428711,
+          "median_p95": 29538837,
+          "median_maximum": 30155718
+        },
+        "memory_compaction_latency_nanos": {
+          "run_p50": [56757796, 56680881, 56571738],
+          "median_p50": 56680881,
+          "median_p95": 56923441,
+          "median_maximum": 56965726
+        },
+        "strict_compaction_latency_nanos": {
+          "run_p50": [64282941, 65152001, 63969920],
+          "median_p50": 64282941,
+          "median_p95": 65046611,
+          "median_maximum": 65357499
+        },
+        "physical_p50": {
+          "validated_v1_plan_page_reads": 842,
+          "compaction_page_reads": 1370,
+          "memory_page_appends": 52,
+          "strict_page_appends": 52,
+          "memory_wal_bytes": 65536,
+          "strict_wal_bytes": 65536,
+          "full_state_loads": 0,
+          "full_catalog_loads": 1
+        }
+      },
+      {
+        "population": 4096,
+        "tombstone_percentage": 75,
+        "deleted_documents": 3072,
+        "receipt": {
+          "scanned_entries": 16387,
+          "retained_entries": 4099,
+          "dropped_tombstones": 12288,
+          "reachable_pages_before": 209,
+          "reachable_pages_after": 18,
+          "pages_appended": 18
+        },
+        "validated_v1_plan_latency_nanos": {
+          "run_p50": [29915256, 29680759, 29997437],
+          "median_p50": 29915256,
+          "median_p95": 30009553,
+          "median_maximum": 30196403
+        },
+        "memory_compaction_latency_nanos": {
+          "run_p50": [39241718, 39386178, 39196232],
+          "median_p50": 39241718,
+          "median_p95": 39482465,
+          "median_maximum": 41153501
+        },
+        "strict_compaction_latency_nanos": {
+          "run_p50": [46609414, 45729333, 46618444],
+          "median_p50": 46609414,
+          "median_p95": 46671599,
+          "median_maximum": 47536019
+        },
+        "physical_p50": {
+          "validated_v1_plan_page_reads": 842,
+          "compaction_page_reads": 1302,
+          "memory_page_appends": 18,
+          "strict_page_appends": 18,
+          "memory_wal_bytes": 65536,
+          "strict_wal_bytes": 65536,
+          "full_state_loads": 0,
+          "full_catalog_loads": 1
+        }
+      }
+    ],
+    "discarded_probe": {
+      "sha256": "fc6d5501f0942f6ad9de567e5968e39e4cb241805ce7aaf0e013d75dc819a9bc",
+      "reason": "fs::copy left baseline pages dirty, so strict sync paid fixture-copy writeback; the corrected harness syncs every copied file before timing"
+    }
+  },
+  "whole_process_allocation_observation": {
+    "tool": "heaptrack 1.5.0",
+    "observations_per_configuration": 1,
+    "trace_sha256": "bfc443f7ff699091dea33a1723189c7c539ea76b98d07d4c8e0b6bef58bd9351",
+    "stdout_sha256": "6f0ed571264a3d4678e77d693b2409a4168f0c95462cd0bf262825095654f1cf",
+    "allocation_calls": 33317237,
+    "temporary_allocations": 1059214,
+    "temporary_allocation_percentage": 3.18,
+    "peak_heap_bytes_reported": "7.48M",
+    "peak_rss_including_heaptrack": "16.33M",
+    "bytes_leaked_at_exit": 544,
+    "scope": "whole harness process including deterministic corpus setup, file copies, opens, validation, compaction, and cleanup; not an operation-only allocation bound"
+  }
+}

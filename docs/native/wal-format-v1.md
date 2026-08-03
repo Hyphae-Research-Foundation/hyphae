@@ -138,6 +138,14 @@ target, and no expiry. Replacement carries UTF-8 source text; deletion carries
 an empty value. They are the only replay authority for their derived
 document, collection-statistic, term, and posting updates.
 
+`COMPACT SEARCH=39` is the physical lexical-rebuild opcode specified by
+[Native lexical tombstone compaction
+v1](search-tombstone-compaction-v1.md). It requires the search engine, a zero
+target, empty key and value, and no expiry. The complete prior search root is
+its deterministic rebuild authority; recovery never interprets the empty
+maintenance body as a logical delete set. The opcode cannot be combined with
+user mutations.
+
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances
 the global CSN and names the replacement structure root while retaining the

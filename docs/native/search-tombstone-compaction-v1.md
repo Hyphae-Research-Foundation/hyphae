@@ -1,6 +1,8 @@
 # Native lexical tombstone compaction v1
 
-Status: normative implementation target; compiler-reaching red gate pending.
+Status: implemented at `fea5925dc37bb1b8c9dbecaca4bc407e5199d3b2`;
+direct-Linux implementation, recovery, and scaling gates pass. Hosted
+cross-platform gates remain release evidence rather than local evidence.
 
 This contract adds explicit current-root reachability compaction to Hyphae's
 native lexical/search B+tree. It removes no logical document, rewrites no

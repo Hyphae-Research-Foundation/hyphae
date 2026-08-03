@@ -297,19 +297,21 @@ implicit conversion. New directories use the B+tree format.
 
 ## Current-root rebuild
 
-Structure reachability compaction validates and scans one complete current
-B+tree before writing. It removes only entries already proven to be canonical
-physical tombstones by the owning engine, then feeds the retained
-strictly-ordered key/value pairs into the empty-tree ordered batch builder.
+Structure and lexical-search reachability compaction each validate and scan
+one complete current B+tree before writing. They remove only entries already
+proven to be canonical physical tombstones by the owning engine, then feed the
+retained strictly-ordered key/value pairs into the empty-tree ordered batch
+builder. Lexical compaction additionally validates the catalog-bound ANN
+generation sharing the root and preserves every ANN key/value byte.
 
 The resulting tree is balanced, contains the retained values byte-for-byte,
 and uses pages created at the maintenance commit CSN. The old tree remains
 immutable and readable. An empty tombstone set is a no-op rather than a
 same-content rewrite.
 
-This rebuild reduces the pages and tombstones reachable from the current root.
-It does not reclaim superseded pages from the append-only page file; that
-requires retention-aware page-file generation garbage collection.
+These rebuilds reduce the pages and tombstones reachable from the owning
+current root. They do not reclaim superseded pages from the append-only page
+file; that requires retention-aware page-file generation garbage collection.
 
 ## Verification
 

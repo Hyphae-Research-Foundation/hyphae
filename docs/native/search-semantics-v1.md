@@ -79,6 +79,15 @@ and tombstone encodings are fixed by
 format does not yet store positions, offsets, field norms, generations, or
 immutable merge segments.
 
+`compact_search` validates the complete current lexical and ANN projection,
+then rebuilds `HYSEABT2` without exact `HYDOCT01`, `HYTERMT1`, or `HYPOSTT1`
+tombstones. Every retained lexical and ANN key/value is copied byte-for-byte;
+historical roots remain immutable, and a root without tombstones advances no
+page, WAL identity, transaction ID, or CSN. Page vacuum and blob collection
+remain separate retention operations. The exact maintenance contract is
+[Native lexical tombstone compaction
+v1](search-tombstone-compaction-v1.md).
+
 `CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
 root and global transaction. Vector writes are grouped per index at commit so
 one duplicate-free batch produces one canonical HNSW generation rather than
@@ -146,6 +155,6 @@ compatibility, large-text blob reuse, key bounds, lexical/ANN metadata
 corruption, canonical graph restore, and all-engine crash recovery. Required
 remaining evidence includes analyzer/token/position goldens, BM25F
 score/explanation fixtures, broader query-operator properties, search
-tombstone compaction, buffered ANN traversal, merge interruption,
+tombstone compaction policy, buffered ANN traversal, merge interruption,
 facet/aggregation correctness, bounded cancellation, full-scale quality
 metrics, and cross-engine stable-ID joins.

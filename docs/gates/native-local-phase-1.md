@@ -735,6 +735,23 @@ the bounded-delta gap but closes no complete gate; hosted stack checks, search
 tombstone compaction, broad query semantics, cross-engine SQL, and complete
 phase evidence remain open.
 
+The [native lexical tombstone compaction
+evidence](evidence/native-search-tombstone-compaction-linux-2026-08-03.md)
+adds explicit current-root `HYSEABT2` reachability compaction under search WAL
+opcode `39`. Complete lexical and catalog-bound ANN validation precedes writer
+admission; exact document, term, and posting tombstones are omitted while
+every retained lexical and ANN byte, historical root, and non-search engine
+root remains unchanged. V1/no-tombstone roots advance no page, WAL identity,
+transaction ID, or CSN. Six focused equivalence tests, two public integration
+tests, all seven commit interruptions, corruption-before-append gates, and the
+compaction/vacuum/retention/blob sequence pass directly on Linux. Across three
+CPU-0 runs, validated-plan p50 was `9.925-29.915 ms`; applied memory/strict
+compaction p50 was `14.821-56.681/20.683-64.283 ms` across 256 and 4,096
+documents at 25% and 75% tombstones. Applied work wrote one 65,536-byte WAL
+block and appended 3-52 replacement pages. This closes explicit lexical
+tombstone compaction, not automatic policy, background merge, broad search,
+cross-engine SQL, or any complete phase gate.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
