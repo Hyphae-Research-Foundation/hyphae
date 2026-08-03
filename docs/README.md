@@ -147,6 +147,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native primary-key left-prefix scan evidence — 2026-08-02](gates/evidence/native-primary-key-prefix-scans-2026-08-02.md)
 - [Native primary-key prefix-range evidence — 2026-08-02](gates/evidence/native-primary-key-prefix-ranges-2026-08-02.md)
 - [Native secondary-index range evidence — 2026-08-02](gates/evidence/native-secondary-index-ranges-2026-08-02.md)
+- [Native composite secondary-index prefix-range Linux evidence — 2026-08-02](gates/evidence/native-secondary-index-prefix-ranges-linux-2026-08-02.md)
 - [Native ext4 Linux baseline evidence — 2026-08-02](gates/evidence/native-ext4-linux-baseline-2026-08-02.md)
 - [Native SQL residual-filter evidence — 2026-08-01](gates/evidence/native-sql-residual-filters-2026-08-01.md)
 - [Native SQL scalar-literal evidence — 2026-08-01](gates/evidence/native-sql-scalar-literals-2026-08-01.md)

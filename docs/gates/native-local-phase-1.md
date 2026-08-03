@@ -432,6 +432,19 @@ p50. This is an operator observation, not G2 or G7; composite
 equality-prefix secondary ranges, descending and streaming execution, and
 the complete correctness and performance matrices remain open.
 
+The [native composite secondary prefix-range
+evidence](evidence/native-secondary-index-prefix-ranges-linux-2026-08-02.md)
+binds a nonempty strict `HYRIDX02` equality prefix plus lower/upper bounds on
+the immediately following index column. It proves canonical bounds across
+remaining index suffixes and primary-key ties, residual-before-limit
+behavior, private/retained/current/reopened equivalence, legacy fallback,
+false-plan rejection, and fail-closed malformed identities and forged
+projections. Its schema-v16 Linux observation uses a second isolated native
+database so the inherited schema-v15 corpus and measurement order remain
+unchanged. This is an operator observation, not G2 or G7; overlapping-index
+cost selection, descending and streaming execution, and the complete
+correctness and performance matrices remain open.
+
 The [native ext4 Linux baseline
 evidence](evidence/native-ext4-linux-baseline-2026-08-02.md) executes the
 same schema-v15 smoke on native Linux for the first time, with the
@@ -558,7 +571,7 @@ unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
 along with automated pin lifecycle policy and quotas,
-composite secondary equality-prefix ranges and streaming execution,
+cost-based overlapping secondary-index selection and streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid
