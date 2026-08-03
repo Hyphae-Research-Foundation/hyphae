@@ -77,6 +77,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native search-engine semantics v1](native/search-semantics-v1.md)
 - [Native ANN semantics v1](native/ann-semantics-v1.md)
 - [Native local protocol v1](native/local-protocol-v1.md)
+- [Native local UDS transport v1](native/local-uds-transport-v1.md)
 - [Native clean-room and dependency inventory](native/dependency-inventory.md)
 - [Structured query semantics v1](query/reference-semantics-v1.md)
 - [Exact retrieval semantics v1](retrieval/reference-semantics-v1.md)
