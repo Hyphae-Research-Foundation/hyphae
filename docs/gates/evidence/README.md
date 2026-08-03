@@ -347,6 +347,18 @@ commit before its tag can be published.
   physical `SISMEMBER`, memory/strict expiry commit, 1- and 256-member cleanup,
   and a matched parent/current persistent-read control. It remains outside
   complete G3 and G7.
+- [Native set member commands evidence —
+  2026-08-03](native-set-commands-linux-2026-08-03.md) binds bounded batch
+  add/remove, positional membership, ascending cursor scans, canonical
+  mutation order, failure atomicity, whole-set TTL, member/lifecycle
+  conflicts, randomized model equivalence, all seven singleton crash
+  boundaries, multilevel pruning, and reached-corruption checks to direct
+  Linux.
+- `native-set-commands-linux.json` records private/snapshot/physical
+  membership batches, 32 singular physical membership calls, head/middle/tail
+  scans, private batch preparation, memory/strict commits, and a matched
+  parent/current persistent-read control. It remains outside complete G3 and
+  G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

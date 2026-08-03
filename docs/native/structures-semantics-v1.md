@@ -2,11 +2,12 @@
 
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
-hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
-buffered reads, large immutable blobs, dual-index sorted sets, bounded
-sorted-set score ranges, bidirectional sorted-set member ranks, and reverse
-sorted-set rank/score ranges are implemented in the convergence slice; the
-ordered durable scalar-expiry index and bounded cleanup are
+hashes, bounded native set member batches and scans, chunked-deque lists,
+multilevel B+tree persistence, direct buffered reads, large immutable blobs,
+dual-index sorted sets, bounded sorted-set score ranges, bidirectional
+sorted-set member ranks, and reverse sorted-set rank/score ranges are
+implemented in the convergence slice; the ordered durable scalar-expiry index
+and bounded cleanup are
 implemented; an engine-owned background timer, version-bearing responses, and
 the remaining structure families remain pending.
 
@@ -71,9 +72,13 @@ CREATE_SET(key)
 EXPIRE_SET(key, expires_at)
 TTL_SET(key)
 SADD(key, member)
+SADD_MANY(key, members)
 SISMEMBER(key, member)
+SMISMEMBER(key, members)
 SREM(key, member)
+SREM_MANY(key, members)
 SCARD(key)
+SSCAN(key, start_after, limit)
 CREATE_LIST(key)
 LPUSH(key, value)
 RPUSH(key, value)
@@ -235,6 +240,17 @@ active cleanup, corruption boundaries, and evidence requirements. The
 [direct-Linux evidence](../gates/evidence/native-set-ttl-linux-2026-08-03.md)
 binds the implementation, group durability, all seven cleanup crash
 boundaries, compaction, page vacuum, and separated latency to exact source.
+
+Bounded multi-member additions, removals, positional membership reads, and
+ascending exact-byte scans are specified in
+[Native set member commands v1](native-set-commands-v1.md). Mutation batches
+reject duplicates and use canonical member order, reads retain duplicate
+caller positions, and scans map exclusive cursors directly into the native
+member B+tree namespace. The
+[direct-Linux evidence](../gates/evidence/native-set-commands-linux-2026-08-03.md)
+binds failure atomicity, TTL preservation, per-member conflicts, all seven
+singleton crash boundaries, a randomized ordered model, multilevel pruning,
+reached-corruption rejection, and separated latency to exact source.
 
 `CREATE_LIST` establishes a binary chunked deque before element mutation.
 `LPUSH` and `RPUSH` insert one exact binary value and return the new length.

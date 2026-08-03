@@ -1,0 +1,228 @@
+{
+  "schema": "hyphae.native.set-commands-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-set-commands",
+  "stacked_parent_commit": "2214e576beeae2ca63f6462347e4ce48f7688f5a",
+  "contract_commit": "5359f37357fb9b0aba443aee5cbef02ddf533e63",
+  "runtime_commit": "babfae4a425bb45943d12466a228fb43536c3bd2",
+  "test_hardening_commit": "0c7620a0c555d9917576524d0188840cfd7d9c1b",
+  "benchmark_commit": "52999503c0c49b6143fcf8e4f06849234ca903fd",
+  "benchmark_tree": "72eb6adb660d3a7ed409237b91cbb9a5473396c1",
+  "benchmark_harness_sha256": "1afeadf71a905fd6b501a740749e610d674c3cad1764d66d357719131b400041",
+  "control_harness_sha256": "edf542fdf0ad1727bd379f0f19214d644d714ca5883b3479f09524732c7729da",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "set_commands_smoke": {
+    "schema": "hyphae.native.set-commands-smoke.v1",
+    "raw_sha256": "8f5a2973c60480c42251d9b291811fcc9582a89b43123598998a3b103c0dbb90",
+    "set_members": 4096,
+    "batch_members": 32,
+    "read_observations": 100000,
+    "read_warmup": 10000,
+    "scan_observations": 20000,
+    "scan_warmup": 2000,
+    "prepare_observations": 256,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "operations": {
+      "snapshot_smismember_32": {
+        "members_per_call": 32,
+        "p50_nanos": 2378,
+        "p95_nanos": 2405,
+        "p99_nanos": 2487,
+        "p999_nanos": 12215,
+        "maximum_nanos": 101701,
+        "p50_nanos_per_member": 74.312,
+        "throughput_per_second": 406835.704
+      },
+      "private_smismember_32": {
+        "members_per_call": 32,
+        "p50_nanos": 2419,
+        "p95_nanos": 2486,
+        "p99_nanos": 2636,
+        "p999_nanos": 12664,
+        "maximum_nanos": 27585,
+        "p50_nanos_per_member": 75.594,
+        "throughput_per_second": 397315.236
+      },
+      "physical_smismember_32": {
+        "members_per_call": 32,
+        "p50_nanos": 53440,
+        "p95_nanos": 64001,
+        "p99_nanos": 96102,
+        "p999_nanos": 140926,
+        "maximum_nanos": 174371,
+        "p50_nanos_per_member": 1670.0,
+        "throughput_per_second": 18043.288
+      },
+      "physical_32_single_sismember": {
+        "members_per_call": 32,
+        "p50_nanos": 97709,
+        "p95_nanos": 110747,
+        "p99_nanos": 148744,
+        "p999_nanos": 207005,
+        "maximum_nanos": 323427,
+        "p50_nanos_per_member": 3053.406,
+        "throughput_per_second": 9945.81
+      },
+      "physical_sscan_head_16": {
+        "members_per_call": 16,
+        "p50_nanos": 15066,
+        "p95_nanos": 20840,
+        "p99_nanos": 29553,
+        "p999_nanos": 44781,
+        "maximum_nanos": 114148,
+        "p50_nanos_per_member": 941.625,
+        "throughput_per_second": 63329.547
+      },
+      "physical_sscan_middle_16": {
+        "members_per_call": 16,
+        "p50_nanos": 16960,
+        "p95_nanos": 18811,
+        "p99_nanos": 30705,
+        "p999_nanos": 55114,
+        "maximum_nanos": 209618,
+        "p50_nanos_per_member": 1060.0,
+        "throughput_per_second": 56923.8
+      },
+      "physical_sscan_tail_16": {
+        "members_per_call": 16,
+        "p50_nanos": 17602,
+        "p95_nanos": 18827,
+        "p99_nanos": 30566,
+        "p999_nanos": 47902,
+        "maximum_nanos": 97528,
+        "p50_nanos_per_member": 1100.125,
+        "throughput_per_second": 55103.106
+      },
+      "private_sadd_many_32_prepare": {
+        "members_per_call": 32,
+        "p50_nanos": 7544,
+        "p95_nanos": 8508,
+        "p99_nanos": 24237,
+        "p999_nanos": 27420,
+        "maximum_nanos": 37813,
+        "p50_nanos_per_member": 235.75,
+        "throughput_per_second": 125566.89
+      },
+      "private_srem_many_32_prepare": {
+        "members_per_call": 32,
+        "p50_nanos": 9413,
+        "p95_nanos": 10344,
+        "p99_nanos": 23762,
+        "p999_nanos": 29293,
+        "maximum_nanos": 37297,
+        "p50_nanos_per_member": 294.156,
+        "throughput_per_second": 101908.313
+      },
+      "memory_sadd_many_32_commit": {
+        "members_per_call": 32,
+        "p50_nanos": 11177175,
+        "p95_nanos": 12731206,
+        "p99_nanos": 12899096,
+        "p999_nanos": 12899096,
+        "maximum_nanos": 13762998,
+        "p50_nanos_per_member": 349286.719,
+        "throughput_per_second": 86.739
+      },
+      "strict_sadd_many_32_commit": {
+        "members_per_call": 32,
+        "p50_nanos": 22209640,
+        "p95_nanos": 23836120,
+        "p99_nanos": 23836120,
+        "p999_nanos": 23836120,
+        "maximum_nanos": 5485342870,
+        "p50_nanos_per_member": 694051.25,
+        "throughput_per_second": 2.749
+      },
+      "memory_srem_many_32_commit": {
+        "members_per_call": 32,
+        "p50_nanos": 11675072,
+        "p95_nanos": 12126744,
+        "p99_nanos": 12158995,
+        "p999_nanos": 12158995,
+        "maximum_nanos": 12165236,
+        "p50_nanos_per_member": 364846.0,
+        "throughput_per_second": 85.368
+      }
+    },
+    "physical_batch_vs_singles_change_percent": {
+      "p50": -45.307,
+      "p95": -42.210,
+      "p99": -35.391,
+      "p999": -31.921,
+      "throughput": 81.416
+    },
+    "scan_p50_change_from_head_percent": {
+      "middle": 12.571,
+      "tail": 16.833
+    }
+  },
+  "matched_persistent_sismember_control": {
+    "set_members": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "parent_raw_sha256": "bcca8096a872abe3c680dbe7a75d84787f40a1695790f6171469d44830571a0b",
+    "current_raw_sha256": "2c1087c69770f28afd8e8850156e55316ea724bb44b04d025488eba5fa60450a",
+    "parent": {
+      "commit": "2214e576beeae2ca63f6462347e4ce48f7688f5a",
+      "p50_nanos": 1968,
+      "p95_nanos": 2242,
+      "p99_nanos": 2285,
+      "p999_nanos": 3721,
+      "maximum_nanos": 5645,
+      "throughput_per_second": 501671.849
+    },
+    "current": {
+      "commit": "52999503c0c49b6143fcf8e4f06849234ca903fd",
+      "p50_nanos": 1968,
+      "p95_nanos": 2241,
+      "p99_nanos": 2290,
+      "p999_nanos": 3862,
+      "maximum_nanos": 5486,
+      "throughput_per_second": 501555.578
+    },
+    "change_percent": {
+      "p50": 0.0,
+      "p95": -0.045,
+      "p99": 0.219,
+      "p999": 3.789,
+      "throughput": -0.023
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "verification": {
+    "dedicated_tests": 7,
+    "native_runtime_tests": 302,
+    "workspace_all_targets_all_features": "passed",
+    "clippy_warnings_denied": "passed",
+    "documentation": "passed",
+    "hosted_ci": "open"
+  },
+  "boundaries": [
+    "Warm concurrency-one observations are not a universal latency SLO.",
+    "Strict commits include ext4/EBS page and WAL synchronization.",
+    "One retained 5.485-second strict outlier makes the aggregate strict throughput unsuitable as a capacity claim.",
+    "Commit results include transaction preparation, B+tree copy-on-write, WAL, root publication, and selected durability.",
+    "The deterministic crash matrix is not process-kill, EC2-stop, block-replay, or physical-power-loss evidence.",
+    "The observation does not close saturation, cold-cache, allocation, RSS, hardware-counter, memory-amplification, complete G3, or G7 gates."
+  ]
+}

@@ -1,6 +1,7 @@
 # Native set member commands v1
 
-Status: frozen contract; implementation and evidence pending.
+Status: implemented; [direct-Linux evidence captured on
+2026-08-03](../gates/evidence/native-set-commands-linux-2026-08-03.md).
 
 This contract extends
 [Native structure-engine semantics v1](structures-semantics-v1.md) and
