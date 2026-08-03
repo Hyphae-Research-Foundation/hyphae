@@ -736,3 +736,15 @@ detectable.
   embedded physical MATCH, persistent PING, and persistent one-hit MATCH.
   They remain in the microsecond domain but do not establish a regression
   threshold or close G0/G1/G4/G6/G7.
+
+## Native local all-engine transaction on Linux
+
+- `native-local-all-engine-transaction-linux-2026-08-03.md` binds one explicit
+  local SQL + structure + lexical transaction to exact contracts, commits,
+  golden codecs, failure-state tests, optimistic conflict, strict reopen, and
+  all seven deterministic commit interruption boundaries.
+- `native-local-all-engine-transaction-linux.json` records three direct-Linux
+  release observations of PING, each engine's stage receipt, and memory/strict
+  commit. Staging remains in the microsecond domain; memory and strict commit
+  remain in milliseconds. The receipt exposes that deficit and is not a
+  regression threshold or G0/G1/G5/G6/G7 closure.

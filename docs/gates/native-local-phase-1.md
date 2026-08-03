@@ -682,6 +682,23 @@ not subtracted. DDL/DML over the protocol, explicit all-engine transactions,
 streaming, Windows named pipes, concurrency, saturation, allocation, hardware
 counters, and complete G2/G5/G6/G7 evidence remain open.
 
+The [native local all-engine transaction
+evidence](evidence/native-local-all-engine-transaction-linux-2026-08-03.md)
+adds one explicit serial transaction over the existing detached optimistic
+batch. SQL DML, scalar SET, and lexical document indexing stage under one
+fixed read CSN and server time, then publish through one WAL transaction and
+one commit CSN. Prior snapshots see none of the writes; strict reopen sees all
+three. Wrong handles/counts, empty commit, semantic failure, response
+preflight, rollback, close, peer loss, the 1,024-operation bound, optimistic
+conflict, and all seven commit interruptions fail closed. Across three
+direct-Linux runs, median SQL/structure/search stage p50 was
+`24.415/22.364/24.271 us`. Memory and strict commit p50 was
+`6.476/15.097 ms`, exposing unfinished publication and synchronization work.
+This completes the minimal transaction proof required by G1 step 4 and
+advances G5/G6, but it does not prove concurrent-reader mixing, cross-engine
+SQL operators, backup/restore, Windows named pipes, or the G7 matrix and
+closes no complete gate.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
