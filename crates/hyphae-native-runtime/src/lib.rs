@@ -1578,6 +1578,7 @@ impl NativeSnapshot {
     ///
     /// Returns an error for a scalar/hash key or a missing set.
     pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, NativeRuntimeError> {
+        validate_set_member_identity(key, member)?;
         if self.state.structures.entries.contains_key(key)
             || self
                 .state
@@ -4704,6 +4705,7 @@ impl NativeDatabase {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
+        validate_set_member_identity(key, member)?;
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         let root = snapshot
             .roots()
@@ -8861,6 +8863,7 @@ impl NativeWriteBatch {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let member = member.into();
+        validate_set_member_identity(&key, &member)?;
         let added = self
             .state
             .structures
@@ -8944,6 +8947,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for a scalar/hash key or a missing set.
     pub fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool, NativeRuntimeError> {
+        validate_set_member_identity(key, member)?;
         if self.state.structures.entries.contains_key(key)
             || self.private_hash_is_visible(key)
             || self.state.structures.lists.contains_key(key)
@@ -9003,6 +9007,7 @@ impl NativeWriteBatch {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let member = member.into();
+        validate_set_member_identity(&key, &member)?;
         let deleted = self
             .state
             .structures
