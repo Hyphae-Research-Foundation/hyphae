@@ -4,9 +4,9 @@ Status: implemented; evidence recorded in
 [Native active-expiry scheduler evidence — 2026-08-02](../gates/evidence/native-active-expiry-scheduler-2026-08-02.md)
 
 Active expiry is physical structure maintenance owned by the native commit
-scheduler. It removes due scalar values through the existing expiry index and
-one normal WAL/MVCC transaction without introducing another writer, timer
-database, cache, or external service.
+scheduler. It removes due scalar values and whole hashes through one typed
+expiry index and one normal WAL/MVCC transaction without introducing another
+writer, timer database, cache, or external service.
 
 This contract extends
 [Native mixed-durability scheduler v1](mixed-durability-scheduler-v1.md) and
@@ -14,9 +14,9 @@ This contract extends
 
 ## Logical versus physical expiry
 
-Scalar `GET` and `TTL` evaluate the stored absolute expiry against their
-supplied logical time. A due value is logically absent even when active expiry
-has not yet written its tombstone.
+Scalar `GET`/`TTL` and hash-family reads/`TTL_HASH` evaluate stored absolute
+expiry against supplied logical time. A due scalar or hash is logically absent
+even when active expiry has not yet written its tombstone.
 
 The scheduler therefore provides bounded physical reclamation, not the
 correctness authority for logical absence. Delayed, disabled, cancelled, or
@@ -46,7 +46,7 @@ Active expiry is optional and disabled by default. Its validated configuration
 names:
 
 - an interval in `100 µs..=60 s`;
-- a batch limit in `1..=4096` scalar keys;
+- a batch limit in `1..=4096` combined scalar or hash keys;
 - `memory` or `strict` singleton durability; and
 - a foreground budget in `1..=4096` submitted requests after a sweep becomes
   due.
@@ -111,7 +111,7 @@ The scheduler exposes a lock-free snapshot containing:
 
 - attempted sweeps;
 - non-empty committed sweeps;
-- expired scalar keys;
+- expired scalar or hash keys;
 - empty sweeps;
 - failures;
 - the latest sampled logical time;
@@ -126,18 +126,18 @@ expiry authority from roots and WAL rather than these counters.
 Executable evidence must cover:
 
 - idle active expiry without a foreground trigger;
-- logical absence before the physical sweep;
+- logical scalar and whole-hash absence before the physical sweep;
 - one non-empty sweep consuming exactly one transaction ID and CSN;
 - an empty sweep consuming neither;
-- deterministic batch bounds and `more_due`;
+- deterministic mixed scalar/hash batch bounds and `more_due`;
 - a regressing injected clock and its non-decreasing watermark;
 - continuous group load with the configured foreground bound;
 - strict and memory sweep durability;
 - crash recovery at every existing commit boundary;
 - sweep failure making the scheduler unavailable;
 - shutdown with a due timer and queued work; and
-- enabled-versus-disabled foreground latency plus cleanup throughput on
-  Windows and WSL2.
+- enabled-versus-disabled foreground latency plus cleanup throughput on the
+  canonical Linux ext4/EBS host.
 
 Persistent-filesystem and power-loss claims require a persistent Linux lane;
 tmpfs synchronization timings are observational only.

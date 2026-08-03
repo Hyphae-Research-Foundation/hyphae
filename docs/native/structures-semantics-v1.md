@@ -60,6 +60,8 @@ TTL(key)
 INCRBY(key, signed_delta)
 CREATE_HASH(key)
 DELETE_HASH(key)
+EXPIRE_HASH(key, expires_at)
+TTL_HASH(key)
 HSET(key, field, value)
 HGET(key, field)
 HDELETE(key, field)
@@ -115,6 +117,10 @@ error. Either failure adds no mutation.
 kind error for another live structure family, and otherwise retires the
 complete hash. `HSET` returns added versus updated, `HGET` reads one field,
 `HDELETE` publishes a field tombstone, and `HLEN` reads durable cardinality.
+`EXPIRE_HASH` applies one absolute expiry to the complete hash and
+`TTL_HASH` evaluates it against deterministic logical time. Missing or already
+expired hashes return false from `EXPIRE_HASH`; due hashes are absent to every
+hash operation before physical cleanup.
 
 `HSCAN` returns at most `limit` live field/value pairs in ascending exact
 field-byte order. `start_after` is an optional exclusive field cursor, not an
@@ -147,6 +153,12 @@ all of its fields become absent at one CSN while retained snapshots preserve
 their earlier view. The same transaction may recreate the key as an empty
 hash or another structure kind after deletion. Recreating a hash never exposes
 fields from the retired incarnation.
+
+Whole-hash expiry is the automatic equivalent lifecycle boundary. A
+transaction may reuse a due hash key as a scalar or explicitly created
+collection; it first records logical whole-hash cleanup so metadata, all
+fields, and the old expiry entry retire in the same publication as the new
+family. Retained snapshots before the boundary preserve the older incarnation.
 
 Scalar mutation of a hash key fails with a kind error. Concurrent scalar
 creation and hash creation over the same absent key conflict. Once the hash
@@ -271,7 +283,7 @@ B+tree:
 |---:|---|---|
 | `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + arbitrary binary user key | canonical `HYSTRV01` value |
-| `0x02` | prefix + binary hash key | canonical `HYHSHM01` metadata |
+| `0x02` | prefix + binary hash key | canonical `HYHSHM01` or `HYHSHM02` metadata |
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
 | `0x04` | prefix + binary set key | canonical `HYSETM01` metadata |
 | `0x05` | prefix + set-member identity | canonical empty persistent `HYSTRV01` value |
@@ -280,7 +292,7 @@ B+tree:
 | `0x08` | prefix + binary sorted-set key | canonical `HYZSTM01` metadata |
 | `0x09` | prefix + sorted-set-member identity | canonical `HYZSCR01` score or structure tombstone |
 | `0x0a` | prefix + sorted-set key + sortable score + member | canonical empty persistent `HYSTRV01` value or structure tombstone |
-| `0x0b` | prefix + sortable expiry + binary scalar key | one-byte live marker or tombstone |
+| `0x0b` | prefix + sortable expiry + binary structure key | typed one-byte live marker or tombstone |
 
 The exact value envelope is:
 
@@ -302,7 +314,7 @@ The only canonical tombstone has flags exactly `0x02`, inline storage, zero
 reserved and expiry bytes, and an empty payload. Any flag combination or
 payload on a tombstone fails closed.
 
-Logical expiry is independent from physical cleanup. The optional
+Scalar and whole-hash logical expiry are independent from physical cleanup. The optional
 [native active-expiry scheduler](active-expiry-scheduler-v1.md) visits the
 ordered expiry namespace through the single native writer and commits bounded
 tombstone transactions without making the timer a visibility authority.
@@ -314,12 +326,25 @@ materializing the complete structure state, then decode only the selected
 envelope and blob. Recovery scans and validates the complete reachable
 namespace while omitting tombstones from materialized state.
 
-The exact hash metadata is 16 bytes:
+Persistent hash metadata remains the exact 16-byte `HYHSHM01` encoding:
 
 | Offset | Width | Field |
 |---:|---:|---|
 | 0 | 8 | ASCII magic `HYHSHM01` |
 | 8 | 8 | unsigned little-endian live field count |
+
+Expiring hashes use the exact 24-byte `HYHSHM02` encoding:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYHSHM02` |
+| 8 | 8 | unsigned little-endian live field count |
+| 16 | 8 | signed little-endian absolute expiry |
+
+The distinct magic is the expiry-presence bit, so every signed timestamp
+round-trips without a sentinel collision. The `0x0b` marker is `0x00` for a
+tombstone, `0x01` for a live scalar expiry, or `0x02` for a live whole-hash
+expiry. Recovery validates an exact one-to-one typed match.
 
 A hash-field identity is `u32` big-endian hash-key length, the hash-key bytes,
 and the remaining field bytes. The physical key prepends `0x03`. This encoding
@@ -327,14 +352,16 @@ is unambiguous for empty or arbitrary binary keys and fields and keeps fields
 clustered by hash-key length/key/field order.
 
 Each field uses the same inline/blob `HYSTRV01` envelope but cannot carry an
-independent expiry in this version. A field delete stores the same canonical
+independent expiry; the family metadata carries the whole-hash expiry. A field
+delete stores the same canonical
 tombstone as a scalar delete. Recovery requires every field to have prior hash
 metadata and requires metadata cardinality to equal the exact number of live
 field envelopes. Orphan fields, malformed identities, expiry-bearing fields,
 and count mismatches fail closed.
 
 Whole-hash deletion writes canonical `HYSTRV01` tombstones over every live
-field path and the hash metadata path through one copy-on-write B+tree batch.
+field path, the hash metadata path, and any live whole-hash expiry path through
+one copy-on-write B+tree batch.
 The WAL carries only the logical hash key; page construction enumerates the
 admitted current-root field prefix after conflict validation. Recovery accepts
 field tombstones under retired metadata, rejects live orphan fields, and
@@ -441,7 +468,7 @@ metadata count, while same-field updates conflict. Physical `HSET`/`HDELETE`
 rewrite the field path and the 16-byte metadata path; they never serialize the
 complete hash as one value.
 
-`CREATE_HASH` and `DELETE_HASH` publish the scalar/collection ownership
+`CREATE_HASH`, `DELETE_HASH`, and `EXPIRE_HASH` publish the scalar/collection ownership
 identity as the hash lifecycle fence. `HSET` and `HDELETE` validate that
 identity in addition to their field write key but publish only the field key.
 This separates incarnation safety from field-level write admission.

@@ -99,7 +99,7 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 MEMBER=16`, `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`, `POP
 LIST HEAD=23`, `POP LIST TAIL=24`, `CREATE SORTED SET=25`, `UPSERT SORTED SET
 MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`, `DELETE
-HASH=30`; and search
+HASH=30`, `EXPIRE HASH=31`; and search
 `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
 `DELETE VECTOR=19`.
 `DELETE VALUE`, collection creation, whole-hash/hash-field deletion, set/sorted-set
@@ -108,6 +108,12 @@ member deletion, and vector deletion require an empty value and no expiry.
 value. The ordered expiry index is a derived physical structure maintained by
 the existing scalar opcodes, so it introduces no second mutation stream or
 WAL opcode.
+
+`EXPIRE HASH` uses the exact binary hash key, no target, an empty value, and an
+explicit signed expiry. The logical mutation is the replay authority; it
+updates versioned hash metadata and the typed ordered expiry entry without
+copying fields into the WAL body. Expiry-driven physical cleanup reuses
+`DELETE HASH`.
 
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances
@@ -135,7 +141,8 @@ on the same write key as scalar creation.
 
 `DELETE HASH` uses the exact binary hash key, an empty value, no expiry, and no
 target. It shares the scalar/collection ownership conflict identity with
-`CREATE HASH`. Hash-field mutations retain their field write identity and also
+`CREATE HASH` and `EXPIRE HASH`. Hash-field mutations retain their field write
+identity and also
 validate that ownership identity as a lifecycle read dependency without
 publishing it. This rejects a stale field mutation after deletion/recreation
 without serializing disjoint field writers. The bounded logical mutation is

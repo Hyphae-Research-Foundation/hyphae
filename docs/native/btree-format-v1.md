@@ -249,7 +249,7 @@ namespace:
 |---:|---|---|
 | `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
-| `0x02` | prefix + binary hash key | `HYHSHM01` live-field count |
+| `0x02` | prefix + binary hash key | `HYHSHM01` persistent or `HYHSHM02` expiring metadata |
 | `0x03` | prefix + length-delimited hash key + field | persistent `HYSTRV01` field envelope |
 | `0x04` | prefix + binary set key | `HYSETM01` live-member count |
 | `0x05` | prefix + length-delimited set key + member | persistent empty `HYSTRV01` marker |
@@ -258,7 +258,7 @@ namespace:
 | `0x08` | prefix + binary sorted-set key | `HYZSTM01` live-member count |
 | `0x09` | prefix + length-delimited sorted-set key + member | `HYZSCR01` canonical score |
 | `0x0a` | prefix + sorted-set key + sortable score + member | persistent empty `HYSTRV01` marker |
-| `0x0b` | prefix + sortable expiry + scalar key | one-byte live marker or tombstone |
+| `0x0b` | prefix + sortable expiry + structure key | typed one-byte live marker or tombstone |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
@@ -268,8 +268,9 @@ the buffer pool. Hash field changes rewrite their own field path plus the small
 hash metadata path rather than a whole serialized map. Whole-hash deletion
 enumerates its exact field prefix and submits live field plus metadata
 tombstones through one sorted copy-on-write batch. `HYSTRBT2` maintains
-the scalar expiry index in the same mutation path and validates it
-one-to-one on recovery. `HYSTRBT1` remains a compatibility format without
+scalar and whole-hash expiry in the same mutation path with distinct live
+markers and validates the typed index one-to-one on recovery. `HYSTRBT1`
+remains a compatibility format without
 that index. The current implementation has no general range/streaming cursor,
 expected-version response, whole-family deletion for the remaining collection
 families, or layouts for unimplemented families. The list layout rewrites
