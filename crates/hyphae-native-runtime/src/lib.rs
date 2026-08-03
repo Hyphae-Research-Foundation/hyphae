@@ -31758,4 +31758,219 @@ mod tests {
         }
         Ok(())
     }
+
+    fn hash_entry_fields(entries: Vec<HashFieldEntry>) -> Vec<Vec<u8>> {
+        entries.into_iter().map(|entry| entry.field).collect()
+    }
+
+    #[test]
+    fn expired_hash_fields_are_hidden_from_every_read_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.hset(b"map".to_vec(), b"a".to_vec(), b"due".to_vec())?;
+        seed.hset(b"map".to_vec(), b"b".to_vec(), b"live".to_vec())?;
+        assert!(seed.expire_hash_field(b"map".to_vec(), b"a".to_vec(), 20)?);
+        seed.commit()?;
+        let fields = vec![b"a".to_vec(), b"b".to_vec()];
+        let exact = HashPatternScanRequest::try_new(b"a", None, 10, 10, 100)?;
+        let any = HashPatternScanRequest::try_new(b"*", None, 10, 10, 100)?;
+
+        let snapshot = database.snapshot(20)?;
+        assert_eq!(
+            snapshot.hget_many(b"map", &fields)?,
+            vec![None, Some(b"live".to_vec())]
+        );
+        assert_eq!(snapshot.hlen(b"map")?, 1);
+        assert_eq!(
+            hash_entry_fields(snapshot.hscan(b"map", None, 10)?),
+            vec![b"b".to_vec()]
+        );
+        assert_eq!(
+            hash_entry_fields(snapshot.hscan_reverse(b"map", None, 10)?),
+            vec![b"b".to_vec()]
+        );
+        let snapshot_exact = snapshot.hscan_match(b"map", &exact)?;
+        assert!(snapshot_exact.entries().is_empty());
+        assert_eq!(snapshot_exact.visited(), 1);
+        assert_eq!(snapshot_exact.match_steps(), 0);
+
+        let private = database.begin(20, DurabilityClass::Memory)?;
+        assert_eq!(
+            private.hget_many(b"map", &fields)?,
+            vec![None, Some(b"live".to_vec())]
+        );
+        assert_eq!(private.hlen(b"map")?, 1);
+        assert_eq!(
+            hash_entry_fields(private.hscan(b"map", None, 10)?),
+            vec![b"b".to_vec()]
+        );
+        assert_eq!(
+            private
+                .hscan_match(b"map", &any)?
+                .into_entries()
+                .into_iter()
+                .map(|entry| entry.field)
+                .collect::<Vec<_>>(),
+            vec![b"b".to_vec()]
+        );
+        private.rollback();
+
+        assert_eq!(
+            database.hget_many_latest_hash_at(b"map", &fields, 20)?,
+            vec![None, Some(b"live".to_vec())]
+        );
+        assert_eq!(database.hlen_latest_hash_at(b"map", 20)?, 1);
+        assert_eq!(
+            hash_entry_fields(database.hscan_reverse_latest_hash_at(b"map", None, 10, 20)?),
+            vec![b"b".to_vec()]
+        );
+        let physical_exact = database.hscan_match_latest_hash_at(b"map", &exact, 20)?;
+        assert!(physical_exact.entries().is_empty());
+        assert_eq!(physical_exact.visited(), 1);
+        assert_eq!(physical_exact.match_steps(), 0);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hget_many_latest_hash_at(b"map", &fields, 20)?,
+            vec![None, Some(b"live".to_vec())]
+        );
+        assert_eq!(
+            reopened
+                .hscan_match_latest_hash_at(b"map", &any, 20)?
+                .into_entries()
+                .into_iter()
+                .map(|entry| entry.field)
+                .collect::<Vec<_>>(),
+            vec![b"b".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn due_structure_order_merges_top_level_before_hash_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"a".to_vec(), b"scalar".to_vec(), Some(10))?;
+        seed.create_hash(b"b".to_vec())?;
+        seed.hset(b"b".to_vec(), b"field".to_vec(), b"whole".to_vec())?;
+        assert!(seed.expire_hash(b"b".to_vec(), 10)?);
+        seed.create_hash(b"c".to_vec())?;
+        seed.hset(b"c".to_vec(), b"field".to_vec(), b"member".to_vec())?;
+        assert!(seed.expire_hash_field(b"c".to_vec(), b"field".to_vec(), 10)?);
+        seed.commit()?;
+
+        let snapshot = database.coordinator.snapshot(10)?;
+        let (first, more_due) = database.due_structure_keys(&snapshot, 10, 2)?;
+        assert!(more_due);
+        assert_eq!(
+            first,
+            vec![
+                super::DueStructureKey {
+                    kind: super::DueStructureKind::Scalar,
+                    key: b"a".to_vec(),
+                },
+                super::DueStructureKey {
+                    kind: super::DueStructureKind::Hash,
+                    key: b"b".to_vec(),
+                },
+            ]
+        );
+        let (all, more_due) = database.due_structure_keys(&snapshot, 10, 3)?;
+        assert!(!more_due);
+        assert_eq!(all[2].kind, super::DueStructureKind::HashField);
+        assert_eq!(all[2].key, super::hash_field_identity(b"c", b"field")?);
+        Ok(())
+    }
+
+    #[test]
+    fn hash_field_expiry_index_covers_the_signed_timestamp_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timestamps = [i64::MIN, -1, 0, 1, i64::MAX];
+        let encoded = timestamps
+            .iter()
+            .map(|timestamp| super::structure_hash_field_expiry_key(*timestamp, b"map", b"field"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(encoded.windows(2).all(|pair| pair[0] < pair[1]));
+        for (timestamp, physical) in timestamps.into_iter().zip(encoded) {
+            let (decoded, hash, field) =
+                super::decode_structure_hash_field_expiry_identity(&physical[1..])?;
+            assert_eq!(
+                (decoded, hash, field),
+                (timestamp, b"map".as_slice(), b"field".as_slice())
+            );
+        }
+
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        for (field, expiry) in [
+            (b"minimum".to_vec(), i64::MIN),
+            (b"maximum".to_vec(), i64::MAX),
+        ] {
+            seed.hset(b"map".to_vec(), field.clone(), b"value".to_vec())?;
+            assert!(seed.expire_hash_field(b"map".to_vec(), field, expiry)?);
+        }
+        seed.commit()?;
+        assert_eq!(
+            database
+                .expire_due_structures(i64::MIN, 1, DurabilityClass::Strict)?
+                .expired_keys,
+            1
+        );
+        assert_eq!(database.hlen_latest_hash_at(b"map", 0)?, 1);
+        assert_eq!(
+            database
+                .expire_due_structures(i64::MAX, 1, DurabilityClass::Strict)?
+                .expired_keys,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hash_field_expiry_conflicts_per_field_and_hash_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.hset(b"map".to_vec(), b"a".to_vec(), b"1".to_vec())?;
+        seed.hset(b"map".to_vec(), b"b".to_vec(), b"2".to_vec())?;
+        seed.commit()?;
+
+        let mut expiry_a = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(expiry_a.expire_hash_field(b"map".to_vec(), b"a".to_vec(), 100)?);
+        let mut write_b = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        write_b.hset(b"map".to_vec(), b"b".to_vec(), b"updated".to_vec())?;
+        database.commit_optimistic(write_b)?;
+        database.commit_optimistic(expiry_a)?;
+
+        let mut expiry_same = database.begin_optimistic(3, DurabilityClass::Strict)?;
+        assert!(expiry_same.expire_hash_field(b"map".to_vec(), b"a".to_vec(), 200)?);
+        let mut write_same = database.begin_optimistic(3, DurabilityClass::Strict)?;
+        write_same.hset(b"map".to_vec(), b"a".to_vec(), b"replacement".to_vec())?;
+        database.commit_optimistic(write_same)?;
+        assert!(matches!(
+            database.commit_optimistic(expiry_same),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+
+        let mut field_expiry = database.begin_optimistic(4, DurabilityClass::Strict)?;
+        assert!(field_expiry.expire_hash_field(b"map".to_vec(), b"b".to_vec(), 200)?);
+        let mut lifecycle = database.begin_optimistic(4, DurabilityClass::Strict)?;
+        assert!(lifecycle.delete_hash(b"map".to_vec())?);
+        database.commit_optimistic(lifecycle)?;
+        assert!(matches!(
+            database.commit_optimistic(field_expiry),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        Ok(())
+    }
 }
