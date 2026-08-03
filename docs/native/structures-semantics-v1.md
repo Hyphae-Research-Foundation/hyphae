@@ -59,6 +59,7 @@ EXPIRE(key, expires_at)
 TTL(key)
 INCRBY(key, signed_delta)
 CREATE_HASH(key)
+DELETE_HASH(key)
 HSET(key, field, value)
 HGET(key, field)
 HDELETE(key, field)
@@ -109,9 +110,11 @@ whitespace, a leading plus, redundant leading zeroes, `-0`, non-UTF-8 bytes,
 and out-of-range input fail as non-integers. Arithmetic overflow is a separate
 error. Either failure adds no mutation.
 
-`CREATE_HASH` establishes the key's family before field mutation. `HSET`
-returns added versus updated, `HGET` reads one field, `HDELETE` publishes a
-field tombstone, and `HLEN` reads durable cardinality.
+`CREATE_HASH` establishes the key's family before field mutation.
+`DELETE_HASH` returns false without a mutation for a missing key, fails with a
+kind error for another live structure family, and otherwise retires the
+complete hash. `HSET` returns added versus updated, `HGET` reads one field,
+`HDELETE` publishes a field tombstone, and `HLEN` reads durable cardinality.
 
 `HSCAN` returns at most `limit` live field/value pairs in ascending exact
 field-byte order. `start_after` is an optional exclusive field cursor, not an
@@ -135,13 +138,24 @@ This bounded `HSCAN` contract is implemented across private, retained,
 current-root, and reopened execution. Its red/green and physical-pruning
 evidence are tracked separately from this normative file.
 
-An empty hash remains a typed hash after its last field is deleted;
-whole-hash delete/recreate is not implemented yet.
+An empty hash remains a typed hash after its last field is deleted.
+`DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
+all of its fields become absent at one CSN while retained snapshots preserve
+their earlier view. The same transaction may recreate the key as an empty
+hash or another structure kind after deletion. Recreating a hash never exposes
+fields from the retired incarnation.
 
 Scalar mutation of a hash key fails with a kind error. Concurrent scalar
 creation and hash creation over the same absent key conflict. Once the hash
 exists, different field identities can prepare and commit independently;
-same-field writers retain first-committer-wins semantics.
+same-field writers retain first-committer-wins semantics. Every field mutation
+also validates, but does not publish, the hash lifecycle fence observed by its
+snapshot. Hash creation and whole-hash deletion publish that fence. Therefore
+a field writer prepared before an admitted deletion cannot resurrect the
+retired hash, while disjoint fields in one live incarnation remain
+independently committable. If a field mutation commits first, a later
+whole-hash deletion rebases over and retires that admitted field as part of the
+same logical hash.
 
 `CREATE_SET` establishes a binary set before member mutation. `SADD` returns
 true only when it adds a missing member, `SISMEMBER` reports exact membership,
@@ -316,6 +330,15 @@ metadata and requires metadata cardinality to equal the exact number of live
 field envelopes. Orphan fields, malformed identities, expiry-bearing fields,
 and count mismatches fail closed.
 
+Whole-hash deletion writes canonical `HYSTRV01` tombstones over every live
+field path and the hash metadata path through one copy-on-write B+tree batch.
+The WAL carries only the logical hash key; page construction enumerates the
+admitted current-root field prefix after conflict validation. Recovery accepts
+field tombstones under retired metadata, rejects live orphan fields, and
+omits the retired family from materialized state. Recreation upserts live
+metadata over the metadata tombstone while the retired field tombstones remain
+non-visible until individually replaced.
+
 The exact set metadata is 16 bytes: ASCII magic `HYSETM01` followed by the
 unsigned little-endian live member count. A set-member identity uses the same
 unambiguous compound form as a hash field: `u32` big-endian set-key length,
@@ -414,6 +437,14 @@ different fields rebase onto the admitted current root without losing the
 metadata count, while same-field updates conflict. Physical `HSET`/`HDELETE`
 rewrite the field path and the 16-byte metadata path; they never serialize the
 complete hash as one value.
+
+`CREATE_HASH` and `DELETE_HASH` publish the scalar/collection ownership
+identity as the hash lifecycle fence. `HSET` and `HDELETE` validate that
+identity in addition to their field write key but publish only the field key.
+This separates incarnation safety from field-level write admission.
+`DELETE_HASH` physically scans and tombstones the admitted hash prefix, so its
+cost is linear in retained physical field paths even though its WAL body is
+bounded.
 
 Set member write keys use the canonical set-member identity. Therefore
 different members rebase onto the admitted current root without losing the

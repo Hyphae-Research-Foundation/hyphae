@@ -98,10 +98,11 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
 MEMBER=16`, `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`, `POP
 LIST HEAD=23`, `POP LIST TAIL=24`, `CREATE SORTED SET=25`, `UPSERT SORTED SET
-MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`; and search
+MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`, `DELETE
+HASH=30`; and search
 `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
 `DELETE VECTOR=19`.
-`DELETE VALUE`, collection creation, hash-field deletion, set/sorted-set
+`DELETE VALUE`, collection creation, whole-hash/hash-field deletion, set/sorted-set
 member deletion, and vector deletion require an empty value and no expiry.
 `EXPIRE VALUE` requires an explicit expiry and carries the retained logical
 value. The ordered expiry index is a derived physical structure maintained by
@@ -131,6 +132,15 @@ Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
 field bytes as their mutation key. The decoder rejects truncated identities.
 This makes first-committer-wins field-granular while keeping creation of a hash
 on the same write key as scalar creation.
+
+`DELETE HASH` uses the exact binary hash key, an empty value, no expiry, and no
+target. It shares the scalar/collection ownership conflict identity with
+`CREATE HASH`. Hash-field mutations retain their field write identity and also
+validate that ownership identity as a lifecycle read dependency without
+publishing it. This rejects a stale field mutation after deletion/recreation
+without serializing disjoint field writers. The bounded logical mutation is
+the replay authority; physical publication deterministically tombstones the
+admitted current-root hash metadata and field prefix.
 
 Set member mutations use the same compound identity with the set key followed
 by the member bytes. Conflict identities add disjoint scalar/collection,
@@ -188,7 +198,7 @@ Larger values are promoted to the shared immutable blob namespace first. The
 WAL stores the relational one-byte envelope, structure `HYSTRV01` envelope, or
 search `HYDOCS01` envelope with its 56-byte reference instead of duplicating
 large content. The search envelope also binds the analyzed token count. A
-structure or hash-field delete keeps its WAL value empty; page construction
+structure, whole-hash, or hash-field delete keeps its WAL value empty; page construction
 publishes the canonical `HYSTRV01` tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
