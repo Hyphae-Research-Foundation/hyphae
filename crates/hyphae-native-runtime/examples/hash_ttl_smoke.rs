@@ -9,7 +9,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hyphae_native_runtime::{NativeDatabase, NativeRuntimeError, Ttl};
+use hyphae_native_runtime::{CommitReceipt, NativeDatabase, NativeRuntimeError, Ttl};
 use hyphae_native_types::DurabilityClass;
 
 const READ_OBSERVATIONS: usize = 200_000;
@@ -55,6 +55,21 @@ struct Stats {
     throughput_per_second: f64,
 }
 
+struct ReadStats {
+    persistent_hget: Stats,
+    persistent_snapshot_ttl: Stats,
+    private_ttl: Stats,
+    snapshot_ttl: Stats,
+    physical_ttl: Stats,
+    expiring_hget: Stats,
+}
+
+struct MutationStats {
+    memory_commit: Stats,
+    strict_commit: Stats,
+    cleanup: Stats,
+}
+
 fn measure<F, T>(
     observations: usize,
     operations_per_observation: usize,
@@ -82,13 +97,14 @@ where
     let completed = observations
         .checked_mul(operations_per_observation)
         .ok_or("benchmark operation count overflow")?;
+    let completed = u32::try_from(completed)?;
     Ok(Stats {
         p50_nanos: percentile(&samples, 500),
         p95_nanos: percentile(&samples, 950),
         p99_nanos: percentile(&samples, 990),
         p999_nanos: percentile(&samples, 999),
         maximum_nanos: *samples.last().ok_or("benchmark produced no samples")?,
-        throughput_per_second: completed as f64 / total.as_secs_f64(),
+        throughput_per_second: f64::from(completed) / total.as_secs_f64(),
     })
 }
 
@@ -131,6 +147,118 @@ fn seed_cleanup_hashes(database: &mut NativeDatabase) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+fn measure_reads(
+    database: &mut NativeDatabase,
+    target: &[u8],
+) -> Result<ReadStats, Box<dyn std::error::Error>> {
+    let persistent_hget = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || database.hget_latest_hash(HASH_KEY, target),
+    )?;
+    let persistent_snapshot = database.snapshot(101)?;
+    let persistent_snapshot_ttl = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || {
+            let ttl = persistent_snapshot.ttl_hash(HASH_KEY);
+            if ttl != Ttl::Persistent {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Ok(ttl)
+        },
+    )?;
+    let mut expire = database.begin(101, DurabilityClass::Memory)?;
+    if !expire.expire_hash(HASH_KEY.to_vec(), 1_000_000)? {
+        return Err("primary hash did not accept expiry".into());
+    }
+    expire.commit()?;
+    let expiring_snapshot = database.snapshot(102)?;
+    let private = database.begin_optimistic(102, DurabilityClass::Memory)?;
+    let private_ttl = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || checked_hash_ttl(private.ttl_hash(HASH_KEY)),
+    )?;
+    let snapshot_ttl = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || checked_hash_ttl(expiring_snapshot.ttl_hash(HASH_KEY)),
+    )?;
+    let physical_ttl = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || database.ttl_latest_hash(HASH_KEY, 102),
+    )?;
+    let expiring_hget = measure(
+        READ_OBSERVATIONS,
+        READ_OPERATIONS_PER_OBSERVATION,
+        READ_WARMUP,
+        || database.hget_latest_hash_at(HASH_KEY, target, 102),
+    )?;
+    Ok(ReadStats {
+        persistent_hget,
+        persistent_snapshot_ttl,
+        private_ttl,
+        snapshot_ttl,
+        physical_ttl,
+        expiring_hget,
+    })
+}
+
+fn checked_hash_ttl(ttl: Ttl) -> Result<Ttl, NativeRuntimeError> {
+    if ttl != Ttl::RemainingMicros(999_898) {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok(ttl)
+}
+
+fn measure_mutations(
+    database: &mut NativeDatabase,
+) -> Result<MutationStats, Box<dyn std::error::Error>> {
+    let mut memory_expiry = 2_000_000_i64;
+    let memory_commit = measure(MEMORY_COMMIT_OBSERVATIONS, 1, 0, || {
+        memory_expiry += 1;
+        expire_primary_hash(database, 200, memory_expiry, DurabilityClass::Memory)
+    })?;
+    let mut strict_expiry = 3_000_000_i64;
+    let strict_commit = measure(STRICT_COMMIT_OBSERVATIONS, 1, 0, || {
+        strict_expiry += 1;
+        expire_primary_hash(database, 201, strict_expiry, DurabilityClass::Strict)
+    })?;
+    seed_cleanup_hashes(database)?;
+    let cleanup = measure(usize::try_from(CLEANUP_HASHES)?, 1, 0, || {
+        let receipt = database.expire_due_structures(CLEANUP_EXPIRY, 1, DurabilityClass::Memory)?;
+        if receipt.expired_keys != 1 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        Ok(receipt)
+    })?;
+    Ok(MutationStats {
+        memory_commit,
+        strict_commit,
+        cleanup,
+    })
+}
+
+fn expire_primary_hash(
+    database: &mut NativeDatabase,
+    logical_time_micros: i64,
+    expiry: i64,
+    durability: DurabilityClass,
+) -> Result<CommitReceipt, NativeRuntimeError> {
+    let mut transaction = database.begin(logical_time_micros, durability)?;
+    if !transaction.expire_hash(HASH_KEY.to_vec(), expiry)? {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    transaction.commit()
+}
+
 fn print_stats(name: &str, stats: Stats, comma: bool) {
     println!("    \"{name}\": {{");
     println!("      \"p50_nanos\": {},", stats.p50_nanos);
@@ -156,98 +284,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut database = NativeDatabase::create(temporary.path())?;
     seed_primary_hash(&mut database)?;
     let target = (HASH_FIELDS / 2).to_be_bytes();
-
-    let persistent_hget = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || database.hget_latest_hash(HASH_KEY, &target),
-    )?;
-    let persistent_snapshot = database.snapshot(101)?;
-    let persistent_snapshot_ttl = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || {
-            let ttl = persistent_snapshot.ttl_hash(HASH_KEY);
-            if ttl != Ttl::Persistent {
-                return Err(NativeRuntimeError::InvalidPreparedMutation);
-            }
-            Ok(ttl)
-        },
-    )?;
-
-    let mut expire = database.begin(101, DurabilityClass::Memory)?;
-    if !expire.expire_hash(HASH_KEY.to_vec(), 1_000_000)? {
-        return Err("primary hash did not accept expiry".into());
-    }
-    expire.commit()?;
-    let expiring_snapshot = database.snapshot(102)?;
-    let private = database.begin_optimistic(102, DurabilityClass::Memory)?;
-    let private_ttl = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || {
-            let ttl = private.ttl_hash(HASH_KEY);
-            if ttl != Ttl::RemainingMicros(999_898) {
-                return Err(NativeRuntimeError::InvalidPreparedMutation);
-            }
-            Ok(ttl)
-        },
-    )?;
-    let snapshot_ttl = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || {
-            let ttl = expiring_snapshot.ttl_hash(HASH_KEY);
-            if ttl != Ttl::RemainingMicros(999_898) {
-                return Err(NativeRuntimeError::InvalidPreparedMutation);
-            }
-            Ok(ttl)
-        },
-    )?;
-    let physical_ttl = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || database.ttl_latest_hash(HASH_KEY, 102),
-    )?;
-    let expiring_hget = measure(
-        READ_OBSERVATIONS,
-        READ_OPERATIONS_PER_OBSERVATION,
-        READ_WARMUP,
-        || database.hget_latest_hash_at(HASH_KEY, &target, 102),
-    )?;
-
-    let mut memory_expiry = 2_000_000_i64;
-    let memory_commit = measure(MEMORY_COMMIT_OBSERVATIONS, 1, 0, || {
-        memory_expiry += 1;
-        let mut transaction = database.begin(200, DurabilityClass::Memory)?;
-        if !transaction.expire_hash(HASH_KEY.to_vec(), memory_expiry)? {
-            return Err(NativeRuntimeError::InvalidPreparedMutation);
-        }
-        transaction.commit()
-    })?;
-    let mut strict_expiry = 3_000_000_i64;
-    let strict_commit = measure(STRICT_COMMIT_OBSERVATIONS, 1, 0, || {
-        strict_expiry += 1;
-        let mut transaction = database.begin(201, DurabilityClass::Strict)?;
-        if !transaction.expire_hash(HASH_KEY.to_vec(), strict_expiry)? {
-            return Err(NativeRuntimeError::InvalidPreparedMutation);
-        }
-        transaction.commit()
-    })?;
-
-    seed_cleanup_hashes(&mut database)?;
-    let cleanup = measure(usize::try_from(CLEANUP_HASHES)?, 1, 0, || {
-        let receipt = database.expire_due_structures(CLEANUP_EXPIRY, 1, DurabilityClass::Memory)?;
-        if receipt.expired_keys != 1 {
-            return Err(NativeRuntimeError::InvalidPreparedMutation);
-        }
-        Ok(receipt)
-    })?;
+    let reads = measure_reads(&mut database, &target)?;
+    let mutations = measure_mutations(&mut database)?;
 
     println!("{{");
     println!("  \"schema\": \"hyphae.native.hash-ttl-smoke.v1\",");
@@ -270,23 +308,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  \"cleanup_hashes\": {CLEANUP_HASHES},");
     println!("  \"cleanup_fields_per_hash\": {CLEANUP_FIELDS_PER_HASH},");
     println!("  \"operations\": {{");
-    print_stats("persistent_hash_hget_physical", persistent_hget, true);
+    print_stats("persistent_hash_hget_physical", reads.persistent_hget, true);
     print_stats(
         "persistent_hash_ttl_materialized_snapshot",
-        persistent_snapshot_ttl,
+        reads.persistent_snapshot_ttl,
         true,
     );
-    print_stats("expiring_hash_ttl_private_batch", private_ttl, true);
+    print_stats("expiring_hash_ttl_private_batch", reads.private_ttl, true);
     print_stats(
         "expiring_hash_ttl_materialized_snapshot",
-        snapshot_ttl,
+        reads.snapshot_ttl,
         true,
     );
-    print_stats("expiring_hash_ttl_physical", physical_ttl, true);
-    print_stats("expiring_hash_hget_physical", expiring_hget, true);
-    print_stats("expire_hash_memory_commit", memory_commit, true);
-    print_stats("expire_hash_strict_commit", strict_commit, true);
-    print_stats("expire_hash_cleanup_256_fields_memory", cleanup, false);
+    print_stats("expiring_hash_ttl_physical", reads.physical_ttl, true);
+    print_stats("expiring_hash_hget_physical", reads.expiring_hget, true);
+    print_stats("expire_hash_memory_commit", mutations.memory_commit, true);
+    print_stats("expire_hash_strict_commit", mutations.strict_commit, true);
+    print_stats(
+        "expire_hash_cleanup_256_fields_memory",
+        mutations.cleanup,
+        false,
+    );
     println!("  }}");
     println!("}}");
     Ok(())

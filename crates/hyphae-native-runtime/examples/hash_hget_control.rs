@@ -83,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let completed = OBSERVATIONS
         .checked_mul(OPERATIONS_PER_OBSERVATION)
         .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let completed = u32::try_from(completed)?;
     println!("{{");
     println!("  \"schema\": \"hyphae.native.hash-hget-control.v1\",");
     println!("  \"commit\": \"{commit}\",");
@@ -104,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "  \"throughput_per_second\": {:.3}",
-        completed as f64 / total.as_secs_f64()
+        f64::from(completed) / total.as_secs_f64()
     );
     println!("}}");
     Ok(())

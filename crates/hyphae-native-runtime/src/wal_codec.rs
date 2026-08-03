@@ -1094,9 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_transaction_round_trips_through_physical_wal()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let transaction_id = TransactionId::new(1)?;
+    fn complete_transaction_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let mut hash_field = 4_u32.to_be_bytes().to_vec();
         hash_field.extend_from_slice(b"hashfield");
         let mut set_member = 3_u32.to_be_bytes().to_vec();
@@ -1177,7 +1175,7 @@ mod tests {
             PageId::new(4)?,
         ];
         let pending = encode_transaction(&TransactionPlan {
-            transaction_id,
+            transaction_id: TransactionId::new(1)?,
             read_csn: None,
             catalog_version: CatalogVersion::new(1)?,
             logical_time_micros: 10,

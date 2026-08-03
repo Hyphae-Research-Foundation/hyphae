@@ -3104,54 +3104,16 @@ impl NativeDatabase {
                     if expiry > logical_time_micros {
                         return Ok(ControlFlow::Break(()));
                     }
-                    match marker {
-                        [STRUCTURE_EXPIRY_TOMBSTONE] => Ok(ControlFlow::Continue(())),
-                        [STRUCTURE_EXPIRY_LIVE] => {
-                            let scalar = tree
-                                .get_cached_pinned(
-                                    &self.pages,
-                                    &self.buffer_pool,
-                                    &structure_key(key),
-                                )?
-                                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                            if structure_value_expiry(scalar.bytes())? != Some(expiry) {
-                                return Err(NativeRuntimeError::InvalidStructureTree);
-                            }
-                            due.push(DueStructureKey {
-                                kind: DueStructureKind::Scalar,
-                                key: key.to_vec(),
-                            });
-                            Ok(if due.len() > max_keys {
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
-                            })
-                        }
-                        [STRUCTURE_HASH_EXPIRY_LIVE] => {
-                            let metadata = tree
-                                .get_cached_pinned(
-                                    &self.pages,
-                                    &self.buffer_pool,
-                                    &structure_hash_meta_key(key),
-                                )?
-                                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                            let metadata = decode_live_hash_metadata(metadata.bytes())?
-                                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-                            if metadata.expires_at_micros != Some(expiry) {
-                                return Err(NativeRuntimeError::InvalidStructureTree);
-                            }
-                            due.push(DueStructureKey {
-                                kind: DueStructureKind::Hash,
-                                key: key.to_vec(),
-                            });
-                            Ok(if due.len() > max_keys {
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
-                            })
-                        }
-                        _ => Err(NativeRuntimeError::InvalidStructureTree),
+                    if let Some(due_key) =
+                        self.validate_due_structure_key(tree, expiry, key, marker)?
+                    {
+                        due.push(due_key);
                     }
+                    Ok(if due.len() > max_keys {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
                 })();
                 match result {
                     Ok(control) => control,
@@ -3168,6 +3130,50 @@ impl NativeDatabase {
         let more_due = due.len() > max_keys;
         due.truncate(max_keys);
         Ok((due, more_due))
+    }
+
+    fn validate_due_structure_key(
+        &self,
+        tree: BTree,
+        expiry: i64,
+        key: &[u8],
+        marker: &[u8],
+    ) -> Result<Option<DueStructureKey>, NativeRuntimeError> {
+        let (kind, actual_expiry) = match marker {
+            [STRUCTURE_EXPIRY_TOMBSTONE] => return Ok(None),
+            [STRUCTURE_EXPIRY_LIVE] => {
+                let scalar = tree
+                    .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                (
+                    DueStructureKind::Scalar,
+                    structure_value_expiry(scalar.bytes())?,
+                )
+            }
+            [STRUCTURE_HASH_EXPIRY_LIVE] => {
+                let metadata = tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_hash_meta_key(key),
+                    )?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                (
+                    DueStructureKind::Hash,
+                    decode_live_hash_metadata(metadata.bytes())?
+                        .ok_or(NativeRuntimeError::InvalidStructureTree)?
+                        .expires_at_micros,
+                )
+            }
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        };
+        if actual_expiry != Some(expiry) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(Some(DueStructureKey {
+            kind,
+            key: key.to_vec(),
+        }))
     }
 
     fn latest_structure_entry(
