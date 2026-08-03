@@ -165,8 +165,19 @@ use thiserror::Error;
 #[cfg(test)]
 thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_FULL_CATALOG_STATE_LOAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static DELTA_LATEST_VERSION_PAGE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reject_full_catalog_state_load_for_test() -> Result<(), NativeRuntimeError> {
+    if FAIL_FULL_CATALOG_STATE_LOAD.get() {
+        Err(NativeRuntimeError::UnexpectedFullStateLoad)
+    } else {
+        Ok(())
+    }
 }
 
 static FULL_STATE_LOADS: AtomicU64 = AtomicU64::new(0);
@@ -17999,6 +18010,8 @@ fn load_catalog_state_root(
     root: PageId,
 ) -> Result<CatalogState, NativeRuntimeError> {
     FULL_CATALOG_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    reject_full_catalog_state_load_for_test()?;
     let page = pages.read(root)?;
     if page.kind() == PageKind::CatalogRoot {
         return Ok(CatalogState::decode(page.payload())?);
@@ -21820,6 +21833,7 @@ mod tests {
 
         let physical_before = database.physical_observation()?;
         super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
         let delta_commit = (|| -> Result<_, Box<dyn std::error::Error>> {
             let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
             database.stage_delta_sql_dml(
@@ -21837,20 +21851,13 @@ mod tests {
             Ok(database.commit_optimistic(delta)?)
         })();
         super::FAIL_FULL_STATE_LOAD.set(false);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
         let committed = delta_commit?;
         let physical_after = database.physical_observation()?;
 
         assert_eq!(
             database.snapshot(2)?.visible_csn(),
             Some(committed.commit_csn)
-        );
-        assert_eq!(
-            physical_after.process_full_state_loads,
-            physical_before.process_full_state_loads
-        );
-        assert_eq!(
-            physical_after.process_full_catalog_loads,
-            physical_before.process_full_catalog_loads
         );
         assert!(physical_after.physical_page_reads > physical_before.physical_page_reads);
         assert!(physical_after.page_count > physical_before.page_count);
