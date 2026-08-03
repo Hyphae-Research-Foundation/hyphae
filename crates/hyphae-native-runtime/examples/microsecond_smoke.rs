@@ -261,6 +261,7 @@ fn seed_secondary_sql_data(
             id BIGINT PRIMARY KEY,
             tenant TEXT NOT NULL,
             email TEXT NOT NULL,
+            ordered_email TEXT NOT NULL,
             scan_email TEXT NOT NULL,
             active BOOLEAN NOT NULL,
             payload BINARY NOT NULL
@@ -289,14 +290,17 @@ fn seed_secondary_sql_data(
         dataset_hasher.update(tenant.as_bytes());
         dataset_hasher.update(email.as_bytes());
         dataset_hasher.update(email.as_bytes());
+        dataset_hasher.update(email.as_bytes());
         dataset_hasher.update(&[u8::from(active)]);
         dataset_hasher.update(&payload);
         transaction.execute_sql(
-            "INSERT INTO benchmark_people (id, tenant, email, scan_email, active, payload)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO benchmark_people
+             (id, tenant, email, ordered_email, scan_email, active, payload)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             &[
                 SqlValue::Signed(i64::from(row)),
                 SqlValue::Text(tenant.to_owned()),
+                SqlValue::Text(email.clone()),
                 SqlValue::Text(email.clone()),
                 SqlValue::Text(email),
                 SqlValue::Boolean(active),
@@ -317,7 +321,7 @@ fn seed_secondary_sql_data(
     };
     transaction.execute_sql(
         "CREATE INDEX benchmark_people_tenant_email
-         ON benchmark_people (tenant, email)",
+         ON benchmark_people (tenant, ordered_email)",
         &[],
     )?;
     Ok((table, index))
@@ -886,8 +890,8 @@ fn prepare_secondary_prefix_range_benchmark(
     )?;
     let physical_prepared = database.prepare_sql_latest(
         "SELECT id, payload FROM benchmark_people
-         WHERE email >= ? AND tenant = ? AND email < ?
-         ORDER BY tenant, email
+         WHERE ordered_email >= ? AND tenant = ? AND ordered_email < ?
+         ORDER BY tenant, ordered_email
          LIMIT 10",
     )?;
     let parameters = vec![
