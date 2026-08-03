@@ -19,10 +19,10 @@ Benchmark source tree:
 `faab7aa72005a03494b33a4d3931ccdad52bebdd`
 
 Final verification commit:
-`1ff7793c4d6c36876df803d79580d1d78e759eef`
+`c042af5b028a77c448985a7dd8d49e266f809322`
 
 Final verification tree:
-`c38c528fa95465e6d99fc5bd6e0e0e91c4de7c16`
+`7201f0fdfb7c1f4e590709bf9e02debe2a539968`
 
 Harness SHA-256:
 `1e75b6cb8e610eb3df79bd9f553b92becca98a1c96588f9826c1e95d1c226113`
@@ -153,18 +153,24 @@ JSON examples.
 Validation-log SHA-256:
 
 - workspace tests:
-  `2e1c46cb5087b54a0c1b04482527ecc3ba07949ba9f4178c8bcf37fea5060083`;
+  `1480066d39ec65d9fe0c744ecc63cd9115ab603c81f45725f3296a8e9d619eaa`;
 - Clippy:
-  `9f56d52ae1a1e5678d40b5657f89b9731a0d6a77209bf41c18bedca5339a208a`;
+  `a415fde2923d5bf8ec1163c18f19850b4e9f3a3aa5201774fb0459b0a7e048f5`;
 - Rustdoc:
-  `73b8ae6064b5247e05d7d18198f92db5f19fe6c67b32ceb3f2043205ae047e76`;
+  `af6664beb508e112d56c7fcfe072f2671d93d067c519fb03b111aff4cc0666dc`;
 - release example check:
-  `24fabc76eabcd36f4516611c2251b444244288cc9589db263ca303ddad1ca7e5`;
+  `92434e198f27984c035c376ec77a7cf9e6ebdde782f8ccb1336ae3329b66ddb7`;
 - documentation:
   `497e5c16ecc24493c799b372f00ec661307c015d594e3d93c69e6a300274a054`;
   and
 - formatting (an empty success log):
   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+
+The first hosted macOS run exposed a fixture-only portability defect:
+GitHub's macOS `TMPDIR` plus the socket name exceeded `sockaddr_un.sun_path`.
+Commit `c042af5b028a77c448985a7dd8d49e266f809322` moves only the Unix test
+fixture into a unique short directory below `/tmp`; product endpoint behavior
+and the measured Linux harness are unchanged.
 
 Hosted Linux/macOS/Windows, dependency, security, fuzz, and stress lanes remain
 PR evidence. Mutation testing was not executed because this repository has no
