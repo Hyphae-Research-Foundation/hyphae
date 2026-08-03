@@ -31552,4 +31552,210 @@ mod tests {
         );
         Ok(())
     }
+
+    fn commit_crash_boundaries() -> [CommitBoundary; 7] {
+        [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ]
+    }
+
+    #[test]
+    fn every_hash_field_expiry_boundary_recovers_persistent_or_complete_ttl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"map".to_vec())?;
+            seed.hset(b"map".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+            seed.commit()?;
+
+            let mut expiry = database.begin(20, DurabilityClass::Strict)?;
+            assert!(expiry.expire_hash_field(b"map".to_vec(), b"field".to_vec(), 100)?);
+            assert!(matches!(
+                expiry.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let ttl = reopened.ttl_latest_hash_field(b"map", b"field", 21)?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(ttl, super::Ttl::Persistent),
+                Some(2) => assert_eq!(ttl, super::Ttl::RemainingMicros(79)),
+                found => {
+                    return Err(format!(
+                        "unexpected recovered hash field expiry CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            assert_eq!(
+                reopened.hget_latest_hash_at(b"map", b"field", 21)?,
+                Some(b"value".to_vec())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_hash_field_cleanup_boundary_recovers_due_or_complete_tombstone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.create_hash(b"map".to_vec())?;
+            seed.hset(b"map".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+            assert!(seed.expire_hash_field(b"map".to_vec(), b"field".to_vec(), 10)?);
+            seed.commit()?;
+            assert!(matches!(
+                database.expire_due_structures_at(
+                    10,
+                    1,
+                    DurabilityClass::Strict,
+                    Some(boundary),
+                ),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let root = reopened
+                .coordinator
+                .snapshot(10)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let tree = hyphae_native_btree::BTree::from_root(root);
+            let field = tree
+                .get(
+                    &reopened.pages,
+                    &super::structure_hash_field_key(b"map", b"field")?,
+                )?
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            let index = tree
+                .get(
+                    &reopened.pages,
+                    &super::structure_hash_field_expiry_key(10, b"map", b"field")?,
+                )?
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(1) => {
+                    assert!(!super::is_structure_tombstone(&field));
+                    assert_eq!(index, vec![super::STRUCTURE_HASH_FIELD_EXPIRY_LIVE]);
+                }
+                Some(2) => {
+                    assert!(super::is_structure_tombstone(&field));
+                    assert_eq!(index, vec![super::STRUCTURE_EXPIRY_TOMBSTONE]);
+                }
+                found => {
+                    return Err(format!(
+                        "unexpected recovered hash field cleanup CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_hash_field_expiry_forgery_rejected(
+        database: &mut NativeDatabase,
+        roots: &hyphae_native_mvcc::RootSet,
+        root: PageId,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forged_tree = hyphae_native_btree::BTree::from_root(root)
+            .upsert(&mut database.pages, Csn::new(1)?, key, value)?
+            .tree;
+        let mut forged_roots = roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        forged_roots.insert(
+            super::SLOT_STRUCTURE,
+            forged_tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let forged = hyphae_native_mvcc::RootSet::committed(
+            roots
+                .visible_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots.catalog_version(),
+            roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_roots,
+            roots.blob_generation(),
+        )?;
+        assert!(matches!(
+            super::load_structure_state(&database.pages, &database.blobs, &forged),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn hash_field_expiry_index_corruption_fails_complete_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"map".to_vec())?;
+        seed.hset(b"map".to_vec(), b"leased".to_vec(), b"value".to_vec())?;
+        seed.hset(b"map".to_vec(), b"persistent".to_vec(), b"value".to_vec())?;
+        assert!(seed.expire_hash_field(b"map".to_vec(), b"leased".to_vec(), 10)?);
+        seed.commit()?;
+        let roots = database.coordinator.snapshot(2)?.roots().clone();
+        let root = roots
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let persistent =
+            super::structure_storage_value(b"value", None, &std::collections::BTreeMap::new())?;
+        let expiring =
+            super::structure_storage_value(b"value", Some(20), &std::collections::BTreeMap::new())?;
+        let forgeries = vec![
+            (
+                super::structure_hash_field_expiry_key(10, b"map", b"leased")?,
+                vec![super::STRUCTURE_EXPIRY_TOMBSTONE],
+            ),
+            (
+                super::structure_hash_field_expiry_key(9, b"map", b"leased")?,
+                vec![super::STRUCTURE_HASH_FIELD_EXPIRY_LIVE],
+            ),
+            (
+                super::structure_hash_field_expiry_key(10, b"map", b"orphan")?,
+                vec![super::STRUCTURE_HASH_FIELD_EXPIRY_LIVE],
+            ),
+            (
+                super::structure_hash_field_expiry_key(10, b"map", b"leased")?,
+                vec![2],
+            ),
+            (vec![super::STRUCTURE_HASH_FIELD_EXPIRY_PREFIX, 0], vec![1]),
+            (
+                super::structure_hash_field_key(b"map", b"leased")?,
+                persistent,
+            ),
+            (
+                super::structure_hash_field_key(b"map", b"persistent")?,
+                expiring,
+            ),
+        ];
+        for (key, value) in forgeries {
+            assert_hash_field_expiry_forgery_rejected(&mut database, &roots, root, key, value)?;
+        }
+        Ok(())
+    }
 }
