@@ -1,6 +1,9 @@
 # Native whole-set lifecycle v1
 
-Status: frozen contract; implementation and evidence pending.
+Status: implemented and directly verified on Linux; hosted checks pending.
+
+Evidence:
+[Native whole-set lifecycle evidence on Linux — 2026-08-03](../gates/evidence/native-set-lifecycle-linux-2026-08-03.md).
 
 This contract extends
 [Native structure-engine semantics v1](structures-semantics-v1.md),

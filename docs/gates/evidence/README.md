@@ -359,6 +359,16 @@ commit before its tag can be published.
   scans, private batch preparation, memory/strict commits, and a matched
   parent/current persistent-read control. It remains outside complete G3 and
   G7.
+- [Native whole-set lifecycle evidence —
+  2026-08-03](native-set-lifecycle-linux-2026-08-03.md) binds explicit
+  complete-set deletion, retained snapshots, same-transaction recreation as
+  every implemented structure family, lifecycle conflicts, all seven
+  singleton delete and replacement crash boundaries, reached corruption,
+  compaction, vacuum, and reopen to direct Linux.
+- `native-set-lifecycle-linux.json` records cardinality-separated private
+  deletion plus Memory and Strict publication for empty, 64-member, and
+  2,048-member sets. It remains outside process-kill/power-loss evidence,
+  complete G3, and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

@@ -209,6 +209,16 @@ compaction, page vacuum, and matched direct-Linux latency. Relative or
 conditional expiry, persist, per-member TTL, destination algebra, complete
 G3, and G7 remain open.
 
+The [native whole-set lifecycle
+evidence](evidence/native-set-lifecycle-linux-2026-08-03.md) promotes the
+existing internal `DELETE_SET=34` path to an explicit embedded operation.
+It proves complete retirement, retained history, same-transaction recreation
+as every implemented structure family, lifecycle conflicts, all seven
+singleton delete and replacement crash boundaries, fail-closed corruption,
+compaction, page vacuum, and direct-Linux cardinality-sensitive latency.
+Generic `DEL`, protocol compatibility, process-kill/block replay, complete
+G3, and G7 remain open.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with

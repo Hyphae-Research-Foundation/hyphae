@@ -151,6 +151,18 @@ at p95, inside its frozen 10% gate. The checked
 logical, physical, publication, durability, and cardinality-sensitive cleanup
 surfaces and does not pass G7.
 
+Whole-set lifecycle uses a separate direct-Linux release harness because
+physical deletion validates and tombstones the complete member prefix.
+At 2,048 members, private `DELETE_SET` preparation observed p50 `27.598 us`,
+Memory commit p50 `2.470 ms`, and Strict commit p50 `10.851 ms`. Empty-set
+private preparation observed p50 `0.101 us`; Strict publication remained
+`6.483 ms` because it includes ext4/EBS page and WAL synchronization. The
+checked
+[receipt](../gates/evidence/native-set-lifecycle-linux-2026-08-03.md)
+keeps private, unsynchronized publication, and synchronized publication as
+separate surfaces. It does not infer synchronization time by subtracting
+independent runs and does not pass G7.
+
 Bounded hash field commands use a third direct-Linux harness over one
 2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
 `0.853 us` per field, compared with `47.334 us` total and `1.479 us` per
