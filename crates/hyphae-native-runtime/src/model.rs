@@ -725,6 +725,36 @@ impl StructureState {
             .flatten()
     }
 
+    pub(crate) fn hscan_reverse(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let fields = self.hashes.get(key)?;
+        Some(
+            fields
+                .iter()
+                .rev()
+                .filter(|(field, _)| start_before.is_none_or(|cursor| field.as_slice() < cursor))
+                .take(limit)
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn hscan_reverse_at(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.hash_is_visible(key, logical_time_micros)
+            .then(|| self.hscan_reverse(key, start_before, limit))
+            .flatten()
+    }
+
     pub(crate) fn create_set(&mut self, key: Vec<u8>) -> bool {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
@@ -1557,6 +1587,42 @@ mod tests {
             structures.hget_many_at(b"profile", &[b"age".to_vec()], 10),
             None
         );
+    }
+
+    #[test]
+    fn reverse_hash_scan_is_descending_and_cursor_exclusive() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"map".to_vec()));
+        for (field, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (b"a".as_slice(), b"one".as_slice()),
+            (b"a\0".as_slice(), b"two".as_slice()),
+            (b"b".as_slice(), b"three".as_slice()),
+            (b"z".as_slice(), b"four".as_slice()),
+        ] {
+            assert_eq!(
+                structures.hset(b"map", field.to_vec(), value.to_vec()),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            structures.hscan_reverse(b"map", None, 3),
+            Some(vec![
+                (b"z".to_vec(), b"four".to_vec()),
+                (b"b".to_vec(), b"three".to_vec()),
+                (b"a\0".to_vec(), b"two".to_vec()),
+            ])
+        );
+        assert_eq!(
+            structures.hscan_reverse(b"map", Some(b"b"), 10),
+            Some(vec![
+                (b"a\0".to_vec(), b"two".to_vec()),
+                (b"a".to_vec(), b"one".to_vec()),
+                (b"".to_vec(), b"empty".to_vec()),
+            ])
+        );
+        assert!(structures.expire_hash(b"map", 10, 9));
+        assert_eq!(structures.hscan_reverse_at(b"map", None, 1, 10), None);
     }
 
     #[test]

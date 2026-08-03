@@ -1373,6 +1373,38 @@ impl NativeSnapshot {
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
+    /// Scans one bounded descending range of hash fields in this snapshot.
+    ///
+    /// `start_before` is an exclusive exact-field cursor. A zero `limit`
+    /// validates the hash and returns no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, another structure
+    /// kind, or a missing or expired hash.
+    pub fn hscan_reverse(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if let Some(cursor) = start_before {
+            validate_hash_field_identity(key, cursor)?;
+        }
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hscan_reverse_at(key, start_before, limit, self.metadata.logical_time_micros)
+            .map(hash_field_entries)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
+    }
+
     /// Tests exact membership in an existing native set in this snapshot.
     ///
     /// # Errors
@@ -3639,6 +3671,129 @@ impl NativeDatabase {
                 if entries.len() < limit {
                     entries.push(entry);
                 }
+                if entries.len() == limit && !verify_complete {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if verify_complete && (outcome != ControlFlow::Continue(()) || live_count != declared_count)
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(entries)
+    }
+
+    /// Scans one bounded current hash-field range in descending exact-byte
+    /// order without materializing the complete hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid cursor identity,
+    /// another structure kind, a missing hash, or malformed reached state.
+    pub fn hscan_reverse_latest_hash(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        self.hscan_reverse_latest_hash_at(key, start_before, limit, i64::MIN)
+    }
+
+    /// Scans one descending current hash-field range at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid cursor identity,
+    /// another structure kind, a missing or expired hash, or malformed
+    /// reached physical state.
+    pub fn hscan_reverse_latest_hash_at(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.hash_scan_reverse_in_tree_at(
+            BTree::from_root(root),
+            key,
+            start_before,
+            limit,
+            logical_time_micros,
+        )
+    }
+
+    #[cfg(test)]
+    fn hash_scan_reverse_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        self.hash_scan_reverse_in_tree_at(tree, key, start_before, limit, i64::MIN)
+    }
+
+    fn hash_scan_reverse_in_tree_at(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        let metadata = self.visible_hash_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let declared_count = usize::try_from(metadata.field_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let upper_key = start_before
+            .map(|field| structure_hash_field_key(key, field))
+            .transpose()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = structure_hash_field_key(key, &[])?;
+        let upper = upper_key
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let verify_complete = start_before.is_none() && limit >= declared_count;
+        let mut live_count = 0_usize;
+        let mut entries = Vec::with_capacity(limit.min(declared_count).min(256));
+        let mut failure = None;
+        let outcome = tree.visit_prefix_range_cached_reverse(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            Bound::Unbounded,
+            upper,
+            |physical_key, encoded| {
+                let decoded = decode_hash_scan_entry(physical_key, encoded, key, &self.blobs);
+                let Some(entry) = (match decoded {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }) else {
+                    return ControlFlow::Continue(());
+                };
+                live_count += 1;
+                if live_count > declared_count {
+                    failure = Some(NativeRuntimeError::InvalidStructureTree);
+                    return ControlFlow::Break(());
+                }
+                entries.push(entry);
                 if entries.len() == limit && !verify_complete {
                     ControlFlow::Break(())
                 } else {
@@ -7030,6 +7185,38 @@ impl NativeWriteBatch {
         self.state
             .structures
             .hscan_at(key, start_after, limit, self.snapshot.logical_time_micros)
+            .map(hash_field_entries)
+            .ok_or(NativeRuntimeError::UnknownStructureHash)
+    }
+
+    /// Scans one bounded descending range of fields through private writes.
+    ///
+    /// `start_before` is an exclusive exact-field cursor. A zero `limit`
+    /// validates the hash and returns no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, another structure
+    /// kind, or a missing or expired hash.
+    pub fn hscan_reverse(
+        &self,
+        key: &[u8],
+        start_before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        if let Some(cursor) = start_before {
+            validate_hash_field_identity(key, cursor)?;
+        }
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .hscan_reverse_at(key, start_before, limit, self.snapshot.logical_time_micros)
             .map(hash_field_entries)
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
@@ -19226,6 +19413,276 @@ mod tests {
                 Some(1_023_u32.to_be_bytes().as_slice()),
                 4,
             )?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_hash_scan_matches_private_snapshot_latest_time_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"reverse-map".to_vec())?;
+        for (field, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (b"a".as_slice(), b"one".as_slice()),
+            (b"a\0".as_slice(), b"two".as_slice()),
+            (b"b".as_slice(), b"three".as_slice()),
+            (b"z".as_slice(), b"four".as_slice()),
+        ] {
+            seed.hset(b"reverse-map".to_vec(), field.to_vec(), value.to_vec())?;
+        }
+        assert!(seed.expire_hash(b"reverse-map".to_vec(), 100)?);
+        let initial = [
+            HashFieldEntry::new(b"z".to_vec(), b"four".to_vec()),
+            HashFieldEntry::new(b"b".to_vec(), b"three".to_vec()),
+            HashFieldEntry::new(b"a\0".to_vec(), b"two".to_vec()),
+            HashFieldEntry::new(b"a".to_vec(), b"one".to_vec()),
+            HashFieldEntry::new(b"".to_vec(), b"empty".to_vec()),
+        ];
+        assert_eq!(seed.hscan_reverse(b"reverse-map", None, 10)?, initial);
+        seed.commit()?;
+        let historical = database.snapshot(11)?;
+
+        let mut mutate = database.begin(12, DurabilityClass::Strict)?;
+        mutate.hset(b"reverse-map".to_vec(), b"a".to_vec(), b"updated".to_vec())?;
+        assert!(mutate.hdelete(b"reverse-map".to_vec(), b"b".to_vec())?);
+        mutate.hset(b"reverse-map".to_vec(), b"c".to_vec(), b"new".to_vec())?;
+        let current = [
+            HashFieldEntry::new(b"z".to_vec(), b"four".to_vec()),
+            HashFieldEntry::new(b"c".to_vec(), b"new".to_vec()),
+            HashFieldEntry::new(b"a\0".to_vec(), b"two".to_vec()),
+            HashFieldEntry::new(b"a".to_vec(), b"updated".to_vec()),
+            HashFieldEntry::new(b"".to_vec(), b"empty".to_vec()),
+        ];
+        assert_eq!(mutate.hscan_reverse(b"reverse-map", None, 10)?, current);
+        mutate.commit()?;
+
+        assert_eq!(
+            historical.hscan_reverse(b"reverse-map", Some(b"b".as_slice()), 10)?,
+            initial[2..]
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash_at(b"reverse-map", None, 10, 99)?,
+            current
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash_at(b"reverse-map", Some(b"d".as_slice()), 10, 99,)?,
+            current[1..]
+        );
+        assert!(matches!(
+            database.hscan_reverse_latest_hash_at(b"reverse-map", None, 10, 100),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_reverse_latest_hash_at(b"reverse-map", None, 10, 101),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_reverse_latest_hash_at(b"reverse-map", None, 10, 99)?,
+            current
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_hash_scan_validates_limits_cursors_types_and_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"reverse".to_vec())?;
+        seed.hset(b"reverse".to_vec(), b"".to_vec(), b"empty".to_vec())?;
+        seed.hset(b"reverse".to_vec(), b"a".to_vec(), b"one".to_vec())?;
+        seed.hset(b"reverse".to_vec(), b"b".to_vec(), b"two".to_vec())?;
+        seed.create_hash(b"empty".to_vec())?;
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+
+        let expected = [
+            HashFieldEntry::new(b"b".to_vec(), b"two".to_vec()),
+            HashFieldEntry::new(b"a".to_vec(), b"one".to_vec()),
+            HashFieldEntry::new(b"".to_vec(), b"empty".to_vec()),
+        ];
+        assert!(
+            database
+                .hscan_reverse_latest_hash(b"reverse", Some(b"".as_slice()), 10)?
+                .is_empty()
+        );
+        assert!(
+            database
+                .hscan_reverse_latest_hash(b"reverse", None, 0)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash(b"reverse", None, 1)?,
+            expected[..1]
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash(b"reverse", None, 3)?,
+            expected
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash(b"reverse", None, 10)?,
+            expected
+        );
+        assert!(
+            database
+                .hscan_reverse_latest_hash(b"empty", None, 10)?
+                .is_empty()
+        );
+        assert!(matches!(
+            database.hscan_reverse_latest_hash(b"missing", None, 0),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_reverse_latest_hash(b"scalar", None, 0),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+
+        let oversized_cursor = vec![0_u8; 65_536];
+        assert!(matches!(
+            database.hscan_reverse_latest_hash(b"reverse", Some(oversized_cursor.as_slice()), 0,),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        let snapshot = database.snapshot(11)?;
+        assert!(matches!(
+            snapshot.hscan_reverse(b"reverse", Some(oversized_cursor.as_slice()), 0),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        let batch = database.begin(12, DurabilityClass::Memory)?;
+        assert!(matches!(
+            batch.hscan_reverse(b"reverse", Some(oversized_cursor.as_slice()), 0),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        Ok(())
+    }
+
+    fn assert_reverse_hash_scan_corruption_boundaries(
+        database: &mut NativeDatabase,
+        expected: &[HashFieldEntry],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = database
+            .coordinator
+            .snapshot(103)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = hyphae_native_btree::BTree::from_root(root);
+        let invalid_lower_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::structure_hash_field_key(b"large-reverse", &1_u32.to_be_bytes())?,
+                vec![0xff],
+            )?
+            .tree;
+        assert_eq!(
+            database.hash_scan_reverse_in_tree(invalid_lower_tree, b"large-reverse", None, 4,)?,
+            expected
+        );
+        assert!(matches!(
+            database.hash_scan_reverse_in_tree(invalid_lower_tree, b"large-reverse", None, 2_048,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let invalid_reached_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(2)?,
+                super::structure_hash_field_key(b"large-reverse", &2_047_u32.to_be_bytes())?,
+                vec![0xff],
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_scan_reverse_in_tree(invalid_reached_tree, b"large-reverse", None, 1,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let invalid_count_tree = tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(3)?,
+                super::structure_hash_meta_key(b"large-reverse"),
+                super::encode_hash_metadata(0),
+            )?
+            .tree;
+        assert!(matches!(
+            database.hash_scan_reverse_in_tree(invalid_count_tree, b"large-reverse", None, 1,),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let blob_key = super::structure_hash_field_key(b"large-reverse", &2_047_u32.to_be_bytes())?;
+        let mut invalid_blob = tree
+            .get(&database.pages, &blob_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let last = invalid_blob
+            .last_mut()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        *last ^= 1;
+        let invalid_blob_tree = tree
+            .upsert(&mut database.pages, Csn::new(4)?, blob_key, invalid_blob)?
+            .tree;
+        assert!(
+            database
+                .hash_scan_reverse_in_tree(invalid_blob_tree, b"large-reverse", None, 1,)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_reverse_hash_scan_prunes_stops_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let blob = vec![0x41; 9_000];
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_hash(b"large-reverse".to_vec())?;
+        for index in 0..2_048_u32 {
+            let value = if index == 2_047 {
+                blob.clone()
+            } else {
+                vec![u8::try_from(index % 251)?; 64]
+            };
+            seed.hset(
+                b"large-reverse".to_vec(),
+                index.to_be_bytes().to_vec(),
+                value,
+            )?;
+        }
+        seed.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"large-reverse".to_vec(), 2_044_u32.to_be_bytes().to_vec(),)?);
+        mutate.commit()?;
+        let expected = [2_047_u32, 2_046, 2_045, 2_043]
+            .into_iter()
+            .map(|index| {
+                let value = if index == 2_047 {
+                    blob.clone()
+                } else {
+                    vec![u8::try_from(index % 251)?; 64]
+                };
+                Ok(HashFieldEntry::new(index.to_be_bytes().to_vec(), value))
+            })
+            .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+        assert_eq!(
+            database.hscan_reverse_latest_hash(b"large-reverse", None, 4)?,
+            expected
+        );
+        assert_reverse_hash_scan_corruption_boundaries(&mut database, &expected)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.hscan_reverse_latest_hash(b"large-reverse", None, 4)?,
             expected
         );
         Ok(())
