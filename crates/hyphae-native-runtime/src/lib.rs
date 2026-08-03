@@ -123,6 +123,7 @@ use std::{
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -167,6 +168,8 @@ thread_local! {
     static DELTA_LATEST_VERSION_PAGE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
+
+static FULL_STATE_LOADS: AtomicU64 = AtomicU64::new(0);
 
 use crate::{
     hash_pattern::HashPatternMatchBudget,
@@ -1018,6 +1021,19 @@ fn build_recovery_report(evidence: &OpenRecoveryReport<'_>) -> RecoveryReport {
         recovered_temporary_blobs: evidence.blob_recovery.recovered_temporary_files,
         recovered_temporary_wal_anchors: evidence.recovered_temporary_wal_anchors,
     }
+}
+
+/// Monotonic physical counters for one open database handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativePhysicalObservation {
+    /// Complete immutable pages in the active page-file generation.
+    pub page_count: u64,
+    /// Verified physical page reads issued by the active page-store handle.
+    pub physical_page_reads: u64,
+    /// Current physical bytes in the active WAL file.
+    pub wal_bytes: u64,
+    /// Process-wide complete all-engine state materializations.
+    pub process_full_state_loads: u64,
 }
 
 /// Receipt for one cross-engine native commit.
@@ -6417,6 +6433,23 @@ impl NativeDatabase {
             return Ok(0);
         };
         Ok(BTree::from_root(root).height(&self.pages)?)
+    }
+
+    /// Returns monotonic physical counters for bounded delta evidence.
+    ///
+    /// Subtract two observations from the same open handle to isolate page
+    /// reads, page appends, WAL growth, and complete-state loads for a route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when WAL file metadata cannot be read.
+    pub fn physical_observation(&self) -> Result<NativePhysicalObservation, NativeRuntimeError> {
+        Ok(NativePhysicalObservation {
+            page_count: self.pages.page_count(),
+            physical_page_reads: self.pages.physical_read_count(),
+            wal_bytes: fs::metadata(self.data_directory.join(WAL_FILE))?.len(),
+            process_full_state_loads: FULL_STATE_LOADS.load(Ordering::Relaxed),
+        })
     }
 
     /// Prepares one detached optimistic write transaction.
@@ -17717,6 +17750,7 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
+    FULL_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]
     if FAIL_FULL_STATE_LOAD.get() {
         return Err(NativeRuntimeError::UnexpectedFullStateLoad);
@@ -21349,6 +21383,7 @@ mod tests {
         seed.create_search_index(index, "documents")?;
         seed.commit()?;
 
+        let physical_before = database.physical_observation()?;
         super::FAIL_FULL_STATE_LOAD.set(true);
         let delta_commit = (|| -> Result<_, Box<dyn std::error::Error>> {
             let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
@@ -21368,11 +21403,19 @@ mod tests {
         })();
         super::FAIL_FULL_STATE_LOAD.set(false);
         let committed = delta_commit?;
+        let physical_after = database.physical_observation()?;
 
         assert_eq!(
             database.snapshot(2)?.visible_csn(),
             Some(committed.commit_csn)
         );
+        assert_eq!(
+            physical_after.process_full_state_loads,
+            physical_before.process_full_state_loads
+        );
+        assert!(physical_after.physical_page_reads > physical_before.physical_page_reads);
+        assert!(physical_after.page_count > physical_before.page_count);
+        assert!(physical_after.wal_bytes > physical_before.wal_bytes);
         assert_eq!(
             database.get_latest_structure(b"joint-key", 2)?,
             Some(b"delta".to_vec())
