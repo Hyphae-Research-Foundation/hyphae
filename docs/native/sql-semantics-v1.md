@@ -415,7 +415,8 @@ executable; JSON is declaration-only until its canonical scalar validator
 exists. General expressions beyond the admitted residual-filter slice,
 remaining literal families, casts, descending scans, offsets, and constraints
 beyond primary key/nullability and the first unique index remain pending.
-Secondary equality-prefix ranges are specified above but remain pending.
+Secondary equality-prefix ranges on ordered `HYRIDX02` indexes are implemented
+as specified above.
 Index unions/intersections and ranges over a legacy length-first secondary
 layout remain pending. Typed mutation does
 not yet change primary keys, use a secondary access path, evaluate general

@@ -428,9 +428,28 @@ struct SecondaryIndexRangeEndpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SecondaryIndexPrefixRangeEndpoint {
+    operand: BoundScalarOperand,
+    inclusive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecondaryIndexRangeKind {
+    Complete {
+        lower: Option<SecondaryIndexRangeEndpoint>,
+        upper: Option<SecondaryIndexRangeEndpoint>,
+    },
+    Prefix {
+        prefix: KeyBinding,
+        range_column: usize,
+        lower: Option<SecondaryIndexPrefixRangeEndpoint>,
+        upper: Option<SecondaryIndexPrefixRangeEndpoint>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SecondaryIndexRange {
-    lower: Option<SecondaryIndexRangeEndpoint>,
-    upper: Option<SecondaryIndexRangeEndpoint>,
+    kind: SecondaryIndexRangeKind,
     parameter_count: usize,
 }
 
@@ -2880,13 +2899,14 @@ fn execute_explain(
             index,
             range,
             limit,
-        } => format!(
-            "SecondaryIndexRangeScan(table={},index={index},lower={},upper={},limit={limit}{}",
+        } => explain_secondary_index_range(
+            &transaction.state.catalog,
             bound.table,
-            secondary_range_bound_name(range.lower.as_ref()),
-            secondary_range_bound_name(range.upper.as_ref()),
-            explain_suffix(bound.residual),
-        ),
+            bound.residual,
+            index,
+            &range,
+            limit,
+        )?,
         SelectAccess::PrimaryKeyScan { limit, .. } => {
             format!(
                 "PrimaryKeyScan(table={},limit={limit}{}",
@@ -2929,6 +2949,49 @@ fn execute_explain(
     Ok(SqlResult::Rows {
         columns: vec!["plan".to_owned()],
         rows: vec![vec![SqlValue::Text(plan)]],
+    })
+}
+
+fn explain_secondary_index_range(
+    catalog: &crate::model::CatalogState,
+    table: ObjectId,
+    residual: bool,
+    index: ObjectId,
+    range: &SecondaryIndexRange,
+    limit: usize,
+) -> Result<String, SqlError> {
+    Ok(match &range.kind {
+        SecondaryIndexRangeKind::Complete { lower, upper } => format!(
+            "SecondaryIndexRangeScan(table={},index={index},lower={},upper={},limit={limit}{}",
+            table,
+            secondary_range_bound_name(lower.as_ref()),
+            secondary_range_bound_name(upper.as_ref()),
+            explain_suffix(residual),
+        ),
+        SecondaryIndexRangeKind::Prefix {
+            prefix,
+            range_column,
+            lower,
+            upper,
+        } => {
+            let relation = relation_by_id(catalog, table)?;
+            let range_column = relation
+                .columns
+                .get(*range_column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .id
+                .get();
+            format!(
+                "SecondaryIndexPrefixRangeScan(table={},index={index},\
+                 prefix_columns={},range_column={range_column},lower={},\
+                 upper={},limit={limit}{}",
+                table,
+                prefix.columns.len(),
+                secondary_prefix_range_bound_name(lower.as_ref()),
+                secondary_prefix_range_bound_name(upper.as_ref()),
+                explain_suffix(residual),
+            )
+        }
     })
 }
 
@@ -3598,7 +3661,7 @@ fn bind_select_access(
         query.limit,
     )? {
         access
-    } else if let Some(prefix) = find_primary_key_prefix(&comparisons, &expected_primary_key) {
+    } else if let Some(prefix) = find_key_prefix(&comparisons, &expected_primary_key) {
         let limit = query.limit.ok_or(SqlError::InvalidSyntax)?;
         validate_primary_key_order(definition, query.order_by, &expected_primary_key)?;
         let used_terms = prefix.columns.len();
@@ -4144,13 +4207,13 @@ fn find_equality_key(
     })
 }
 
-fn find_primary_key_prefix(
+fn find_key_prefix(
     comparisons: &[&BoundFilterExpression],
-    primary_key: &[usize],
+    key_columns: &[usize],
 ) -> Option<KeyBinding> {
-    let mut columns = Vec::with_capacity(primary_key.len().saturating_sub(1));
-    let mut operands = Vec::with_capacity(primary_key.len().saturating_sub(1));
-    for key_column in primary_key {
+    let mut columns = Vec::with_capacity(key_columns.len().saturating_sub(1));
+    let mut operands = Vec::with_capacity(key_columns.len().saturating_sub(1));
+    for key_column in key_columns {
         let matching = comparisons
             .iter()
             .filter_map(|comparison| {
@@ -4176,7 +4239,7 @@ fn find_primary_key_prefix(
         columns.push(*key_column);
         operands.push(operand.clone());
     }
-    (!columns.is_empty() && columns.len() < primary_key.len())
+    (!columns.is_empty() && columns.len() < key_columns.len())
         .then_some(KeyBinding { columns, operands })
 }
 
@@ -4184,7 +4247,7 @@ fn bind_primary_key_prefix_range_shape(
     comparisons: &[&BoundFilterExpression],
     primary_key: &[usize],
 ) -> Result<Option<(PrimaryKeyPrefixRange, usize)>, SqlError> {
-    let Some(prefix) = find_primary_key_prefix(comparisons, primary_key) else {
+    let Some(prefix) = find_key_prefix(comparisons, primary_key) else {
         return Ok(None);
     };
     let range_column = primary_key
@@ -4325,10 +4388,16 @@ fn bind_secondary_index_range_access(
             continue;
         }
         let columns = secondary_index_column_indices(definition, index_definition)?;
-        let Some((range, used_terms)) =
-            bind_secondary_index_range_shape(comparisons, &columns, parameter_count)?
-        else {
-            continue;
+        let bound_range = bind_secondary_index_range_shape(comparisons, &columns, parameter_count)?;
+        let (range, used_terms) = if let Some(range) = bound_range {
+            range
+        } else {
+            let Some(range) =
+                bind_secondary_index_prefix_range_shape(comparisons, &columns, parameter_count)?
+            else {
+                continue;
+            };
+            range
         };
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
         validate_secondary_index_order(definition, order_by, &columns)?;
@@ -4398,8 +4467,78 @@ fn bind_secondary_index_range_shape(
     }
     Ok(Some((
         SecondaryIndexRange {
-            lower,
-            upper,
+            kind: SecondaryIndexRangeKind::Complete { lower, upper },
+            parameter_count,
+        },
+        used_terms,
+    )))
+}
+
+fn bind_secondary_index_prefix_range_shape(
+    comparisons: &[&BoundFilterExpression],
+    index_columns: &[usize],
+    parameter_count: usize,
+) -> Result<Option<(SecondaryIndexRange, usize)>, SqlError> {
+    let Some(prefix) = find_key_prefix(comparisons, index_columns) else {
+        return Ok(None);
+    };
+    let range_column = index_columns
+        .get(prefix.columns.len())
+        .copied()
+        .ok_or(SqlError::InvalidSecondaryIndexRange)?;
+    let mut lower = None;
+    let mut upper = None;
+    let mut range_terms = 0_usize;
+    for predicate in comparisons {
+        let BoundFilterExpression::Comparison {
+            columns,
+            operator,
+            operands,
+        } = predicate
+        else {
+            continue;
+        };
+        if columns.as_slice() != [range_column] {
+            continue;
+        }
+        let [operand] = operands.as_slice() else {
+            return Err(SqlError::InvalidSecondaryIndexRange);
+        };
+        let endpoint = SecondaryIndexPrefixRangeEndpoint {
+            operand: operand.clone(),
+            inclusive: matches!(
+                operator,
+                ComparisonOperator::GreaterOrEqual | ComparisonOperator::LessOrEqual
+            ),
+        };
+        match operator {
+            ComparisonOperator::Greater | ComparisonOperator::GreaterOrEqual => {
+                if lower.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidSecondaryIndexRange);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Less | ComparisonOperator::LessOrEqual => {
+                if upper.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidSecondaryIndexRange);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual => {}
+        }
+    }
+    if lower.is_none() && upper.is_none() {
+        return Ok(None);
+    }
+    let used_terms = prefix.columns.len().saturating_add(range_terms);
+    Ok(Some((
+        SecondaryIndexRange {
+            kind: SecondaryIndexRangeKind::Prefix {
+                prefix,
+                range_column,
+                lower,
+                upper,
+            },
             parameter_count,
         },
         used_terms,
@@ -4474,6 +4613,16 @@ fn range_bound_name(endpoint: Option<&PrimaryKeyRangeEndpoint>) -> &'static str 
 }
 
 fn secondary_range_bound_name(endpoint: Option<&SecondaryIndexRangeEndpoint>) -> &'static str {
+    match endpoint {
+        Some(endpoint) if endpoint.inclusive => "inclusive",
+        Some(_) => "exclusive",
+        None => "unbounded",
+    }
+}
+
+fn secondary_prefix_range_bound_name(
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+) -> &'static str {
     match endpoint {
         Some(endpoint) if endpoint.inclusive => "inclusive",
         Some(_) => "exclusive",
@@ -4951,15 +5100,45 @@ fn bind_secondary_index_range(
     if parameters.len() != range.parameter_count {
         return Err(SqlError::ParameterMismatch);
     }
+    match &range.kind {
+        SecondaryIndexRangeKind::Complete { lower, upper } => bind_complete_secondary_index_range(
+            relation,
+            index,
+            lower.as_ref(),
+            upper.as_ref(),
+            parameters,
+        ),
+        SecondaryIndexRangeKind::Prefix {
+            prefix,
+            range_column,
+            lower,
+            upper,
+        } => bind_secondary_index_prefix_range(
+            relation,
+            index,
+            prefix,
+            *range_column,
+            lower.as_ref(),
+            upper.as_ref(),
+            parameters,
+        ),
+    }
+}
+
+fn bind_complete_secondary_index_range(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    lower: Option<&SecondaryIndexRangeEndpoint>,
+    upper: Option<&SecondaryIndexRangeEndpoint>,
+    parameters: &[SqlValue],
+) -> Result<Option<KeyBounds>, SqlError> {
     let Some(lower) =
-        bind_secondary_index_range_endpoint(relation, index, range.lower.as_ref(), parameters)?
-            .into_bound()
+        bind_secondary_index_range_endpoint(relation, index, lower, parameters)?.into_bound()
     else {
         return Ok(None);
     };
     let Some(upper) =
-        bind_secondary_index_range_endpoint(relation, index, range.upper.as_ref(), parameters)?
-            .into_bound()
+        bind_secondary_index_range_endpoint(relation, index, upper, parameters)?.into_bound()
     else {
         return Ok(None);
     };
@@ -4984,6 +5163,128 @@ fn bind_secondary_index_range_endpoint(
             None => BoundSecondaryIndexEndpoint::Null,
         },
     )
+}
+
+fn bind_secondary_index_prefix_range(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    prefix: &KeyBinding,
+    range_column: usize,
+    lower: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    upper: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    parameters: &[SqlValue],
+) -> Result<Option<KeyBounds>, SqlError> {
+    let prefix_column_count = prefix.columns.len();
+    let Some(encoded_prefix) = bind_secondary_index_prefix(relation, index, prefix, parameters)?
+    else {
+        return Ok(None);
+    };
+    let index_columns = secondary_index_column_indices(relation, index)?;
+    if index_columns.get(prefix_column_count) != Some(&range_column) {
+        return Err(SqlError::InvalidSecondaryIndexRange);
+    }
+    let logical_type = &relation
+        .columns
+        .get(range_column)
+        .ok_or(SqlError::InvalidCatalogObject)?
+        .logical_type;
+    let prefix_upper = binary_prefix_successor(&encoded_prefix);
+    let lower =
+        bind_secondary_index_prefix_lower(&encoded_prefix, lower, logical_type, parameters)?;
+    let Some(lower) = lower else {
+        return Ok(None);
+    };
+    let upper = bind_secondary_index_prefix_upper(
+        &encoded_prefix,
+        prefix_upper,
+        upper,
+        logical_type,
+        parameters,
+    )?;
+    let Some(upper) = upper else {
+        return Ok(None);
+    };
+    Ok(Some((lower, upper)))
+}
+
+fn bind_secondary_index_prefix(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    prefix: &KeyBinding,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let index_columns = secondary_index_column_indices(relation, index)?;
+    if prefix.columns.is_empty()
+        || prefix.columns.len() >= index_columns.len()
+        || !index_columns.starts_with(&prefix.columns)
+        || prefix.columns.len() != prefix.operands.len()
+    {
+        return Err(SqlError::InvalidSecondaryIndexRange);
+    }
+    let mut encoded = Vec::new();
+    for (column, operand) in prefix.columns.iter().zip(&prefix.operands) {
+        let value = resolve_operand(operand, parameters)?;
+        if matches!(value, SqlValue::Null) {
+            return Ok(None);
+        }
+        encoded = append_ordered_component(
+            &encoded,
+            value,
+            &relation
+                .columns
+                .get(*column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type,
+        )?;
+    }
+    Ok(Some(encoded))
+}
+
+fn bind_secondary_index_prefix_lower(
+    prefix: &[u8],
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    logical_type: &LogicalType,
+    parameters: &[SqlValue],
+) -> Result<Option<Bound<Vec<u8>>>, SqlError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(Some(Bound::Included(prefix.to_vec())));
+    };
+    let value = resolve_operand(&endpoint.operand, parameters)?;
+    if matches!(value, SqlValue::Null) {
+        return Ok(None);
+    }
+    let key = append_ordered_component(prefix, value, logical_type)?;
+    if endpoint.inclusive {
+        Ok(Some(Bound::Included(key)))
+    } else {
+        Ok(binary_prefix_successor(&key).map(Bound::Included))
+    }
+}
+
+fn bind_secondary_index_prefix_upper(
+    prefix: &[u8],
+    prefix_upper: Option<Vec<u8>>,
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    logical_type: &LogicalType,
+    parameters: &[SqlValue],
+) -> Result<Option<Bound<Vec<u8>>>, SqlError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(Some(prefix_upper.map_or(Bound::Unbounded, Bound::Excluded)));
+    };
+    let value = resolve_operand(&endpoint.operand, parameters)?;
+    if matches!(value, SqlValue::Null) {
+        return Ok(None);
+    }
+    let key = append_ordered_component(prefix, value, logical_type)?;
+    if endpoint.inclusive {
+        Ok(Some(
+            binary_prefix_successor(&key)
+                .or(prefix_upper)
+                .map_or(Bound::Unbounded, Bound::Excluded),
+        ))
+    } else {
+        Ok(Some(Bound::Excluded(key)))
+    }
 }
 
 fn validate_secondary_index_row(
