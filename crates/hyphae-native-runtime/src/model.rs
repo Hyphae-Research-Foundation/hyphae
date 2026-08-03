@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound;
 
 use hyphae_native_catalog::{
     CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
@@ -717,6 +718,34 @@ impl StructureState {
         )
     }
 
+    pub(crate) fn zrange_by_score(
+        &self,
+        key: &[u8],
+        lower: Bound<SortedSetScore>,
+        upper: Bound<SortedSetScore>,
+        offset: usize,
+        limit: usize,
+    ) -> Option<Vec<(Vec<u8>, SortedSetScore)>> {
+        let members = self.sorted_sets.get(key)?;
+        if limit == 0 || sorted_set_score_range_is_empty(&lower, &upper) {
+            return Some(Vec::new());
+        }
+        let mut ordered = members
+            .iter()
+            .map(|(member, score)| (*score, member))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable();
+        Some(
+            ordered
+                .into_iter()
+                .filter(|(score, _)| sorted_set_score_is_within(*score, &lower, &upper))
+                .skip(offset)
+                .take(limit)
+                .map(|(score, member)| (member.clone(), score))
+                .collect(),
+        )
+    }
+
     pub(crate) fn ttl_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
         self.visible_entry(key, logical_time_micros).map(|entry| {
             entry
@@ -788,6 +817,38 @@ pub(crate) fn normalize_list_range(length: usize, start: i64, stop: i64) -> Opti
         return None;
     }
     Some((usize::try_from(start).ok()?, usize::try_from(stop).ok()?))
+}
+
+pub(crate) fn sorted_set_score_range_is_empty(
+    lower: &Bound<SortedSetScore>,
+    upper: &Bound<SortedSetScore>,
+) -> bool {
+    match (lower, upper) {
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (
+            Bound::Included(lower) | Bound::Excluded(lower),
+            Bound::Included(upper) | Bound::Excluded(upper),
+        ) => lower >= upper,
+        _ => false,
+    }
+}
+
+fn sorted_set_score_is_within(
+    score: SortedSetScore,
+    lower: &Bound<SortedSetScore>,
+    upper: &Bound<SortedSetScore>,
+) -> bool {
+    let above_lower = match lower {
+        Bound::Included(lower) => score >= *lower,
+        Bound::Excluded(lower) => score > *lower,
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(upper) => score <= *upper,
+        Bound::Excluded(upper) => score < *upper,
+        Bound::Unbounded => true,
+    };
+    above_lower && below_upper
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
