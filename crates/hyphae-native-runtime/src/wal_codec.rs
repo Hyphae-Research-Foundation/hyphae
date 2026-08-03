@@ -67,6 +67,7 @@ pub(crate) enum Opcode {
     CompactStructure = 28,
     VacuumPageGeneration = 29,
     DeleteHash = 30,
+    ExpireHash = 31,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -627,6 +628,7 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
             (Opcode::DeleteHashField, EngineKind::Structure)
         }
         value if value == Opcode::DeleteHash as u8 => (Opcode::DeleteHash, EngineKind::Structure),
+        value if value == Opcode::ExpireHash as u8 => (Opcode::ExpireHash, EngineKind::Structure),
         value if value == Opcode::CreateSet as u8 => (Opcode::CreateSet, EngineKind::Structure),
         value if value == Opcode::AddSetMember as u8 => {
             (Opcode::AddSetMember, EngineKind::Structure)
@@ -746,6 +748,7 @@ fn validate_mutation_shape(
         | Opcode::ExpireValue
         | Opcode::CreateHash
         | Opcode::DeleteHash
+        | Opcode::ExpireHash
         | Opcode::SetHashField
         | Opcode::DeleteHashField
         | Opcode::CreateSet
@@ -795,6 +798,9 @@ fn validate_mutation_shape(
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::ExpireValue if expires_at_micros.is_none() => {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        Opcode::ExpireHash if value_length != 0 || expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::PushListHead
@@ -1110,6 +1116,7 @@ mod tests {
             structure_mutation(Opcode::ExpireValue, b"key", b"value", Some(i64::MAX)),
             structure_mutation(Opcode::DeleteValue, b"old-key", b"", None),
             structure_mutation(Opcode::CreateHash, b"hash", b"", None),
+            structure_mutation(Opcode::ExpireHash, b"hash", b"", Some(i64::MIN)),
             structure_mutation(Opcode::DeleteHash, b"retired-hash", b"", None),
             structure_mutation(Opcode::SetHashField, &hash_field, b"value", None),
             structure_mutation(Opcode::DeleteHashField, &hash_field, b"", None),
@@ -1187,7 +1194,7 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 24);
+        assert_eq!(recovered.commits[0].manifest.mutation_count, 25);
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -1205,6 +1212,25 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutation_shape(Opcode::DeleteHash, false, 0, Some(10), b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn whole_hash_expiry_requires_only_an_explicit_expiry() {
+        assert!(
+            validate_mutation_shape(Opcode::ExpireHash, false, 0, Some(i64::MIN), b"hash").is_ok()
+        );
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHash, true, 0, Some(10), b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHash, false, 1, Some(10), b"hash"),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        assert!(matches!(
+            validate_mutation_shape(Opcode::ExpireHash, false, 0, None, b"hash"),
             Err(WalSemanticError::InvalidBody)
         ));
     }

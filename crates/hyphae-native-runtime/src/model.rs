@@ -469,6 +469,7 @@ pub(crate) enum TtlValue {
 pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
     pub(crate) hashes: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) hash_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
@@ -547,7 +548,48 @@ impl StructureState {
     }
 
     pub(crate) fn delete_hash(&mut self, key: &[u8]) -> bool {
+        self.hash_expiries.remove(key);
         self.hashes.remove(key).is_some()
+    }
+
+    pub(crate) fn hash_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.hashes.contains_key(key)
+            && self
+                .hash_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
+    }
+
+    pub(crate) fn hash_is_expired(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.hashes.contains_key(key)
+            && self
+                .hash_expiries
+                .get(key)
+                .is_some_and(|expiry| *expiry <= logical_time_micros)
+    }
+
+    pub(crate) fn hash_expiry(&self, key: &[u8]) -> Option<i64> {
+        self.hash_expiries.get(key).copied()
+    }
+
+    pub(crate) fn expire_hash(
+        &mut self,
+        key: &[u8],
+        expires_at_micros: i64,
+        logical_time_micros: i64,
+    ) -> bool {
+        if !self.hash_is_visible(key, logical_time_micros) {
+            return false;
+        }
+        self.set_hash_expiry(key, expires_at_micros)
+    }
+
+    pub(crate) fn set_hash_expiry(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.hashes.contains_key(key) {
+            return false;
+        }
+        self.hash_expiries.insert(key.to_vec(), expires_at_micros);
+        true
     }
 
     pub(crate) fn hset(&mut self, key: &[u8], field: Vec<u8>, value: Vec<u8>) -> Option<bool> {
@@ -563,6 +605,17 @@ impl StructureState {
             .map(Vec::as_slice)
     }
 
+    pub(crate) fn hget_at(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<&[u8]> {
+        self.hash_is_visible(key, logical_time_micros)
+            .then(|| self.hget(key, field))
+            .flatten()
+    }
+
     pub(crate) fn hdelete(&mut self, key: &[u8], field: &[u8]) -> Option<bool> {
         self.hashes
             .get_mut(key)
@@ -571,6 +624,12 @@ impl StructureState {
 
     pub(crate) fn hlen(&self, key: &[u8]) -> Option<usize> {
         self.hashes.get(key).map(BTreeMap::len)
+    }
+
+    pub(crate) fn hlen_at(&self, key: &[u8], logical_time_micros: i64) -> Option<usize> {
+        self.hash_is_visible(key, logical_time_micros)
+            .then(|| self.hlen(key))
+            .flatten()
     }
 
     pub(crate) fn hscan(
@@ -588,6 +647,18 @@ impl StructureState {
                 .map(|(field, value)| (field.clone(), value.clone()))
                 .collect(),
         )
+    }
+
+    pub(crate) fn hscan_at(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.hash_is_visible(key, logical_time_micros)
+            .then(|| self.hscan(key, start_after, limit))
+            .flatten()
     }
 
     pub(crate) fn create_set(&mut self, key: Vec<u8>) -> bool {
@@ -869,8 +940,18 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn ttl_hash_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
+        self.hash_is_visible(key, logical_time_micros).then(|| {
+            self.hash_expiry(key)
+                .map_or(TtlValue::Persistent, |expiry| {
+                    TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
+                })
+        })
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         if !self.hashes.is_empty()
+            || !self.hash_expiries.is_empty()
             || !self.sets.is_empty()
             || !self.lists.is_empty()
             || !self.sorted_sets.is_empty()
@@ -908,6 +989,7 @@ impl StructureState {
         Ok(Self {
             entries,
             hashes: BTreeMap::new(),
+            hash_expiries: BTreeMap::new(),
             sets: BTreeMap::new(),
             lists: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
@@ -1334,6 +1416,35 @@ mod tests {
         assert_eq!(structures.get(b"k", 10), None);
         assert_eq!(structures.ttl_micros(b"k", 9), Some(TtlValue::Remaining(1)));
         assert_eq!(structures.ttl_micros(b"k", 10), None);
+    }
+
+    #[test]
+    fn whole_hash_ttl_is_a_logical_incarnation_boundary() {
+        let mut structures = StructureState::default();
+        assert!(structures.create_hash(b"profile".to_vec()));
+        assert_eq!(
+            structures.hset(b"profile", b"name".to_vec(), b"Mario".to_vec()),
+            Some(true)
+        );
+        assert!(structures.expire_hash(b"profile", 10, 0));
+        assert_eq!(
+            structures.ttl_hash_micros(b"profile", 9),
+            Some(TtlValue::Remaining(1))
+        );
+        assert_eq!(
+            structures.hget_at(b"profile", b"name", 9),
+            Some(b"Mario".as_slice())
+        );
+        assert_eq!(structures.ttl_hash_micros(b"profile", 10), None);
+        assert_eq!(structures.hget_at(b"profile", b"name", 10), None);
+        assert!(!structures.expire_hash(b"profile", 20, 10));
+        assert!(structures.delete_hash(b"profile"));
+        assert!(structures.create_hash(b"profile".to_vec()));
+        assert_eq!(
+            structures.ttl_hash_micros(b"profile", 10),
+            Some(TtlValue::Persistent)
+        );
+        assert_eq!(structures.hget_at(b"profile", b"name", 10), None);
     }
 
     #[test]
