@@ -82,6 +82,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local structure SET and TTL v1](native/local-structure-set-ttl-v1.md)
 - [Native local SEARCH MATCH v1](native/local-search-match-v1.md)
 - [Native local SQL SELECT v1](native/local-sql-select-v1.md)
+- [Native local all-engine transaction v1](native/local-all-engine-transaction-v1.md)
 - [Native local UDS Linux evidence](gates/evidence/native-local-uds-linux-2026-08-03.md)
 - [Native local structure GET Linux evidence](gates/evidence/native-local-structure-get-linux-2026-08-03.md)
 - [Native local structure SET and TTL Linux evidence](gates/evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
