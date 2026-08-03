@@ -62,6 +62,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native whole-hash TTL v1](native/native-hash-ttl-v1.md)
 - [Native hash field commands v1](native/native-hash-field-commands-v1.md)
 - [Native reverse hash scan v1](native/native-hash-reverse-scan-v1.md)
+- [Native hash pattern scan v1](native/native-hash-pattern-scan-v1.md)
 - [Native catalog v1](native/catalog-v1.md)
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)

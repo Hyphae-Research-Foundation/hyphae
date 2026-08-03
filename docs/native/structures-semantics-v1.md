@@ -164,6 +164,14 @@ cannot implement descending output by materializing and reversing an
 ascending scan. Its complete contract is
 [Native reverse hash scan v1](native-hash-reverse-scan-v1.md).
 
+`HSCAN_MATCH` adds binary-glob filtering with separate returned-match,
+physical-visit, and matcher-step bounds. Its continuation is the last visited
+field, including a nonmatch or tombstone when necessary, so an empty
+non-exhausted page still makes forward progress. The physical route derives a
+leading literal prefix for B+tree pruning and falls back to a bounded hash
+prefix scan only for leading-wildcard patterns. Its complete contract is
+[Native hash pattern scan v1](native-hash-pattern-scan-v1.md).
+
 An empty hash remains a typed hash after its last field is deleted.
 `DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
 all of its fields become absent at one CSN while retained snapshots preserve
