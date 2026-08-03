@@ -6793,78 +6793,10 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        let mut collection_kinds = 0_u8;
-        if let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_hash_meta_key(key),
-        )? && let Some(metadata) = decode_live_hash_metadata(encoded.bytes())?
-        {
-            collection_kinds += 1;
-            batch
-                .state
-                .structures
-                .hashes
-                .insert(key.to_vec(), BTreeMap::new());
-            if let Some(expiry) = metadata.expires_at_micros {
-                batch
-                    .state
-                    .structures
-                    .hash_expiries
-                    .insert(key.to_vec(), expiry);
-            }
-        }
-        if let Some(encoded) =
-            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
-            && let Some(metadata) = decode_live_set_metadata(encoded.bytes())?
-        {
-            collection_kinds += 1;
-            batch
-                .state
-                .structures
-                .sets
-                .insert(key.to_vec(), BTreeSet::new());
-            if let Some(expiry) = metadata.expires_at_micros {
-                batch
-                    .state
-                    .structures
-                    .set_expiries
-                    .insert(key.to_vec(), expiry);
-            }
-        }
-        if let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_list_meta_key(key)?,
-        )? && let Some(metadata) = decode_live_list_metadata(encoded.bytes())?
-        {
-            collection_kinds += 1;
-            batch
-                .state
-                .structures
-                .lists
-                .insert(key.to_vec(), VecDeque::new());
-            if let Some(expiry) = metadata.expires_at_micros {
-                batch
-                    .state
-                    .structures
-                    .list_expiries
-                    .insert(key.to_vec(), expiry);
-            }
-        }
-        if let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_sorted_set_meta_key(key)?,
-        )? {
-            decode_sorted_set_metadata(encoded.bytes())?;
-            collection_kinds += 1;
-            batch
-                .state
-                .structures
-                .sorted_sets
-                .insert(key.to_vec(), BTreeMap::new());
-        }
+        let collection_kinds = u8::from(self.hydrate_delta_hash(batch, key, tree)?)
+            + u8::from(self.hydrate_delta_set(batch, key, tree)?)
+            + u8::from(self.hydrate_delta_list(batch, key, tree)?)
+            + u8::from(self.hydrate_delta_sorted_set(batch, key, tree)?);
         if collection_kinds > 1 {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -6884,6 +6816,122 @@ impl NativeDatabase {
             .structure_scalars
             .insert(key.to_vec());
         Ok(())
+    }
+
+    fn hydrate_delta_hash(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        tree: BTree,
+    ) -> Result<bool, NativeRuntimeError> {
+        let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_hash_meta_key(key),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(metadata) = decode_live_hash_metadata(encoded.bytes())? else {
+            return Ok(false);
+        };
+        batch
+            .state
+            .structures
+            .hashes
+            .insert(key.to_vec(), BTreeMap::new());
+        if let Some(expiry) = metadata.expires_at_micros {
+            batch
+                .state
+                .structures
+                .hash_expiries
+                .insert(key.to_vec(), expiry);
+        }
+        Ok(true)
+    }
+
+    fn hydrate_delta_set(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        tree: BTree,
+    ) -> Result<bool, NativeRuntimeError> {
+        let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
+        else {
+            return Ok(false);
+        };
+        let Some(metadata) = decode_live_set_metadata(encoded.bytes())? else {
+            return Ok(false);
+        };
+        batch
+            .state
+            .structures
+            .sets
+            .insert(key.to_vec(), BTreeSet::new());
+        if let Some(expiry) = metadata.expires_at_micros {
+            batch
+                .state
+                .structures
+                .set_expiries
+                .insert(key.to_vec(), expiry);
+        }
+        Ok(true)
+    }
+
+    fn hydrate_delta_list(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        tree: BTree,
+    ) -> Result<bool, NativeRuntimeError> {
+        let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_list_meta_key(key)?,
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(metadata) = decode_live_list_metadata(encoded.bytes())? else {
+            return Ok(false);
+        };
+        batch
+            .state
+            .structures
+            .lists
+            .insert(key.to_vec(), VecDeque::new());
+        if let Some(expiry) = metadata.expires_at_micros {
+            batch
+                .state
+                .structures
+                .list_expiries
+                .insert(key.to_vec(), expiry);
+        }
+        Ok(true)
+    }
+
+    fn hydrate_delta_sorted_set(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        tree: BTree,
+    ) -> Result<bool, NativeRuntimeError> {
+        let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_sorted_set_meta_key(key)?,
+        )?
+        else {
+            return Ok(false);
+        };
+        decode_sorted_set_metadata(encoded.bytes())?;
+        batch
+            .state
+            .structures
+            .sorted_sets
+            .insert(key.to_vec(), BTreeMap::new());
+        Ok(true)
     }
 
     /// Begins one serialized native write transaction.
@@ -12491,72 +12539,7 @@ fn validate_write_batch_shape(
     match batch.mode {
         NativeWriteBatchMode::Materialized => Ok(()),
         NativeWriteBatchMode::PhysicalAllEngineDelta => {
-            let valid_roots = roots.iter().all(Option::is_some);
-            let valid_formats = structure_format == StructureFormat::BTreeV2
-                && batch.structure_format == StructureFormat::BTreeV2
-                && search_format == SearchFormat::InvertedBTreeV1
-                && batch.search_format == SearchFormat::InvertedBTreeV1;
-            let Some(delta) = batch.delta.as_ref() else {
-                return Err(NativeRuntimeError::InvalidPreparedMutation);
-            };
-            let mut expected_dirty = [false; 4];
-            let valid_mutations = !batch.mutations.is_empty()
-                && batch
-                    .mutations
-                    .iter()
-                    .all(|mutation| match mutation.engine {
-                        EngineKind::Relational => {
-                            expected_dirty[1] = true;
-                            mutation.target.is_some_and(|table| {
-                                delta
-                                    .relational_rows
-                                    .contains(&(table, mutation.key.clone()))
-                            }) && matches!(
-                                mutation.opcode,
-                                Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow
-                            ) && mutation.expires_at_micros.is_none()
-                        }
-                        EngineKind::Structure => {
-                            expected_dirty[2] = true;
-                            mutation.target.is_none()
-                                && delta.structure_scalars.contains(&mutation.key)
-                                && match mutation.opcode {
-                                    Opcode::SetValue => true,
-                                    Opcode::DeleteHash | Opcode::DeleteSet | Opcode::DeleteList => {
-                                        mutation.value.is_empty()
-                                            && mutation.expires_at_micros.is_none()
-                                    }
-                                    _ => false,
-                                }
-                        }
-                        EngineKind::Search => {
-                            expected_dirty[3] = true;
-                            mutation.target.is_some()
-                                && mutation.opcode == Opcode::IndexDocument
-                                && mutation.expires_at_micros.is_none()
-                        }
-                        EngineKind::Kernel => false,
-                    });
-            let valid_unique_probes = delta.unique_probes.iter().all(|probe| {
-                !probe.key.is_empty()
-                    && matches!(
-                        batch.state.catalog.object(probe.index),
-                        Some(CatalogObject::SecondaryIndex(definition))
-                            if definition.unique
-                    )
-            });
-            if valid_roots
-                && valid_formats
-                && valid_mutations
-                && valid_unique_probes
-                && batch.dirty == expected_dirty
-                && !batch.dirty[0]
-                && batch.state.ann == ann_store::AnnState::default()
-            {
-                Ok(())
-            } else {
-                Err(NativeRuntimeError::InvalidPreparedMutation)
-            }
+            validate_delta_write_batch_shape(batch, roots, structure_format, search_format)
         }
         NativeWriteBatchMode::PhysicalStructureExpiry => {
             let valid_roots = roots.iter().all(Option::is_some);
@@ -12618,6 +12601,78 @@ fn validate_write_batch_shape(
                 Err(NativeRuntimeError::InvalidPreparedMutation)
             }
         }
+    }
+}
+
+fn validate_delta_write_batch_shape(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_roots = roots.iter().all(Option::is_some);
+    let valid_formats = structure_format == StructureFormat::BTreeV2
+        && batch.structure_format == StructureFormat::BTreeV2
+        && search_format == SearchFormat::InvertedBTreeV1
+        && batch.search_format == SearchFormat::InvertedBTreeV1;
+    let Some(delta) = batch.delta.as_ref() else {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    };
+    let mut expected_dirty = [false; 4];
+    let valid_mutations = !batch.mutations.is_empty()
+        && batch
+            .mutations
+            .iter()
+            .all(|mutation| match mutation.engine {
+                EngineKind::Relational => {
+                    expected_dirty[1] = true;
+                    mutation.target.is_some_and(|table| {
+                        delta
+                            .relational_rows
+                            .contains(&(table, mutation.key.clone()))
+                    }) && matches!(
+                        mutation.opcode,
+                        Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow
+                    ) && mutation.expires_at_micros.is_none()
+                }
+                EngineKind::Structure => {
+                    expected_dirty[2] = true;
+                    mutation.target.is_none()
+                        && delta.structure_scalars.contains(&mutation.key)
+                        && match mutation.opcode {
+                            Opcode::SetValue => true,
+                            Opcode::DeleteHash | Opcode::DeleteSet | Opcode::DeleteList => {
+                                mutation.value.is_empty() && mutation.expires_at_micros.is_none()
+                            }
+                            _ => false,
+                        }
+                }
+                EngineKind::Search => {
+                    expected_dirty[3] = true;
+                    mutation.target.is_some()
+                        && mutation.opcode == Opcode::IndexDocument
+                        && mutation.expires_at_micros.is_none()
+                }
+                EngineKind::Kernel => false,
+            });
+    let valid_unique_probes = delta.unique_probes.iter().all(|probe| {
+        !probe.key.is_empty()
+            && matches!(
+                batch.state.catalog.object(probe.index),
+                Some(CatalogObject::SecondaryIndex(definition)) if definition.unique
+            )
+    });
+    if valid_roots
+        && valid_formats
+        && valid_mutations
+        && valid_unique_probes
+        && batch.dirty == expected_dirty
+        && !batch.dirty[0]
+        && batch.state.ann == ann_store::AnnState::default()
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
     }
 }
 
