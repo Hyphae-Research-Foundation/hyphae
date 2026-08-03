@@ -15,6 +15,9 @@ mod hash_model_equivalence;
 mod hash_pattern;
 mod local_protocol;
 mod model;
+mod set_algebra;
+#[cfg(test)]
+mod set_algebra_equivalence;
 mod snapshot_pins;
 mod sql;
 mod wal_codec;
@@ -38,6 +41,10 @@ pub use hyphae_native_ann::{
 pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE,
     LocalProtocolError, decode_frame, encode_frame,
+};
+pub use set_algebra::{
+    MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,
+    SetAlgebraOperation, SetAlgebraRequest, SetAlgebraResult,
 };
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
@@ -99,6 +106,7 @@ use crate::{
         TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
         sorted_set_score_range_is_empty,
     },
+    set_algebra::{SetAlgebraExecution, evaluate_materialized_set_algebra},
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticBase, WalSemanticError,
@@ -285,6 +293,9 @@ pub enum NativeRuntimeError {
     /// Native binary-glob compilation, request validation, or matching failed.
     #[error(transparent)]
     HashPattern(#[from] HashPatternError),
+    /// Native set-algebra request validation or execution failed.
+    #[error(transparent)]
+    SetAlgebra(#[from] SetAlgebraError),
     /// Native ANN validation, construction, or query failed.
     #[error(transparent)]
     Ann(#[from] hyphae_native_ann::AnnError),
@@ -1255,6 +1266,24 @@ struct MaterializedState {
     ann: ann_store::AnnState,
 }
 
+fn set_algebra_in_state(
+    state: &StructureState,
+    logical_time_micros: i64,
+    request: &SetAlgebraRequest,
+) -> Result<SetAlgebraResult, NativeRuntimeError> {
+    validate_set_algebra_keys(request)?;
+    for key in request.keys() {
+        if state.entries.contains_key(key)
+            || state.hash_is_visible(key, logical_time_micros)
+            || state.lists.contains_key(key)
+            || state.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+    }
+    evaluate_materialized_set_algebra(&state.sets, request).map_err(Into::into)
+}
+
 /// Immutable logical snapshot spanning all three native engines.
 #[derive(Clone, Debug)]
 pub struct NativeSnapshot {
@@ -1545,6 +1574,24 @@ impl NativeSnapshot {
             .structures
             .scard(key)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Evaluates one bounded complete binary-set algebra request in this
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request identity, another live
+    /// structure family, or an exhausted output or visit bound.
+    pub fn set_algebra(
+        &self,
+        request: &SetAlgebraRequest,
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        set_algebra_in_state(
+            &self.state.structures,
+            self.metadata.logical_time_micros,
+            request,
+        )
     }
 
     /// Returns one native list's element count in this snapshot.
@@ -4634,6 +4681,289 @@ impl NativeDatabase {
         };
         usize::try_from(decode_set_metadata(metadata.bytes())?)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Evaluates one bounded complete binary-set algebra request directly
+    /// through the current physical structure root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, invalid identities, another live
+    /// structure family, exhausted output or visit bounds, or malformed
+    /// reached physical state.
+    pub fn set_algebra_latest(
+        &self,
+        request: &SetAlgebraRequest,
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        validate_set_algebra_keys(request)?;
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.set_algebra_in_tree(BTree::from_root(root), request)
+    }
+
+    fn set_algebra_in_tree(
+        &self,
+        tree: BTree,
+        request: &SetAlgebraRequest,
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        let cardinalities = self.preflight_set_algebra_inputs(tree, request)?;
+        match request.operation() {
+            SetAlgebraOperation::Union => self.set_union_in_tree(tree, request, &cardinalities),
+            SetAlgebraOperation::Intersection => {
+                self.set_intersection_in_tree(tree, request, &cardinalities)
+            }
+            SetAlgebraOperation::Difference => {
+                self.set_difference_in_tree(tree, request, &cardinalities)
+            }
+        }
+    }
+
+    fn preflight_set_algebra_inputs(
+        &self,
+        tree: BTree,
+        request: &SetAlgebraRequest,
+    ) -> Result<Vec<Option<usize>>, NativeRuntimeError> {
+        let mut cardinalities = Vec::with_capacity(request.keys().len());
+        for key in request.keys() {
+            let metadata = tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_set_meta_key(key),
+            )?;
+            if let Some(metadata) = metadata {
+                cardinalities.push(Some(
+                    usize::try_from(decode_set_metadata(metadata.bytes())?)
+                        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                ));
+            } else {
+                if self.non_set_structure_exists_in_tree(tree, key)? {
+                    return Err(NativeRuntimeError::StructureKindMismatch);
+                }
+                cardinalities.push(None);
+            }
+        }
+        Ok(cardinalities)
+    }
+
+    fn non_set_structure_exists_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+    ) -> Result<bool, NativeRuntimeError> {
+        let scalar = tree
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+            .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let hash = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_hash_meta_key(key),
+            )?
+            .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let list = match tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_list_meta_key(key)?,
+        )? {
+            Some(encoded) => {
+                decode_list_metadata(encoded.bytes())?;
+                true
+            }
+            None => false,
+        };
+        let sorted_set = match tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_sorted_set_meta_key(key)?,
+        )? {
+            Some(encoded) => {
+                decode_sorted_set_metadata(encoded.bytes())?;
+                true
+            }
+            None => false,
+        };
+        Ok(scalar || hash || list || sorted_set)
+    }
+
+    fn set_union_in_tree(
+        &self,
+        tree: BTree,
+        request: &SetAlgebraRequest,
+        cardinalities: &[Option<usize>],
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        let mut execution = SetAlgebraExecution::new(request);
+        for (key, cardinality) in request.keys().iter().zip(cardinalities) {
+            if let Some(cardinality) = cardinality {
+                self.visit_live_set_members(
+                    tree,
+                    key,
+                    *cardinality,
+                    &mut execution,
+                    |member, execution| execution.insert(member).map_err(Into::into),
+                )?;
+            }
+        }
+        Ok(execution.finish())
+    }
+
+    fn set_intersection_in_tree(
+        &self,
+        tree: BTree,
+        request: &SetAlgebraRequest,
+        cardinalities: &[Option<usize>],
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        if cardinalities
+            .iter()
+            .any(|cardinality| cardinality.is_none_or(|count| count == 0))
+        {
+            return Ok(SetAlgebraExecution::new(request).finish());
+        }
+        let (source_position, source_count) = cardinalities
+            .iter()
+            .enumerate()
+            .filter_map(|(position, cardinality)| cardinality.map(|count| (position, count)))
+            .min_by_key(|(position, count)| (*count, *position))
+            .ok_or(SetAlgebraError::InvalidKeyCount { requested: 0 })?;
+        let source_key = &request.keys()[source_position];
+        let mut execution = SetAlgebraExecution::new(request);
+        self.visit_live_set_members(
+            tree,
+            source_key,
+            source_count,
+            &mut execution,
+            |member, execution| {
+                for (position, key) in request.keys().iter().enumerate() {
+                    if position != source_position
+                        && !self.set_member_live_in_tree(tree, key, member, execution)?
+                    {
+                        return Ok(());
+                    }
+                }
+                execution.insert(member).map_err(Into::into)
+            },
+        )?;
+        Ok(execution.finish())
+    }
+
+    fn set_difference_in_tree(
+        &self,
+        tree: BTree,
+        request: &SetAlgebraRequest,
+        cardinalities: &[Option<usize>],
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        let Some(first_count) = cardinalities[0] else {
+            return Ok(SetAlgebraExecution::new(request).finish());
+        };
+        let mut execution = SetAlgebraExecution::new(request);
+        self.visit_live_set_members(
+            tree,
+            &request.keys()[0],
+            first_count,
+            &mut execution,
+            |member, execution| {
+                for (key, cardinality) in request.keys()[1..].iter().zip(&cardinalities[1..]) {
+                    if cardinality.is_some()
+                        && self.set_member_live_in_tree(tree, key, member, execution)?
+                    {
+                        return Ok(());
+                    }
+                }
+                execution.insert(member).map_err(Into::into)
+            },
+        )?;
+        Ok(execution.finish())
+    }
+
+    fn set_member_live_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        member: &[u8],
+        execution: &mut SetAlgebraExecution<'_>,
+    ) -> Result<bool, NativeRuntimeError> {
+        execution.consume_visit()?;
+        tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_set_member_key(key, member)?,
+        )?
+        .map(|encoded| decode_set_member_value(encoded.bytes()))
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    fn visit_live_set_members(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        declared_count: usize,
+        execution: &mut SetAlgebraExecution<'_>,
+        mut on_live: impl FnMut(&[u8], &mut SetAlgebraExecution<'_>) -> Result<(), NativeRuntimeError>,
+    ) -> Result<(), NativeRuntimeError> {
+        let prefix = structure_set_member_key(key, &[])?;
+        let mut live_count = 0_usize;
+        let mut failure = None;
+        let outcome = tree.visit_prefix_range_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            |physical_key, encoded| {
+                if let Err(error) = execution.consume_visit() {
+                    failure = Some(error.into());
+                    return ControlFlow::Break(());
+                }
+                let member = match decode_set_scan_member_identity(physical_key, key) {
+                    Ok(member) => member,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                let live = match decode_set_member_value(encoded) {
+                    Ok(live) => live,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if live {
+                    live_count += 1;
+                    if live_count > declared_count {
+                        failure = Some(NativeRuntimeError::InvalidStructureTree);
+                        return ControlFlow::Break(());
+                    }
+                    if let Err(error) = on_live(member, execution) {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if outcome == ControlFlow::Break(()) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if live_count != declared_count {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
     }
 
     /// Reads one list cardinality directly from its physical metadata.
@@ -8136,6 +8466,24 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureSet)
     }
 
+    /// Evaluates one bounded complete binary-set algebra request against this
+    /// private read-your-writes state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request identity, another live
+    /// structure family, or an exhausted output or visit bound.
+    pub fn set_algebra(
+        &self,
+        request: &SetAlgebraRequest,
+    ) -> Result<SetAlgebraResult, NativeRuntimeError> {
+        set_algebra_in_state(
+            &self.state.structures,
+            self.snapshot.logical_time_micros,
+            request,
+        )
+    }
+
     /// Creates one explicitly typed empty native list.
     ///
     /// # Errors
@@ -11300,6 +11648,17 @@ fn validate_hash_pattern_identity(
     Ok(())
 }
 
+fn validate_set_algebra_keys(request: &SetAlgebraRequest) -> Result<(), NativeRuntimeError> {
+    for key in request.keys() {
+        let metadata_key = structure_set_meta_key(key);
+        let member_prefix = structure_set_member_key(key, &[])?;
+        if metadata_key.len() > BTREE_MAX_KEY_SIZE || member_prefix.len() > BTREE_MAX_KEY_SIZE {
+            return Err(NativeRuntimeError::StructureIdentityTooLarge);
+        }
+    }
+    Ok(())
+}
+
 fn validate_hash_field_positions(key: &[u8], fields: &[Vec<u8>]) -> Result<(), NativeRuntimeError> {
     validate_hash_field_batch_size(fields.len())?;
     for field in fields {
@@ -11341,6 +11700,21 @@ fn set_member_identity(key: &[u8], member: &[u8]) -> Result<Vec<u8>, NativeRunti
 
 fn decode_set_member_identity(encoded: &[u8]) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
     decode_collection_member_identity(encoded)
+}
+
+fn decode_set_scan_member_identity<'key>(
+    physical_key: &'key [u8],
+    expected_set: &[u8],
+) -> Result<&'key [u8], NativeRuntimeError> {
+    if physical_key.first() != Some(&STRUCTURE_SET_MEMBER_PREFIX) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let (set, member) = decode_set_member_identity(&physical_key[1..])
+        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+    if set != expected_set {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(member)
 }
 
 fn sorted_set_member_identity(key: &[u8], member: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
