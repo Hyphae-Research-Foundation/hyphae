@@ -39,11 +39,14 @@ before that retention floor.
 10. A vacuum that cannot reduce physical page count is a no-op: it writes no
     WAL transaction, advances no CSN, and publishes no generation.
 
-V1 does not promise historical snapshot reconstruction after process restart.
-That requires a configurable multi-generation retention window. A
-`NativeSnapshot` already materialized before vacuum remains usable because it
-owns its logical state. A detached `NativeWriteBatch` whose read CSN precedes
-the new floor fails explicitly instead of rebasing across retired history.
+V1 does not implicitly retain historical snapshots after process restart.
+[Durable snapshot pins v1](snapshot-pins-v1.md) now provide explicit,
+identity-bound multi-generation retention: vacuum preserves every generation
+named by a stable pin, while unpinned operation keeps this current-root policy.
+A `NativeSnapshot` already materialized before vacuum remains usable because
+it owns its logical state. A detached `NativeWriteBatch` whose read CSN
+precedes the new floor fails explicitly instead of rebasing across retired
+history.
 
 ## Current-root rewrite
 
@@ -198,7 +201,8 @@ observation. Structure tombstone removal remains the separate reachability
 compaction gate; vacuum preserves every entry reachable from its captured
 current root.
 
-This vertical closes neither G1 nor the complete retention program. It does not
-collect blobs, retain multiple restartable historical generations, rewrite or
-truncate WAL blocks, schedule background work, or establish interference and
-p99.9 gates.
+This vertical closes neither G1 nor the complete retention program. Durable
+snapshot pins now retain multiple explicitly named restartable generations,
+but this vacuum protocol still does not collect blobs, rewrite or truncate WAL
+blocks, schedule background retention policy, define quotas, or establish
+interference and p99.9 gates.

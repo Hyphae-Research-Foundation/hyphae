@@ -12,6 +12,7 @@ mod directory;
 mod group_commit;
 mod local_protocol;
 mod model;
+mod snapshot_pins;
 mod sql;
 mod wal_codec;
 
@@ -31,6 +32,7 @@ pub use local_protocol::{
     DEFAULT_MAX_FRAME_PAYLOAD, DecodedFrame, FrameKind, LOCAL_FRAME_HEADER_SIZE,
     LocalProtocolError, decode_frame, encode_frame,
 };
+pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 
 use std::{
@@ -87,6 +89,7 @@ use crate::{
         SortedSetMemberState, SortedSetScore, StructureEntry, StructureState, TtlValue, analyze,
         bm25_idf, bm25_term_score, normalize_list_range,
     },
+    snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticBase, WalSemanticError,
         encode_abort, encode_checkpoint, encode_transaction, recover_wal_after,
@@ -293,6 +296,9 @@ pub enum NativeRuntimeError {
     /// Native immutable root-manifest handling failed.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// Native durable snapshot-pin handling failed.
+    #[error(transparent)]
+    SnapshotPin(#[from] SnapshotPinError),
     /// Catalog definition validation failed.
     #[error(transparent)]
     Catalog(#[from] CatalogError),
@@ -411,6 +417,21 @@ pub enum NativeRuntimeError {
         /// Oldest physical root retained by the active page generation.
         retention_floor_csn: Csn,
     },
+    /// A durable snapshot pin already owns the requested identity.
+    #[error("native snapshot pin already exists")]
+    SnapshotPinExists,
+    /// No durable snapshot pin owns the requested identity.
+    #[error("native snapshot pin does not exist")]
+    UnknownSnapshotPin,
+    /// A stable pin does not match retained manifest, WAL, page, or blob authority.
+    #[error("native snapshot pin authority is invalid or incomplete")]
+    InvalidSnapshotPinAuthority,
+    /// A historical pin prevents retirement of its WAL or manifest authority.
+    #[error("native historical snapshot pins block WAL retention")]
+    SnapshotPinsBlockWalRetention,
+    /// A historical pin prevents sole-current-root blob collection.
+    #[error("native historical snapshot pins block blob collection")]
+    SnapshotPinsBlockBlobCollection,
     /// A checkpoint does not match its manifest, WAL commit, or root set.
     #[error("native checkpoint does not match the verified manifest/WAL chain")]
     InvalidCheckpoint,
@@ -440,6 +461,9 @@ pub enum NativeRuntimeError {
     /// A deterministic checkpoint interruption was requested.
     #[error("native checkpoint interrupted at {0:?}; reopen the data directory")]
     InjectedCheckpointCrash(CheckpointBoundary),
+    /// A deterministic snapshot-pin interruption was requested.
+    #[error("native snapshot pin interrupted at {0:?}; reopen the data directory")]
+    InjectedSnapshotPinCrash(SnapshotPinBoundary),
     /// A deterministic page-vacuum interruption was requested.
     #[error("native page vacuum interrupted at {0:?}; reopen the data directory")]
     InjectedVacuumCrash(VacuumBoundary),
@@ -521,6 +545,15 @@ pub enum CheckpointBoundary {
     WalAppended,
     /// The manifest and its WAL checkpoint record are synchronized.
     WalSynchronized,
+}
+
+/// Deterministic durable snapshot-pin boundary used by the crash matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPinBoundary {
+    /// The complete pin record is synchronized only under its temporary name.
+    RecordSynchronized,
+    /// The immutable pin record is renamed and its directory synchronized.
+    RecordPublished,
 }
 
 /// Deterministic WAL-retention boundary used by the crash matrix.
@@ -901,6 +934,53 @@ pub struct PageVacuumReceipt {
     pub reclaimed_pages: u64,
     /// Vacuum commit, absent when the candidate was not smaller.
     pub commit: Option<CommitReceipt>,
+}
+
+/// Receipt for one durably published snapshot pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPinReceipt {
+    /// Stable caller-supplied pin identity.
+    pub id: SnapshotPinId,
+    /// Exact all-engine commit retained by the pin.
+    pub visible_csn: Csn,
+    /// Logical time captured for TTL reads.
+    pub logical_time_micros: i64,
+    /// Immutable checkpoint manifest generation.
+    pub manifest_generation: ManifestGeneration,
+    /// Complete checkpoint manifest digest.
+    pub manifest_digest: [u8; 32],
+    /// Immutable page-file generation retained by the pin.
+    pub page_generation: PageGeneration,
+    /// Whether strict pin-directory synchronization is implemented here.
+    pub parent_directory_sync_supported: bool,
+}
+
+/// Receipt for one durably removed snapshot retention claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotUnpinReceipt {
+    /// Stable removed pin identity.
+    pub id: SnapshotPinId,
+    /// Exact all-engine commit that is no longer pinned.
+    pub visible_csn: Csn,
+    /// Page-file generation that may now be collectible.
+    pub page_generation: PageGeneration,
+    /// Whether strict pin-directory synchronization is implemented here.
+    pub parent_directory_sync_supported: bool,
+}
+
+/// Receipt for explicit inactive page-generation collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageGenerationCollectionReceipt {
+    /// Complete inactive unpinned generation files removed.
+    pub removed_files: usize,
+    /// Physical bytes removed with those files.
+    pub removed_bytes: u64,
+    /// Active or pinned generation files retained.
+    pub retained_files: usize,
+    /// Physical bytes retained in active or pinned generations.
+    pub retained_bytes: u64,
+    /// Whether strict data-directory synchronization is implemented here.
+    pub parent_directory_sync_supported: bool,
 }
 
 /// Receipt for one synchronized immutable root checkpoint.
@@ -1411,6 +1491,18 @@ fn ann_search_receipt(
     }
 }
 
+fn snapshot_pin_receipt(pin: &SnapshotPin) -> SnapshotPinReceipt {
+    SnapshotPinReceipt {
+        id: pin.id(),
+        visible_csn: pin.visible_csn(),
+        logical_time_micros: pin.logical_time_micros(),
+        manifest_generation: pin.manifest_generation(),
+        manifest_digest: pin.manifest_digest(),
+        page_generation: pin.page_generation(),
+        parent_directory_sync_supported: cfg!(unix),
+    }
+}
+
 fn open_blob_store(path: &Path) -> Result<(BlobStore, Duration), BlobError> {
     let started = Instant::now();
     let blobs = BlobStore::open(path)?;
@@ -1427,6 +1519,7 @@ pub struct NativeDatabase {
     wal: WalFile,
     wal_retention: WalRetentionStore,
     manifests: RootManifestStore,
+    snapshot_pins: SnapshotPinStore,
     coordinator: CommitCoordinator,
     conflicts: ConflictTable,
     relational_format: RelationalFormat,
@@ -1458,6 +1551,7 @@ impl NativeDatabase {
         let wal = WalFile::create(path.join(WAL_FILE))?;
         let wal_retention = WalRetentionStore::create(path)?;
         let manifests = RootManifestStore::create(path)?;
+        let snapshot_pins = SnapshotPinStore::create(path)?;
         let coordinator = CommitCoordinator::new(
             CatalogVersion::new(1).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
         );
@@ -1469,6 +1563,7 @@ impl NativeDatabase {
             wal,
             wal_retention,
             manifests,
+            snapshot_pins,
             coordinator,
             conflicts: ConflictTable::default(),
             relational_format: RelationalFormat::VersionChainV2,
@@ -1527,24 +1622,16 @@ impl NativeDatabase {
         let open_started = Instant::now();
         let path = path.as_ref();
         let directory_guard = NativeDirectoryGuard::open(path)?;
+        let mut snapshot_pins =
+            SnapshotPinStore::open_or_create(path, directory_guard.identity().lineage())?;
         let (mut blobs, blob_verification_time) = open_blob_store(path)?;
-        let WalOpenState {
-            mut manifests,
-            manifest_recovery,
-            mut wal_retention,
-            recovered_temporary_wal_anchors,
-            retention_anchor,
-            base_root,
-            opened_wal,
-            recovered_wal,
-            active_page_generation,
-            retention_floor_csn,
-            manifest_verification_time,
-            wal_physical_verification_time,
-            wal_semantic_replay_time,
-        } = open_wal_state(path, directory_guard.identity().lineage())?;
-        let commits = &recovered_wal.commits;
-        let blob_generation_floor = recovered_blob_generation_floor(base_root.as_ref(), commits);
+        let mut wal_state = open_wal_state(path, directory_guard.identity().lineage())?;
+        let retention_anchor = wal_state.retention_anchor;
+        let active_page_generation = wal_state.active_page_generation;
+        let retention_floor_csn = wal_state.retention_floor_csn;
+        let commits = &wal_state.recovered_wal.commits;
+        let blob_generation_floor =
+            recovered_blob_generation_floor(wal_state.base_root.as_ref(), commits);
         blobs.apply_committed_generation_floor(blob_generation_floor)?;
         let blob_recovery = blobs.recovery()?;
         let opened_pages = PageStore::open_repair_tail_generation(
@@ -1557,7 +1644,7 @@ impl NativeDatabase {
         let root_validation_started = Instant::now();
         let (committed_roots, latest_root) = recover_committed_roots(
             commits,
-            &opened_wal.recovery,
+            &wal_state.opened_wal.recovery,
             &RetainedPageState {
                 pages: &opened_pages.store,
                 blobs: &blobs,
@@ -1565,55 +1652,62 @@ impl NativeDatabase {
                 active_generation: active_page_generation,
                 retention_floor_csn,
             },
-            base_root,
+            wal_state.base_root.take(),
         )?;
         let root_validation_time = root_validation_started.elapsed();
         let checkpoint_validation = validate_checkpoints(
-            &recovered_wal,
-            &manifest_recovery.manifests,
+            &wal_state.recovered_wal,
+            &wal_state.manifest_recovery.manifests,
             &committed_roots,
             retention_anchor.as_ref(),
         )?;
+        let recovered_page_generation_files = recover_snapshot_pin_files(
+            path,
+            &mut snapshot_pins,
+            &wal_state.manifest_recovery.manifests,
+            &wal_state.recovered_wal,
+            retention_anchor.as_ref(),
+            &blobs,
+            active_page_generation,
+        )?;
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
-        let recovered_page_generation_files =
-            cleanup_page_generation_files(path, active_page_generation)?;
         let coordinator = restore_commit_coordinator(latest_root)?;
-        let metadata =
-            wal_recovery_metadata(path, retention_anchor, &opened_wal.recovery, &recovered_wal)?;
+        let metadata = wal_recovery_metadata_for_open(path, retention_anchor, &wal_state)?;
         let (manifest_prune, manifest_pruning_time) =
-            prune_recovered_manifest_prefix(&mut manifests, retention_anchor)?;
-        cleanup_stale_wal_anchors(&mut wal_retention, retention_anchor)?;
+            prune_recovered_manifest_prefix(&mut wal_state.manifests, retention_anchor)?;
+        cleanup_stale_wal_anchors(&mut wal_state.wal_retention, retention_anchor)?;
         let recovery = build_recovery_report(&OpenRecoveryReport {
             open_started,
             opened_pages: &opened_pages,
-            opened_wal: &opened_wal,
+            opened_wal: &wal_state.opened_wal,
             replayed_transactions: commits.len(),
             metadata: &metadata,
             retention_anchor,
-            wal_physical_verification_time,
-            wal_semantic_replay_time,
+            wal_physical_verification_time: wal_state.wal_physical_verification_time,
+            wal_semantic_replay_time: wal_state.wal_semantic_replay_time,
             root_validation_time,
             active_page_generation,
             retention_floor_csn,
             recovered_page_generation_files,
-            manifest_recovery: &manifest_recovery,
+            manifest_recovery: &wal_state.manifest_recovery,
             manifest_prune,
-            manifest_verification_time,
+            manifest_verification_time: wal_state.manifest_verification_time,
             manifest_pruning_time,
             checkpoint_validation: &checkpoint_validation,
             blob_recovery: &blob_recovery,
             blob_verification_time,
-            recovered_temporary_wal_anchors,
+            recovered_temporary_wal_anchors: wal_state.recovered_temporary_wal_anchors,
         });
         Ok(Self {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
             buffer_pool,
             blobs,
-            wal: opened_wal.wal,
-            wal_retention,
-            manifests,
+            wal: wal_state.opened_wal.wal,
+            wal_retention: wal_state.wal_retention,
+            manifests: wal_state.manifests,
+            snapshot_pins,
             coordinator,
             conflicts,
             relational_format,
@@ -1764,6 +1858,158 @@ impl NativeDatabase {
         let metadata = self.coordinator.snapshot(logical_time_micros)?;
         let state = load_state(&self.pages, &self.blobs, metadata.roots())?;
         Ok(NativeSnapshot { metadata, state })
+    }
+
+    /// Returns the number of verified durable snapshot pins.
+    pub fn snapshot_pin_count(&self) -> usize {
+        self.snapshot_pins.len()
+    }
+
+    /// Checkpoints and durably pins the current committed all-engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty database, duplicate identity, checkpoint
+    /// failure, or uncertain pin publication.
+    pub fn pin_current(
+        &mut self,
+        id: SnapshotPinId,
+        logical_time_micros: i64,
+    ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        self.pin_current_at(id, logical_time_micros, None)
+    }
+
+    /// Checkpoints and pins the current state with one deterministic
+    /// interruption.
+    ///
+    /// After an injected interruption the caller must drop this handle and
+    /// reopen the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedSnapshotPinCrash`] at the
+    /// requested boundary, or the same errors as [`Self::pin_current`].
+    pub fn pin_current_with_interruption(
+        &mut self,
+        id: SnapshotPinId,
+        logical_time_micros: i64,
+        boundary: SnapshotPinBoundary,
+    ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        self.pin_current_at(id, logical_time_micros, Some(boundary))
+    }
+
+    fn pin_current_at(
+        &mut self,
+        id: SnapshotPinId,
+        logical_time_micros: i64,
+        interruption: Option<SnapshotPinBoundary>,
+    ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        if self.snapshot_pins.get(id).is_some() {
+            return Err(NativeRuntimeError::SnapshotPinExists);
+        }
+        let checkpoint = self.checkpoint()?;
+        let manifest = self
+            .manifests
+            .current()
+            .ok_or(NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        if manifest.generation() != checkpoint.manifest_generation
+            || manifest.digest() != checkpoint.manifest_digest
+        {
+            return Err(NativeRuntimeError::InvalidSnapshotPinAuthority);
+        }
+        let roots = self
+            .coordinator
+            .snapshot(logical_time_micros)?
+            .roots()
+            .clone();
+        let pin = SnapshotPin::from_manifest(
+            id,
+            logical_time_micros,
+            self.directory_guard.identity().lineage(),
+            manifest,
+            &roots,
+        )?;
+        let staged = self
+            .snapshot_pins
+            .stage(pin, true)
+            .map_err(|error| match error {
+                SnapshotPinError::PublicationTargetExists => NativeRuntimeError::SnapshotPinExists,
+                error => NativeRuntimeError::SnapshotPin(error),
+            })?;
+        interrupt_snapshot_pin(interruption, SnapshotPinBoundary::RecordSynchronized)?;
+        let pin = self.snapshot_pins.publish(staged, true)?;
+        interrupt_snapshot_pin(interruption, SnapshotPinBoundary::RecordPublished)?;
+        Ok(snapshot_pin_receipt(&pin))
+    }
+
+    /// Materializes one exact durable historical all-engine snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown pin or any manifest, page, root, blob,
+    /// or lineage divergence.
+    pub fn open_pinned_snapshot(
+        &self,
+        id: SnapshotPinId,
+    ) -> Result<NativeSnapshot, NativeRuntimeError> {
+        let pin = self
+            .snapshot_pins
+            .get(id)
+            .ok_or(NativeRuntimeError::UnknownSnapshotPin)?;
+        let manifest = manifest_by_generation(
+            &self.manifests.recovery().manifests,
+            pin.manifest_generation(),
+        )
+        .cloned()
+        .ok_or(NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        if !pin.matches_manifest(&manifest) {
+            return Err(NativeRuntimeError::InvalidSnapshotPinAuthority);
+        }
+        let roots = manifest.to_root_set()?;
+        let pages = PageStore::open_generation(
+            page_generation_path(&self.data_directory, pin.page_generation()),
+            pin.page_generation(),
+        )
+        .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        validate_roots(&pages, &self.blobs, &roots, pin.visible_csn())
+            .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        let state = load_state(&pages, &self.blobs, &roots)?;
+        let metadata = Snapshot::from_committed_root(roots, pin.logical_time_micros())?;
+        Ok(NativeSnapshot { metadata, state })
+    }
+
+    /// Durably removes one snapshot retention claim without collecting files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown identity or uncertain file removal.
+    pub fn unpin(&mut self, id: SnapshotPinId) -> Result<SnapshotUnpinReceipt, NativeRuntimeError> {
+        let pin = self
+            .snapshot_pins
+            .remove(id, true)?
+            .ok_or(NativeRuntimeError::UnknownSnapshotPin)?;
+        Ok(SnapshotUnpinReceipt {
+            id: pin.id(),
+            visible_csn: pin.visible_csn(),
+            page_generation: pin.page_generation(),
+            parent_directory_sync_supported: cfg!(unix),
+        })
+    }
+
+    /// Removes complete inactive page generations that no stable pin retains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a noncanonical entry, deletion failure, byte-count
+    /// overflow, or uncertain directory synchronization.
+    pub fn collect_retired_page_generations(
+        &mut self,
+    ) -> Result<PageGenerationCollectionReceipt, NativeRuntimeError> {
+        collect_page_generation_files(
+            &self.data_directory,
+            self.pages.generation(),
+            &self.snapshot_pins.pinned_generations(),
+        )
     }
 
     /// Binds one parameterized SQL `SELECT` against only the current catalog.
@@ -3824,11 +4070,7 @@ impl NativeDatabase {
         self.buffer_pool = replacement_buffer;
         drop(prior_pages);
         interrupt_vacuum(interruption, VacuumBoundary::RootPublished)?;
-        fs::remove_file(page_generation_path(
-            &self.data_directory,
-            previous_generation,
-        ))?;
-        sync_page_generation_directory(&self.data_directory)?;
+        self.remove_page_generation_if_unpinned(previous_generation)?;
         interrupt_vacuum(interruption, VacuumBoundary::PriorGenerationRemoved)?;
 
         Ok(PageVacuumReceipt {
@@ -3849,6 +4091,18 @@ impl NativeDatabase {
                 durability_cohort_position: 0,
             }),
         })
+    }
+
+    fn remove_page_generation_if_unpinned(
+        &self,
+        generation: PageGeneration,
+    ) -> Result<(), NativeRuntimeError> {
+        if self.snapshot_pins.references_generation(generation) {
+            return Ok(());
+        }
+        fs::remove_file(page_generation_path(&self.data_directory, generation))?;
+        sync_page_generation_directory(&self.data_directory)?;
+        Ok(())
     }
 
     /// Publishes and WAL-anchors one synchronized immutable root checkpoint.
@@ -4055,6 +4309,12 @@ impl NativeDatabase {
             .manifests
             .current()
             .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
+        if self.snapshot_pins.iter().any(|pin| {
+            pin.manifest_generation() != manifest.generation()
+                || pin.manifest_digest() != manifest.digest()
+        }) {
+            return Err(NativeRuntimeError::SnapshotPinsBlockWalRetention);
+        }
         let checkpoint_lsn = self
             .last_checkpoint_lsn
             .ok_or(NativeRuntimeError::WalRetentionIneligible)?;
@@ -4308,6 +4568,13 @@ impl NativeDatabase {
             .visible_csn
             .ok_or(NativeRuntimeError::BlobCollectionIneligible)?;
         let roots = snapshot.roots().clone();
+        if self.snapshot_pins.iter().any(|pin| {
+            pin.root_digest() != roots.digest()
+                || pin.page_generation() != roots.page_generation()
+                || pin.blob_generation() != roots.blob_generation()
+        }) {
+            return Err(NativeRuntimeError::SnapshotPinsBlockBlobCollection);
+        }
         let fields = self
             .wal_retention
             .current()
@@ -7010,6 +7277,17 @@ fn interrupt_checkpoint(
     }
 }
 
+fn interrupt_snapshot_pin(
+    requested: Option<SnapshotPinBoundary>,
+    current: SnapshotPinBoundary,
+) -> Result<(), NativeRuntimeError> {
+    if requested == Some(current) {
+        Err(NativeRuntimeError::InjectedSnapshotPinCrash(current))
+    } else {
+        Ok(())
+    }
+}
+
 fn interrupt_wal_retention(
     requested: Option<WalRetentionBoundary>,
     current: WalRetentionBoundary,
@@ -7057,6 +7335,81 @@ fn manifest_by_generation(
         .binary_search_by_key(&generation.get(), |manifest| manifest.generation().get())
         .ok()
         .and_then(|index| manifests.get(index))
+}
+
+fn validate_snapshot_pins(
+    data_directory: &Path,
+    pins: &SnapshotPinStore,
+    manifests: &[RootManifest],
+    recovered: &RecoveredWal,
+    retention_anchor: Option<&WalRetentionAnchor>,
+    blobs: &BlobStore,
+) -> Result<(), NativeRuntimeError> {
+    for pin in pins.iter() {
+        let manifest = manifest_by_generation(manifests, pin.manifest_generation())
+            .ok_or(NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        if !pin.matches_manifest(manifest)
+            || !snapshot_pin_has_checkpoint_authority(pin, recovered, retention_anchor)
+            || pin.blob_generation() > blobs.generation()?
+        {
+            return Err(NativeRuntimeError::InvalidSnapshotPinAuthority);
+        }
+        let roots = manifest.to_root_set()?;
+        let pages = PageStore::open_generation(
+            page_generation_path(data_directory, pin.page_generation()),
+            pin.page_generation(),
+        )
+        .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+        validate_roots(&pages, blobs, &roots, pin.visible_csn())
+            .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
+    }
+    Ok(())
+}
+
+fn recover_snapshot_pin_files(
+    data_directory: &Path,
+    pins: &mut SnapshotPinStore,
+    manifests: &[RootManifest],
+    recovered: &RecoveredWal,
+    retention_anchor: Option<&WalRetentionAnchor>,
+    blobs: &BlobStore,
+    active_page_generation: PageGeneration,
+) -> Result<usize, NativeRuntimeError> {
+    validate_snapshot_pins(
+        data_directory,
+        pins,
+        manifests,
+        recovered,
+        retention_anchor,
+        blobs,
+    )?;
+    pins.cleanup_temporaries()?;
+    let pinned_generations = pins.pinned_generations();
+    Ok(
+        collect_page_generation_files(data_directory, active_page_generation, &pinned_generations)?
+            .removed_files,
+    )
+}
+
+fn snapshot_pin_has_checkpoint_authority(
+    pin: &SnapshotPin,
+    recovered: &RecoveredWal,
+    retention_anchor: Option<&WalRetentionAnchor>,
+) -> bool {
+    let recovered_checkpoint = recovered.checkpoints.iter().any(|checkpoint| {
+        checkpoint.visible_csn == pin.visible_csn()
+            && checkpoint.manifest_generation == pin.manifest_generation()
+            && checkpoint.manifest_digest == pin.manifest_digest()
+    });
+    let retained_checkpoint = retention_anchor.is_some_and(|anchor| {
+        let fields = anchor.fields();
+        fields.base_visible_csn == pin.visible_csn()
+            && fields.manifest_generation == pin.manifest_generation()
+            && fields.manifest_digest == pin.manifest_digest()
+            && fields.root_commit_lsn == pin.wal_lsn()
+            && fields.root_commit_block_digest == pin.wal_digest()
+    });
+    recovered_checkpoint || retained_checkpoint
 }
 
 fn validate_retention_anchor(
@@ -10923,11 +11276,15 @@ fn sync_page_generation_directory(data_directory: &Path) -> Result<(), std::io::
     fs::metadata(data_directory).map(|_| ())
 }
 
-fn cleanup_page_generation_files(
+fn collect_page_generation_files(
     data_directory: &Path,
     active_generation: PageGeneration,
-) -> Result<usize, NativeRuntimeError> {
-    let mut removed = 0_usize;
+    pinned_generations: &BTreeSet<PageGeneration>,
+) -> Result<PageGenerationCollectionReceipt, NativeRuntimeError> {
+    let mut removed_files = 0_usize;
+    let mut removed_bytes = 0_u64;
+    let mut retained_files = 0_usize;
+    let mut retained_bytes = 0_u64;
     for entry in fs::read_dir(data_directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -10938,28 +11295,48 @@ fn cleanup_page_generation_files(
         if page_generation_like && !entry.file_type()?.is_file() {
             return Err(NativeRuntimeError::UnexpectedPageGenerationEntry);
         }
-        let remove = if name == PAGE_FILE {
-            active_generation != PageGeneration::FIRST
+        let (generation, temporary) = if name == PAGE_FILE {
+            (Some(PageGeneration::FIRST), false)
         } else if let Some(generation) = parse_page_generation_filename(name, ".hydb") {
-            generation != active_generation
+            (Some(generation), false)
         } else if parse_page_generation_filename(name, ".hydb.tmp").is_some() {
-            true
+            (None, true)
         } else if name.starts_with("pages-") {
             return Err(NativeRuntimeError::UnexpectedPageGenerationEntry);
         } else {
-            false
+            continue;
         };
-        if remove {
+        let retain = generation.is_some_and(|generation| {
+            generation == active_generation || pinned_generations.contains(&generation)
+        });
+        let bytes = entry.metadata()?.len();
+        if temporary || !retain {
             fs::remove_file(entry.path())?;
-            removed = removed
+            removed_files = removed_files
                 .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            removed_bytes = removed_bytes
+                .checked_add(bytes)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        } else {
+            retained_files = retained_files
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            retained_bytes = retained_bytes
+                .checked_add(bytes)
                 .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         }
     }
-    if removed != 0 {
+    if removed_files != 0 {
         sync_page_generation_directory(data_directory)?;
     }
-    Ok(removed)
+    Ok(PageGenerationCollectionReceipt {
+        removed_files,
+        removed_bytes,
+        retained_files,
+        retained_bytes,
+        parent_directory_sync_supported: cfg!(unix),
+    })
 }
 
 fn parse_page_generation_filename(name: &str, suffix: &str) -> Option<PageGeneration> {
@@ -11153,6 +11530,19 @@ fn wal_recovery_metadata(
         retained_wal_bytes: fs::metadata(path.join(WAL_FILE))?.len(),
         checkpoint_count,
     })
+}
+
+fn wal_recovery_metadata_for_open(
+    path: &Path,
+    anchor: Option<WalRetentionAnchor>,
+    state: &WalOpenState,
+) -> Result<WalRecoveryMetadata, NativeRuntimeError> {
+    wal_recovery_metadata(
+        path,
+        anchor,
+        &state.opened_wal.recovery,
+        &state.recovered_wal,
+    )
 }
 
 fn checked_recovery_total(base: u64, suffix: usize) -> Option<usize> {
@@ -12679,13 +13069,13 @@ mod tests {
         NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
         NativeSchedulerClock, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
         RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector,
-        VectorMetric, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome,
-        binary_relation_definition, catalog_definition_storage_value, catalog_name_identity,
-        catalog_name_key, catalog_object_key, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
-        physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
+        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
+        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
+        catalog_object_key, catalog_root_after_mutations, decode_catalog_definition_storage_value,
+        page_generation_path, physical_expiry_tree_after_mutations, qualified_name,
+        rebuild_page_generation, validate_commit_sequence,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -13290,6 +13680,527 @@ mod tests {
         assert_eq!(head.next(), None);
         assert_eq!(row.begin_csn(), Csn::new(13)?);
         assert_eq!(row.end_csn(), None);
+        Ok(())
+    }
+
+    fn assert_reopened_pinned_all_engine_state(
+        database: &NativeDatabase,
+        pin_id: SnapshotPinId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let vectors = ObjectId::new(3)?;
+        let old_best = ObjectId::new(101)?;
+        let new_best = ObjectId::new(102)?;
+        let query = Vector::new([1.0, 0.0, 0.0])?;
+        assert_eq!(
+            database.select_latest_relational(table, b"key")?,
+            Some(b"new-row-8".to_vec())
+        );
+        let pinned = database.open_pinned_snapshot(pin_id)?;
+        assert_eq!(pinned.visible_csn(), Some(Csn::new(1)?));
+        assert_eq!(pinned.select(table, b"key"), Some(b"old-row".as_slice()));
+        assert_eq!(
+            pinned.get(b"expiring"),
+            Some(b"old-value".as_slice()),
+            "captured logical time must survive restart"
+        );
+        assert_eq!(
+            pinned.match_text(search, "old", 1)?[0].document_id,
+            b"old-doc"
+        );
+        assert!(pinned.match_text(search, "new", 1)?.is_empty());
+        assert_eq!(
+            pinned.search_vector_exact(vectors, &query, 2)?[0].object_id,
+            old_best
+        );
+        assert_eq!(
+            database.search_vector_exact_latest(vectors, &query, 2)?[0].object_id,
+            new_best
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_snapshot_pin_reopens_old_state_and_releases_its_page_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let search = ObjectId::new(2)?;
+        let vectors = ObjectId::new(3)?;
+        let old_best = ObjectId::new(101)?;
+        let new_best = ObjectId::new(102)?;
+        let pin_id = SnapshotPinId::new(1)?;
+        let mut seed = database.begin(40, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pinned_rows")?;
+        seed.insert(table, b"key".to_vec(), b"old-row".to_vec())?;
+        seed.set(b"expiring".to_vec(), b"old-value".to_vec(), Some(1_000))?;
+        seed.create_search_index(search, "pinned_search")?;
+        seed.index_document(search, b"old-doc".to_vec(), "old lexical state")?;
+        seed.create_vector_index(
+            vectors,
+            "pinned_vectors",
+            3,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        seed.upsert_vectors(
+            vectors,
+            [
+                (old_best, Vector::new([1.0, 0.0, 0.0])?),
+                (new_best, Vector::new([0.0, 1.0, 0.0])?),
+            ],
+        )?;
+        seed.commit()?;
+        let pin = database.pin_current(pin_id, 500)?;
+        assert_eq!(pin.id, pin_id);
+        assert_eq!(pin.visible_csn, Csn::new(1)?);
+        assert_eq!(pin.page_generation, PageGeneration::FIRST);
+        assert!(matches!(
+            database.pin_current(pin_id, 500),
+            Err(NativeRuntimeError::SnapshotPinExists)
+        ));
+
+        for version in 1..=8 {
+            let mut update = database.begin(500 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("new-row-{version}").into_bytes(),
+            )?;
+            if version == 1 {
+                update.set(b"expiring".to_vec(), b"new-value".to_vec(), Some(2_000))?;
+                update.index_document(search, b"new-doc".to_vec(), "new lexical state")?;
+                update.upsert_vectors(
+                    vectors,
+                    [
+                        (old_best, Vector::new([0.0, 1.0, 0.0])?),
+                        (new_best, Vector::new([1.0, 0.0, 0.0])?),
+                    ],
+                )?;
+            }
+            update.commit()?;
+        }
+        assert!(database.vacuum_pages()?.applied);
+        assert!(temporary.path().join(PAGE_FILE).exists());
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_reopened_pinned_all_engine_state(&reopened, pin_id)?;
+        let unpinned = reopened.unpin(pin_id)?;
+        assert_eq!(unpinned.id, pin_id);
+        assert!(matches!(
+            reopened.unpin(pin_id),
+            Err(NativeRuntimeError::UnknownSnapshotPin)
+        ));
+        assert!(temporary.path().join(PAGE_FILE).exists());
+        let collection = reopened.collect_retired_page_generations()?;
+        assert_eq!(collection.removed_files, 1);
+        assert!(!temporary.path().join(PAGE_FILE).exists());
+        assert!(matches!(
+            reopened.open_pinned_snapshot(pin_id),
+            Err(NativeRuntimeError::UnknownSnapshotPin)
+        ));
+        Ok(())
+    }
+
+    fn create_closed_pinned_directory(
+        pin: SnapshotPinId,
+    ) -> Result<TestDirectory, Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pin_corruption")?;
+        seed.insert(table, b"key".to_vec(), b"pinned-value".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pin, 20)?;
+        drop(database);
+        Ok(temporary)
+    }
+
+    fn canonical_pin_path(path: &Path, pin: SnapshotPinId) -> PathBuf {
+        path.join("pins").join(format!("pin-{pin}.hypin"))
+    }
+
+    #[test]
+    fn snapshot_pin_namespace_and_records_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let pin = SnapshotPinId::new(31)?;
+
+        let truncated = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(truncated.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes.pop();
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(truncated.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidLength)
+        ));
+
+        let extended = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(extended.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes.push(0);
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(extended.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidLength)
+        ));
+
+        let reserved = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(reserved.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes[12] = 1;
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(reserved.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::InvalidPreamble)
+        ));
+
+        let checksum = create_closed_pinned_directory(pin)?;
+        let path = canonical_pin_path(checksum.path(), pin);
+        let mut bytes = fs::read(&path)?;
+        bytes[239] ^= 1;
+        fs::write(&path, bytes)?;
+        assert!(matches!(
+            expected_open_error(checksum.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::ChecksumMismatch)
+        ));
+
+        let renamed = create_closed_pinned_directory(pin)?;
+        fs::rename(
+            canonical_pin_path(renamed.path(), pin),
+            canonical_pin_path(renamed.path(), SnapshotPinId::new(32)?),
+        )?;
+        assert!(matches!(
+            expected_open_error(renamed.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::FilenameIdentityMismatch)
+        ));
+
+        let unexpected = create_closed_pinned_directory(pin)?;
+        fs::write(
+            unexpected.path().join("pins").join("notes.txt"),
+            b"not authority",
+        )?;
+        assert!(matches!(
+            expected_open_error(unexpected.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::UnexpectedDirectoryEntry)
+        ));
+
+        let non_file = create_closed_pinned_directory(pin)?;
+        fs::create_dir(non_file.path().join("pins").join("pin-directory"))?;
+        assert!(matches!(
+            expected_open_error(non_file.path())?,
+            NativeRuntimeError::SnapshotPin(SnapshotPinError::UnexpectedDirectoryEntry)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_corrupt_pinned_physical_authority_fails_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pin = SnapshotPinId::new(41)?;
+        let missing_manifest = create_closed_pinned_directory(pin)?;
+        fs::remove_file(
+            missing_manifest
+                .path()
+                .join("roots")
+                .join("manifest-0000000000000001.hyroot"),
+        )?;
+        assert!(expected_open_error(missing_manifest.path()).is_ok());
+
+        for corrupt in [false, true] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "missing_pinned_page")?;
+            seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+            seed.commit()?;
+            database.pin_current(pin, 20)?;
+            for version in 1..=5 {
+                let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("after-{version}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+            assert!(database.vacuum_pages()?.applied);
+            drop(database);
+
+            if corrupt {
+                let mut page_bytes = fs::read(temporary.path().join(PAGE_FILE))?;
+                page_bytes[0] ^= 1;
+                fs::write(temporary.path().join(PAGE_FILE), page_bytes)?;
+            } else {
+                fs::remove_file(temporary.path().join(PAGE_FILE))?;
+            }
+            assert!(matches!(
+                expected_open_error(temporary.path())?,
+                NativeRuntimeError::InvalidSnapshotPinAuthority
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn three_pinned_generations_reopen_and_collect_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let pins = [
+            SnapshotPinId::new(11)?,
+            SnapshotPinId::new(12)?,
+            SnapshotPinId::new(13)?,
+        ];
+
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "multi_generation_pins")?;
+        seed.insert(table, b"key".to_vec(), b"generation-1".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pins[0], 100)?;
+
+        let mut expected_csn = 1_u64;
+        for (generation, pin) in [(2_u64, pins[1]), (3, pins[2])] {
+            for update_index in 0..5 {
+                expected_csn += 1;
+                let mut update =
+                    database.begin(100 + i64::try_from(expected_csn)?, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("generation-{generation}-update-{update_index}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+            expected_csn += 1;
+            let vacuum = database.vacuum_pages()?;
+            assert!(vacuum.applied);
+            assert_eq!(vacuum.active_generation, PageGeneration::new(generation)?);
+            database.pin_current(pin, 100 + i64::try_from(expected_csn)?)?;
+        }
+
+        for update_index in 0..5 {
+            expected_csn += 1;
+            let mut update =
+                database.begin(100 + i64::try_from(expected_csn)?, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("generation-4-update-{update_index}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        let active = database.vacuum_pages()?;
+        assert!(active.applied);
+        assert_eq!(active.active_generation, PageGeneration::new(4)?);
+        assert_eq!(database.snapshot_pin_count(), 3);
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.snapshot_pin_count(), 3);
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[0])?
+                .select(table, b"key"),
+            Some(b"generation-1".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[1])?
+                .select(table, b"key"),
+            Some(b"generation-2-update-4".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .open_pinned_snapshot(pins[2])?
+                .select(table, b"key"),
+            Some(b"generation-3-update-4".as_slice())
+        );
+        assert_eq!(
+            reopened.select_latest_relational(table, b"key")?,
+            Some(b"generation-4-update-4".to_vec())
+        );
+
+        reopened.unpin(pins[1])?;
+        let collection = reopened.collect_retired_page_generations()?;
+        assert_eq!(collection.removed_files, 1);
+        assert!(temporary.path().join(PAGE_FILE).exists());
+        assert!(
+            !temporary
+                .path()
+                .join("pages-00000000000000000002.hydb")
+                .exists()
+        );
+        assert!(
+            temporary
+                .path()
+                .join("pages-00000000000000000003.hydb")
+                .exists()
+        );
+        assert!(
+            temporary
+                .path()
+                .join("pages-00000000000000000004.hydb")
+                .exists()
+        );
+        assert_eq!(
+            reopened.collect_retired_page_generations()?.removed_files,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_snapshot_pin_boundary_recovers_absent_or_complete_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            SnapshotPinBoundary::RecordSynchronized,
+            SnapshotPinBoundary::RecordPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let pin = SnapshotPinId::new(boundary as u128 + 1)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "pin_crash_matrix")?;
+            seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+            seed.commit()?;
+
+            assert!(matches!(
+                database.pin_current_with_interruption(pin, 20, boundary),
+                Err(NativeRuntimeError::InjectedSnapshotPinCrash(actual))
+                    if actual == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            if boundary == SnapshotPinBoundary::RecordSynchronized {
+                assert_eq!(reopened.snapshot_pin_count(), 0);
+                assert!(matches!(
+                    reopened.open_pinned_snapshot(pin),
+                    Err(NativeRuntimeError::UnknownSnapshotPin)
+                ));
+            } else {
+                assert_eq!(reopened.snapshot_pin_count(), 1);
+                assert_eq!(
+                    reopened.open_pinned_snapshot(pin)?.select(table, b"key"),
+                    Some(b"before".as_slice())
+                );
+            }
+            assert_eq!(
+                fs::read_dir(temporary.path().join("pins"))?.count(),
+                usize::from(boundary == SnapshotPinBoundary::RecordPublished)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_pin_blocks_destructive_retention_until_unpinned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = ObjectId::new(1)?;
+        let pin = SnapshotPinId::new(21)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "pin_retention")?;
+        seed.insert(table, b"key".to_vec(), b"before".to_vec())?;
+        seed.commit()?;
+        database.pin_current(pin, 20)?;
+        for version in 1..=5 {
+            let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                b"key".to_vec(),
+                format!("after-{version}").into_bytes(),
+            )?;
+            update.commit()?;
+        }
+        assert!(database.vacuum_pages()?.applied);
+        database.checkpoint()?;
+        let wal_bytes = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+
+        assert!(matches!(
+            database.truncate_wal_at_retention_checkpoint(),
+            Err(NativeRuntimeError::SnapshotPinsBlockWalRetention)
+        ));
+        assert_eq!(
+            fs::metadata(temporary.path().join(WAL_FILE))?.len(),
+            wal_bytes
+        );
+        assert!(matches!(
+            database.collect_blobs(),
+            Err(NativeRuntimeError::SnapshotPinsBlockBlobCollection)
+        ));
+
+        database.unpin(pin)?;
+        assert_eq!(
+            database.collect_retired_page_generations()?.removed_files,
+            1
+        );
+        database.truncate_wal_at_retention_checkpoint()?;
+        assert_eq!(database.collect_blobs()?.removed_files, 0);
+        drop(database);
+        assert_eq!(
+            NativeDatabase::open(temporary.path())?.snapshot_pin_count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_vacuum_boundary_preserves_a_durable_historical_pin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            VacuumBoundary::CandidateSynchronized,
+            VacuumBoundary::CandidatePublished,
+            VacuumBoundary::WalAppended,
+            VacuumBoundary::WalSynchronized,
+            VacuumBoundary::RootPublished,
+            VacuumBoundary::PriorGenerationRemoved,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let table = ObjectId::new(1)?;
+            let pin = SnapshotPinId::new(100 + boundary as u128)?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_relation(table, "pinned_vacuum_boundary")?;
+            seed.insert(table, b"key".to_vec(), b"pinned".to_vec())?;
+            seed.commit()?;
+            database.pin_current(pin, 20)?;
+            for version in 1..=5 {
+                let mut update = database.begin(20 + version, DurabilityClass::Strict)?;
+                update.update(
+                    table,
+                    b"key".to_vec(),
+                    format!("current-{version}").into_bytes(),
+                )?;
+                update.commit()?;
+            }
+
+            assert!(matches!(
+                database.vacuum_pages_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedVacuumCrash(actual))
+                    if actual == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened.open_pinned_snapshot(pin)?.select(table, b"key"),
+                Some(b"pinned".as_slice())
+            );
+            assert_eq!(
+                reopened.select_latest_relational(table, b"key")?,
+                Some(b"current-5".to_vec())
+            );
+            assert!(temporary.path().join(PAGE_FILE).exists());
+        }
         Ok(())
     }
 

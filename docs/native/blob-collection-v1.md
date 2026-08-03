@@ -10,7 +10,8 @@ content-addressed blob files that the sole retained restart root cannot
 reference.
 
 V1 is intentionally conservative. It does not attempt collection while a WAL
-suffix, historical restart root, or unretired manifest generation remains.
+suffix, historical restart root, unretired manifest generation, or durable
+snapshot pin names a root different from the sole current retained root.
 
 ## Pain point
 
@@ -244,7 +245,10 @@ wear, and physical power-loss evidence remain separate.
 V1 does not:
 
 - collect while more than one restartable root is retained;
-- register snapshot, replica, backup, archive, or change-feed pins;
+- trace a durable snapshot pin's historical root; snapshot pins instead block
+  collection before deletion under
+  [durable snapshot pins v1](snapshot-pins-v1.md);
+- register replica, backup, archive, or change-feed pins;
 - collect page generations, WAL blocks, or manifests;
 - stream, chunk, compress, encrypt, or rewrite blob content;
 - repair missing or corrupt live content;

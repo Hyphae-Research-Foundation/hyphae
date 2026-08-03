@@ -10,10 +10,11 @@ WAL or weakening its digest chain. It removes only a prefix made obsolete by a
 current-root retention checkpoint. Every retained block keeps its original
 block sequence, LSNs, bytes, and digest.
 
-V1 deliberately implements current-root retention. It does not promise that a
-snapshot older than the published retention floor can be reconstructed after
-restart. Multi-generation historical retention, replica pins, incremental
-backup pins, and remote WAL archiving require later contracts.
+V1 deliberately defaults to current-root retention. A snapshot older than the
+published retention floor is reconstructable after restart only when a
+verified [durable snapshot pin](snapshot-pins-v1.md) names its exact manifest
+and blocks an incompatible base selection. Replica pins, incremental-backup
+pins, and remote WAL archiving require later contracts.
 
 ## Pain points fixed
 
@@ -141,7 +142,7 @@ request unless all of these are true:
 - the checkpoint block is the last complete WAL block;
 - no transaction, group cohort, checkpoint, vacuum, or background task is in
   progress;
-- no registered snapshot, backup, replica, or archive pin requires the
+- no durable snapshot pin, backup, replica, or archive authority requires the
   candidate prefix; and
 - the next transaction ID and all cumulative counters fit their fields.
 
@@ -279,7 +280,8 @@ universal microsecond restart.
 
 V1 does not:
 
-- retain restartable history below the current floor;
+- retain restartable history below the current floor without a verified
+  durable snapshot pin;
 - collect immutable blobs or old manifest generations;
 - archive WAL remotely;
 - define replica or incremental-backup pin registration;
