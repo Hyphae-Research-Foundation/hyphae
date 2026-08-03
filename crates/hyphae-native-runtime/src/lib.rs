@@ -19,6 +19,8 @@ mod set_algebra;
 #[cfg(test)]
 mod set_algebra_equivalence;
 #[cfg(test)]
+mod set_commands_equivalence;
+#[cfg(test)]
 mod set_ttl_equivalence;
 mod snapshot_pins;
 mod sql;
@@ -189,6 +191,8 @@ const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 /// Maximum field positions admitted by one native hash multi-field call.
 pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
+/// Maximum member positions admitted by one native set multi-member call.
+pub const MAX_SET_MEMBER_BATCH_SIZE: usize = 4_096;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
 const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
@@ -447,6 +451,17 @@ pub enum NativeRuntimeError {
     /// One hash mutation batch contains the same exact field more than once.
     #[error("native hash field mutation batch contains a duplicate field")]
     DuplicateHashField,
+    /// One set multi-member call exceeds its fixed position bound.
+    #[error(
+        "native set member batch contains {requested} positions; maximum is {MAX_SET_MEMBER_BATCH_SIZE}"
+    )]
+    SetMemberBatchTooLarge {
+        /// Rejected caller-supplied member-position count.
+        requested: usize,
+    },
+    /// One set mutation batch contains the same exact member more than once.
+    #[error("native set member mutation batch contains a duplicate member")]
+    DuplicateSetMember,
     /// A durable expiry cleanup request is zero or exceeds its hard bound.
     #[error("native expiry sweep limit {requested} is outside 1..={MAX_EXPIRY_SWEEP_KEYS}")]
     InvalidExpirySweepLimit {
@@ -1579,6 +1594,36 @@ impl NativeSnapshot {
             .ok_or(NativeRuntimeError::UnknownStructureSet)
     }
 
+    /// Tests bounded exact membership positions in an existing native set.
+    ///
+    /// Duplicate members preserve duplicate output positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized batch, invalid identity, another
+    /// structure kind, or a missing or expired set.
+    pub fn smismember(
+        &self,
+        key: &[u8],
+        members: &[Vec<u8>],
+    ) -> Result<Vec<bool>, NativeRuntimeError> {
+        validate_set_member_positions(key, members)?;
+        if self.state.structures.entries.contains_key(key)
+            || self
+                .state
+                .structures
+                .hash_is_visible(key, self.metadata.logical_time_micros)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .smismember_at(key, members, self.metadata.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
     /// Returns one native set's exact member count in this snapshot.
     ///
     /// # Errors
@@ -1598,6 +1643,38 @@ impl NativeSnapshot {
         self.state
             .structures
             .scard_at(key, self.metadata.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Scans one bounded ascending range of set members in this snapshot.
+    ///
+    /// `start_after` is an exclusive exact-member cursor. A zero `limit`
+    /// validates the set and returns no members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, another structure
+    /// kind, or a missing or expired set.
+    pub fn sscan(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        validate_set_scan_identity(key, start_after)?;
+        if self.state.structures.entries.contains_key(key)
+            || self
+                .state
+                .structures
+                .hash_is_visible(key, self.metadata.logical_time_micros)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .sscan_at(key, start_after, limit, self.metadata.logical_time_micros)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
     }
 
@@ -4654,6 +4731,61 @@ impl NativeDatabase {
         .map(Option::unwrap_or_default)
     }
 
+    /// Tests bounded membership positions through the current physical set
+    /// namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized batch, invalid
+    /// identities, another live structure kind, a missing set, or malformed
+    /// reached physical state.
+    pub fn smismember_latest_set(
+        &self,
+        key: &[u8],
+        members: &[Vec<u8>],
+    ) -> Result<Vec<bool>, NativeRuntimeError> {
+        self.smismember_latest_set_at(key, members, i64::MIN)
+    }
+
+    /// Tests bounded membership positions at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized batch, invalid
+    /// identities, another live structure kind, a missing or expired set, or
+    /// malformed reached physical state.
+    pub fn smismember_latest_set_at(
+        &self,
+        key: &[u8],
+        members: &[Vec<u8>],
+        logical_time_micros: i64,
+    ) -> Result<Vec<bool>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        validate_set_member_positions(key, members)?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let _metadata = self.visible_set_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        members
+            .iter()
+            .map(|member| {
+                tree.get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &structure_set_member_key(key, member)?,
+                )?
+                .map(|encoded| decode_set_member_value(encoded.bytes()))
+                .transpose()
+                .map(Option::unwrap_or_default)
+            })
+            .collect()
+    }
+
     /// Reads one set cardinality directly from its physical metadata.
     ///
     /// # Errors
@@ -4699,6 +4831,124 @@ impl NativeDatabase {
         usize::try_from(metadata.member_count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
 
+    /// Scans one bounded current physical set-member range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid cursor identity,
+    /// another live structure kind, a missing set, or malformed reached
+    /// physical state.
+    pub fn sscan_latest_set(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        self.sscan_latest_set_at(key, start_after, limit, i64::MIN)
+    }
+
+    /// Scans one bounded physical set-member range at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an invalid cursor identity,
+    /// another live structure kind, a missing or expired set, or malformed
+    /// reached physical state.
+    pub fn sscan_latest_set_at(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        validate_set_scan_identity(key, start_after)?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        self.set_scan_in_tree_at(
+            BTree::from_root(root),
+            key,
+            start_after,
+            limit,
+            logical_time_micros,
+        )
+    }
+
+    fn set_scan_in_tree_at(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        let metadata = self.visible_set_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let declared_count = usize::try_from(metadata.member_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = structure_set_member_key(key, &[])?;
+        let lower_key = start_after
+            .map(|member| structure_set_member_key(key, member))
+            .transpose()?;
+        let lower = lower_key
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let verify_complete = start_after.is_none() && limit >= declared_count;
+        let mut live_count = 0_usize;
+        let mut members = Vec::with_capacity(limit.min(declared_count).min(256));
+        let mut failure = None;
+        let outcome = tree.visit_prefix_range_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            lower,
+            Bound::Unbounded,
+            |physical_key, encoded| {
+                let member = match decode_set_scan_member_identity(physical_key, key) {
+                    Ok(member) => member,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                let live = match decode_set_member_value(encoded) {
+                    Ok(live) => live,
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if live {
+                    live_count += 1;
+                    if live_count > declared_count {
+                        failure = Some(NativeRuntimeError::InvalidStructureTree);
+                        return ControlFlow::Break(());
+                    }
+                    members.push(member.to_vec());
+                    if members.len() == limit && !verify_complete {
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if verify_complete && (outcome != ControlFlow::Continue(()) || live_count != declared_count)
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(members)
+    }
+
     /// Returns one current physical set family's TTL at explicit logical
     /// time.
     ///
@@ -4734,6 +4984,26 @@ impl NativeDatabase {
             }
             Some(_) => Ttl::Missing,
         })
+    }
+
+    fn visible_set_metadata_in_tree_at(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<SetMetadata, NativeRuntimeError> {
+        let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
+        else {
+            return self.set_missing_or_kind_error(tree, key, logical_time_micros);
+        };
+        let Some(metadata) = decode_live_set_metadata(encoded.bytes())? else {
+            return self.set_missing_or_kind_error(tree, key, logical_time_micros);
+        };
+        if !metadata.is_visible_at(logical_time_micros) {
+            return Err(NativeRuntimeError::UnknownStructureSet);
+        }
+        Ok(metadata)
     }
 
     fn set_missing_or_kind_error<T>(
@@ -7726,6 +7996,24 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    fn require_private_set(&self, key: &[u8]) -> Result<(), NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.private_hash_is_visible(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if !self
+            .state
+            .structures
+            .set_is_visible(key, self.snapshot.logical_time_micros)
+        {
+            return Err(NativeRuntimeError::UnknownStructureSet);
+        }
+        Ok(())
+    }
+
     /// Replaces one visible scalar value's absolute expiry.
     ///
     /// The value bytes are retained in the WAL mutation so recovery can verify
@@ -8593,6 +8881,63 @@ impl NativeWriteBatch {
         Ok(true)
     }
 
+    /// Atomically inserts one bounded set of exact binary members.
+    ///
+    /// Accepted members are prepared in exact-byte order. The result counts
+    /// members that were absent before this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized or duplicate batch,
+    /// an invalid identity, another structure kind, or a missing set.
+    pub fn sadd_many(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        members: Vec<Vec<u8>>,
+    ) -> Result<usize, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        let members = prepare_set_mutation_members(&key, members)?;
+        self.require_private_set(&key)?;
+        let added_members = members
+            .iter()
+            .filter(|member| {
+                !self
+                    .state
+                    .structures
+                    .sismember_at(&key, member, self.snapshot.logical_time_micros)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mutations = added_members
+            .iter()
+            .map(|member| {
+                Ok(Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::AddSetMember,
+                    target: None,
+                    key: set_member_identity(&key, member)?,
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                })
+            })
+            .collect::<Result<Vec<_>, NativeRuntimeError>>()?;
+        let added = self
+            .state
+            .structures
+            .sadd_many_at(&key, &added_members, self.snapshot.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)?;
+        debug_assert_eq!(added, mutations.len());
+        if !mutations.is_empty() {
+            self.mutations.extend(mutations);
+            self.dirty[2] = true;
+        }
+        Ok(added)
+    }
+
     /// Tests exact binary membership in an existing native set.
     ///
     /// # Errors
@@ -8609,6 +8954,27 @@ impl NativeWriteBatch {
         self.state
             .structures
             .sismember_at(key, member, self.snapshot.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Tests bounded exact membership positions in an existing native set.
+    ///
+    /// Duplicate members preserve duplicate output positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized batch, invalid identity, another
+    /// structure kind, or a missing or expired set.
+    pub fn smismember(
+        &self,
+        key: &[u8],
+        members: &[Vec<u8>],
+    ) -> Result<Vec<bool>, NativeRuntimeError> {
+        validate_set_member_positions(key, members)?;
+        self.require_private_set(key)?;
+        self.state
+            .structures
+            .smismember_at(key, members, self.snapshot.logical_time_micros)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
     }
 
@@ -8657,6 +9023,62 @@ impl NativeWriteBatch {
         Ok(true)
     }
 
+    /// Atomically deletes one bounded set of exact binary members.
+    ///
+    /// Accepted members are prepared in exact-byte order. Missing members do
+    /// not add mutations. The typed set remains after its final member.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized or duplicate batch,
+    /// an invalid identity, another structure kind, or a missing set.
+    pub fn srem_many(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        members: Vec<Vec<u8>>,
+    ) -> Result<usize, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        let members = prepare_set_mutation_members(&key, members)?;
+        self.require_private_set(&key)?;
+        let deleted_members = members
+            .iter()
+            .filter(|member| {
+                self.state
+                    .structures
+                    .sismember_at(&key, member, self.snapshot.logical_time_micros)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mutations = deleted_members
+            .iter()
+            .map(|member| {
+                Ok(Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::DeleteSetMember,
+                    target: None,
+                    key: set_member_identity(&key, member)?,
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                })
+            })
+            .collect::<Result<Vec<_>, NativeRuntimeError>>()?;
+        let deleted = self
+            .state
+            .structures
+            .srem_many_at(&key, &deleted_members, self.snapshot.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)?;
+        debug_assert_eq!(deleted, mutations.len());
+        if !mutations.is_empty() {
+            self.mutations.extend(mutations);
+            self.dirty[2] = true;
+        }
+        Ok(deleted)
+    }
+
     /// Returns the current private exact cardinality of one native set.
     ///
     /// # Errors
@@ -8673,6 +9095,29 @@ impl NativeWriteBatch {
         self.state
             .structures
             .scard_at(key, self.snapshot.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)
+    }
+
+    /// Scans one bounded ascending range through private set writes.
+    ///
+    /// `start_after` is an exclusive exact-member cursor. A zero `limit`
+    /// validates the set and returns no members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor identity, another structure
+    /// kind, or a missing or expired set.
+    pub fn sscan(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        validate_set_scan_identity(key, start_after)?;
+        self.require_private_set(key)?;
+        self.state
+            .structures
+            .sscan_at(key, start_after, limit, self.snapshot.logical_time_micros)
             .ok_or(NativeRuntimeError::UnknownStructureSet)
     }
 
@@ -11957,11 +12402,68 @@ fn prepare_hash_field_updates(
 }
 
 fn set_member_identity(key: &[u8], member: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
-    collection_member_identity(key, member)
+    let identity = collection_member_identity(key, member)?;
+    if identity
+        .len()
+        .checked_add(1)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    Ok(identity)
 }
 
 fn decode_set_member_identity(encoded: &[u8]) -> Result<(&[u8], &[u8]), NativeRuntimeError> {
     decode_collection_member_identity(encoded)
+}
+
+fn validate_set_member_batch_size(requested: usize) -> Result<(), NativeRuntimeError> {
+    if requested > MAX_SET_MEMBER_BATCH_SIZE {
+        return Err(NativeRuntimeError::SetMemberBatchTooLarge { requested });
+    }
+    Ok(())
+}
+
+fn validate_set_member_identity(key: &[u8], member: &[u8]) -> Result<(), NativeRuntimeError> {
+    structure_set_member_key(key, member).map(drop)
+}
+
+fn validate_set_member_positions(
+    key: &[u8],
+    members: &[Vec<u8>],
+) -> Result<(), NativeRuntimeError> {
+    validate_set_member_batch_size(members.len())?;
+    for member in members {
+        validate_set_member_identity(key, member)?;
+    }
+    Ok(())
+}
+
+fn prepare_set_mutation_members(
+    key: &[u8],
+    mut members: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    validate_set_member_positions(key, &members)?;
+    members.sort_unstable();
+    if members.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(NativeRuntimeError::DuplicateSetMember);
+    }
+    Ok(members)
+}
+
+fn validate_set_scan_identity(
+    key: &[u8],
+    start_after: Option<&[u8]>,
+) -> Result<(), NativeRuntimeError> {
+    let metadata = structure_set_meta_key(key);
+    if metadata.len() > BTREE_MAX_KEY_SIZE {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    validate_set_member_identity(key, &[])?;
+    if let Some(cursor) = start_after {
+        validate_set_member_identity(key, cursor)?;
+    }
+    Ok(())
 }
 
 fn decode_set_scan_member_identity<'key>(

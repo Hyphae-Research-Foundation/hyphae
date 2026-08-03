@@ -1086,6 +1086,23 @@ impl StructureState {
             .flatten()
     }
 
+    pub(crate) fn sadd_many_at(
+        &mut self,
+        key: &[u8],
+        members: &[Vec<u8>],
+        logical_time_micros: i64,
+    ) -> Option<usize> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets.get_mut(key).map(|set| {
+            members
+                .iter()
+                .filter(|member| set.insert((*member).clone()))
+                .count()
+        })
+    }
+
     pub(crate) fn sismember(&self, key: &[u8], member: &[u8]) -> Option<bool> {
         self.sets.get(key).map(|members| members.contains(member))
     }
@@ -1099,6 +1116,20 @@ impl StructureState {
         self.set_is_visible(key, logical_time_micros)
             .then(|| self.sismember(key, member))
             .flatten()
+    }
+
+    pub(crate) fn smismember_at(
+        &self,
+        key: &[u8],
+        members: &[Vec<u8>],
+        logical_time_micros: i64,
+    ) -> Option<Vec<bool>> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets
+            .get(key)
+            .map(|set| members.iter().map(|member| set.contains(member)).collect())
     }
 
     pub(crate) fn srem(&mut self, key: &[u8], member: &[u8]) -> Option<bool> {
@@ -1116,6 +1147,23 @@ impl StructureState {
             .flatten()
     }
 
+    pub(crate) fn srem_many_at(
+        &mut self,
+        key: &[u8],
+        members: &[Vec<u8>],
+        logical_time_micros: i64,
+    ) -> Option<usize> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets.get_mut(key).map(|set| {
+            members
+                .iter()
+                .filter(|member| set.remove(member.as_slice()))
+                .count()
+        })
+    }
+
     pub(crate) fn scard(&self, key: &[u8]) -> Option<usize> {
         self.sets.get(key).map(BTreeSet::len)
     }
@@ -1124,6 +1172,27 @@ impl StructureState {
         self.set_is_visible(key, logical_time_micros)
             .then(|| self.scard(key))
             .flatten()
+    }
+
+    pub(crate) fn sscan_at(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets.get(key).map(|members| {
+            let lower =
+                start_after.map_or(Bound::Unbounded, |member| Bound::Excluded(member.to_vec()));
+            members
+                .range((lower, Bound::Unbounded))
+                .take(limit)
+                .cloned()
+                .collect()
+        })
     }
 
     pub(crate) fn create_list(&mut self, key: Vec<u8>) -> bool {
