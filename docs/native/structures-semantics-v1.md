@@ -231,8 +231,10 @@ The [native whole-set TTL v1](native-set-ttl-v1.md) contract freezes absolute
 complete-set expiry, explicit logical-time reads, lifecycle conflicts,
 due-incarnation reuse, WAL opcodes `EXPIRE_SET=33` and internal
 `DELETE_SET=34`, `HYSETM02` metadata, the top-level expiry marker `3`, shared
-active cleanup, corruption boundaries, and evidence requirements. Its
-implementation and evidence remain open.
+active cleanup, corruption boundaries, and evidence requirements. The
+[direct-Linux evidence](../gates/evidence/native-set-ttl-linux-2026-08-03.md)
+binds the implementation, group durability, all seven cleanup crash
+boundaries, compaction, page vacuum, and separated latency to exact source.
 
 `CREATE_LIST` establishes a binary chunked deque before element mutation.
 `LPUSH` and `RPUSH` insert one exact binary value and return the new length.

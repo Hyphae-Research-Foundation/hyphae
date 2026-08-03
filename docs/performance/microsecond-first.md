@@ -140,6 +140,17 @@ inside its frozen 10% gate. The checked
 [receipt](../gates/evidence/native-hash-ttl-linux-2026-08-03.md) remains a
 warm, concurrency-one observation and does not pass G7.
 
+Whole-set TTL uses a dedicated direct-Linux harness over a 2,048-member set.
+Materialized `TTL_SET` observed p50 `0.012 us`, physical `TTL_SET` p50 `0.873
+us`, and physical expiring-set `SISMEMBER` p50 `1.902 us`. Memory expiry
+commit observed p50 `1.047 ms`, strict expiry commit `8.272 ms`, and cleanup
+observed `0.403 ms` for one member versus `0.602 ms` for 256 members. The
+matched persistent `SISMEMBER` control changed by -0.371% at p50 and -0.093%
+at p95, inside its frozen 10% gate. The checked
+[receipt](../gates/evidence/native-set-ttl-linux-2026-08-03.md) separates
+logical, physical, publication, durability, and cardinality-sensitive cleanup
+surfaces and does not pass G7.
+
 Bounded hash field commands use a third direct-Linux harness over one
 2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
 `0.853 us` per field, compared with `47.334 us` total and `1.479 us` per

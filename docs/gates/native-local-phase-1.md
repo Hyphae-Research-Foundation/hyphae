@@ -195,17 +195,19 @@ intersection, reached-corruption failures, hard output/visit limits, and
 direct-Linux latency. Small embedded cases measured 1.838–6.013 microseconds
 at p50; current-root physical cases measured 61.645–93.838 microseconds at
 p50. Large union and difference remained cardinality-sensitive at 2.605 and
-6.784 milliseconds p50. Store variants, set TTL, sorted-set algebra/TTL,
-streams, complete G3, and G7 remain open.
+6.784 milliseconds p50. Store variants, sorted-set algebra/TTL, streams,
+complete G3, and G7 remain open.
 
 The [native whole-set TTL
-contract](../native/native-set-ttl-v1.md) freezes absolute complete-set
-expiry across membership, cardinality, bounded algebra, snapshots, physical
-reads, restart, lifecycle conflicts, due-key reuse, shared active cleanup, and
-compaction. It reserves additive WAL opcodes `EXPIRE_SET=33` and internal
-`DELETE_SET=34`, plus backward-readable `HYSETM02` metadata and top-level
-expiry marker `3`. Implementation, crash, corruption, and latency evidence
-remain open; the contract alone does not satisfy G3.
+evidence](evidence/native-set-ttl-linux-2026-08-03.md) implements the frozen
+absolute complete-set expiry contract across membership, cardinality, bounded
+algebra, snapshots, physical reads, restart, lifecycle conflicts, due-key
+reuse, and shared cleanup. It binds additive WAL opcodes `EXPIRE_SET=33` and
+internal `DELETE_SET=34`, backward-readable `HYSETM02` metadata, expiry marker
+`3`, group durability, seven cleanup crash boundaries, corruption rejection,
+compaction, page vacuum, and matched direct-Linux latency. Relative or
+conditional expiry, persist, per-member TTL, destination algebra, complete
+G3, and G7 remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -699,13 +701,14 @@ ascending, descending, and binary-glob iteration, exact binary sets with
 member-granular conflicts, chunked-deque lists, and dual-index sorted sets
 with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
 delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
-counters, and independent absolute field TTL. It still lacks floating
-counters, set TTL, sorted-set algebra/TTL, relative/conditional field expiry,
-field persist/batches, subtree-count order-statistic acceleration, streams,
-adaptive empty-expiry backoff, randomized model tests, and a user-facing
-historical-retention policy required to close G3. Ordered cleanup,
-current-root compaction, and page-generation vacuum provide exact first
-amplification measurements, not the complete memory-amplification gate.
+counters, independent absolute field TTL, bounded set algebra, and complete-set
+TTL. It still lacks floating counters, sorted-set algebra/TTL,
+relative/conditional expiry, persist/batches, subtree-count order-statistic
+acceleration, streams, adaptive empty-expiry backoff, randomized models for
+every structure family, and a user-facing historical-retention policy
+required to close G3. Ordered cleanup, current-root compaction, and
+page-generation vacuum provide exact first amplification measurements, not
+the complete memory-amplification gate.
 
 ## G1 substrate exit
 

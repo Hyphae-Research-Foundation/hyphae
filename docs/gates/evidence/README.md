@@ -337,6 +337,16 @@ commit before its tag can be published.
   due `HLEN`, memory/strict mutation, 64-field cleanup, and repeated isolated
   parent/current HGET controls. It retains invalid preliminary observations
   as exclusions and remains outside complete G3 and G7.
+- [Native whole-set TTL evidence —
+  2026-08-03](native-set-ttl-linux-2026-08-03.md) binds absolute complete-set
+  expiry, compatible `HYSETM01`/`HYSETM02` metadata, typed shared cleanup,
+  set-algebra visibility, lifecycle conflicts, group durability, all seven
+  cleanup crash boundaries, corruption rejection, compaction, and page vacuum
+  to direct Linux.
+- `native-set-ttl-linux.json` records separated private/snapshot/physical TTL,
+  physical `SISMEMBER`, memory/strict expiry commit, 1- and 256-member cleanup,
+  and a matched parent/current persistent-read control. It remains outside
+  complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

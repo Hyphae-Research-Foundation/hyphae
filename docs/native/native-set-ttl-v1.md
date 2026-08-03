@@ -1,6 +1,7 @@
 # Native whole-set TTL v1
 
-Status: contract frozen; implementation and evidence pending.
+Status: implemented; [direct-Linux evidence captured on
+2026-08-03](../gates/evidence/native-set-ttl-linux-2026-08-03.md).
 
 This contract adds one absolute expiry to a complete native binary set. It
 uses Hyphae's existing WAL, MVCC, ordered B+tree, expiry scheduler, compaction,
