@@ -358,8 +358,17 @@ fn large_document_replacement_and_deletion_reopen_without_resurrection() -> Resu
     let mut delete = reopened.begin(3, DurabilityClass::Strict)?;
     delete.delete_document(index, b"large".to_vec())?;
     delete.commit()?;
+    let vacuum = reopened.vacuum_pages()?;
+    assert!(vacuum.applied);
+    reopened.checkpoint()?;
+    reopened.truncate_wal_at_retention_checkpoint()?;
+    let collection = reopened.collect_blobs()?;
+    assert_eq!(collection.live_files, 0);
+    assert_eq!(collection.candidate_files, 2);
+    assert_eq!(collection.removed_files, 2);
     drop(reopened);
     let reopened = NativeDatabase::open(&data)?;
     assert!(reopened.match_latest_text(index, "new", 10)?.is_empty());
+    assert_eq!(reopened.recovery_report().blob_count, 0);
     Ok(())
 }
