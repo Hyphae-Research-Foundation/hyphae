@@ -79,6 +79,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local protocol v1](native/local-protocol-v1.md)
 - [Native local UDS transport v1](native/local-uds-transport-v1.md)
 - [Native local structure GET v1](native/local-structure-get-v1.md)
+- [Native local structure SET and TTL v1](native/local-structure-set-ttl-v1.md)
 - [Native local UDS Linux evidence](gates/evidence/native-local-uds-linux-2026-08-03.md)
 - [Native local structure GET Linux evidence](gates/evidence/native-local-structure-get-linux-2026-08-03.md)
 - [Native clean-room and dependency inventory](native/dependency-inventory.md)
