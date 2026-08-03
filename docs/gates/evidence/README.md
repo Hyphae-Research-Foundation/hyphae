@@ -269,6 +269,14 @@ commit before its tag can be published.
   `native-pr59-pr60-pr61-integration-rank-linux.json` are the clean
   single-process observations from the integrated source commit. They remain
   outside G2, G3, and G7.
+- [Native sorted-set reverse-range evidence —
+  2026-08-02](native-sorted-set-reverse-ranges-linux-2026-08-02.md) binds
+  descending signed-rank and bounded-score ranges, complete tie reversal,
+  execution-mode equivalence, reverse physical pruning, live-only
+  rank/offset accounting, and fail-closed physical decoding to one source
+  commit.
+- `native-sorted-set-reverse-range-linux.json` is its direct-Linux release
+  observation over 2,048 members. It remains outside G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

@@ -299,9 +299,9 @@ membership and score/member order to one native structure B+tree. It proves
 canonical binary64 ordering, retained snapshots, member-granular optimistic
 rebase, strict reopen, fail-closed dual-index recovery, all seven commit crash
 boundaries, and clean physical microsecond observations over 2,048 members.
-Reverse range output, subtree-count order-statistic acceleration, algebra,
-TTL, protocol exposure, model testing, amplification evidence, the complete
-G3 suite, and G7 remain open.
+Subtree-count order-statistic acceleration, algebra, TTL, protocol exposure,
+model testing, amplification evidence, the complete G3 suite, and G7 remain
+open.
 
 The [native sorted-set score-range
 evidence](evidence/native-sorted-set-score-ranges-linux-2026-08-02.md) adds
@@ -320,9 +320,18 @@ execution. The physical path resolves the member score through the membership
 index, walks the ordered B+tree toward the target in the requested direction,
 ignores tombstones, stops at the live target, and fails closed on forged
 metadata, scores, identities, or markers. Its direct-Linux observation
-characterizes head, middle, and tail costs over 2,048 members. Reverse range
-output, subtree live counts, algebra, TTL, protocol exposure, model testing,
-amplification evidence, the complete G3 suite, and G7 remain open.
+characterizes head, middle, and tail costs over 2,048 members.
+
+The [native sorted-set reverse-range
+evidence](evidence/native-sorted-set-reverse-ranges-linux-2026-08-02.md) adds
+signed-rank `ZREVRANGE` and bounded-score `ZREVRANGE_BY_SCORE` across private,
+retained, current-root, and reopened execution. Both reverse the complete
+score/member order, count only live entries, and stop at the requested result
+boundary. The physical paths start at the ordered prefix tail or traverse only
+the bounded score interval in reverse, reject forged metadata/markers, and do
+not materialize the complete sorted set. Subtree live counts, algebra, TTL,
+protocol exposure, model testing, amplification evidence, the complete G3
+suite, and G7 remain open.
 
 The [native durable scalar-expiry
 evidence](evidence/native-expiry-2026-08-01.md) binds `HYSTRBT2`, its ordered
@@ -606,11 +615,11 @@ primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
 conditional writes, signed counters, independent-field hashes, exact binary
 sets with member-granular conflicts, chunked-deque lists, and dual-index
-sorted sets with bounded score ranges and bidirectional member-rank lookup. It
-still lacks whole-hash lifecycle/iteration, set and sorted-set algebra/TTL,
-reverse range output, subtree-count order-statistic acceleration, streams,
-adaptive empty-expiry backoff, model tests, and a user-facing
-historical-retention policy required to close G3. Ordered cleanup,
+sorted sets with bounded bidirectional score/rank ranges and member-rank
+lookup. It still lacks whole-hash lifecycle/iteration, set and sorted-set
+algebra/TTL, subtree-count order-statistic acceleration, streams, adaptive
+empty-expiry backoff, model tests, and a user-facing historical-retention
+policy required to close G3. Ordered cleanup,
 current-root compaction, and page-generation vacuum provide exact first
 amplification measurements, not the complete memory-amplification gate.
 
