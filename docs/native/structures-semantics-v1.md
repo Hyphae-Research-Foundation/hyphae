@@ -154,16 +154,16 @@ order. A missing member returns no rank; a missing sorted set or another
 structure kind remains a typed error. Private transaction, retained snapshot,
 current-root physical, and reopened execution have identical results.
 
-Current-root rank lookup validates metadata and resolves the member's canonical
-score through the membership index before targeting its exact ordered identity.
-It walks the ordered `0x0a` namespace only through that target, ignores
-tombstones without charging rank, and stops when the live target is found. It
-does not materialize the complete sorted set. A missing or non-live target
-ordered entry, visited live target under a conflicting score, malformed
-visited identity, score, or marker, or impossible cardinality relationship
-fails the complete call. `ZREVRANK` derives its result from validated
-cardinality and forward rank. This first lookup contract does not add subtree
-live counts; order-statistic acceleration remains open.
+Current-root rank lookup validates metadata and resolves the member's
+canonical score through the membership index before targeting its exact
+ordered identity. `ZRANK` walks the ordered `0x0a` namespace ascending through
+that target; `ZREVRANK` walks it descending through the target. Both ignore
+tombstones without charging rank, stop when the live target is found, and do
+not materialize the complete sorted set. A missing or non-live target ordered
+entry, visited live target under a conflicting score, malformed visited
+identity, score, or marker, or a live rank reaching the declared cardinality
+fails the complete call. This first lookup contract does not add subtree live
+counts; order-statistic acceleration remains open.
 
 Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
 rejected before mutation. Negative zero is normalized to positive zero. These
