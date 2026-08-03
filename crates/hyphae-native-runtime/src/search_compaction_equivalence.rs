@@ -224,11 +224,18 @@ fn forged_roots(roots: &RootSet, search_root: PageId) -> Result<RootSet, NativeR
     )?)
 }
 
+#[derive(Clone, Copy)]
+enum ExpectedCorruption {
+    Search,
+    Ann,
+}
+
 fn assert_forgery_rejected(
     database: &mut NativeDatabase,
     roots: &RootSet,
     key: Vec<u8>,
     value: Vec<u8>,
+    expected: ExpectedCorruption,
 ) -> Result<(), TestError> {
     database.coordinator = CommitCoordinator::restore(roots.clone())?;
     let visible_csn = roots
@@ -248,10 +255,15 @@ fn assert_forgery_rejected(
     )?)?;
     let pages_before = database.pages.page_count();
     let wal_before = wal_bytes(database)?;
-    assert!(matches!(
-        database.compact_search(DurabilityClass::Strict),
-        Err(NativeRuntimeError::InvalidSearchTree)
-    ));
+    let result = database.compact_search(DurabilityClass::Strict);
+    match expected {
+        ExpectedCorruption::Search => {
+            assert!(matches!(result, Err(NativeRuntimeError::InvalidSearchTree)));
+        }
+        ExpectedCorruption::Ann => {
+            assert!(matches!(result, Err(NativeRuntimeError::InvalidAnnTree)));
+        }
+    }
     assert_eq!(database.pages.page_count(), pages_before);
     assert_eq!(wal_bytes(database)?, wal_before);
     Ok(())
@@ -285,13 +297,28 @@ fn malformed_v2_roots_are_rejected_before_compaction_append() -> Result<(), Test
         &roots,
         search_document_key(index, b"doc-deleted")?,
         malformed_tombstone,
+        ExpectedCorruption::Search,
     )?;
-    assert_forgery_rejected(&mut database, &roots, vec![0xff, 0x01], vec![0])?;
+    assert_forgery_rejected(
+        &mut database,
+        &roots,
+        vec![0xff, 0x01],
+        vec![0],
+        ExpectedCorruption::Search,
+    )?;
     assert_forgery_rejected(
         &mut database,
         &roots,
         search_posting_key(index, b"orphan", b"doc-live")?,
         posting_value,
+        ExpectedCorruption::Search,
+    )?;
+    assert_forgery_rejected(
+        &mut database,
+        &roots,
+        vec![ann_store::ANN_INDEX_META_PREFIX],
+        vec![0],
+        ExpectedCorruption::Ann,
     )?;
     database.coordinator = CommitCoordinator::restore(roots)?;
     Ok(())
@@ -323,6 +350,33 @@ fn v1_and_inline_search_roots_do_not_advance_storage() -> Result<(), TestError> 
     assert!(matches!(
         database.compact_search(DurabilityClass::Strict),
         Err(NativeRuntimeError::SearchCompactionUnsupported)
+    ));
+    assert_eq!(database.pages.page_count(), pages_before);
+    assert_eq!(wal_bytes(&database)?, wal_before);
+    Ok(())
+}
+
+#[test]
+fn missing_search_blob_is_rejected_before_compaction_append() -> Result<(), TestError> {
+    let temporary = TestDirectory::new();
+    let index = ObjectId::new(100)?;
+    let text = format!("blobtoken {}", "x ".repeat(SEARCH_INLINE_VALUE_LIMIT));
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_search_index(index, "documents")?;
+    seed.index_document(index, b"doc".to_vec(), text)?;
+    seed.commit()?;
+    let blob = fs::read_dir(temporary.path().join("blobs"))?
+        .next()
+        .ok_or("missing source blob")??
+        .path();
+    fs::remove_file(blob)?;
+    let pages_before = database.pages.page_count();
+    let wal_before = wal_bytes(&database)?;
+
+    assert!(matches!(
+        database.compact_search(DurabilityClass::Strict),
+        Err(NativeRuntimeError::Blob(_))
     ));
     assert_eq!(database.pages.page_count(), pages_before);
     assert_eq!(wal_bytes(&database)?, wal_before);
