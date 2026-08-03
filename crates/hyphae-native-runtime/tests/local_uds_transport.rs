@@ -14,8 +14,8 @@ use std::{
 };
 
 use hyphae_native_runtime::{
-    DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, LocalFrameIo, LocalProtocolError, LocalTransportError,
-    UdsFrameConnection, UdsFrameListener, encode_frame,
+    DEFAULT_MAX_FRAME_PAYLOAD, FrameKind, LOCAL_FRAME_HEADER_SIZE, LocalFrameIo,
+    LocalProtocolError, LocalTransportError, UdsFrameConnection, UdsFrameListener, encode_frame,
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -83,10 +83,16 @@ fn framed_io_rejects_invalid_maximum_truncation_and_oversized_header()
     ));
 
     let encoded = encode_frame(FrameKind::Ping, 0, 1, b"x", 1)?;
-    let mut truncated = Cursor::new(&encoded[..encoded.len() - 1]);
+    let mut truncated_header = Cursor::new(&encoded[..LOCAL_FRAME_HEADER_SIZE - 1]);
     let mut io = LocalFrameIo::new(1)?;
     assert!(matches!(
-        io.receive_from(&mut truncated),
+        io.receive_from(&mut truncated_header),
+        Err(LocalTransportError::Truncated)
+    ));
+
+    let mut truncated_payload = Cursor::new(&encoded[..encoded.len() - 1]);
+    assert!(matches!(
+        io.receive_from(&mut truncated_payload),
         Err(LocalTransportError::Truncated)
     ));
 
@@ -98,6 +104,10 @@ fn framed_io_rejects_invalid_maximum_truncation_and_oversized_header()
             LocalProtocolError::PayloadTooLarge
         ))
     ));
+    assert_eq!(
+        oversized.position(),
+        u64::try_from(LOCAL_FRAME_HEADER_SIZE)?
+    );
     Ok(())
 }
 
