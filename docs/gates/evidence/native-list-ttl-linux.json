@@ -1,0 +1,330 @@
+{
+  "schema": "hyphae.native.list-ttl-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-list-ttl",
+  "stacked_base_commit": "6d56bb1ba2544754731cd84eba3b634cc2cb4bd3",
+  "contract_commit": "5a7a84593ea8098aab52a8e406de9d261bc1fb7f",
+  "contract_correction_commit": "c85d2e9a9490be3525a15bbac7906380c9a7f160",
+  "runtime_implementation_commit": "f491f859fd5b494d955b694018ab753d92108f1c",
+  "test_hardening_commit": "2310f812671d3578e1b349f1cd3171b015cad404",
+  "benchmark_introduction_commit": "3e888652e9811c18594c7120dc17c4119d67cde8",
+  "runtime_benchmark_commit": "3e888652e9811c18594c7120dc17c4119d67cde8",
+  "control_harness_commit": "601f1311afaa9985ccfa47193f8e33af66365cdc",
+  "final_verified_source_commit": "947a423019ae480ef7c5a9874a7cb55b67f0c862",
+  "final_verified_source_tree": "c7fe917e4d0e505271b55cd08f84d217dcf8a17f",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test list_ttl_equivalence --no-run",
+    "raw_sha256": "ac23787e32feed7958ab5a1d030686ed4c482a1436da68af4ad30d1f7064069b8",
+    "expected_error": "E0599",
+    "expected_error_count": 8
+  },
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "list_ttl_smoke": {
+    "schema": "hyphae.native.list-ttl-smoke.v1",
+    "status": "observation-not-universal-slo",
+    "harness_sha256": "42298fde0a23a512dc649b33bdbc08becc54038e076b25c578efb3ba514a7d7a",
+    "raw_sha256": "c392ac47835919eee50d88d33181cca4332c7f2ddd8b754ee8c8d07c8365e479",
+    "commit": "3e888652e9811c18594c7120dc17c4119d67cde8",
+    "list_elements": 2048,
+    "read_observations": 200000,
+    "read_operations_per_observation": 32,
+    "read_warmup": 20000,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "cleanup_lists_per_cardinality": 16,
+    "small_cleanup_elements": 1,
+    "large_cleanup_elements": 256,
+    "operations": {
+      "persistent_list_llen_physical": {
+        "p50_nanos": 216,
+        "p95_nanos": 301,
+        "p99_nanos": 398,
+        "p999_nanos": 608,
+        "maximum_nanos": 3765,
+        "throughput_per_second": 4406174.409
+      },
+      "persistent_list_ttl_materialized_snapshot": {
+        "p50_nanos": 7,
+        "p95_nanos": 8,
+        "p99_nanos": 8,
+        "p999_nanos": 10,
+        "maximum_nanos": 599,
+        "throughput_per_second": 111774924.145
+      },
+      "expiring_list_ttl_private_batch": {
+        "p50_nanos": 13,
+        "p95_nanos": 14,
+        "p99_nanos": 15,
+        "p999_nanos": 27,
+        "maximum_nanos": 427,
+        "throughput_per_second": 68346534.057
+      },
+      "expiring_list_ttl_materialized_snapshot": {
+        "p50_nanos": 12,
+        "p95_nanos": 13,
+        "p99_nanos": 24,
+        "p999_nanos": 28,
+        "maximum_nanos": 451,
+        "throughput_per_second": 71949148.410
+      },
+      "expiring_list_ttl_physical": {
+        "p50_nanos": 212,
+        "p95_nanos": 338,
+        "p99_nanos": 405,
+        "p999_nanos": 636,
+        "maximum_nanos": 3477,
+        "throughput_per_second": 4460081.913
+      },
+      "expiring_list_llen_physical": {
+        "p50_nanos": 216,
+        "p95_nanos": 321,
+        "p99_nanos": 408,
+        "p999_nanos": 640,
+        "maximum_nanos": 3459,
+        "throughput_per_second": 4384475.774
+      },
+      "expire_list_memory_commit": {
+        "p50_nanos": 680528,
+        "p95_nanos": 697888,
+        "p99_nanos": 712429,
+        "p999_nanos": 712429,
+        "maximum_nanos": 809084,
+        "throughput_per_second": 1463.099
+      },
+      "expire_list_strict_commit": {
+        "p50_nanos": 7632511,
+        "p95_nanos": 10216026,
+        "p99_nanos": 10216026,
+        "p999_nanos": 10216026,
+        "maximum_nanos": 108587383,
+        "throughput_per_second": 69.915
+      },
+      "expire_list_cleanup_1_element_memory": {
+        "p50_nanos": 337042,
+        "p95_nanos": 356063,
+        "p99_nanos": 356063,
+        "p999_nanos": 356063,
+        "maximum_nanos": 384418,
+        "throughput_per_second": 2918.284
+      },
+      "expire_list_cleanup_256_elements_memory": {
+        "p50_nanos": 401284,
+        "p95_nanos": 459927,
+        "p99_nanos": 459927,
+        "p999_nanos": 459927,
+        "maximum_nanos": 462157,
+        "throughput_per_second": 2456.651
+      }
+    }
+  },
+  "matched_persistent_llen_control": {
+    "harness_sha256": "63088625fa4930117bfca0684ec7db4a6bbfb43dcc8b8c4329401bd51e684ac6",
+    "cpu_affinity": 2,
+    "pair_count": 5,
+    "order": "alternating parent-current and current-parent",
+    "list_elements": 2048,
+    "observations_per_run": 200000,
+    "operations_per_observation": 32,
+    "warmup_per_run": 20000,
+    "runs": [
+      {
+        "pair": 1,
+        "parent": {
+          "raw_sha256": "2454f64704e168b15277d63a553dd8fb8d2f3c86c41121d40482975164b4d7cb",
+          "p50_nanos": 220,
+          "p95_nanos": 381,
+          "p99_nanos": 542,
+          "p999_nanos": 817,
+          "maximum_nanos": 3559,
+          "throughput_per_second": 4096941.311
+        },
+        "current": {
+          "raw_sha256": "3352de05a171b029740592bfc11ce28eea941de6bcb8781fecb3d9dc7caa205c",
+          "p50_nanos": 215,
+          "p95_nanos": 369,
+          "p99_nanos": 509,
+          "p999_nanos": 782,
+          "maximum_nanos": 3530,
+          "throughput_per_second": 4272625.832
+        }
+      },
+      {
+        "pair": 2,
+        "parent": {
+          "raw_sha256": "211452baeb41372132ebcc8ad3e2d01336ff4eaa950488f2ba9d047d441099a3",
+          "p50_nanos": 217,
+          "p95_nanos": 361,
+          "p99_nanos": 513,
+          "p999_nanos": 752,
+          "maximum_nanos": 3563,
+          "throughput_per_second": 4250973.074
+        },
+        "current": {
+          "raw_sha256": "d3c596b6a3a2f12767209c4777372a733ce2f25d27cb616ff3b95f2f0de08df1",
+          "p50_nanos": 216,
+          "p95_nanos": 383,
+          "p99_nanos": 533,
+          "p999_nanos": 814,
+          "maximum_nanos": 3397,
+          "throughput_per_second": 4162104.013
+        }
+      },
+      {
+        "pair": 3,
+        "parent": {
+          "raw_sha256": "49836a4efe389a499e34b83a2f67bdf118dc57ab80e3ef7f959bacfb01a2496e",
+          "p50_nanos": 217,
+          "p95_nanos": 369,
+          "p99_nanos": 509,
+          "p999_nanos": 789,
+          "maximum_nanos": 3137,
+          "throughput_per_second": 4251174.436
+        },
+        "current": {
+          "raw_sha256": "b79706a95b7fe4bce6da2b7556adeb8196b10e08cf1d4d8942ce37c40ab131a7",
+          "p50_nanos": 220,
+          "p95_nanos": 387,
+          "p99_nanos": 557,
+          "p999_nanos": 830,
+          "maximum_nanos": 4540,
+          "throughput_per_second": 4062361.483
+        }
+      },
+      {
+        "pair": 4,
+        "parent": {
+          "raw_sha256": "69277003ac1518f0a1443e59657aac436fedec5346a615910a43f7b66f0d9be6",
+          "p50_nanos": 216,
+          "p95_nanos": 372,
+          "p99_nanos": 524,
+          "p999_nanos": 808,
+          "maximum_nanos": 5195,
+          "throughput_per_second": 4228469.566
+        },
+        "current": {
+          "raw_sha256": "0a90082e862629fc90504a9f5e6c11868e35ad1e57722e85735f3d3ecef91e32",
+          "p50_nanos": 216,
+          "p95_nanos": 372,
+          "p99_nanos": 527,
+          "p999_nanos": 779,
+          "maximum_nanos": 3804,
+          "throughput_per_second": 4238711.876
+        }
+      },
+      {
+        "pair": 5,
+        "parent": {
+          "raw_sha256": "3a9bf8b88aa69153f0cc7a6e2d218dc08621807de678684ade40db96767de957",
+          "p50_nanos": 216,
+          "p95_nanos": 371,
+          "p99_nanos": 524,
+          "p999_nanos": 780,
+          "maximum_nanos": 3235,
+          "throughput_per_second": 4231996.904
+        },
+        "current": {
+          "raw_sha256": "124d08015a668c8107d6f7b6e6b3e288c3733aff6fe841032769eca768f893b7",
+          "p50_nanos": 219,
+          "p95_nanos": 366,
+          "p99_nanos": 502,
+          "p999_nanos": 755,
+          "maximum_nanos": 4584,
+          "throughput_per_second": 4240947.374
+        }
+      }
+    ],
+    "median": {
+      "parent": {
+        "commit": "6d56bb1ba2544754731cd84eba3b634cc2cb4bd3",
+        "p50_nanos": 217,
+        "p95_nanos": 371,
+        "p99_nanos": 524,
+        "p999_nanos": 789,
+        "maximum_nanos": 3559,
+        "throughput_per_second": 4231996.904
+      },
+      "current": {
+        "commit": "601f1311afaa9985ccfa47193f8e33af66365cdc",
+        "p50_nanos": 216,
+        "p95_nanos": 372,
+        "p99_nanos": 527,
+        "p999_nanos": 782,
+        "maximum_nanos": 3804,
+        "throughput_per_second": 4238711.876
+      },
+      "change_percent": {
+        "p50": -0.461,
+        "p95": 0.270,
+        "p99": 0.573,
+        "p999": -0.887,
+        "throughput": 0.159
+      }
+    },
+    "gate": {
+      "metric": "median p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "matched_list_lifecycle_control": {
+    "harness_sha256": "aeaa873be656fabd9387d85f82b9723b81a1516729f67f940099872954b346d5",
+    "parent_raw_sha256": "0fd98deb2d2074723e66cbf75e61254c66c4419cfcd9959b96ff01265730ca5f",
+    "current_raw_sha256": "f9e59f605e4933a6a5fbf66f44488d79105541c95f0d60d7726c36c3130f842b",
+    "parent_commit": "6d56bb1ba2544754731cd84eba3b634cc2cb4bd3",
+    "current_commit": "3e888652e9811c18594c7120dc17c4119d67cde8",
+    "elements": 2048,
+    "change_percent": {
+      "private_delete_list_p50": -1.878,
+      "private_delete_list_p95": -22.416,
+      "memory_commit_p50": -0.080,
+      "memory_commit_p95": 6.923,
+      "strict_commit_p50": 3.774,
+      "strict_commit_p95": -0.295
+    },
+    "gate": {
+      "metric": "2048-element p50 and p95 increase no greater than 10 percent per route",
+      "passed": true
+    }
+  },
+  "verification": {
+    "runtime_tests_passed": 331,
+    "runtime_tests_failed": 0,
+    "list_ttl_tests_passed": 10,
+    "list_ttl_tests_failed": 0,
+    "wal_codec_tests_passed": 15,
+    "wal_codec_tests_failed": 0,
+    "singleton_cleanup_boundaries": 7,
+    "workspace_all_targets_all_features_locked": "passed",
+    "clippy_workspace_all_targets_all_features_locked_deny_warnings": "passed",
+    "rustdoc_workspace_all_features_locked_deny_warnings": "passed",
+    "documentation_check": "passed",
+    "logs": {
+      "workspace_test_sha256": "7ffa4722cc520a42f43216485537e6856635743cf2cbe1276309735fdbd161b1",
+      "clippy_sha256": "432c812e654c854afca85a6a0470500fc6752ec54b9ce15adc879ff7d7592c65",
+      "rustdoc_sha256": "14013b7d8f6ab21aeeba5c3a49035ca293c709229864f54e6d753de435cc8fb3"
+    }
+  },
+  "boundaries": [
+    "Warm embedded and current-root observations are not a universal latency SLO.",
+    "Strict commit includes ext4/EBS page and WAL synchronization.",
+    "Cleanup cost is cardinality-sensitive and is reported separately for 1 and 256 live elements.",
+    "The matched LLEN control uses five alternating parent/current pairs pinned to one vCPU after an unpinned single-pair p95 proved noisy.",
+    "The matched controls are concurrency-one and do not close saturation, cold-cache, allocation, RSS, hardware-counter, or G7 gates.",
+    "Injected commit boundaries are not physical power-loss evidence.",
+    "Complete G3, local-protocol exposure, randomized list-TTL model equivalence, relative or conditional expiry, persist, per-element TTL, blocking operations, indexed insertion, trimming, moving, element mutation, batched push/pop, and streams remain open."
+  ]
+}

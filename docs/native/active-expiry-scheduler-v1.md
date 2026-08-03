@@ -3,11 +3,18 @@
 Status: implemented; evidence recorded in
 [Native active-expiry scheduler evidence — 2026-08-02](../gates/evidence/native-active-expiry-scheduler-2026-08-02.md)
 and extended to mixed scalar/hash cleanup in
-[Native whole-hash TTL evidence on Linux — 2026-08-03](../gates/evidence/native-hash-ttl-linux-2026-08-03.md).
+[Native whole-hash TTL evidence on Linux — 2026-08-03](../gates/evidence/native-hash-ttl-linux-2026-08-03.md),
+hash-field cleanup in
+[Native hash field TTL evidence on Linux — 2026-08-03](../gates/evidence/native-hash-field-ttl-linux-2026-08-03.md),
+whole-set cleanup in
+[Native whole-set TTL evidence on Linux — 2026-08-03](../gates/evidence/native-set-ttl-linux-2026-08-03.md),
+and whole-list cleanup in
+[Native whole-list TTL evidence on Linux — 2026-08-03](../gates/evidence/native-list-ttl-linux-2026-08-03.md).
 
 Active expiry is physical structure maintenance owned by the native commit
-scheduler. It removes due scalar values and whole hashes through one typed
-expiry index and one normal WAL/MVCC transaction without introducing another
+scheduler. It removes due scalar values, whole hashes, whole sets, whole
+lists, and independently expiring hash fields through typed native expiry
+indexes and one normal WAL/MVCC transaction without introducing another
 writer, timer database, cache, or external service.
 
 This contract extends
@@ -16,9 +23,9 @@ This contract extends
 
 ## Logical versus physical expiry
 
-Scalar `GET`/`TTL` and hash-family reads/`TTL_HASH` evaluate stored absolute
-expiry against supplied logical time. A due scalar or hash is logically absent
-even when active expiry has not yet written its tombstone.
+Scalar, hash, set, list, and hash-field reads evaluate stored absolute expiry
+against supplied logical time. A due value or family is logically absent even
+when active expiry has not yet written its tombstone.
 
 The scheduler therefore provides bounded physical reclamation, not the
 correctness authority for logical absence. Delayed, disabled, cancelled, or
@@ -48,7 +55,7 @@ Active expiry is optional and disabled by default. Its validated configuration
 names:
 
 - an interval in `100 µs..=60 s`;
-- a batch limit in `1..=4096` combined scalar or hash keys;
+- a batch limit in `1..=4096` combined due structure identities;
 - `memory` or `strict` singleton durability; and
 - a foreground budget in `1..=4096` submitted requests after a sweep becomes
   due.
@@ -113,7 +120,7 @@ The scheduler exposes a lock-free snapshot containing:
 
 - attempted sweeps;
 - non-empty committed sweeps;
-- expired scalar or hash keys;
+- expired scalar, hash, set, list, or hash-field identities;
 - empty sweeps;
 - failures;
 - the latest sampled logical time;
@@ -128,10 +135,11 @@ expiry authority from roots and WAL rather than these counters.
 Executable evidence must cover:
 
 - idle active expiry without a foreground trigger;
-- logical scalar and whole-hash absence before the physical sweep;
+- logical scalar, whole-hash, whole-set, whole-list, and hash-field absence
+  before the physical sweep;
 - one non-empty sweep consuming exactly one transaction ID and CSN;
 - an empty sweep consuming neither;
-- deterministic mixed scalar/hash batch bounds and `more_due`;
+- deterministic mixed-family batch bounds and `more_due`;
 - a regressing injected clock and its non-decreasing watermark;
 - continuous group load with the configured foreground bound;
 - strict and memory sweep durability;

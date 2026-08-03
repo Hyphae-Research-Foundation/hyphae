@@ -1,6 +1,7 @@
 # Native whole-list TTL v1
 
-Status: contract frozen; implementation and direct-Linux evidence pending.
+Status: implemented; direct-Linux evidence recorded in
+[Native whole-list TTL evidence — 2026-08-03](../gates/evidence/native-list-ttl-linux-2026-08-03.md).
 
 This contract adds one absolute expiry to a complete native binary list. It
 uses Hyphae's existing WAL, MVCC, ordered B+tree, chunked deque storage,

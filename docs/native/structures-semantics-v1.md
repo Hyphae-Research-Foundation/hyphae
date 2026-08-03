@@ -3,13 +3,14 @@
 Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, bounded native set member batches and scans, chunked-deque lists,
+absolute complete-set and complete-list TTL,
 multilevel B+tree persistence, direct buffered reads, large immutable blobs,
 dual-index sorted sets, bounded sorted-set score ranges, bidirectional
 sorted-set member ranks, and reverse sorted-set rank/score ranges are
 implemented in the convergence slice; the ordered durable scalar-expiry index
 and bounded cleanup are
 implemented; an engine-owned background timer, version-bearing responses, and
-the remaining structure families remain pending.
+the remaining structure commands and complete G3 gates remain pending.
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -275,8 +276,12 @@ WAL opcode `DELETE_LIST=35`. The
 complete-list expiry, explicit logical-time reads, due-incarnation reuse,
 additive WAL opcode `EXPIRE_LIST=36`, `HYLSTM02` metadata, top-level expiry
 marker `4`, shared cleanup, corruption boundaries, and direct-Linux evidence
-requirements. Blocking pop, insertion by index, trimming, moving between
-lists, and element mutation remain pending.
+requirements. The
+[direct-Linux evidence](../gates/evidence/native-list-ttl-linux-2026-08-03.md)
+binds the implementation, Group durability, all seven cleanup crash
+boundaries, compaction, page vacuum, blob collection, and repeated matched
+latency controls to exact source. Blocking pop, insertion by index, trimming,
+moving between lists, and element mutation remain pending.
 
 `CREATE_SORTED_SET` establishes a typed binary sorted set before member
 mutation. `ZADD` adds a member or replaces its score and reports added,

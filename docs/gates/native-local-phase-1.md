@@ -225,8 +225,21 @@ evidence](evidence/native-list-lifecycle-linux-2026-08-03.md) adds
 and chunk retirement, retained history, all typed recreations, whole-list
 first-committer-wins conflicts, 14 singleton crash boundaries, multichunk
 blob retirement, fail-closed corruption, compaction, page vacuum, blob
-collection, reopen, and direct-Linux cardinality-sensitive latency. List TTL,
-blocking operations, streams, complete G3, and G7 remain open.
+collection, reopen, and direct-Linux cardinality-sensitive latency.
+Process-kill/block replay, blocking operations, streams, complete G3, and G7
+remain open.
+
+The [native whole-list TTL
+evidence](evidence/native-list-ttl-linux-2026-08-03.md) implements absolute
+complete-list expiry across both-end mutation, length/range reads, snapshots,
+explicit-time physical reads, restart, lifecycle conflicts, due-key reuse,
+and shared cleanup. It binds additive WAL opcode `EXPIRE_LIST=36`, existing
+retirement opcode `DELETE_LIST=35`, backward-readable `HYLSTM02` metadata,
+expiry marker `4`, Group durability, seven cleanup crash boundaries,
+corruption rejection, compaction, page vacuum, blob collection, and repeated
+matched direct-Linux latency. Relative or conditional expiry, persist,
+per-element TTL, blocking/indexed/trim/move operations, complete G3, and G7
+remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -721,7 +734,8 @@ member-granular conflicts, chunked-deque lists, and dual-index sorted sets
 with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
 delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
 counters, independent absolute field TTL, bounded set algebra, and complete-set
-TTL. It still lacks floating counters, sorted-set algebra/TTL,
+TTL, plus complete-list delete/recreate and TTL. It still lacks floating
+counters, sorted-set algebra/TTL,
 relative/conditional expiry, persist/batches, subtree-count order-statistic
 acceleration, streams, adaptive empty-expiry backoff, randomized models for
 every structure family, and a user-facing historical-retention policy

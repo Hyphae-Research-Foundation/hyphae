@@ -377,8 +377,17 @@ commit before its tag can be published.
   direct Linux.
 - `native-list-lifecycle-linux.json` records private deletion plus Memory and
   Strict publication for empty, 64-element, and 2,048-element lists. It
-  remains outside list TTL, process-kill/power-loss evidence, complete G3,
-  and G7.
+  remains outside process-kill/power-loss evidence, complete G3, and G7.
+- [Native whole-list TTL evidence —
+  2026-08-03](native-list-ttl-linux-2026-08-03.md) binds absolute complete-list
+  expiry, compatible `HYLSTM01`/`HYLSTM02` metadata, typed shared cleanup,
+  both-end mutation visibility, lifecycle conflicts, Group durability, all
+  seven cleanup crash boundaries, corruption rejection, compaction, page
+  vacuum, and blob collection to direct Linux.
+- `native-list-ttl-linux.json` records separated private/snapshot/physical
+  TTL, physical `LLEN`, memory/strict expiry commit, 1- and 256-element
+  cleanup, five alternating pinned parent/current persistent-read pairs, and
+  a matched list-lifecycle control. It remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed

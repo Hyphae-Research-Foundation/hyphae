@@ -173,6 +173,18 @@ checked
 does not infer synchronization time by subtracting independent routes and
 does not pass G7.
 
+Whole-list TTL uses a dedicated direct-Linux harness over a 2,048-element
+chunked deque. Materialized `TTL_LIST` observed p50 `0.012 us`, physical
+`TTL_LIST` p50 `0.212 us`, and physical expiring-list `LLEN` p50 `0.216 us`.
+Memory expiry commit observed p50 `0.681 ms`, strict expiry commit `7.633 ms`,
+and cleanup observed `0.337 ms` for one element versus `0.401 ms` for 256
+elements. Five alternating parent/current persistent-`LLEN` pairs pinned to
+one vCPU changed by -0.461% at median p50 and +0.270% at median p95, inside
+the frozen 10% gate. The checked
+[receipt](../gates/evidence/native-list-ttl-linux-2026-08-03.md) separates
+logical, physical, publication, durability, and cardinality-sensitive cleanup
+surfaces and does not pass G7.
+
 Bounded hash field commands use a third direct-Linux harness over one
 2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
 `0.853 us` per field, compared with `47.334 us` total and `1.479 us` per
