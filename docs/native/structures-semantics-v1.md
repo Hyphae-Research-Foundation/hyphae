@@ -4,10 +4,10 @@ Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
 buffered reads, large immutable blobs, and dual-index sorted sets are
-implemented in the convergence slice; bounded sorted-set score ranges are the
-next admitted increment; the ordered durable scalar-expiry index and bounded
-cleanup are implemented; an engine-owned background timer, version-bearing
-responses, and the remaining structure families remain pending
+implemented in the convergence slice, including bounded sorted-set score
+ranges; the ordered durable scalar-expiry index and bounded cleanup are
+implemented; an engine-owned background timer, version-bearing responses, and
+the remaining structure families remain pending
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -44,8 +44,8 @@ conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
 counters, explicitly created binary hash/maps, exact binary sets, and
-chunked-deque lists. Sorted sets, streams, bitmaps, sketches, geo indexes, and
-typed registers remain targets.
+chunked-deque lists, plus dual-index sorted sets with bounded score ranges.
+Streams, bitmaps, sketches, geo indexes, and typed registers remain targets.
 
 ## First vertical operations
 
