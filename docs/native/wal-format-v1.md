@@ -99,7 +99,8 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 MEMBER=16`, `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`, `POP
 LIST HEAD=23`, `POP LIST TAIL=24`, `CREATE SORTED SET=25`, `UPSERT SORTED SET
 MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`, `DELETE
-HASH=30`, `EXPIRE HASH=31`; and search
+HASH=30`, `EXPIRE HASH=31`, `EXPIRE HASH FIELD=32`, `EXPIRE SET=33`, `DELETE
+SET=34`, `DELETE LIST=35`, `EXPIRE LIST=36`; and search
 `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
 `DELETE VECTOR=19`.
 `DELETE VALUE`, collection creation, whole-hash/hash-field deletion, set/sorted-set
@@ -120,6 +121,14 @@ copying fields into the WAL body. Expiry-driven physical cleanup reuses
 compound hash-key/field identity, no target, an empty value, and one explicit
 signed expiry. Replay preserves the admitted field value while deriving its
 collision-free field-expiry index update.
+
+`EXPIRE SET=33` and `DELETE SET=34` are the complete-set lifecycle opcodes
+specified by [Native whole-set TTL v1](native-set-ttl-v1.md).
+`DELETE LIST=35` and `EXPIRE LIST=36` are the complete-list lifecycle opcodes
+specified by [Native whole-list lifecycle v1](native-list-lifecycle-v1.md) and
+[Native whole-list TTL v1](native-list-ttl-v1.md). The expiry mutations carry
+an empty value and one explicit signed expiry. Complete deletion carries no
+expiry and is also the replay authority used by active cleanup.
 
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances

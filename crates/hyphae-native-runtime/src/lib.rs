@@ -8231,7 +8231,10 @@ impl NativeWriteBatch {
                 .state
                 .structures
                 .set_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.lists.contains_key(&key)
+            || self
+                .state
+                .structures
+                .list_is_visible(&key, self.snapshot.logical_time_micros)
             || self.state.structures.sorted_sets.contains_key(&key)
         {
             return Err(NativeRuntimeError::StructureKindMismatch);
@@ -10526,7 +10529,9 @@ fn apply_list_mutation(
     state: &mut StructureState,
     mutation: &Mutation,
 ) -> Result<(), NativeRuntimeError> {
-    if mutation.target.is_some() || mutation.expires_at_micros.is_some() {
+    if mutation.target.is_some()
+        || (mutation.opcode != Opcode::ExpireList && mutation.expires_at_micros.is_some())
+    {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     match mutation.opcode {

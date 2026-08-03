@@ -1156,6 +1156,8 @@ mod tests {
             structure_mutation(Opcode::ExpireSet, b"set", b"", Some(42)),
             structure_mutation(Opcode::DeleteSet, b"retired-set", b"", None),
             structure_mutation(Opcode::CreateList, b"list", b"", None),
+            structure_mutation(Opcode::ExpireList, b"list", b"", Some(43)),
+            structure_mutation(Opcode::DeleteList, b"retired-list", b"", None),
             structure_mutation(Opcode::PushListHead, b"list", b"head", None),
             structure_mutation(Opcode::PushListTail, b"list", b"tail", None),
             structure_mutation(Opcode::PopListHead, b"list", b"head", None),
@@ -1221,7 +1223,10 @@ mod tests {
         let recovered = recover_wal(decoded.records())?;
         assert_eq!(recovered.commits.len(), 1);
         assert_eq!(recovered.commits[0].manifest.roots, roots);
-        assert_eq!(recovered.commits[0].manifest.mutation_count, 28);
+        assert_eq!(
+            recovered.commits[0].manifest.mutation_count,
+            u32::try_from(mutations.len())?
+        );
         assert_eq!(recovered.commits[0].mutations, mutations);
         Ok(())
     }
@@ -1308,7 +1313,12 @@ mod tests {
 
     #[test]
     fn list_mutations_reject_targets_expiry_and_nonempty_creation() {
+        assert_eq!(Opcode::DeleteList as u8, 35);
+        assert_eq!(Opcode::ExpireList as u8, 36);
         assert!(validate_mutation_shape(Opcode::DeleteList, false, 0, None, b"list").is_ok());
+        assert!(
+            validate_mutation_shape(Opcode::ExpireList, false, 0, Some(i64::MIN), b"list").is_ok()
+        );
         assert!(matches!(
             validate_mutation_shape(Opcode::CreateList, false, 1, None, b"list"),
             Err(WalSemanticError::InvalidBody)
@@ -1329,6 +1339,9 @@ mod tests {
             validate_mutation_shape(Opcode::DeleteList, true, 0, None, b"list"),
             validate_mutation_shape(Opcode::DeleteList, false, 1, None, b"list"),
             validate_mutation_shape(Opcode::DeleteList, false, 0, Some(10), b"list"),
+            validate_mutation_shape(Opcode::ExpireList, true, 0, Some(10), b"list"),
+            validate_mutation_shape(Opcode::ExpireList, false, 1, Some(10), b"list"),
+            validate_mutation_shape(Opcode::ExpireList, false, 0, None, b"list"),
         ] {
             assert!(matches!(result, Err(WalSemanticError::InvalidBody)));
         }
