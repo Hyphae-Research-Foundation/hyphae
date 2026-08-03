@@ -90,6 +90,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local SEARCH MATCH Linux evidence](gates/evidence/native-local-search-match-linux-2026-08-03.md)
 - [Native local SQL SELECT Linux evidence](gates/evidence/native-local-sql-select-linux-2026-08-03.md)
 - [Native local all-engine transaction Linux evidence](gates/evidence/native-local-all-engine-transaction-linux-2026-08-03.md)
+- [Native delta all-engine transaction Linux evidence](gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md)
 - [Native clean-room and dependency inventory](native/dependency-inventory.md)
 - [Structured query semantics v1](query/reference-semantics-v1.md)
 - [Exact retrieval semantics v1](retrieval/reference-semantics-v1.md)

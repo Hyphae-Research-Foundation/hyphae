@@ -1,7 +1,8 @@
 # Native delta all-engine transaction v1
 
-Status: normative implementation target; red gate and direct-Linux evidence
-pending.
+Status: implemented and verified by
+[`native-delta-all-engine-transaction-linux-2026-08-03.md`](../gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md).
+The bounded delta gates pass; the wider native phase gates remain open.
 
 This contract replaces the materialized hot path behind the local
 SQL-plus-structure-plus-search transaction with a Hyphae-owned physical delta
