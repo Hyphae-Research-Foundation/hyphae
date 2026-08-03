@@ -532,12 +532,13 @@ fn run_fixed_hash_model_corpus() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("fixed corpus action accounting diverged").into());
     }
     println!(
-        "hash_model_corpus seeds={} steps_per_seed={} actions={} comparisons={} \
+        "hash_model_corpus seeds={} steps_per_seed={} actions={} action_counts={:?} comparisons={} \
          private_audits={} retained_audits={} materialized_audits={} \
          physical_audits={} reopens={}",
         FIXED_SEEDS.len(),
         STEPS_PER_SEED,
         expected_actions,
+        stats.actions,
         stats.comparisons,
         stats.private_audits,
         stats.retained_audits,
