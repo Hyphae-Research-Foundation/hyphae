@@ -67,6 +67,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native set member commands v1](native/native-set-commands-v1.md)
 - [Native whole-set lifecycle v1](native/native-set-lifecycle-v1.md)
 - [Native whole-list lifecycle v1](native/native-list-lifecycle-v1.md)
+- [Native whole-list TTL v1](native/native-list-ttl-v1.md)
 - [Native hash field commands v1](native/native-hash-field-commands-v1.md)
 - [Native reverse hash scan v1](native/native-hash-reverse-scan-v1.md)
 - [Native hash pattern scan v1](native/native-hash-pattern-scan-v1.md)

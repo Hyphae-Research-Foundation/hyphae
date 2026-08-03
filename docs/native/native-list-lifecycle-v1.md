@@ -141,9 +141,11 @@ Implementation evidence must include:
 
 ## Boundaries
 
-This contract does not add list TTL, generic cross-family `DEL`, blocking
-operations, insertion by index, trimming, moving, element mutation, batched
-push/pop, streams, protocol compatibility, complete G3, or G7.
+List TTL is specified separately by
+[Native whole-list TTL v1](native-list-ttl-v1.md). This lifecycle contract
+does not add generic cross-family `DEL`, blocking operations, insertion by
+index, trimming, moving, element mutation, batched push/pop, streams, protocol
+compatibility, complete G3, or G7.
 
 Complete deletion is cardinality-, chunk-, and payload-sensitive. Strict
 durability includes physical synchronization. No surface receives a universal

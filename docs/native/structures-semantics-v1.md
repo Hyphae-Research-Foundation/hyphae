@@ -80,6 +80,9 @@ SREM_MANY(key, members)
 SCARD(key)
 SSCAN(key, start_after, limit)
 CREATE_LIST(key)
+DELETE_LIST(key)
+EXPIRE_LIST(key, expires_at)
+TTL_LIST(key)
 LPUSH(key, value)
 RPUSH(key, value)
 LPOP(key)
@@ -263,8 +266,17 @@ empty or inverted normalized interval returns an empty result.
 An empty list remains typed. Scalar, hash, set, and list kinds are mutually
 exclusive for one user key. Every list mutation conflicts on the complete
 list identity in this version; concurrent end operations do not silently
-commute. Whole-list deletion, list TTL, blocking pop, insertion by index,
-trimming, moving between lists, and element mutation remain pending.
+commute.
+
+The [native whole-list lifecycle v1](native-list-lifecycle-v1.md) contract
+freezes complete deletion and typed same-transaction recreation with additive
+WAL opcode `DELETE_LIST=35`. The
+[native whole-list TTL v1](native-list-ttl-v1.md) contract freezes absolute
+complete-list expiry, explicit logical-time reads, due-incarnation reuse,
+additive WAL opcode `EXPIRE_LIST=36`, `HYLIST02` metadata, top-level expiry
+marker `4`, shared cleanup, corruption boundaries, and direct-Linux evidence
+requirements. Blocking pop, insertion by index, trimming, moving between
+lists, and element mutation remain pending.
 
 `CREATE_SORTED_SET` establishes a typed binary sorted set before member
 mutation. `ZADD` adds a member or replaces its score and reports added,
