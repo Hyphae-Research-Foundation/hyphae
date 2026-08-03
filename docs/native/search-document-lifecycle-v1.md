@@ -1,6 +1,8 @@
 # Native lexical document lifecycle v1
 
-Status: normative implementation target; compiler-reaching red gate pending.
+Status: normative contract; compiler-reaching red gate, embedded/delta/local
+implementation, deterministic recovery matrix, and direct Linux test gates
+passed; performance receipts and hosted stack gates remain pending.
 
 This contract adds first-class replacement and deletion to Hyphae's native
 lexical document store. It does not add an OpenSearch facade, a sidecar, a

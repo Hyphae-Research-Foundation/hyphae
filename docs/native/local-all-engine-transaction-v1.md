@@ -1,13 +1,14 @@
 # Native local all-engine transaction v1
 
-Status: normative implementation target; compiler-reaching red gate and
-direct-Linux evidence pending.
+Status: normative implemented contract with direct-Linux baseline evidence;
+the lexical replacement/deletion extension is implementation-gated and awaits
+its sealed performance and hosted-stack receipts.
 
 This contract exposes one explicit serial local transaction over the existing
 detached `NativeWriteBatch`. One batch captures a single immutable all-engine
 snapshot, stages relational SQL DML, scalar structure `SET`, and lexical
-document indexing in process, and publishes every affected engine root under
-one native commit sequence number.
+document creation/replacement/deletion in process, and publishes every
+affected engine root under one native commit sequence number.
 
 The local transport is not an engine-to-engine path. It neither serializes
 internal engine calls nor introduces another transaction coordinator.
@@ -142,14 +143,15 @@ The key retains the physical scalar bound of 4,095 bytes. Empty keys and
 values remain valid. Relative TTL is added to the fixed `BEGIN` logical time;
 staging never samples the server clock again.
 
-## Transaction-bound lexical document
+## Transaction-bound lexical documents
 
-A `SEARCH` frame with opcode `2` stages one immutable lexical document:
+A `SEARCH` frame with opcode `2` creates one lexical document. Opcode `3`
+replaces one exact live document and uses the same payload:
 
 | Offset | Width | Field |
 |---:|---:|---|
 | 0 | 1 | search payload version `1` |
-| 1 | 1 | opcode `2` (`TRANSACTION_INDEX_DOCUMENT`) |
+| 1 | 1 | opcode `2` (`TRANSACTION_INDEX_DOCUMENT`) or `3` (`TRANSACTION_REPLACE_DOCUMENT`) |
 | 2 | 2 | reserved zero |
 | 4 | 8 | matching local transaction handle |
 | 12 | 16 | nonzero search collection `ObjectId` |
@@ -159,10 +161,25 @@ A `SEARCH` frame with opcode `2` stages one immutable lexical document:
 | 40 | document-ID length | binary document identity |
 | next | text length | UTF-8 document text |
 
+Opcode `4` deletes one exact live document with a shorter body:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 1 | search payload version `1` |
+| 1 | 1 | opcode `4` (`TRANSACTION_DELETE_DOCUMENT`) |
+| 2 | 2 | reserved zero |
+| 4 | 8 | matching local transaction handle |
+| 12 | 16 | nonzero search collection `ObjectId` |
+| 28 | 4 | document-ID byte length, little-endian `u32` |
+| 32 | 4 | reserved zero |
+| 36 | document-ID length | binary document identity |
+
 The local limits are 4,079 document-ID bytes and 65,536 text bytes, subject to
 the stricter existing physical term/document key checks. The search collection
 must already exist in the captured catalog. Empty document IDs and empty text
-remain valid when physical identity checks admit them.
+remain valid when physical identity checks admit them. Replacement and
+deletion require a live document. Every semantic failure preserves earlier
+staged operations and the next ordinal.
 
 ## STAGED receipt
 
@@ -267,7 +284,8 @@ The implementation gate requires:
 
 - a compiler-reaching red test before public transaction codecs/session state
   exist;
-- golden BEGIN, BEGUN, each engine mutation, STAGED, COMMIT, COMMITTED,
+- golden BEGIN, BEGUN, each engine mutation including all three lexical
+  lifecycle payloads, STAGED, COMMIT, COMMITTED,
   ROLLBACK, ROLLED_BACK, and every new failure-code byte sequence;
 - every truncation boundary plus version, opcode, tag, engine, durability,
   reserved, handle, identity, count, UTF-8, scalar, length, TTL, and trailing

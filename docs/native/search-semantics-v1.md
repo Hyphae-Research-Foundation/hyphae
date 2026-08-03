@@ -2,10 +2,11 @@
 
 Status: normative target contract; deterministic tokenization, BM25, native
 B+tree collection/document/term/posting namespaces, direct physical `MATCH`,
-catalogued vector/HNSW generations, exact/approximate vector query, legacy
-inline-state compatibility, and multilevel recovery evidence are implemented
-experimentally; positions, segments, phrases, filters, facets, hybrid fusion,
-and broad scale/quality evidence remain pending
+catalogued vector/HNSW generations, exact/approximate vector query, lexical
+document replacement/deletion, legacy inline-state compatibility, and
+multilevel recovery evidence are implemented experimentally; positions,
+segments, phrases, filters, facets, hybrid fusion, and broad scale/quality
+evidence remain pending
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -46,16 +47,16 @@ unchanged.
 - A mutable transactional delta is searchable at commit; background merges do
   not define visibility.
 
-The first physical implementation uses marker `HYSEABT1` in one immutable
-copy-on-write native B+tree. It stores:
+The first physical implementation uses marker `HYSEABT1` or `HYSEABT2` in one
+immutable copy-on-write native B+tree. It stores:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact format key | ASCII `HYSEABT1` |
+| `0x00` | exact format key | ASCII `HYSEABT1` or `HYSEABT2` |
 | `0x01` | collection `ObjectId` | `HYIDX001` document count and total analyzed terms |
-| `0x02` | collection `ObjectId` + document ID | `HYDOCS01` token count and inline/blob source text |
-| `0x03` | collection `ObjectId` + canonical UTF-8 term | `HYTERM01` document frequency |
-| `0x04` | collection `ObjectId` + u32 term length + term + document ID | `HYPOST01` term frequency |
+| `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
+| `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
+| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01` or v2 `HYPOSTT1` tombstone |
 | `0x05` | vector-index `ObjectId` | `HYANNM01` current generation metadata |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
@@ -66,11 +67,17 @@ terms share byte prefixes. Terms and composite document identities must fit
 the native 4,096-byte key limit. Oversized identities are rejected before a
 logical mutation is staged.
 
-`INDEX DOCUMENT` is immutable in this slice. It analyzes source text once,
-stores per-document length, increments exact collection/term statistics, and
-inserts one posting per distinct term. Text above 8,192 bytes uses the common
-content-addressed blob store. The format does not yet store positions,
-offsets, field norms, tombstones, generations, or immutable merge segments.
+`INDEX DOCUMENT` creates one document. `REPLACE DOCUMENT` and `DELETE DOCUMENT`
+require one exact live identity and atomically maintain stored source,
+collection statistics, term metadata, and postings. The first accepted
+lifecycle mutation upgrades the current root to `HYSEABT2`; historical v1
+roots remain readable and v1 rejects every tombstone. Insertion may revive
+canonical v2 tombstones without overwriting a live identity. Text above 8,192
+bytes uses the common content-addressed blob store. Exact lifecycle semantics
+and tombstone encodings are fixed by
+[Native lexical document lifecycle v1](search-document-lifecycle-v1.md). The
+format does not yet store positions, offsets, field norms, generations, or
+immutable merge segments.
 
 `CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
 root and global transaction. Vector writes are grouped per index at commit so
@@ -132,11 +139,13 @@ and are labelled with the skipped/error state.
 ## Verification
 
 Current tests cover reference/physical BM25 equivalence, multilevel postings,
-historical lexical and vector snapshots, optimistic disjoint document/vector
-rebase, vector batch atomicity, restart, single-page legacy compatibility,
-large-text blob reuse, key bounds, lexical/ANN metadata corruption, canonical
-graph restore, and all-engine crash recovery. Required remaining evidence
-includes analyzer/token/position goldens, BM25F score/explanation fixtures,
-broader query-operator properties, lexical delete/update visibility, buffered
-ANN traversal, merge interruption, facet/aggregation correctness, bounded
-cancellation, full-scale quality metrics, and cross-engine stable-ID joins.
+historical lexical and vector snapshots, lexical replace/delete/reinsert
+visibility, exact v1-to-v2 tombstone upgrade, optimistic disjoint
+document/vector rebase, vector batch atomicity, restart, single-page legacy
+compatibility, large-text blob reuse, key bounds, lexical/ANN metadata
+corruption, canonical graph restore, and all-engine crash recovery. Required
+remaining evidence includes analyzer/token/position goldens, BM25F
+score/explanation fixtures, broader query-operator properties, search
+tombstone compaction, buffered ANN traversal, merge interruption,
+facet/aggregation correctness, bounded cancellation, full-scale quality
+metrics, and cross-engine stable-ID joins.

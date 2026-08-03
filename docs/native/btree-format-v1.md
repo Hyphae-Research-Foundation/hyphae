@@ -281,11 +281,15 @@ corruption rules are specified in the structure contract.
 
 ## Lexical-search namespace
 
-New lexical-search roots use marker `HYSEABT1` and four independent private
-prefixes for collection statistics, stored documents, term statistics, and
-postings. Query execution performs point reads for collection/term/document
-metadata and a separator-pruned prefix scan for each requested term's
-postings. Exact key/value envelopes are specified in
+New lexical-search roots begin with marker `HYSEABT1`; the first document
+replacement or deletion upgrades the current copy-on-write root to
+`HYSEABT2`. Both formats use four independent private prefixes for collection
+statistics, stored documents, term statistics, and postings. V2 alone admits
+the exact `HYDOCT01`, `HYTERMT1`, and `HYPOSTT1` tombstones; v1 and malformed
+or cross-namespace tombstones fail closed. Query execution performs point
+reads for collection/term/document metadata and a separator-pruned prefix scan
+for each requested term's live postings. Exact key/value envelopes are
+specified in
 [Native search-engine semantics v1](search-semantics-v1.md).
 
 Legacy page-kind-10 `SearchState` roots remain readable and writable without

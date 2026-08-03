@@ -102,7 +102,7 @@ MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`, `DELETE
 HASH=30`, `EXPIRE HASH=31`, `EXPIRE HASH FIELD=32`, `EXPIRE SET=33`, `DELETE
 SET=34`, `DELETE LIST=35`, `EXPIRE LIST=36`; and search
 `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
-`DELETE VECTOR=19`.
+`DELETE VECTOR=19`, `REPLACE DOCUMENT=37`, `DELETE DOCUMENT=38`.
 `DELETE VALUE`, collection creation, whole-hash/hash-field deletion, set/sorted-set
 member deletion, and vector deletion require an empty value and no expiry.
 `EXPIRE VALUE` requires an explicit expiry and carries the retained logical
@@ -129,6 +129,14 @@ specified by [Native whole-list lifecycle v1](native-list-lifecycle-v1.md) and
 [Native whole-list TTL v1](native-list-ttl-v1.md). The expiry mutations carry
 an empty value and one explicit signed expiry. Complete deletion carries no
 expiry and is also the replay authority used by active cleanup.
+
+`REPLACE DOCUMENT=37` and `DELETE DOCUMENT=38` are the lexical lifecycle
+opcodes specified by
+[Native lexical document lifecycle v1](search-document-lifecycle-v1.md).
+Both use the exact binary document ID as key, the nonzero search collection as
+target, and no expiry. Replacement carries UTF-8 source text; deletion carries
+an empty value. They are the only replay authority for their derived
+document, collection-statistic, term, and posting updates.
 
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances
@@ -215,13 +223,14 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 92 | 32 | four little-endian root page IDs |
 
 The current relational, scalar `SET`/`EXPIRE`, hash-field `HSET`, and search
-`INDEX DOCUMENT` mutation bodies store values at or below 8,192 bytes inline.
-Larger values are promoted to the shared immutable blob namespace first. The
-WAL stores the relational one-byte envelope, structure `HYSTRV01` envelope, or
-search `HYDOCS01` envelope with its 56-byte reference instead of duplicating
-large content. The search envelope also binds the analyzed token count. A
-structure, whole-hash, or hash-field delete keeps its WAL value empty; page construction
-publishes the canonical `HYSTRV01` tombstone.
+`INDEX DOCUMENT`/`REPLACE DOCUMENT` mutation bodies store values at or below
+8,192 bytes inline. Larger values are promoted to the shared immutable blob
+namespace first. The WAL stores the relational one-byte envelope, structure
+`HYSTRV01` envelope, or search `HYDOCS01` envelope with its 56-byte reference
+instead of duplicating large content. The search envelope also binds the
+analyzed token count. A structure, whole-hash, hash-field, or lexical-document
+delete keeps its WAL value empty; page construction publishes the owning
+namespace's canonical tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 
