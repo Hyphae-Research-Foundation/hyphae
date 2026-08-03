@@ -1070,6 +1070,55 @@ pub(crate) fn execute_transaction_dml(
     }
 }
 
+pub(crate) fn transaction_dml_primary_key(
+    transaction: &NativeWriteBatch,
+    statement: &str,
+    parameters: &[SqlValue],
+) -> Result<(ObjectId, Vec<u8>), SqlError> {
+    match parse(statement)? {
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
+            let resolved =
+                resolve_mutation_operands(definition, &values, parameter_count, parameters)?;
+            let values = bind_insert_values(definition, &values, &resolved)?;
+            let primary_key = if is_legacy_binary_relation(definition) {
+                legacy_binary_value(values[0], false)?
+            } else {
+                encode_primary_key(definition, &values)?
+            };
+            Ok((table, primary_key))
+        }
+        Statement::Update {
+            name,
+            predicates,
+            parameter_count,
+            ..
+        }
+        | Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
+            let predicate_columns = bind_primary_key_columns(definition, &predicates)?;
+            let predicate_values =
+                resolve_mutation_operands(definition, &predicates, parameter_count, parameters)?;
+            let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+            Ok((table, primary_key))
+        }
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
+    }
+}
+
 fn execute_bound_snapshot(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,

@@ -3333,6 +3333,7 @@ impl NativeDatabase {
                     structure_format: self.structure_format,
                     search_format: self.search_format,
                     mode: NativeWriteBatchMode::PhysicalStructureExpiry,
+                    delta: None,
                 },
             }
         } else {
@@ -3445,6 +3446,7 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalStructureCompaction,
+                delta: None,
             },
         };
         let commit = match interruption {
@@ -6441,7 +6443,268 @@ impl NativeDatabase {
             structure_format: self.structure_format,
             search_format: self.search_format,
             mode: NativeWriteBatchMode::Materialized,
+            delta: None,
         })
+    }
+
+    /// Prepares one detached point-resolved all-engine write transaction.
+    ///
+    /// The batch captures the immutable root-set snapshot and materializes only
+    /// catalog definitions. Rows, scalar keys, and document identities are
+    /// resolved on demand by the corresponding `stage_delta_*` operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported legacy physical formats, snapshot,
+    /// catalog, relational-index metadata, page, blob, or model corruption.
+    pub fn begin_optimistic_delta(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        if self.relational_format != RelationalFormat::VersionChainV2
+            || self.structure_format != StructureFormat::BTreeV2
+            || self.search_format != SearchFormat::InvertedBTreeV1
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let state = self.delta_materialized_state(&snapshot)?;
+        Ok(NativeWriteBatch {
+            snapshot,
+            state,
+            mutations: Vec::new(),
+            dirty: [false; 4],
+            durability,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
+            delta: Some(DeltaOverlay::default()),
+        })
+    }
+
+    /// Stages one exact-primary-key SQL DML statement in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, unsupported SQL, binding,
+    /// point-read corruption, or native relational semantics.
+    pub fn stage_delta_sql_dml(
+        &self,
+        batch: &mut NativeWriteBatch,
+        statement: &str,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        self.require_delta_batch(batch).map_err(SqlError::from)?;
+        let (table, primary_key) = sql::transaction_dml_primary_key(batch, statement, parameters)?;
+        self.hydrate_delta_relational_row(batch, table, &primary_key)
+            .map_err(SqlError::from)?;
+        batch.execute_sql_dml(statement, parameters)
+    }
+
+    /// Stages one scalar `SET` in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, physical corruption, a
+    /// collection-owned key, or invalid structure identity.
+    pub fn stage_delta_set(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.require_delta_batch(batch)?;
+        self.hydrate_delta_scalar(batch, &key)?;
+        batch.set(key, value, expires_at_micros)
+    }
+
+    /// Stages one immutable lexical document in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, unknown index, duplicate
+    /// document identity, invalid identity bounds, or physical corruption.
+    pub fn stage_delta_index_document(
+        &self,
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        document_id: Vec<u8>,
+        text: String,
+    ) -> Result<(), NativeRuntimeError> {
+        self.require_delta_batch(batch)?;
+        batch.state.catalog.require(index, EngineKind::Search)?;
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let document_key = search_document_key(index, &document_id)?;
+        if BTree::from_root(root)
+            .get_cached_pinned(&self.pages, &self.buffer_pool, &document_key)?
+            .is_some()
+        {
+            return Err(ModelError::DuplicateDocumentId.into());
+        }
+        batch.index_document(index, document_id, text)
+    }
+
+    fn require_delta_batch(&self, batch: &NativeWriteBatch) -> Result<(), NativeRuntimeError> {
+        if batch.mode != NativeWriteBatchMode::PhysicalAllEngineDelta
+            || batch.delta.is_none()
+            || batch.structure_format != self.structure_format
+            || batch.search_format != self.search_format
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        Ok(())
+    }
+
+    fn delta_materialized_state(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<MaterializedState, NativeRuntimeError> {
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let mut relational = RelationState::default();
+        let mut search = SearchState::default();
+
+        for object in catalog.objects.values() {
+            match object {
+                CatalogObject::Relation(definition) => {
+                    relational.create_table(definition.header.id)?;
+                }
+                CatalogObject::Search(definition) => {
+                    search.create_index(definition.header.id)?;
+                }
+                CatalogObject::SecondaryIndex(_) | CatalogObject::Structure(_) => {}
+            }
+        }
+
+        let relational_root = snapshot.roots().root(SLOT_RELATIONAL);
+        for object in catalog.objects.values() {
+            let CatalogObject::SecondaryIndex(definition) = object else {
+                continue;
+            };
+            relational.create_secondary_index(
+                definition.header.id,
+                definition.relation,
+                definition.unique,
+                definition.nulls_distinct,
+            )?;
+            let root = relational_root.ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let encoded = BTree::from_root(root)
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &relational_secondary_index_key(definition.header.id),
+                )?
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let (relation, unique, nulls_distinct, layout) =
+                decode_secondary_index_metadata(encoded.bytes())?;
+            if relation != definition.relation
+                || unique != definition.unique
+                || nulls_distinct != definition.nulls_distinct
+            {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            relational
+                .indexes
+                .get_mut(&definition.header.id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                .layout = layout;
+        }
+
+        Ok(MaterializedState {
+            catalog,
+            relational,
+            structures: StructureState::default(),
+            search,
+            ann: ann_store::AnnState::default(),
+        })
+    }
+
+    fn hydrate_delta_relational_row(
+        &self,
+        batch: &mut NativeWriteBatch,
+        table: ObjectId,
+        primary_key: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let identity = (table, primary_key.to_vec());
+        let already_loaded = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .relational_rows
+            .contains(&identity);
+        if already_loaded {
+            return Ok(());
+        }
+        if let Some(row) = self.select_relational_at(&batch.snapshot, table, primary_key)? {
+            batch
+                .state
+                .relational
+                .tables
+                .get_mut(&table)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                .insert(primary_key.to_vec(), row);
+        }
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .relational_rows
+            .insert(identity);
+        Ok(())
+    }
+
+    fn hydrate_delta_scalar(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let already_loaded = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_scalars
+            .contains(key);
+        if already_loaded {
+            return Ok(());
+        }
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let collection_exists = [
+            structure_hash_meta_key(key),
+            structure_set_meta_key(key),
+            structure_list_meta_key(key)?,
+            structure_sorted_set_meta_key(key)?,
+        ]
+        .into_iter()
+        .map(|metadata_key| tree.get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|encoded| encoded.is_some_and(|encoded| !is_structure_tombstone(encoded.bytes())));
+        if collection_exists {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        if let Some(encoded) =
+            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+            && let Some(entry) = decode_structure_value(encoded.bytes(), &self.blobs)?
+        {
+            batch.state.structures.entries.insert(key.to_vec(), entry);
+        }
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_scalars
+            .insert(key.to_vec());
+        Ok(())
     }
 
     /// Begins one serialized native write transaction.
@@ -6543,7 +6806,10 @@ impl NativeDatabase {
         mut batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
-        if batch.mode != NativeWriteBatchMode::Materialized {
+        if !matches!(
+            batch.mode,
+            NativeWriteBatchMode::Materialized | NativeWriteBatchMode::PhysicalAllEngineDelta
+        ) {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         if batch.mutations.is_empty() {
@@ -6566,10 +6832,12 @@ impl NativeDatabase {
         self.conflicts
             .validate(conflict_read_csn, &validation_keys)?;
 
-        let mut state = load_state(&self.pages, &self.blobs, root_transaction.base_roots())?;
-        apply_mutations_to_state(&mut state, &batch.mutations)?;
         batch.snapshot = root_transaction.base_snapshot(logical_time_micros);
-        batch.state = state;
+        if batch.mode == NativeWriteBatchMode::Materialized {
+            let mut state = load_state(&self.pages, &self.blobs, root_transaction.base_roots())?;
+            apply_mutations_to_state(&mut state, &batch.mutations)?;
+            batch.state = state;
+        }
         let transaction_id = TransactionId::new(self.next_transaction_id)
             .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
         NativeTransaction {
@@ -7537,6 +7805,12 @@ fn read_list_range_from_tail(
     Ok(segments.into_iter().flatten().collect())
 }
 
+#[derive(Debug, Default)]
+struct DeltaOverlay {
+    relational_rows: BTreeSet<(ObjectId, Vec<u8>)>,
+    structure_scalars: BTreeSet<Vec<u8>>,
+}
+
 /// Detached private write set over one immutable all-engine snapshot.
 ///
 /// A batch owns no file handle and holds no writer guard. It may be prepared
@@ -7551,11 +7825,13 @@ pub struct NativeWriteBatch {
     structure_format: StructureFormat,
     search_format: SearchFormat,
     mode: NativeWriteBatchMode,
+    delta: Option<DeltaOverlay>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeWriteBatchMode {
     Materialized,
+    PhysicalAllEngineDelta,
     PhysicalStructureExpiry,
     PhysicalStructureCompaction,
 }
@@ -12005,6 +12281,58 @@ fn validate_write_batch_shape(
 ) -> Result<(), NativeRuntimeError> {
     match batch.mode {
         NativeWriteBatchMode::Materialized => Ok(()),
+        NativeWriteBatchMode::PhysicalAllEngineDelta => {
+            let valid_roots = roots.iter().all(Option::is_some);
+            let valid_formats = structure_format == StructureFormat::BTreeV2
+                && batch.structure_format == StructureFormat::BTreeV2
+                && search_format == SearchFormat::InvertedBTreeV1
+                && batch.search_format == SearchFormat::InvertedBTreeV1;
+            let Some(delta) = batch.delta.as_ref() else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            let mut expected_dirty = [false; 4];
+            let valid_mutations = !batch.mutations.is_empty()
+                && batch
+                    .mutations
+                    .iter()
+                    .all(|mutation| match mutation.engine {
+                        EngineKind::Relational => {
+                            expected_dirty[1] = true;
+                            mutation.target.is_some_and(|table| {
+                                delta
+                                    .relational_rows
+                                    .contains(&(table, mutation.key.clone()))
+                            }) && matches!(
+                                mutation.opcode,
+                                Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow
+                            ) && mutation.expires_at_micros.is_none()
+                        }
+                        EngineKind::Structure => {
+                            expected_dirty[2] = true;
+                            mutation.target.is_none()
+                                && mutation.opcode == Opcode::SetValue
+                                && delta.structure_scalars.contains(&mutation.key)
+                        }
+                        EngineKind::Search => {
+                            expected_dirty[3] = true;
+                            mutation.target.is_some()
+                                && mutation.opcode == Opcode::IndexDocument
+                                && mutation.expires_at_micros.is_none()
+                        }
+                        EngineKind::Kernel => false,
+                    });
+            if valid_roots
+                && valid_formats
+                && valid_mutations
+                && batch.dirty == expected_dirty
+                && !batch.dirty[0]
+                && batch.state.ann == ann_store::AnnState::default()
+            {
+                Ok(())
+            } else {
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            }
+        }
         NativeWriteBatchMode::PhysicalStructureExpiry => {
             let valid_roots = roots.iter().all(Option::is_some);
             let valid_formats = structure_format == StructureFormat::BTreeV2

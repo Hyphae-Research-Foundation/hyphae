@@ -417,7 +417,12 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         &mut self,
         request: LocalTransactionStructureSetRequest<'_>,
     ) -> Result<LocalTransactionStageReceipt, LocalFailureCode> {
-        let active = self.active_transaction_mut(request.handle)?;
+        let Self {
+            database,
+            active_transaction,
+            ..
+        } = self;
+        let active = active_transaction_for_handle(active_transaction, request.handle)?;
         ensure_transaction_stage_capacity(active.staged_operations)?;
         let expires_at_micros = request.relative_ttl_micros.map_or(Ok(None), |relative| {
             active
@@ -426,9 +431,9 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
                 .map(Some)
                 .ok_or(LocalFailureCode::ExpiryOverflow)
         })?;
-        active
-            .batch
-            .set(
+        database
+            .stage_delta_set(
+                &mut active.batch,
                 request.key.to_vec(),
                 request.value.to_vec(),
                 expires_at_micros,
@@ -605,11 +610,16 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         &mut self,
         request: LocalTransactionIndexDocumentRequest<'_>,
     ) -> Result<LocalTransactionStageReceipt, LocalFailureCode> {
-        let active = self.active_transaction_mut(request.handle)?;
+        let Self {
+            database,
+            active_transaction,
+            ..
+        } = self;
+        let active = active_transaction_for_handle(active_transaction, request.handle)?;
         ensure_transaction_stage_capacity(active.staged_operations)?;
-        active
-            .batch
-            .index_document(
+        database
+            .stage_delta_index_document(
+                &mut active.batch,
                 request.index,
                 request.document_id.to_vec(),
                 request.text.to_owned(),
@@ -827,11 +837,15 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         &mut self,
         request: &LocalTransactionSqlDmlRequest<'_>,
     ) -> Result<LocalTransactionStageReceipt, LocalFailureCode> {
-        let active = self.active_transaction_mut(request.handle)?;
+        let Self {
+            database,
+            active_transaction,
+            ..
+        } = self;
+        let active = active_transaction_for_handle(active_transaction, request.handle)?;
         ensure_transaction_stage_capacity(active.staged_operations)?;
-        let result = active
-            .batch
-            .execute_sql_dml(request.statement, &request.parameters)
+        let result = database
+            .stage_delta_sql_dml(&mut active.batch, request.statement, &request.parameters)
             .map_err(|error| execute_sql_failure_code(&error))?;
         let SqlResult::Command {
             rows_affected,
@@ -979,7 +993,7 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         let logical_time_micros = self.clock.logical_time_micros();
         let Ok(batch) = self
             .database
-            .begin_optimistic(logical_time_micros, durability)
+            .begin_optimistic_delta(logical_time_micros, durability)
         else {
             return self.send_engine_failure(connection, stream_id, request_id);
         };
@@ -1157,20 +1171,6 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         Ok(())
     }
 
-    fn active_transaction_mut(
-        &mut self,
-        handle: NonZeroU64,
-    ) -> Result<&mut ActiveLocalTransaction, LocalFailureCode> {
-        let active = self
-            .active_transaction
-            .as_mut()
-            .ok_or(LocalFailureCode::TransactionInactive)?;
-        if active.handle != handle {
-            return Err(LocalFailureCode::TransactionMismatch);
-        }
-        Ok(active)
-    }
-
     fn send_engine_failure(
         &mut self,
         connection: &mut UdsFrameConnection,
@@ -1196,6 +1196,19 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         connection.send(FrameKind::Failure, stream_id, request_id, payload)?;
         Ok(())
     }
+}
+
+fn active_transaction_for_handle(
+    active_transaction: &mut Option<ActiveLocalTransaction>,
+    handle: NonZeroU64,
+) -> Result<&mut ActiveLocalTransaction, LocalFailureCode> {
+    let active = active_transaction
+        .as_mut()
+        .ok_or(LocalFailureCode::TransactionInactive)?;
+    if active.handle != handle {
+        return Err(LocalFailureCode::TransactionMismatch);
+    }
+    Ok(active)
 }
 
 fn ensure_transaction_stage_capacity(staged_operations: u64) -> Result<(), LocalFailureCode> {
