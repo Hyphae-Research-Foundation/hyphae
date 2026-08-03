@@ -6531,17 +6531,18 @@ impl NativeDatabase {
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
         self.require_delta_batch(batch).map_err(SqlError::from)?;
-        let (table, primary_key) = sql::transaction_dml_primary_key(batch, statement, parameters)?;
+        let dml = sql::TransactionDml::parse(statement)?;
+        let (table, primary_key) = dml.primary_key(batch, parameters)?;
         self.hydrate_delta_relational_row(batch, table, &primary_key)
             .map_err(SqlError::from)?;
-        let candidate = sql::transaction_dml_candidate_row(batch, statement, parameters)?;
+        let candidate = dml.candidate_row(batch, parameters)?;
         let unique_probes = candidate
             .as_deref()
             .map(|row| self.validate_delta_unique_projections(batch, table, &primary_key, row))
             .transpose()
             .map_err(sql::map_runtime_error)?
             .unwrap_or_default();
-        let result = batch.execute_sql_dml(statement, parameters)?;
+        let result = dml.execute(batch, parameters)?;
         batch
             .delta
             .as_mut()

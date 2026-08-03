@@ -1032,154 +1032,184 @@ pub(crate) fn execute_transaction(
     }
 }
 
+pub(crate) struct TransactionDml {
+    statement: Statement,
+}
+
+impl TransactionDml {
+    pub(crate) fn parse(statement: &str) -> Result<Self, SqlError> {
+        let statement = parse(statement)?;
+        match statement {
+            Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+                Ok(Self { statement })
+            }
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn primary_key(
+        &self,
+        transaction: &NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<(ObjectId, Vec<u8>), SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => {
+                let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+                let resolved =
+                    resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
+                let values = bind_insert_values(definition, values, &resolved)?;
+                let primary_key = if is_legacy_binary_relation(definition) {
+                    legacy_binary_value(values[0], false)?
+                } else {
+                    encode_primary_key(definition, &values)?
+                };
+                Ok((table, primary_key))
+            }
+            Statement::Update {
+                name,
+                predicates,
+                parameter_count,
+                ..
+            }
+            | Statement::Delete {
+                name,
+                predicates,
+                parameter_count,
+            } => {
+                let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+                let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+                let predicate_values = resolve_mutation_operands(
+                    definition,
+                    predicates,
+                    *parameter_count,
+                    parameters,
+                )?;
+                let primary_key =
+                    bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+                Ok((table, primary_key))
+            }
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn candidate_row(
+        &self,
+        transaction: &NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<Option<Vec<u8>>, SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => {
+                let (_, definition) = relation_named(&transaction.state.catalog, name)?;
+                let resolved =
+                    resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
+                let values = bind_insert_values(definition, values, &resolved)?;
+                if is_legacy_binary_relation(definition) {
+                    Ok(Some(legacy_binary_value(values[1], false)?))
+                } else {
+                    Ok(Some(encode_tuple(definition, &values)?))
+                }
+            }
+            Statement::Update {
+                name,
+                assignments,
+                predicates,
+                parameter_count,
+            } => transaction_update_candidate(
+                transaction,
+                name,
+                assignments,
+                predicates,
+                *parameter_count,
+                parameters,
+            ),
+            Statement::Delete { .. } => Ok(None),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        transaction: &mut NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => execute_insert(transaction, name, values, *parameter_count, parameters),
+            Statement::Update {
+                name,
+                assignments,
+                predicates,
+                parameter_count,
+            } => execute_update(
+                transaction,
+                name,
+                assignments,
+                predicates,
+                *parameter_count,
+                parameters,
+            ),
+            Statement::Delete {
+                name,
+                predicates,
+                parameter_count,
+            } => execute_delete(transaction, name, predicates, *parameter_count, parameters),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+}
+
+fn transaction_update_candidate(
+    transaction: &NativeWriteBatch,
+    name: &str,
+    assignments: &[ColumnOperand],
+    predicates: &[ColumnOperand],
+    parameter_count: usize,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+    let assignment_columns = bind_update_columns(definition, assignments)?;
+    let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+    let assignment_values =
+        resolve_mutation_operands(definition, assignments, parameter_count, parameters)?;
+    let predicate_values =
+        resolve_mutation_operands(definition, predicates, parameter_count, parameters)?;
+    let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+    let Some(stored) = transaction.select(table, &primary_key) else {
+        return Ok(None);
+    };
+    if is_legacy_binary_relation(definition) {
+        if assignment_columns.as_slice() != [1] {
+            return Err(SqlError::InvalidSyntax);
+        }
+        Ok(Some(legacy_binary_value(assignment_values.first(), false)?))
+    } else {
+        let assignments =
+            bind_update_assignments(definition, &assignment_columns, &assignment_values)?;
+        Ok(Some(encode_updated_tuple(
+            definition,
+            &assignments,
+            stored,
+        )?))
+    }
+}
+
 pub(crate) fn execute_transaction_dml(
     transaction: &mut NativeWriteBatch,
     statement: &str,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    match parse(statement)? {
-        Statement::Insert {
-            name,
-            values,
-            parameter_count,
-        } => execute_insert(transaction, &name, &values, parameter_count, parameters),
-        Statement::Update {
-            name,
-            assignments,
-            predicates,
-            parameter_count,
-        } => execute_update(
-            transaction,
-            &name,
-            &assignments,
-            &predicates,
-            parameter_count,
-            parameters,
-        ),
-        Statement::Delete {
-            name,
-            predicates,
-            parameter_count,
-        } => execute_delete(transaction, &name, &predicates, parameter_count, parameters),
-        Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. }
-        | Statement::Select { .. }
-        | Statement::ExplainSelect { .. }
-        | Statement::SelectJoin(_)
-        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
-    }
-}
-
-pub(crate) fn transaction_dml_primary_key(
-    transaction: &NativeWriteBatch,
-    statement: &str,
-    parameters: &[SqlValue],
-) -> Result<(ObjectId, Vec<u8>), SqlError> {
-    match parse(statement)? {
-        Statement::Insert {
-            name,
-            values,
-            parameter_count,
-        } => {
-            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
-            let resolved =
-                resolve_mutation_operands(definition, &values, parameter_count, parameters)?;
-            let values = bind_insert_values(definition, &values, &resolved)?;
-            let primary_key = if is_legacy_binary_relation(definition) {
-                legacy_binary_value(values[0], false)?
-            } else {
-                encode_primary_key(definition, &values)?
-            };
-            Ok((table, primary_key))
-        }
-        Statement::Update {
-            name,
-            predicates,
-            parameter_count,
-            ..
-        }
-        | Statement::Delete {
-            name,
-            predicates,
-            parameter_count,
-        } => {
-            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
-            let predicate_columns = bind_primary_key_columns(definition, &predicates)?;
-            let predicate_values =
-                resolve_mutation_operands(definition, &predicates, parameter_count, parameters)?;
-            let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
-            Ok((table, primary_key))
-        }
-        Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. }
-        | Statement::Select { .. }
-        | Statement::ExplainSelect { .. }
-        | Statement::SelectJoin(_)
-        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
-    }
-}
-
-pub(crate) fn transaction_dml_candidate_row(
-    transaction: &NativeWriteBatch,
-    statement: &str,
-    parameters: &[SqlValue],
-) -> Result<Option<Vec<u8>>, SqlError> {
-    match parse(statement)? {
-        Statement::Insert {
-            name,
-            values,
-            parameter_count,
-        } => {
-            let (_, definition) = relation_named(&transaction.state.catalog, &name)?;
-            let resolved =
-                resolve_mutation_operands(definition, &values, parameter_count, parameters)?;
-            let values = bind_insert_values(definition, &values, &resolved)?;
-            if is_legacy_binary_relation(definition) {
-                Ok(Some(legacy_binary_value(values[1], false)?))
-            } else {
-                Ok(Some(encode_tuple(definition, &values)?))
-            }
-        }
-        Statement::Update {
-            name,
-            assignments,
-            predicates,
-            parameter_count,
-        } => {
-            let (table, definition) = relation_named(&transaction.state.catalog, &name)?;
-            let assignment_columns = bind_update_columns(definition, &assignments)?;
-            let predicate_columns = bind_primary_key_columns(definition, &predicates)?;
-            let assignment_values =
-                resolve_mutation_operands(definition, &assignments, parameter_count, parameters)?;
-            let predicate_values =
-                resolve_mutation_operands(definition, &predicates, parameter_count, parameters)?;
-            let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
-            let Some(stored) = transaction.select(table, &primary_key) else {
-                return Ok(None);
-            };
-            if is_legacy_binary_relation(definition) {
-                if assignment_columns.as_slice() != [1] {
-                    return Err(SqlError::InvalidSyntax);
-                }
-                Ok(Some(legacy_binary_value(assignment_values.first(), false)?))
-            } else {
-                let assignments =
-                    bind_update_assignments(definition, &assignment_columns, &assignment_values)?;
-                Ok(Some(encode_updated_tuple(
-                    definition,
-                    &assignments,
-                    stored,
-                )?))
-            }
-        }
-        Statement::Delete { .. } => Ok(None),
-        Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. }
-        | Statement::Select { .. }
-        | Statement::ExplainSelect { .. }
-        | Statement::SelectJoin(_)
-        | Statement::ExplainSelectJoin(_) => Err(SqlError::InvalidSyntax),
-    }
+    TransactionDml::parse(statement)?.execute(transaction, parameters)
 }
 
 fn execute_bound_snapshot(
