@@ -699,6 +699,26 @@ advances G5/G6, but it does not prove concurrent-reader mixing, cross-engine
 SQL operators, backup/restore, Windows named pipes, or the G7 matrix and
 closes no complete gate.
 
+The [native delta all-engine transaction
+evidence](evidence/native-delta-all-engine-transaction-linux-2026-08-03.md)
+replaces complete engine-state materialization on that local transaction hot
+path with one bounded physical delta. HYCAT004 point-resolves the named
+relation and its exact secondary-index dependencies; SQL, scalar structure,
+and immutable lexical overlays revalidate and publish through the existing
+WAL transaction and one CSN. Deterministic guards reject any hot-path complete
+engine or catalog load, latest and historical reads stop at the first visible
+row version, full verification still rejects corrupt older links, and all
+seven commit interruptions remain never-mixed. Across three CPU-0
+direct-Linux runs, median memory/strict commit p50 is `1.001241/9.388397 ms`;
+depth from 1 through 1,024 prior versions retains nine page reads, three page
+appends, one 65,536-byte WAL block, and zero complete state/catalog loads.
+This closes the bounded delta slice and removes the known materialization
+bottleneck. It does not close G1, G5, G6, or G7: memory commit remains outside
+the microsecond domain, and cold/concurrent/saturated performance,
+per-operation allocation bounds, mutable lexical documents, cross-engine SQL
+operators, backup/restore, replication, and complete phase evidence remain
+open.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
