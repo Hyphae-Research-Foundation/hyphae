@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::{collections::BTreeMap, num::NonZeroU64};
+
 use thiserror::Error;
 
 use crate::{
     FrameKind, LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE,
-    LOCAL_SEARCH_RESULTS_HEADER_SIZE, LocalFailureCode, LocalOperationCodecError,
-    LocalSearchCodecError, LocalSearchMatchRequest, LocalStructureCommitReceipt,
-    LocalStructureRequest, LocalStructureSetRequest, LocalTransportError, LocalTtlValue,
-    NativeDatabase, NativeSchedulerClock, Ttl, UdsFrameConnection, decode_local_search_match,
+    LOCAL_SEARCH_RESULTS_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE, LOCAL_SQL_ROWS_HEADER_SIZE,
+    LocalFailureCode, LocalOperationCodecError, LocalSearchCodecError, LocalSearchMatchRequest,
+    LocalSqlColumn, LocalSqlPreparedReceipt, LocalStructureCommitReceipt, LocalStructureRequest,
+    LocalStructureSetRequest, LocalTransportError, LocalTtlValue, MAX_LOCAL_PREPARED_STATEMENTS,
+    MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS, MAX_LOCAL_SQL_ROWS, NativeDatabase,
+    NativeSchedulerClock, PreparedStatement, SqlError, SqlResult, Ttl, UdsFrameConnection,
+    decode_local_search_match, decode_local_sql_execute, decode_local_sql_prepare,
     decode_local_structure_request, encode_local_failure, encode_local_search_match_results,
+    encode_local_sql_prepared_receipt, encode_local_sql_rows,
     encode_local_structure_commit_receipt, encode_local_ttl, encode_local_value,
 };
 
@@ -29,10 +35,18 @@ pub enum LocalSessionError {
     InvalidHandshake,
 }
 
-/// Serial local session exposing scalar operations and lexical `MATCH`.
+struct RetainedSqlPlan {
+    prepared: PreparedStatement,
+    columns: Vec<LocalSqlColumn>,
+    maximum_rows: usize,
+}
+
+/// Serial local session exposing scalar, lexical, and prepared SQL operations.
 pub struct LocalDataSession<'database, Clock: NativeSchedulerClock + ?Sized> {
     database: &'database mut NativeDatabase,
     clock: &'database Clock,
+    prepared_statements: BTreeMap<u64, RetainedSqlPlan>,
+    next_plan_id: Option<NonZeroU64>,
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
     echo_buffer: Vec<u8>,
@@ -45,13 +59,15 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         Self {
             database,
             clock,
+            prepared_statements: BTreeMap::new(),
+            next_plan_id: NonZeroU64::new(1),
             request_buffer: Vec::with_capacity(LOCAL_OPERATION_HEADER_SIZE),
             response_buffer: Vec::with_capacity(LOCAL_OPERATION_HEADER_SIZE),
             echo_buffer: Vec::new(),
         }
     }
 
-    /// Serves one minimal `HELLO`, `PING`/structure/search, `CLOSE` session.
+    /// Serves one minimal `HELLO`, engine operation, `CLOSE` session.
     ///
     /// Request-local codec and engine failures are returned to the peer and
     /// do not terminate the session.
@@ -90,6 +106,26 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
                     self.request_buffer.clear();
                     self.request_buffer.extend_from_slice(frame.payload);
                     self.serve_search_request(connection, stream_id, request_id, maximum_payload)?;
+                }
+                FrameKind::Prepare => {
+                    self.request_buffer.clear();
+                    self.request_buffer.extend_from_slice(frame.payload);
+                    self.serve_sql_prepare_request(
+                        connection,
+                        stream_id,
+                        request_id,
+                        maximum_payload,
+                    )?;
+                }
+                FrameKind::Execute => {
+                    self.request_buffer.clear();
+                    self.request_buffer.extend_from_slice(frame.payload);
+                    self.serve_sql_execute_request(
+                        connection,
+                        stream_id,
+                        request_id,
+                        maximum_payload,
+                    )?;
                 }
                 FrameKind::Close => {
                     self.echo_buffer.clear();
@@ -352,6 +388,226 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
         Ok(())
     }
 
+    fn serve_sql_prepare_request(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+    ) -> Result<(), LocalSessionError> {
+        let request_buffer = std::mem::take(&mut self.request_buffer);
+        let result = match decode_local_sql_prepare(&request_buffer) {
+            Ok(statement) => self.serve_sql_prepare(
+                connection,
+                stream_id,
+                request_id,
+                maximum_payload,
+                statement,
+            ),
+            Err(_) => self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::InvalidRequest,
+            ),
+        };
+        self.request_buffer = request_buffer;
+        result
+    }
+
+    fn serve_sql_prepare(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+        statement: &str,
+    ) -> Result<(), LocalSessionError> {
+        if maximum_payload < LOCAL_SQL_PREPARED_RECEIPT_SIZE {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::ResponseTooLarge,
+            );
+        }
+        let (receipt, retained) = match self.prepare_local_sql_plan(statement) {
+            Ok(prepared) => prepared,
+            Err(code) => return self.send_failure(connection, stream_id, request_id, code),
+        };
+        let Ok(response) = encode_local_sql_prepared_receipt(&mut self.response_buffer, receipt)
+        else {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        };
+        self.prepared_statements
+            .insert(receipt.plan_id.get(), retained);
+        self.next_plan_id = receipt
+            .plan_id
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new);
+        connection.send(FrameKind::Receipt, stream_id, request_id, response)?;
+        Ok(())
+    }
+
+    fn prepare_local_sql_plan(
+        &self,
+        statement: &str,
+    ) -> Result<(LocalSqlPreparedReceipt, RetainedSqlPlan), LocalFailureCode> {
+        if self.prepared_statements.len() >= MAX_LOCAL_PREPARED_STATEMENTS {
+            return Err(LocalFailureCode::SqlResourceLimit);
+        }
+        let plan_id = self
+            .next_plan_id
+            .ok_or(LocalFailureCode::SqlResourceLimit)?;
+        let prepared = self
+            .database
+            .prepare_sql_latest(statement)
+            .map_err(|error| prepare_sql_failure_code(&error))?;
+        let parameter_count = prepared.parameter_count();
+        if parameter_count > MAX_LOCAL_SQL_PARAMETERS {
+            return Err(LocalFailureCode::SqlResourceLimit);
+        }
+        let maximum_rows = prepared
+            .maximum_result_rows()
+            .filter(|maximum| *maximum <= MAX_LOCAL_SQL_ROWS)
+            .ok_or(LocalFailureCode::SqlResourceLimit)?;
+        let schema = prepared
+            .result_schema()
+            .map_err(|_| LocalFailureCode::EngineFailure)?;
+        if schema.len() > MAX_LOCAL_SQL_COLUMNS {
+            return Err(LocalFailureCode::SqlResourceLimit);
+        }
+        let columns = schema
+            .into_iter()
+            .map(|(name, logical_type)| LocalSqlColumn { name, logical_type })
+            .collect::<Vec<_>>();
+        let receipt = LocalSqlPreparedReceipt {
+            plan_id,
+            catalog_version: prepared.catalog_version(),
+            parameter_count: bounded_sql_count(parameter_count)?,
+            column_count: bounded_sql_count(columns.len())?,
+            maximum_rows: bounded_sql_count(maximum_rows)?,
+        };
+        Ok((
+            receipt,
+            RetainedSqlPlan {
+                prepared,
+                columns,
+                maximum_rows,
+            },
+        ))
+    }
+
+    fn serve_sql_execute_request(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+    ) -> Result<(), LocalSessionError> {
+        if maximum_payload < LOCAL_SQL_ROWS_HEADER_SIZE {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::ResponseTooLarge,
+            );
+        }
+        let request_buffer = std::mem::take(&mut self.request_buffer);
+        let result = match decode_local_sql_execute(&request_buffer) {
+            Ok(request) => self.serve_sql_execute(
+                connection,
+                stream_id,
+                request_id,
+                maximum_payload,
+                request.plan_id,
+                &request.parameters,
+            ),
+            Err(_) => self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::InvalidRequest,
+            ),
+        };
+        self.request_buffer = request_buffer;
+        result
+    }
+
+    fn serve_sql_execute(
+        &mut self,
+        connection: &mut UdsFrameConnection,
+        stream_id: u32,
+        request_id: u64,
+        maximum_payload: usize,
+        plan_id: NonZeroU64,
+        parameters: &[crate::SqlValue],
+    ) -> Result<(), LocalSessionError> {
+        let Some(retained) = self.prepared_statements.get(&plan_id.get()) else {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::UnknownPrepared,
+            );
+        };
+        if parameters.len() != retained.prepared.parameter_count() {
+            return self.send_failure(
+                connection,
+                stream_id,
+                request_id,
+                LocalFailureCode::SqlParameters,
+            );
+        }
+        let (visible_csn, result) = match self
+            .database
+            .execute_prepared_latest_with_csn(&retained.prepared, parameters)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return self.send_failure(
+                    connection,
+                    stream_id,
+                    request_id,
+                    execute_sql_failure_code(&error),
+                );
+            }
+        };
+        let SqlResult::Rows { columns, rows } = result else {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        };
+        if columns.len() != retained.columns.len()
+            || columns
+                .iter()
+                .zip(&retained.columns)
+                .any(|(actual, expected)| actual != &expected.name)
+            || rows.len() > retained.maximum_rows
+        {
+            return self.send_engine_failure(connection, stream_id, request_id);
+        }
+        let response = match encode_local_sql_rows(
+            &mut self.response_buffer,
+            visible_csn,
+            &retained.columns,
+            &rows,
+            maximum_payload,
+        ) {
+            Ok(response) => response,
+            Err(crate::LocalSqlCodecError::PayloadTooLarge) => {
+                return self.send_failure(
+                    connection,
+                    stream_id,
+                    request_id,
+                    LocalFailureCode::ResponseTooLarge,
+                );
+            }
+            Err(_) => return self.send_engine_failure(connection, stream_id, request_id),
+        };
+        connection.send(FrameKind::Value, stream_id, request_id, response)?;
+        Ok(())
+    }
+
     fn send_engine_failure(
         &mut self,
         connection: &mut UdsFrameConnection,
@@ -386,5 +642,57 @@ fn codec_failure_code(error: &LocalOperationCodecError) -> LocalFailureCode {
             LocalFailureCode::UnsupportedDurability
         }
         _ => LocalFailureCode::InvalidRequest,
+    }
+}
+
+fn prepare_sql_failure_code(error: &SqlError) -> LocalFailureCode {
+    match error {
+        SqlError::Runtime(_) | SqlError::InvalidCatalogObject => LocalFailureCode::EngineFailure,
+        _ => LocalFailureCode::SqlInvalid,
+    }
+}
+
+fn execute_sql_failure_code(error: &SqlError) -> LocalFailureCode {
+    match error {
+        SqlError::CatalogChanged => LocalFailureCode::SqlCatalogChanged,
+        SqlError::ParameterMismatch
+        | SqlError::TypeMismatch
+        | SqlError::NullViolation
+        | SqlError::InvalidPrimaryKey
+        | SqlError::InvalidSecondaryIndexRange => LocalFailureCode::SqlParameters,
+        SqlError::Runtime(_) | SqlError::InvalidStoredRow | SqlError::InvalidCatalogObject => {
+            LocalFailureCode::EngineFailure
+        }
+        _ => LocalFailureCode::SqlInvalid,
+    }
+}
+
+fn bounded_sql_count(count: usize) -> Result<u32, LocalFailureCode> {
+    u32::try_from(count).map_err(|_| LocalFailureCode::SqlResourceLimit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{execute_sql_failure_code, prepare_sql_failure_code};
+    use crate::{LocalFailureCode, SqlError};
+
+    #[test]
+    fn sql_errors_map_to_stable_local_failure_classes() {
+        assert_eq!(
+            prepare_sql_failure_code(&SqlError::InvalidCatalogObject),
+            LocalFailureCode::EngineFailure
+        );
+        assert_eq!(
+            execute_sql_failure_code(&SqlError::CatalogChanged),
+            LocalFailureCode::SqlCatalogChanged
+        );
+        assert_eq!(
+            execute_sql_failure_code(&SqlError::InvalidSecondaryIndexRange),
+            LocalFailureCode::SqlParameters
+        );
+        assert_eq!(
+            execute_sql_failure_code(&SqlError::InvalidStoredRow),
+            LocalFailureCode::EngineFailure
+        );
     }
 }

@@ -47,6 +47,16 @@ pub enum LocalFailureCode {
     UnsupportedDurability = 6,
     /// Relative TTL addition overflowed absolute server time.
     ExpiryOverflow = 7,
+    /// SQL text, binding, or physical access path is invalid.
+    SqlInvalid = 8,
+    /// SQL parameters do not satisfy the prepared plan.
+    SqlParameters = 9,
+    /// A prepared SQL plan's catalog version is stale.
+    SqlCatalogChanged = 10,
+    /// A bounded SQL session resource limit was reached.
+    SqlResourceLimit = 11,
+    /// A session-local prepared SQL plan does not exist.
+    UnknownPrepared = 12,
 }
 
 impl TryFrom<u8> for LocalFailureCode {
@@ -61,6 +71,11 @@ impl TryFrom<u8> for LocalFailureCode {
             5 => Ok(Self::UnexpectedFrame),
             6 => Ok(Self::UnsupportedDurability),
             7 => Ok(Self::ExpiryOverflow),
+            8 => Ok(Self::SqlInvalid),
+            9 => Ok(Self::SqlParameters),
+            10 => Ok(Self::SqlCatalogChanged),
+            11 => Ok(Self::SqlResourceLimit),
+            12 => Ok(Self::UnknownPrepared),
             _ => Err(LocalOperationCodecError::UnknownFailureCode(value)),
         }
     }

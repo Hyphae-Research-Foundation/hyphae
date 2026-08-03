@@ -107,6 +107,18 @@ impl PreparedStatement {
     pub const fn catalog_version(&self) -> CatalogVersion {
         self.catalog_version
     }
+
+    pub(crate) fn parameter_count(&self) -> usize {
+        self.plan.parameter_count()
+    }
+
+    pub(crate) fn result_schema(&self) -> Result<Vec<(String, LogicalType)>, SqlError> {
+        self.plan.result_schema()
+    }
+
+    pub(crate) fn maximum_result_rows(&self) -> Option<usize> {
+        self.plan.maximum_result_rows()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,6 +257,167 @@ enum JoinRightAccess {
 enum JoinSide {
     Left,
     Right,
+}
+
+impl PreparedPlan {
+    fn parameter_count(&self) -> usize {
+        match self {
+            Self::PrimaryKeyLookup {
+                parameter_count, ..
+            }
+            | Self::SecondaryIndexLookup {
+                parameter_count, ..
+            }
+            | Self::SecondaryIndexRangeScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyPrefixScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyPrefixRangeScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyRangeScan {
+                parameter_count, ..
+            }
+            | Self::IndexedInnerJoin {
+                parameter_count, ..
+            } => *parameter_count,
+        }
+    }
+
+    fn maximum_result_rows(&self) -> Option<usize> {
+        match self {
+            Self::PrimaryKeyLookup { .. } => Some(1),
+            Self::SecondaryIndexLookup {
+                index_definition,
+                limit,
+                ..
+            } => {
+                if index_definition.unique {
+                    Some(1)
+                } else {
+                    *limit
+                }
+            }
+            Self::SecondaryIndexRangeScan { limit, .. }
+            | Self::PrimaryKeyScan { limit, .. }
+            | Self::PrimaryKeyPrefixScan { limit, .. }
+            | Self::PrimaryKeyPrefixRangeScan { limit, .. }
+            | Self::PrimaryKeyRangeScan { limit, .. } => Some(*limit),
+            Self::IndexedInnerJoin { left_access, .. } => match left_access {
+                JoinLeftAccess::PrimaryKey { .. } | JoinLeftAccess::UniqueSecondaryIndex { .. } => {
+                    Some(1)
+                }
+                JoinLeftAccess::BoundedSecondaryIndex { limit, .. }
+                | JoinLeftAccess::BoundedPrimaryKeyScan { limit, .. } => Some(*limit),
+            },
+        }
+    }
+
+    fn result_schema(&self) -> Result<Vec<(String, LogicalType)>, SqlError> {
+        match self {
+            Self::PrimaryKeyLookup {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::SecondaryIndexLookup {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::SecondaryIndexRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyPrefixScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyPrefixRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            } => projected_schema(relation, projection, output_columns),
+            Self::IndexedInnerJoin {
+                left_relation,
+                right_relation,
+                projection,
+                output_columns,
+                ..
+            } => join_projected_schema(left_relation, right_relation, projection, output_columns),
+        }
+    }
+}
+
+fn projected_schema(
+    relation: &RelationDefinition,
+    projection: &[usize],
+    output_columns: &[String],
+) -> Result<Vec<(String, LogicalType)>, SqlError> {
+    if projection.len() != output_columns.len() {
+        return Err(SqlError::InvalidCatalogObject);
+    }
+    projection
+        .iter()
+        .zip(output_columns)
+        .map(|(column, output)| {
+            let definition = relation
+                .columns
+                .get(*column)
+                .ok_or(SqlError::UnknownColumn)?;
+            Ok((output.clone(), definition.logical_type.clone()))
+        })
+        .collect()
+}
+
+fn join_projected_schema(
+    left_relation: &RelationDefinition,
+    right_relation: &RelationDefinition,
+    projection: &[JoinProjection],
+    output_columns: &[String],
+) -> Result<Vec<(String, LogicalType)>, SqlError> {
+    if projection.len() != output_columns.len() {
+        return Err(SqlError::InvalidCatalogObject);
+    }
+    projection
+        .iter()
+        .zip(output_columns)
+        .map(|(projected, output)| {
+            let relation = match projected.side {
+                JoinSide::Left => left_relation,
+                JoinSide::Right => right_relation,
+            };
+            let definition = relation
+                .columns
+                .get(projected.column)
+                .ok_or(SqlError::UnknownColumn)?;
+            Ok((output.clone(), definition.logical_type.clone()))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -22,6 +22,7 @@ mod local_protocol;
 mod local_search;
 #[cfg(unix)]
 mod local_session;
+mod local_sql;
 #[cfg(unix)]
 mod local_uds;
 mod model;
@@ -76,6 +77,16 @@ pub use local_search::{
 };
 #[cfg(unix)]
 pub use local_session::{LocalDataSession, LocalSessionError};
+pub use local_sql::{
+    LOCAL_SQL_EXECUTE_HEADER_SIZE, LOCAL_SQL_PREPARE_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE,
+    LOCAL_SQL_ROWS_HEADER_SIZE, LocalSqlCodecError, LocalSqlColumn, LocalSqlExecuteRequest,
+    LocalSqlPreparedReceipt, LocalSqlRows, MAX_LOCAL_PREPARED_STATEMENTS,
+    MAX_LOCAL_SQL_COLUMN_NAME_BYTES, MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS,
+    MAX_LOCAL_SQL_ROWS, MAX_LOCAL_SQL_STATEMENT_BYTES, MAX_LOCAL_SQL_TYPE_DESCRIPTOR_BYTES,
+    decode_local_sql_execute, decode_local_sql_prepare, decode_local_sql_prepared_receipt,
+    decode_local_sql_rows, encode_local_sql_execute, encode_local_sql_prepare,
+    encode_local_sql_prepared_receipt, encode_local_sql_rows,
+};
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use set_algebra::{
@@ -2621,11 +2632,24 @@ impl NativeDatabase {
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
+        self.execute_prepared_latest_with_csn(prepared, parameters)
+            .map(|(_, result)| result)
+    }
+
+    pub(crate) fn execute_prepared_latest_with_csn(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+    ) -> Result<(Csn, SqlResult), SqlError> {
         let metadata = self
             .coordinator
             .snapshot(0)
             .map_err(NativeRuntimeError::from)?;
-        sql::execute_prepared_latest(self, &metadata, prepared, parameters)
+        let visible_csn = metadata
+            .visible_csn
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = sql::execute_prepared_latest(self, &metadata, prepared, parameters)?;
+        Ok((visible_csn, result))
     }
 
     /// Performs an owned primary-key lookup through the current relational

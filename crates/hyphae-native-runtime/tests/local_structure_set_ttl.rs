@@ -334,8 +334,8 @@ fn local_ttl_and_receipt_codecs_reject_every_noncanonical_boundary() {
         Err(LocalOperationCodecError::InvalidIdentity)
     ));
     assert!(matches!(
-        decode_local_failure(&[1, 8, 0, 0]),
-        Err(LocalOperationCodecError::UnknownFailureCode(8))
+        decode_local_failure(&[1, 13, 0, 0]),
+        Err(LocalOperationCodecError::UnknownFailureCode(13))
     ));
 }
 

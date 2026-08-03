@@ -103,8 +103,8 @@ fn local_operation_codecs_reject_every_noncanonical_boundary()
         Err(LocalOperationCodecError::PayloadTooLarge)
     ));
     assert!(matches!(
-        decode_local_failure(&[1, 8, 0, 0]),
-        Err(LocalOperationCodecError::UnknownFailureCode(8))
+        decode_local_failure(&[1, 13, 0, 0]),
+        Err(LocalOperationCodecError::UnknownFailureCode(13))
     ));
     Ok(())
 }
@@ -277,7 +277,7 @@ mod unix {
             LocalFailureCode::ResponseTooLarge
         );
 
-        client.send(FrameKind::Prepare, 10, 9, b"")?;
+        client.send(FrameKind::Begin, 10, 9, b"")?;
         let unexpected = receive_response(&mut client, FrameKind::Failure, 10, 9)?;
         assert_eq!(
             decode_local_failure(&unexpected)?,
