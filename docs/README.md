@@ -61,6 +61,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native active-expiry scheduler v1](native/active-expiry-scheduler-v1.md)
 - [Native whole-hash TTL v1](native/native-hash-ttl-v1.md)
 - [Native hash field TTL v1](native/native-hash-field-ttl-v1.md)
+- [Native hash randomized-model gate v1](native/native-hash-randomized-model-v1.md)
 - [Native hash field commands v1](native/native-hash-field-commands-v1.md)
 - [Native reverse hash scan v1](native/native-hash-reverse-scan-v1.md)
 - [Native hash pattern scan v1](native/native-hash-pattern-scan-v1.md)

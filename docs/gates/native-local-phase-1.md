@@ -179,6 +179,12 @@ conditional field expiry, field persist/batches, floating counters,
 randomized model testing, other collection-family TTL, the complete G3 suite,
 and G7 remain open.
 
+The [native hash randomized-model
+gate](../native/native-hash-randomized-model-v1.md) freezes a dependency-free,
+replayable state-machine corpus over private, retained, physical, and reopened
+execution. Its implementation and evidence remain open; the contract alone
+does not satisfy the G3 randomized-model requirement.
+
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
 of the bounded search page for new directories with
