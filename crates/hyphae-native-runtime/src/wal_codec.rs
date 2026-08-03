@@ -72,6 +72,7 @@ pub(crate) enum Opcode {
     ExpireSet = 33,
     DeleteSet = 34,
     DeleteList = 35,
+    ExpireList = 36,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -647,6 +648,7 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteSet as u8 => (Opcode::DeleteSet, EngineKind::Structure),
         value if value == Opcode::CreateList as u8 => (Opcode::CreateList, EngineKind::Structure),
         value if value == Opcode::DeleteList as u8 => (Opcode::DeleteList, EngineKind::Structure),
+        value if value == Opcode::ExpireList as u8 => (Opcode::ExpireList, EngineKind::Structure),
         value if value == Opcode::PushListHead as u8 => {
             (Opcode::PushListHead, EngineKind::Structure)
         }
@@ -769,6 +771,7 @@ fn validate_mutation_shape(
         | Opcode::DeleteSet
         | Opcode::CreateList
         | Opcode::DeleteList
+        | Opcode::ExpireList
         | Opcode::PushListHead
         | Opcode::PushListTail
         | Opcode::PopListHead
@@ -816,7 +819,7 @@ fn validate_mutation_shape(
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::ExpireHash | Opcode::ExpireHashField | Opcode::ExpireSet
+        Opcode::ExpireHash | Opcode::ExpireHashField | Opcode::ExpireSet | Opcode::ExpireList
             if value_length != 0 || expires_at_micros.is_none() =>
         {
             return Err(WalSemanticError::InvalidBody);

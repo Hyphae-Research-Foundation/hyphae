@@ -478,6 +478,7 @@ pub(crate) struct StructureState {
     pub(crate) sets: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     pub(crate) set_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
+    pub(crate) list_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
 }
 
@@ -1209,7 +1210,48 @@ impl StructureState {
     }
 
     pub(crate) fn delete_list(&mut self, key: &[u8]) -> bool {
+        self.list_expiries.remove(key);
         self.lists.remove(key).is_some()
+    }
+
+    pub(crate) fn list_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.lists.contains_key(key)
+            && self
+                .list_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
+    }
+
+    pub(crate) fn list_is_expired(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.lists.contains_key(key)
+            && self
+                .list_expiries
+                .get(key)
+                .is_some_and(|expiry| *expiry <= logical_time_micros)
+    }
+
+    pub(crate) fn list_expiry(&self, key: &[u8]) -> Option<i64> {
+        self.list_expiries.get(key).copied()
+    }
+
+    pub(crate) fn expire_list(
+        &mut self,
+        key: &[u8],
+        expires_at_micros: i64,
+        logical_time_micros: i64,
+    ) -> bool {
+        if !self.list_is_visible(key, logical_time_micros) {
+            return false;
+        }
+        self.set_list_expiry(key, expires_at_micros)
+    }
+
+    pub(crate) fn set_list_expiry(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.lists.contains_key(key) {
+            return false;
+        }
+        self.list_expiries.insert(key.to_vec(), expires_at_micros);
+        true
     }
 
     pub(crate) fn lpush(&mut self, key: &[u8], value: Vec<u8>) -> Option<usize> {
@@ -1219,6 +1261,17 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn lpush_at(
+        &mut self,
+        key: &[u8],
+        value: Vec<u8>,
+        logical_time_micros: i64,
+    ) -> Option<usize> {
+        self.list_is_visible(key, logical_time_micros)
+            .then(|| self.lpush(key, value))
+            .flatten()
+    }
+
     pub(crate) fn rpush(&mut self, key: &[u8], value: Vec<u8>) -> Option<usize> {
         self.lists.get_mut(key).map(|values| {
             values.push_back(value);
@@ -1226,10 +1279,29 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn rpush_at(
+        &mut self,
+        key: &[u8],
+        value: Vec<u8>,
+        logical_time_micros: i64,
+    ) -> Option<usize> {
+        self.list_is_visible(key, logical_time_micros)
+            .then(|| self.rpush(key, value))
+            .flatten()
+    }
+
     pub(crate) fn lpop(&mut self, key: &[u8]) -> ListPop {
         match self.lists.get_mut(key) {
             None => ListPop::Missing,
             Some(values) => values.pop_front().map_or(ListPop::Empty, ListPop::Value),
+        }
+    }
+
+    pub(crate) fn lpop_at(&mut self, key: &[u8], logical_time_micros: i64) -> ListPop {
+        if self.list_is_visible(key, logical_time_micros) {
+            self.lpop(key)
+        } else {
+            ListPop::Missing
         }
     }
 
@@ -1240,8 +1312,22 @@ impl StructureState {
         }
     }
 
+    pub(crate) fn rpop_at(&mut self, key: &[u8], logical_time_micros: i64) -> ListPop {
+        if self.list_is_visible(key, logical_time_micros) {
+            self.rpop(key)
+        } else {
+            ListPop::Missing
+        }
+    }
+
     pub(crate) fn llen(&self, key: &[u8]) -> Option<usize> {
         self.lists.get(key).map(VecDeque::len)
+    }
+
+    pub(crate) fn llen_at(&self, key: &[u8], logical_time_micros: i64) -> Option<usize> {
+        self.list_is_visible(key, logical_time_micros)
+            .then(|| self.llen(key))
+            .flatten()
     }
 
     pub(crate) fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Option<Vec<Vec<u8>>> {
@@ -1255,6 +1341,18 @@ impl StructureState {
                 .cloned()
                 .collect::<Vec<Vec<u8>>>(),
         )
+    }
+
+    pub(crate) fn lrange_at(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        logical_time_micros: i64,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.list_is_visible(key, logical_time_micros)
+            .then(|| self.lrange(key, start, stop))
+            .flatten()
     }
 
     pub(crate) fn create_sorted_set(&mut self, key: Vec<u8>) -> bool {
@@ -1480,12 +1578,22 @@ impl StructureState {
         })
     }
 
+    pub(crate) fn ttl_list_micros(&self, key: &[u8], logical_time_micros: i64) -> Option<TtlValue> {
+        self.list_is_visible(key, logical_time_micros).then(|| {
+            self.list_expiry(key)
+                .map_or(TtlValue::Persistent, |expiry| {
+                    TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
+                })
+        })
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         if !self.hashes.is_empty()
             || !self.hash_expiries.is_empty()
             || !self.sets.is_empty()
             || !self.set_expiries.is_empty()
             || !self.lists.is_empty()
+            || !self.list_expiries.is_empty()
             || !self.sorted_sets.is_empty()
         {
             return Err(ModelError::UnsupportedLegacyStructureFamily);
@@ -1526,6 +1634,7 @@ impl StructureState {
             sets: BTreeMap::new(),
             set_expiries: BTreeMap::new(),
             lists: BTreeMap::new(),
+            list_expiries: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
         })
     }
