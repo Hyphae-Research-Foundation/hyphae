@@ -4691,28 +4691,31 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, invalid identities, another live
     /// structure family, exhausted output or visit bounds, or malformed
     /// reached physical state.
-    pub fn set_algebra_latest(
+    pub fn set_algebra_latest_at(
         &self,
         request: &SetAlgebraRequest,
+        logical_time_micros: i64,
     ) -> Result<SetAlgebraResult, NativeRuntimeError> {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_set_algebra_keys(request)?;
-        let snapshot = self.coordinator.snapshot(0)?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         let root = snapshot
             .roots()
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        self.set_algebra_in_tree(BTree::from_root(root), request)
+        self.set_algebra_in_tree(BTree::from_root(root), request, logical_time_micros)
     }
 
     fn set_algebra_in_tree(
         &self,
         tree: BTree,
         request: &SetAlgebraRequest,
+        logical_time_micros: i64,
     ) -> Result<SetAlgebraResult, NativeRuntimeError> {
-        let cardinalities = self.preflight_set_algebra_inputs(tree, request)?;
+        let cardinalities =
+            self.preflight_set_algebra_inputs(tree, request, logical_time_micros)?;
         match request.operation() {
             SetAlgebraOperation::Union => self.set_union_in_tree(tree, request, &cardinalities),
             SetAlgebraOperation::Intersection => {
@@ -4728,6 +4731,7 @@ impl NativeDatabase {
         &self,
         tree: BTree,
         request: &SetAlgebraRequest,
+        logical_time_micros: i64,
     ) -> Result<Vec<Option<usize>>, NativeRuntimeError> {
         let mut cardinalities = Vec::with_capacity(request.keys().len());
         for key in request.keys() {
@@ -4742,7 +4746,7 @@ impl NativeDatabase {
                         .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
                 ));
             } else {
-                if self.non_set_structure_exists_in_tree(tree, key)? {
+                if self.non_set_structure_exists_in_tree(tree, key, logical_time_micros)? {
                     return Err(NativeRuntimeError::StructureKindMismatch);
                 }
                 cardinalities.push(None);
@@ -4755,13 +4759,18 @@ impl NativeDatabase {
         &self,
         tree: BTree,
         key: &[u8],
+        logical_time_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
         let scalar = tree
             .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
             .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
             .transpose()?
             .flatten()
-            .is_some();
+            .is_some_and(|entry| {
+                entry
+                    .expires_at_micros
+                    .is_none_or(|expiry| expiry > logical_time_micros)
+            });
         let hash = tree
             .get_cached_pinned(
                 &self.pages,
@@ -4771,7 +4780,11 @@ impl NativeDatabase {
             .map(|encoded| decode_live_hash_metadata(encoded.bytes()))
             .transpose()?
             .flatten()
-            .is_some();
+            .is_some_and(|metadata| {
+                metadata
+                    .expires_at_micros
+                    .is_none_or(|expiry| expiry > logical_time_micros)
+            });
         let list = match tree.get_cached_pinned(
             &self.pages,
             &self.buffer_pool,

@@ -56,23 +56,23 @@ fn set_algebra_matches_private_snapshot_physical_and_reopen() -> Result<(), Box<
     let snapshot = database.snapshot(11)?;
     for surface in [
         snapshot.set_algebra(&union)?,
-        database.set_algebra_latest(&union)?,
+        database.set_algebra_latest_at(&union, 11)?,
     ] {
         assert_members(surface.members(), &[b"", b"a", b"b", b"c", b"z", b"\xff"]);
     }
     assert_members(
-        database.set_algebra_latest(&intersection)?.members(),
+        database.set_algebra_latest_at(&intersection, 11)?.members(),
         &[b"a", b"\xff"],
     );
     assert_members(
-        database.set_algebra_latest(&difference)?.members(),
+        database.set_algebra_latest_at(&difference, 11)?.members(),
         &[b"", b"c"],
     );
     drop(database);
 
     let reopened = NativeDatabase::open(temporary.path())?;
     assert_members(
-        reopened.set_algebra_latest(&union)?.members(),
+        reopened.set_algebra_latest_at(&union, 11)?.members(),
         &[b"", b"a", b"b", b"c", b"z", b"\xff"],
     );
     Ok(())
@@ -86,6 +86,10 @@ fn set_algebra_missing_types_and_bounds_fail_exactly() -> Result<(), Box<dyn Err
     seed.create_set(b"members".to_vec())?;
     add_members(&mut seed, b"members", &[b"a", b"b"])?;
     seed.create_list(b"wrong-kind".to_vec())?;
+    seed.set(b"due-scalar".to_vec(), b"value".to_vec(), Some(11))?;
+    seed.create_hash(b"due-hash".to_vec())?;
+    seed.hset(b"due-hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+    assert!(seed.expire_hash(b"due-hash".to_vec(), 11)?);
     seed.commit()?;
 
     let union_missing = request(SetAlgebraOperation::Union, &[b"members", b"missing"], 8, 32)?;
@@ -108,22 +112,26 @@ fn set_algebra_missing_types_and_bounds_fail_exactly() -> Result<(), Box<dyn Err
         32,
     )?;
     assert_members(
-        database.set_algebra_latest(&union_missing)?.members(),
+        database
+            .set_algebra_latest_at(&union_missing, 11)?
+            .members(),
         &[b"a", b"b"],
     );
     assert!(
         database
-            .set_algebra_latest(&intersection_missing)?
+            .set_algebra_latest_at(&intersection_missing, 11)?
             .members()
             .is_empty()
     );
     assert_members(
-        database.set_algebra_latest(&difference_missing)?.members(),
+        database
+            .set_algebra_latest_at(&difference_missing, 11)?
+            .members(),
         &[b"a", b"b"],
     );
     assert!(
         database
-            .set_algebra_latest(&repeated_first)?
+            .set_algebra_latest_at(&repeated_first, 11)?
             .members()
             .is_empty()
     );
@@ -135,19 +143,36 @@ fn set_algebra_missing_types_and_bounds_fail_exactly() -> Result<(), Box<dyn Err
         32,
     )?;
     assert!(matches!(
-        database.set_algebra_latest(&wrong_kind),
+        database.set_algebra_latest_at(&wrong_kind, 11),
         Err(NativeRuntimeError::StructureKindMismatch)
     ));
+
+    let due_other_families = request(
+        SetAlgebraOperation::Union,
+        &[b"members", b"due-scalar", b"due-hash"],
+        8,
+        32,
+    )?;
+    assert!(matches!(
+        database.set_algebra_latest_at(&due_other_families, 10),
+        Err(NativeRuntimeError::StructureKindMismatch)
+    ));
+    assert_members(
+        database
+            .set_algebra_latest_at(&due_other_families, 11)?
+            .members(),
+        &[b"a", b"b"],
+    );
     let output_exhausted = request(SetAlgebraOperation::Union, &[b"members"], 1, 32)?;
     assert!(matches!(
-        database.set_algebra_latest(&output_exhausted),
+        database.set_algebra_latest_at(&output_exhausted, 11),
         Err(NativeRuntimeError::SetAlgebra(
             SetAlgebraError::OutputLimitExceeded { maximum: 1 }
         ))
     ));
     let visits_exhausted = request(SetAlgebraOperation::Union, &[b"members"], 8, 1)?;
     assert!(matches!(
-        database.set_algebra_latest(&visits_exhausted),
+        database.set_algebra_latest_at(&visits_exhausted, 11),
         Err(NativeRuntimeError::SetAlgebra(
             SetAlgebraError::VisitLimitExceeded { maximum: 1 }
         ))

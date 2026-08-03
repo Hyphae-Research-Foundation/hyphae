@@ -25,6 +25,10 @@ The Rust surface uses a shared `SetAlgebraRequest`, a
 retained/materialized snapshots, and current-root physical reads expose the
 same operation and result semantics.
 
+Private batches and snapshots use their captured logical time. The
+current-root physical surface requires an explicit logical time so an expired
+scalar or hash incarnation is missing rather than a live wrong-kind input.
+
 This version returns only a complete result. It never returns an ambiguous
 partial prefix and has no cursor. Pagination, destination-set store variants,
 and protocol exposure require separate contracts.
@@ -138,9 +142,9 @@ input may not be normalized to missing, empty, or a partial result.
 
 Private-batch algebra includes the batch's read-your-writes set mutations.
 A retained snapshot remains fixed at its captured root. Current-root physical
-execution captures one root set before preflight and uses it for the complete
-operation, so concurrent publication cannot mix commit sequences across input
-sets.
+execution captures one root set at the caller's explicit logical time before
+preflight and uses it for the complete operation, so concurrent publication
+cannot mix commit sequences across input sets.
 
 The operation is read-only. It publishes no conflict identities, consumes no
 CSN, changes no TTL, and cannot make a rejected write batch dirty.
