@@ -1654,6 +1654,84 @@ mod tests {
         }
 
         #[test]
+        fn decimal_storage_and_ordered_codecs_round_trip(value in -999_999_999_999_i128..=999_999_999_999_i128) {
+            let logical_type = LogicalType::Decimal(DecimalType::new(12, 4)?);
+            let scalar = ScalarValue::Decimal(value);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let ordered = scalar.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &ordered)?, scalar);
+        }
+
+        #[test]
+        fn decimal_ordered_bytes_preserve_coefficient_order(
+            left in -999_999_999_999_i128..=999_999_999_999_i128,
+            right in -999_999_999_999_i128..=999_999_999_999_i128,
+        ) {
+            let logical_type = LogicalType::Decimal(DecimalType::new(12, 4)?);
+            let left_bytes = ScalarValue::Decimal(left).encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Decimal(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+        }
+
+        #[test]
+        fn date_and_timestamp_codecs_round_trip_and_preserve_order(
+            left_date in any::<i32>(), right_date in any::<i32>(),
+            left_timestamp in any::<i64>(), right_timestamp in any::<i64>(),
+        ) {
+            for (logical_type, left, right, value_order) in [
+                (
+                    LogicalType::Date,
+                    ScalarValue::Date(left_date),
+                    ScalarValue::Date(right_date),
+                    left_date.cmp(&right_date),
+                ),
+                (
+                    LogicalType::Timestamp,
+                    ScalarValue::Timestamp(left_timestamp),
+                    ScalarValue::Timestamp(right_timestamp),
+                    left_timestamp.cmp(&right_timestamp),
+                ),
+            ] {
+                let storage = left.encode_storage(&logical_type)?;
+                prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, left.clone());
+                let left_bytes = left.encode_ordered_component(&logical_type)?;
+                let right_bytes = right.encode_ordered_component(&logical_type)?;
+                prop_assert_eq!(value_order, left_bytes.cmp(&right_bytes));
+                prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, left);
+            }
+        }
+
+        #[test]
+        fn time_codecs_round_trip_and_preserve_order(
+            left in 0_u64..86_400_000_000_000_u64,
+            right in 0_u64..86_400_000_000_000_u64,
+        ) {
+            let logical_type = LogicalType::Time;
+            let scalar = ScalarValue::Time(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Time(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
+        fn uuid_codecs_round_trip_and_preserve_network_order(
+            left in any::<[u8; 16]>(), right in any::<[u8; 16]>(),
+        ) {
+            let logical_type = LogicalType::Uuid;
+            let scalar = ScalarValue::Uuid(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Uuid(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
         fn binary_storage_and_ordered_codecs_round_trip(value in proptest::collection::vec(any::<u8>(), 0..512)) {
             let logical_type = LogicalType::Binary;
             let scalar = ScalarValue::Binary(value);
