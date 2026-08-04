@@ -1,9 +1,8 @@
 name: Native Conformance Aggregate
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -12,22 +11,40 @@ permissions:
 jobs:
   aggregate:
     name: Native conformance aggregate
-    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Check out the exact tested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.11.15
+      - name: Resolve successful CI run for the exact commit
+        id: ci
+        uses: actions/github-script@c1a9c1e1f36c44f6f9b7c8fcae7ce5ac1030f939 # v8.0.0
+        with:
+          script: |
+            const sha = context.payload.pull_request?.head.sha || context.sha;
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              head_sha: sha,
+              status: 'success',
+              per_page: 20,
+            });
+            const run = response.data.workflow_runs
+              .filter(item => item.head_sha === sha)
+              .sort((a, b) => b.run_number - a.run_number)[0];
+            if (!run) core.setFailed(`missing successful CI run for ${sha}`);
+            core.setOutput('run_id', run.id);
       - name: Download hosted conformance receipts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.ci.outputs.run_id }}
           pattern: native-conformance-*
           path: conformance-receipts
           merge-multiple: true

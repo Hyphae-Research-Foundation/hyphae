@@ -146,6 +146,7 @@ class NativeG0ReadinessTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("head_sha: sha", workflow)
+        self.assertIn("pull_request?.head.sha || context.sha", workflow)
         self.assertIn("Verify receipt commit identity", workflow)
         self.assertIn("source_commit {actual} != {expected}", workflow)
         self.assertIn("tools/assemble_native_g0_evidence.py", workflow)

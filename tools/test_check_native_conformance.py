@@ -271,8 +271,9 @@ class NativeConformanceProfileTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/native-conformance.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("workflow_run:", workflow)
-        self.assertIn("github.event.workflow_run.head_sha", workflow)
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("head_sha: sha", workflow)
+        self.assertIn("steps.ci.outputs.run_id", workflow)
         self.assertIn("--aggregate", workflow)
         for platform in ("linux", "macos", "windows"):
             self.assertIn(f"native-conformance-{platform}.json", workflow)

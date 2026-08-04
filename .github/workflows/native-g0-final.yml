@@ -1,9 +1,8 @@
 name: Native G0 Final Readiness
 
 on:
-  workflow_run:
-    workflows: [Security, Native Conformance Aggregate]
-    types: [completed]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -18,7 +17,7 @@ jobs:
       - name: Check out the exact evaluated commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -28,7 +27,7 @@ jobs:
         uses: actions/github-script@c1a9c1e1f36c44f6f9b7c8fcae7ce5ac1030f939 # v8.0.0
         with:
           script: |
-            const sha = context.payload.workflow_run.head_sha;
+            const sha = context.payload.pull_request?.head.sha || context.sha;
             const workflows = ['security.yml', 'native-conformance.yml'];
             for (const workflow_id of workflows) {
               const response = await github.rest.actions.listWorkflowRuns({
@@ -64,7 +63,7 @@ jobs:
       - name: Verify receipt commit identity
         shell: bash
         env:
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -86,7 +85,7 @@ jobs:
             --root evidence \
             --profile config/native-g0-readiness-profile.json \
             --evidence config/native-g0-readiness-evidence.json \
-            --expected-commit "${{ github.event.workflow_run.head_sha }}" \
+            --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
             --output native-g0-final-evidence.json
           python tools/check_native_g0_readiness.py \
             --root evidence \
