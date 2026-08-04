@@ -79,6 +79,7 @@ class NativeG1ReadinessTests(unittest.TestCase):
         self.assertIn("native-g1-latency-aggregate.json", workflow)
         self.assertIn("tools/assemble_native_g1_evidence.py", workflow)
         self.assertIn("native-g1-final-readiness.json", workflow)
+        self.assertIn("dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30", workflow)
         self.assertIn('"passed": 7', workflow)
 
     def test_missing_digest_or_lower_level_fails_closed(self) -> None:

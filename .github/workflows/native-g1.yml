@@ -17,7 +17,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install pinned Rust
-        uses: dtolnay/rust-toolchain@5d4589f9e56f52d2d495721a11cfd02e1a5db6a9
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
       - name: Install pinned Python
