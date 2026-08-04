@@ -82,6 +82,73 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_receipt(profile: dict[str, Any], receipt: dict[str, Any]) -> None:
+    """Validate exact platform coverage and receipt arithmetic."""
+
+    receipt_fields = {
+        "schema",
+        "platform",
+        "status",
+        "required_count",
+        "passed_count",
+        "results",
+    }
+    if set(receipt) != receipt_fields:
+        raise GateFailure("unknown receipt field or missing required field")
+    if receipt.get("schema") != "hyphae-native-conformance-receipt-v1":
+        raise GateFailure("unsupported conformance receipt")
+    platform = receipt.get("platform")
+    if platform not in PLATFORMS:
+        raise GateFailure("unknown receipt platform")
+    if profile.get("schema") != "hyphae-native-conformance-profile-audit-v1" or profile.get(
+        "status"
+    ) != "passed":
+        raise GateFailure("receipt requires a validated profile")
+    surfaces = profile.get("surfaces")
+    results = receipt.get("results")
+    if not isinstance(surfaces, list) or not isinstance(results, list):
+        raise GateFailure("profile surfaces and receipt results must be arrays")
+    expected = {
+        surface["id"]
+        for surface in surfaces
+        if isinstance(surface, dict)
+        and isinstance(surface.get("required_platforms"), list)
+        and platform in surface["required_platforms"]
+    }
+    seen: set[str] = set()
+    passed = 0
+    result_fields = {"id", "command", "status", "exit_code"}
+    for value in results:
+        result = _mapping(value, "receipt result")
+        if set(result) != result_fields:
+            raise GateFailure("unknown result field or missing required field")
+        result_id = result.get("id")
+        if not isinstance(result_id, str):
+            raise GateFailure("result ID must be a string")
+        if result_id in seen:
+            raise GateFailure(f"duplicate result {result_id}")
+        seen.add(result_id)
+        status = result.get("status")
+        exit_code = result.get("exit_code")
+        if status not in {"passed", "failed"} or not isinstance(exit_code, int):
+            raise GateFailure(f"result {result_id} is malformed")
+        if (status == "passed") != (exit_code == 0):
+            raise GateFailure(f"result {result_id} status and exit code disagree")
+        passed += status == "passed"
+    if seen != expected:
+        raise GateFailure("receipt coverage differs from required platform surfaces")
+    required_count = receipt.get("required_count")
+    passed_count = receipt.get("passed_count")
+    status = receipt.get("status")
+    expected_status = "passed" if passed == len(expected) else "failed"
+    if (
+        required_count != len(expected)
+        or passed_count != passed
+        or status != expected_status
+    ):
+        raise GateFailure("receipt summary is inconsistent with results")
+
+
 def run_profile(
     profile: dict[str, Any], platform: str, execute: Callable[[list[str]], int]
 ) -> dict[str, Any]:
