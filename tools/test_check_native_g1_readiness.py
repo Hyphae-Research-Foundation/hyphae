@@ -75,6 +75,8 @@ class NativeG1ReadinessTests(unittest.TestCase):
         self.assertIn("native-g1-crash-audit.json", workflow)
         self.assertIn("tools/check_native_g1_vertical_receipt.py", workflow)
         self.assertIn("native-g1-vertical-audit.json", workflow)
+        self.assertIn("tools/check_native_g1_latency_receipts.py", workflow)
+        self.assertIn("native-g1-latency-aggregate.json", workflow)
 
     def test_missing_digest_or_lower_level_fails_closed(self) -> None:
         profile = self.profile()

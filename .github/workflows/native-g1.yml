@@ -31,7 +31,8 @@ jobs:
             tools.test_check_native_g1_inventory \
             tools.test_check_native_g1_substrate \
             tools.test_check_native_g1_crash_receipt \
-            tools.test_check_native_g1_vertical_receipt -v
+            tools.test_check_native_g1_vertical_receipt \
+            tools.test_check_native_g1_latency_receipts -v
       - name: Execute native kernel suites
         run: |
           cargo test -p hyphae-native-pages \
@@ -91,6 +92,29 @@ jobs:
             --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
             --output native-g1-crash-audit.json
           python -m json.tool native-g1-crash-audit.json >/dev/null
+      - name: Build G1 latency producers
+        run: |
+          cargo build --release -p hyphae-native-runtime \
+            --example microsecond_smoke \
+            --example uds_all_engine_transaction_smoke --locked
+          cargo clippy -p hyphae-native-runtime \
+            --example microsecond_smoke \
+            --example uds_all_engine_transaction_smoke --locked -- -D warnings
+      - name: Execute bounded G1 latency observations
+        run: |
+          target/release/examples/microsecond_smoke \
+            "$G1_SHA" "$(rustc --version)" \
+            > native-g1-embedded-latency.json
+          target/release/examples/uds_all_engine_transaction_smoke \
+            "$G1_SHA" "$G1_SHA" \
+            > native-g1-protocol-latency.json
+          PYTHONPATH=. python tools/check_native_g1_latency_receipts.py \
+            --embedded native-g1-embedded-latency.json \
+            --protocol native-g1-protocol-latency.json \
+            --expected-commit "$G1_SHA" \
+            --output native-g1-latency-aggregate.json
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Upload G1 substrate evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -101,6 +125,9 @@ jobs:
             native-g1-vertical-audit.json
             native-g1-process-crash-matrix.json
             native-g1-crash-audit.json
+            native-g1-embedded-latency.json
+            native-g1-protocol-latency.json
+            native-g1-latency-aggregate.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true
