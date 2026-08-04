@@ -886,6 +886,8 @@ pub enum ScalarValue {
     Array(Vec<Self>),
     /// Canonically key-ordered nested entries.
     Map(Vec<(Self, Self)>),
+    /// Fixed-dimension canonical float32 vector.
+    Vector(Vec<CanonicalF32>),
 }
 
 impl ScalarValue {
@@ -904,7 +906,7 @@ impl ScalarValue {
         if matches!(self, Self::Null) {
             return Err(NativeTypeError::NullRequiresRowBitmap);
         }
-        if matches!(logical_type, LogicalType::Json | LogicalType::Vector(_)) {
+        if matches!(logical_type, LogicalType::Json) {
             return Err(NativeTypeError::UnsupportedScalarType);
         }
         let encoded = match (self, logical_type) {
@@ -955,6 +957,9 @@ impl ScalarValue {
             }
             (Self::Map(entries), LogicalType::Map(key_type, value_type)) => {
                 encode_map_storage(entries, key_type, value_type)?
+            }
+            (Self::Vector(values), LogicalType::Vector(vector_type)) => {
+                encode_vector_storage(values, *vector_type)?
             }
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
@@ -1042,9 +1047,10 @@ impl ScalarValue {
             LogicalType::Map(key_type, value_type) => {
                 decode_map_storage(encoded, key_type, value_type).map(Self::Map)
             }
-            LogicalType::Json | LogicalType::Vector(_) => {
-                Err(NativeTypeError::UnsupportedScalarType)
+            LogicalType::Vector(vector_type) => {
+                decode_vector_storage(encoded, *vector_type).map(Self::Vector)
             }
+            LogicalType::Json => Err(NativeTypeError::UnsupportedScalarType),
         }
     }
 
@@ -1234,6 +1240,41 @@ impl ScalarValue {
             | LogicalType::Vector(_) => Err(NativeTypeError::UnsupportedOrderedType),
         }
     }
+}
+
+fn encode_vector_storage(
+    values: &[CanonicalF32],
+    vector_type: VectorType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || values.len() != usize::from(vector_type.dimension())
+    {
+        return Err(NativeTypeError::ScalarOutOfRange);
+    }
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        encoded.extend_from_slice(&value.bits().to_le_bytes());
+    }
+    ensure_scalar_length(encoded.len())?;
+    Ok(encoded)
+}
+
+fn decode_vector_storage(
+    encoded: &[u8],
+    vector_type: VectorType,
+) -> Result<Vec<CanonicalF32>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || encoded.len() != usize::from(vector_type.dimension()).saturating_mul(4)
+    {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    encoded
+        .chunks_exact(4)
+        .map(|bytes| {
+            let bits = u32::from_le_bytes(exact_scalar_bytes(bytes)?);
+            decode_canonical_f32(bits)
+        })
+        .collect()
 }
 
 fn encode_map_storage(
@@ -2212,6 +2253,60 @@ mod tests {
         trailing.push(0);
         assert_eq!(
             ScalarValue::decode_storage(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_storage_codec_round_trips_canonical_float_elements() -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 4)?);
+        let value = ScalarValue::Vector(vec![
+            CanonicalF32::new(-0.0),
+            CanonicalF32::new(1.5),
+            CanonicalF32::new(f32::NEG_INFINITY),
+            CanonicalF32::new(f32::NAN),
+        ]);
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        assert_eq!(
+            encoded,
+            [
+                0, 0, 0, 0, 0, 0, 0xc0, 0x3f, 0, 0, 0x80, 0xff, 0, 0, 0xc0, 0x7f,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_storage_codec_rejects_dimensions_noncanonical_bits_and_mismatch()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0)]).encode_storage(&logical_type),
+            Err(NativeTypeError::ScalarOutOfRange)
+        );
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0), CanonicalF32::new(2.0)])
+                .encode_storage(&LogicalType::Array(Box::new(LogicalType::Float32))),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &[0; 4]),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut negative_zero = Vec::new();
+        negative_zero.extend_from_slice(&(-0.0_f32).to_bits().to_le_bytes());
+        negative_zero.extend_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &negative_zero),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut noncanonical_nan = Vec::new();
+        noncanonical_nan.extend_from_slice(&0x7fc0_0001_u32.to_le_bytes());
+        noncanonical_nan.extend_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &noncanonical_nan),
             Err(NativeTypeError::InvalidScalarEncoding)
         );
         Ok(())
