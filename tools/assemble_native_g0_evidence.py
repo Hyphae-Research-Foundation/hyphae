@@ -23,6 +23,24 @@ INJECTIONS = [
 ]
 
 
+def validate_receipt_commit_identity(root: Path, expected_commit: str) -> None:
+    """Reject any receipt whose explicit source commit differs from the target."""
+
+    for _, _, artifact in INJECTIONS:
+        path = root / artifact
+        if not path.is_file():
+            raise GateFailure(f"injected artifact is missing: {artifact}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise GateFailure(f"receipt must be valid JSON: {artifact}") from error
+        actual = payload.get("source_commit")
+        if actual is not None and actual != expected_commit:
+            raise GateFailure(
+                f"receipt source commit mismatch for {artifact}: {actual} != {expected_commit}"
+            )
+
+
 def assemble(root: Path, profile: dict, evidence: dict) -> dict:
     """Inject all exact artifacts or fail closed at the first absent/red input."""
 
@@ -37,11 +55,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
+        validate_receipt_commit_identity(args.root, args.expected_commit)
         result = assemble(args.root, profile, evidence)
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native G0 evidence assembly failed: {error}")

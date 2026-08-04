@@ -86,6 +86,7 @@ jobs:
             --root evidence \
             --profile config/native-g0-readiness-profile.json \
             --evidence config/native-g0-readiness-evidence.json \
+            --expected-commit "${{ github.event.workflow_run.head_sha }}" \
             --output native-g0-final-evidence.json
           python tools/check_native_g0_readiness.py \
             --root evidence \
