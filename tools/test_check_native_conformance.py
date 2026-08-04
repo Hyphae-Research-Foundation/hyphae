@@ -4,7 +4,11 @@ import json
 import unittest
 from pathlib import Path
 
-from tools.check_native_conformance import GateFailure, validate_profile
+from tools.check_native_conformance import (
+    GateFailure,
+    run_profile,
+    validate_profile,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +85,48 @@ class NativeConformanceProfileTests(unittest.TestCase):
                     ],
                 }
             )
+    def test_runner_executes_only_current_platform_and_records_failures(self) -> None:
+        profile = {
+            "schema": "hyphae-native-conformance-profile-audit-v1",
+            "status": "passed",
+            "surface_count": 3,
+            "platform_counts": {"linux": 2, "macos": 2, "windows": 1},
+            "surfaces": [
+                {
+                    "id": "green",
+                    "command": "cargo test green --locked",
+                    "required_platforms": ["linux", "macos"],
+                },
+                {
+                    "id": "red",
+                    "command": "cargo test red --locked",
+                    "required_platforms": ["linux"],
+                },
+                {
+                    "id": "windows-only",
+                    "command": "cargo test windows --locked",
+                    "required_platforms": ["windows"],
+                },
+            ],
+        }
+        calls: list[list[str]] = []
+
+        def execute(command: list[str]) -> int:
+            calls.append(command)
+            return 1 if "red" in command else 0
+
+        result = run_profile(profile, "linux", execute)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual([row["id"] for row in result["results"]], ["green", "red"])
+        self.assertEqual([row["status"] for row in result["results"]], ["passed", "failed"])
+        self.assertEqual(calls, [["cargo", "test", "green", "--locked"], ["cargo", "test", "red", "--locked"]])
+
+    def test_runner_rejects_unknown_platform_and_unvalidated_profile(self) -> None:
+        with self.assertRaisesRegex(GateFailure, "unknown platform"):
+            run_profile({"status": "passed", "surfaces": []}, "plan9", lambda _: 0)
+        with self.assertRaisesRegex(GateFailure, "validated profile"):
+            run_profile({"status": "failed", "surfaces": []}, "linux", lambda _: 0)
 
 
 if __name__ == "__main__":
