@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -133,10 +134,32 @@ def evaluate_readiness(
     }
 
 
+def validate_passed_artifacts(root: Path, result: dict[str, Any]) -> None:
+    """Require every passed artifact to exist under root and match its binding."""
+
+    resolved_root = root.resolve()
+    for row in result["requirements"]:
+        if row["status"] != "passed":
+            continue
+        artifact = row["artifact"]
+        digest = row.get("artifact_sha256")
+        path = (resolved_root / artifact).resolve()
+        try:
+            path.relative_to(resolved_root)
+        except ValueError as error:
+            raise GateFailure(f"passed artifact escapes repository root: {artifact}") from error
+        if not path.is_file():
+            raise GateFailure(f"passed artifact is missing: {artifact}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != digest:
+            raise GateFailure(f"passed artifact SHA-256 mismatch: {artifact}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
@@ -144,6 +167,7 @@ def main() -> int:
             json.loads(args.profile.read_text(encoding="utf-8")),
             json.loads(args.evidence.read_text(encoding="utf-8")),
         )
+        validate_passed_artifacts(args.root, result)
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native G0 readiness failed: {error}")
         return 2
