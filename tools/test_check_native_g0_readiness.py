@@ -4,7 +4,11 @@ import json
 import unittest
 from pathlib import Path
 
-from tools.check_native_g0_readiness import GateFailure, evaluate_readiness
+from tools.check_native_g0_readiness import (
+    GateFailure,
+    evaluate_readiness,
+    validate_passed_artifacts,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,11 +68,13 @@ class NativeG0ReadinessTests(unittest.TestCase):
                 "status": "passed",
                 "evidence_level": "local-integration",
                 "artifact": "evidence/types.json",
+                "artifact_sha256": "a" * 64,
             },
             "dependencies": {
                 "status": "passed",
                 "evidence_level": "hosted",
                 "artifact": "evidence/dependencies.json",
+                "artifact_sha256": "b" * 64,
             },
         }
 
@@ -91,6 +97,7 @@ class NativeG0ReadinessTests(unittest.TestCase):
                 "status": "passed",
                 "evidence_level": "local-integration",
                 "artifact": "evidence/types.json",
+                "artifact_sha256": "a" * 64,
             },
             "corpus": {
                 "status": "failed",
@@ -106,6 +113,83 @@ class NativeG0ReadinessTests(unittest.TestCase):
             [row["status"] for row in result["requirements"]],
             ["insufficient-evidence", "failed"],
         )
+
+    def test_passed_artifact_bytes_must_match_the_bound_digest(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "evidence.json"
+            artifact.write_bytes(b"canonical")
+            result = {
+                "requirements": [
+                    {
+                        "id": "types",
+                        "status": "passed",
+                        "artifact": "evidence.json",
+                        "artifact_sha256": (
+                            "a3a7b7569607cbd40b16e3717c44068e174f1f5442923f01d09a30c4e8d8f9e6"
+                        ),
+                    }
+                ]
+            }
+            with self.assertRaisesRegex(GateFailure, "SHA-256 mismatch"):
+                validate_passed_artifacts(root, result)
+
+            result["requirements"][0]["artifact_sha256"] = __import__(
+                "hashlib"
+            ).sha256(b"canonical").hexdigest()
+            validate_passed_artifacts(root, result)
+
+            result["requirements"][0]["artifact"] = "../outside.json"
+            with self.assertRaisesRegex(GateFailure, "escapes repository root"):
+                validate_passed_artifacts(root, result)
+
+    def test_passed_evidence_requires_a_canonical_sha256_binding(self) -> None:
+        profile = {
+            "schema": "hyphae-native-g0-profile-v1",
+            "gate": "G0",
+            "requirements": [
+                {"id": "types", "required_evidence_level": "hosted"}
+            ],
+        }
+        with self.assertRaisesRegex(GateFailure, "SHA-256"):
+            evaluate_readiness(
+                profile,
+                {
+                    "types": {
+                        "status": "passed",
+                        "evidence_level": "hosted",
+                        "artifact": "evidence/types.json",
+                    }
+                },
+            )
+        with self.assertRaisesRegex(GateFailure, "SHA-256"):
+            evaluate_readiness(
+                profile,
+                {
+                    "types": {
+                        "status": "passed",
+                        "evidence_level": "hosted",
+                        "artifact": "evidence/types.json",
+                        "artifact_sha256": "not-a-digest",
+                    }
+                },
+            )
+
+        result = evaluate_readiness(
+            profile,
+            {
+                "types": {
+                    "status": "passed",
+                    "evidence_level": "hosted",
+                    "artifact": "evidence/types.json",
+                    "artifact_sha256": "a" * 64,
+                }
+            },
+        )
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["requirements"][0]["artifact_sha256"], "a" * 64)
 
     def test_profile_and_evidence_drift_fail_closed(self) -> None:
         with self.assertRaisesRegex(GateFailure, "duplicate requirement"):
@@ -162,6 +246,11 @@ class NativeG0ReadinessTests(unittest.TestCase):
         result = evaluate_readiness(profile, evidence)
         self.assertEqual(result["status"], "failed")
         self.assertLess(result["passed"], result["required"])
+        architecture = result["requirements"][0]
+        self.assertEqual(
+            architecture["artifact_sha256"],
+            "61550f71005a1a880f929bb309c3f26cea6259e76928342ed8f71930b56705c6",
+        )
 
         security_workflow = (ROOT / ".github/workflows/security.yml").read_text(
             encoding="utf-8"
