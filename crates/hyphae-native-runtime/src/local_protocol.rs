@@ -48,6 +48,22 @@ pub enum FrameKind {
     Cancel = 14,
     /// Clean connection close.
     Close = 15,
+    /// Release one prepared plan.
+    Deallocate = 16,
+    /// Explain one prepared or textual operation.
+    Explain = 17,
+    /// Create or address one transaction savepoint.
+    Savepoint = 18,
+    /// Bounded stream data fragment.
+    Data = 19,
+    /// End one bounded result or data stream.
+    End = 20,
+    /// Increase one stream's available byte window.
+    WindowUpdate = 21,
+    /// Typed row-schema result.
+    RowSchema = 22,
+    /// Bounded typed row batch.
+    RowBatch = 23,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -70,6 +86,14 @@ impl TryFrom<u8> for FrameKind {
             13 => Ok(Self::Failure),
             14 => Ok(Self::Cancel),
             15 => Ok(Self::Close),
+            16 => Ok(Self::Deallocate),
+            17 => Ok(Self::Explain),
+            18 => Ok(Self::Savepoint),
+            19 => Ok(Self::Data),
+            20 => Ok(Self::End),
+            21 => Ok(Self::WindowUpdate),
+            22 => Ok(Self::RowSchema),
+            23 => Ok(Self::RowBatch),
             _ => Err(LocalProtocolError::UnknownKind(value)),
         }
     }

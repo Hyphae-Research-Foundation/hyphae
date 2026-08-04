@@ -54,6 +54,39 @@ Payloads use canonical type encodings and little-endian fixed fields. The
 default maximum is 16 MiB. Larger inputs/results use bounded `DATA` frames on
 one stream with explicit total length and final digest.
 
+The v1 kind registry is append-only:
+
+| Code | Kind | Family |
+|---:|---|---|
+| 1 | `HELLO` | session |
+| 2 | `WELCOME` | session |
+| 3 | `PING` | session |
+| 4 | `PREPARE` | plan |
+| 5 | `EXECUTE` | plan |
+| 6 | `BEGIN` | transaction |
+| 7 | `COMMIT` | transaction |
+| 8 | `ROLLBACK` | transaction |
+| 9 | `STRUCTURE` | structure |
+| 10 | `SEARCH` | search |
+| 11 | `VALUE` | result |
+| 12 | `RECEIPT` | result |
+| 13 | `ERROR` | failure |
+| 14 | `CANCEL` | flow |
+| 15 | `CLOSE` | session |
+| 16 | `DEALLOCATE` | plan |
+| 17 | `EXPLAIN` | plan |
+| 18 | `SAVEPOINT` | transaction |
+| 19 | `DATA` | flow |
+| 20 | `END` | flow |
+| 21 | `WINDOW_UPDATE` | flow |
+| 22 | `ROW_SCHEMA` | result |
+| 23 | `ROW_BATCH` | result |
+
+Codes 24 through 255 are unassigned in v1 and fail as unknown kinds. Adding a
+kind uses a previously unassigned code; existing assignments never change.
+Registry recognition does not imply that the corresponding session operation
+is implemented.
+
 ## Message families
 
 - session: `HELLO`, `WELCOME`, `PING`, `CLOSE`;
