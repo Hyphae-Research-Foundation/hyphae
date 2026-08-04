@@ -57,6 +57,22 @@ jobs:
           python tools/check_native_dependencies.py \
             --require-clean \
             --output native-dependency-audit.json
+      - name: Audit native golden inventory
+        run: |
+          python -m unittest tools/test_check_native_goldens.py -v
+          python tools/check_native_goldens.py \
+            --inventory config/native-golden-inventory.json \
+            --requirements config/native-golden-requirements.json \
+            --output native-golden-audit.json
+          python -m json.tool native-golden-audit.json >/dev/null
+      - name: Upload native golden evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-golden-audit
+          path: native-golden-audit.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Audit canonical native types
         shell: bash
         run: |
