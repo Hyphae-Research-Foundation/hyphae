@@ -1,0 +1,99 @@
+name: Native G0 Final Readiness
+
+on:
+  workflow_run:
+    workflows: [Security, Native Conformance Aggregate]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  readiness:
+    name: Native G0 final readiness
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact evaluated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Find successful producer runs for the exact commit
+        id: runs
+        uses: actions/github-script@c1a9c1e1f36c44f6f9b7c8fcae7ce5ac1030f939 # v8.0.0
+        with:
+          script: |
+            const sha = context.payload.workflow_run.head_sha;
+            const workflows = ['security.yml', 'native-conformance.yml'];
+            for (const workflow_id of workflows) {
+              const response = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                head_sha: sha,
+                status: 'success',
+                per_page: 20,
+              });
+              const run = response.data.workflow_runs
+                .filter(item => item.head_sha === sha)
+                .sort((a, b) => b.run_number - a.run_number)[0];
+              if (!run) core.setFailed(`missing successful ${workflow_id} run for ${sha}`);
+              core.setOutput(workflow_id === 'security.yml' ? 'security_run' : 'conformance_run', run.id);
+            }
+      - name: Download Security evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.runs.outputs.security_run }}
+          pattern: native-*
+          path: evidence
+          merge-multiple: true
+      - name: Download conformance evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.runs.outputs.conformance_run }}
+          pattern: native-conformance-aggregate
+          path: evidence
+          merge-multiple: true
+      - name: Assemble and evaluate exact G0 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_assemble_native_g0_evidence.py -v
+          python tools/assemble_native_g0_evidence.py \
+            --root evidence \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --output native-g0-final-evidence.json
+          python tools/check_native_g0_readiness.py \
+            --root evidence \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-final-evidence.json \
+            --output native-g0-final-readiness.json
+          python - <<'PY'
+          import json
+          receipt = json.load(open('native-g0-final-readiness.json'))
+          assert receipt == {
+              **receipt,
+              'gate': 'G0',
+              'status': 'passed',
+              'required': 8,
+              'passed': 8,
+          }
+          PY
+      - name: Upload final G0 readiness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g0-final-readiness
+          path: |
+            native-g0-final-evidence.json
+            native-g0-final-readiness.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true

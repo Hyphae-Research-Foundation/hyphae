@@ -141,6 +141,16 @@ class NativeG0ReadinessTests(unittest.TestCase):
         )
         self.assertIn("native-specification-receipt.json", workflow)
 
+    def test_final_workflow_assembles_exact_eight_row_readiness(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g0-final.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("head_sha: sha", workflow)
+        self.assertIn("tools/assemble_native_g0_evidence.py", workflow)
+        self.assertIn("native-g0-final-readiness.json", workflow)
+        self.assertIn("'required': 8", workflow)
+        self.assertIn("'passed': 8", workflow)
+
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
             "schema": "hyphae-native-g0-profile-v1",
