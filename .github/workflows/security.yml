@@ -235,6 +235,27 @@ jobs:
           test "$clean_room_readiness_status" -eq 0 || test "$clean_room_readiness_status" -eq 1
           python -m json.tool native-clean-room-receipt.json >/dev/null
           python -m json.tool native-g0-readiness-with-clean-room.json >/dev/null
+      - name: Audit accepted native specification set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_check_native_specifications.py -v
+          python tools/check_native_specifications.py \
+            --profile config/native-specification-profile.json \
+            --output native-specification-receipt.json
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement architecture-and-versioned-specifications \
+            --inject-level hosted \
+            --inject-reference native-specification-receipt.json \
+            --evidence-output native-g0-evidence-with-specifications.json \
+            --output native-g0-readiness-with-specifications.json
+          specification_readiness_status=$?
+          set -e
+          test "$specification_readiness_status" -eq 0 || test "$specification_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-specifications.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -247,6 +268,17 @@ jobs:
           set -e
           test "$status" -eq 0 || test "$status" -eq 1
           python -m json.tool native-g0-readiness.json >/dev/null
+      - name: Upload accepted specification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-specification-evidence
+          path: |
+            native-specification-receipt.json
+            native-g0-evidence-with-specifications.json
+            native-g0-readiness-with-specifications.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Upload clean-room evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

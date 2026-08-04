@@ -134,6 +134,12 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertIn("human-review-required", workflow)
         self.assertIn("--inject-requirement clean-room-porting-ledger-review", workflow)
         self.assertIn("native-clean-room-receipt.json", workflow)
+        self.assertIn("Audit accepted native specification set", workflow)
+        self.assertIn(
+            "--inject-requirement architecture-and-versioned-specifications",
+            workflow,
+        )
+        self.assertIn("native-specification-receipt.json", workflow)
 
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
