@@ -119,12 +119,28 @@
       "rationale": "MSVC discovery used transitively by the cc build primitive."
     },
     {
+      "name": "itoa",
+      "version": "1.0.18",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "canonical JSON primitive",
+      "rationale": "Integer formatting used transitively by serde_json canonical value validation."
+    },
+    {
       "name": "libc",
       "version": "0.2.186",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "platform primitive",
       "rationale": "Target-conditioned CPU feature support outside Hyphae-owned semantics."
+    },
+    {
+      "name": "memchr",
+      "version": "2.8.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Unlicense OR MIT",
+      "category": "canonical JSON primitive",
+      "rationale": "Byte scanning used transitively by serde_json parsing."
     },
     {
       "name": "proc-macro2",
@@ -157,6 +173,38 @@
       "license": "MIT OR Apache-2.0",
       "category": "build primitive",
       "rationale": "Version parsing used transitively by rustc_version."
+    },
+    {
+      "name": "serde",
+      "version": "1.0.229",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "canonical JSON primitive",
+      "rationale": "Serialization facade selected transitively by serde_json."
+    },
+    {
+      "name": "serde_core",
+      "version": "1.0.229",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "canonical JSON primitive",
+      "rationale": "Core serialization traits used transitively by serde_json."
+    },
+    {
+      "name": "serde_derive",
+      "version": "1.0.229",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Procedural macro implementation selected transitively by serde_core."
+    },
+    {
+      "name": "serde_json",
+      "version": "1.0.151",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "canonical JSON primitive",
+      "rationale": "Strict RFC 8259 parse and deterministic canonical re-encoding validation; no storage or query semantics."
     },
     {
       "name": "shlex",
@@ -197,6 +245,14 @@
       "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
       "category": "derive build primitive",
       "rationale": "Unicode identifier tables used by proc-macro2 and syn."
+    },
+    {
+      "name": "zmij",
+      "version": "1.0.23",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "canonical JSON primitive",
+      "rationale": "Floating-point formatting implementation used transitively by serde_json."
     }
   ]
 }
