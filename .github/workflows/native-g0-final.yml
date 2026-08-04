@@ -61,6 +61,22 @@ jobs:
           pattern: native-conformance-aggregate
           path: evidence
           merge-multiple: true
+      - name: Verify receipt commit identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          expected = os.environ['EXPECTED_SHA']
+          for path in Path('evidence').glob('*.json'):
+              data = json.loads(path.read_text())
+              actual = data.get('source_commit')
+              if actual is not None and actual != expected:
+                  raise SystemExit(f'{path}: source_commit {actual} != {expected}')
+          PY
       - name: Assemble and evaluate exact G0 evidence
         shell: bash
         run: |
