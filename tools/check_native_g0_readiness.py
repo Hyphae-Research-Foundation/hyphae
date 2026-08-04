@@ -144,6 +144,39 @@ def evaluate_readiness(
     }
 
 
+def inject_evidence(
+    baseline: dict[str, Any],
+    requirement_id: str,
+    source_artifact: Path,
+    evidence_level: str,
+    artifact_reference: str,
+) -> dict[str, Any]:
+    """Return a baseline copy with one validated, content-bound passed receipt."""
+
+    if requirement_id not in baseline:
+        raise GateFailure(f"unknown requirement for evidence injection: {requirement_id}")
+    if evidence_level not in EVIDENCE_LEVELS:
+        raise GateFailure(f"invalid injected evidence level: {evidence_level}")
+    if not source_artifact.is_file():
+        raise GateFailure(f"missing evidence artifact: {source_artifact}")
+    try:
+        receipt = json.loads(source_artifact.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateFailure("injected evidence artifact is not valid JSON") from error
+    if not isinstance(receipt, dict) or receipt.get("status") != "passed":
+        raise GateFailure("injected evidence receipt is not passed")
+    if not artifact_reference or Path(artifact_reference).is_absolute():
+        raise GateFailure("injected artifact reference must be a relative path")
+    updated = json.loads(json.dumps(baseline))
+    updated[requirement_id] = {
+        "status": "passed",
+        "evidence_level": evidence_level,
+        "artifact": artifact_reference,
+        "artifact_sha256": hashlib.sha256(source_artifact.read_bytes()).hexdigest(),
+    }
+    return updated
+
+
 def validate_passed_artifacts(root: Path, result: dict[str, Any]) -> None:
     """Require every passed artifact to exist under root and match its binding."""
 
@@ -169,13 +202,34 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--inject-requirement")
+    parser.add_argument("--inject-artifact", type=Path)
+    parser.add_argument("--inject-level", choices=EVIDENCE_LEVELS)
+    parser.add_argument("--inject-reference")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
+        evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
+        injection = (
+            args.inject_requirement,
+            args.inject_artifact,
+            args.inject_level,
+            args.inject_reference,
+        )
+        if any(value is not None for value in injection):
+            if not all(value is not None for value in injection):
+                raise GateFailure("evidence injection requires all injection arguments")
+            evidence = inject_evidence(
+                evidence,
+                args.inject_requirement,
+                args.inject_artifact,
+                args.inject_level,
+                args.inject_reference,
+            )
         result = evaluate_readiness(
             json.loads(args.profile.read_text(encoding="utf-8")),
-            json.loads(args.evidence.read_text(encoding="utf-8")),
+            evidence,
         )
         validate_passed_artifacts(args.root, result)
     except (OSError, json.JSONDecodeError, GateFailure) as error:

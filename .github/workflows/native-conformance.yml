@@ -43,6 +43,34 @@ jobs:
             --receipt conformance-receipts/native-conformance-macos.json \
             --receipt conformance-receipts/native-conformance-windows.json \
             --output native-conformance-aggregate.json
+      - name: Inject aggregate into G0 readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp native-conformance-aggregate.json \
+            artifacts/native-conformance-aggregate.json
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement local-protocol-goldens-and-conformance \
+            --inject-artifact artifacts/native-conformance-aggregate.json \
+            --inject-level hosted \
+            --inject-reference artifacts/native-conformance-aggregate.json \
+            --output native-g0-readiness-with-conformance.json
+          readiness_status=$?
+          set -e
+          test "$readiness_status" -eq 0 || test "$readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-conformance.json >/dev/null
+      - name: Upload G0 readiness with hosted conformance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g0-readiness-with-conformance
+          path: native-g0-readiness-with-conformance.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Upload native conformance aggregate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

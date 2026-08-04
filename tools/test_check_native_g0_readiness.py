@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.check_native_g0_readiness import (
     GateFailure,
     evaluate_readiness,
+    inject_evidence,
     validate_passed_artifacts,
 )
 
@@ -191,6 +192,50 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["requirements"][0]["artifact_sha256"], "a" * 64)
 
+    def test_injected_evidence_is_content_bound_without_mutating_baseline(self) -> None:
+        import hashlib
+        import tempfile
+
+        baseline = {
+            "conformance": {
+                "status": "not-configured",
+                "evidence_level": "contract",
+                "artifact": "docs/native/local-protocol-v1.md",
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "native-conformance-aggregate.json"
+            artifact.write_text('{"status":"passed"}\n', encoding="utf-8")
+            updated = inject_evidence(
+                baseline,
+                "conformance",
+                artifact,
+                "hosted",
+                "artifacts/native-conformance-aggregate.json",
+            )
+
+        self.assertEqual(baseline["conformance"]["status"], "not-configured")
+        self.assertEqual(updated["conformance"]["status"], "passed")
+        self.assertEqual(updated["conformance"]["evidence_level"], "hosted")
+        self.assertEqual(
+            updated["conformance"]["artifact_sha256"],
+            hashlib.sha256(b'{"status":"passed"}\n').hexdigest(),
+        )
+
+    def test_injection_rejects_unknown_requirement_missing_artifact_and_bad_receipt(self) -> None:
+        import tempfile
+
+        baseline = {"known": {"status": "not-configured"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aggregate.json"
+            with self.assertRaisesRegex(GateFailure, "unknown requirement"):
+                inject_evidence(baseline, "unknown", path, "hosted", "artifact.json")
+            with self.assertRaisesRegex(GateFailure, "missing evidence artifact"):
+                inject_evidence(baseline, "known", path, "hosted", "artifact.json")
+            path.write_text('{"status":"failed"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(GateFailure, "receipt is not passed"):
+                inject_evidence(baseline, "known", path, "hosted", "artifact.json")
+
     def test_profile_and_evidence_drift_fail_closed(self) -> None:
         with self.assertRaisesRegex(GateFailure, "duplicate requirement"):
             evaluate_readiness(
@@ -258,6 +303,17 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertIn("Assess native G0 readiness", security_workflow)
         self.assertIn("tools/test_check_native_g0_readiness.py", security_workflow)
         self.assertIn("config/native-g0-readiness-profile.json", security_workflow)
+
+        aggregate_workflow = (
+            ROOT / ".github/workflows/native-conformance.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Inject aggregate into G0 readiness", aggregate_workflow)
+        self.assertIn(
+            "--inject-requirement local-protocol-goldens-and-conformance",
+            aggregate_workflow,
+        )
+        self.assertIn("--inject-level hosted", aggregate_workflow)
+        self.assertIn("native-g0-readiness-with-conformance.json", aggregate_workflow)
 
 
 if __name__ == "__main__":
