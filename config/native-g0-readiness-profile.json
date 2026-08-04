@@ -1,0 +1,38 @@
+{
+  "schema": "hyphae-native-g0-profile-v1",
+  "gate": "G0",
+  "requirements": [
+    {
+      "id": "architecture-and-versioned-specifications",
+      "required_evidence_level": "hosted"
+    },
+    {
+      "id": "canonical-type-goldens-and-properties",
+      "required_evidence_level": "hosted"
+    },
+    {
+      "id": "page-row-blob-wal-mvcc-goldens",
+      "required_evidence_level": "hosted"
+    },
+    {
+      "id": "sql-structure-search-ann-contracts",
+      "required_evidence_level": "hosted"
+    },
+    {
+      "id": "local-protocol-goldens-and-conformance",
+      "required_evidence_level": "hosted"
+    },
+    {
+      "id": "benchmark-and-quality-corpus",
+      "required_evidence_level": "production"
+    },
+    {
+      "id": "native-dependency-license-unsafe-audit",
+      "required_evidence_level": "external-governance"
+    },
+    {
+      "id": "clean-room-porting-ledger-review",
+      "required_evidence_level": "external-governance"
+    }
+  ]
+}
