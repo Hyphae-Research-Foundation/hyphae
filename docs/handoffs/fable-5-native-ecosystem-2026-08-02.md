@@ -1,6 +1,14 @@
 # Fable 5 native-ecosystem handoff
 
-Status: active engineering handoff; PR 47 remains draft
+> **Historical record — superseded.** This handoff captures repository and PR
+> state from 2026-08-02 and must not be used as the current execution plan.
+> PR 47 and its follow-on native slices were subsequently merged. Current work
+> is governed by [`native-local-phase-1.md`](../gates/native-local-phase-1.md),
+> [`roadmap.md`](../roadmap.md), and the live `dev` branch. Historical source
+> identities and negative results below remain immutable evidence for their
+> bound commits.
+
+Status: superseded historical engineering handoff; retained for provenance
 
 Prepared: 2026-08-02 11:25:54 -05:00
 
@@ -8,8 +16,13 @@ Audience: Fable 5 and the next Hyphae maintainer
 
 ## Read this first
 
-The immediate work is not a general migration or product cutover. It is the
-ordered secondary-index range milestone in draft
+This section is the original 2026-08-02 instruction and is preserved only to
+explain the bound evidence. It is no longer actionable: PR 47 was merged and
+its missing-at-the-time receipt was later captured. Use the current phase gate
+and live pull requests for execution.
+
+The immediate work at the time was not a general migration or product cutover.
+It was the ordered secondary-index range milestone in draft
 [PR 47](https://github.com/celiumsai/hyphae/pull/47). Its implementation and
 hosted CI are green, but its schema-v15 latency receipt and evidence closure do
 not exist. Do not mark the PR ready, merge it, or claim a gate closed until
