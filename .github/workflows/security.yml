@@ -183,6 +183,23 @@ jobs:
           test "$contracts_readiness_status" -eq 0 || test "$contracts_readiness_status" -eq 1
           python -m json.tool native-g0-readiness-with-types.json >/dev/null
           python -m json.tool native-g0-readiness-with-contracts.json >/dev/null
+      - name: Inject hosted dependency evidence into G0
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement native-dependency-license-unsafe-audit \
+            --inject-level external-governance \
+            --inject-reference native-dependency-audit.json \
+            --evidence-output native-g0-evidence-with-dependencies.json \
+            --output native-g0-readiness-with-dependencies.json
+          dependency_readiness_status=$?
+          set -e
+          test "$dependency_readiness_status" -eq 0 || test "$dependency_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-dependencies.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -221,7 +238,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-dependency-audit
-          path: native-dependency-audit.json
+          path: |
+            native-dependency-audit.json
+            native-g0-evidence-with-dependencies.json
+            native-g0-readiness-with-dependencies.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true

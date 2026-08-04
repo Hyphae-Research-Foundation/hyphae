@@ -125,6 +125,11 @@ class NativeG0ReadinessTests(unittest.TestCase):
             conformance_workflow,
         )
         self.assertIn("native-g0-evidence-with-conformance.json", conformance_workflow)
+        self.assertIn(
+            "--inject-requirement native-dependency-license-unsafe-audit",
+            workflow,
+        )
+        self.assertIn("native-g0-evidence-with-dependencies.json", workflow)
 
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
