@@ -35,7 +35,7 @@ def validate_receipt_commit_identity(root: Path, expected_commit: str) -> None:
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise GateFailure(f"receipt must be valid JSON: {artifact}") from error
         actual = payload.get("source_commit")
-        if actual is not None and actual != expected_commit:
+        if not isinstance(actual, str) or actual != expected_commit:
             raise GateFailure(
                 f"receipt source commit mismatch for {artifact}: {actual} != {expected_commit}"
             )

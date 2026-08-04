@@ -166,10 +166,13 @@ def validate_quality_receipt_set(
 
     lexical = validate_lexical_receipt(lexical_receipt)
     ann = validate_ann_receipt(ann_receipt)
+    if lexical_receipt["source_commit"] != ann_receipt["source_commit"]:
+        raise GateFailure("quality receipts must bind the same source commit")
     production_scale = lexical["production_scale"] and ann["production_scale"]
     return {
         "schema": "hyphae-native-quality-aggregate-v1",
         "status": "passed",
+        "source_commit": lexical_receipt["source_commit"],
         "evidence_scope": "production" if production_scale else "bounded-observation",
         "production_scale": production_scale,
         "engines": ["ann", "lexical"],

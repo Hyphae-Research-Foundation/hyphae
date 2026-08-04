@@ -231,8 +231,10 @@ class NativeQualityCorpusTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        ann["source_commit"] = lexical["source_commit"]
         result = validate_quality_receipt_set(lexical, ann)
         self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["source_commit"], lexical["source_commit"])
         self.assertEqual(result["evidence_scope"], "bounded-observation")
         self.assertEqual(result["engines"], ["ann", "lexical"])
         self.assertFalse(result["production_scale"])
@@ -255,9 +257,19 @@ class NativeQualityCorpusTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        ann["source_commit"] = lexical["source_commit"]
         result = validate_quality_receipt_set(lexical, ann)
         self.assertFalse(result["production_scale"])
         self.assertEqual(result["evidence_scope"], "bounded-observation")
+    def test_quality_receipt_set_rejects_mixed_commits(self) -> None:
+        lexical = json.loads(
+            (ROOT / "docs/gates/evidence/native-lexical-quality-macos.json").read_text()
+        )
+        ann = json.loads(
+            (ROOT / "docs/gates/evidence/native-ann-kernel-wsl2.json").read_text()
+        )
+        with self.assertRaisesRegex(GateFailure, "same source commit"):
+            validate_quality_receipt_set(lexical, ann)
 
 
 if __name__ == "__main__":

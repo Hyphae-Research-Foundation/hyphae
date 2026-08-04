@@ -22,7 +22,14 @@ class NativeG0EvidenceAssemblyTests(unittest.TestCase):
         for requirement, _, artifact in INJECTIONS:
             status = clean_room if requirement == "clean-room-porting-ledger-review" else "passed"
             (root / artifact).write_text(
-                json.dumps({"schema": f"test-{requirement}", "status": status}) + "\n",
+                json.dumps(
+                    {
+                        "schema": f"test-{requirement}",
+                        "status": status,
+                        "source_commit": "a" * 40,
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
 
@@ -56,6 +63,10 @@ class NativeG0EvidenceAssemblyTests(unittest.TestCase):
             receipt = root / INJECTIONS[0][2]
             payload = json.loads(receipt.read_text())
             payload["source_commit"] = "b" * 40
+            receipt.write_text(json.dumps(payload) + "\n")
+            with self.assertRaisesRegex(GateFailure, "source commit mismatch"):
+                validate_receipt_commit_identity(root, "a" * 40)
+            payload.pop("source_commit")
             receipt.write_text(json.dumps(payload) + "\n")
             with self.assertRaisesRegex(GateFailure, "source commit mismatch"):
                 validate_receipt_commit_identity(root, "a" * 40)

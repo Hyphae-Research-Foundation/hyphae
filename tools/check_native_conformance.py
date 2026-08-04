@@ -98,6 +98,7 @@ def validate_receipt_set(
             raise GateFailure("profile surface has no required platforms")
         required_platforms.update(platforms)
     seen: set[str] = set()
+    source_commits: set[str] = set()
     passed_platforms = 0
     passed_surfaces = 0
     summaries: list[dict[str, Any]] = []
@@ -109,6 +110,7 @@ def validate_receipt_set(
             raise GateFailure(f"duplicate platform receipt: {platform}")
         seen.add(platform)
         validate_receipt(profile, receipt)
+        source_commits.add(receipt["source_commit"])
         passed_platforms += receipt["status"] == "passed"
         passed_surfaces += receipt["passed_count"]
         summaries.append(
@@ -125,9 +127,13 @@ def validate_receipt_set(
     extra = seen - required_platforms
     if extra:
         raise GateFailure("unexpected platform receipt: " + ", ".join(sorted(extra)))
+    if len(source_commits) != 1:
+        raise GateFailure("platform receipts must bind one source commit")
+    source_commit = next(iter(source_commits))
     return {
         "schema": "hyphae-native-conformance-aggregate-v1",
         "status": "passed" if passed_platforms == len(required_platforms) else "failed",
+        "source_commit": source_commit,
         "platform_count": len(required_platforms),
         "passed_platforms": passed_platforms,
         "passed_surfaces": passed_surfaces,
@@ -140,6 +146,7 @@ def validate_receipt(profile: dict[str, Any], receipt: dict[str, Any]) -> None:
 
     receipt_fields = {
         "schema",
+        "source_commit",
         "platform",
         "status",
         "required_count",
@@ -150,6 +157,11 @@ def validate_receipt(profile: dict[str, Any], receipt: dict[str, Any]) -> None:
         raise GateFailure("unknown receipt field or missing required field")
     if receipt.get("schema") != "hyphae-native-conformance-receipt-v1":
         raise GateFailure("unsupported conformance receipt")
+    source_commit = receipt.get("source_commit")
+    if not isinstance(source_commit, str) or len(source_commit) != 40 or any(
+        character not in "0123456789abcdef" for character in source_commit
+    ):
+        raise GateFailure("receipt source commit is invalid")
     platform = receipt.get("platform")
     if platform not in PLATFORMS:
         raise GateFailure("unknown receipt platform")
@@ -203,7 +215,10 @@ def validate_receipt(profile: dict[str, Any], receipt: dict[str, Any]) -> None:
 
 
 def run_profile(
-    profile: dict[str, Any], platform: str, execute: Callable[[list[str]], int]
+    profile: dict[str, Any],
+    platform: str,
+    execute: Callable[[list[str]], int],
+    source_commit: str = "0" * 40,
 ) -> dict[str, Any]:
     """Run the reviewed commands required by one platform."""
 
@@ -240,6 +255,7 @@ def run_profile(
         raise GateFailure(f"validated profile has no surfaces for {platform}")
     return {
         "schema": "hyphae-native-conformance-receipt-v1",
+        "source_commit": source_commit,
         "platform": platform,
         "status": "passed" if all(row["status"] == "passed" for row in results) else "failed",
         "required_count": len(results),
@@ -252,6 +268,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--platform", choices=sorted(PLATFORMS))
+    parser.add_argument("--source-commit")
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--receipt", type=Path, action="append", default=[])
     parser.add_argument("--aggregate", action="store_true")
@@ -269,12 +286,13 @@ def main() -> int:
                 [json.loads(path.read_text(encoding="utf-8")) for path in args.receipt],
             )
         elif args.run:
-            if args.platform is None:
-                raise GateFailure("--run requires --platform")
+            if args.platform is None or args.source_commit is None:
+                raise GateFailure("--run requires --platform and --source-commit")
             result = run_profile(
                 profile,
                 args.platform,
                 lambda command: subprocess.run(command, check=False).returncode,
+                args.source_commit,
             )
         else:
             result = profile

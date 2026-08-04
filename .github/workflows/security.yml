@@ -69,9 +69,13 @@ jobs:
           cargo run -p hyphae-native-runtime \
             --example lexical_quality_receipt --locked -- \
             "$(git rev-parse HEAD)" > native-lexical-quality.json
+          cargo run -p hyphae-native-ann \
+            --example quality_smoke --locked -- \
+            "$(git rev-parse HEAD)" "github-actions-ubuntu" \
+            > native-ann-quality.json
           python tools/check_native_quality_corpus.py \
             --lexical-receipt native-lexical-quality.json \
-            --ann-receipt docs/gates/evidence/native-ann-kernel-wsl2.json \
+            --ann-receipt native-ann-quality.json \
             --output native-quality-aggregate.json
           python -m json.tool native-quality-aggregate.json >/dev/null
           set +e
@@ -107,6 +111,7 @@ jobs:
           path: |
             native-golden-audit.json
             native-lexical-quality.json
+            native-ann-quality.json
             native-quality-aggregate.json
             native-g0-evidence-with-goldens.json
             native-g0-readiness-with-goldens.json

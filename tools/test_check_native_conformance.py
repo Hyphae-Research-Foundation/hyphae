@@ -151,6 +151,7 @@ class NativeConformanceProfileTests(unittest.TestCase):
         }
         receipt = {
             "schema": "hyphae-native-conformance-receipt-v1",
+            "source_commit": "a" * 40,
             "platform": "linux",
             "status": "passed",
             "required_count": 2,
@@ -179,6 +180,7 @@ class NativeConformanceProfileTests(unittest.TestCase):
         }
         receipt = {
             "schema": "hyphae-native-conformance-receipt-v1",
+            "source_commit": "a" * 40,
             "platform": "linux",
             "status": "passed",
             "required_count": 1,
@@ -212,6 +214,7 @@ class NativeConformanceProfileTests(unittest.TestCase):
         def receipt(platform: str, ids: list[str]) -> dict[str, object]:
             return {
                 "schema": "hyphae-native-conformance-receipt-v1",
+            "source_commit": "a" * 40,
                 "platform": platform,
                 "status": "passed",
                 "required_count": len(ids),
@@ -245,6 +248,7 @@ class NativeConformanceProfileTests(unittest.TestCase):
         }
         green = {
             "schema": "hyphae-native-conformance-receipt-v1",
+            "source_commit": "a" * 40,
             "platform": "linux",
             "status": "passed",
             "required_count": 1,
@@ -253,6 +257,7 @@ class NativeConformanceProfileTests(unittest.TestCase):
         }
         red = {
             "schema": "hyphae-native-conformance-receipt-v1",
+            "source_commit": "a" * 40,
             "platform": "macos",
             "status": "failed",
             "required_count": 1,

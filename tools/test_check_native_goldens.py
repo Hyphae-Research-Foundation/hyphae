@@ -24,6 +24,7 @@ class NativeGoldenInventoryTests(unittest.TestCase):
         result = validate_inventory(ROOT, inventory)
 
         self.assertEqual(result["status"], "passed")
+        self.assertRegex(result["source_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(result["fixture_count"], 10)
         self.assertEqual(result["fixture_count"], len(result["fixtures"]))
 

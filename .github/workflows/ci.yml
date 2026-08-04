@@ -96,6 +96,7 @@ jobs:
           python tools/check_native_conformance.py \
             --profile config/native-conformance-profile.json \
             --platform "${{ matrix.native-platform }}" \
+            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
             --run \
             --output "native-conformance-${{ matrix.native-platform }}.json"
       - name: Upload native conformance receipt

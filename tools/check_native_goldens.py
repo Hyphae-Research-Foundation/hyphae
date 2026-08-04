@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,12 @@ def validate_completeness(
     }
 
 
+def _git_commit(root: Path) -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+
+
 def validate_inventory(root: Path, inventory: dict[str, Any]) -> dict[str, Any]:
     """Return a content-bound ordered inventory or fail on any drift."""
 
@@ -123,6 +130,7 @@ def validate_inventory(root: Path, inventory: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": "hyphae-native-golden-audit-v1",
         "status": "passed",
+        "source_commit": _git_commit(root),
         "fixture_count": len(rows),
         "fixtures": rows,
     }
