@@ -109,8 +109,11 @@ byte comparison:
 The text/binary terminator makes both prefixes and embedded zero bytes
 unambiguous. Decoders reject missing terminators, bytes after a terminator,
 invalid escapes, noncanonical float bits, wrong fixed widths, and
-out-of-domain values. Ordered codecs for `JSON`, `ARRAY`, `MAP`, and `VECTOR`
-remain undefined and fail explicitly.
+out-of-domain values. Ordered arrays encode each complete element component
+through the same zero-byte escaping used by text and binary, concatenate those
+self-delimiting components, and end with `00 00`. This preserves lexicographic
+array order, including SQL null elements and prefix arrays. Ordered codecs for
+`JSON`, `MAP`, and `VECTOR` remain undefined and fail explicitly.
 
 ## Directory lineage identity
 
@@ -249,4 +252,5 @@ consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
 consume this exact corpus. Nested arrays, maps, and vectors have canonical
-storage coverage; canonical JSON and nested ordered codecs remain required.
+storage coverage, and arrays have canonical ordered coverage. Canonical JSON
+and ordered map/vector codecs remain required.

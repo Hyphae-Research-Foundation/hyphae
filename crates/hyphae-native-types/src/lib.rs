@@ -1118,13 +1118,12 @@ impl ScalarValue {
                 encoded
             }
             (Self::Uuid(value), LogicalType::Uuid) => value.to_vec(),
-            (
-                _,
-                LogicalType::Json
-                | LogicalType::Array(_)
-                | LogicalType::Map(_, _)
-                | LogicalType::Vector(_),
-            ) => return Err(NativeTypeError::UnsupportedOrderedType),
+            (Self::Array(values), LogicalType::Array(element_type)) => {
+                encode_array_ordered(values, element_type)?
+            }
+            (_, LogicalType::Json | LogicalType::Map(_, _) | LogicalType::Vector(_)) => {
+                return Err(NativeTypeError::UnsupportedOrderedType);
+            }
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
         let output_length = payload
@@ -1234,12 +1233,78 @@ impl ScalarValue {
                 })
             }
             LogicalType::Uuid => Ok(Self::Uuid(exact_scalar_bytes(payload)?)),
-            LogicalType::Json
-            | LogicalType::Array(_)
-            | LogicalType::Map(_, _)
-            | LogicalType::Vector(_) => Err(NativeTypeError::UnsupportedOrderedType),
+            LogicalType::Array(element_type) => {
+                decode_array_ordered(payload, element_type).map(Self::Array)
+            }
+            LogicalType::Json | LogicalType::Map(_, _) | LogicalType::Vector(_) => {
+                Err(NativeTypeError::UnsupportedOrderedType)
+            }
         }
     }
+}
+
+fn encode_array_ordered(
+    values: &[ScalarValue],
+    element_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let mut encoded = Vec::new();
+    for value in values {
+        let component = value.encode_ordered_component(element_type)?;
+        encoded.extend_from_slice(&encode_memcomparable_bytes(&component)?);
+    }
+    encoded.extend_from_slice(&[0, 0]);
+    ensure_scalar_length(encoded.len())?;
+    Ok(encoded)
+}
+
+fn decode_array_ordered(
+    encoded: &[u8],
+    element_type: &LogicalType,
+) -> Result<Vec<ScalarValue>, NativeTypeError> {
+    let mut offset = 0_usize;
+    let mut values = Vec::new();
+    loop {
+        let remaining = encoded
+            .get(offset..)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        if remaining == [0, 0] {
+            return Ok(values);
+        }
+        if remaining.starts_with(&[0, 0]) {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        if values.len() >= 100_000 {
+            return Err(NativeTypeError::ScalarLengthExceeded);
+        }
+        let end = memcomparable_component_end(remaining)?;
+        let component = decode_memcomparable_bytes(&remaining[..end])?;
+        values.push(ScalarValue::decode_ordered_component(
+            element_type,
+            &component,
+        )?);
+        offset = offset
+            .checked_add(end)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    }
+}
+
+fn memcomparable_component_end(encoded: &[u8]) -> Result<usize, NativeTypeError> {
+    let mut offset = 0_usize;
+    while offset < encoded.len() {
+        if encoded[offset] != 0 {
+            offset += 1;
+            continue;
+        }
+        let escape = *encoded
+            .get(offset + 1)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        match escape {
+            0 => return Ok(offset + 2),
+            0xff => offset += 2,
+            _ => return Err(NativeTypeError::InvalidScalarEncoding),
+        }
+    }
+    Err(NativeTypeError::InvalidScalarEncoding)
 }
 
 fn encode_vector_storage(
@@ -2178,6 +2243,65 @@ mod tests {
             ScalarValue::Array(vec![ScalarValue::Text("bad".to_owned())])
                 .encode_storage(&logical_type),
             Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn array_ordered_codec_round_trips_and_preserves_lexicographic_order()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Signed(IntegerWidth::Bits16)));
+        let values = [
+            ScalarValue::Array(vec![]),
+            ScalarValue::Array(vec![ScalarValue::Null]),
+            ScalarValue::Array(vec![ScalarValue::Signed(-1)]),
+            ScalarValue::Array(vec![ScalarValue::Signed(-1), ScalarValue::Null]),
+            ScalarValue::Array(vec![ScalarValue::Signed(0)]),
+        ];
+        let mut previous: Option<Vec<u8>> = None;
+        for value in values {
+            let encoded = value.encode_ordered_component(&logical_type)?;
+            assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded)?,
+                value
+            );
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn array_ordered_codec_rejects_truncation_invalid_escape_and_trailing_bytes()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Text));
+        let value = ScalarValue::Array(vec![
+            ScalarValue::Text("a\0b".to_owned()),
+            ScalarValue::Null,
+        ]);
+        let encoded = value.encode_ordered_component(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded[..length]).is_err()
+            );
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut invalid = encoded;
+        let escape = invalid
+            .windows(2)
+            .position(|window| window == [0, 0xff])
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        invalid[escape + 1] = 0x7f;
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &invalid),
+            Err(NativeTypeError::InvalidScalarEncoding)
         );
         Ok(())
     }
