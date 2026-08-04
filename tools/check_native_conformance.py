@@ -82,6 +82,59 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_receipt_set(
+    profile: dict[str, Any], receipts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Validate one exact receipt for every platform required by the profile."""
+
+    surfaces = profile.get("surfaces")
+    if not isinstance(surfaces, list):
+        raise GateFailure("validated profile has no surfaces")
+    required_platforms: set[str] = set()
+    for value in surfaces:
+        surface = _mapping(value, "surface")
+        platforms = surface.get("required_platforms")
+        if not isinstance(platforms, list):
+            raise GateFailure("profile surface has no required platforms")
+        required_platforms.update(platforms)
+    seen: set[str] = set()
+    passed_platforms = 0
+    passed_surfaces = 0
+    summaries: list[dict[str, Any]] = []
+    for receipt in receipts:
+        platform = receipt.get("platform")
+        if not isinstance(platform, str):
+            raise GateFailure("receipt platform must be a string")
+        if platform in seen:
+            raise GateFailure(f"duplicate platform receipt: {platform}")
+        seen.add(platform)
+        validate_receipt(profile, receipt)
+        passed_platforms += receipt["status"] == "passed"
+        passed_surfaces += receipt["passed_count"]
+        summaries.append(
+            {
+                "platform": platform,
+                "status": receipt["status"],
+                "passed_count": receipt["passed_count"],
+                "required_count": receipt["required_count"],
+            }
+        )
+    missing = required_platforms - seen
+    if missing:
+        raise GateFailure("missing platform receipt: " + ", ".join(sorted(missing)))
+    extra = seen - required_platforms
+    if extra:
+        raise GateFailure("unexpected platform receipt: " + ", ".join(sorted(extra)))
+    return {
+        "schema": "hyphae-native-conformance-aggregate-v1",
+        "status": "passed" if passed_platforms == len(required_platforms) else "failed",
+        "platform_count": len(required_platforms),
+        "passed_platforms": passed_platforms,
+        "passed_surfaces": passed_surfaces,
+        "platforms": sorted(summaries, key=lambda row: row["platform"]),
+    }
+
+
 def validate_receipt(profile: dict[str, Any], receipt: dict[str, Any]) -> None:
     """Validate exact platform coverage and receipt arithmetic."""
 
