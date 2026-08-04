@@ -882,6 +882,8 @@ pub enum ScalarValue {
     },
     /// UUID bits in network byte order.
     Uuid([u8; 16]),
+    /// Ordered homogeneous nested values.
+    Array(Vec<Self>),
 }
 
 impl ScalarValue {
@@ -900,7 +902,10 @@ impl ScalarValue {
         if matches!(self, Self::Null) {
             return Err(NativeTypeError::NullRequiresRowBitmap);
         }
-        if scalar_type_is_unsupported(logical_type) {
+        if matches!(
+            logical_type,
+            LogicalType::Json | LogicalType::Map(_, _) | LogicalType::Vector(_)
+        ) {
             return Err(NativeTypeError::UnsupportedScalarType);
         }
         let encoded = match (self, logical_type) {
@@ -946,6 +951,9 @@ impl ScalarValue {
                 encoded
             }
             (Self::Uuid(value), LogicalType::Uuid) => value.to_vec(),
+            (Self::Array(values), LogicalType::Array(element_type)) => {
+                encode_array_storage(values, element_type)?
+            }
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
         ensure_scalar_length(encoded.len())?;
@@ -1026,10 +1034,12 @@ impl ScalarValue {
                 })
             }
             LogicalType::Uuid => Ok(Self::Uuid(exact_scalar_bytes(encoded)?)),
-            LogicalType::Json
-            | LogicalType::Array(_)
-            | LogicalType::Map(_, _)
-            | LogicalType::Vector(_) => Err(NativeTypeError::UnsupportedScalarType),
+            LogicalType::Array(element_type) => {
+                decode_array_storage(encoded, element_type).map(Self::Array)
+            }
+            LogicalType::Json | LogicalType::Map(_, _) | LogicalType::Vector(_) => {
+                Err(NativeTypeError::UnsupportedScalarType)
+            }
         }
     }
 
@@ -1221,11 +1231,77 @@ impl ScalarValue {
     }
 }
 
-fn scalar_type_is_unsupported(logical_type: &LogicalType) -> bool {
-    matches!(
-        logical_type,
-        LogicalType::Json | LogicalType::Array(_) | LogicalType::Map(_, _) | LogicalType::Vector(_)
-    )
+fn encode_array_storage(
+    values: &[ScalarValue],
+    element_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let count = u32::try_from(values.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        if matches!(value, ScalarValue::Null) {
+            encoded.push(0);
+            continue;
+        }
+        let payload = value.encode_storage(element_type)?;
+        let length =
+            u32::try_from(payload.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+        encoded.push(1);
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(&payload);
+        ensure_scalar_length(encoded.len())?;
+    }
+    Ok(encoded)
+}
+
+fn decode_array_storage(
+    encoded: &[u8],
+    element_type: &LogicalType,
+) -> Result<Vec<ScalarValue>, NativeTypeError> {
+    let count_bytes = encoded
+        .get(..4)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    let count = usize::try_from(u32::from_le_bytes(exact_scalar_bytes(count_bytes)?))
+        .map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    if count > 100_000 {
+        return Err(NativeTypeError::ScalarLengthExceeded);
+    }
+    let mut offset = 4_usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let marker = *encoded
+            .get(offset)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        offset += 1;
+        match marker {
+            0 => values.push(ScalarValue::Null),
+            1 => {
+                let length_end = offset
+                    .checked_add(4)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let length = usize::try_from(u32::from_le_bytes(exact_scalar_bytes(
+                    encoded
+                        .get(offset..length_end)
+                        .ok_or(NativeTypeError::InvalidScalarEncoding)?,
+                )?))
+                .map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+                offset = length_end;
+                let end = offset
+                    .checked_add(length)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let payload = encoded
+                    .get(offset..end)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                values.push(ScalarValue::decode_storage(element_type, payload)?);
+                offset = end;
+            }
+            _ => return Err(NativeTypeError::InvalidScalarEncoding),
+        }
+    }
+    if offset != encoded.len() {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    Ok(values)
 }
 
 fn ensure_scalar_length(length: usize) -> Result<(), NativeTypeError> {
@@ -1898,6 +1974,52 @@ mod tests {
         assert_eq!(fixtures[6].ordered, [1, b'A', 0, 0xff, b'B', 0, 0]);
         assert_eq!(fixtures[12].storage, [0x11; 16]);
         assert_eq!(fixtures[12].ordered, [vec![1], vec![0x11; 16]].concat());
+        Ok(())
+    }
+
+    #[test]
+    fn array_storage_codec_round_trips_nested_null_and_empty_values() -> Result<(), NativeTypeError>
+    {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Array(Box::new(
+            LogicalType::Signed(IntegerWidth::Bits16),
+        ))));
+        let value = ScalarValue::Array(vec![
+            ScalarValue::Array(vec![ScalarValue::Signed(-2), ScalarValue::Null]),
+            ScalarValue::Array(Vec::new()),
+        ]);
+
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        assert_eq!(
+            encoded,
+            [
+                2, 0, 0, 0, 1, 12, 0, 0, 0, 2, 0, 0, 0, 1, 2, 0, 0, 0, 0xfe, 0xff, 0, 1, 4, 0, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn array_storage_codec_rejects_truncation_trailing_and_type_mismatch()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)));
+        let value = ScalarValue::Array(vec![ScalarValue::Unsigned(7)]);
+        let encoded = value.encode_storage(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(ScalarValue::decode_storage(&logical_type, &encoded[..length]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        assert_eq!(
+            ScalarValue::Array(vec![ScalarValue::Text("bad".to_owned())])
+                .encode_storage(&logical_type),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
         Ok(())
     }
 
