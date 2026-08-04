@@ -137,6 +137,18 @@ class NativeQualityCorpusTests(unittest.TestCase):
         receipt["exact_latency_micros"]["p50"] = receipt["exact_latency_micros"]["p95"] + 1
         with self.assertRaisesRegex(GateFailure, "percentile order"):
             validate_ann_receipt(receipt)
+    def test_checked_in_lexical_receipt_is_source_bound_and_valid(self) -> None:
+        receipt = json.loads(
+            (
+                ROOT / "docs/gates/evidence/native-lexical-quality-macos.json"
+            ).read_text(encoding="utf-8")
+        )
+        result = validate_lexical_receipt(receipt)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["document_count"], 512)
+        self.assertEqual(result["query_count"], 4)
+        self.assertFalse(result["production_scale"])
+
     def test_lexical_receipt_requires_exact_order_and_reopen_equivalence(self) -> None:
         receipt = {
             "schema": "hyphae-native-lexical-quality-v1",
