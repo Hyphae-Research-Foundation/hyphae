@@ -115,8 +115,10 @@ self-delimiting components, and end with `00 00`. This preserves lexicographic
 array order, including SQL null elements and prefix arrays. Ordered maps use
 the same framing over alternating key/value ordered components and require
 strictly increasing non-null keys. This preserves lexicographic entry order and
-nullable values. Ordered codecs for `JSON` and `VECTOR` remain undefined and
-fail explicitly.
+nullable values. Ordered vectors concatenate fixed-width sortable float32
+components in declared dimension order, giving lexicographic vector total order
+with canonical NaN/zero handling. Only ordered `JSON` remains undefined and
+fails explicitly.
 
 ## Directory lineage identity
 
@@ -255,5 +257,5 @@ consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
 consume this exact corpus. Nested arrays, maps, and vectors have canonical
-storage coverage, and arrays/maps have canonical ordered coverage. Canonical
-JSON and the ordered vector codec remain required.
+storage coverage, and arrays/maps/vectors have canonical ordered coverage. Only
+canonical JSON remains required for the declared v1 value families.

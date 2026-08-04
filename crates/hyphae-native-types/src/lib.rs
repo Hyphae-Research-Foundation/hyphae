@@ -1124,7 +1124,10 @@ impl ScalarValue {
             (Self::Map(entries), LogicalType::Map(key_type, value_type)) => {
                 encode_map_ordered(entries, key_type, value_type)?
             }
-            (_, LogicalType::Json | LogicalType::Vector(_)) => {
+            (Self::Vector(values), LogicalType::Vector(vector_type)) => {
+                encode_vector_ordered(values, *vector_type)?
+            }
+            (_, LogicalType::Json) => {
                 return Err(NativeTypeError::UnsupportedOrderedType);
             }
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
@@ -1242,11 +1245,46 @@ impl ScalarValue {
             LogicalType::Map(key_type, value_type) => {
                 decode_map_ordered(payload, key_type, value_type).map(Self::Map)
             }
-            LogicalType::Json | LogicalType::Vector(_) => {
-                Err(NativeTypeError::UnsupportedOrderedType)
+            LogicalType::Vector(vector_type) => {
+                decode_vector_ordered(payload, *vector_type).map(Self::Vector)
             }
+            LogicalType::Json => Err(NativeTypeError::UnsupportedOrderedType),
         }
     }
+}
+
+fn encode_vector_ordered(
+    values: &[CanonicalF32],
+    vector_type: VectorType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || values.len() != usize::from(vector_type.dimension())
+    {
+        return Err(NativeTypeError::ScalarOutOfRange);
+    }
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        encoded.extend_from_slice(&sortable_f32_bits(value.bits()).to_be_bytes());
+    }
+    Ok(encoded)
+}
+
+fn decode_vector_ordered(
+    encoded: &[u8],
+    vector_type: VectorType,
+) -> Result<Vec<CanonicalF32>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || encoded.len() != usize::from(vector_type.dimension()).saturating_mul(4)
+    {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    encoded
+        .chunks_exact(4)
+        .map(|bytes| {
+            let sortable = u32::from_be_bytes(exact_scalar_bytes(bytes)?);
+            decode_canonical_f32(unsortable_f32_bits(sortable))
+        })
+        .collect()
 }
 
 fn encode_map_ordered(
@@ -1940,6 +1978,7 @@ mod tests {
         CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, DirectoryUuid, HistoryEpoch,
         IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
         ScalarValue, VectorElement, VectorType, primitive_scalar_golden_fixtures,
+        sortable_f32_bits,
     };
     use proptest::prelude::*;
 
@@ -2585,6 +2624,69 @@ mod tests {
         noncanonical_nan.extend_from_slice(&1.0_f32.to_bits().to_le_bytes());
         assert_eq!(
             ScalarValue::decode_storage(&logical_type, &noncanonical_nan),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_ordered_codec_round_trips_and_preserves_lexicographic_total_order()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        let values = [
+            ScalarValue::Vector(vec![
+                CanonicalF32::new(f32::NEG_INFINITY),
+                CanonicalF32::new(0.0),
+            ]),
+            ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(2.0)]),
+            ScalarValue::Vector(vec![CanonicalF32::new(0.0), CanonicalF32::new(-1.0)]),
+            ScalarValue::Vector(vec![CanonicalF32::new(0.0), CanonicalF32::new(1.0)]),
+            ScalarValue::Vector(vec![
+                CanonicalF32::new(f32::INFINITY),
+                CanonicalF32::new(f32::NAN),
+            ]),
+        ];
+        let mut previous: Option<Vec<u8>> = None;
+        for value in values {
+            let encoded = value.encode_ordered_component(&logical_type)?;
+            assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded)?,
+                value
+            );
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_ordered_codec_rejects_dimensions_noncanonical_bits_and_trailing()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0)])
+                .encode_ordered_component(&logical_type),
+            Err(NativeTypeError::ScalarOutOfRange)
+        );
+        let value = ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(1.0)]);
+        let encoded = value.encode_ordered_component(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded[..length]).is_err()
+            );
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut noncanonical = encoded;
+        noncanonical[1..5].copy_from_slice(&sortable_f32_bits((-0.0_f32).to_bits()).to_be_bytes());
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &noncanonical),
             Err(NativeTypeError::InvalidScalarEncoding)
         );
         Ok(())
