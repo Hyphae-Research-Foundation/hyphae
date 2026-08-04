@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ EVIDENCE_LEVELS = (
     "external-governance",
 )
 EVIDENCE_STATUSES = {"passed", "failed", "not-configured", "blocked"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GateFailure(RuntimeError):
@@ -88,31 +91,39 @@ def evaluate_readiness(
             )
             continue
         record = _mapping(value, f"evidence {requirement_id}")
-        if set(record) != {"status", "evidence_level", "artifact"}:
+        required_fields = {"status", "evidence_level", "artifact"}
+        allowed_fields = required_fields | {"artifact_sha256"}
+        if not required_fields <= set(record) or not set(record) <= allowed_fields:
             raise GateFailure(f"invalid evidence fields for {requirement_id}")
         status = record.get("status")
         level = record.get("evidence_level")
         artifact = record.get("artifact")
+        artifact_sha256 = record.get("artifact_sha256")
         if status not in EVIDENCE_STATUSES:
             raise GateFailure(f"invalid evidence status for {requirement_id}")
         if level not in EVIDENCE_LEVELS:
             raise GateFailure(f"invalid evidence level for {requirement_id}")
         if not isinstance(artifact, str) or not artifact:
             raise GateFailure(f"evidence artifact required for {requirement_id}")
+        if status == "passed" and (
+            not isinstance(artifact_sha256, str) or SHA256.fullmatch(artifact_sha256) is None
+        ):
+            raise GateFailure(f"canonical SHA-256 required for passed evidence {requirement_id}")
         if status == "passed" and EVIDENCE_LEVELS.index(level) < EVIDENCE_LEVELS.index(
             required_level
         ):
             row_status = "insufficient-evidence"
         else:
             row_status = status
-        rows.append(
-            {
-                "id": requirement_id,
-                "required_evidence_level": required_level,
-                "status": row_status,
-                "artifact": artifact,
-            }
-        )
+        row = {
+            "id": requirement_id,
+            "required_evidence_level": required_level,
+            "status": row_status,
+            "artifact": artifact,
+        }
+        if artifact_sha256 is not None:
+            row["artifact_sha256"] = artifact_sha256
+        rows.append(row)
 
     statuses = {row["status"] for row in rows}
     if statuses == {"passed"}:
@@ -133,17 +144,100 @@ def evaluate_readiness(
     }
 
 
+def inject_evidence(
+    baseline: dict[str, Any],
+    requirement_id: str,
+    source_artifact: Path,
+    evidence_level: str,
+    artifact_reference: str,
+) -> dict[str, Any]:
+    """Return a baseline copy with one validated, content-bound passed receipt."""
+
+    if requirement_id not in baseline:
+        raise GateFailure(f"unknown requirement for evidence injection: {requirement_id}")
+    if evidence_level not in EVIDENCE_LEVELS:
+        raise GateFailure(f"invalid injected evidence level: {evidence_level}")
+    if not source_artifact.is_file():
+        raise GateFailure(f"missing evidence artifact: {source_artifact}")
+    try:
+        receipt = json.loads(source_artifact.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateFailure("injected evidence artifact is not valid JSON") from error
+    if not isinstance(receipt, dict) or receipt.get("status") != "passed":
+        raise GateFailure("injected evidence receipt is not passed")
+    if not artifact_reference or Path(artifact_reference).is_absolute():
+        raise GateFailure("injected artifact reference must be a relative path")
+    updated = json.loads(json.dumps(baseline))
+    updated[requirement_id] = {
+        "status": "passed",
+        "evidence_level": evidence_level,
+        "artifact": artifact_reference,
+        "artifact_sha256": hashlib.sha256(source_artifact.read_bytes()).hexdigest(),
+    }
+    return updated
+
+
+def validate_passed_artifacts(root: Path, result: dict[str, Any]) -> None:
+    """Require every passed artifact to exist under root and match its binding."""
+
+    resolved_root = root.resolve()
+    for row in result["requirements"]:
+        if row["status"] != "passed":
+            continue
+        artifact = row["artifact"]
+        digest = row.get("artifact_sha256")
+        path = (resolved_root / artifact).resolve()
+        try:
+            path.relative_to(resolved_root)
+        except ValueError as error:
+            raise GateFailure(f"passed artifact escapes repository root: {artifact}") from error
+        if not path.is_file():
+            raise GateFailure(f"passed artifact is missing: {artifact}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != digest:
+            raise GateFailure(f"passed artifact SHA-256 mismatch: {artifact}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--inject-requirement")
+    parser.add_argument("--inject-artifact", type=Path)
+    parser.add_argument("--inject-level", choices=EVIDENCE_LEVELS)
+    parser.add_argument("--inject-reference")
+    parser.add_argument("--evidence-output", type=Path)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
+        evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
+        injection = (
+            args.inject_requirement,
+            args.inject_artifact,
+            args.inject_level,
+            args.inject_reference,
+        )
+        if any(value is not None for value in injection):
+            if not all(value is not None for value in injection):
+                raise GateFailure("evidence injection requires all injection arguments")
+            evidence = inject_evidence(
+                evidence,
+                args.inject_requirement,
+                args.inject_artifact,
+                args.inject_level,
+                args.inject_reference,
+            )
+        if args.evidence_output is not None:
+            args.evidence_output.write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         result = evaluate_readiness(
             json.loads(args.profile.read_text(encoding="utf-8")),
-            json.loads(args.evidence.read_text(encoding="utf-8")),
+            evidence,
         )
+        validate_passed_artifacts(args.root, result)
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native G0 readiness failed: {error}")
         return 2
