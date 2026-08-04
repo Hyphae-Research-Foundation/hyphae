@@ -307,7 +307,12 @@ class NativeG0ReadinessTests(unittest.TestCase):
         aggregate_workflow = (
             ROOT / ".github/workflows/native-conformance.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("Inject aggregate into G0 readiness", aggregate_workflow)
+        self.assertIn("Inject golden and conformance evidence into G0 readiness", aggregate_workflow)
+        self.assertIn(
+            "--inject-requirement page-row-blob-wal-mvcc-goldens",
+            aggregate_workflow,
+        )
+        self.assertIn("native-g0-evidence-with-goldens.json", aggregate_workflow)
         self.assertIn(
             "--inject-requirement local-protocol-goldens-and-conformance",
             aggregate_workflow,

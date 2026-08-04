@@ -43,17 +43,32 @@ jobs:
             --receipt conformance-receipts/native-conformance-macos.json \
             --receipt conformance-receipts/native-conformance-windows.json \
             --output native-conformance-aggregate.json
-      - name: Inject aggregate into G0 readiness
+      - name: Inject golden and conformance evidence into G0 readiness
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts
           cp native-conformance-aggregate.json \
             artifacts/native-conformance-aggregate.json
+          python -m unittest tools/test_check_native_goldens.py -v
+          python tools/check_native_goldens.py \
+            --inventory config/native-golden-inventory.json \
+            --requirements config/native-golden-requirements.json \
+            --output artifacts/native-golden-audit.json
           set +e
           python tools/check_native_g0_readiness.py \
             --profile config/native-g0-readiness-profile.json \
             --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement page-row-blob-wal-mvcc-goldens \
+            --inject-artifact artifacts/native-golden-audit.json \
+            --inject-level hosted \
+            --inject-reference artifacts/native-golden-audit.json \
+            --evidence-output native-g0-evidence-with-goldens.json \
+            --output native-g0-readiness-with-goldens.json
+          golden_status=$?
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-goldens.json \
             --inject-requirement local-protocol-goldens-and-conformance \
             --inject-artifact artifacts/native-conformance-aggregate.json \
             --inject-level hosted \
@@ -61,6 +76,7 @@ jobs:
             --output native-g0-readiness-with-conformance.json
           readiness_status=$?
           set -e
+          test "$golden_status" -eq 0 || test "$golden_status" -eq 1
           test "$readiness_status" -eq 0 || test "$readiness_status" -eq 1
           python -m json.tool native-g0-readiness-with-conformance.json >/dev/null
       - name: Upload G0 readiness with hosted conformance

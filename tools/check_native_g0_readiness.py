@@ -206,6 +206,7 @@ def main() -> int:
     parser.add_argument("--inject-artifact", type=Path)
     parser.add_argument("--inject-level", choices=EVIDENCE_LEVELS)
     parser.add_argument("--inject-reference")
+    parser.add_argument("--evidence-output", type=Path)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -226,6 +227,11 @@ def main() -> int:
                 args.inject_artifact,
                 args.inject_level,
                 args.inject_reference,
+            )
+        if args.evidence_output is not None:
+            args.evidence_output.write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
             )
         result = evaluate_readiness(
             json.loads(args.profile.read_text(encoding="utf-8")),
