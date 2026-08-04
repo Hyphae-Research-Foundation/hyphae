@@ -77,6 +77,9 @@ class NativeG1ReadinessTests(unittest.TestCase):
         self.assertIn("native-g1-vertical-audit.json", workflow)
         self.assertIn("tools/check_native_g1_latency_receipts.py", workflow)
         self.assertIn("native-g1-latency-aggregate.json", workflow)
+        self.assertIn("tools/assemble_native_g1_evidence.py", workflow)
+        self.assertIn("native-g1-final-readiness.json", workflow)
+        self.assertIn('"passed": 7', workflow)
 
     def test_missing_digest_or_lower_level_fails_closed(self) -> None:
         profile = self.profile()
