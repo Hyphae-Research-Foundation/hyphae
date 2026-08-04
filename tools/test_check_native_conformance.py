@@ -9,6 +9,7 @@ from tools.check_native_conformance import (
     run_profile,
     validate_profile,
     validate_receipt,
+    validate_receipt_set,
 )
 
 
@@ -198,6 +199,69 @@ class NativeConformanceProfileTests(unittest.TestCase):
         receipt["passed_count"] = 2
         with self.assertRaisesRegex(GateFailure, "duplicate result"):
             validate_receipt(profile, receipt)
+    def test_receipt_set_requires_every_platform_exactly_once(self) -> None:
+        profile = {
+            "schema": "hyphae-native-conformance-profile-audit-v1",
+            "status": "passed",
+            "surfaces": [
+                {"id": "portable", "required_platforms": ["linux", "macos", "windows"]},
+                {"id": "unix", "required_platforms": ["linux", "macos"]},
+            ],
+        }
+
+        def receipt(platform: str, ids: list[str]) -> dict[str, object]:
+            return {
+                "schema": "hyphae-native-conformance-receipt-v1",
+                "platform": platform,
+                "status": "passed",
+                "required_count": len(ids),
+                "passed_count": len(ids),
+                "results": [
+                    {"id": item, "command": f"cargo test {item} --locked", "status": "passed", "exit_code": 0}
+                    for item in ids
+                ],
+            }
+
+        receipts = [
+            receipt("linux", ["portable", "unix"]),
+            receipt("macos", ["portable", "unix"]),
+            receipt("windows", ["portable"]),
+        ]
+        result = validate_receipt_set(profile, receipts)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["platform_count"], 3)
+        self.assertEqual(result["passed_surfaces"], 5)
+
+        with self.assertRaisesRegex(GateFailure, "missing platform receipt"):
+            validate_receipt_set(profile, receipts[:-1])
+        with self.assertRaisesRegex(GateFailure, "duplicate platform receipt"):
+            validate_receipt_set(profile, receipts + [receipts[0]])
+
+    def test_receipt_set_fails_when_one_platform_receipt_fails(self) -> None:
+        profile = {
+            "schema": "hyphae-native-conformance-profile-audit-v1",
+            "status": "passed",
+            "surfaces": [{"id": "portable", "required_platforms": ["linux", "macos"]}],
+        }
+        green = {
+            "schema": "hyphae-native-conformance-receipt-v1",
+            "platform": "linux",
+            "status": "passed",
+            "required_count": 1,
+            "passed_count": 1,
+            "results": [{"id": "portable", "command": "cargo test portable --locked", "status": "passed", "exit_code": 0}],
+        }
+        red = {
+            "schema": "hyphae-native-conformance-receipt-v1",
+            "platform": "macos",
+            "status": "failed",
+            "required_count": 1,
+            "passed_count": 0,
+            "results": [{"id": "portable", "command": "cargo test portable --locked", "status": "failed", "exit_code": 1}],
+        }
+        result = validate_receipt_set(profile, [green, red])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["passed_platforms"], 1)
 
 
 if __name__ == "__main__":
