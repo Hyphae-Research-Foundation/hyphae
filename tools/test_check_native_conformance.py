@@ -121,7 +121,18 @@ class NativeConformanceProfileTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual([row["id"] for row in result["results"]], ["green", "red"])
         self.assertEqual([row["status"] for row in result["results"]], ["passed", "failed"])
-        self.assertEqual(calls, [["cargo", "test", "green", "--locked"], ["cargo", "test", "red", "--locked"]])
+        self.assertEqual(
+            calls,
+            [
+                ["cargo", "test", "green", "--locked"],
+                ["cargo", "test", "red", "--locked"],
+            ],
+        )
+
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("Run native conformance profile", workflow)
+        self.assertIn("native-conformance-${{ matrix.native-platform }}.json", workflow)
+        self.assertIn("run-native-conformance: false", workflow)
 
     def test_runner_rejects_unknown_platform_and_unvalidated_profile(self) -> None:
         with self.assertRaisesRegex(GateFailure, "unknown platform"):
