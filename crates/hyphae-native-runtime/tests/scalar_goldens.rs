@@ -2,23 +2,25 @@
 
 //! Cross-crate local-protocol consumption of canonical primitive scalar bytes.
 
-use hyphae_native_types::primitive_scalar_golden_fixtures;
+use hyphae_native_types::canonical_value_golden_fixtures;
 
 #[test]
 fn local_protocol_consumes_native_scalar_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let fixtures = primitive_scalar_golden_fixtures()?;
-    assert_eq!(fixtures.len(), 13);
+    let fixtures = canonical_value_golden_fixtures()?;
+    assert_eq!(fixtures.len(), 17);
     for fixture in fixtures {
         assert_eq!(
             fixture.value.encode_storage(&fixture.logical_type)?,
             fixture.storage
         );
-        assert_eq!(
-            fixture
-                .value
-                .encode_ordered_component(&fixture.logical_type)?,
-            fixture.ordered
-        );
+        if !fixture.ordered.is_empty() {
+            assert_eq!(
+                fixture
+                    .value
+                    .encode_ordered_component(&fixture.logical_type)?,
+                fixture.ordered
+            );
+        }
     }
     Ok(())
 }

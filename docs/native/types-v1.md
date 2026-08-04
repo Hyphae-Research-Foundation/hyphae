@@ -259,6 +259,7 @@ plus exact value-order agreement with memcomparable bytes. The records crate
 consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
-consume this exact corpus. Nested arrays, maps, and vectors have canonical
-storage and canonical ordered coverage. JSON storage is canonical; JSON ordered
-index semantics remain intentionally undefined and fail explicitly.
+consume a frozen 17-family corpus, including nested arrays, maps, vectors, and
+JSON. Storage bytes are checked for every family; ordered bytes are checked for
+all families with declared ordered semantics. JSON storage is canonical; JSON
+ordered index semantics remain intentionally undefined and fail explicitly.

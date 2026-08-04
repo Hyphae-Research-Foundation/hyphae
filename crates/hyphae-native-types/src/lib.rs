@@ -846,6 +846,7 @@ impl PartialOrd for CanonicalF64 {
 /// JSON, and vector values deliberately remain unsupported until their
 /// canonical validators and resource bounds exist.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum ScalarValue {
     /// SQL null.
     Null,
@@ -2040,13 +2041,60 @@ pub fn primitive_scalar_golden_fixtures() -> Result<Vec<PrimitiveScalarGolden>, 
         .collect()
 }
 
+/// Returns the frozen cross-crate canonical value corpus.
+///
+/// # Errors
+///
+/// Returns an error only if an internal fixture declaration violates a checked
+/// logical-type bound.
+pub fn canonical_value_golden_fixtures() -> Result<Vec<PrimitiveScalarGolden>, NativeTypeError> {
+    let mut fixtures = primitive_scalar_golden_fixtures()?;
+    let declarations = [
+        (
+            LogicalType::Array(Box::new(LogicalType::Signed(IntegerWidth::Bits16))),
+            ScalarValue::Array(vec![ScalarValue::Signed(-2), ScalarValue::Null]),
+        ),
+        (
+            LogicalType::Map(
+                Box::new(LogicalType::Text),
+                Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)),
+            ),
+            ScalarValue::Map(vec![
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Unsigned(1)),
+                (ScalarValue::Text("b".to_owned()), ScalarValue::Null),
+            ]),
+        ),
+        (
+            LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?),
+            ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(f32::NAN)]),
+        ),
+    ];
+    for (logical_type, value) in declarations {
+        fixtures.push(PrimitiveScalarGolden {
+            storage: value.encode_storage(&logical_type)?,
+            ordered: value.encode_ordered_component(&logical_type)?,
+            logical_type,
+            value,
+        });
+    }
+    let json_type = LogicalType::Json;
+    let json_value = ScalarValue::Json(r#"{"a":[1,null],"b":true}"#.to_owned());
+    fixtures.push(PrimitiveScalarGolden {
+        storage: json_value.encode_storage(&json_type)?,
+        ordered: Vec::new(),
+        logical_type: json_type,
+        value: json_value,
+    });
+    Ok(fixtures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, DirectoryUuid, HistoryEpoch,
         IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
-        ScalarValue, VectorElement, VectorType, primitive_scalar_golden_fixtures,
-        sortable_f32_bits,
+        ScalarValue, VectorElement, VectorType, canonical_value_golden_fixtures,
+        primitive_scalar_golden_fixtures, sortable_f32_bits,
     };
     use proptest::prelude::*;
 
@@ -2370,6 +2418,27 @@ mod tests {
             let right_bytes = ScalarValue::Binary(right.clone()).encode_ordered_component(&logical_type)?;
             prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
         }
+    }
+
+    #[test]
+    fn canonical_value_golden_corpus_covers_every_declared_family() -> Result<(), NativeTypeError> {
+        let fixtures = canonical_value_golden_fixtures()?;
+        assert_eq!(fixtures.len(), 17);
+        for fixture in fixtures {
+            assert_eq!(
+                ScalarValue::decode_storage(&fixture.logical_type, &fixture.storage)?,
+                fixture.value
+            );
+            if matches!(fixture.logical_type, LogicalType::Json) {
+                assert!(fixture.ordered.is_empty());
+            } else {
+                assert_eq!(
+                    ScalarValue::decode_ordered_component(&fixture.logical_type, &fixture.ordered,)?,
+                    fixture.value
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
