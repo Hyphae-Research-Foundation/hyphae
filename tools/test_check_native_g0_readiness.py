@@ -145,6 +145,7 @@ class NativeG0ReadinessTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/native-g0-final.yml").read_text(
             encoding="utf-8"
         )
+        self.assertNotIn("github.event.workflow_run.conclusion", workflow)
         self.assertIn("head_sha: sha", workflow)
         self.assertIn("pull_request?.head.sha || context.sha", workflow)
         self.assertIn("attempt <= 40", workflow)
