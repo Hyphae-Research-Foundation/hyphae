@@ -888,6 +888,8 @@ pub enum ScalarValue {
     Map(Vec<(Self, Self)>),
     /// Fixed-dimension canonical float32 vector.
     Vector(Vec<CanonicalF32>),
+    /// Canonical RFC 8259 JSON bytes represented as UTF-8 text.
+    Json(String),
 }
 
 impl ScalarValue {
@@ -905,9 +907,6 @@ impl ScalarValue {
     pub fn encode_storage(&self, logical_type: &LogicalType) -> Result<Vec<u8>, NativeTypeError> {
         if matches!(self, Self::Null) {
             return Err(NativeTypeError::NullRequiresRowBitmap);
-        }
-        if matches!(logical_type, LogicalType::Json) {
-            return Err(NativeTypeError::UnsupportedScalarType);
         }
         let encoded = match (self, logical_type) {
             (Self::Boolean(value), LogicalType::Boolean) => vec![u8::from(*value)],
@@ -961,6 +960,7 @@ impl ScalarValue {
             (Self::Vector(values), LogicalType::Vector(vector_type)) => {
                 encode_vector_storage(values, *vector_type)?
             }
+            (Self::Json(value), LogicalType::Json) => canonical_json_bytes(value)?.to_vec(),
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
         ensure_scalar_length(encoded.len())?;
@@ -1050,7 +1050,7 @@ impl ScalarValue {
             LogicalType::Vector(vector_type) => {
                 decode_vector_storage(encoded, *vector_type).map(Self::Vector)
             }
-            LogicalType::Json => Err(NativeTypeError::UnsupportedScalarType),
+            LogicalType::Json => decode_canonical_json(encoded).map(Self::Json),
         }
     }
 
@@ -1249,6 +1249,74 @@ impl ScalarValue {
                 decode_vector_ordered(payload, *vector_type).map(Self::Vector)
             }
             LogicalType::Json => Err(NativeTypeError::UnsupportedOrderedType),
+        }
+    }
+}
+
+fn canonical_json_bytes(value: &str) -> Result<&[u8], NativeTypeError> {
+    ensure_scalar_length(value.len())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    let canonical = canonicalize_json_value(&parsed)?;
+    if canonical != value {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    Ok(value.as_bytes())
+}
+
+fn decode_canonical_json(encoded: &[u8]) -> Result<String, NativeTypeError> {
+    ensure_scalar_length(encoded.len())?;
+    let value = std::str::from_utf8(encoded).map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    canonical_json_bytes(value)?;
+    Ok(value.to_owned())
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> Result<String, NativeTypeError> {
+    match value {
+        serde_json::Value::Null => Ok("null".to_owned()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(integer.to_string())
+            } else if let Some(integer) = value.as_u64() {
+                Ok(integer.to_string())
+            } else {
+                let float = value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let mut encoded = float.to_string();
+                if encoded == "-0" {
+                    "0".clone_into(&mut encoded);
+                }
+                Ok(encoded)
+            }
+        }
+        serde_json::Value::String(value) => {
+            serde_json::to_string(value).map_err(|_| NativeTypeError::InvalidScalarEncoding)
+        }
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(canonicalize_json_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", values.join(",")))
+        }
+        serde_json::Value::Object(entries) => {
+            let mut encoded = String::from("{");
+            for (index, (key, value)) in entries.iter().enumerate() {
+                if index != 0 {
+                    encoded.push(',');
+                }
+                encoded.push_str(
+                    &serde_json::to_string(key)
+                        .map_err(|_| NativeTypeError::InvalidScalarEncoding)?,
+                );
+                encoded.push(':');
+                encoded.push_str(&canonicalize_json_value(value)?);
+            }
+            encoded.push('}');
+            Ok(encoded)
         }
     }
 }
@@ -2693,6 +2761,54 @@ mod tests {
     }
 
     #[test]
+    fn json_storage_codec_accepts_only_canonical_json_and_round_trips()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Json;
+        let value = ScalarValue::Json(r#"{"a":[true,null,"x"],"b":1,"c":-2.5}"#.to_owned());
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(encoded, br#"{"a":[true,null,"x"],"b":1,"c":-2.5}"#);
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        Ok(())
+    }
+
+    #[test]
+    fn json_storage_codec_rejects_noncanonical_duplicate_and_nonfinite_forms() {
+        let logical_type = LogicalType::Json;
+        for json in [
+            r#"{ "a": 1}"#,
+            r#"{"b":1,"a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1.0}"#,
+            r#"{"a":NaN}"#,
+            r#"{"a":"\u0078"}"#,
+        ] {
+            assert_eq!(
+                ScalarValue::Json(json.to_owned()).encode_storage(&logical_type),
+                Err(NativeTypeError::InvalidScalarEncoding),
+                "accepted noncanonical JSON: {json}"
+            );
+            assert_eq!(
+                ScalarValue::decode_storage(&logical_type, json.as_bytes()),
+                Err(NativeTypeError::InvalidScalarEncoding),
+                "decoded noncanonical JSON: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_storage_codec_rejects_type_mismatch_and_oversize() {
+        assert_eq!(
+            ScalarValue::Json("null".to_owned()).encode_storage(&LogicalType::Text),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        assert_eq!(
+            ScalarValue::Json(format!("\"{}\"", "x".repeat(MAX_SCALAR_BYTES)))
+                .encode_storage(&LogicalType::Json),
+            Err(NativeTypeError::ScalarLengthExceeded)
+        );
+    }
+
+    #[test]
     fn vector_dimensions_are_nonzero() {
         assert_eq!(
             VectorType::new(VectorElement::Float32, 0),
@@ -2935,7 +3051,7 @@ mod tests {
         );
         assert_eq!(
             ScalarValue::Text("{}".to_owned()).encode_storage(&LogicalType::Json),
-            Err(NativeTypeError::UnsupportedScalarType)
+            Err(NativeTypeError::ScalarTypeMismatch)
         );
         assert_eq!(
             ScalarValue::decode_storage(&LogicalType::Boolean, &[2]),

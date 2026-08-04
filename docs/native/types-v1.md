@@ -3,9 +3,9 @@
 Status: normative target contract; identities, logical-type descriptors,
 primitive scalar storage, and primitive ordered-index components are
 implemented in `hyphae-native-types`. Canonical arrays, maps, and fixed-
-dimension float32 vectors now have checked storage codecs; arrays/maps support
-nested/null values and maps enforce strict canonical key order. Canonical JSON
-remains a target-only value codec.
+dimension float32 vectors, and RFC 8259 canonical JSON now have checked storage
+codecs; arrays/maps support nested/null values and maps enforce strict canonical
+key order.
 
 This specification defines the types and stable identities shared by the
 native relational, structure, and search engines. Public SQL and local-wire
@@ -81,7 +81,10 @@ their declared ordered encoding, making duplicates and unsorted maps
 noncanonical. Vector storage is exactly `N` canonical float32 values in
 little-endian element order with no redundant dimension field; the declared
 type fixes `N`, and noncanonical NaN/zero bits or wrong byte counts fail closed.
-Canonical JSON is not defined in this slice and rejects use explicitly.
+JSON storage is canonical UTF-8 RFC 8259: object keys are byte-sorted, duplicate
+keys are rejected by canonical re-encoding, insignificant whitespace is absent,
+escapes are minimal, integers use decimal spelling, finite floats use the
+shortest round-tripping spelling, and non-finite numbers fail closed.
 
 ## Ordered-index component v1
 
@@ -257,5 +260,5 @@ consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
 consume this exact corpus. Nested arrays, maps, and vectors have canonical
-storage coverage, and arrays/maps/vectors have canonical ordered coverage. Only
-canonical JSON remains required for the declared v1 value families.
+storage and canonical ordered coverage. JSON storage is canonical; JSON ordered
+index semantics remain intentionally undefined and fail explicitly.
