@@ -1,0 +1,15 @@
+{
+  "schema": "hyphae-native-golden-requirements-v1",
+  "required_ids": [
+    "canonical-logical-type-descriptors",
+    "native-page-v1",
+    "native-wal-block-v1",
+    "native-btree-leaf-v1",
+    "native-directory-format-v1",
+    "native-catalog-tree-v3",
+    "local-structure-get-v1",
+    "local-structure-set-ttl-v1",
+    "local-search-match-v1",
+    "local-all-engine-transaction-v1"
+  ]
+}
