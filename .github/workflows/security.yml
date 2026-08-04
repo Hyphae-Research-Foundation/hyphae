@@ -96,6 +96,11 @@ jobs:
           }, indent=2, sort_keys=True))
           PY
           python -m json.tool native-types-audit.json >/dev/null
+          python -m unittest tools.test_check_native_contract_conformance -v
+          python tools/check_native_contract_conformance.py \
+            --inventory config/native-contract-conformance.json \
+            --output native-contract-conformance.json
+          python -m json.tool native-contract-conformance.json >/dev/null
           set +e
           python tools/check_native_g0_readiness.py \
             --profile config/native-g0-readiness-profile.json \
@@ -106,9 +111,20 @@ jobs:
             --evidence-output native-g0-evidence-with-types.json \
             --output native-g0-readiness-with-types.json
           types_readiness_status=$?
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-types.json \
+            --inject-requirement sql-structure-search-ann-contracts \
+            --inject-level hosted \
+            --inject-reference native-contract-conformance.json \
+            --evidence-output native-g0-evidence-with-contracts.json \
+            --output native-g0-readiness-with-contracts.json
+          contracts_readiness_status=$?
           set -e
           test "$types_readiness_status" -eq 0 || test "$types_readiness_status" -eq 1
+          test "$contracts_readiness_status" -eq 0 || test "$contracts_readiness_status" -eq 1
           python -m json.tool native-g0-readiness-with-types.json >/dev/null
+          python -m json.tool native-g0-readiness-with-contracts.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -127,8 +143,11 @@ jobs:
           name: native-types-audit
           path: |
             native-types-audit.json
+            native-contract-conformance.json
             native-g0-evidence-with-types.json
             native-g0-readiness-with-types.json
+            native-g0-evidence-with-contracts.json
+            native-g0-readiness-with-contracts.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true
