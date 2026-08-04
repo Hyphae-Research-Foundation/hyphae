@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,18 @@ FIELDS = {
     "metrics",
 }
 ENGINES = {"lexical", "ann", "hybrid"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+ANN_FIELDS = {
+    "schema", "source_commit", "environment", "dataset_digest", "vector_count",
+    "dimension", "query_count", "k", "m", "ef_construction", "ef_search",
+    "max_level", "directed_edges", "build_identity", "build_duration_millis",
+    "recall_at_10", "recall_at_10_floor", "recall_floor_met",
+    "minimum_query_recall_at_10", "p50_query_recall_at_10",
+    "mean_visited_nodes", "mean_candidate_count", "exact_latency_micros",
+    "hnsw_latency_micros",
+}
+LATENCY_FIELDS = {"p50", "p95", "p99", "maximum"}
 
 
 class GateFailure(RuntimeError):
@@ -44,6 +58,59 @@ def _producer(root: Path, value: str) -> Path:
     if not path.is_file():
         raise GateFailure(f"producer is missing: {value}")
     return path
+
+
+def _finite_positive(value: object, label: str, *, allow_zero: bool = False) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise GateFailure(f"{label} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0 or (numeric == 0 and not allow_zero):
+        raise GateFailure(f"{label} must be finite latency or positive metric")
+    return numeric
+
+
+def validate_ann_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Validate one bounded ANN quality observation without promoting its scale."""
+
+    if set(receipt) != ANN_FIELDS:
+        raise GateFailure("unknown ANN receipt field or missing required field")
+    if receipt.get("schema") != "hyphae-native-ann-quality-v1":
+        raise GateFailure("unsupported ANN receipt schema")
+    source_commit = receipt.get("source_commit")
+    if not isinstance(source_commit, str) or COMMIT.fullmatch(source_commit) is None:
+        raise GateFailure("ANN receipt source_commit digest is invalid")
+    for field in ("dataset_digest", "build_identity"):
+        value = receipt.get(field)
+        if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+            raise GateFailure(f"ANN receipt {field} digest is invalid")
+    for field in ("vector_count", "dimension", "query_count", "k", "m", "ef_construction", "ef_search"):
+        value = receipt.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise GateFailure(f"ANN receipt {field} requires positive scale")
+    recall = _finite_positive(receipt.get("recall_at_10"), "recall_at_10")
+    floor = _finite_positive(receipt.get("recall_at_10_floor"), "recall_at_10_floor")
+    if recall > 1 or floor > 1 or recall < floor or receipt.get("recall_floor_met") is not True:
+        raise GateFailure("ANN recall floor or recall arithmetic is invalid")
+    for field in ("build_duration_millis", "mean_visited_nodes", "mean_candidate_count"):
+        _finite_positive(receipt.get(field), field, allow_zero=True)
+    for name in ("exact_latency_micros", "hnsw_latency_micros"):
+        latency = _mapping(receipt.get(name), name)
+        if set(latency) != LATENCY_FIELDS:
+            raise GateFailure(f"{name} fields are invalid")
+        values = [_finite_positive(latency[field], f"{name}.{field}") for field in ("p50", "p95", "p99", "maximum")]
+        if values != sorted(values):
+            raise GateFailure(f"{name} percentile order is invalid")
+    vector_count = receipt["vector_count"]
+    query_count = receipt["query_count"]
+    return {
+        "status": "passed",
+        "evidence_scope": "bounded-observation",
+        "vector_count": vector_count,
+        "query_count": query_count,
+        "dimension": receipt["dimension"],
+        "recall_at_10": recall,
+        "production_scale": vector_count >= 1_000_000 and receipt["dimension"] >= 384,
+    }
 
 
 def validate_corpus(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
