@@ -112,6 +112,8 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertIn("native-contract-conformance.json", workflow)
         self.assertIn("--inject-requirement sql-structure-search-ann-contracts", workflow)
         self.assertIn("native-g0-evidence-with-contracts.json", workflow)
+        self.assertIn("--inject-requirement page-row-blob-wal-mvcc-goldens", workflow)
+        self.assertIn("native-g0-evidence-with-goldens.json", workflow)
 
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
