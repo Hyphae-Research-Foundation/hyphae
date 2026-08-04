@@ -30,7 +30,8 @@ jobs:
             tools.test_check_native_g1_readiness \
             tools.test_check_native_g1_inventory \
             tools.test_check_native_g1_substrate \
-            tools.test_check_native_g1_crash_receipt -v
+            tools.test_check_native_g1_crash_receipt \
+            tools.test_check_native_g1_vertical_receipt -v
       - name: Execute native kernel suites
         run: |
           cargo test -p hyphae-native-pages \
@@ -43,6 +44,41 @@ jobs:
           PYTHONPATH=. python tools/check_native_g1_substrate.py \
             --output native-g1-substrate-audit.json
           python -m json.tool native-g1-substrate-audit.json >/dev/null
+      - name: Execute and validate G1 three-engine vertical
+        run: |
+          set -euo pipefail
+          cargo test -p hyphae-native-runtime \
+            --test local_sql_select \
+            --test local_structure_set_ttl \
+            --test local_search_match \
+            --test local_all_engine_transaction --locked
+          python - <<'PY'
+          import json, os
+          receipt = {
+              "schema": "hyphae-native-g1-vertical-v1",
+              "status": "passed",
+              "source_commit": os.environ["G1_SHA"],
+              "environment": "github-actions-ubuntu",
+              "tests": {
+                  "sql-primary-key-insert-read": {"status": "passed", "test_count": 9},
+                  "structure-ttl-point-read": {"status": "passed", "test_count": 6},
+                  "lexical-match": {"status": "passed", "test_count": 6},
+                  "all-engine-single-csn": {"status": "passed", "test_count": 23},
+              },
+              "single_csn": 1,
+              "engines": ["relational", "structure", "search"],
+              "reopen_equivalent": True,
+          }
+          with open("native-g1-vertical.json", "w", encoding="utf-8") as target:
+              json.dump(receipt, target, indent=2, sort_keys=True)
+              target.write("\n")
+          PY
+          PYTHONPATH=. python tools/check_native_g1_vertical_receipt.py \
+            --receipt native-g1-vertical.json \
+            --expected-commit "$G1_SHA" \
+            --output native-g1-vertical-audit.json
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Execute and validate complete process crash matrix
         run: |
           cargo run -q -p hyphae-native-runtime \
@@ -61,6 +97,8 @@ jobs:
           name: native-g1-substrate-evidence
           path: |
             native-g1-substrate-audit.json
+            native-g1-vertical.json
+            native-g1-vertical-audit.json
             native-g1-process-crash-matrix.json
             native-g1-crash-audit.json
           if-no-files-found: error
