@@ -235,5 +235,5 @@ binary, date, time, timestamp, interval, and UUID storage/ordered round trips
 plus exact value-order agreement with memcomparable bytes. The records crate
 consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
-Nested value codecs and additional page, WAL, and local-protocol consumers
-remain required.
+Records, pages, WAL, and the native runtime/local-protocol test surface all
+consume this exact corpus. Nested value codecs remain required.
