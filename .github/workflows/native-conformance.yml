@@ -23,6 +23,30 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.11.15
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Generate hosted lexical quality receipt
+        shell: bash
+        env:
+          TESTED_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo run -p hyphae-native-runtime \
+            --example lexical_quality_receipt --locked -- \
+            "$TESTED_COMMIT" > artifacts/native-lexical-quality.json
+          python -m json.tool artifacts/native-lexical-quality.json >/dev/null
+      - name: Validate and aggregate quality receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_check_native_quality_corpus.py -v
+          python tools/check_native_quality_corpus.py \
+            --lexical-receipt artifacts/native-lexical-quality.json \
+            --ann-receipt docs/gates/evidence/native-ann-kernel-wsl2.json \
+            --output artifacts/native-quality-aggregate.json
       - name: Download hosted conformance receipts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -73,17 +97,36 @@ jobs:
             --inject-artifact artifacts/native-conformance-aggregate.json \
             --inject-level hosted \
             --inject-reference artifacts/native-conformance-aggregate.json \
+            --evidence-output native-g0-evidence-with-conformance.json \
             --output native-g0-readiness-with-conformance.json
+          conformance_status=$?
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-conformance.json \
+            --inject-requirement benchmark-and-quality-corpus \
+            --inject-artifact artifacts/native-quality-aggregate.json \
+            --inject-level hosted \
+            --inject-reference artifacts/native-quality-aggregate.json \
+            --output native-g0-readiness-with-quality.json
           readiness_status=$?
           set -e
           test "$golden_status" -eq 0 || test "$golden_status" -eq 1
+          test "$conformance_status" -eq 0 || test "$conformance_status" -eq 1
           test "$readiness_status" -eq 0 || test "$readiness_status" -eq 1
-          python -m json.tool native-g0-readiness-with-conformance.json >/dev/null
-      - name: Upload G0 readiness with hosted conformance
+          python -m json.tool native-g0-readiness-with-quality.json >/dev/null
+      - name: Upload G0 readiness with hosted quality
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-g0-readiness-with-conformance
-          path: native-g0-readiness-with-conformance.json
+          name: native-g0-readiness-with-quality
+          path: native-g0-readiness-with-quality.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Upload native quality aggregate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-quality-aggregate
+          path: artifacts/native-quality-aggregate.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true

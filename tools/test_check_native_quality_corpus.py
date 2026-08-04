@@ -198,6 +198,19 @@ class NativeQualityCorpusTests(unittest.TestCase):
         receipt["document_count"] = 0
         with self.assertRaisesRegex(GateFailure, "positive scale"):
             validate_lexical_receipt(receipt)
+    def test_hosted_workflow_generates_and_injects_quality_aggregate(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-conformance.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Generate hosted lexical quality receipt", workflow)
+        self.assertIn("--example lexical_quality_receipt", workflow)
+        self.assertIn("native-ann-kernel-wsl2.json", workflow)
+        self.assertIn("--lexical-receipt artifacts/native-lexical-quality.json", workflow)
+        self.assertIn("--ann-receipt docs/gates/evidence/native-ann-kernel-wsl2.json", workflow)
+        self.assertIn("artifacts/native-quality-aggregate.json", workflow)
+        self.assertIn("--inject-requirement benchmark-and-quality-corpus", workflow)
+        self.assertIn("--inject-level hosted", workflow)
+
     def test_g0_requires_reproducible_hosted_corpus_not_g7_production_scale(self) -> None:
         profile = json.loads(
             (ROOT / "config/native-g0-readiness-profile.json").read_text(
