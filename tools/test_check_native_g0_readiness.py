@@ -130,6 +130,10 @@ class NativeG0ReadinessTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("native-g0-evidence-with-dependencies.json", workflow)
+        self.assertIn("Generate clean-room evidence when externally approved", workflow)
+        self.assertIn("human-review-required", workflow)
+        self.assertIn("--inject-requirement clean-room-porting-ledger-review", workflow)
+        self.assertIn("native-clean-room-receipt.json", workflow)
 
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {

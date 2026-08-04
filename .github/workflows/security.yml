@@ -200,6 +200,41 @@ jobs:
           set -e
           test "$dependency_readiness_status" -eq 0 || test "$dependency_readiness_status" -eq 1
           python -m json.tool native-g0-readiness-with-dependencies.json >/dev/null
+      - name: Generate clean-room evidence when externally approved
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_check_native_clean_room.py -v
+          if [ "$(python -c 'import json; print(len(json.load(open("config/native-clean-room-profile.json"))["human_reviewers"]))')" -eq 0 ]; then
+            printf '%s\n' '{"schema":"hyphae-native-clean-room-receipt-v1","status":"blocked","reason":"human-review-required"}' \
+              > native-clean-room-receipt.json
+          else
+            python tools/check_native_clean_room.py \
+              --profile config/native-clean-room-profile.json \
+              --output native-clean-room-receipt.json
+          fi
+          set +e
+          if python -c 'import json; raise SystemExit(0 if json.load(open("native-clean-room-receipt.json"))["status"] == "passed" else 1)'; then
+            python tools/check_native_g0_readiness.py \
+              --profile config/native-g0-readiness-profile.json \
+              --evidence config/native-g0-readiness-evidence.json \
+              --inject-requirement clean-room-porting-ledger-review \
+              --inject-level external-governance \
+              --inject-reference native-clean-room-receipt.json \
+              --evidence-output native-g0-evidence-with-clean-room.json \
+              --output native-g0-readiness-with-clean-room.json
+            clean_room_readiness_status=$?
+          else
+            clean_room_readiness_status=1
+            python tools/check_native_g0_readiness.py \
+              --profile config/native-g0-readiness-profile.json \
+              --evidence config/native-g0-readiness-evidence.json \
+              --output native-g0-readiness-with-clean-room.json
+          fi
+          set -e
+          test "$clean_room_readiness_status" -eq 0 || test "$clean_room_readiness_status" -eq 1
+          python -m json.tool native-clean-room-receipt.json >/dev/null
+          python -m json.tool native-g0-readiness-with-clean-room.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -212,6 +247,17 @@ jobs:
           set -e
           test "$status" -eq 0 || test "$status" -eq 1
           python -m json.tool native-g0-readiness.json >/dev/null
+      - name: Upload clean-room evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-clean-room-evidence
+          path: |
+            native-clean-room-receipt.json
+            native-g0-readiness-with-clean-room.json
+            native-g0-evidence-with-clean-room.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
       - name: Upload canonical native type evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
