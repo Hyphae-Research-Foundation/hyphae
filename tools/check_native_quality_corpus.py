@@ -159,6 +159,26 @@ def validate_ann_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_quality_receipt_set(
+    lexical_receipt: dict[str, Any], ann_receipt: dict[str, Any]
+) -> dict[str, Any]:
+    """Aggregate exact lexical and ANN receipts without inflating evidence scope."""
+
+    lexical = validate_lexical_receipt(lexical_receipt)
+    ann = validate_ann_receipt(ann_receipt)
+    production_scale = lexical["production_scale"] and ann["production_scale"]
+    return {
+        "schema": "hyphae-native-quality-aggregate-v1",
+        "status": "passed",
+        "evidence_scope": "production" if production_scale else "bounded-observation",
+        "production_scale": production_scale,
+        "engines": ["ann", "lexical"],
+        "total_observations": lexical["query_count"] + ann["query_count"],
+        "lexical": lexical,
+        "ann": ann,
+    }
+
+
 def validate_corpus(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
     """Return a content-bound registry or fail closed on any ambiguity."""
 
@@ -232,14 +252,27 @@ def validate_corpus(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--corpus", type=Path)
+    parser.add_argument("--lexical-receipt", type=Path)
+    parser.add_argument("--ann-receipt", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
-        result = validate_corpus(
-            args.root,
-            json.loads(args.corpus.read_text(encoding="utf-8")),
-        )
+        aggregate_inputs = (args.lexical_receipt, args.ann_receipt)
+        if any(value is not None for value in aggregate_inputs):
+            if not all(value is not None for value in aggregate_inputs) or args.corpus is not None:
+                raise GateFailure("quality aggregation requires exactly both receipt inputs")
+            result = validate_quality_receipt_set(
+                json.loads(args.lexical_receipt.read_text(encoding="utf-8")),
+                json.loads(args.ann_receipt.read_text(encoding="utf-8")),
+            )
+        elif args.corpus is not None:
+            result = validate_corpus(
+                args.root,
+                json.loads(args.corpus.read_text(encoding="utf-8")),
+            )
+        else:
+            raise GateFailure("provide --corpus or both quality receipts")
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native quality corpus failed: {error}")
         return 2
