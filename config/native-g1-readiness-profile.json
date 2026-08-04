@@ -1,0 +1,13 @@
+{
+  "schema": "hyphae-native-g1-readiness-profile-v1",
+  "gate": "G1",
+  "requirements": [
+    {"id": "native-page-blob-wal-catalog-mvcc", "required_evidence": "hosted"},
+    {"id": "partitioned-memory-and-scheduler", "required_evidence": "hosted"},
+    {"id": "no-redb-on-native-target-path", "required_evidence": "hosted"},
+    {"id": "three-engine-minimal-vertical", "required_evidence": "hosted"},
+    {"id": "single-csn-all-engine-commit", "required_evidence": "hosted"},
+    {"id": "commit-checkpoint-crash-matrix", "required_evidence": "hosted"},
+    {"id": "embedded-and-local-protocol-latency", "required_evidence": "hosted"}
+  ]
+}

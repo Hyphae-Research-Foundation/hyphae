@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from tools.check_native_g1_readiness import GateFailure, evaluate
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class NativeG1ReadinessTests(unittest.TestCase):
+    def profile(self) -> dict:
+        return json.loads((ROOT / "config/native-g1-readiness-profile.json").read_text())
+
+    def baseline(self) -> dict:
+        return json.loads((ROOT / "config/native-g1-readiness-evidence.json").read_text())
+
+    def test_checked_in_profile_has_exact_seven_substrate_requirements(self) -> None:
+        profile = self.profile()
+        self.assertEqual(profile["schema"], "hyphae-native-g1-readiness-profile-v1")
+        self.assertEqual(
+            [row["id"] for row in profile["requirements"]],
+            [
+                "native-page-blob-wal-catalog-mvcc",
+                "partitioned-memory-and-scheduler",
+                "no-redb-on-native-target-path",
+                "three-engine-minimal-vertical",
+                "single-csn-all-engine-commit",
+                "commit-checkpoint-crash-matrix",
+                "embedded-and-local-protocol-latency",
+            ],
+        )
+
+    def test_checked_in_baseline_remains_open(self) -> None:
+        result = evaluate(ROOT, self.profile(), self.baseline())
+        self.assertEqual(result["gate"], "G1")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["required"], 7)
+        self.assertEqual(result["passed"], 0)
+
+    def test_exact_hosted_evidence_closes_g1(self) -> None:
+        profile = self.profile()
+        evidence = self.baseline()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = {}
+            for requirement in profile["requirements"]:
+                artifact = root / f"{requirement['id']}.json"
+                artifact.write_text('{"status":"passed"}\n')
+                import hashlib
+
+                rows[requirement["id"]] = {
+                    "status": "passed",
+                    "level": requirement["required_evidence"],
+                    "reference": artifact.name,
+                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }
+            evidence["evidence"] = rows
+            result = evaluate(root, profile, evidence)
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["passed"], 7)
+
+    def test_missing_digest_or_lower_level_fails_closed(self) -> None:
+        profile = self.profile()
+        evidence = self.baseline()
+        evidence["evidence"][profile["requirements"][0]["id"]] = {
+            "status": "passed",
+            "level": "local",
+            "reference": "missing.json",
+        }
+        with self.assertRaises(GateFailure):
+            evaluate(ROOT, profile, evidence)
+
+
+if __name__ == "__main__":
+    unittest.main()
