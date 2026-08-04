@@ -274,6 +274,8 @@ class NativeConformanceProfileTests(unittest.TestCase):
         self.assertIn("pull_request:", workflow)
         self.assertIn("head_sha: sha", workflow)
         self.assertIn("steps.ci.outputs.run_id", workflow)
+        self.assertIn("attempt <= 40", workflow)
+        self.assertIn("item.conclusion === 'success'", workflow)
         self.assertIn("--aggregate", workflow)
         for platform in ("linux", "macos", "windows"):
             self.assertIn(f"native-conformance-{platform}.json", workflow)

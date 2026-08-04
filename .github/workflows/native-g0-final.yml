@@ -30,18 +30,26 @@ jobs:
             const sha = context.payload.pull_request?.head.sha || context.sha;
             const workflows = ['security.yml', 'native-conformance.yml'];
             for (const workflow_id of workflows) {
-              const response = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id,
-                head_sha: sha,
-                status: 'success',
-                per_page: 20,
-              });
-              const run = response.data.workflow_runs
-                .filter(item => item.head_sha === sha)
-                .sort((a, b) => b.run_number - a.run_number)[0];
-              if (!run) core.setFailed(`missing successful ${workflow_id} run for ${sha}`);
+              let run;
+              for (let attempt = 1; attempt <= 40; attempt++) {
+                const response = await github.rest.actions.listWorkflowRuns({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id,
+                  head_sha: sha,
+                  per_page: 20,
+                });
+                run = response.data.workflow_runs
+                  .filter(item => item.head_sha === sha && item.conclusion === 'success')
+                  .sort((a, b) => b.run_number - a.run_number)[0];
+                if (run) break;
+                core.info(`waiting for successful ${workflow_id} run for ${sha} (${attempt}/40)`);
+                await new Promise(resolve => setTimeout(resolve, 30000));
+              }
+              if (!run) {
+                core.setFailed(`missing successful ${workflow_id} run for ${sha}`);
+                return;
+              }
               core.setOutput(workflow_id === 'security.yml' ? 'security_run' : 'conformance_run', run.id);
             }
       - name: Download Security evidence
