@@ -65,7 +65,7 @@ jobs:
             --requirements config/native-golden-requirements.json \
             --output native-golden-audit.json
           python -m json.tool native-golden-audit.json >/dev/null
-          python -m unittest tools/test_check_native_quality_corpus -v
+          python -m unittest tools/test_check_native_quality_corpus.py -v
           cargo run -p hyphae-native-runtime \
             --example lexical_quality_receipt --locked -- \
             "$(git rev-parse HEAD)" > native-lexical-quality.json
