@@ -229,8 +229,8 @@ The current implementation provides deterministic unit fixtures for descriptor
 round trips, all primitive storage codecs, byte-order agreement for each
 primitive ordered codec, malformed inputs, limits, decimal domains, time
 domains, float NaN/zero canonicalization, and descriptor golden bytes. Property
-tests now cover signed, unsigned, decimal, text, binary, date, time, timestamp,
-and UUID storage/ordered round trips plus exact value-order agreement with
-memcomparable bytes. Float and interval property coverage, nested value codecs,
-cross-crate golden consumption, and broader property coverage across every
-implemented scalar family remain required.
+tests now cover every implemented primitive family: signed and unsigned
+integers, decimal, float32/float64 canonicalization and total order, text,
+binary, date, time, timestamp, interval, and UUID storage/ordered round trips
+plus exact value-order agreement with memcomparable bytes. Nested value codecs
+and cross-crate golden consumption remain required.

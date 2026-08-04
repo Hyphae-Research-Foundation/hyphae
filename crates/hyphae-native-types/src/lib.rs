@@ -1732,6 +1732,65 @@ mod tests {
         }
 
         #[test]
+        fn float32_codecs_canonicalize_round_trip_and_preserve_total_order(
+            left_bits in any::<u32>(), right_bits in any::<u32>(),
+        ) {
+            let logical_type = LogicalType::Float32;
+            let left = CanonicalF32::new(f32::from_bits(left_bits));
+            let right = CanonicalF32::new(f32::from_bits(right_bits));
+            let scalar = ScalarValue::Float32(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Float32(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
+        fn float64_codecs_canonicalize_round_trip_and_preserve_total_order(
+            left_bits in any::<u64>(), right_bits in any::<u64>(),
+        ) {
+            let logical_type = LogicalType::Float64;
+            let left = CanonicalF64::new(f64::from_bits(left_bits));
+            let right = CanonicalF64::new(f64::from_bits(right_bits));
+            let scalar = ScalarValue::Float64(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Float64(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
+        fn interval_codecs_round_trip_and_preserve_lexicographic_order(
+            left_months in any::<i32>(), left_days in any::<i32>(), left_nanos in any::<i64>(),
+            right_months in any::<i32>(), right_days in any::<i32>(), right_nanos in any::<i64>(),
+        ) {
+            let logical_type = LogicalType::Interval;
+            let left = ScalarValue::Interval {
+                months: left_months,
+                days: left_days,
+                nanoseconds: left_nanos,
+            };
+            let right = ScalarValue::Interval {
+                months: right_months,
+                days: right_days,
+                nanoseconds: right_nanos,
+            };
+            let storage = left.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, left.clone());
+            let left_bytes = left.encode_ordered_component(&logical_type)?;
+            let right_bytes = right.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                (left_months, left_days, left_nanos).cmp(&(right_months, right_days, right_nanos)),
+                left_bytes.cmp(&right_bytes)
+            );
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, left);
+        }
+
+        #[test]
         fn binary_storage_and_ordered_codecs_round_trip(value in proptest::collection::vec(any::<u8>(), 0..512)) {
             let logical_type = LogicalType::Binary;
             let scalar = ScalarValue::Binary(value);
