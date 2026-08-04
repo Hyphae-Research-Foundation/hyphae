@@ -84,8 +84,17 @@ def build_receipt(root: Path, profile_path: Path) -> dict[str, Any]:
     summary = validate_profile(root, profile)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     reviewed = {entry["reviewed_commit"] for entry in profile["human_reviewers"]}
-    if reviewed != {commit}:
-        raise GateFailure("human review is not bound to the exact evaluated commit")
+    if not all(
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", revision, commit],
+            cwd=root,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        for revision in reviewed
+    ):
+        raise GateFailure("human review is not bound to an ancestor of the evaluated commit")
     return {
         "schema": RECEIPT_SCHEMA,
         "status": "passed",

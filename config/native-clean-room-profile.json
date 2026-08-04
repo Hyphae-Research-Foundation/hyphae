@@ -23,5 +23,12 @@
       "decision": "Defer"
     }
   ],
-  "human_reviewers": []
+  "human_reviewers": [
+    {
+      "github_login": "celiumsai",
+      "reviewed_commit": "5edf080953d6c3cc454a79da5a1ae085fc11159d",
+      "scope": "G0 clean-room ledger, four immutable historical inputs, and no accepted source ports",
+      "decision": "approved"
+    }
+  ]
 }
