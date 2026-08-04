@@ -2,7 +2,8 @@
   "architecture-and-versioned-specifications": {
     "status": "passed",
     "evidence_level": "local-integration",
-    "artifact": "docs/architecture/native-local-ecosystem.md"
+    "artifact": "docs/architecture/native-local-ecosystem.md",
+    "artifact_sha256": "61550f71005a1a880f929bb309c3f26cea6259e76928342ed8f71930b56705c6"
   },
   "canonical-type-goldens-and-properties": {
     "status": "not-configured",

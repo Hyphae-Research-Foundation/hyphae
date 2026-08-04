@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ EVIDENCE_LEVELS = (
     "external-governance",
 )
 EVIDENCE_STATUSES = {"passed", "failed", "not-configured", "blocked"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GateFailure(RuntimeError):
@@ -88,31 +90,39 @@ def evaluate_readiness(
             )
             continue
         record = _mapping(value, f"evidence {requirement_id}")
-        if set(record) != {"status", "evidence_level", "artifact"}:
+        required_fields = {"status", "evidence_level", "artifact"}
+        allowed_fields = required_fields | {"artifact_sha256"}
+        if not required_fields <= set(record) or not set(record) <= allowed_fields:
             raise GateFailure(f"invalid evidence fields for {requirement_id}")
         status = record.get("status")
         level = record.get("evidence_level")
         artifact = record.get("artifact")
+        artifact_sha256 = record.get("artifact_sha256")
         if status not in EVIDENCE_STATUSES:
             raise GateFailure(f"invalid evidence status for {requirement_id}")
         if level not in EVIDENCE_LEVELS:
             raise GateFailure(f"invalid evidence level for {requirement_id}")
         if not isinstance(artifact, str) or not artifact:
             raise GateFailure(f"evidence artifact required for {requirement_id}")
+        if status == "passed" and (
+            not isinstance(artifact_sha256, str) or SHA256.fullmatch(artifact_sha256) is None
+        ):
+            raise GateFailure(f"canonical SHA-256 required for passed evidence {requirement_id}")
         if status == "passed" and EVIDENCE_LEVELS.index(level) < EVIDENCE_LEVELS.index(
             required_level
         ):
             row_status = "insufficient-evidence"
         else:
             row_status = status
-        rows.append(
-            {
-                "id": requirement_id,
-                "required_evidence_level": required_level,
-                "status": row_status,
-                "artifact": artifact,
-            }
-        )
+        row = {
+            "id": requirement_id,
+            "required_evidence_level": required_level,
+            "status": row_status,
+            "artifact": artifact,
+        }
+        if artifact_sha256 is not None:
+            row["artifact_sha256"] = artifact_sha256
+        rows.append(row)
 
     statuses = {row["status"] for row in rows}
     if statuses == {"passed"}:
