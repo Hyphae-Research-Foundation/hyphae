@@ -9,6 +9,7 @@ from tools.check_native_quality_corpus import (
     GateFailure,
     validate_ann_receipt,
     validate_corpus,
+    validate_lexical_receipt,
 )
 
 
@@ -136,6 +137,54 @@ class NativeQualityCorpusTests(unittest.TestCase):
         receipt["exact_latency_micros"]["p50"] = receipt["exact_latency_micros"]["p95"] + 1
         with self.assertRaisesRegex(GateFailure, "percentile order"):
             validate_ann_receipt(receipt)
+    def test_lexical_receipt_requires_exact_order_and_reopen_equivalence(self) -> None:
+        receipt = {
+            "schema": "hyphae-native-lexical-quality-v1",
+            "source_commit": "a" * 40,
+            "dataset_digest": "b" * 64,
+            "document_count": 512,
+            "query_count": 4,
+            "top_k": 25,
+            "exact_score_order_equivalence": True,
+            "reopen_equivalence": True,
+            "query_result_digests": ["c" * 64, "d" * 64, "e" * 64, "f" * 64],
+        }
+        result = validate_lexical_receipt(receipt)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["evidence_scope"], "bounded-observation")
+        self.assertFalse(result["production_scale"])
+
+        receipt["reopen_equivalence"] = False
+        with self.assertRaisesRegex(GateFailure, "equivalence"):
+            validate_lexical_receipt(receipt)
+        receipt["reopen_equivalence"] = True
+        receipt["query_result_digests"].pop()
+        with self.assertRaisesRegex(GateFailure, "query digest count"):
+            validate_lexical_receipt(receipt)
+
+    def test_lexical_receipt_rejects_unknown_fields_bad_identity_and_zero_scale(self) -> None:
+        receipt = {
+            "schema": "hyphae-native-lexical-quality-v1",
+            "source_commit": "a" * 40,
+            "dataset_digest": "b" * 64,
+            "document_count": 512,
+            "query_count": 1,
+            "top_k": 25,
+            "exact_score_order_equivalence": True,
+            "reopen_equivalence": True,
+            "query_result_digests": ["c" * 64],
+        }
+        receipt["extra"] = True
+        with self.assertRaisesRegex(GateFailure, "unknown lexical receipt field"):
+            validate_lexical_receipt(receipt)
+        receipt.pop("extra")
+        receipt["dataset_digest"] = "bad"
+        with self.assertRaisesRegex(GateFailure, "dataset digest"):
+            validate_lexical_receipt(receipt)
+        receipt["dataset_digest"] = "b" * 64
+        receipt["document_count"] = 0
+        with self.assertRaisesRegex(GateFailure, "positive scale"):
+            validate_lexical_receipt(receipt)
 
 
 if __name__ == "__main__":
