@@ -253,11 +253,22 @@ def main() -> int:
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--platform", choices=sorted(PLATFORMS))
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--receipt", type=Path, action="append", default=[])
+    parser.add_argument("--aggregate", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
         profile = validate_profile(json.loads(args.profile.read_text(encoding="utf-8")))
-        if args.run:
+        if args.run and args.aggregate:
+            raise GateFailure("--run and --aggregate are mutually exclusive")
+        if args.aggregate:
+            if not args.receipt:
+                raise GateFailure("--aggregate requires --receipt")
+            result = validate_receipt_set(
+                profile,
+                [json.loads(path.read_text(encoding="utf-8")) for path in args.receipt],
+            )
+        elif args.run:
             if args.platform is None:
                 raise GateFailure("--run requires --platform")
             result = run_profile(
