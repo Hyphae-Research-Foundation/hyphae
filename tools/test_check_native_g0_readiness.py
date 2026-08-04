@@ -4,7 +4,11 @@ import json
 import unittest
 from pathlib import Path
 
-from tools.check_native_g0_readiness import GateFailure, evaluate_readiness
+from tools.check_native_g0_readiness import (
+    GateFailure,
+    evaluate_readiness,
+    validate_passed_artifacts,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,6 +113,37 @@ class NativeG0ReadinessTests(unittest.TestCase):
             [row["status"] for row in result["requirements"]],
             ["insufficient-evidence", "failed"],
         )
+
+    def test_passed_artifact_bytes_must_match_the_bound_digest(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "evidence.json"
+            artifact.write_bytes(b"canonical")
+            result = {
+                "requirements": [
+                    {
+                        "id": "types",
+                        "status": "passed",
+                        "artifact": "evidence.json",
+                        "artifact_sha256": (
+                            "a3a7b7569607cbd40b16e3717c44068e174f1f5442923f01d09a30c4e8d8f9e6"
+                        ),
+                    }
+                ]
+            }
+            with self.assertRaisesRegex(GateFailure, "SHA-256 mismatch"):
+                validate_passed_artifacts(root, result)
+
+            result["requirements"][0]["artifact_sha256"] = __import__(
+                "hashlib"
+            ).sha256(b"canonical").hexdigest()
+            validate_passed_artifacts(root, result)
+
+            result["requirements"][0]["artifact"] = "../outside.json"
+            with self.assertRaisesRegex(GateFailure, "escapes repository root"):
+                validate_passed_artifacts(root, result)
 
     def test_passed_evidence_requires_a_canonical_sha256_binding(self) -> None:
         profile = {
