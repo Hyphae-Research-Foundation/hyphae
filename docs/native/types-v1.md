@@ -2,9 +2,10 @@
 
 Status: normative target contract; identities, logical-type descriptors,
 primitive scalar storage, and primitive ordered-index components are
-implemented in `hyphae-native-types`. Canonical arrays now have a checked,
-self-delimiting storage codec with nested/null support. Canonical JSON, maps,
-and vectors remain target-only value codecs.
+implemented in `hyphae-native-types`. Canonical arrays and maps now have
+checked, self-delimiting storage codecs with nested/null support and strict
+canonical key order. Canonical JSON and vectors remain target-only value
+codecs.
 
 This specification defines the types and stable identities shared by the
 native relational, structure, and search engines. Public SQL and local-wire
@@ -73,8 +74,12 @@ null bitmap. Inside canonical arrays, each element carries an explicit null or
 value marker. Array storage is `u32 count` followed by each element as `0x00`
 for null or `0x01 + u32 byte length + canonical element payload`. Counts above
 100,000, truncation, trailing bytes, invalid markers, and aggregate values over
-16 MiB fail closed. Canonical value codecs for `JSON`, `MAP`, and `VECTOR` are
-not defined in this slice and reject use explicitly.
+16 MiB fail closed. Map storage is `u32 count`; each entry carries a length-
+prefixed non-null canonical key followed by `0x00` for a null value or `0x01 +
+u32 byte length + canonical value payload`. Keys must be strictly increasing by
+their declared ordered encoding, making duplicates and unsorted maps
+noncanonical. Canonical value codecs for `JSON` and `VECTOR` are not defined in
+this slice and reject use explicitly.
 
 ## Ordered-index component v1
 
@@ -241,5 +246,5 @@ plus exact value-order agreement with memcomparable bytes. The records crate
 consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
-consume this exact corpus. Nested arrays have canonical storage coverage;
-canonical JSON, maps, vectors, and nested ordered codecs remain required.
+consume this exact corpus. Nested arrays and maps have canonical storage
+coverage; canonical JSON, vectors, and nested ordered codecs remain required.
