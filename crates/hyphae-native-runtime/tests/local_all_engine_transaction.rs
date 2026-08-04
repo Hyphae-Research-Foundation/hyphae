@@ -922,10 +922,9 @@ mod unix {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
-        time::{SystemTime, UNIX_EPOCH},
     };
 
     use hyphae_native_runtime::{
@@ -957,11 +956,13 @@ mod unix {
 
     struct TemporaryDirectory(PathBuf);
 
+    static NEXT_TEMPORARY_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
     impl TemporaryDirectory {
         fn create() -> Result<Self, TestError> {
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let path = Path::new("/tmp")
-                .join(format!("hy-transaction-{}-{timestamp}", std::process::id()));
+            let ordinal = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("hy-transaction-{}-{ordinal}", std::process::id()));
             fs::create_dir(&path)?;
             Ok(Self(path))
         }
