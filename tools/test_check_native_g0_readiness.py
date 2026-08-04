@@ -117,6 +117,14 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertIn("--inject-requirement benchmark-and-quality-corpus", workflow)
         self.assertIn("native-quality-aggregate.json", workflow)
         self.assertIn("native-g0-evidence-with-quality.json", workflow)
+        conformance_workflow = (
+            ROOT / ".github/workflows/native-conformance.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "--inject-requirement local-protocol-goldens-and-conformance",
+            conformance_workflow,
+        )
+        self.assertIn("native-g0-evidence-with-conformance.json", conformance_workflow)
 
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
