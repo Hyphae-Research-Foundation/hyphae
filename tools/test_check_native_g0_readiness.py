@@ -54,6 +54,17 @@ class NativeG0ReadinessTests(unittest.TestCase):
             ],
         )
 
+    def test_types_hosted_workflow_runs_complete_cross_crate_corpus(self) -> None:
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(encoding="utf-8")
+        self.assertIn("Audit canonical native types", workflow)
+        self.assertIn("canonical_value_golden_fixtures", workflow)
+        self.assertIn("-p hyphae-native-types", workflow)
+        self.assertIn("-p hyphae-native-records", workflow)
+        self.assertIn("-p hyphae-native-pages", workflow)
+        self.assertIn("-p hyphae-native-wal", workflow)
+        self.assertIn("-p hyphae-native-runtime", workflow)
+        self.assertIn("native-types-audit.json", workflow)
+
     def test_all_exact_evidence_must_pass_at_the_required_level(self) -> None:
         profile = {
             "schema": "hyphae-native-g0-profile-v1",

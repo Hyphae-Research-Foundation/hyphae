@@ -57,6 +57,45 @@ jobs:
           python tools/check_native_dependencies.py \
             --require-clean \
             --output native-dependency-audit.json
+      - name: Audit canonical native types
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test \
+            -p hyphae-native-types \
+            -p hyphae-native-records \
+            -p hyphae-native-pages \
+            -p hyphae-native-wal \
+            -p hyphae-native-runtime \
+            --test scalar_goldens --locked
+          cargo test -p hyphae-native-types --locked
+          grep -q canonical_value_golden_fixtures \
+            crates/hyphae-native-types/src/lib.rs
+          python - <<'PY' > native-types-audit.json
+          import hashlib, json, pathlib, subprocess
+          files = [
+              "Cargo.lock",
+              "crates/hyphae-native-types/src/lib.rs",
+              "crates/hyphae-native-records/tests/scalar_goldens.rs",
+              "crates/hyphae-native-pages/tests/scalar_goldens.rs",
+              "crates/hyphae-native-wal/tests/scalar_goldens.rs",
+              "crates/hyphae-native-runtime/tests/scalar_goldens.rs",
+          ]
+          print(json.dumps({
+              "schema": "hyphae-native-types-audit-v1",
+              "status": "passed",
+              "source_commit": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "fixture_count": 17,
+              "consumers": ["records", "pages", "wal", "local-protocol"],
+              "artifacts": {
+                  path: hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+                  for path in files
+              },
+          }, indent=2, sort_keys=True))
+          PY
+          python -m json.tool native-types-audit.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -69,6 +108,14 @@ jobs:
           set -e
           test "$status" -eq 0 || test "$status" -eq 1
           python -m json.tool native-g0-readiness.json >/dev/null
+      - name: Upload canonical native type evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-types-audit
+          path: native-types-audit.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Upload native G0 readiness
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
