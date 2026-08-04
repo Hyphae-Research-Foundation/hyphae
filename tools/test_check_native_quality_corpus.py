@@ -10,6 +10,7 @@ from tools.check_native_quality_corpus import (
     validate_ann_receipt,
     validate_corpus,
     validate_lexical_receipt,
+    validate_quality_receipt_set,
 )
 
 
@@ -197,6 +198,44 @@ class NativeQualityCorpusTests(unittest.TestCase):
         receipt["document_count"] = 0
         with self.assertRaisesRegex(GateFailure, "positive scale"):
             validate_lexical_receipt(receipt)
+    def test_quality_receipt_set_aggregates_exact_lexical_and_ann_evidence(self) -> None:
+        lexical = json.loads(
+            (ROOT / "docs/gates/evidence/native-lexical-quality-macos.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ann = json.loads(
+            (ROOT / "docs/gates/evidence/native-ann-kernel-wsl2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        result = validate_quality_receipt_set(lexical, ann)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["evidence_scope"], "bounded-observation")
+        self.assertEqual(result["engines"], ["ann", "lexical"])
+        self.assertFalse(result["production_scale"])
+        self.assertEqual(result["total_observations"], 104)
+
+    def test_quality_receipt_set_never_promotes_one_bounded_engine(self) -> None:
+        lexical = {
+            "schema": "hyphae-native-lexical-quality-v1",
+            "source_commit": "a" * 40,
+            "dataset_digest": "b" * 64,
+            "document_count": 1_000_000,
+            "query_count": 1_000,
+            "top_k": 25,
+            "exact_score_order_equivalence": True,
+            "reopen_equivalence": True,
+            "query_result_digests": [f"{value:064x}" for value in range(1_000)],
+        }
+        ann = json.loads(
+            (ROOT / "docs/gates/evidence/native-ann-kernel-wsl2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        result = validate_quality_receipt_set(lexical, ann)
+        self.assertFalse(result["production_scale"])
+        self.assertEqual(result["evidence_scope"], "bounded-observation")
 
 
 if __name__ == "__main__":
