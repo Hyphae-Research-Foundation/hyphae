@@ -38,6 +38,13 @@ G0 must close these decisions before production implementation:
 - strict, group and memory durability classes; and
 - the reproducible performance and quality corpus.
 
+G0 requires a reproducible hosted corpus and bounded quality receipts that
+freeze generators, identities, reference semantics, metrics, and replay. It
+does not require the final product-scale performance claim. Production-scale
+latency and saturation remain G7 evidence; search quality at the complete
+feature and target corpus remains G4 evidence. Those later gates may supply
+inputs to G0, but G0 cannot silently claim their closure.
+
 No disk format, public API, or crate boundary should be frozen before the
 relevant G0 contract is reviewable.
 
