@@ -1,0 +1,40 @@
+{
+  "schema": "hyphae-native-conformance-profile-v1",
+  "surfaces": [
+    {
+      "id": "local-frame-codec",
+      "command": "cargo test -p hyphae-native-runtime local_protocol --locked",
+      "required_platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "id": "local-structure-get",
+      "command": "cargo test -p hyphae-native-runtime --test local_structure_get --locked",
+      "required_platforms": ["linux", "macos"]
+    },
+    {
+      "id": "local-structure-set-ttl",
+      "command": "cargo test -p hyphae-native-runtime --test local_structure_set_ttl --locked",
+      "required_platforms": ["linux", "macos"]
+    },
+    {
+      "id": "local-search-match",
+      "command": "cargo test -p hyphae-native-runtime --test local_search_match --locked",
+      "required_platforms": ["linux", "macos"]
+    },
+    {
+      "id": "local-sql-select",
+      "command": "cargo test -p hyphae-native-runtime --test local_sql_select --locked",
+      "required_platforms": ["linux", "macos"]
+    },
+    {
+      "id": "local-all-engine-transaction",
+      "command": "cargo test -p hyphae-native-runtime --test local_all_engine_transaction --locked",
+      "required_platforms": ["linux", "macos"]
+    },
+    {
+      "id": "local-uds-transport",
+      "command": "cargo test -p hyphae-native-runtime --test local_uds_transport --locked",
+      "required_platforms": ["linux", "macos"]
+    }
+  ]
+}
