@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_native_goldens import GateFailure, validate_inventory
+from tools.check_native_goldens import (
+    GateFailure,
+    validate_completeness,
+    validate_inventory,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +26,53 @@ class NativeGoldenInventoryTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["fixture_count"], 10)
         self.assertEqual(result["fixture_count"], len(result["fixtures"]))
+
+    def test_checked_in_requirements_match_the_inventory_exactly(self) -> None:
+        inventory = json.loads(
+            (ROOT / "config/native-golden-inventory.json").read_text(encoding="utf-8")
+        )
+        requirements = json.loads(
+            (ROOT / "config/native-golden-requirements.json").read_text(encoding="utf-8")
+        )
+
+        result = validate_completeness(requirements, inventory)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["required_count"], 10)
+        self.assertEqual(result["inventoried_count"], 10)
+
+    def test_missing_stale_and_duplicate_requirements_fail_closed(self) -> None:
+        inventory = {
+            "schema": "hyphae-native-golden-inventory-v1",
+            "fixtures": [
+                {"id": "one", "producer": "p", "test": "t", "consumer": "c"},
+                {"id": "two", "producer": "p", "test": "t", "consumer": "c"},
+            ],
+        }
+        with self.assertRaisesRegex(GateFailure, "missing required golden"):
+            validate_completeness(
+                {
+                    "schema": "hyphae-native-golden-requirements-v1",
+                    "required_ids": ["one", "two", "three"],
+                },
+                inventory,
+            )
+        with self.assertRaisesRegex(GateFailure, "not required"):
+            validate_completeness(
+                {
+                    "schema": "hyphae-native-golden-requirements-v1",
+                    "required_ids": ["one"],
+                },
+                inventory,
+            )
+        with self.assertRaisesRegex(GateFailure, "duplicate required golden"):
+            validate_completeness(
+                {
+                    "schema": "hyphae-native-golden-requirements-v1",
+                    "required_ids": ["one", "one"],
+                },
+                inventory,
+            )
 
     def test_missing_test_and_duplicate_id_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

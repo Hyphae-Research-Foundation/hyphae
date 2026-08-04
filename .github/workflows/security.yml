@@ -62,6 +62,7 @@ jobs:
           python -m unittest tools/test_check_native_goldens.py -v
           python tools/check_native_goldens.py \
             --inventory config/native-golden-inventory.json \
+            --requirements config/native-golden-requirements.json \
             --output native-golden-audit.json
       - name: Upload native golden evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "hyphae-native-golden-inventory-v1"
+REQUIREMENTS_SCHEMA = "hyphae-native-golden-requirements-v1"
 FIELDS = {"id", "producer", "test", "consumer"}
 
 
@@ -35,6 +36,50 @@ def _path_under(root: Path, value: str, label: str) -> Path:
     if not path.is_file():
         raise GateFailure(f"{label} is missing: {value}")
     return path
+
+
+def validate_completeness(
+    requirements: dict[str, Any], inventory: dict[str, Any]
+) -> dict[str, Any]:
+    """Require the reviewed golden set and live inventory to match exactly."""
+
+    if requirements.get("schema") != REQUIREMENTS_SCHEMA or set(requirements) != {
+        "schema",
+        "required_ids",
+    }:
+        raise GateFailure("unsupported or malformed golden requirements")
+    required_ids = requirements.get("required_ids")
+    if not isinstance(required_ids, list) or not required_ids:
+        raise GateFailure("required_ids must be a nonempty array")
+    if any(not isinstance(item, str) or not item for item in required_ids):
+        raise GateFailure("required golden IDs must be nonempty strings")
+    if len(required_ids) != len(set(required_ids)):
+        raise GateFailure("duplicate required golden ID")
+    if inventory.get("schema") != SCHEMA:
+        raise GateFailure("unsupported golden inventory")
+    fixtures = inventory.get("fixtures")
+    if not isinstance(fixtures, list):
+        raise GateFailure("fixtures must be an array")
+    inventoried_ids: list[str] = []
+    for item in fixtures:
+        fixture_id = _mapping(item, "fixture").get("id")
+        if not isinstance(fixture_id, str):
+            raise GateFailure("inventoried golden ID must be a string")
+        inventoried_ids.append(fixture_id)
+    required = set(required_ids)
+    inventoried = set(inventoried_ids)
+    missing = required - inventoried
+    if missing:
+        raise GateFailure("missing required golden: " + ", ".join(sorted(missing)))
+    stale = inventoried - required
+    if stale:
+        raise GateFailure("inventoried golden is not required: " + ", ".join(sorted(stale)))
+    return {
+        "status": "passed",
+        "required_count": len(required_ids),
+        "inventoried_count": len(inventoried_ids),
+        "required_ids": required_ids,
+    }
 
 
 def validate_inventory(root: Path, inventory: dict[str, Any]) -> dict[str, Any]:
@@ -87,13 +132,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--inventory", type=Path, required=True)
+    parser.add_argument("--requirements", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
-        result = validate_inventory(
-            args.root,
-            json.loads(args.inventory.read_text(encoding="utf-8")),
+        inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
+        completeness = validate_completeness(
+            json.loads(args.requirements.read_text(encoding="utf-8")), inventory
         )
+        result = validate_inventory(args.root, inventory)
+        result["required_count"] = completeness["required_count"]
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native golden inventory failed: {error}")
         return 2
