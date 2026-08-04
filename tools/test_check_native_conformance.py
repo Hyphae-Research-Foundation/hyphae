@@ -8,6 +8,7 @@ from tools.check_native_conformance import (
     GateFailure,
     run_profile,
     validate_profile,
+    validate_receipt,
 )
 
 
@@ -127,6 +128,65 @@ class NativeConformanceProfileTests(unittest.TestCase):
             run_profile({"status": "passed", "surfaces": []}, "plan9", lambda _: 0)
         with self.assertRaisesRegex(GateFailure, "validated profile"):
             run_profile({"status": "failed", "surfaces": []}, "linux", lambda _: 0)
+    def test_receipt_must_cover_exact_platform_surfaces_and_consistent_counts(self) -> None:
+        profile = {
+            "schema": "hyphae-native-conformance-profile-audit-v1",
+            "status": "passed",
+            "surfaces": [
+                {"id": "one", "required_platforms": ["linux", "macos"]},
+                {"id": "two", "required_platforms": ["linux"]},
+            ],
+        }
+        receipt = {
+            "schema": "hyphae-native-conformance-receipt-v1",
+            "platform": "linux",
+            "status": "passed",
+            "required_count": 2,
+            "passed_count": 2,
+            "results": [
+                {"id": "one", "command": "cargo test one --locked", "status": "passed", "exit_code": 0},
+                {"id": "two", "command": "cargo test two --locked", "status": "passed", "exit_code": 0},
+            ],
+        }
+        validate_receipt(profile, receipt)
+
+        receipt["results"].pop()
+        with self.assertRaisesRegex(GateFailure, "coverage"):
+            validate_receipt(profile, receipt)
+        receipt["results"].append(
+            {"id": "two", "command": "cargo test two --locked", "status": "failed", "exit_code": 1}
+        )
+        with self.assertRaisesRegex(GateFailure, "summary"):
+            validate_receipt(profile, receipt)
+
+    def test_receipt_rejects_unknown_fields_duplicate_results_and_inconsistent_exit(self) -> None:
+        profile = {
+            "schema": "hyphae-native-conformance-profile-audit-v1",
+            "status": "passed",
+            "surfaces": [{"id": "one", "required_platforms": ["linux"]}],
+        }
+        receipt = {
+            "schema": "hyphae-native-conformance-receipt-v1",
+            "platform": "linux",
+            "status": "passed",
+            "required_count": 1,
+            "passed_count": 1,
+            "results": [
+                {"id": "one", "command": "cargo test one --locked", "status": "passed", "exit_code": 1}
+            ],
+        }
+        with self.assertRaisesRegex(GateFailure, "exit code"):
+            validate_receipt(profile, receipt)
+        receipt["results"][0]["exit_code"] = 0
+        receipt["extra"] = True
+        with self.assertRaisesRegex(GateFailure, "unknown receipt field"):
+            validate_receipt(profile, receipt)
+        receipt.pop("extra")
+        receipt["results"].append(dict(receipt["results"][0]))
+        receipt["required_count"] = 2
+        receipt["passed_count"] = 2
+        with self.assertRaisesRegex(GateFailure, "duplicate result"):
+            validate_receipt(profile, receipt)
 
 
 if __name__ == "__main__":
