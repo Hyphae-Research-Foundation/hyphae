@@ -198,6 +198,28 @@ class NativeQualityCorpusTests(unittest.TestCase):
         receipt["document_count"] = 0
         with self.assertRaisesRegex(GateFailure, "positive scale"):
             validate_lexical_receipt(receipt)
+    def test_g0_requires_reproducible_hosted_corpus_not_g7_production_scale(self) -> None:
+        profile = json.loads(
+            (ROOT / "config/native-g0-readiness-profile.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        requirements = {
+            row["id"]: row["required_evidence_level"]
+            for row in profile["requirements"]
+        }
+        self.assertEqual(requirements["benchmark-and-quality-corpus"], "hosted")
+
+        gate = (ROOT / "docs/gates/native-local-phase-1.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "G0 requires a reproducible hosted corpus and bounded quality receipts",
+            gate,
+        )
+        self.assertIn("Production-scale", gate)
+        self.assertIn("latency and saturation remain G7 evidence", gate)
+
     def test_quality_receipt_set_aggregates_exact_lexical_and_ann_evidence(self) -> None:
         lexical = json.loads(
             (ROOT / "docs/gates/evidence/native-lexical-quality-macos.json").read_text(
