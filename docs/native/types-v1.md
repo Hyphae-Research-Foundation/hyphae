@@ -232,5 +232,8 @@ domains, float NaN/zero canonicalization, and descriptor golden bytes. Property
 tests now cover every implemented primitive family: signed and unsigned
 integers, decimal, float32/float64 canonicalization and total order, text,
 binary, date, time, timestamp, interval, and UUID storage/ordered round trips
-plus exact value-order agreement with memcomparable bytes. Nested value codecs
-and cross-crate golden consumption remain required.
+plus exact value-order agreement with memcomparable bytes. The records crate
+consumes one frozen 13-family primitive corpus directly from
+`hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
+Nested value codecs and additional page, WAL, and local-protocol consumers
+remain required.

@@ -1487,12 +1487,80 @@ fn decode_memcomparable_bytes(encoded: &[u8]) -> Result<Vec<u8>, NativeTypeError
     Err(NativeTypeError::InvalidScalarEncoding)
 }
 
+/// One frozen primitive scalar fixture consumed by native storage layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimitiveScalarGolden {
+    /// Declared logical type.
+    pub logical_type: LogicalType,
+    /// Canonical logical value.
+    pub value: ScalarValue,
+    /// Canonical row/storage payload.
+    pub storage: Vec<u8>,
+    /// Canonical ordered-index component including its non-null marker.
+    pub ordered: Vec<u8>,
+}
+
+/// Returns the frozen cross-crate primitive scalar corpus.
+///
+/// # Errors
+///
+/// Returns an error only if an internal fixture declaration violates a checked
+/// logical-type bound.
+pub fn primitive_scalar_golden_fixtures() -> Result<Vec<PrimitiveScalarGolden>, NativeTypeError> {
+    let decimal = DecimalType::new(6, 2)?;
+    let declarations = [
+        (LogicalType::Boolean, ScalarValue::Boolean(true)),
+        (
+            LogicalType::Signed(IntegerWidth::Bits16),
+            ScalarValue::Signed(-2),
+        ),
+        (
+            LogicalType::Unsigned(IntegerWidth::Bits16),
+            ScalarValue::Unsigned(0x1234),
+        ),
+        (LogicalType::Decimal(decimal), ScalarValue::Decimal(-12_345)),
+        (
+            LogicalType::Float32,
+            ScalarValue::Float32(CanonicalF32::new(-1.5)),
+        ),
+        (
+            LogicalType::Float64,
+            ScalarValue::Float64(CanonicalF64::new(f64::NAN)),
+        ),
+        (LogicalType::Text, ScalarValue::Text("A\0B".to_owned())),
+        (LogicalType::Binary, ScalarValue::Binary(vec![0, 0xff])),
+        (LogicalType::Date, ScalarValue::Date(-1)),
+        (LogicalType::Time, ScalarValue::Time(1)),
+        (LogicalType::Timestamp, ScalarValue::Timestamp(-2)),
+        (
+            LogicalType::Interval,
+            ScalarValue::Interval {
+                months: -1,
+                days: 2,
+                nanoseconds: -3,
+            },
+        ),
+        (LogicalType::Uuid, ScalarValue::Uuid([0x11; 16])),
+    ];
+    declarations
+        .into_iter()
+        .map(|(logical_type, value)| {
+            Ok(PrimitiveScalarGolden {
+                storage: value.encode_storage(&logical_type)?,
+                ordered: value.encode_ordered_component(&logical_type)?,
+                logical_type,
+                value,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, DirectoryUuid, HistoryEpoch,
         IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
-        ScalarValue, VectorElement, VectorType,
+        ScalarValue, VectorElement, VectorType, primitive_scalar_golden_fixtures,
     };
     use proptest::prelude::*;
 
@@ -1816,6 +1884,21 @@ mod tests {
             let right_bytes = ScalarValue::Binary(right.clone()).encode_ordered_component(&logical_type)?;
             prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
         }
+    }
+
+    #[test]
+    fn primitive_scalar_golden_corpus_is_frozen() -> Result<(), NativeTypeError> {
+        let fixtures = primitive_scalar_golden_fixtures()?;
+        assert_eq!(fixtures.len(), 13);
+        assert_eq!(fixtures[0].storage, [1]);
+        assert_eq!(fixtures[0].ordered, [1, 1]);
+        assert_eq!(fixtures[1].storage, [0xfe, 0xff]);
+        assert_eq!(fixtures[1].ordered, [1, 0x7f, 0xfe]);
+        assert_eq!(fixtures[6].storage, b"A\0B");
+        assert_eq!(fixtures[6].ordered, [1, b'A', 0, 0xff, b'B', 0, 0]);
+        assert_eq!(fixtures[12].storage, [0x11; 16]);
+        assert_eq!(fixtures[12].ordered, [vec![1], vec![0x11; 16]].concat());
+        Ok(())
     }
 
     #[test]
