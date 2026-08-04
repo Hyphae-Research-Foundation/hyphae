@@ -24,7 +24,7 @@ jobs:
           python-version: 3.11.15
       - name: Find successful producer runs for the exact commit
         id: runs
-        uses: actions/github-script@c1a9c1e1f36c44f6f9b7c8fcae7ce5ac1030f939 # v8.0.0
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             const sha = context.payload.pull_request?.head.sha || context.sha;
