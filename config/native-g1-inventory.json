@@ -1,0 +1,60 @@
+{
+  "schema": "hyphae-native-g1-inventory-v1",
+  "gate": "G1",
+  "requirements": [
+    {
+      "id": "native-page-blob-wal-catalog-mvcc",
+      "status": "implemented-unhosted",
+      "commands": [
+        "cargo test -p hyphae-native-pages -p hyphae-native-blobs -p hyphae-native-wal -p hyphae-native-catalog -p hyphae-native-mvcc --locked"
+      ]
+    },
+    {
+      "id": "partitioned-memory-and-scheduler",
+      "status": "implemented-unhosted",
+      "commands": [
+        "cargo test -p hyphae-native-pages buffer_pool --locked",
+        "cargo test -p hyphae-native-runtime commit_scheduler --locked"
+      ]
+    },
+    {
+      "id": "no-redb-on-native-target-path",
+      "status": "implemented-unhosted",
+      "commands": [
+        "cargo tree -p hyphae-native-runtime --locked"
+      ]
+    },
+    {
+      "id": "three-engine-minimal-vertical",
+      "status": "implemented-unhosted",
+      "commands": [
+        "cargo test -p hyphae-native-runtime --test local_sql_select --test local_structure_set_ttl --test local_search_match --locked"
+      ]
+    },
+    {
+      "id": "single-csn-all-engine-commit",
+      "status": "implemented-unhosted",
+      "commands": [
+        "cargo test -p hyphae-native-runtime --test local_all_engine_transaction --test delta_all_engine_transaction --locked"
+      ]
+    },
+    {
+      "id": "commit-checkpoint-crash-matrix",
+      "status": "partial",
+      "commands": [
+        "cargo test -p hyphae-native-runtime every_checkpoint_boundary_recovers_anchored_or_unanchored_state --locked",
+        "cargo run -p hyphae-native-runtime --example process_crash_matrix --locked"
+      ],
+      "gap": "One hosted aggregate must prove every commit and checkpoint boundary with exact prior-or-complete-CSN recovery semantics."
+    },
+    {
+      "id": "embedded-and-local-protocol-latency",
+      "status": "partial",
+      "commands": [
+        "cargo run -p hyphae-native-runtime --example microsecond_smoke --locked",
+        "cargo run -p hyphae-native-runtime --example uds_all_engine_transaction_smoke --locked"
+      ],
+      "gap": "One hosted receipt must bind both embedded and local-protocol observations on the exact commit without claiming G7 scale."
+    }
+  ]
+}
