@@ -64,6 +64,16 @@ class NativeG1ReadinessTests(unittest.TestCase):
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["passed"], 7)
 
+    def test_hosted_workflow_produces_exact_sha_substrate_and_crash_receipts(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g1.yml").read_text(encoding="utf-8")
+        self.assertIn("cargo test -p hyphae-native-pages", workflow)
+        self.assertIn("tools/check_native_g1_substrate.py", workflow)
+        self.assertIn("--example process_crash_matrix", workflow)
+        self.assertIn("tools/check_native_g1_crash_receipt.py", workflow)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", workflow)
+        self.assertIn("native-g1-substrate-audit.json", workflow)
+        self.assertIn("native-g1-crash-audit.json", workflow)
+
     def test_missing_digest_or_lower_level_fails_closed(self) -> None:
         profile = self.profile()
         evidence = self.baseline()

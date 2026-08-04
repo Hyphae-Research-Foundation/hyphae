@@ -1,0 +1,68 @@
+name: Native G1 Substrate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  substrate:
+    name: G1 substrate and crash evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@5d4589f9e56f52d2d495721a11cfd02e1a5db6a9
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Verify G1 validators
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_g1_readiness \
+            tools.test_check_native_g1_inventory \
+            tools.test_check_native_g1_substrate \
+            tools.test_check_native_g1_crash_receipt -v
+      - name: Execute native kernel suites
+        run: |
+          cargo test -p hyphae-native-pages \
+            -p hyphae-native-blobs \
+            -p hyphae-native-wal \
+            -p hyphae-native-catalog \
+            -p hyphae-native-mvcc --locked
+      - name: Audit native target dependency closure
+        run: |
+          PYTHONPATH=. python tools/check_native_g1_substrate.py \
+            --output native-g1-substrate-audit.json
+          python -m json.tool native-g1-substrate-audit.json >/dev/null
+      - name: Execute and validate complete process crash matrix
+        run: |
+          cargo run -q -p hyphae-native-runtime \
+            --example process_crash_matrix --locked -- \
+            "${{ github.event.pull_request.head.sha || github.sha }}" \
+            github-actions-ubuntu \
+            > native-g1-process-crash-matrix.json
+          PYTHONPATH=. python tools/check_native_g1_crash_receipt.py \
+            --receipt native-g1-process-crash-matrix.json \
+            --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --output native-g1-crash-audit.json
+          python -m json.tool native-g1-crash-audit.json >/dev/null
+      - name: Upload G1 substrate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g1-substrate-evidence
+          path: |
+            native-g1-substrate-audit.json
+            native-g1-process-crash-matrix.json
+            native-g1-crash-audit.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
