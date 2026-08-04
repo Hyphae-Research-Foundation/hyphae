@@ -20,30 +20,28 @@
   <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
 </p>
 
-Hyphae is an autonomous, embeddable, and verifiable data engine written in
-Rust. Its base deployment is one native `hyphae` executable and one data
-directory. KV, structured query, recovery, and verification work offline
-without a database, cache, cloud service, embedding provider, or LLM.
+Hyphae is a local-first data engine written in Rust. One process owns one data
+directory and exposes relational SQL, native structures, lexical search, and
+vector search over a shared transaction, WAL, MVCC, recovery, and proof
+substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
+OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Latest published release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
-Its annotated tag peels to
-`08028e8dac077846c638f067ce74fbcf6fb75501`, and all ten publishable Rust
-workspace crates are available on crates.io at version `0.2.1`. This release
-accepts large but bounded offline snapshot witnesses and adds SemVer-compatible
-bounded query, recovery, snapshot, and compaction paths used by the packaged
-CLI/server. The published `0.2.0` embedded entry points retain their
-signatures, exhaustive error surfaces, and compatibility behavior. See the
-[`0.2.1` publication receipt](docs/release/receipts/0.2.1.md) for exact source,
-tag, workflow, artifact, and registry identities.
+**Development line:** Hyphae Native is the active architecture on `dev`. Its G0
+foundation gate is closed with hosted, content-bound evidence across eight
+requirements: versioned contracts, canonical types and encodings, page/row/blob/
+WAL/MVCC goldens, SQL/structures/search/ANN semantics, local protocol
+conformance on Linux/macOS/Windows, bounded lexical and ANN quality receipts,
+dependency/license/transitive-unsafe review, and clean-room provenance.
 
-**Forward architecture:** Hyphae is now targeting a fully native local data
-ecosystem with its own relational/SQL, keyspace/structure, and lexical/vector
-search engines. They will share one Hyphae-owned transaction, memory,
-durability, recovery, and proof substrate without embedding PostgreSQL,
-Valkey, OpenSearch, or another database engine. This is an accepted target,
-not shipped `0.2.1` behavior. See the
-[native architecture](docs/architecture/native-local-ecosystem.md) and its
-[ordered phase-1 gate](docs/gates/native-local-phase-1.md).
+**Published stable release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1)
+is still the version available from crates.io and GitHub Releases. It is the
+compatibility baseline, not a description of the current `dev` architecture.
+Its publication receipt remains available at
+[`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
+
+The target release for the native line is `1.0.0`. G1-G8 remain development
+gates and `main` will not receive the native line until the complete product is
+implemented, tested, and ready to replace `0.2.1`.
 
 ## What Hyphae does
 
@@ -193,21 +191,23 @@ Start at the [documentation index](docs/README.md). Key guides:
 
 ## Product boundary
 
+Hyphae Native is a local, single-node data ecosystem with Hyphae-owned SQL,
+structures, lexical search, and ANN under one durable authority. G0 freezes and
+verifies that foundation; it does not claim that the remaining `1.0.0` gates
+are complete.
+
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
-runtime, a hosted SaaS, or a framework-specific data layer. Release `0.2.1`
-does not ship SQL, replication, clustering, built-in TLS, at-rest encryption,
-multitenancy, billing, a control plane, an embedding model, or an LLM.
+runtime, a hosted SaaS, or a framework-specific data layer. The published
+`0.2.1` release does not include the native SQL/structures/search architecture
+now present on `dev`. Replication, clustering, built-in TLS, at-rest encryption,
+multitenancy, billing, a control plane, an embedding model, and an LLM are also
+outside `0.2.1`.
 
-The phase-1 target deliberately adds Hyphae-owned relational SQL, native
-keyspace structures, and native lexical/vector search inside the same local
-process. It does not add an external database, cache, search service, model, or
-cloud dependency. Hosted, distributed, and model-driven programs remain later
-phases.
-
-Applications own process supervision, remote TLS termination, filesystem
-permissions, backup media policy, and optional embedding providers. Semantic
-providers can supply vectors to the Rust retrieval API but never become a core
-dependency or authority.
+Hosted, distributed, and model-driven programs remain later phases. Applications
+still own process supervision, remote TLS termination, filesystem permissions,
+backup media policy, and optional embedding providers. Semantic providers can
+supply vectors to the Rust APIs but never become a core dependency or source of
+authority.
 
 ## Repository map
 
