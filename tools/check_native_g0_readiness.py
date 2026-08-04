@@ -165,18 +165,81 @@ def validate_passed_artifacts(root: Path, result: dict[str, Any]) -> None:
             raise GateFailure(f"passed artifact SHA-256 mismatch: {artifact}")
 
 
+def inject_evidence(
+    root: Path,
+    evidence: dict[str, Any],
+    profile: dict[str, Any],
+    requirement_id: str,
+    evidence_level: str,
+    artifact: str,
+) -> dict[str, Any]:
+    """Return a copy with one validated, content-bound passed artifact."""
+
+    requirements = {entry["id"] for entry in _requirements(_mapping(profile, "profile"))}
+    if requirement_id not in requirements:
+        raise GateFailure(f"unknown injected requirement: {requirement_id}")
+    if evidence_level not in EVIDENCE_LEVELS:
+        raise GateFailure(f"invalid injected evidence level: {evidence_level}")
+    artifact_path = Path(artifact)
+    if artifact_path.is_absolute():
+        raise GateFailure("injected artifact must be repository-relative")
+    resolved_root = root.resolve()
+    resolved_artifact = (resolved_root / artifact_path).resolve()
+    try:
+        resolved_artifact.relative_to(resolved_root)
+    except ValueError as error:
+        raise GateFailure("injected artifact escapes repository root") from error
+    if not resolved_artifact.is_file():
+        raise GateFailure(f"injected artifact is missing: {artifact}")
+    try:
+        artifact_payload = json.loads(resolved_artifact.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateFailure("injected artifact must be valid JSON") from error
+    status = artifact_payload.get("status", artifact_payload.get("result"))
+    if status not in {"passed", "pass"}:
+        raise GateFailure("injected artifact does not report passed status")
+    updated = dict(_mapping(evidence, "evidence"))
+    updated[requirement_id] = {
+        "status": "passed",
+        "evidence_level": evidence_level,
+        "artifact": artifact_path.as_posix(),
+        "artifact_sha256": hashlib.sha256(resolved_artifact.read_bytes()).hexdigest(),
+    }
+    return updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--inject-requirement")
+    parser.add_argument("--inject-level")
+    parser.add_argument("--inject-reference")
+    parser.add_argument("--evidence-output", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
-        result = evaluate_readiness(
-            json.loads(args.profile.read_text(encoding="utf-8")),
-            json.loads(args.evidence.read_text(encoding="utf-8")),
-        )
+        profile = json.loads(args.profile.read_text(encoding="utf-8"))
+        evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
+        injection = (args.inject_requirement, args.inject_level, args.inject_reference)
+        if any(value is not None for value in injection):
+            if not all(value is not None for value in injection):
+                raise GateFailure("all injection arguments are required together")
+            evidence = inject_evidence(
+                args.root,
+                evidence,
+                profile,
+                args.inject_requirement,
+                args.inject_level,
+                args.inject_reference,
+            )
+            if args.evidence_output is not None:
+                args.evidence_output.write_text(
+                    json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+        result = evaluate_readiness(profile, evidence)
         validate_passed_artifacts(args.root, result)
     except (OSError, json.JSONDecodeError, GateFailure) as error:
         print(f"native G0 readiness failed: {error}")

@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.check_native_g0_readiness import (
     GateFailure,
     evaluate_readiness,
+    inject_evidence,
     validate_passed_artifacts,
 )
 
@@ -53,6 +54,50 @@ class NativeG0ReadinessTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_inject_evidence_validates_passed_json_and_binds_exact_bytes(self) -> None:
+        import hashlib
+        import tempfile
+
+        profile = {
+            "schema": "hyphae-native-g0-profile-v1",
+            "gate": "G0",
+            "requirements": [
+                {
+                    "id": "canonical-type-goldens-and-properties",
+                    "required_evidence_level": "hosted",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "types.json"
+            artifact.write_text('{"status":"passed"}\n', encoding="utf-8")
+            evidence = inject_evidence(
+                root,
+                {},
+                profile,
+                "canonical-type-goldens-and-properties",
+                "hosted",
+                "types.json",
+            )
+            record = evidence["canonical-type-goldens-and-properties"]
+            self.assertEqual(record["status"], "passed")
+            self.assertEqual(record["evidence_level"], "hosted")
+            self.assertEqual(
+                record["artifact_sha256"],
+                hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+            artifact.write_text('{"status":"failed"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(GateFailure, "does not report passed"):
+                inject_evidence(
+                    root,
+                    {},
+                    profile,
+                    "canonical-type-goldens-and-properties",
+                    "hosted",
+                    "types.json",
+                )
 
     def test_types_hosted_workflow_runs_complete_cross_crate_corpus(self) -> None:
         workflow = (ROOT / ".github/workflows/security.yml").read_text(encoding="utf-8")
