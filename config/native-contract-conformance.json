@@ -1,0 +1,46 @@
+{
+  "schema": "hyphae-native-contract-conformance-v1",
+  "requirement": "sql-structure-search-ann-contracts",
+  "surfaces": [
+    {
+      "id": "sql-semantics",
+      "contract": "docs/native/sql-semantics-v1.md",
+      "tests": [
+        "cargo test -p hyphae-native-runtime --test local_sql_select --locked",
+        "cargo test -p hyphae-native-runtime --lib sql::tests --locked"
+      ]
+    },
+    {
+      "id": "structure-semantics",
+      "contract": "docs/native/structures-semantics-v1.md",
+      "tests": [
+        "cargo test -p hyphae-native-runtime --test local_structure_get --locked",
+        "cargo test -p hyphae-native-runtime --test local_structure_set_ttl --locked"
+      ]
+    },
+    {
+      "id": "search-semantics",
+      "contract": "docs/native/search-semantics-v1.md",
+      "tests": [
+        "cargo test -p hyphae-native-runtime --test search_document_lifecycle --locked",
+        "cargo test -p hyphae-native-runtime --test search_tombstone_compaction --locked",
+        "cargo test -p hyphae-native-runtime --test local_search_match --locked"
+      ]
+    },
+    {
+      "id": "ann-semantics",
+      "contract": "docs/native/ann-semantics-v1.md",
+      "tests": [
+        "cargo test -p hyphae-native-ann --locked"
+      ]
+    },
+    {
+      "id": "cross-engine-atomicity",
+      "contract": "docs/native/mvcc-commit-v1.md",
+      "tests": [
+        "cargo test -p hyphae-native-runtime --test local_all_engine_transaction --locked",
+        "cargo test -p hyphae-native-runtime --test delta_all_engine_transaction --locked"
+      ]
+    }
+  ]
+}
