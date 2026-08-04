@@ -112,8 +112,11 @@ invalid escapes, noncanonical float bits, wrong fixed widths, and
 out-of-domain values. Ordered arrays encode each complete element component
 through the same zero-byte escaping used by text and binary, concatenate those
 self-delimiting components, and end with `00 00`. This preserves lexicographic
-array order, including SQL null elements and prefix arrays. Ordered codecs for
-`JSON`, `MAP`, and `VECTOR` remain undefined and fail explicitly.
+array order, including SQL null elements and prefix arrays. Ordered maps use
+the same framing over alternating key/value ordered components and require
+strictly increasing non-null keys. This preserves lexicographic entry order and
+nullable values. Ordered codecs for `JSON` and `VECTOR` remain undefined and
+fail explicitly.
 
 ## Directory lineage identity
 
@@ -252,5 +255,5 @@ consumes one frozen 13-family primitive corpus directly from
 `hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
 Records, pages, WAL, and the native runtime/local-protocol test surface all
 consume this exact corpus. Nested arrays, maps, and vectors have canonical
-storage coverage, and arrays have canonical ordered coverage. Canonical JSON
-and ordered map/vector codecs remain required.
+storage coverage, and arrays/maps have canonical ordered coverage. Canonical
+JSON and the ordered vector codec remain required.
