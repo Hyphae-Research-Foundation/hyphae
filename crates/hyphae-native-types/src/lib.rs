@@ -1494,6 +1494,7 @@ mod tests {
         IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
         ScalarValue, VectorElement, VectorType,
     };
+    use proptest::prelude::*;
 
     #[test]
     fn lineage_identity_has_canonical_text_and_binary_forms() -> Result<(), NativeTypeError> {
@@ -1577,6 +1578,107 @@ mod tests {
             Err(NativeTypeError::InvalidDecimalScale)
         );
         assert_eq!(DecimalType::new(38, 18).map(DecimalType::scale), Ok(18));
+    }
+
+    proptest! {
+        #[test]
+        fn unsigned_storage_and_ordered_codecs_round_trip(value in any::<u64>()) {
+            let logical_type = LogicalType::Unsigned(IntegerWidth::Bits64);
+            let scalar = ScalarValue::Unsigned(value);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_storage(&logical_type, &storage)?,
+                scalar.clone()
+            );
+            let ordered = scalar.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &ordered)?,
+                scalar
+            );
+        }
+
+        #[test]
+        fn unsigned_ordered_bytes_preserve_value_order(left in any::<u64>(), right in any::<u64>()) {
+            let logical_type = LogicalType::Unsigned(IntegerWidth::Bits64);
+            let left_bytes = ScalarValue::Unsigned(left).encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Unsigned(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+        }
+
+        #[test]
+        fn signed_storage_and_ordered_codecs_round_trip(value in any::<i64>()) {
+            let logical_type = LogicalType::Signed(IntegerWidth::Bits64);
+            let scalar = ScalarValue::Signed(value);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_storage(&logical_type, &storage)?,
+                scalar.clone()
+            );
+            let ordered = scalar.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &ordered)?,
+                scalar
+            );
+        }
+
+        #[test]
+        fn signed_ordered_bytes_preserve_value_order(left in any::<i64>(), right in any::<i64>()) {
+            let logical_type = LogicalType::Signed(IntegerWidth::Bits64);
+            let left_bytes = ScalarValue::Signed(left).encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Signed(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+        }
+
+        #[test]
+        fn text_storage_and_ordered_codecs_round_trip(value in ".{0,128}") {
+            let logical_type = LogicalType::Text;
+            let scalar = ScalarValue::Text(value);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_storage(&logical_type, &storage)?,
+                scalar.clone()
+            );
+            let ordered = scalar.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &ordered)?,
+                scalar
+            );
+        }
+
+        #[test]
+        fn text_ordered_bytes_preserve_value_order(left in ".{0,64}", right in ".{0,64}") {
+            let logical_type = LogicalType::Text;
+            let left_bytes = ScalarValue::Text(left.clone()).encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Text(right.clone()).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.as_bytes().cmp(right.as_bytes()), left_bytes.cmp(&right_bytes));
+        }
+
+        #[test]
+        fn binary_storage_and_ordered_codecs_round_trip(value in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let logical_type = LogicalType::Binary;
+            let scalar = ScalarValue::Binary(value);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_storage(&logical_type, &storage)?,
+                scalar.clone()
+            );
+            let ordered = scalar.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &ordered)?,
+                scalar
+            );
+        }
+
+        #[test]
+        fn binary_ordered_bytes_preserve_value_order(
+            left in proptest::collection::vec(any::<u8>(), 0..128),
+            right in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let logical_type = LogicalType::Binary;
+            let left_bytes = ScalarValue::Binary(left.clone()).encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Binary(right.clone()).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+        }
     }
 
     #[test]
