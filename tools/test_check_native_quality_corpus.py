@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_native_quality_corpus import GateFailure, validate_corpus
+from tools.check_native_quality_corpus import (
+    GateFailure,
+    validate_ann_receipt,
+    validate_corpus,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +79,63 @@ class NativeQualityCorpusTests(unittest.TestCase):
         entry["extra"] = True
         with self.assertRaisesRegex(GateFailure, "unknown corpus field"):
             validate_corpus(ROOT, corpus)
+    def test_checked_in_ann_receipt_is_valid_bounded_observation(self) -> None:
+        receipt = json.loads(
+            (
+                ROOT
+                / "docs/gates/evidence/native-ann-kernel-wsl2.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        result = validate_ann_receipt(receipt)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["evidence_scope"], "bounded-observation")
+        self.assertEqual(result["vector_count"], 10_000)
+        self.assertEqual(result["query_count"], 100)
+        self.assertFalse(result["production_scale"])
+
+    def test_ann_receipt_rejects_bad_recall_scale_digest_and_nonfinite_timings(self) -> None:
+        receipt = json.loads(
+            (
+                ROOT
+                / "docs/gates/evidence/native-ann-kernel-wsl2.json"
+            ).read_text(encoding="utf-8")
+        )
+        receipt["recall_floor_met"] = False
+        with self.assertRaisesRegex(GateFailure, "recall floor"):
+            validate_ann_receipt(receipt)
+        receipt["recall_floor_met"] = True
+        receipt["recall_at_10"] = 0.94
+        with self.assertRaisesRegex(GateFailure, "recall arithmetic"):
+            validate_ann_receipt(receipt)
+        receipt["recall_at_10"] = 0.97
+        receipt["dataset_digest"] = "bad"
+        with self.assertRaisesRegex(GateFailure, "digest"):
+            validate_ann_receipt(receipt)
+        receipt["dataset_digest"] = "d" * 64
+        receipt["hnsw_latency_micros"]["p99"] = float("nan")
+        with self.assertRaisesRegex(GateFailure, "finite latency"):
+            validate_ann_receipt(receipt)
+        receipt["hnsw_latency_micros"]["p99"] = 1.0
+        receipt["vector_count"] = 0
+        with self.assertRaisesRegex(GateFailure, "positive scale"):
+            validate_ann_receipt(receipt)
+
+    def test_ann_receipt_rejects_unknown_fields_and_bad_percentile_order(self) -> None:
+        receipt = json.loads(
+            (
+                ROOT
+                / "docs/gates/evidence/native-ann-kernel-wsl2.json"
+            ).read_text(encoding="utf-8")
+        )
+        receipt["extra"] = True
+        with self.assertRaisesRegex(GateFailure, "unknown ANN receipt field"):
+            validate_ann_receipt(receipt)
+        receipt.pop("extra")
+        receipt["exact_latency_micros"]["p50"] = receipt["exact_latency_micros"]["p95"] + 1
+        with self.assertRaisesRegex(GateFailure, "percentile order"):
+            validate_ann_receipt(receipt)
 
 
 if __name__ == "__main__":
