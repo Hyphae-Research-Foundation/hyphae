@@ -1,0 +1,27 @@
+{
+  "schema": "hyphae-native-clean-room-profile-v1",
+  "ledger": "docs/porting/ledger.md",
+  "historical_inputs": [
+    {
+      "source": "terrizoaguimor/hyphae-v2",
+      "revision": "3d06318fffb15a151520a35bd8b4f5b49954d6c5",
+      "decision": "Exclude"
+    },
+    {
+      "source": "local historical hyphae tree",
+      "revision": "268290e561c309ea24ac12392a6984670c8abccc",
+      "decision": "Rewrite"
+    },
+    {
+      "source": "local celiums-hyphae tree",
+      "revision": "174ebea2aa0b9df4a4bb4ee59d30c74bf76cb8e7",
+      "decision": "Rewrite"
+    },
+    {
+      "source": "celiumsai/hyphae-network",
+      "revision": "b6b630ca44dc549c42a7f921249b1cb210e13337",
+      "decision": "Defer"
+    }
+  ],
+  "human_reviewers": []
+}
