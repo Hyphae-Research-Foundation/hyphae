@@ -65,6 +65,15 @@ jobs:
             --requirements config/native-golden-requirements.json \
             --output native-golden-audit.json
           python -m json.tool native-golden-audit.json >/dev/null
+          python -m unittest tools/test_check_native_quality_corpus -v
+          cargo run -p hyphae-native-runtime \
+            --example lexical_quality_receipt --locked -- \
+            "$(git rev-parse HEAD)" > native-lexical-quality.json
+          python tools/check_native_quality_corpus.py \
+            --lexical-receipt native-lexical-quality.json \
+            --ann-receipt docs/gates/evidence/native-ann-kernel-wsl2.json \
+            --output native-quality-aggregate.json
+          python -m json.tool native-quality-aggregate.json >/dev/null
           set +e
           python tools/check_native_g0_readiness.py \
             --profile config/native-g0-readiness-profile.json \
@@ -78,14 +87,31 @@ jobs:
           set -e
           test "$golden_readiness_status" -eq 0 || test "$golden_readiness_status" -eq 1
           python -m json.tool native-g0-readiness-with-goldens.json >/dev/null
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-goldens.json \
+            --inject-requirement benchmark-and-quality-corpus \
+            --inject-level hosted \
+            --inject-reference native-quality-aggregate.json \
+            --evidence-output native-g0-evidence-with-quality.json \
+            --output native-g0-readiness-with-quality.json
+          quality_readiness_status=$?
+          set -e
+          test "$quality_readiness_status" -eq 0 || test "$quality_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-quality.json >/dev/null
       - name: Upload native golden evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-golden-audit
           path: |
             native-golden-audit.json
+            native-lexical-quality.json
+            native-quality-aggregate.json
             native-g0-evidence-with-goldens.json
             native-g0-readiness-with-goldens.json
+            native-g0-evidence-with-quality.json
+            native-g0-readiness-with-quality.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true
