@@ -57,6 +57,210 @@ jobs:
           python tools/check_native_dependencies.py \
             --require-clean \
             --output native-dependency-audit.json
+      - name: Audit native golden inventory
+        run: |
+          python -m unittest tools/test_check_native_goldens.py -v
+          python tools/check_native_goldens.py \
+            --inventory config/native-golden-inventory.json \
+            --requirements config/native-golden-requirements.json \
+            --output native-golden-audit.json
+          python -m json.tool native-golden-audit.json >/dev/null
+          python -m unittest tools/test_check_native_quality_corpus.py -v
+          cargo run -p hyphae-native-runtime \
+            --example lexical_quality_receipt --locked -- \
+            "$(git rev-parse HEAD)" > native-lexical-quality.json
+          cargo run -p hyphae-native-ann \
+            --example quality_smoke --locked -- \
+            "$(git rev-parse HEAD)" "github-actions-ubuntu" \
+            > native-ann-quality.json
+          python tools/check_native_quality_corpus.py \
+            --lexical-receipt native-lexical-quality.json \
+            --ann-receipt native-ann-quality.json \
+            --output native-quality-aggregate.json
+          python -m json.tool native-quality-aggregate.json >/dev/null
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement page-row-blob-wal-mvcc-goldens \
+            --inject-level hosted \
+            --inject-reference native-golden-audit.json \
+            --evidence-output native-g0-evidence-with-goldens.json \
+            --output native-g0-readiness-with-goldens.json
+          golden_readiness_status=$?
+          set -e
+          test "$golden_readiness_status" -eq 0 || test "$golden_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-goldens.json >/dev/null
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-goldens.json \
+            --inject-requirement benchmark-and-quality-corpus \
+            --inject-level hosted \
+            --inject-reference native-quality-aggregate.json \
+            --evidence-output native-g0-evidence-with-quality.json \
+            --output native-g0-readiness-with-quality.json
+          quality_readiness_status=$?
+          set -e
+          test "$quality_readiness_status" -eq 0 || test "$quality_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-quality.json >/dev/null
+      - name: Upload native golden evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-golden-audit
+          path: |
+            native-golden-audit.json
+            native-lexical-quality.json
+            native-ann-quality.json
+            native-quality-aggregate.json
+            native-g0-evidence-with-goldens.json
+            native-g0-readiness-with-goldens.json
+            native-g0-evidence-with-quality.json
+            native-g0-readiness-with-quality.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Audit canonical native types
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test \
+            -p hyphae-native-types \
+            -p hyphae-native-records \
+            -p hyphae-native-pages \
+            -p hyphae-native-wal \
+            -p hyphae-native-runtime \
+            --test scalar_goldens --locked
+          cargo test -p hyphae-native-types --locked
+          grep -q canonical_value_golden_fixtures \
+            crates/hyphae-native-types/src/lib.rs
+          python - <<'PY' > native-types-audit.json
+          import hashlib, json, pathlib, subprocess
+          files = [
+              "Cargo.lock",
+              "crates/hyphae-native-types/src/lib.rs",
+              "crates/hyphae-native-records/tests/scalar_goldens.rs",
+              "crates/hyphae-native-pages/tests/scalar_goldens.rs",
+              "crates/hyphae-native-wal/tests/scalar_goldens.rs",
+              "crates/hyphae-native-runtime/tests/scalar_goldens.rs",
+          ]
+          print(json.dumps({
+              "schema": "hyphae-native-types-audit-v1",
+              "status": "passed",
+              "source_commit": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "fixture_count": 17,
+              "consumers": ["records", "pages", "wal", "local-protocol"],
+              "artifacts": {
+                  path: hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+                  for path in files
+              },
+          }, indent=2, sort_keys=True))
+          PY
+          python -m json.tool native-types-audit.json >/dev/null
+          python -m unittest tools.test_check_native_contract_conformance -v
+          python tools/check_native_contract_conformance.py \
+            --inventory config/native-contract-conformance.json \
+            --output native-contract-conformance.json
+          python -m json.tool native-contract-conformance.json >/dev/null
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement canonical-type-goldens-and-properties \
+            --inject-level hosted \
+            --inject-reference native-types-audit.json \
+            --evidence-output native-g0-evidence-with-types.json \
+            --output native-g0-readiness-with-types.json
+          types_readiness_status=$?
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence native-g0-evidence-with-types.json \
+            --inject-requirement sql-structure-search-ann-contracts \
+            --inject-level hosted \
+            --inject-reference native-contract-conformance.json \
+            --evidence-output native-g0-evidence-with-contracts.json \
+            --output native-g0-readiness-with-contracts.json
+          contracts_readiness_status=$?
+          set -e
+          test "$types_readiness_status" -eq 0 || test "$types_readiness_status" -eq 1
+          test "$contracts_readiness_status" -eq 0 || test "$contracts_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-types.json >/dev/null
+          python -m json.tool native-g0-readiness-with-contracts.json >/dev/null
+      - name: Inject hosted dependency evidence into G0
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement native-dependency-license-unsafe-audit \
+            --inject-level external-governance \
+            --inject-reference native-dependency-audit.json \
+            --evidence-output native-g0-evidence-with-dependencies.json \
+            --output native-g0-readiness-with-dependencies.json
+          dependency_readiness_status=$?
+          set -e
+          test "$dependency_readiness_status" -eq 0 || test "$dependency_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-dependencies.json >/dev/null
+      - name: Generate clean-room evidence when externally approved
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_check_native_clean_room.py -v
+          if [ "$(python -c 'import json; print(len(json.load(open("config/native-clean-room-profile.json"))["human_reviewers"]))')" -eq 0 ]; then
+            printf '%s\n' '{"schema":"hyphae-native-clean-room-receipt-v1","status":"blocked","reason":"human-review-required"}' \
+              > native-clean-room-receipt.json
+          else
+            python tools/check_native_clean_room.py \
+              --profile config/native-clean-room-profile.json \
+              --output native-clean-room-receipt.json
+          fi
+          set +e
+          if python -c 'import json; raise SystemExit(0 if json.load(open("native-clean-room-receipt.json"))["status"] == "passed" else 1)'; then
+            python tools/check_native_g0_readiness.py \
+              --profile config/native-g0-readiness-profile.json \
+              --evidence config/native-g0-readiness-evidence.json \
+              --inject-requirement clean-room-porting-ledger-review \
+              --inject-level external-governance \
+              --inject-reference native-clean-room-receipt.json \
+              --evidence-output native-g0-evidence-with-clean-room.json \
+              --output native-g0-readiness-with-clean-room.json
+            clean_room_readiness_status=$?
+          else
+            clean_room_readiness_status=1
+            python tools/check_native_g0_readiness.py \
+              --profile config/native-g0-readiness-profile.json \
+              --evidence config/native-g0-readiness-evidence.json \
+              --output native-g0-readiness-with-clean-room.json
+          fi
+          set -e
+          test "$clean_room_readiness_status" -eq 0 || test "$clean_room_readiness_status" -eq 1
+          python -m json.tool native-clean-room-receipt.json >/dev/null
+          python -m json.tool native-g0-readiness-with-clean-room.json >/dev/null
+      - name: Audit accepted native specification set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tools/test_check_native_specifications.py -v
+          python tools/check_native_specifications.py \
+            --profile config/native-specification-profile.json \
+            --output native-specification-receipt.json
+          set +e
+          python tools/check_native_g0_readiness.py \
+            --profile config/native-g0-readiness-profile.json \
+            --evidence config/native-g0-readiness-evidence.json \
+            --inject-requirement architecture-and-versioned-specifications \
+            --inject-level hosted \
+            --inject-reference native-specification-receipt.json \
+            --evidence-output native-g0-evidence-with-specifications.json \
+            --output native-g0-readiness-with-specifications.json
+          specification_readiness_status=$?
+          set -e
+          test "$specification_readiness_status" -eq 0 || test "$specification_readiness_status" -eq 1
+          python -m json.tool native-g0-readiness-with-specifications.json >/dev/null
       - name: Assess native G0 readiness
         run: |
           python -m unittest tools/test_check_native_g0_readiness.py -v
@@ -69,6 +273,42 @@ jobs:
           set -e
           test "$status" -eq 0 || test "$status" -eq 1
           python -m json.tool native-g0-readiness.json >/dev/null
+      - name: Upload accepted specification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-specification-evidence
+          path: |
+            native-specification-receipt.json
+            native-g0-evidence-with-specifications.json
+            native-g0-readiness-with-specifications.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Upload clean-room evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-clean-room-evidence
+          path: |
+            native-clean-room-receipt.json
+            native-g0-readiness-with-clean-room.json
+            native-g0-evidence-with-clean-room.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+      - name: Upload canonical native type evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-types-audit
+          path: |
+            native-types-audit.json
+            native-contract-conformance.json
+            native-g0-evidence-with-types.json
+            native-g0-readiness-with-types.json
+            native-g0-evidence-with-contracts.json
+            native-g0-readiness-with-contracts.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
       - name: Upload native G0 readiness
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -81,7 +321,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-dependency-audit
-          path: native-dependency-audit.json
+          path: |
+            native-dependency-audit.json
+            native-g0-evidence-with-dependencies.json
+            native-g0-readiness-with-dependencies.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true

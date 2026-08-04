@@ -58,15 +58,23 @@ jobs:
           - name: Linux stable
             os: ubuntu-latest
             toolchain: 1.96.0
+            native-platform: linux
+            run-native-conformance: true
           - name: Linux MSRV
             os: ubuntu-latest
             toolchain: 1.89.0
+            native-platform: linux
+            run-native-conformance: false
           - name: macOS stable
             os: macos-latest
             toolchain: 1.96.0
+            native-platform: macos
+            run-native-conformance: true
           - name: Windows stable
             os: windows-latest
             toolchain: 1.96.0
+            native-platform: windows
+            run-native-conformance: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -81,6 +89,25 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Run native conformance profile
+        if: matrix.run-native-conformance
+        shell: bash
+        run: |
+          python tools/check_native_conformance.py \
+            --profile config/native-conformance-profile.json \
+            --platform "${{ matrix.native-platform }}" \
+            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --run \
+            --output "native-conformance-${{ matrix.native-platform }}.json"
+      - name: Upload native conformance receipt
+        if: matrix.run-native-conformance && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-conformance-${{ matrix.native-platform }}
+          path: native-conformance-${{ matrix.native-platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
   public-clients:
     name: Public client conformance

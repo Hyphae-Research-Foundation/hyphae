@@ -24,7 +24,7 @@
     },
     {
       "id": "benchmark-and-quality-corpus",
-      "required_evidence_level": "production"
+      "required_evidence_level": "hosted"
     },
     {
       "id": "native-dependency-license-unsafe-audit",

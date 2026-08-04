@@ -714,6 +714,7 @@ fn scalar_payload_length(value: &SqlValue) -> Result<usize, LocalSqlCodecError> 
         ScalarValue::Float32(_) | ScalarValue::Date(_) => 4,
         ScalarValue::Text(value) => value.len(),
         ScalarValue::Binary(value) => value.len(),
+        _ => return Err(LocalSqlCodecError::InvalidScalar),
     };
     if length > MAX_SCALAR_BYTES {
         return Err(LocalSqlCodecError::InvalidScalar);
@@ -731,7 +732,7 @@ fn encode_parameter_record(
 ) -> Result<(), LocalSqlCodecError> {
     let length = scalar_payload_length(value)?;
     let length = u32::try_from(length).map_err(|_| LocalSqlCodecError::InvalidScalar)?;
-    let tag = scalar_tag(value);
+    let tag = scalar_tag(value).ok_or(LocalSqlCodecError::InvalidScalar)?;
     write_exact(output, offset, &[tag, 0, 0, 0])?;
     write_exact(output, offset, &length.to_le_bytes())?;
     match value {
@@ -759,6 +760,7 @@ fn encode_parameter_record(
             write_exact(output, offset, &nanoseconds.to_le_bytes())?;
         }
         ScalarValue::Uuid(value) => write_exact(output, offset, value)?,
+        _ => return Err(LocalSqlCodecError::InvalidScalar),
     }
     Ok(())
 }
@@ -837,22 +839,23 @@ fn decode_scalar(tag: u8, encoded: &[u8]) -> Result<SqlValue, LocalSqlCodecError
     }
 }
 
-const fn scalar_tag(value: &SqlValue) -> u8 {
+const fn scalar_tag(value: &SqlValue) -> Option<u8> {
     match value {
-        ScalarValue::Null => SCALAR_NULL,
-        ScalarValue::Boolean(_) => SCALAR_BOOLEAN,
-        ScalarValue::Signed(_) => SCALAR_SIGNED,
-        ScalarValue::Unsigned(_) => SCALAR_UNSIGNED,
-        ScalarValue::Decimal(_) => SCALAR_DECIMAL,
-        ScalarValue::Float32(_) => SCALAR_FLOAT32,
-        ScalarValue::Float64(_) => SCALAR_FLOAT64,
-        ScalarValue::Text(_) => SCALAR_TEXT,
-        ScalarValue::Binary(_) => SCALAR_BINARY,
-        ScalarValue::Date(_) => SCALAR_DATE,
-        ScalarValue::Time(_) => SCALAR_TIME,
-        ScalarValue::Timestamp(_) => SCALAR_TIMESTAMP,
-        ScalarValue::Interval { .. } => SCALAR_INTERVAL,
-        ScalarValue::Uuid(_) => SCALAR_UUID,
+        ScalarValue::Null => Some(SCALAR_NULL),
+        ScalarValue::Boolean(_) => Some(SCALAR_BOOLEAN),
+        ScalarValue::Signed(_) => Some(SCALAR_SIGNED),
+        ScalarValue::Unsigned(_) => Some(SCALAR_UNSIGNED),
+        ScalarValue::Decimal(_) => Some(SCALAR_DECIMAL),
+        ScalarValue::Float32(_) => Some(SCALAR_FLOAT32),
+        ScalarValue::Float64(_) => Some(SCALAR_FLOAT64),
+        ScalarValue::Text(_) => Some(SCALAR_TEXT),
+        ScalarValue::Binary(_) => Some(SCALAR_BINARY),
+        ScalarValue::Date(_) => Some(SCALAR_DATE),
+        ScalarValue::Time(_) => Some(SCALAR_TIME),
+        ScalarValue::Timestamp(_) => Some(SCALAR_TIMESTAMP),
+        ScalarValue::Interval { .. } => Some(SCALAR_INTERVAL),
+        ScalarValue::Uuid(_) => Some(SCALAR_UUID),
+        _ => None,
     }
 }
 

@@ -11,6 +11,9 @@ readme = "README.md"
 description = "Canonical identities and logical types for Hyphae's native local ecosystem."
 publish = false
 
+[dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
 

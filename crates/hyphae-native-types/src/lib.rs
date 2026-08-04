@@ -846,6 +846,7 @@ impl PartialOrd for CanonicalF64 {
 /// JSON, and vector values deliberately remain unsupported until their
 /// canonical validators and resource bounds exist.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum ScalarValue {
     /// SQL null.
     Null,
@@ -882,6 +883,14 @@ pub enum ScalarValue {
     },
     /// UUID bits in network byte order.
     Uuid([u8; 16]),
+    /// Ordered homogeneous nested values.
+    Array(Vec<Self>),
+    /// Canonically key-ordered nested entries.
+    Map(Vec<(Self, Self)>),
+    /// Fixed-dimension canonical float32 vector.
+    Vector(Vec<CanonicalF32>),
+    /// Canonical RFC 8259 JSON bytes represented as UTF-8 text.
+    Json(String),
 }
 
 impl ScalarValue {
@@ -899,9 +908,6 @@ impl ScalarValue {
     pub fn encode_storage(&self, logical_type: &LogicalType) -> Result<Vec<u8>, NativeTypeError> {
         if matches!(self, Self::Null) {
             return Err(NativeTypeError::NullRequiresRowBitmap);
-        }
-        if scalar_type_is_unsupported(logical_type) {
-            return Err(NativeTypeError::UnsupportedScalarType);
         }
         let encoded = match (self, logical_type) {
             (Self::Boolean(value), LogicalType::Boolean) => vec![u8::from(*value)],
@@ -946,6 +952,16 @@ impl ScalarValue {
                 encoded
             }
             (Self::Uuid(value), LogicalType::Uuid) => value.to_vec(),
+            (Self::Array(values), LogicalType::Array(element_type)) => {
+                encode_array_storage(values, element_type)?
+            }
+            (Self::Map(entries), LogicalType::Map(key_type, value_type)) => {
+                encode_map_storage(entries, key_type, value_type)?
+            }
+            (Self::Vector(values), LogicalType::Vector(vector_type)) => {
+                encode_vector_storage(values, *vector_type)?
+            }
+            (Self::Json(value), LogicalType::Json) => canonical_json_bytes(value)?.to_vec(),
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
         ensure_scalar_length(encoded.len())?;
@@ -1026,10 +1042,16 @@ impl ScalarValue {
                 })
             }
             LogicalType::Uuid => Ok(Self::Uuid(exact_scalar_bytes(encoded)?)),
-            LogicalType::Json
-            | LogicalType::Array(_)
-            | LogicalType::Map(_, _)
-            | LogicalType::Vector(_) => Err(NativeTypeError::UnsupportedScalarType),
+            LogicalType::Array(element_type) => {
+                decode_array_storage(encoded, element_type).map(Self::Array)
+            }
+            LogicalType::Map(key_type, value_type) => {
+                decode_map_storage(encoded, key_type, value_type).map(Self::Map)
+            }
+            LogicalType::Vector(vector_type) => {
+                decode_vector_storage(encoded, *vector_type).map(Self::Vector)
+            }
+            LogicalType::Json => decode_canonical_json(encoded).map(Self::Json),
         }
     }
 
@@ -1097,13 +1119,18 @@ impl ScalarValue {
                 encoded
             }
             (Self::Uuid(value), LogicalType::Uuid) => value.to_vec(),
-            (
-                _,
-                LogicalType::Json
-                | LogicalType::Array(_)
-                | LogicalType::Map(_, _)
-                | LogicalType::Vector(_),
-            ) => return Err(NativeTypeError::UnsupportedOrderedType),
+            (Self::Array(values), LogicalType::Array(element_type)) => {
+                encode_array_ordered(values, element_type)?
+            }
+            (Self::Map(entries), LogicalType::Map(key_type, value_type)) => {
+                encode_map_ordered(entries, key_type, value_type)?
+            }
+            (Self::Vector(values), LogicalType::Vector(vector_type)) => {
+                encode_vector_ordered(values, *vector_type)?
+            }
+            (_, LogicalType::Json) => {
+                return Err(NativeTypeError::UnsupportedOrderedType);
+            }
             _ => return Err(NativeTypeError::ScalarTypeMismatch),
         };
         let output_length = payload
@@ -1213,19 +1240,478 @@ impl ScalarValue {
                 })
             }
             LogicalType::Uuid => Ok(Self::Uuid(exact_scalar_bytes(payload)?)),
-            LogicalType::Json
-            | LogicalType::Array(_)
-            | LogicalType::Map(_, _)
-            | LogicalType::Vector(_) => Err(NativeTypeError::UnsupportedOrderedType),
+            LogicalType::Array(element_type) => {
+                decode_array_ordered(payload, element_type).map(Self::Array)
+            }
+            LogicalType::Map(key_type, value_type) => {
+                decode_map_ordered(payload, key_type, value_type).map(Self::Map)
+            }
+            LogicalType::Vector(vector_type) => {
+                decode_vector_ordered(payload, *vector_type).map(Self::Vector)
+            }
+            LogicalType::Json => Err(NativeTypeError::UnsupportedOrderedType),
         }
     }
 }
 
-fn scalar_type_is_unsupported(logical_type: &LogicalType) -> bool {
-    matches!(
-        logical_type,
-        LogicalType::Json | LogicalType::Array(_) | LogicalType::Map(_, _) | LogicalType::Vector(_)
-    )
+fn canonical_json_bytes(value: &str) -> Result<&[u8], NativeTypeError> {
+    ensure_scalar_length(value.len())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    let canonical = canonicalize_json_value(&parsed)?;
+    if canonical != value {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    Ok(value.as_bytes())
+}
+
+fn decode_canonical_json(encoded: &[u8]) -> Result<String, NativeTypeError> {
+    ensure_scalar_length(encoded.len())?;
+    let value = std::str::from_utf8(encoded).map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    canonical_json_bytes(value)?;
+    Ok(value.to_owned())
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> Result<String, NativeTypeError> {
+    match value {
+        serde_json::Value::Null => Ok("null".to_owned()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(integer.to_string())
+            } else if let Some(integer) = value.as_u64() {
+                Ok(integer.to_string())
+            } else {
+                let float = value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let mut encoded = float.to_string();
+                if encoded == "-0" {
+                    "0".clone_into(&mut encoded);
+                }
+                Ok(encoded)
+            }
+        }
+        serde_json::Value::String(value) => {
+            serde_json::to_string(value).map_err(|_| NativeTypeError::InvalidScalarEncoding)
+        }
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(canonicalize_json_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", values.join(",")))
+        }
+        serde_json::Value::Object(entries) => {
+            let mut encoded = String::from("{");
+            for (index, (key, value)) in entries.iter().enumerate() {
+                if index != 0 {
+                    encoded.push(',');
+                }
+                encoded.push_str(
+                    &serde_json::to_string(key)
+                        .map_err(|_| NativeTypeError::InvalidScalarEncoding)?,
+                );
+                encoded.push(':');
+                encoded.push_str(&canonicalize_json_value(value)?);
+            }
+            encoded.push('}');
+            Ok(encoded)
+        }
+    }
+}
+
+fn encode_vector_ordered(
+    values: &[CanonicalF32],
+    vector_type: VectorType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || values.len() != usize::from(vector_type.dimension())
+    {
+        return Err(NativeTypeError::ScalarOutOfRange);
+    }
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        encoded.extend_from_slice(&sortable_f32_bits(value.bits()).to_be_bytes());
+    }
+    Ok(encoded)
+}
+
+fn decode_vector_ordered(
+    encoded: &[u8],
+    vector_type: VectorType,
+) -> Result<Vec<CanonicalF32>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || encoded.len() != usize::from(vector_type.dimension()).saturating_mul(4)
+    {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    encoded
+        .chunks_exact(4)
+        .map(|bytes| {
+            let sortable = u32::from_be_bytes(exact_scalar_bytes(bytes)?);
+            decode_canonical_f32(unsortable_f32_bits(sortable))
+        })
+        .collect()
+}
+
+fn encode_map_ordered(
+    entries: &[(ScalarValue, ScalarValue)],
+    key_type: &LogicalType,
+    value_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let mut encoded = Vec::new();
+    let mut previous_key: Option<Vec<u8>> = None;
+    for (key, value) in entries {
+        if matches!(key, ScalarValue::Null) {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        let key_component = key.encode_ordered_component(key_type)?;
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key_component)
+        {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        previous_key = Some(key_component.clone());
+        encoded.extend_from_slice(&encode_memcomparable_bytes(&key_component)?);
+        let value_component = value.encode_ordered_component(value_type)?;
+        encoded.extend_from_slice(&encode_memcomparable_bytes(&value_component)?);
+    }
+    encoded.extend_from_slice(&[0, 0]);
+    ensure_scalar_length(encoded.len())?;
+    Ok(encoded)
+}
+
+fn decode_map_ordered(
+    encoded: &[u8],
+    key_type: &LogicalType,
+    value_type: &LogicalType,
+) -> Result<Vec<(ScalarValue, ScalarValue)>, NativeTypeError> {
+    let mut offset = 0_usize;
+    let mut previous_key: Option<Vec<u8>> = None;
+    let mut entries = Vec::new();
+    loop {
+        let remaining = encoded
+            .get(offset..)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        if remaining == [0, 0] {
+            return Ok(entries);
+        }
+        if entries.len() >= 100_000 {
+            return Err(NativeTypeError::ScalarLengthExceeded);
+        }
+        let key_end = memcomparable_component_end(remaining)?;
+        let key_component = decode_memcomparable_bytes(&remaining[..key_end])?;
+        let key = ScalarValue::decode_ordered_component(key_type, &key_component)?;
+        if matches!(key, ScalarValue::Null)
+            || previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &key_component)
+        {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        previous_key = Some(key_component);
+        offset = offset
+            .checked_add(key_end)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        let remaining = encoded
+            .get(offset..)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        let value_end = memcomparable_component_end(remaining)?;
+        let value_component = decode_memcomparable_bytes(&remaining[..value_end])?;
+        let value = ScalarValue::decode_ordered_component(value_type, &value_component)?;
+        offset = offset
+            .checked_add(value_end)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        entries.push((key, value));
+    }
+}
+
+fn encode_array_ordered(
+    values: &[ScalarValue],
+    element_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let mut encoded = Vec::new();
+    for value in values {
+        let component = value.encode_ordered_component(element_type)?;
+        encoded.extend_from_slice(&encode_memcomparable_bytes(&component)?);
+    }
+    encoded.extend_from_slice(&[0, 0]);
+    ensure_scalar_length(encoded.len())?;
+    Ok(encoded)
+}
+
+fn decode_array_ordered(
+    encoded: &[u8],
+    element_type: &LogicalType,
+) -> Result<Vec<ScalarValue>, NativeTypeError> {
+    let mut offset = 0_usize;
+    let mut values = Vec::new();
+    loop {
+        let remaining = encoded
+            .get(offset..)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        if remaining == [0, 0] {
+            return Ok(values);
+        }
+        if remaining.starts_with(&[0, 0]) {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        if values.len() >= 100_000 {
+            return Err(NativeTypeError::ScalarLengthExceeded);
+        }
+        let end = memcomparable_component_end(remaining)?;
+        let component = decode_memcomparable_bytes(&remaining[..end])?;
+        values.push(ScalarValue::decode_ordered_component(
+            element_type,
+            &component,
+        )?);
+        offset = offset
+            .checked_add(end)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    }
+}
+
+fn memcomparable_component_end(encoded: &[u8]) -> Result<usize, NativeTypeError> {
+    let mut offset = 0_usize;
+    while offset < encoded.len() {
+        if encoded[offset] != 0 {
+            offset += 1;
+            continue;
+        }
+        let escape = *encoded
+            .get(offset + 1)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        match escape {
+            0 => return Ok(offset + 2),
+            0xff => offset += 2,
+            _ => return Err(NativeTypeError::InvalidScalarEncoding),
+        }
+    }
+    Err(NativeTypeError::InvalidScalarEncoding)
+}
+
+fn encode_vector_storage(
+    values: &[CanonicalF32],
+    vector_type: VectorType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || values.len() != usize::from(vector_type.dimension())
+    {
+        return Err(NativeTypeError::ScalarOutOfRange);
+    }
+    let mut encoded = Vec::with_capacity(values.len().saturating_mul(4));
+    for value in values {
+        encoded.extend_from_slice(&value.bits().to_le_bytes());
+    }
+    ensure_scalar_length(encoded.len())?;
+    Ok(encoded)
+}
+
+fn decode_vector_storage(
+    encoded: &[u8],
+    vector_type: VectorType,
+) -> Result<Vec<CanonicalF32>, NativeTypeError> {
+    if vector_type.element() != VectorElement::Float32
+        || encoded.len() != usize::from(vector_type.dimension()).saturating_mul(4)
+    {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    encoded
+        .chunks_exact(4)
+        .map(|bytes| {
+            let bits = u32::from_le_bytes(exact_scalar_bytes(bytes)?);
+            decode_canonical_f32(bits)
+        })
+        .collect()
+}
+
+fn encode_map_storage(
+    entries: &[(ScalarValue, ScalarValue)],
+    key_type: &LogicalType,
+    value_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let count = u32::try_from(entries.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&count.to_le_bytes());
+    let mut previous_key: Option<Vec<u8>> = None;
+    for (key, value) in entries {
+        if matches!(key, ScalarValue::Null) {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        let key_payload = key.encode_storage(key_type)?;
+        let key_ordered = key.encode_ordered_component(key_type)?;
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key_ordered)
+        {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        previous_key = Some(key_ordered);
+        put_nested_payload(&mut encoded, &key_payload)?;
+        if matches!(value, ScalarValue::Null) {
+            encoded.push(0);
+        } else {
+            encoded.push(1);
+            let value_payload = value.encode_storage(value_type)?;
+            put_nested_payload(&mut encoded, &value_payload)?;
+        }
+        ensure_scalar_length(encoded.len())?;
+    }
+    Ok(encoded)
+}
+
+fn put_nested_payload(encoded: &mut Vec<u8>, payload: &[u8]) -> Result<(), NativeTypeError> {
+    let length = u32::try_from(payload.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+    encoded.extend_from_slice(&length.to_le_bytes());
+    encoded.extend_from_slice(payload);
+    Ok(())
+}
+
+fn take_nested_payload<'a>(
+    encoded: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], NativeTypeError> {
+    let length_end = offset
+        .checked_add(4)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    let length = usize::try_from(u32::from_le_bytes(exact_scalar_bytes(
+        encoded
+            .get(*offset..length_end)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?,
+    )?))
+    .map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    *offset = length_end;
+    let end = offset
+        .checked_add(length)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    let payload = encoded
+        .get(*offset..end)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    *offset = end;
+    Ok(payload)
+}
+
+fn decode_map_storage(
+    encoded: &[u8],
+    key_type: &LogicalType,
+    value_type: &LogicalType,
+) -> Result<Vec<(ScalarValue, ScalarValue)>, NativeTypeError> {
+    let count = encoded
+        .get(..4)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)
+        .and_then(|bytes| exact_scalar_bytes(bytes).map(u32::from_le_bytes))?;
+    let count = usize::try_from(count).map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    if count > 100_000 {
+        return Err(NativeTypeError::ScalarLengthExceeded);
+    }
+    let mut offset = 4_usize;
+    let mut previous_key: Option<Vec<u8>> = None;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key =
+            ScalarValue::decode_storage(key_type, take_nested_payload(encoded, &mut offset)?)?;
+        let key_ordered = key.encode_ordered_component(key_type)?;
+        if matches!(key, ScalarValue::Null)
+            || previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &key_ordered)
+        {
+            return Err(NativeTypeError::InvalidScalarEncoding);
+        }
+        previous_key = Some(key_ordered);
+        let marker = *encoded
+            .get(offset)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        offset += 1;
+        let value = match marker {
+            0 => ScalarValue::Null,
+            1 => {
+                ScalarValue::decode_storage(value_type, take_nested_payload(encoded, &mut offset)?)?
+            }
+            _ => return Err(NativeTypeError::InvalidScalarEncoding),
+        };
+        entries.push((key, value));
+    }
+    if offset != encoded.len() {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    Ok(entries)
+}
+
+fn encode_array_storage(
+    values: &[ScalarValue],
+    element_type: &LogicalType,
+) -> Result<Vec<u8>, NativeTypeError> {
+    let count = u32::try_from(values.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        if matches!(value, ScalarValue::Null) {
+            encoded.push(0);
+            continue;
+        }
+        let payload = value.encode_storage(element_type)?;
+        let length =
+            u32::try_from(payload.len()).map_err(|_| NativeTypeError::ScalarLengthExceeded)?;
+        encoded.push(1);
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(&payload);
+        ensure_scalar_length(encoded.len())?;
+    }
+    Ok(encoded)
+}
+
+fn decode_array_storage(
+    encoded: &[u8],
+    element_type: &LogicalType,
+) -> Result<Vec<ScalarValue>, NativeTypeError> {
+    let count_bytes = encoded
+        .get(..4)
+        .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+    let count = usize::try_from(u32::from_le_bytes(exact_scalar_bytes(count_bytes)?))
+        .map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+    if count > 100_000 {
+        return Err(NativeTypeError::ScalarLengthExceeded);
+    }
+    let mut offset = 4_usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let marker = *encoded
+            .get(offset)
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        offset += 1;
+        match marker {
+            0 => values.push(ScalarValue::Null),
+            1 => {
+                let length_end = offset
+                    .checked_add(4)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let length = usize::try_from(u32::from_le_bytes(exact_scalar_bytes(
+                    encoded
+                        .get(offset..length_end)
+                        .ok_or(NativeTypeError::InvalidScalarEncoding)?,
+                )?))
+                .map_err(|_| NativeTypeError::InvalidScalarEncoding)?;
+                offset = length_end;
+                let end = offset
+                    .checked_add(length)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                let payload = encoded
+                    .get(offset..end)
+                    .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+                values.push(ScalarValue::decode_storage(element_type, payload)?);
+                offset = end;
+            }
+            _ => return Err(NativeTypeError::InvalidScalarEncoding),
+        }
+    }
+    if offset != encoded.len() {
+        return Err(NativeTypeError::InvalidScalarEncoding);
+    }
+    Ok(values)
 }
 
 fn ensure_scalar_length(length: usize) -> Result<(), NativeTypeError> {
@@ -1487,12 +1973,128 @@ fn decode_memcomparable_bytes(encoded: &[u8]) -> Result<Vec<u8>, NativeTypeError
     Err(NativeTypeError::InvalidScalarEncoding)
 }
 
+/// One frozen primitive scalar fixture consumed by native storage layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimitiveScalarGolden {
+    /// Declared logical type.
+    pub logical_type: LogicalType,
+    /// Canonical logical value.
+    pub value: ScalarValue,
+    /// Canonical row/storage payload.
+    pub storage: Vec<u8>,
+    /// Canonical ordered-index component including its non-null marker.
+    pub ordered: Vec<u8>,
+}
+
+/// Returns the frozen cross-crate primitive scalar corpus.
+///
+/// # Errors
+///
+/// Returns an error only if an internal fixture declaration violates a checked
+/// logical-type bound.
+pub fn primitive_scalar_golden_fixtures() -> Result<Vec<PrimitiveScalarGolden>, NativeTypeError> {
+    let decimal = DecimalType::new(6, 2)?;
+    let declarations = [
+        (LogicalType::Boolean, ScalarValue::Boolean(true)),
+        (
+            LogicalType::Signed(IntegerWidth::Bits16),
+            ScalarValue::Signed(-2),
+        ),
+        (
+            LogicalType::Unsigned(IntegerWidth::Bits16),
+            ScalarValue::Unsigned(0x1234),
+        ),
+        (LogicalType::Decimal(decimal), ScalarValue::Decimal(-12_345)),
+        (
+            LogicalType::Float32,
+            ScalarValue::Float32(CanonicalF32::new(-1.5)),
+        ),
+        (
+            LogicalType::Float64,
+            ScalarValue::Float64(CanonicalF64::new(f64::NAN)),
+        ),
+        (LogicalType::Text, ScalarValue::Text("A\0B".to_owned())),
+        (LogicalType::Binary, ScalarValue::Binary(vec![0, 0xff])),
+        (LogicalType::Date, ScalarValue::Date(-1)),
+        (LogicalType::Time, ScalarValue::Time(1)),
+        (LogicalType::Timestamp, ScalarValue::Timestamp(-2)),
+        (
+            LogicalType::Interval,
+            ScalarValue::Interval {
+                months: -1,
+                days: 2,
+                nanoseconds: -3,
+            },
+        ),
+        (LogicalType::Uuid, ScalarValue::Uuid([0x11; 16])),
+    ];
+    declarations
+        .into_iter()
+        .map(|(logical_type, value)| {
+            Ok(PrimitiveScalarGolden {
+                storage: value.encode_storage(&logical_type)?,
+                ordered: value.encode_ordered_component(&logical_type)?,
+                logical_type,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// Returns the frozen cross-crate canonical value corpus.
+///
+/// # Errors
+///
+/// Returns an error only if an internal fixture declaration violates a checked
+/// logical-type bound.
+pub fn canonical_value_golden_fixtures() -> Result<Vec<PrimitiveScalarGolden>, NativeTypeError> {
+    let mut fixtures = primitive_scalar_golden_fixtures()?;
+    let declarations = [
+        (
+            LogicalType::Array(Box::new(LogicalType::Signed(IntegerWidth::Bits16))),
+            ScalarValue::Array(vec![ScalarValue::Signed(-2), ScalarValue::Null]),
+        ),
+        (
+            LogicalType::Map(
+                Box::new(LogicalType::Text),
+                Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)),
+            ),
+            ScalarValue::Map(vec![
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Unsigned(1)),
+                (ScalarValue::Text("b".to_owned()), ScalarValue::Null),
+            ]),
+        ),
+        (
+            LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?),
+            ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(f32::NAN)]),
+        ),
+    ];
+    for (logical_type, value) in declarations {
+        fixtures.push(PrimitiveScalarGolden {
+            storage: value.encode_storage(&logical_type)?,
+            ordered: value.encode_ordered_component(&logical_type)?,
+            logical_type,
+            value,
+        });
+    }
+    let json_type = LogicalType::Json;
+    let json_value = ScalarValue::Json(r#"{"a":[1,null],"b":true}"#.to_owned());
+    fixtures.push(PrimitiveScalarGolden {
+        storage: json_value.encode_storage(&json_type)?,
+        ordered: Vec::new(),
+        logical_type: json_type,
+        value: json_value,
+    });
+    Ok(fixtures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, DirectoryUuid, HistoryEpoch,
         IntegerWidth, LineageIdentity, LogicalType, MAX_SCALAR_BYTES, NativeTypeError, ObjectId,
-        ScalarValue, VectorElement, VectorType,
+        ScalarValue, VectorElement, VectorType, canonical_value_golden_fixtures,
+        primitive_scalar_golden_fixtures, sortable_f32_bits,
     };
     use proptest::prelude::*;
 
@@ -1732,6 +2334,65 @@ mod tests {
         }
 
         #[test]
+        fn float32_codecs_canonicalize_round_trip_and_preserve_total_order(
+            left_bits in any::<u32>(), right_bits in any::<u32>(),
+        ) {
+            let logical_type = LogicalType::Float32;
+            let left = CanonicalF32::new(f32::from_bits(left_bits));
+            let right = CanonicalF32::new(f32::from_bits(right_bits));
+            let scalar = ScalarValue::Float32(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Float32(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
+        fn float64_codecs_canonicalize_round_trip_and_preserve_total_order(
+            left_bits in any::<u64>(), right_bits in any::<u64>(),
+        ) {
+            let logical_type = LogicalType::Float64;
+            let left = CanonicalF64::new(f64::from_bits(left_bits));
+            let right = CanonicalF64::new(f64::from_bits(right_bits));
+            let scalar = ScalarValue::Float64(left);
+            let storage = scalar.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, scalar.clone());
+            let left_bytes = scalar.encode_ordered_component(&logical_type)?;
+            let right_bytes = ScalarValue::Float64(right).encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, scalar);
+        }
+
+        #[test]
+        fn interval_codecs_round_trip_and_preserve_lexicographic_order(
+            left_months in any::<i32>(), left_days in any::<i32>(), left_nanos in any::<i64>(),
+            right_months in any::<i32>(), right_days in any::<i32>(), right_nanos in any::<i64>(),
+        ) {
+            let logical_type = LogicalType::Interval;
+            let left = ScalarValue::Interval {
+                months: left_months,
+                days: left_days,
+                nanoseconds: left_nanos,
+            };
+            let right = ScalarValue::Interval {
+                months: right_months,
+                days: right_days,
+                nanoseconds: right_nanos,
+            };
+            let storage = left.encode_storage(&logical_type)?;
+            prop_assert_eq!(ScalarValue::decode_storage(&logical_type, &storage)?, left.clone());
+            let left_bytes = left.encode_ordered_component(&logical_type)?;
+            let right_bytes = right.encode_ordered_component(&logical_type)?;
+            prop_assert_eq!(
+                (left_months, left_days, left_nanos).cmp(&(right_months, right_days, right_nanos)),
+                left_bytes.cmp(&right_bytes)
+            );
+            prop_assert_eq!(ScalarValue::decode_ordered_component(&logical_type, &left_bytes)?, left);
+        }
+
+        #[test]
         fn binary_storage_and_ordered_codecs_round_trip(value in proptest::collection::vec(any::<u8>(), 0..512)) {
             let logical_type = LogicalType::Binary;
             let scalar = ScalarValue::Binary(value);
@@ -1757,6 +2418,463 @@ mod tests {
             let right_bytes = ScalarValue::Binary(right.clone()).encode_ordered_component(&logical_type)?;
             prop_assert_eq!(left.cmp(&right), left_bytes.cmp(&right_bytes));
         }
+    }
+
+    #[test]
+    fn canonical_value_golden_corpus_covers_every_declared_family() -> Result<(), NativeTypeError> {
+        let fixtures = canonical_value_golden_fixtures()?;
+        assert_eq!(fixtures.len(), 17);
+        for fixture in fixtures {
+            assert_eq!(
+                ScalarValue::decode_storage(&fixture.logical_type, &fixture.storage)?,
+                fixture.value
+            );
+            if matches!(fixture.logical_type, LogicalType::Json) {
+                assert!(fixture.ordered.is_empty());
+            } else {
+                assert_eq!(
+                    ScalarValue::decode_ordered_component(&fixture.logical_type, &fixture.ordered,)?,
+                    fixture.value
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_scalar_golden_corpus_is_frozen() -> Result<(), NativeTypeError> {
+        let fixtures = primitive_scalar_golden_fixtures()?;
+        assert_eq!(fixtures.len(), 13);
+        assert_eq!(fixtures[0].storage, [1]);
+        assert_eq!(fixtures[0].ordered, [1, 1]);
+        assert_eq!(fixtures[1].storage, [0xfe, 0xff]);
+        assert_eq!(fixtures[1].ordered, [1, 0x7f, 0xfe]);
+        assert_eq!(fixtures[6].storage, b"A\0B");
+        assert_eq!(fixtures[6].ordered, [1, b'A', 0, 0xff, b'B', 0, 0]);
+        assert_eq!(fixtures[12].storage, [0x11; 16]);
+        assert_eq!(fixtures[12].ordered, [vec![1], vec![0x11; 16]].concat());
+        Ok(())
+    }
+
+    #[test]
+    fn array_storage_codec_round_trips_nested_null_and_empty_values() -> Result<(), NativeTypeError>
+    {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Array(Box::new(
+            LogicalType::Signed(IntegerWidth::Bits16),
+        ))));
+        let value = ScalarValue::Array(vec![
+            ScalarValue::Array(vec![ScalarValue::Signed(-2), ScalarValue::Null]),
+            ScalarValue::Array(Vec::new()),
+        ]);
+
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        assert_eq!(
+            encoded,
+            [
+                2, 0, 0, 0, 1, 12, 0, 0, 0, 2, 0, 0, 0, 1, 2, 0, 0, 0, 0xfe, 0xff, 0, 1, 4, 0, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn array_storage_codec_rejects_truncation_trailing_and_type_mismatch()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)));
+        let value = ScalarValue::Array(vec![ScalarValue::Unsigned(7)]);
+        let encoded = value.encode_storage(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(ScalarValue::decode_storage(&logical_type, &encoded[..length]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        assert_eq!(
+            ScalarValue::Array(vec![ScalarValue::Text("bad".to_owned())])
+                .encode_storage(&logical_type),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn array_ordered_codec_round_trips_and_preserves_lexicographic_order()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Signed(IntegerWidth::Bits16)));
+        let values = [
+            ScalarValue::Array(vec![]),
+            ScalarValue::Array(vec![ScalarValue::Null]),
+            ScalarValue::Array(vec![ScalarValue::Signed(-1)]),
+            ScalarValue::Array(vec![ScalarValue::Signed(-1), ScalarValue::Null]),
+            ScalarValue::Array(vec![ScalarValue::Signed(0)]),
+        ];
+        let mut previous: Option<Vec<u8>> = None;
+        for value in values {
+            let encoded = value.encode_ordered_component(&logical_type)?;
+            assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded)?,
+                value
+            );
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn array_ordered_codec_rejects_truncation_invalid_escape_and_trailing_bytes()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Text));
+        let value = ScalarValue::Array(vec![
+            ScalarValue::Text("a\0b".to_owned()),
+            ScalarValue::Null,
+        ]);
+        let encoded = value.encode_ordered_component(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded[..length]).is_err()
+            );
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut invalid = encoded;
+        let escape = invalid
+            .windows(2)
+            .position(|window| window == [0, 0xff])
+            .ok_or(NativeTypeError::InvalidScalarEncoding)?;
+        invalid[escape + 1] = 0x7f;
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &invalid),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_ordered_codec_round_trips_and_preserves_entry_order() -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Map(
+            Box::new(LogicalType::Text),
+            Box::new(LogicalType::Signed(IntegerWidth::Bits16)),
+        );
+        let values = [
+            ScalarValue::Map(vec![]),
+            ScalarValue::Map(vec![(ScalarValue::Text("a".to_owned()), ScalarValue::Null)]),
+            ScalarValue::Map(vec![(
+                ScalarValue::Text("a".to_owned()),
+                ScalarValue::Signed(-1),
+            )]),
+            ScalarValue::Map(vec![
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Signed(-1)),
+                (ScalarValue::Text("b".to_owned()), ScalarValue::Signed(0)),
+            ]),
+            ScalarValue::Map(vec![(ScalarValue::Text("b".to_owned()), ScalarValue::Null)]),
+        ];
+        let mut previous: Option<Vec<u8>> = None;
+        for value in values {
+            let encoded = value.encode_ordered_component(&logical_type)?;
+            assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded)?,
+                value
+            );
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn map_ordered_codec_rejects_unsorted_duplicate_truncated_and_trailing()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Map(
+            Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)),
+            Box::new(LogicalType::Text),
+        );
+        for value in [
+            ScalarValue::Map(vec![
+                (ScalarValue::Unsigned(2), ScalarValue::Text("b".to_owned())),
+                (ScalarValue::Unsigned(1), ScalarValue::Text("a".to_owned())),
+            ]),
+            ScalarValue::Map(vec![
+                (ScalarValue::Unsigned(1), ScalarValue::Text("a".to_owned())),
+                (ScalarValue::Unsigned(1), ScalarValue::Text("b".to_owned())),
+            ]),
+        ] {
+            assert_eq!(
+                value.encode_ordered_component(&logical_type),
+                Err(NativeTypeError::InvalidScalarEncoding)
+            );
+        }
+        let value = ScalarValue::Map(vec![(
+            ScalarValue::Unsigned(1),
+            ScalarValue::Text("a\0b".to_owned()),
+        )]);
+        let encoded = value.encode_ordered_component(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded[..length]).is_err()
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_storage_codec_round_trips_canonical_order_and_nullable_values()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Map(
+            Box::new(LogicalType::Text),
+            Box::new(LogicalType::Array(Box::new(LogicalType::Unsigned(
+                IntegerWidth::Bits8,
+            )))),
+        );
+        let value = ScalarValue::Map(vec![
+            (
+                ScalarValue::Text("a".to_owned()),
+                ScalarValue::Array(vec![ScalarValue::Unsigned(1), ScalarValue::Null]),
+            ),
+            (ScalarValue::Text("b".to_owned()), ScalarValue::Null),
+        ]);
+
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        assert_eq!(
+            encoded,
+            [
+                2, 0, 0, 0, 1, 0, 0, 0, b'a', 1, 11, 0, 0, 0, 2, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1,
+                0, 0, 0, b'b', 0,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_storage_codec_rejects_null_duplicate_and_unsorted_keys() {
+        let logical_type = LogicalType::Map(
+            Box::new(LogicalType::Text),
+            Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)),
+        );
+        for value in [
+            ScalarValue::Map(vec![(ScalarValue::Null, ScalarValue::Unsigned(1))]),
+            ScalarValue::Map(vec![
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Unsigned(1)),
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Unsigned(2)),
+            ]),
+            ScalarValue::Map(vec![
+                (ScalarValue::Text("b".to_owned()), ScalarValue::Unsigned(1)),
+                (ScalarValue::Text("a".to_owned()), ScalarValue::Unsigned(2)),
+            ]),
+        ] {
+            assert_eq!(
+                value.encode_storage(&logical_type),
+                Err(NativeTypeError::InvalidScalarEncoding)
+            );
+        }
+    }
+
+    #[test]
+    fn map_storage_codec_rejects_truncation_and_trailing_bytes() -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Map(
+            Box::new(LogicalType::Unsigned(IntegerWidth::Bits8)),
+            Box::new(LogicalType::Text),
+        );
+        let value = ScalarValue::Map(vec![(
+            ScalarValue::Unsigned(1),
+            ScalarValue::Text("one".to_owned()),
+        )]);
+        let encoded = value.encode_storage(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(ScalarValue::decode_storage(&logical_type, &encoded[..length]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_storage_codec_round_trips_canonical_float_elements() -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 4)?);
+        let value = ScalarValue::Vector(vec![
+            CanonicalF32::new(-0.0),
+            CanonicalF32::new(1.5),
+            CanonicalF32::new(f32::NEG_INFINITY),
+            CanonicalF32::new(f32::NAN),
+        ]);
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        assert_eq!(
+            encoded,
+            [
+                0, 0, 0, 0, 0, 0, 0xc0, 0x3f, 0, 0, 0x80, 0xff, 0, 0, 0xc0, 0x7f,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_storage_codec_rejects_dimensions_noncanonical_bits_and_mismatch()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0)]).encode_storage(&logical_type),
+            Err(NativeTypeError::ScalarOutOfRange)
+        );
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0), CanonicalF32::new(2.0)])
+                .encode_storage(&LogicalType::Array(Box::new(LogicalType::Float32))),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &[0; 4]),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut negative_zero = Vec::new();
+        negative_zero.extend_from_slice(&(-0.0_f32).to_bits().to_le_bytes());
+        negative_zero.extend_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &negative_zero),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut noncanonical_nan = Vec::new();
+        noncanonical_nan.extend_from_slice(&0x7fc0_0001_u32.to_le_bytes());
+        noncanonical_nan.extend_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        assert_eq!(
+            ScalarValue::decode_storage(&logical_type, &noncanonical_nan),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_ordered_codec_round_trips_and_preserves_lexicographic_total_order()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        let values = [
+            ScalarValue::Vector(vec![
+                CanonicalF32::new(f32::NEG_INFINITY),
+                CanonicalF32::new(0.0),
+            ]),
+            ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(2.0)]),
+            ScalarValue::Vector(vec![CanonicalF32::new(0.0), CanonicalF32::new(-1.0)]),
+            ScalarValue::Vector(vec![CanonicalF32::new(0.0), CanonicalF32::new(1.0)]),
+            ScalarValue::Vector(vec![
+                CanonicalF32::new(f32::INFINITY),
+                CanonicalF32::new(f32::NAN),
+            ]),
+        ];
+        let mut previous: Option<Vec<u8>> = None;
+        for value in values {
+            let encoded = value.encode_ordered_component(&logical_type)?;
+            assert_eq!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded)?,
+                value
+            );
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_ordered_codec_rejects_dimensions_noncanonical_bits_and_trailing()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Vector(VectorType::new(VectorElement::Float32, 2)?);
+        assert_eq!(
+            ScalarValue::Vector(vec![CanonicalF32::new(1.0)])
+                .encode_ordered_component(&logical_type),
+            Err(NativeTypeError::ScalarOutOfRange)
+        );
+        let value = ScalarValue::Vector(vec![CanonicalF32::new(-1.0), CanonicalF32::new(1.0)]);
+        let encoded = value.encode_ordered_component(&logical_type)?;
+        for length in 0..encoded.len() {
+            assert!(
+                ScalarValue::decode_ordered_component(&logical_type, &encoded[..length]).is_err()
+            );
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &trailing),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        let mut noncanonical = encoded;
+        noncanonical[1..5].copy_from_slice(&sortable_f32_bits((-0.0_f32).to_bits()).to_be_bytes());
+        assert_eq!(
+            ScalarValue::decode_ordered_component(&logical_type, &noncanonical),
+            Err(NativeTypeError::InvalidScalarEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_storage_codec_accepts_only_canonical_json_and_round_trips()
+    -> Result<(), NativeTypeError> {
+        let logical_type = LogicalType::Json;
+        let value = ScalarValue::Json(r#"{"a":[true,null,"x"],"b":1,"c":-2.5}"#.to_owned());
+        let encoded = value.encode_storage(&logical_type)?;
+        assert_eq!(encoded, br#"{"a":[true,null,"x"],"b":1,"c":-2.5}"#);
+        assert_eq!(ScalarValue::decode_storage(&logical_type, &encoded)?, value);
+        Ok(())
+    }
+
+    #[test]
+    fn json_storage_codec_rejects_noncanonical_duplicate_and_nonfinite_forms() {
+        let logical_type = LogicalType::Json;
+        for json in [
+            r#"{ "a": 1}"#,
+            r#"{"b":1,"a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1.0}"#,
+            r#"{"a":NaN}"#,
+            r#"{"a":"\u0078"}"#,
+        ] {
+            assert_eq!(
+                ScalarValue::Json(json.to_owned()).encode_storage(&logical_type),
+                Err(NativeTypeError::InvalidScalarEncoding),
+                "accepted noncanonical JSON: {json}"
+            );
+            assert_eq!(
+                ScalarValue::decode_storage(&logical_type, json.as_bytes()),
+                Err(NativeTypeError::InvalidScalarEncoding),
+                "decoded noncanonical JSON: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_storage_codec_rejects_type_mismatch_and_oversize() {
+        assert_eq!(
+            ScalarValue::Json("null".to_owned()).encode_storage(&LogicalType::Text),
+            Err(NativeTypeError::ScalarTypeMismatch)
+        );
+        assert_eq!(
+            ScalarValue::Json(format!("\"{}\"", "x".repeat(MAX_SCALAR_BYTES)))
+                .encode_storage(&LogicalType::Json),
+            Err(NativeTypeError::ScalarLengthExceeded)
+        );
     }
 
     #[test]
@@ -2002,7 +3120,7 @@ mod tests {
         );
         assert_eq!(
             ScalarValue::Text("{}".to_owned()).encode_storage(&LogicalType::Json),
-            Err(NativeTypeError::UnsupportedScalarType)
+            Err(NativeTypeError::ScalarTypeMismatch)
         );
         assert_eq!(
             ScalarValue::decode_storage(&LogicalType::Boolean, &[2]),

@@ -580,6 +580,7 @@ def build_receipt(
         "gate_version": GATE_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "result": "pass",
+        "source_commit": _git_value(["rev-parse", "HEAD"], root),
         "git": {
             "commit": _git_value(["rev-parse", "HEAD"], root),
             "tree": _git_value(["rev-parse", "HEAD^{tree}"], root),

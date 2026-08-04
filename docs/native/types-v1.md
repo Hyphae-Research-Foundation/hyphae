@@ -2,8 +2,10 @@
 
 Status: normative target contract; identities, logical-type descriptors,
 primitive scalar storage, and primitive ordered-index components are
-implemented in `hyphae-native-types`. Canonical JSON, arrays, maps, and vectors
-remain target-only value codecs.
+implemented in `hyphae-native-types`. Canonical arrays, maps, and fixed-
+dimension float32 vectors, and RFC 8259 canonical JSON now have checked storage
+codecs; arrays/maps support nested/null values and maps enforce strict canonical
+key order.
 
 This specification defines the types and stable identities shared by the
 native relational, structure, and search engines. Public SQL and local-wire
@@ -67,9 +69,22 @@ payloads carry no internal length prefix.
 | `INTERVAL` | `i32` months, `i32` days, `i64` nanoseconds; each little-endian |
 | `UUID` | 16 bytes in network byte order |
 
-SQL `NULL` is never a scalar payload; it is represented only in the containing
-row's null bitmap. Canonical value codecs for `JSON`, `ARRAY`, `MAP`, and
-`VECTOR` are not defined in this slice and reject use explicitly.
+SQL `NULL` is never a primitive scalar payload; it is represented in a row's
+null bitmap. Inside canonical arrays, each element carries an explicit null or
+value marker. Array storage is `u32 count` followed by each element as `0x00`
+for null or `0x01 + u32 byte length + canonical element payload`. Counts above
+100,000, truncation, trailing bytes, invalid markers, and aggregate values over
+16 MiB fail closed. Map storage is `u32 count`; each entry carries a length-
+prefixed non-null canonical key followed by `0x00` for a null value or `0x01 +
+u32 byte length + canonical value payload`. Keys must be strictly increasing by
+their declared ordered encoding, making duplicates and unsorted maps
+noncanonical. Vector storage is exactly `N` canonical float32 values in
+little-endian element order with no redundant dimension field; the declared
+type fixes `N`, and noncanonical NaN/zero bits or wrong byte counts fail closed.
+JSON storage is canonical UTF-8 RFC 8259: object keys are byte-sorted, duplicate
+keys are rejected by canonical re-encoding, insignificant whitespace is absent,
+escapes are minimal, integers use decimal spelling, finite floats use the
+shortest round-tripping spelling, and non-finite numbers fail closed.
 
 ## Ordered-index component v1
 
@@ -97,8 +112,16 @@ byte comparison:
 The text/binary terminator makes both prefixes and embedded zero bytes
 unambiguous. Decoders reject missing terminators, bytes after a terminator,
 invalid escapes, noncanonical float bits, wrong fixed widths, and
-out-of-domain values. Ordered codecs for `JSON`, `ARRAY`, `MAP`, and `VECTOR`
-remain undefined and fail explicitly.
+out-of-domain values. Ordered arrays encode each complete element component
+through the same zero-byte escaping used by text and binary, concatenate those
+self-delimiting components, and end with `00 00`. This preserves lexicographic
+array order, including SQL null elements and prefix arrays. Ordered maps use
+the same framing over alternating key/value ordered components and require
+strictly increasing non-null keys. This preserves lexicographic entry order and
+nullable values. Ordered vectors concatenate fixed-width sortable float32
+components in declared dimension order, giving lexicographic vector total order
+with canonical NaN/zero handling. Only ordered `JSON` remains undefined and
+fails explicitly.
 
 ## Directory lineage identity
 
@@ -229,8 +252,14 @@ The current implementation provides deterministic unit fixtures for descriptor
 round trips, all primitive storage codecs, byte-order agreement for each
 primitive ordered codec, malformed inputs, limits, decimal domains, time
 domains, float NaN/zero canonicalization, and descriptor golden bytes. Property
-tests now cover signed, unsigned, decimal, text, binary, date, time, timestamp,
-and UUID storage/ordered round trips plus exact value-order agreement with
-memcomparable bytes. Float and interval property coverage, nested value codecs,
-cross-crate golden consumption, and broader property coverage across every
-implemented scalar family remain required.
+tests now cover every implemented primitive family: signed and unsigned
+integers, decimal, float32/float64 canonicalization and total order, text,
+binary, date, time, timestamp, interval, and UUID storage/ordered round trips
+plus exact value-order agreement with memcomparable bytes. The records crate
+consumes one frozen 13-family primitive corpus directly from
+`hyphae-native-types`, proving cross-crate storage and ordered-byte identity.
+Records, pages, WAL, and the native runtime/local-protocol test surface all
+consume a frozen 17-family corpus, including nested arrays, maps, vectors, and
+JSON. Storage bytes are checked for every family; ordered bytes are checked for
+all families with declared ordered semantics. JSON storage is canonical; JSON
+ordered index semantics remain intentionally undefined and fail explicitly.

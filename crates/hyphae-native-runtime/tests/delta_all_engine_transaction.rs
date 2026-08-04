@@ -5,7 +5,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use hyphae_native_runtime::{NativeDatabase, NativeRuntimeError, SqlError, SqlResult};
@@ -15,15 +15,23 @@ type TestError = Box<dyn std::error::Error>;
 
 struct TemporaryDirectory(PathBuf);
 
+static NEXT_TEMPORARY_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
 impl TemporaryDirectory {
     fn create() -> Result<Self, TestError> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hy-delta-transaction-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        for _ in 0..1_024 {
+            let nonce = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "hy-delta-transaction-{}-{nonce}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err("failed to allocate a unique temporary directory".into())
     }
 
     fn path(&self) -> &Path {
