@@ -349,7 +349,6 @@ mod unix {
             atomic::{AtomicI64, AtomicUsize, Ordering},
         },
         thread,
-        time::{SystemTime, UNIX_EPOCH},
     };
 
     use hyphae_native_runtime::{
@@ -368,12 +367,21 @@ mod unix {
 
     struct TemporaryDirectory(PathBuf);
 
+    static NEXT_TEMPORARY_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
     impl TemporaryDirectory {
         fn create() -> Result<Self, Box<dyn std::error::Error>> {
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let path = Path::new("/tmp").join(format!("hy-set-{}-{timestamp}", std::process::id()));
-            fs::create_dir(&path)?;
-            Ok(Self(path))
+            for _ in 0..1_024 {
+                let nonce = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path =
+                    std::env::temp_dir().join(format!("hy-set-{}-{nonce}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self(path)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err("failed to allocate a unique temporary directory".into())
         }
 
         fn path(&self) -> &Path {
