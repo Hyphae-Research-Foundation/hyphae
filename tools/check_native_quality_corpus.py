@@ -36,6 +36,11 @@ ANN_FIELDS = {
     "hnsw_latency_micros",
 }
 LATENCY_FIELDS = {"p50", "p95", "p99", "maximum"}
+LEXICAL_FIELDS = {
+    "schema", "source_commit", "dataset_digest", "document_count", "query_count",
+    "top_k", "exact_score_order_equivalence", "reopen_equivalence",
+    "query_result_digests",
+}
 
 
 class GateFailure(RuntimeError):
@@ -58,6 +63,47 @@ def _producer(root: Path, value: str) -> Path:
     if not path.is_file():
         raise GateFailure(f"producer is missing: {value}")
     return path
+
+
+def validate_lexical_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Validate one bounded lexical equivalence receipt."""
+
+    if set(receipt) != LEXICAL_FIELDS:
+        raise GateFailure("unknown lexical receipt field or missing required field")
+    if receipt.get("schema") != "hyphae-native-lexical-quality-v1":
+        raise GateFailure("unsupported lexical receipt schema")
+    source_commit = receipt.get("source_commit")
+    if not isinstance(source_commit, str) or COMMIT.fullmatch(source_commit) is None:
+        raise GateFailure("lexical source commit is invalid")
+    dataset_digest = receipt.get("dataset_digest")
+    if not isinstance(dataset_digest, str) or SHA256.fullmatch(dataset_digest) is None:
+        raise GateFailure("lexical dataset digest is invalid")
+    for field in ("document_count", "query_count", "top_k"):
+        value = receipt.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise GateFailure(f"lexical receipt {field} requires positive scale")
+    if (
+        receipt.get("exact_score_order_equivalence") is not True
+        or receipt.get("reopen_equivalence") is not True
+    ):
+        raise GateFailure("lexical receipt equivalence is not complete")
+    digests = receipt.get("query_result_digests")
+    if not isinstance(digests, list) or len(digests) != receipt["query_count"]:
+        raise GateFailure("lexical query digest count differs from query_count")
+    if len(digests) != len(set(digests)) or any(
+        not isinstance(digest, str) or SHA256.fullmatch(digest) is None for digest in digests
+    ):
+        raise GateFailure("lexical query result digests are invalid or duplicate")
+    document_count = receipt["document_count"]
+    query_count = receipt["query_count"]
+    return {
+        "status": "passed",
+        "evidence_scope": "bounded-observation",
+        "document_count": document_count,
+        "query_count": query_count,
+        "top_k": receipt["top_k"],
+        "production_scale": document_count >= 1_000_000 and query_count >= 1_000,
+    }
 
 
 def _finite_positive(value: object, label: str, *, allow_zero: bool = False) -> float:
