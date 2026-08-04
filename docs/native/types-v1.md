@@ -228,6 +228,8 @@ The implementation must provide:
 The current implementation provides deterministic unit fixtures for descriptor
 round trips, all primitive storage codecs, byte-order agreement for each
 primitive ordered codec, malformed inputs, limits, decimal domains, time
-domains, float NaN/zero canonicalization, and descriptor golden bytes. Broad
-property testing, nested value codecs, and cross-crate golden consumption
-remain required.
+domains, float NaN/zero canonicalization, and descriptor golden bytes. Property
+tests now cover signed and binary storage/ordered round trips plus exact
+value-order agreement with memcomparable bytes. Nested value codecs,
+cross-crate golden consumption, and broader property coverage across every
+implemented scalar family remain required.
