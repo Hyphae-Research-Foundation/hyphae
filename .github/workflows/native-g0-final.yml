@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest tools/test_assemble_native_g0_evidence.py -v
-          python tools/assemble_native_g0_evidence.py \
+          PYTHONPATH=. python tools/assemble_native_g0_evidence.py \
             --root evidence \
             --profile config/native-g0-readiness-profile.json \
             --evidence config/native-g0-readiness-evidence.json \

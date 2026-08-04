@@ -152,6 +152,7 @@ class NativeG0ReadinessTests(unittest.TestCase):
         self.assertIn("item.conclusion === 'success'", workflow)
         self.assertIn("Verify receipt commit identity", workflow)
         self.assertIn("source_commit {actual} != {expected}", workflow)
+        self.assertIn("PYTHONPATH=. python tools/assemble_native_g0_evidence.py", workflow)
         self.assertIn("tools/assemble_native_g0_evidence.py", workflow)
         self.assertIn("native-g0-final-readiness.json", workflow)
         self.assertIn("'required': 8", workflow)
