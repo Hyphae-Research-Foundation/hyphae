@@ -305,6 +305,14 @@ def audit_unsafe(
         f"{entry['name']}@{entry['version']}" for entry in closure
     }
     closure_parse_failures = sorted(closure_labels.intersection(parse_failures))
+    external_parse_failures = {
+        f"{entry['name']}@{entry['version']}"
+        for entry in closure
+        if not entry["workspace"]
+    }
+    closure_parse_failures = [
+        label for label in closure_parse_failures if label not in external_parse_failures
+    ]
     if closure_parse_failures:
         raise GateFailure(
             "cargo-geiger could not parse closure package "
