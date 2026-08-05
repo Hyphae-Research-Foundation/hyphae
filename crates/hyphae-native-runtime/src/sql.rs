@@ -3723,6 +3723,14 @@ fn execute_create(
             },
         ));
     }
+    let mut constraint_names = BTreeSet::new();
+    for foreign_key in &parsed_foreign_keys {
+        if let Some(name) = &foreign_key.name
+            && !constraint_names.insert(normalize_identifier(name))
+        {
+            return Err(SqlError::DuplicateColumn);
+        }
+    }
     let mut foreign_keys = Vec::new();
     for foreign_key in parsed_foreign_keys {
         let child_columns = foreign_key

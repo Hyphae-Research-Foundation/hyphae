@@ -74,6 +74,12 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
             &[],
         )
         .is_err());
+    assert!(tx
+        .execute_sql(
+            "CREATE TABLE duplicate_names (id BIGINT PRIMARY KEY, first_parent BIGINT, second_parent BIGINT, CONSTRAINT duplicate_fk FOREIGN KEY (first_parent) REFERENCES parents (id), CONSTRAINT duplicate_fk FOREIGN KEY (second_parent) REFERENCES parents (id))",
+            &[],
+        )
+        .is_err());
     tx.commit()?;
     drop(database);
 
