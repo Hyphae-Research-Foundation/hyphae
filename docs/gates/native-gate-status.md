@@ -11,7 +11,7 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 | G1 | Closure claimed; revalidation required | Reconstruct all 7 hosted requirements after G0 authority is restored |
 | G2 | Closed at `a839037` | [8/8 hosted bounded relational closure](evidence/closures/native-g2-a839037.json); no universal SQL or official benchmark claim |
 | G3 | Closed at `a839037` | [11/11 hosted suite-bound structure closure](evidence/closures/native-g3-a839037.json) |
-| G4 | Closure candidate | 12/12 hosted corpus-bound exact-SHA evidence for the bounded search profile |
+| G4 | Closed at `0059fce` | [12/12 hosted corpus-bound search closure](evidence/closures/native-g4-0059fce.json) |
 | G5-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
 
 `closure-claimed-revalidation-required` preserves a historical closure claim
