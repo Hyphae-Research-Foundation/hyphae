@@ -22,21 +22,24 @@ class NativeG2InventoryTests(unittest.TestCase):
             self.assertIn(row["status"], allowed)
             self.assertTrue(row["gaps"])
 
-    def test_benchmark_and_conformance_gaps_are_explicitly_missing(self) -> None:
+    def test_all_rows_are_implemented_unhosted_but_remain_open(self) -> None:
         inventory = json.loads((ROOT / "config/native-g2-inventory.json").read_text())
-        rows = {row["id"]: row for row in inventory["requirements"]}
-        for identifier in (
-            "sqllogictest-conformance",
-            "metamorphic-sql-equivalence",
-            "tpch-correctness",
-            "tpcc-acid",
-        ):
-            self.assertEqual(rows[identifier]["status"], "missing")
+        self.assertEqual(
+            {row["status"] for row in inventory["requirements"]},
+            {"implemented-unhosted"},
+        )
+        for row in inventory["requirements"]:
+            self.assertTrue(any("hosted exact-SHA" in gap for gap in row["gaps"]))
 
-    def test_ctes_windows_and_constraint_gaps_are_not_omitted(self) -> None:
+    def test_benchmark_non_claims_remain_explicit(self) -> None:
         inventory = json.loads((ROOT / "config/native-g2-inventory.json").read_text())
         text = json.dumps(inventory)
-        for gap in ("CTEs", "window functions", "CHECK constraints", "FOREIGN KEY"):
+        for gap in (
+            "21 unsupported canonical queries",
+            "canonical full-column TPC-C schema",
+            "serializable/write-skew",
+            "recursive CTEs",
+        ):
             self.assertIn(gap, text)
 
 

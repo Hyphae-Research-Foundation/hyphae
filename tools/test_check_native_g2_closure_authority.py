@@ -17,18 +17,17 @@ class NativeG2ClosureAuthorityTests(unittest.TestCase):
         )
         unsupported = sum(row["status"] == "unsupported" for row in matrix["queries"])
         self.assertEqual(unsupported, 21)
-        self.assertNotEqual(rows["tpch-correctness"]["status"], "implemented-unhosted")
+        self.assertEqual(rows["tpch-correctness"]["status"], "implemented-unhosted")
+        self.assertTrue(any("21 unsupported" in gap for gap in rows["tpch-correctness"]["gaps"]))
 
     def test_complete_g2_contract_retains_hard_engine_gaps(self) -> None:
         inventory = json.loads((ROOT / "config/native-g2-inventory.json").read_text())
         text = json.dumps(inventory)
         for gap in (
-            "ALTER TABLE",
-            "DROP TABLE",
-            "CHECK constraints",
-            "FOREIGN KEY constraints",
-            "complete isolation litmus corpus",
-            "complete join semantics and algorithms",
+            "non-rename schema evolution",
+            "serializable/write-skew",
+            "recursive CTEs",
+            "21 unsupported canonical queries",
             "canonical full-column TPC-C schema",
         ):
             self.assertIn(gap, text)
