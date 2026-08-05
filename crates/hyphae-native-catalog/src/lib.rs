@@ -814,6 +814,7 @@ impl CatalogSnapshot {
 pub struct CatalogTransaction {
     base: Arc<CatalogSnapshot>,
     additions: Vec<CatalogObject>,
+    removals: BTreeSet<ObjectId>,
 }
 
 impl CatalogTransaction {
@@ -822,6 +823,7 @@ impl CatalogTransaction {
         Self {
             base,
             additions: Vec::new(),
+            removals: BTreeSet::new(),
         }
     }
 
@@ -887,12 +889,46 @@ impl CatalogTransaction {
         Ok(())
     }
 
+    /// Stages strict object removal with dependency checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object is absent or still owns a dependent
+    /// secondary index or foreign-key edge.
+    pub fn remove(&mut self, id: ObjectId) -> Result<(), CatalogError> {
+        let object = self
+            .additions
+            .iter()
+            .find(|object| object.header().id == id)
+            .or_else(|| self.base.objects.get(&id))
+            .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+        if matches!(object, CatalogObject::Relation(_))
+            && self
+                .additions
+                .iter()
+                .chain(self.base.objects.values())
+                .filter(|candidate| !self.removals.contains(&candidate.header().id))
+                .any(|candidate| match candidate {
+                    CatalogObject::SecondaryIndex(index) => index.relation == id,
+                    CatalogObject::Relation(relation) => relation
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_relation == id),
+                    CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+                })
+        {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        self.removals.insert(id);
+        Ok(())
+    }
+
     /// Commits a new immutable in-memory catalog snapshot.
     ///
     /// # Errors
     ///
     /// Returns an error when catalog version space is exhausted.
-    pub fn commit(self) -> Result<Arc<CatalogSnapshot>, CatalogError> {
+    pub fn commit(mut self) -> Result<Arc<CatalogSnapshot>, CatalogError> {
         let version = self
             .base
             .version
@@ -900,6 +936,17 @@ impl CatalogTransaction {
             .ok_or(CatalogError::VersionExhausted)?;
         let mut objects = self.base.objects.clone();
         let mut names = self.base.names.clone();
+        for id in self.removals {
+            if let Some(object) = objects.remove(&id) {
+                names.remove(&object.header().name);
+            } else if let Some(index) = self
+                .additions
+                .iter()
+                .position(|object| object.header().id == id)
+            {
+                self.additions.remove(index);
+            }
+        }
         for object in self.additions {
             let header = object.header();
             names.insert(header.name.clone(), header.id);
@@ -1005,6 +1052,21 @@ mod tests {
             transaction.create(relation(1, "other")?),
             Err(CatalogError::DuplicateObjectId(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_rejects_unknown_and_dependent_objects() -> Result<(), Box<dyn std::error::Error>> {
+        let base = CatalogSnapshot::empty(CatalogVersion::new(1)?);
+        let mut transaction = CatalogTransaction::begin(base);
+        transaction.create(relation(1, "accounts")?)?;
+        transaction.create(secondary_index(2, 1, 1)?)?;
+        assert!(transaction.remove(ObjectId::new(1)?).is_err());
+        transaction.remove(ObjectId::new(2)?)?;
+        transaction.remove(ObjectId::new(1)?)?;
+        assert!(transaction.remove(ObjectId::new(99)?).is_err());
+        let committed = transaction.commit()?;
+        assert!(committed.is_empty());
         Ok(())
     }
 
