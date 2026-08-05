@@ -3774,7 +3774,12 @@ fn execute_create(
                     CatalogObject::SecondaryIndex(index)
                         if index.relation == parent_id
                             && index.unique
-                            && index.columns == parent_columns =>
+                            && index.columns == parent_columns
+                            && index.columns.iter().all(|column_id| {
+                                parent_columns_source
+                                    .iter()
+                                    .any(|column| column.id == *column_id && !column.nullable)
+                            }) =>
                     {
                         Some(index.header.id)
                     }

@@ -54,6 +54,20 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
         "INSERT INTO invites (id, email) VALUES (1, 'a@example.com')",
         &[],
     )?;
+    tx.execute_sql(
+        "CREATE TABLE nullable_users (id BIGINT PRIMARY KEY, email TEXT)",
+        &[],
+    )?;
+    tx.execute_sql(
+        "CREATE UNIQUE INDEX nullable_email ON nullable_users (email)",
+        &[],
+    )?;
+    assert!(tx
+        .execute_sql(
+            "CREATE TABLE nullable_invites (id BIGINT PRIMARY KEY, email TEXT, FOREIGN KEY (email) REFERENCES nullable_users (email))",
+            &[],
+        )
+        .is_err());
     assert!(matches!(
         tx.execute_sql(
             "INSERT INTO invites (id, email) VALUES (2, 'missing@example.com')",
