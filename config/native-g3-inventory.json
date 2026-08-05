@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g3-inventory-v1",
+  "gate": "G3",
+  "requirements": [
+    {"id": "strings-and-counters", "status": "implemented-unhosted", "present": ["binary scalar SET/GET/DELETE", "NX/XX", "signed canonical INCRBY"], "gaps": ["hosted exact-SHA receipt", "expected-version SET remains a non-claim"]},
+    {"id": "hashes", "status": "implemented-unhosted", "present": ["typed lifecycle", "field CRUD/batches/counter/scans", "whole and field TTL", "randomized hash model"], "gaps": ["complete G3 hosted receipt"]},
+    {"id": "lists", "status": "partial", "present": ["chunked deque", "push/pop/range", "whole lifecycle and TTL"], "gaps": ["model-based randomized family corpus", "hosted exact-SHA receipt"]},
+    {"id": "sets", "status": "partial", "present": ["member CRUD/batches/scans", "algebra", "whole lifecycle and TTL"], "gaps": ["complete randomized family corpus", "hosted exact-SHA receipt"]},
+    {"id": "sorted-sets", "status": "partial", "present": ["dual-index CRUD", "rank", "forward/reverse rank and score ranges"], "gaps": ["whole-family TTL/lifecycle", "randomized model", "hosted exact-SHA receipt"]},
+    {"id": "streams", "status": "missing", "present": [], "gaps": ["append-ordered stream format", "stable entry IDs", "read/range/lifecycle/TTL", "restart and randomized evidence"]},
+    {"id": "ttl-and-controlled-expiry", "status": "partial", "present": ["deterministic logical-time scalar/hash/set/list expiry", "ordered expiry index", "bounded cleanup and reconstruction"], "gaps": ["sorted-set and stream expiry", "complete family matrix", "hosted exact-SHA receipt"]},
+    {"id": "atomic-batches-and-conflicts", "status": "partial", "present": ["multi-field/member atomic batches", "MVCC first-committer-wins", "group commit"], "gaps": ["complete all-family and multi-key atomicity/conflict matrix", "hosted exact-SHA receipt"]},
+    {"id": "model-based-randomized-equivalence", "status": "partial", "present": ["hash fixed-seed model", "set command randomized model"], "gaps": ["models for every required structure family", "negative controls", "hosted exact-SHA receipt"]},
+    {"id": "restart-equivalence", "status": "partial", "present": ["reopen tests across implemented families"], "gaps": ["stream restart equivalence", "one complete all-family matrix", "hosted exact-SHA receipt"]},
+    {"id": "memory-amplification", "status": "missing", "present": [], "gaps": ["defined logical-byte denominator", "resident/page/blob measurements", "thresholds and hosted receipt"]}
+  ]
+}
