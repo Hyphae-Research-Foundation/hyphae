@@ -16358,7 +16358,8 @@ fn append_stream_entry_in_tree(
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
     let last = u64::from_be_bytes(
         metadata
-            .as_slice()
+            .get(..8)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
             .try_into()
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
     );
@@ -16372,8 +16373,14 @@ fn append_stream_entry_in_tree(
     tree = tree
         .upsert(pages, creating_csn, entry_key, mutation.value.clone())?
         .tree;
+    let mut next_metadata = id.to_be_bytes().to_vec();
+    if metadata.len() == 16 {
+        next_metadata.extend_from_slice(&metadata[8..16]);
+    } else if metadata.len() != 8 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
     Ok(tree
-        .upsert(pages, creating_csn, metadata_key, id.to_be_bytes().to_vec())?
+        .upsert(pages, creating_csn, metadata_key, next_metadata)?
         .tree)
 }
 
@@ -16390,16 +16397,45 @@ fn expire_stream_in_tree(
     let metadata = tree
         .get(pages, &key)?
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    if metadata.len() != 8 {
-        return Err(NativeRuntimeError::InvalidStructureTree);
-    }
-    let mut updated = metadata;
+    let (last, previous_expiry) = match metadata.len() {
+        8 => (
+            u64::from_be_bytes(
+                metadata[..8]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            ),
+            None,
+        ),
+        16 => (
+            u64::from_be_bytes(
+                metadata[..8]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            ),
+            Some(i64::from_be_bytes(
+                metadata[8..16]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )),
+        ),
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    let mut updated = last.to_be_bytes().to_vec();
     updated.extend_from_slice(&expiry.to_be_bytes());
     let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
     let mut entries = vec![
         (key, updated),
         (expiry_key, vec![STRUCTURE_STREAM_EXPIRY_LIVE]),
     ];
+    if let Some(previous) = previous_expiry
+        && previous != expiry
+    {
+        let previous_key = structure_expiry_key(previous, &mutation.key)?;
+        if tree.get(pages, &previous_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((previous_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
