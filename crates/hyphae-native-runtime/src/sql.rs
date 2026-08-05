@@ -473,6 +473,14 @@ enum Statement {
     },
     SelectJoin(ParsedInnerJoin),
     ExplainSelectJoin(ParsedInnerJoin),
+    WithSelect(ParsedCteSelect),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedCteSelect {
+    name: String,
+    inner: Box<Statement>,
+    outer: Box<Statement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1029,6 +1037,100 @@ pub(crate) fn execute_transaction(
         Statement::ExplainSelectJoin(join) => {
             execute_indexed_join_explain(transaction, &join, parameters)
         }
+        Statement::WithSelect(cte) => execute_cte_select(transaction, &cte, parameters),
+    }
+}
+
+fn execute_cte_select(
+    transaction: &mut NativeWriteBatch,
+    cte: &ParsedCteSelect,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let inner = execute_parsed_transaction(transaction, &cte.inner, parameters)?;
+    let SqlResult::Rows { columns, rows } = inner else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let Statement::Select {
+        name,
+        projection,
+        filter,
+        parameter_count,
+        order_by,
+        limit,
+    } = cte.outer.as_ref()
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if normalize_identifier(name) != normalize_identifier(&cte.name)
+        || filter.is_some()
+        || *parameter_count != 0
+        || !order_by.is_empty()
+    {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let projection = match projection {
+        Projection::All => (0..columns.len()).collect::<Vec<_>>(),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| {
+                let lookup = normalize_identifier(name);
+                columns
+                    .iter()
+                    .position(|column| normalize_identifier(column) == lookup)
+                    .ok_or(SqlError::UnknownColumn)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let output_columns = projection
+        .iter()
+        .map(|index| columns.get(*index).cloned().ok_or(SqlError::UnknownColumn))
+        .collect::<Result<Vec<_>, _>>()?;
+    let limit = limit.unwrap_or(rows.len());
+    let rows = rows
+        .into_iter()
+        .take(limit)
+        .map(|row| {
+            projection
+                .iter()
+                .map(|index| row.get(*index).cloned().ok_or(SqlError::InvalidStoredRow))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns,
+        rows,
+    })
+}
+
+fn execute_parsed_transaction(
+    transaction: &mut NativeWriteBatch,
+    statement: &Statement,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    match statement {
+        Statement::Select {
+            name,
+            projection,
+            filter,
+            parameter_count,
+            order_by,
+            limit,
+        } => execute_select(
+            transaction,
+            SelectQuery {
+                name,
+                projection,
+                filter: filter.as_ref(),
+                parameter_count: *parameter_count,
+                order_by,
+                limit: *limit,
+            },
+            parameters,
+        ),
+        _ => Err(SqlError::InvalidSyntax),
     }
 }
 
@@ -6101,7 +6203,9 @@ fn ensure_catalog_version(
 
 fn parse(statement: &str) -> Result<Statement, SqlError> {
     let mut parser = Parser::new(lex(statement)?);
-    let parsed = if parser.consume_keyword("CREATE") {
+    let parsed = if parser.consume_keyword("WITH") {
+        parse_with_select(&mut parser)?
+    } else if parser.consume_keyword("CREATE") {
         parse_create(&mut parser)?
     } else if parser.consume_keyword("INSERT") {
         parse_insert(&mut parser)?
@@ -6138,6 +6242,34 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
     parser.consume_symbol(';');
     parser.finish()?;
     Ok(parsed)
+}
+
+fn parse_with_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    if parser.consume_keyword("RECURSIVE") {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let name = parser.identifier()?;
+    parser.expect_keyword("AS")?;
+    parser.expect_symbol('(')?;
+    parser.expect_keyword("SELECT")?;
+    let inner = parse_select(parser)?;
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("SELECT")?;
+    let outer = parse_select(parser)?;
+    let Statement::Select {
+        name: outer_name, ..
+    } = &outer
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if normalize_identifier(outer_name) != normalize_identifier(&name) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    Ok(Statement::WithSelect(ParsedCteSelect {
+        name,
+        inner: Box::new(inner),
+        outer: Box::new(outer),
+    }))
 }
 
 fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {

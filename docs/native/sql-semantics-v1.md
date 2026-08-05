@@ -15,6 +15,22 @@ scans are implemented experimentally as described below. G2 remains open
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
 
+The first bounded non-recursive CTE materialization slice is also implemented:
+
+```text
+WITH <name> AS (
+  SELECT <projection> FROM <base-table> [WHERE ...] LIMIT <n>
+)
+SELECT <projection> FROM <name> [LIMIT <n>]
+```
+
+The inner query uses the ordinary catalog-bound native SELECT executor, then
+materializes its bounded rows as one statement-local relation. The outer query
+may project those rows and apply a second bound. Recursive CTEs, nested CTEs,
+parameterized CTEs, outer filters/order, joins against a CTE, multiple CTEs,
+and durable catalog publication are rejected. This slice is not complete G2
+CTE support and does not change the gate status.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,
