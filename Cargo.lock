@@ -725,6 +725,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "unicode-casefold",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -265,6 +265,25 @@ pub struct VectorHit {
     pub distance: f64,
 }
 
+/// Physical strategy used to produce one ANN result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnSearchStrategy {
+    /// Ordinary bounded graph traversal without a filter.
+    GraphTraversal,
+    /// Bounded graph traversal followed by a stable-object-ID allowlist.
+    StableIdAllowlistPostFilter,
+}
+
+/// Honest recall qualification for one ANN execution strategy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnRecallRisk {
+    /// Results remain subject to ordinary bounded graph-traversal recall.
+    ApproximateTraversal,
+    /// Post-filtering a bounded candidate set may miss allowed neighbors and
+    /// may return fewer than `k` hits even when enough allowed vectors exist.
+    PostFilterMayMissAllowedNeighbors,
+}
+
 /// Per-query ANN bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchOptions {
@@ -323,6 +342,12 @@ pub struct AnnSearchResult {
     pub ef_search: usize,
     /// Number of layer-zero candidates retained before final truncation.
     pub candidate_count: usize,
+    /// Candidates retained after applying the selected filter strategy.
+    pub eligible_candidate_count: usize,
+    /// Physical filtering and traversal strategy that ran.
+    pub strategy: AnnSearchStrategy,
+    /// Recall qualification implied by the selected strategy.
+    pub recall_risk: AnnRecallRisk,
     /// Whether candidates were explicitly rescored.
     pub exact_reranked: bool,
     /// Number of distinct nodes whose distance was evaluated.
@@ -568,6 +593,32 @@ impl HnswIndex {
     ///
     /// Returns an error for invalid query admission.
     pub fn search_exact(&self, query: &Vector, k: usize) -> Result<Vec<VectorHit>, AnnError> {
+        self.search_exact_allowlist(query, k, None)
+    }
+
+    /// Executes the complete exact ranking oracle over a stable-ID allowlist.
+    ///
+    /// IDs absent from the current generation are ignored. Unlike filtered
+    /// ANN traversal, this scans every current vector admitted by the filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query admission.
+    pub fn search_exact_filtered(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, AnnError> {
+        self.search_exact_allowlist(query, k, Some(allowlist))
+    }
+
+    fn search_exact_allowlist(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+    ) -> Result<Vec<VectorHit>, AnnError> {
         validate_vector(self.definition, query)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -575,6 +626,7 @@ impl HnswIndex {
         let mut hits = self
             .entries
             .iter()
+            .filter(|(object_id, _)| allowlist.is_none_or(|ids| ids.contains(object_id)))
             .map(|(object_id, entry)| {
                 Ok(VectorHit {
                     object_id: *object_id,
@@ -602,6 +654,35 @@ impl HnswIndex {
         query: &Vector,
         options: SearchOptions,
     ) -> Result<AnnSearchResult, AnnError> {
+        self.search_allowlist(query, options, None)
+    }
+
+    /// Traverses the graph with bounded breadth and post-filters its candidate
+    /// set through a stable-ID allowlist.
+    ///
+    /// This is deliberately not a production-recall claim: disallowed graph
+    /// nodes may be traversed, only at most the bounded layer-zero candidates
+    /// are filtered, and the result may underfill `k`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for query admission or breadth above the configured
+    /// maximum.
+    pub fn search_filtered(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchResult, AnnError> {
+        self.search_allowlist(query, options, Some(allowlist))
+    }
+
+    fn search_allowlist(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+    ) -> Result<AnnSearchResult, AnnError> {
         validate_vector(self.definition, query)?;
         if options.ef_search > usize::from(self.definition.config.ef_search_max) {
             return Err(AnnError::SearchBreadthExceeded);
@@ -613,6 +694,9 @@ impl HnswIndex {
                 metric: self.definition.metric,
                 ef_search: options.ef_search,
                 candidate_count: 0,
+                eligible_candidate_count: 0,
+                strategy: strategy(allowlist),
+                recall_risk: recall_risk(allowlist),
                 exact_reranked: options.exact_rerank.is_some(),
                 visited_nodes: 0,
                 hits: Vec::new(),
@@ -635,6 +719,10 @@ impl HnswIndex {
             &mut visited,
         )?;
         let candidate_count = candidates.len();
+        if let Some(allowlist) = allowlist {
+            candidates.retain(|candidate| allowlist.contains(&candidate.object_id));
+        }
+        let eligible_candidate_count = candidates.len();
         if let Some(rerank_count) = options.exact_rerank {
             candidates.truncate(rerank_count);
             for candidate in &mut candidates {
@@ -653,6 +741,9 @@ impl HnswIndex {
             metric: self.definition.metric,
             ef_search: options.ef_search,
             candidate_count,
+            eligible_candidate_count,
+            strategy: strategy(allowlist),
+            recall_risk: recall_risk(allowlist),
             exact_reranked: options.exact_rerank.is_some(),
             visited_nodes: visited.len(),
             hits: candidates
@@ -1106,6 +1197,22 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| left.object_id.cmp(&right.object_id))
 }
 
+fn strategy(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnSearchStrategy {
+    if allowlist.is_some() {
+        AnnSearchStrategy::StableIdAllowlistPostFilter
+    } else {
+        AnnSearchStrategy::GraphTraversal
+    }
+}
+
+fn recall_risk(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnRecallRisk {
+    if allowlist.is_some() {
+        AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+    } else {
+        AnnRecallRisk::ApproximateTraversal
+    }
+}
+
 fn compare_hits(left: &VectorHit, right: &VectorHit) -> Ordering {
     left.distance
         .total_cmp(&right.distance)
@@ -1119,11 +1226,13 @@ fn sort_and_deduplicate_candidates(candidates: &mut Vec<Candidate>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use hyphae_native_types::{Csn, ObjectId};
 
     use super::{
-        AnnError, HnswConfig, HnswIndex, Metric, SearchOptions, Vector, VectorIndexDefinition,
-        VectorRecord,
+        AnnError, AnnRecallRisk, AnnSearchStrategy, HnswConfig, HnswIndex, Metric, SearchOptions,
+        Vector, VectorIndexDefinition, VectorRecord,
     };
 
     fn object(value: u128) -> Result<ObjectId, Box<dyn std::error::Error>> {
@@ -1314,6 +1423,72 @@ mod tests {
         assert_eq!(
             index.search(&Vector::new([1.0, 0.0])?, SearchOptions::new(1, 129, None)?),
             Err(AnnError::SearchBreadthExceeded)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_and_ann_filtered_use_the_same_stable_id_allowlist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut index = HnswIndex::new(definition(Metric::SquaredL2)?)?;
+        for value in 1..=32_u16 {
+            index.upsert(
+                object(u128::from(value))?,
+                csn(u64::from(value))?,
+                Vector::new([f32::from(value), 1.0])?,
+            )?;
+        }
+        let allowlist = [object(2)?, object(7)?, object(19)?]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let query = Vector::new([6.5, 1.0])?;
+        let exact = index.search_exact_filtered(&query, 3, &allowlist)?;
+        let approximate =
+            index.search_filtered(&query, SearchOptions::new(3, 32, Some(32))?, &allowlist)?;
+
+        assert_eq!(approximate.hits, exact);
+        assert_eq!(
+            approximate.strategy,
+            AnnSearchStrategy::StableIdAllowlistPostFilter
+        );
+        assert_eq!(
+            approximate.recall_risk,
+            AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+        );
+        assert_eq!(approximate.eligible_candidate_count, 3);
+        assert!(approximate.candidate_count >= approximate.eligible_candidate_count);
+        assert!(
+            approximate
+                .hits
+                .iter()
+                .all(|hit| allowlist.contains(&hit.object_id))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_ann_is_bounded_and_fails_closed_for_empty_or_unknown_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut index = HnswIndex::new(definition(Metric::SquaredL2)?)?;
+        for value in 1..=16_u16 {
+            index.upsert(
+                object(u128::from(value))?,
+                csn(u64::from(value))?,
+                Vector::new([f32::from(value), 1.0])?,
+            )?;
+        }
+        let query = Vector::new([1.0, 1.0])?;
+        for allowlist in [BTreeSet::new(), BTreeSet::from([object(999)?])] {
+            let result =
+                index.search_filtered(&query, SearchOptions::new(4, 4, None)?, &allowlist)?;
+            assert!(result.hits.is_empty());
+            assert_eq!(result.eligible_candidate_count, 0);
+            assert!(result.candidate_count <= 4);
+        }
+        assert!(
+            index
+                .search_exact_filtered(&query, 4, &BTreeSet::new())?
+                .is_empty()
         );
         Ok(())
     }

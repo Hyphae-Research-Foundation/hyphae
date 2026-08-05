@@ -1,11 +1,11 @@
 # Native ANN semantics v1
 
-Status: normative target contract; deterministic HNSW, canonical `f32`
+Status: normative bounded G4 contract; deterministic HNSW, canonical `f32`
 admission, three metrics, exact oracle, catalog definitions, native search
 B+tree generations, WAL mutations, all-engine MVCC visibility, batch rebuild,
-historical snapshots and fail-closed recovery are implemented experimentally;
-buffered graph traversal, filtering, tombstone compaction and background
-generation publication remain pending
+historical snapshots, stable-ID filtering and fail-closed recovery are
+implemented. Page-buffered traversal, typed in-traversal filtering, tombstone
+compaction and background generation publication remain production non-claims.
 
 ANN is a Hyphae-owned search-engine capability. Exact vector execution remains
 the quality oracle.
@@ -100,13 +100,23 @@ Background consolidation, tombstone compaction and delta/graph query merge
 remain target work.
 
 A query traverses the visible graph and may exact-rerank a declared candidate
-count. Snapshot filtering remains pending.
+count. Stable-ID allowlist post-filtering is implemented; typed predicates and
+filter-aware graph traversal remain pending.
 
 ## Filtering
 
 Stable-ID bitmaps and typed doc-value predicates may run before, during, or
 after graph traversal according to the physical plan. The explanation records
 which strategy ran and whether it can reduce recall.
+
+The current bounded implementation accepts a stable `ObjectId` allowlist. The
+exact oracle scans every visible vector and scores only admitted IDs. ANN still
+traverses admitted and non-admitted graph nodes, retains at most the declared
+layer-zero candidate breadth, then removes candidates absent from the allowlist
+before reranking and top-k truncation. It may therefore underfill `k` or omit an
+allowed exact neighbor. Receipts report `StableIdAllowlistPostFilter`, pre- and
+post-filter candidate counts, and `PostFilterMayMissAllowedNeighbors`; this is
+not a production recall claim.
 
 ## Result contract
 
@@ -125,8 +135,9 @@ used the exact oracle.
 
 ## Quality gates
 
-The primary bounded target is 1,000,000 vectors, 384 dimensions, top 10,
-recall@10 at least 0.95, with latency and memory measured under the
+The G4 bounded correctness profile requires deterministic exact-oracle recall
+evidence with recall@10 at least 0.95. The 1,000,000-vector, 384-dimension
+latency and memory target remains a G7 performance profile under the
 [microsecond contract](../performance/microsecond-first.md).
 
 Receipts also report build time, ingest/update/delete cost, graph bytes per
@@ -138,6 +149,8 @@ distribution across at least ten deterministic query sets.
 Current tests cover metric goldens, admission failures, deterministic rebuild,
 batch atomicity, historical snapshot visibility, optimistic write conflicts,
 update/delete, exact-rerank identity, reopen equivalence, orphan/corrupt
-generation rejection, and all seven cross-engine commit interruption
-boundaries. Filter strategies, interrupted background builds, page-buffered
-traversal and the complete quality matrix remain pending.
+generation rejection, exact-vs-ANN stable-ID filtering, fail-closed empty and
+unknown-ID allowlists, and all seven cross-engine commit interruption
+boundaries, plus the bounded recall matrix. Typed in-traversal strategies,
+interrupted background builds and page-buffered traversal remain future
+production work and do not weaken the explicit G4 bounded non-claims.

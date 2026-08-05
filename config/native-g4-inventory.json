@@ -1,0 +1,20 @@
+{
+  "schema": "hyphae-native-g4-inventory-v1",
+  "gate": "G4",
+  "requirements": [
+    {"id": "analyzers", "status": "implemented-unhosted", "present": ["canonical NFKC Unicode case-fold analyzer", "bounded tokens", "positions and normalized UTF-8 offsets", "content-bound analyzer identity", "goldens and negative controls"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "postings-and-segments", "status": "implemented-unhosted", "present": ["native durable lexical postings", "transactional COW-root delta", "compaction/vacuum rebuild equivalence", "reopen preservation"], "gaps": ["hosted corpus-bound exact-SHA receipt"], "non_claims": ["automatic background segment merge policy is deferred"]},
+    {"id": "bm25-and-scoring-goldens", "status": "implemented-unhosted", "present": ["native BM25 physical/reference equivalence", "canonical analyzer", "deterministic stable-ID ties"], "gaps": ["hosted corpus-bound exact-SHA receipt"], "non_claims": ["multi-field BM25F physical storage is not claimed"]},
+    {"id": "phrase-search", "status": "implemented-unhosted", "present": ["bounded positional phrase execution", "repeated-term and tie tests"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "prefix-and-fuzzy-search", "status": "implemented-unhosted", "present": ["bounded prefix expansion", "bounded Levenshtein fuzzy search", "boolean composition", "work budgets"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "doc-values-and-filtering", "status": "implemented-unhosted", "present": ["typed boolean/integer/text/binary values", "bounded recursive filters", "multi-field sort", "missing placement"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "facets-and-aggregations", "status": "implemented-unhosted", "present": ["deterministic terms facets", "count/sum/min/max metrics", "candidate/bucket/memory bounds", "no partial results"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "exact-vector-search", "status": "implemented-unhosted", "present": ["three native exact metrics", "stable-ID filtered oracle", "snapshot identity", "hybrid exact branch"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "ann-search", "status": "implemented-unhosted", "present": ["deterministic HNSW", "stable-ID post-filter strategy", "explicit recall-risk receipt", "exact filtered oracle", "recall matrix"], "gaps": ["hosted corpus-bound exact-SHA receipt"], "non_claims": ["page-buffered traversal and foreground delta graph are not production claims"]},
+    {"id": "hybrid-search", "status": "implemented-unhosted", "present": ["native same-snapshot lexical plus exact/ANN fusion", "deterministic RRF", "branch limits", "explanations and ANN evidence"], "gaps": ["hosted corpus-bound exact-SHA receipt"]},
+    {"id": "ndcg-and-recall-quality", "status": "implemented-unhosted", "present": ["versioned qrels corpus", "integer deterministic NDCG@10", "lexical and hybrid thresholds", "ANN recall matrix", "negative controls"], "gaps": ["hosted corpus-bound exact-SHA receipt"], "non_claims": ["production-scale quality/performance remains G7 evidence"]},
+    {"id": "rebuild-and-corruption", "status": "implemented-unhosted", "present": ["lexical and ANN rebuild/compaction/vacuum/reopen equivalence", "structured lexical/ANN corruption matrix", "zero silent acceptance", "zero partial writes"], "gaps": ["hosted corpus-bound exact-SHA receipt"]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

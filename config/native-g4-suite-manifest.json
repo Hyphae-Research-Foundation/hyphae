@@ -1,0 +1,20 @@
+{
+  "schema": "hyphae-native-g4-suite-manifest-v1",
+  "gate": "G4",
+  "requirements": [
+    {"id": "analyzers", "corpora": ["search-quality-v1"], "suites": [{"name": "analyzers", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "analyzer::tests", "--locked"]}]},
+    {"id": "postings-and-segments", "corpora": ["search-quality-v1"], "suites": [{"name": "postings-segments", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "search_maintenance_g4", "rebuild_compaction_and_reopen_preserve_lexical_and_ann_results", "--locked"]}]},
+    {"id": "bm25-and-scoring-goldens", "corpora": ["search-quality-v1"], "suites": [{"name": "bm25-goldens", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "native_inverted_index_matches_reference_bm25_across_recovery", "--locked"]}]},
+    {"id": "phrase-search", "corpora": ["search-quality-v1"], "suites": [{"name": "phrases", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "bounded_search::tests::phrase_is_positional_and_ties_use_binary_document_identity", "--locked"]}]},
+    {"id": "prefix-and-fuzzy-search", "corpora": ["search-quality-v1"], "suites": [{"name": "prefix-fuzzy", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "bounded_search::tests::boolean_phrase_prefix_and_fuzzy_are_composable_and_deterministic", "--locked"]}]},
+    {"id": "doc-values-and-filtering", "corpora": ["search-quality-v1"], "suites": [{"name": "doc-values-filtering", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "search_doc_values_g4", "optimized_surface_matches_a_direct_reference_and_aggregates_before_limit", "--locked"]}]},
+    {"id": "facets-and-aggregations", "corpora": ["search-quality-v1"], "suites": [{"name": "facets-aggregations", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "search_doc_values_g4", "facets_fail_instead_of_returning_partial_counts", "--locked"]}]},
+    {"id": "exact-vector-search", "corpora": ["search-quality-v1"], "suites": [{"name": "exact-vector", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "native_hybrid", "exact_hybrid_fuses_stable_ids_on_one_snapshot_with_explanations", "--locked"]}]},
+    {"id": "ann-search", "corpora": ["search-quality-v1"], "suites": [{"name": "ann", "command": ["cargo", "test", "-p", "hyphae-native-ann", "--test", "quality_matrix_g4", "--locked"]}]},
+    {"id": "hybrid-search", "corpora": ["search-quality-v1"], "suites": [{"name": "hybrid", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "native_hybrid", "--locked"]}]},
+    {"id": "ndcg-and-recall-quality", "corpora": ["search-quality-v1"], "suites": [{"name": "quality", "command": ["python3", "-m", "unittest", "tools.test_native_g4_quality", "-v"]}, {"name": "ann-quality", "command": ["cargo", "test", "-p", "hyphae-native-ann", "--test", "quality_matrix_g4", "--locked"]}]},
+    {"id": "rebuild-and-corruption", "corpora": ["search-quality-v1"], "suites": [{"name": "rebuild-corruption", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "search_maintenance_g4", "--locked"]}]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

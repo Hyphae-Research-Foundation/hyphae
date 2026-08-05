@@ -26,10 +26,10 @@ class NativeQualityCorpusTests(unittest.TestCase):
         result = validate_corpus(ROOT, corpus)
 
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["corpus_count"], 2)
-        self.assertEqual(result["engines"], ["ann", "lexical"])
-        self.assertEqual(result["minimum_documents"], 10_512)
-        self.assertEqual(result["minimum_queries"], 104)
+        self.assertEqual(result["corpus_count"], 3)
+        self.assertEqual(result["engines"], ["ann", "hybrid", "lexical"])
+        self.assertEqual(result["minimum_documents"], 10_524)
+        self.assertEqual(result["minimum_queries"], 108)
 
     def test_duplicate_ids_missing_symbols_and_zero_scale_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

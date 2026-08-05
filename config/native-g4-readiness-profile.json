@@ -1,0 +1,27 @@
+{
+  "schema": "hyphae-native-g4-readiness-profile-v1",
+  "gate": "G4",
+  "scope": "bounded-search-correctness",
+  "production_scale_required": false,
+  "performance_gate_claimed": false,
+  "requirements": [
+    {"id": "analyzers", "required_evidence": "hosted"},
+    {"id": "postings-and-segments", "required_evidence": "hosted"},
+    {"id": "bm25-and-scoring-goldens", "required_evidence": "hosted"},
+    {"id": "phrase-search", "required_evidence": "hosted"},
+    {"id": "prefix-and-fuzzy-search", "required_evidence": "hosted"},
+    {"id": "doc-values-and-filtering", "required_evidence": "hosted"},
+    {"id": "facets-and-aggregations", "required_evidence": "hosted"},
+    {"id": "exact-vector-search", "required_evidence": "hosted"},
+    {"id": "ann-search", "required_evidence": "hosted"},
+    {"id": "hybrid-search", "required_evidence": "hosted"},
+    {"id": "ndcg-and-recall-quality", "required_evidence": "hosted"},
+    {"id": "rebuild-and-corruption", "required_evidence": "hosted"}
+  ],
+  "non_claims": [
+    "universal search language compatibility",
+    "official external benchmark conformance",
+    "production-scale performance",
+    "universal sub-millisecond durability"
+  ]
+}

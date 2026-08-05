@@ -27,8 +27,8 @@ substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
 **Development line:** Hyphae Native is the active architecture on `dev`. G0 and
-G1 have hosted exact-SHA workflows, while G2 and G3 are closure candidates for
-their versioned bounded relational and structure profiles. The
+G1 have hosted exact-SHA workflows, G2 and G3 are closed, and G4 is a closure
+candidate for its versioned bounded search profile. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 

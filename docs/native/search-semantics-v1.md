@@ -1,12 +1,13 @@
 # Native search-engine semantics v1
 
-Status: normative target contract; deterministic tokenization, BM25, native
+Status: normative bounded G4 contract; canonical tokenization, BM25, native
 B+tree collection/document/term/posting namespaces, direct physical `MATCH`,
 catalogued vector/HNSW generations, exact/approximate vector query, lexical
-document replacement/deletion, legacy inline-state compatibility, and
-multilevel recovery evidence are implemented experimentally; positions,
-segments, phrases, filters, facets, hybrid fusion, and broad scale/quality
-evidence remain pending
+document replacement/deletion, bounded boolean/phrase/prefix/fuzzy execution,
+typed doc values, filters, sort, facets, aggregations, native hybrid fusion,
+legacy inline-state compatibility, rebuild, corruption, and bounded quality
+evidence are implemented. Automatic segments, page-buffered ANN and
+production-scale performance remain non-claims.
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -76,8 +77,10 @@ canonical v2 tombstones without overwriting a live identity. Text above 8,192
 bytes uses the common content-addressed blob store. Exact lifecycle semantics
 and tombstone encodings are fixed by
 [Native lexical document lifecycle v1](search-document-lifecycle-v1.md). The
-format does not yet store positions, offsets, field norms, generations, or
-immutable merge segments.
+format does not store positions, offsets, field norms, generations, or
+immutable merge segments. The bounded G4 phrase/prefix/fuzzy executor derives
+canonical positions from stored source under explicit work budgets; it does
+not claim a production positional-posting layout.
 
 `compact_search` validates the complete current lexical and ANN projection,
 then rebuilds `HYSEABT2` without exact `HYDOCT01`, `HYTERMT1`, or `HYPOSTT1`
@@ -110,8 +113,11 @@ The implemented vertical slice is one analyzer, one text field, `MATCH`,
 exact vector ranking, approximate HNSW top-k with optional exact reranking,
 and stable-ID tie-breakers. Vector query receipts name the snapshot CSN, build
 identity, metric, breadth, candidate count, reranking flag and visited nodes.
-Phrase, boolean, range, prefix, fuzzy, wildcard, vector filters, facets,
-highlighting, doc values, and hybrid operators remain target work.
+Bounded boolean, phrase, prefix and fuzzy execution, stable-ID vector filters,
+typed doc-value filters/sort, terms facets, metric aggregations and native RRF
+hybrid execution are implemented as embedded G4 surfaces. Wildcard,
+highlighting, persistent multi-field doc-value columns and unrestricted query
+language remain non-claims.
 
 ## Lexical scoring
 
@@ -152,9 +158,9 @@ historical lexical and vector snapshots, lexical replace/delete/reinsert
 visibility, exact v1-to-v2 tombstone upgrade, optimistic disjoint
 document/vector rebase, vector batch atomicity, restart, single-page legacy
 compatibility, large-text blob reuse, key bounds, lexical/ANN metadata
-corruption, canonical graph restore, and all-engine crash recovery. Required
-remaining evidence includes analyzer/token/position goldens, BM25F
-score/explanation fixtures, broader query-operator properties, search
-tombstone compaction policy, buffered ANN traversal, merge interruption,
-facet/aggregation correctness, bounded cancellation, full-scale quality
-metrics, and cross-engine stable-ID joins.
+corruption, canonical graph restore, and all-engine crash recovery. G4 evidence
+also covers analyzer/token/position goldens, bounded query-operator properties,
+filtered ANN strategy receipts, facet/aggregation equivalence, NDCG/recall,
+rebuild and structured corruption matrices. Buffered ANN traversal, automatic
+background merge policy, cross-engine SQL joins and production-scale
+performance remain G5/G7 work.

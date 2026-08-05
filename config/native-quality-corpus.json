@@ -18,6 +18,15 @@
       "minimum_documents": 10000,
       "minimum_queries": 100,
       "metrics": ["recall_at_10", "minimum_query_overlap", "latency_percentiles"]
+    },
+    {
+      "id": "g4-lexical-hybrid-ndcg-v1",
+      "engine": "hybrid",
+      "producer": "tools/native_g4_quality.py",
+      "test": "evaluate_corpus",
+      "minimum_documents": 12,
+      "minimum_queries": 4,
+      "metrics": ["integer_ndcg_at_10", "negative_control", "corpus_digest"]
     }
   ]
 }

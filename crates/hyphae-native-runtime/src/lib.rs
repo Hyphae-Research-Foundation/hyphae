@@ -7,7 +7,9 @@
 //! lexical-search state. Its deliberately small operation surface is not a
 //! claim of complete SQL, Valkey, or `OpenSearch` compatibility.
 
+mod analyzer;
 mod ann_store;
+mod bounded_search;
 mod directory;
 mod group_commit;
 #[cfg(test)]
@@ -27,8 +29,10 @@ mod local_transaction;
 #[cfg(unix)]
 mod local_uds;
 mod model;
+mod native_hybrid;
 #[cfg(test)]
 mod search_compaction_equivalence;
+mod search_doc_values;
 #[cfg(test)]
 mod search_lifecycle_equivalence;
 mod set_algebra;
@@ -44,6 +48,14 @@ mod snapshot_pins;
 mod sql;
 mod wal_codec;
 
+pub use analyzer::{
+    Analysis, AnalyzedToken, AnalyzerIdentity, CANONICAL_ANALYZER_NAME, CANONICAL_ANALYZER_VERSION,
+    CanonicalAnalyzer, MAX_CANONICAL_TOKEN_BYTES,
+};
+pub use bounded_search::{
+    BoundedSearchError, BoundedSearchLimits, BoundedSearchQuery, BoundedSearchResults,
+    MAX_BOUNDED_SEARCH_DEPTH, MAX_BOUNDED_SEARCH_EDIT_DISTANCE,
+};
 pub use directory::{NativeDirectoryError, NativeDirectoryIdentity};
 pub use group_commit::{
     ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
@@ -58,7 +70,8 @@ pub use hash_pattern::{
     MAX_HASH_PATTERN_BYTES, MAX_HASH_PATTERN_MATCH_STEPS,
 };
 pub use hyphae_native_ann::{
-    HnswConfig, Metric as VectorMetric, SearchOptions as AnnSearchOptions, Vector, VectorHit,
+    AnnRecallRisk, AnnSearchStrategy, HnswConfig, Metric as VectorMetric,
+    SearchOptions as AnnSearchOptions, Vector, VectorHit,
 };
 pub use local_operation::{
     LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LOCAL_STRUCTURE_SET_HEADER_SIZE,
@@ -119,6 +132,21 @@ pub use local_transaction::{
 };
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
+pub use native_hybrid::{
+    MAX_NATIVE_HYBRID_BRANCH_HITS, MAX_NATIVE_HYBRID_RETURNED, NATIVE_HYBRID_RRF_CONSTANT,
+    NativeHybridError, NativeHybridExplanation, NativeHybridFusion, NativeHybridMatch,
+    NativeHybridOutcome, NativeHybridReceipt, NativeHybridRequest, NativeVectorBranch,
+};
+pub use search_doc_values::{
+    DocValue, DocValueAggregation, DocValueAggregationValue, DocValueCandidate, DocValueError,
+    DocValueFilter, DocValueLimits, DocValueOperator, DocValueRequest, DocValueResult,
+    DocValueSort, DocValueSortDirection, DocValueSortSource, FacetBucket, FacetRequest,
+    FacetResult, MAX_DOC_VALUE_AGGREGATIONS, MAX_DOC_VALUE_BYTES, MAX_DOC_VALUE_CANDIDATES,
+    MAX_DOC_VALUE_FACET_TERMS, MAX_DOC_VALUE_FACETS, MAX_DOC_VALUE_FILTER_DEPTH,
+    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
+    MAX_DOC_VALUES_PER_CANDIDATE, MissingPlacement, NamedDocValueAggregation,
+    NamedDocValueAggregationValue, execute_doc_values,
+};
 pub use set_algebra::{
     MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,
     SetAlgebraOperation, SetAlgebraRequest, SetAlgebraResult,
@@ -1420,6 +1448,12 @@ pub struct AnnSearchReceipt {
     pub ef_search: usize,
     /// Layer-zero candidates retained before final truncation.
     pub candidate_count: usize,
+    /// Candidates retained after the selected filter strategy.
+    pub eligible_candidate_count: usize,
+    /// Physical traversal and filtering strategy that ran.
+    pub strategy: AnnSearchStrategy,
+    /// Recall qualification for that strategy.
+    pub recall_risk: AnnRecallRisk,
     /// Whether candidates were exactly rescored.
     pub exact_reranked: bool,
     /// Distinct graph nodes whose distance was evaluated.
@@ -1510,6 +1544,30 @@ impl NativeSnapshot {
     /// snapshot.
     pub fn catalog_object(&self, id: ObjectId) -> Option<&CatalogObject> {
         self.state.catalog.object(id)
+    }
+
+    /// Executes a resource-bounded compound lexical query over this snapshot.
+    ///
+    /// Phrase, prefix, and fuzzy matching use the retained source text because
+    /// the current physical postings do not retain positions or expansions.
+    /// Exhausting any global budget returns no partial result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, unknown-collection, or work-budget error.
+    pub fn search_bounded(
+        &self,
+        index: ObjectId,
+        query: &BoundedSearchQuery,
+        limit: usize,
+        limits: BoundedSearchLimits,
+    ) -> Result<BoundedSearchResults, BoundedSearchError> {
+        let documents = self
+            .state
+            .search
+            .documents(index)
+            .ok_or(BoundedSearchError::UnknownIndex)?;
+        bounded_search::search_documents(documents, query, limit, limits)
     }
 
     /// Performs a relational primary-key lookup.
@@ -2158,6 +2216,27 @@ impl NativeSnapshot {
         Ok(ann_search_receipt(index, self.metadata.visible_csn, result))
     }
 
+    /// Executes bounded ANN traversal and post-filters candidates through a
+    /// stable-object-ID allowlist on this immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, invalid query, or invalid query
+    /// breadth.
+    pub fn search_ann_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let result = self
+            .state
+            .ann
+            .search_filtered(index, query, options, allowlist)?;
+        Ok(ann_search_receipt(index, self.metadata.visible_csn, result))
+    }
+
     /// Executes the complete exact vector-ranking oracle against this
     /// immutable all-engine snapshot.
     ///
@@ -2171,6 +2250,24 @@ impl NativeSnapshot {
         k: usize,
     ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
         self.state.ann.search_exact(index, query, k)
+    }
+
+    /// Executes the complete exact vector oracle over a stable-ID allowlist on
+    /// this immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or invalid query vector.
+    pub fn search_vector_exact_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        self.state
+            .ann
+            .search_exact_filtered(index, query, k, allowlist)
     }
 
     /// Lexes, parses, and catalog-binds one parameterized native SQL `SELECT`.
@@ -2223,6 +2320,9 @@ fn ann_search_receipt(
         metric: result.metric,
         ef_search: result.ef_search,
         candidate_count: result.candidate_count,
+        eligible_candidate_count: result.eligible_candidate_count,
+        strategy: result.strategy,
+        recall_risk: result.recall_risk,
         exact_reranked: result.exact_reranked,
         visited_nodes: result.visited_nodes,
         hits: result.hits,
@@ -6828,6 +6928,28 @@ impl NativeDatabase {
         Ok(ann_search_receipt(index, snapshot.visible_csn, result))
     }
 
+    /// Executes bounded ANN traversal with stable-ID allowlist post-filtering
+    /// against the current committed root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, invalid query, malformed state,
+    /// or invalid query breadth.
+    pub fn search_ann_filtered_latest(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let result = state
+            .ann
+            .search_filtered(index, query, options, allowlist)?;
+        Ok(ann_search_receipt(index, snapshot.visible_csn, result))
+    }
+
     /// Executes the complete exact vector-ranking oracle against the current
     /// committed all-engine root set.
     ///
@@ -6845,6 +6967,26 @@ impl NativeDatabase {
         load_state(&self.pages, &self.blobs, snapshot.roots())?
             .ann
             .search_exact(index, query, k)
+    }
+
+    /// Executes the complete exact vector oracle over a stable-ID allowlist
+    /// against the current committed root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, invalid query, or malformed
+    /// catalog/root state.
+    pub fn search_vector_exact_filtered_latest(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        load_state(&self.pages, &self.blobs, snapshot.roots())?
+            .ann
+            .search_exact_filtered(index, query, k, allowlist)
     }
 
     /// Verifies the current relational B+tree and returns its node height.
@@ -11592,6 +11734,26 @@ impl NativeWriteBatch {
         Ok(ann_search_receipt(index, self.snapshot.visible_csn, result))
     }
 
+    /// Executes bounded ANN traversal with stable-ID allowlist post-filtering
+    /// over the snapshot plus private writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or invalid query options.
+    pub fn search_ann_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let result = self
+            .state
+            .ann
+            .search_filtered(index, query, options, allowlist)?;
+        Ok(ann_search_receipt(index, self.snapshot.visible_csn, result))
+    }
+
     /// Executes the complete exact vector-ranking oracle over the snapshot
     /// plus private writes.
     ///
@@ -11605,6 +11767,24 @@ impl NativeWriteBatch {
         k: usize,
     ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
         self.state.ann.search_exact(index, query, k)
+    }
+
+    /// Executes the complete exact vector oracle over a stable-ID allowlist
+    /// and the transaction's snapshot plus private writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or invalid query vector.
+    pub fn search_vector_exact_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        self.state
+            .ann
+            .search_exact_filtered(index, query, k, allowlist)
     }
 
     /// Returns the snapshot CSN captured before private preparation.
@@ -15371,7 +15551,15 @@ fn validate_search_document_identity(
     {
         return Err(NativeRuntimeError::SearchIdentityTooLarge);
     }
-    for term in analyze(text) {
+    let analysis = CanonicalAnalyzer::analyze(text);
+    if analysis
+        .normalized_text
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|term| term.len().saturating_add(17) > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::SearchIdentityTooLarge);
+    }
+    for term in analysis.tokens.into_iter().map(|token| token.term) {
         let term_length = term.len();
         if 17_usize
             .checked_add(term_length)
@@ -21515,7 +21703,7 @@ fn qualified_name(name: &str) -> Result<QualifiedName, CatalogError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         io::{self, Read, Seek, SeekFrom, Write},
         ops::Bound,
@@ -21539,18 +21727,19 @@ mod tests {
     use crate::wal_codec::{CommitManifest, RecoveredCommit};
 
     use super::{
-        ActiveExpiryConfig, ActiveExpiryFailure, AnnSearchOptions, BlobStore, CATALOG_FORMAT_KEY,
-        CATALOG_FORMAT_VALUE_V3, CATALOG_FORMAT_VALUE_V4, CATALOG_INLINE_VALUE_LIMIT,
-        CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_RELATION_INDEX_PREFIX,
-        CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC,
-        CatalogName, CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition,
-        CommitBoundary, CommitCancellationOutcome, EngineKind, GroupCommitBoundary,
-        GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError, HashFieldEntry,
-        HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
-        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
-        NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
-        NativeSchedulerClock, NativeTransaction, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
-        PageStore, RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
+        ActiveExpiryConfig, ActiveExpiryFailure, AnnRecallRisk, AnnSearchOptions,
+        AnnSearchStrategy, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
+        CATALOG_FORMAT_VALUE_V4, CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX,
+        CATALOG_OBJECT_PREFIX, CATALOG_RELATION_INDEX_PREFIX, CATALOG_VALUE_BLOB,
+        CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogName,
+        CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
+        CommitCancellationOutcome, EngineKind, GroupCommitBoundary, GroupCommitConfig,
+        GroupCommitOutcome, GroupCommitSubmitError, HashFieldEntry, HashPatternError,
+        HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop, HashSetOutcome,
+        HnswConfig, ManifestError, Mutation, NativeCommitControl, NativeCommitScheduler,
+        NativeDatabase, NativeDirectoryError, NativeRuntimeError, NativeSchedulerClock,
+        NativeTransaction, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
+        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
         SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
         SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
         WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
@@ -37446,6 +37635,65 @@ mod tests {
                 .map(|hit| hit.object_id)
                 .collect::<Vec<_>>(),
             vec![luciana, mario]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_ann_filtered_matches_exact_allowlist_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(30)?;
+        let allowed_near = ObjectId::new(301)?;
+        let disallowed = ObjectId::new(302)?;
+        let allowed_far = ObjectId::new(303)?;
+        let mut transaction = database.begin(1, DurabilityClass::Strict)?;
+        transaction.create_vector_index(
+            index,
+            "filtered-embeddings",
+            3,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        transaction.upsert_vectors(
+            index,
+            [
+                (allowed_near, Vector::new([0.9, 0.1, 0.0])?),
+                (disallowed, Vector::new([1.0, 0.0, 0.0])?),
+                (allowed_far, Vector::new([0.0, 1.0, 0.0])?),
+            ],
+        )?;
+        transaction.commit()?;
+
+        let allowlist = BTreeSet::from([allowed_near, allowed_far, ObjectId::new(999)?]);
+        let query = Vector::new([1.0, 0.0, 0.0])?;
+        let exact = database.search_vector_exact_filtered_latest(index, &query, 2, &allowlist)?;
+        let approximate =
+            database.search_ann_filtered_latest(index, &query, ann_options()?, &allowlist)?;
+        assert_eq!(approximate.hits, exact);
+        assert_eq!(
+            approximate.strategy,
+            AnnSearchStrategy::StableIdAllowlistPostFilter
+        );
+        assert_eq!(
+            approximate.recall_risk,
+            AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+        );
+        assert_eq!(approximate.eligible_candidate_count, 2);
+        assert!(approximate.candidate_count >= approximate.eligible_candidate_count);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.search_ann_filtered_latest(index, &query, ann_options()?, &allowlist)?,
+            approximate
+        );
+        assert!(
+            reopened
+                .search_ann_filtered_latest(index, &query, ann_options()?, &BTreeSet::new())?
+                .hits
+                .is_empty()
         );
         Ok(())
     }

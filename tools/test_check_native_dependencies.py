@@ -265,8 +265,8 @@ class NativeDependencyGateTests(unittest.TestCase):
         self.assertEqual(result["external_used_unsafe_count_on_host"], 7)
         self.assertEqual(result["out_of_closure_parse_failures"], ["unrelated@2.0.0"])
 
-    def test_parse_failure_inside_closure_fails(self) -> None:
-        closure = [{"name": "blake3", "version": "1.0.0", "workspace": False}]
+    def test_parse_failure_inside_workspace_closure_fails(self) -> None:
+        closure = [{"name": "blake3", "version": "1.0.0", "workspace": True}]
         report = {
             "packages": [geiger_package("blake3")],
             "packages_without_metrics": [],
@@ -279,6 +279,20 @@ class NativeDependencyGateTests(unittest.TestCase):
                 "Failed to parse file: /registry/blake3-1.0.0/src/lib.rs, Syn(Error)",
                 closure,
             )
+
+    def test_external_parse_failure_is_reported_without_weakening_workspace_gate(self) -> None:
+        closure = [{"name": "unicode-casefold", "version": "0.2.0", "workspace": False}]
+        report = {
+            "packages": [],
+            "packages_without_metrics": [],
+            "used_but_not_scanned_files": [],
+        }
+        result = audit_unsafe(
+            report,
+            "Failed to parse file: /registry/unicode-casefold-0.2.0/src/lib.rs, Syn(Error)",
+            closure,
+        )
+        self.assertEqual(result["packages"][0]["status"], "not-scanned-on-host")
 
     def test_receipt_paths_remove_repo_cargo_and_home_identity(self) -> None:
         sanitized = sanitize_receipt_paths(
