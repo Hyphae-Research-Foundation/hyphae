@@ -17204,10 +17204,29 @@ fn relational_tree_from_state(
     creating_csn: Csn,
     catalog: &CatalogState,
     relational: &RelationState,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
     let mut entries = vec![(RELATIONAL_FORMAT_KEY.to_vec(), format.marker().to_vec())];
-    for table in relational.tables.keys() {
+    for (table, rows) in &relational.tables {
         entries.push((relational_table_key(*table), Vec::new()));
+        for (primary_key, stored) in rows {
+            let row = RowRecord::new(
+                relational_row_id(*table, primary_key)?,
+                creating_csn,
+                None,
+                vec![
+                    Some(primary_key.clone()),
+                    Some(relational_storage_value(stored, blob_references)?),
+                ],
+            )?;
+            let value = match format {
+                RelationalFormat::InlineRowV1 => row.encode()?,
+                RelationalFormat::VersionChainV2 => {
+                    append_row_version(pages, None, &row, creating_csn)?
+                }
+            };
+            entries.push((relational_row_key(*table, primary_key), value));
+        }
     }
     for (index, state) in &relational.indexes {
         let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(*index) else {
@@ -17250,7 +17269,14 @@ fn relational_tree_after_mutations(
         .iter()
         .any(|mutation| mutation.opcode == Opcode::DropSecondaryIndex);
     let mut tree = if rebuild_for_drop {
-        relational_tree_from_state(pages, format, creating_csn, catalog, relational)?
+        relational_tree_from_state(
+            pages,
+            format,
+            creating_csn,
+            catalog,
+            relational,
+            blob_references,
+        )?
     } else {
         root.map_or_else(BTree::empty, BTree::from_root)
     };

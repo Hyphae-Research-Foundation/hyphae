@@ -2,7 +2,7 @@
 
 //! Strict DROP INDEX SQL vertical.
 
-use hyphae_native_runtime::{NativeDatabase, SqlError};
+use hyphae_native_runtime::{NativeDatabase, SqlError, SqlResult, SqlValue};
 use hyphae_native_types::DurabilityClass;
 
 #[test]
@@ -34,6 +34,15 @@ fn drop_index_invalidates_plans_and_survives_reopen() -> Result<(), Box<dyn std:
             .prepare_sql_latest("SELECT id FROM people WHERE email = ?")
             .is_err()
     );
+    let mut read = database.begin_sql(3, DurabilityClass::Memory)?;
+    assert_eq!(
+        read.execute_sql("SELECT email FROM people WHERE id = 1", &[])?,
+        SqlResult::Rows {
+            columns: vec!["email".to_owned()],
+            rows: vec![vec![SqlValue::Text("a@example.com".to_owned())]],
+        }
+    );
+    read.rollback();
     drop(database);
     let reopened = NativeDatabase::open(&temporary)?;
     assert!(
