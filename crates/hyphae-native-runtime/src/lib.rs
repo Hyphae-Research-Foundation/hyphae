@@ -10965,6 +10965,34 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Deletes one complete sorted-set lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage.
+    pub fn delete_sorted_set(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.delete_sorted_set(&key).is_none() {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Adds or rescoring one exact binary sorted-set member.
     ///
     /// # Errors
@@ -11754,7 +11782,10 @@ fn apply_structure_mutation(
         | Opcode::ExpireStream => {
             apply_stream_mutation(state, mutation)?;
         }
-        Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
+        Opcode::CreateSortedSet
+        | Opcode::DeleteSortedSet
+        | Opcode::UpsertSortedSetMember
+        | Opcode::DeleteSortedSetMember => {
             apply_sorted_set_mutation(state, mutation)?;
         }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
@@ -11965,6 +11996,11 @@ fn apply_sorted_set_mutation(
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
+        Opcode::DeleteSortedSet => {
+            if !mutation.value.is_empty() || state.delete_sorted_set(&mutation.key).is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
         Opcode::UpsertSortedSetMember => {
             let (key, member) = decode_sorted_set_member_identity(&mutation.key)?;
             let score = decode_sorted_set_wal_score(&mutation.value)?;
@@ -12146,6 +12182,7 @@ fn apply_mutations_to_state(
             | Opcode::PopListHead
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
+            | Opcode::DeleteSortedSet
             | Opcode::UpsertSortedSetMember
             | Opcode::DeleteSortedSetMember
             | Opcode::CreateStream
@@ -12435,6 +12472,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::DeleteList
             | Opcode::ExpireList
             | Opcode::CreateSortedSet
+            | Opcode::DeleteSortedSet
             | Opcode::CreateStream
             | Opcode::AppendStreamEntry
             | Opcode::DeleteStream

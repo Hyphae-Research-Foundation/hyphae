@@ -83,6 +83,7 @@ pub(crate) enum Opcode {
     AppendStreamEntry = 45,
     DeleteStream = 46,
     ExpireStream = 47,
+    DeleteSortedSet = 48,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -621,6 +622,7 @@ struct ActiveTransaction {
     mutations: Vec<(Mutation, Vec<u8>)>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
     Ok(match value {
         value if value == Opcode::CreateTable as u8 => {
@@ -650,6 +652,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         }
         value if value == Opcode::ExpireStream as u8 => {
             (Opcode::ExpireStream, EngineKind::Structure)
+        }
+        value if value == Opcode::DeleteSortedSet as u8 => {
+            (Opcode::DeleteSortedSet, EngineKind::Structure)
         }
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
@@ -820,6 +825,7 @@ fn validate_mutation_shape(
         | Opcode::CreateList
         | Opcode::DeleteList
         | Opcode::CreateSortedSet
+        | Opcode::DeleteSortedSet
         | Opcode::DeleteSortedSetMember
             if value_length != 0 || expires_at_micros.is_some() =>
         {
@@ -896,6 +902,7 @@ fn validate_mutation_target_shape(
             | Opcode::PopListHead
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
+            | Opcode::DeleteSortedSet
             | Opcode::UpsertSortedSetMember
             | Opcode::DeleteSortedSetMember
     );
