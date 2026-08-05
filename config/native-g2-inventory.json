@@ -1,0 +1,54 @@
+{
+  "schema": "hyphae-native-g2-inventory-v1",
+  "gate": "G2",
+  "requirements": [
+    {
+      "id": "native-ddl-dml-and-constraints",
+      "status": "partial",
+      "present": ["CREATE TABLE", "CREATE INDEX", "INSERT", "UPDATE", "DELETE", "PRIMARY KEY", "NOT NULL", "UNIQUE"],
+      "gaps": ["ALTER TABLE", "DROP TABLE", "CHECK constraints", "FOREIGN KEY constraints"]
+    },
+    {
+      "id": "transactions-and-isolation",
+      "status": "partial",
+      "present": ["snapshot transactions", "first-committer-wins", "rollback", "reopen recovery"],
+      "gaps": ["complete isolation litmus corpus", "documented anomaly matrix", "serializable execution evidence"]
+    },
+    {
+      "id": "indexes-joins-ctes-windows",
+      "status": "partial",
+      "present": ["primary indexes", "secondary indexes", "unique indexes", "bounded indexed INNER JOIN"],
+      "gaps": ["CTEs", "window functions", "complete join semantics and algorithms"]
+    },
+    {
+      "id": "prepared-plans-and-explain",
+      "status": "implemented-unhosted",
+      "present": ["prepared SELECT plans", "indexed access plans", "EXPLAIN SELECT", "join EXPLAIN"],
+      "gaps": ["hosted exact-SHA conformance artifact"]
+    },
+    {
+      "id": "sqllogictest-conformance",
+      "status": "missing",
+      "present": [],
+      "gaps": ["SQLLogicTest runner", "versioned corpus", "hosted receipt"]
+    },
+    {
+      "id": "metamorphic-sql-equivalence",
+      "status": "missing",
+      "present": [],
+      "gaps": ["query transformation generator", "equivalence oracle", "hosted receipt"]
+    },
+    {
+      "id": "tpch-correctness",
+      "status": "missing",
+      "present": [],
+      "gaps": ["TPC-H schema and dataset generator", "supported query corpus", "reference-result comparison", "hosted receipt"]
+    },
+    {
+      "id": "tpcc-acid",
+      "status": "missing",
+      "present": [],
+      "gaps": ["TPC-C schema and loader", "transaction profiles", "ACID tests", "hosted receipt"]
+    }
+  ]
+}
