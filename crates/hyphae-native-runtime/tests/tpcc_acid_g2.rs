@@ -71,6 +71,54 @@ fn new_order_like_transaction_is_atomic_durable_and_conflict_safe()
 }
 
 #[test]
+fn delivery_like_transaction_updates_order_and_customer_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = std::env::temp_dir().join(format!(
+        "hyphae-native-tpcc-delivery-{}",
+        std::process::id()
+    ));
+    let _ignored = std::fs::remove_dir_all(&temporary);
+    let mut database = NativeDatabase::create(&temporary)?;
+    let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+    for statement in [
+        "CREATE TABLE orders (o_id BIGINT PRIMARY KEY, o_carrier_id BIGINT, o_customer_id BIGINT NOT NULL)",
+        "CREATE TABLE customer (c_id BIGINT PRIMARY KEY, c_balance BIGINT NOT NULL, c_delivery_cnt BIGINT NOT NULL)",
+        "INSERT INTO orders (o_id, o_carrier_id, o_customer_id) VALUES (7, NULL, 100)",
+        "INSERT INTO customer (c_id, c_balance, c_delivery_cnt) VALUES (100, 500, 0)",
+    ] {
+        seed.execute_sql(statement, &[])?;
+    }
+    seed.commit()?;
+    let mut delivery = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    delivery.execute_sql("UPDATE orders SET o_carrier_id = 5 WHERE o_id = 7", &[])?;
+    delivery.execute_sql(
+        "UPDATE customer SET c_balance = 542, c_delivery_cnt = 1 WHERE c_id = 100",
+        &[],
+    )?;
+    database.commit_optimistic(delivery)?;
+    drop(database);
+    let reopened = NativeDatabase::open(&temporary)?;
+    let mut observed = reopened.begin_optimistic(3, DurabilityClass::Memory)?;
+    assert_eq!(
+        signed_cell(observed.execute_sql("SELECT o_carrier_id FROM orders WHERE o_id = 7", &[])?)?,
+        5
+    );
+    assert_eq!(
+        signed_cell(observed.execute_sql("SELECT c_balance FROM customer WHERE c_id = 100", &[])?)?,
+        542
+    );
+    assert_eq!(
+        signed_cell(
+            observed.execute_sql("SELECT c_delivery_cnt FROM customer WHERE c_id = 100", &[])?
+        )?,
+        1
+    );
+    observed.rollback();
+    std::fs::remove_dir_all(&temporary)?;
+    Ok(())
+}
+
+#[test]
 fn payment_like_transaction_updates_warehouse_district_and_customer_atomically()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary =
