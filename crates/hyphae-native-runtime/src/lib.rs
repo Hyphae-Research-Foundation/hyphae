@@ -285,6 +285,7 @@ const STRUCTURE_EXPIRY_LIVE: u8 = 1;
 const STRUCTURE_HASH_EXPIRY_LIVE: u8 = 2;
 const STRUCTURE_SET_EXPIRY_LIVE: u8 = 3;
 const STRUCTURE_LIST_EXPIRY_LIVE: u8 = 4;
+const STRUCTURE_STREAM_EXPIRY_LIVE: u8 = 5;
 const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 /// Maximum field positions admitted by one native hash multi-field call.
@@ -1176,6 +1177,7 @@ enum DueStructureKind {
     Hash,
     Set,
     List,
+    Stream,
     HashField,
 }
 
@@ -3516,6 +3518,7 @@ impl NativeDatabase {
                         DueStructureKind::Hash => Opcode::DeleteHash,
                         DueStructureKind::Set => Opcode::DeleteSet,
                         DueStructureKind::List => Opcode::DeleteList,
+                        DueStructureKind::Stream => Opcode::DeleteStream,
                         DueStructureKind::HashField => Opcode::DeleteHashField,
                     },
                     target: None,
@@ -4037,6 +4040,24 @@ impl NativeDatabase {
                         .ok_or(NativeRuntimeError::InvalidStructureTree)?
                         .expires_at_micros,
                 )
+            }
+            [STRUCTURE_STREAM_EXPIRY_LIVE] => {
+                let metadata = tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_stream_meta_key(key)?,
+                    )?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                let expiry = match metadata.bytes() {
+                    bytes if bytes.len() == 16 => Some(i64::from_be_bytes(
+                        bytes[8..16]
+                            .try_into()
+                            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                    )),
+                    _ => return Err(NativeRuntimeError::InvalidStructureTree),
+                };
+                (DueStructureKind::Stream, expiry)
             }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
         };
@@ -13515,6 +13536,7 @@ fn validate_write_batch_shape(
                                 | Opcode::DeleteHash
                                 | Opcode::DeleteSet
                                 | Opcode::DeleteList
+                                | Opcode::DeleteStream
                                 | Opcode::DeleteHashField
                         )
                         && mutation.target.is_none()
@@ -16373,7 +16395,13 @@ fn expire_stream_in_tree(
     }
     let mut updated = metadata;
     updated.extend_from_slice(&expiry.to_be_bytes());
-    Ok(tree.upsert(pages, creating_csn, key, updated)?.tree)
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    let mut entries = vec![
+        (key, updated),
+        (expiry_key, vec![STRUCTURE_STREAM_EXPIRY_LIVE]),
+    ];
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
 fn delete_stream_in_tree(
@@ -16388,10 +16416,20 @@ fn delete_stream_in_tree(
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
     let last = u64::from_be_bytes(
         metadata
-            .as_slice()
+            .get(..8)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
             .try_into()
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
     );
+    let expiry = match metadata.len() {
+        8 => None,
+        16 => Some(i64::from_be_bytes(
+            metadata[8..16]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        )),
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
     for id in 1..=last {
         let entry_key = structure_stream_entry_key(&mutation.key, id)?;
         if tree.get(pages, &entry_key)?.is_some() {
@@ -16399,6 +16437,20 @@ fn delete_stream_in_tree(
                 .upsert(pages, creating_csn, entry_key, structure_tombstone_value())?
                 .tree;
         }
+    }
+    if let Some(expiry) = expiry {
+        let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+        if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                expiry_key,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            )?
+            .tree;
     }
     Ok(tree
         .upsert(
@@ -17037,6 +17089,9 @@ fn physical_expiry_tree_after_mutations(
             Opcode::DeleteList => {
                 physical_list_expiry_entries(pages, tree, logical_time_micros, mutation)?
             }
+            Opcode::DeleteStream => {
+                physical_stream_expiry_entries(pages, tree, logical_time_micros, mutation)?
+            }
             Opcode::DeleteHashField => physical_hash_field_expiry_entries(
                 pages,
                 tree,
@@ -17201,6 +17256,52 @@ fn physical_list_expiry_entries(
     mutation: &Mutation,
 ) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
     list_retirement_entries(pages, tree, mutation, Some(logical_time_micros))
+}
+
+fn physical_stream_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if metadata.len() != 16 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let last = u64::from_be_bytes(
+        metadata[..8]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    let expiry = i64::from_be_bytes(
+        metadata[8..16]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    if expiry > logical_time_micros {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let capacity = usize::try_from(last)
+        .ok()
+        .and_then(|last| last.checked_add(2))
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut entries = Vec::with_capacity(capacity);
+    entries.push((metadata_key, structure_tombstone_value()));
+    entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    for id in 1..=last {
+        let key = structure_stream_entry_key(&mutation.key, id)?;
+        if tree.get(pages, &key)?.is_some() {
+            entries.push((key, structure_tombstone_value()));
+        }
+    }
+    Ok(entries)
 }
 
 fn physical_hash_field_expiry_entries(
@@ -20102,7 +20203,8 @@ impl StructureTreeDecoder {
                         marker @ (STRUCTURE_EXPIRY_LIVE
                         | STRUCTURE_HASH_EXPIRY_LIVE
                         | STRUCTURE_SET_EXPIRY_LIVE
-                        | STRUCTURE_LIST_EXPIRY_LIVE),
+                        | STRUCTURE_LIST_EXPIRY_LIVE
+                        | STRUCTURE_STREAM_EXPIRY_LIVE),
                     ] if self
                         .expiry_index
                         .insert((expiry, structure_key.to_vec()), *marker)
@@ -20417,12 +20519,14 @@ impl StructureTreeDecoder {
                 &hash_expiries,
                 &set_expiries,
                 &list_expiries,
+                &stream_expiries,
                 &expiry_index,
             )?;
             validate_hash_field_expiry_index(&hash_field_expiries, &hash_field_expiry_index)?;
         } else if !expiry_index.is_empty()
             || !set_expiries.is_empty()
             || !list_expiries.is_empty()
+            || !stream_expiries.is_empty()
             || !hash_field_expiries.is_empty()
             || !hash_field_expiry_index.is_empty()
         {
@@ -20556,6 +20660,7 @@ fn validate_expiry_index(
     hash_expiries: &BTreeMap<Vec<u8>, i64>,
     set_expiries: &BTreeMap<Vec<u8>, i64>,
     list_expiries: &BTreeMap<Vec<u8>, i64>,
+    stream_expiries: &BTreeMap<Vec<u8>, i64>,
     actual: &BTreeMap<(i64, Vec<u8>), u8>,
 ) -> Result<(), NativeRuntimeError> {
     let mut expected = entries
@@ -20585,6 +20690,14 @@ fn validate_expiry_index(
     for (key, expiry) in list_expiries {
         if expected
             .insert(((*expiry), key.clone()), STRUCTURE_LIST_EXPIRY_LIVE)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    for (key, expiry) in stream_expiries {
+        if expected
+            .insert(((*expiry), key.clone()), STRUCTURE_STREAM_EXPIRY_LIVE)
             .is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
@@ -24159,6 +24272,27 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_cleanup_removes_due_stream_and_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_stream(b"events".to_vec())?;
+        seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+        assert!(seed.expire_stream(b"events".to_vec(), 10)?);
+        database.commit_optimistic(seed)?;
+        let first = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(matches!(
+            database.xrange_latest_stream(b"events", 1, u64::MAX, 8),
+            Err(NativeRuntimeError::UnknownStructureStream)
+        ));
+        let second = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 0);
         Ok(())
     }
 
