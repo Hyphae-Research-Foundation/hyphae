@@ -6378,6 +6378,7 @@ fn secondary_index_by_id(
 pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
     match error {
         NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
+        NativeRuntimeError::CheckConstraintViolation => SqlError::CheckViolation,
         error => SqlError::Runtime(error),
     }
 }

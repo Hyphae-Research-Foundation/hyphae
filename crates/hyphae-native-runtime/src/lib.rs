@@ -476,6 +476,9 @@ pub enum NativeRuntimeError {
     /// A non-null native unique secondary-index key already identifies a row.
     #[error("native relational unique secondary index is violated")]
     UniqueSecondaryIndexViolation,
+    /// One persisted relation CHECK predicate rejected a row.
+    #[error("native relational CHECK constraint is violated")]
+    CheckConstraintViolation,
     /// The requested native secondary index does not exist in the current root.
     #[error("native relational secondary index {index} does not exist")]
     UnknownSecondaryIndex {
