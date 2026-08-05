@@ -11888,6 +11888,9 @@ fn apply_relational_mutation(
         }
         Opcode::UpdateRow | Opcode::DeleteRow => {
             state.catalog.require(target, EngineKind::Relational)?;
+            if mutation.opcode == Opcode::DeleteRow {
+                validate_parent_not_referenced_state(state, target, &mutation.key)?;
+            }
             let old_row = state
                 .relational
                 .select(target, &mutation.key)
@@ -17504,6 +17507,73 @@ fn remove_secondary_index_projections(
 ) -> Result<(), NativeRuntimeError> {
     for projection in projections {
         relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
+    }
+    Ok(())
+}
+
+fn validate_parent_not_referenced_state(
+    state: &MaterializedState,
+    parent_id: ObjectId,
+    parent_key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(parent)) = state.catalog.object(parent_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    for object in state.catalog.objects.values() {
+        let CatalogObject::Relation(child) = object else {
+            continue;
+        };
+        for foreign_key in &child.foreign_keys {
+            if foreign_key.referenced_relation != parent_id {
+                continue;
+            }
+            let Some(rows) = state.relational.tables.get(&child.header.id) else {
+                continue;
+            };
+            for stored in rows.values() {
+                let tuple = RowTupleView::decode(stored)?;
+                let mut key = Vec::new();
+                let mut contains_null = false;
+                for (child_id, parent_column_id) in foreign_key
+                    .columns
+                    .iter()
+                    .zip(&foreign_key.referenced_columns)
+                {
+                    let child_index = child
+                        .columns
+                        .iter()
+                        .position(|column| column.id == *child_id)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                    let parent_type = &parent
+                        .columns
+                        .iter()
+                        .find(|column| column.id == *parent_column_id)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                        .logical_type;
+                    let value = match tuple
+                        .value(child_index)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                    {
+                        ColumnValueRef::Null => {
+                            contains_null = true;
+                            break;
+                        }
+                        ColumnValueRef::Bytes(encoded) => {
+                            ScalarValue::decode_storage(parent_type, encoded)
+                                .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?
+                        }
+                    };
+                    key.extend_from_slice(
+                        &value
+                            .encode_ordered_component(parent_type)
+                            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+                    );
+                }
+                if !contains_null && key == parent_key {
+                    return Err(NativeRuntimeError::ForeignKeyConstraintViolation);
+                }
+            }
+        }
     }
     Ok(())
 }
