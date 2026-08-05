@@ -6140,6 +6140,20 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, another family, a missing sorted
     /// set, or malformed metadata.
     pub fn zcard_latest_sorted_set(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        self.zcard_latest_sorted_set_at(key, i64::MIN)
+    }
+
+    /// Reads sorted-set cardinality at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing/due set,
+    /// or malformed metadata.
+    pub fn zcard_latest_sorted_set_at(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<usize, NativeRuntimeError> {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -6158,8 +6172,11 @@ impl NativeDatabase {
         if is_structure_tombstone(metadata.bytes()) {
             return Err(NativeRuntimeError::UnknownStructureSortedSet);
         }
-        usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
-            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+        let (count, expiry) = decode_sorted_set_metadata_state(metadata.bytes())?;
+        if expiry.is_some_and(|expiry| expiry <= logical_time_micros) {
+            return Err(NativeRuntimeError::UnknownStructureSortedSet);
+        }
+        usize::try_from(count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
 
     /// Reads one member's zero-based ascending rank through both physical
@@ -10968,6 +10985,33 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    /// Applies an absolute expiry to a live sorted set.
+    ///
+    /// # Errors
+    ///
+    /// This infallible admission surface retains `Result` for family symmetry.
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn expire_sorted_set(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        expires_at_micros: i64,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into();
+        if !self.state.structures.sorted_sets.contains_key(&key) {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::ExpireSortedSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Deletes one complete sorted-set lifecycle.
     ///
     /// # Errors
@@ -11787,6 +11831,7 @@ fn apply_structure_mutation(
         }
         Opcode::CreateSortedSet
         | Opcode::DeleteSortedSet
+        | Opcode::ExpireSortedSet
         | Opcode::UpsertSortedSetMember
         | Opcode::DeleteSortedSetMember => {
             apply_sorted_set_mutation(state, mutation)?;
@@ -11989,7 +12034,7 @@ fn apply_sorted_set_mutation(
     mutation: &Mutation,
 ) -> Result<(), NativeRuntimeError> {
     if mutation.target.is_some()
-        || (mutation.opcode != Opcode::ExpireList && mutation.expires_at_micros.is_some())
+        || (mutation.opcode != Opcode::ExpireSortedSet && mutation.expires_at_micros.is_some())
     {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
@@ -11998,6 +12043,12 @@ fn apply_sorted_set_mutation(
             if !mutation.value.is_empty() || !state.create_sorted_set(mutation.key.clone()) {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
+        }
+        Opcode::ExpireSortedSet => {
+            if !mutation.value.is_empty() || mutation.expires_at_micros.is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            return Ok(());
         }
         Opcode::DeleteSortedSet => {
             if !mutation.value.is_empty() || state.delete_sorted_set(&mutation.key).is_none() {
@@ -12186,6 +12237,7 @@ fn apply_mutations_to_state(
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
             | Opcode::DeleteSortedSet
+            | Opcode::ExpireSortedSet
             | Opcode::UpsertSortedSetMember
             | Opcode::DeleteSortedSetMember
             | Opcode::CreateStream
@@ -12476,6 +12528,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::ExpireList
             | Opcode::CreateSortedSet
             | Opcode::DeleteSortedSet
+            | Opcode::ExpireSortedSet
             | Opcode::CreateStream
             | Opcode::AppendStreamEntry
             | Opcode::DeleteStream
@@ -15006,21 +15059,41 @@ fn decode_live_sorted_set_order_entry<'entry>(
 }
 
 fn encode_sorted_set_metadata(member_count: u64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_META_SIZE);
+    encode_sorted_set_metadata_state(member_count, None)
+}
+
+fn encode_sorted_set_metadata_state(member_count: u64, expiry: Option<i64>) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_META_SIZE + 8);
     encoded.extend_from_slice(STRUCTURE_SORTED_SET_META_MAGIC);
     encoded.extend_from_slice(&member_count.to_le_bytes());
+    if let Some(expiry) = expiry {
+        encoded.extend_from_slice(&expiry.to_le_bytes());
+    }
     encoded
 }
 
-fn decode_sorted_set_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
-    if encoded.len() != STRUCTURE_SORTED_SET_META_SIZE
+fn decode_sorted_set_metadata_state(
+    encoded: &[u8],
+) -> Result<(u64, Option<i64>), NativeRuntimeError> {
+    if !matches!(encoded.len(), STRUCTURE_SORTED_SET_META_SIZE | 24)
         || encoded.get(..8) != Some(STRUCTURE_SORTED_SET_META_MAGIC.as_slice())
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     let mut count = [0_u8; 8];
     count.copy_from_slice(&encoded[8..16]);
-    Ok(u64::from_le_bytes(count))
+    let expiry = if encoded.len() == 24 {
+        let mut expiry = [0_u8; 8];
+        expiry.copy_from_slice(&encoded[16..24]);
+        Some(i64::from_le_bytes(expiry))
+    } else {
+        None
+    };
+    Ok((u64::from_le_bytes(count), expiry))
+}
+
+fn decode_sorted_set_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
+    Ok(decode_sorted_set_metadata_state(encoded)?.0)
 }
 
 fn encode_sorted_set_score(score: SortedSetScore) -> Vec<u8> {
@@ -16539,6 +16612,30 @@ fn delete_stream_in_tree(
         .tree)
 }
 
+fn expire_sorted_set_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let expiry = mutation
+        .expires_at_micros
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (count, _) = decode_sorted_set_metadata_state(&metadata)?;
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            encode_sorted_set_metadata_state(count, Some(expiry)),
+        )?
+        .tree)
+}
+
 fn delete_sorted_set_in_tree(
     pages: &mut PageStore,
     mut tree: BTree,
@@ -17012,6 +17109,7 @@ fn apply_structure_tree_mutation(
         Opcode::DeleteStream => delete_stream_in_tree(pages, tree, creating_csn, mutation),
         Opcode::CreateSortedSet => create_sorted_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteSortedSet => delete_sorted_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::ExpireSortedSet => expire_sorted_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::UpsertSortedSetMember => {
             upsert_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
         }
@@ -24416,6 +24514,32 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_ttl_is_exact_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+        database.commit_optimistic(expiry)?;
+        assert_eq!(database.zcard_latest_sorted_set_at(b"scores", 9)?, 1);
+        assert!(matches!(
+            database.zcard_latest_sorted_set_at(b"scores", 10),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.zcard_latest_sorted_set_at(b"scores", 9)?, 1);
+        assert!(matches!(
+            reopened.zcard_latest_sorted_set_at(b"scores", 10),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
         Ok(())
     }
 

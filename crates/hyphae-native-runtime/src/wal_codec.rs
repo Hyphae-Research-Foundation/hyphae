@@ -84,6 +84,7 @@ pub(crate) enum Opcode {
     DeleteStream = 46,
     ExpireStream = 47,
     DeleteSortedSet = 48,
+    ExpireSortedSet = 49,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -656,6 +657,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteSortedSet as u8 => {
             (Opcode::DeleteSortedSet, EngineKind::Structure)
         }
+        value if value == Opcode::ExpireSortedSet as u8 => {
+            (Opcode::ExpireSortedSet, EngineKind::Structure)
+        }
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
@@ -839,6 +843,7 @@ fn validate_mutation_shape(
         | Opcode::ExpireSet
         | Opcode::ExpireList
         | Opcode::ExpireStream
+        | Opcode::ExpireSortedSet
             if value_length != 0 || expires_at_micros.is_none() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -903,6 +908,7 @@ fn validate_mutation_target_shape(
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
             | Opcode::DeleteSortedSet
+            | Opcode::ExpireSortedSet
             | Opcode::UpsertSortedSetMember
             | Opcode::DeleteSortedSetMember
     );
