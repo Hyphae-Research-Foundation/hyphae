@@ -1,0 +1,18 @@
+# G2 TPC-C ACID vertical
+
+Status: bounded implementation evidence; G2 remains open.
+
+`crates/hyphae-native-runtime/tests/tpcc_acid_g2.rs` implements a deterministic
+New-Order-derived transaction over district and order rows. The tests prove:
+
+- district sequence update and order creation publish atomically;
+- overlapping New-Order attempts are resolved by first-committer-wins;
+- the losing transaction cannot publish its alternate order total;
+- strict-durability results survive reopen; and
+- explicit rollback publishes neither the sequence update nor order row.
+
+This is not complete TPC-C ACID evidence. G2 still requires the canonical TPC-C
+schema and loader, warehouse/district/customer/order/order-line/stock
+transactions, all standard ACID tests, invariants and consistency checks,
+seeded workload receipts, and hosted exact-SHA execution. Throughput and tail
+latency remain G7 responsibilities.
