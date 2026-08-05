@@ -1,4 +1,4 @@
-name: Native G2 Complete Evidence
+name: Native G2 Bounded Closure Evidence
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   complete:
-    name: G2 complete relational evidence
+    name: G2 bounded relational closure evidence
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact commit
@@ -114,7 +114,7 @@ jobs:
       - name: Upload exact-SHA G2 evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: native-g2-complete-evidence
+          name: native-g2-bounded-closure-evidence
           path: |
             g2-receipts/
             g2-audits/

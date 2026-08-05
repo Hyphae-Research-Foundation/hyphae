@@ -6,19 +6,22 @@
       "id": "native-ddl-dml-and-constraints",
       "status": "implemented-unhosted",
       "present": ["CREATE/ALTER TABLE RENAME/DROP TABLE RESTRICT", "CREATE/DROP INDEX", "INSERT", "UPDATE", "DELETE", "PRIMARY KEY", "NOT NULL", "UNIQUE", "persistent CHECK", "persistent immediate FOREIGN KEY", "seven-boundary DDL crash matrices"],
-      "gaps": ["hosted exact-SHA semantic receipt", "non-rename schema evolution remains fail-closed"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["non-rename schema evolution remains fail-closed"]
     },
     {
       "id": "transactions-and-isolation",
       "status": "implemented-unhosted",
       "present": ["snapshot transactions", "first-committer-wins", "rollback", "reopen recovery", "dirty-read/non-repeatable-read/phantom litmus", "bidirectional FK race admission", "group commit admission"],
-      "gaps": ["hosted exact-SHA semantic receipt", "serializable/write-skew remains a documented non-claim"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["serializable/write-skew remains a documented non-claim"]
     },
     {
       "id": "indexes-joins-ctes-windows",
       "status": "implemented-unhosted",
       "present": ["primary/secondary/unique indexes", "bounded indexed INNER JOIN", "materialized nonrecursive CTE", "ROW_NUMBER/RANK streaming windows", "PARTITION BY over composite PK"],
-      "gaps": ["hosted exact-SHA semantic receipt", "outer/full joins, recursive CTEs, frames and spill remain fail-closed non-claims"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["outer/full joins, recursive CTEs, frames and spill remain fail-closed non-claims"]
     },
     {
       "id": "prepared-plans-and-explain",
@@ -30,25 +33,29 @@
       "id": "sqllogictest-conformance",
       "status": "implemented-unhosted",
       "present": ["SQLLogicTest-compatible runner", "versioned deterministic smoke corpus", "exact result/type/rowsort comparison"],
-      "gaps": ["hosted exact-SHA semantic receipt", "full upstream SQLLogicTest corpus remains outside admitted grammar"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["full upstream SQLLogicTest corpus remains outside admitted grammar"]
     },
     {
       "id": "metamorphic-sql-equivalence",
       "status": "implemented-unhosted",
       "present": ["versioned deterministic equivalence corpus", "seeded generated 256-case/768-comparison oracle", "schema/row/order equality"],
-      "gaps": ["hosted exact-SHA semantic receipt", "typed multi-schema shrinking remains a non-claim"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["typed multi-schema shrinking remains a non-claim"]
     },
     {
       "id": "tpch-correctness",
       "status": "implemented-unhosted",
       "present": ["TPC-H-derived Q3 correctness vertical", "four-query admitted-shape corpus", "explicit 22-query support matrix with 21 unsupported non-claims", "exact reference rows"],
-      "gaps": ["hosted exact-SHA semantic receipt", "canonical scale-factor generator and 21 unsupported canonical queries remain non-claims"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["canonical scale-factor generator and 21 unsupported canonical queries remain non-claims"]
     },
     {
       "id": "tpcc-acid",
       "status": "implemented-unhosted",
       "present": ["bounded nine-table deterministic loader", "New-Order/Payment/Delivery/Order-Status/Stock-Level derived verticals", "atomicity/conflict/rollback/reopen checks"],
-      "gaps": ["hosted exact-SHA semantic receipt", "canonical full-column TPC-C schema and standard consistency suite remain non-claims"]
+      "gaps": ["hosted exact-SHA semantic receipt"],
+      "out_of_scope_non_claims": ["canonical full-column TPC-C schema and standard consistency suite remain non-claims"]
     }
   ]
 }

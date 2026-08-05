@@ -61,11 +61,21 @@ jobs:
                   command = suite["command"]
                   log = pathlib.Path("g3-logs") / f"{requirement['id']}--{name}.log"
                   marker = "G3_COMMAND: " + json.dumps(command, separators=(",", ":")) + "\n"
+                  run_command = command
+                  time_log = None
+                  if requirement["id"] == "memory-amplification" and name == "amplification":
+                      time_log = pathlib.Path("g3-logs") / "memory-amplification-time.log"
+                      run_command = ["/usr/bin/time", "-v", "-o", str(time_log), *command]
                   with log.open("w") as output:
                       output.write(marker)
                       output.flush()
-                      subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, check=True)
+                      subprocess.run(run_command, stdout=output, stderr=subprocess.STDOUT, check=True)
                   receipt_args.extend(["--suite-log", name, str(log)])
+              if requirement["id"] == "memory-amplification":
+                  time_text = (pathlib.Path("g3-logs") / "memory-amplification-time.log").read_text()
+                  line = next(line for line in time_text.splitlines() if "Maximum resident set size" in line)
+                  peak = int(line.rsplit(":", 1)[1].strip())
+                  receipt_args.extend(["--peak-rss-kib", str(peak)])
               receipt = pathlib.Path("g3-receipts") / f"{requirement['id']}.json"
               subprocess.run([
                   sys.executable, "tools/produce_native_g3_receipt.py",
@@ -92,15 +102,6 @@ jobs:
             --evidence g3-evidence.json --expected-commit "$SHA" \
             --manifest-sha256 "$MANIFEST_SHA" \
             --output native-g3-readiness.json
-
-      - name: Record hosted peak RSS
-        shell: bash
-        run: |
-          set -euo pipefail
-          /usr/bin/time -v cargo test -p hyphae-native-runtime \
-            --test memory_amplification_g3 --locked -- --nocapture \
-            > g3-logs/memory-amplification-rss.log 2>&1
-          grep 'Maximum resident set size' g3-logs/memory-amplification-rss.log
 
       - name: Upload exact-SHA G3 evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

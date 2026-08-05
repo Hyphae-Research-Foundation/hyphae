@@ -16681,7 +16681,15 @@ fn delete_sorted_set_in_tree(
     let metadata = tree
         .get(pages, &metadata_key)?
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    let count = decode_sorted_set_metadata(&metadata)?;
+    let (count, expiry) = decode_sorted_set_metadata_state(&metadata)?;
+    let expiry_key = expiry
+        .map(|expiry| structure_expiry_key(expiry, &mutation.key))
+        .transpose()?;
+    if let Some(expiry_key) = expiry_key.as_ref()
+        && tree.get(pages, expiry_key)?.as_deref() != Some(&[STRUCTURE_SORTED_SET_EXPIRY_LIVE])
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
     let prefix = structure_sorted_set_member_key(&mutation.key, &[])?;
     let members = tree.scan_prefix(pages, &prefix)?;
     let mut live = 0_u64;
@@ -16693,7 +16701,9 @@ fn delete_sorted_set_in_tree(
         if key != mutation.key {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
-        live += 1;
+        live = live
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
         let order_key = structure_sorted_set_order_key(key, score, member)?;
         if tree.get(pages, &order_key)?.as_deref() != Some(&set_member_live_value()) {
             return Err(NativeRuntimeError::InvalidStructureTree);
@@ -16707,6 +16717,16 @@ fn delete_sorted_set_in_tree(
     }
     if live != count {
         return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if let Some(expiry_key) = expiry_key {
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                expiry_key,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            )?
+            .tree;
     }
     Ok(tree
         .upsert(

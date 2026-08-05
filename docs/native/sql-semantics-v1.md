@@ -10,7 +10,28 @@ experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
 `INNER JOIN` shape, bounded composite primary-key left-prefix scans,
 prefix-plus-next-component range scans, and ordered secondary-index range
-scans are implemented experimentally as described below. G2 remains open
+scans are implemented experimentally as described below.
+
+## G2 bounded closure profile
+
+G2 closes the complete versioned bounded dialect described by the implemented
+and fail-closed shapes in this document. It does not require universal SQL
+compatibility or every grammar and algebra item listed as future target scope.
+The admitted G2 profile consists of catalog-backed bounded DDL/DML and
+immediate constraints, snapshot transactions and documented conflicts,
+primary/secondary/unique indexes, indexed inner joins, one bounded
+nonrecursive CTE shape, the bounded `ROW_NUMBER`/`RANK` window shapes, prepared
+plans, and deterministic `EXPLAIN`. Every other form remains an explicit
+fail-closed non-claim.
+
+G2 evidence uses a versioned SQLLogicTest-format corpus covering every admitted
+family and negative unsupported forms, deterministic metamorphic and isolation
+suites, and canonical-derived bounded TPC-H and TPC-C fixtures. Canonical-derived
+means provenance and selected semantics are traceable to the named benchmark,
+while schemas, cardinalities, queries, and transactions may be reduced to this
+bounded profile. It is not execution of an official benchmark kit, complete
+canonical schema/query/workload conformance, or performance evidence. TPC-H
+and TPC-C throughput, latency, scale, and price/performance remain G7 concerns.
 
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
@@ -29,8 +50,9 @@ materializes its bounded rows as one statement-local relation. The outer query
 may project those rows and apply a second bound. Parameters are accepted by the
 inner query and retain statement-text ordering. Recursive CTEs, nested CTEs,
 outer filters/order, joins against a CTE, multiple CTEs,
-and durable catalog publication are rejected. This slice is not complete G2
-CTE support and does not change the gate status.
+and durable catalog publication are rejected. This is the complete CTE shape
+admitted by the G2 bounded profile; broader CTE support remains future target
+scope.
 
 The first bounded streaming window slice is implemented for single-column
 primary keys:
@@ -52,8 +74,8 @@ window order is unique in these admitted shapes, `RANK` and `ROW_NUMBER`
 intentionally coincide. Ties on non-unique order keys,
 multiple partition columns or composite order suffixes, descending/null ordering,
 frames, additional window functions, snapshot/latest prepared execution, and
-spill remain unsupported and fail closed. This slice does not close the G2
-window-function requirement.
+spill remain unsupported and fail closed. These are the complete window shapes
+admitted by the G2 bounded profile.
 
 The current typed DDL also admits one persistent column-local CHECK shape:
 

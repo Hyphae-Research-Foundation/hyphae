@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fail-closed readiness evaluation for the complete native relational gate."""
+"""Fail-closed closure evaluation for the bounded native relational gate."""
 
 from __future__ import annotations
 
@@ -23,6 +23,12 @@ class GateFailure(ValueError):
 def evaluate(root: Path, profile: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
     if profile.get("schema") != PROFILE_SCHEMA or profile.get("gate") != "G2":
         raise GateFailure("unsupported G2 readiness profile")
+    if profile.get("scope") != "bounded-correctness":
+        raise GateFailure("G2 profile must declare bounded correctness")
+    if profile.get("universal_sql_compatibility_required") is not False:
+        raise GateFailure("G2 profile must retain the universal SQL non-claim")
+    if profile.get("performance_evidence_permitted") is not False:
+        raise GateFailure("G2 profile cannot admit performance evidence")
     if evidence.get("schema") != EVIDENCE_SCHEMA or evidence.get("gate") != "G2":
         raise GateFailure("unsupported G2 evidence map")
     requirements = profile.get("requirements")

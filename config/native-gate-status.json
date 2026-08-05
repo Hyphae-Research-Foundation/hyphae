@@ -15,13 +15,15 @@
     },
     {
       "id": "G2",
-      "status": "bounded-readiness-only",
-      "reason": "The hosted workflow covers bounded relational verticals; canonical TPC-H, TPC-C, and broad SQL conformance remain non-claims."
+      "status": "closed",
+      "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+      "evidence": "docs/gates/evidence/closures/native-g2-a839037.json"
     },
     {
       "id": "G3",
-      "status": "in-progress",
-      "reason": "Structure implementation is substantial, but hosted exact-SHA exit evidence is not complete."
+      "status": "closed",
+      "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+      "evidence": "docs/gates/evidence/closures/native-g3-a839037.json"
     },
     {"id": "G4", "status": "open"},
     {"id": "G5", "status": "open"},

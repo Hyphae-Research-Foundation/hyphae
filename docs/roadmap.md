@@ -19,8 +19,8 @@ format.
 ## Next program: native local data ecosystem
 
 The next product program is an accepted target but has no release number.
-Historical G0/G1 closure claims require retained exact-SHA revalidation, G2 has
-bounded relational readiness, and G3 is in progress; see the
+G0/G1 hosted closure evidence is reproducible, while G2 and G3 are exact-SHA
+closure candidates for their versioned profiles; see the
 [native gate status](gates/native-gate-status.md). Hyphae will build its own
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory

@@ -41,6 +41,7 @@ def build_receipt(
     platform: str,
     toolchain: str,
     logs: list[tuple[str, bytes]],
+    peak_rss_kib: int | None = None,
 ) -> dict[str, Any]:
     if not HEX40.fullmatch(source_commit) or not HEX64.fullmatch(manifest_sha256):
         raise GateFailure("commit or manifest digest is invalid")
@@ -70,7 +71,24 @@ def build_receipt(
         count = sum(counts)
         total += count
         audits.append({"name": name, "test_count": count, "log_sha256": hashlib.sha256(raw).hexdigest()})
-    return {
+    if requirement == "memory-amplification":
+        metrics = row.get("hosted_metrics")
+        if not isinstance(metrics, dict) or set(metrics) != {"max_peak_rss_kib"}:
+            raise GateFailure("memory amplification hosted metric contract is invalid")
+        maximum = metrics["max_peak_rss_kib"]
+        if (
+            not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or maximum <= 0
+            or not isinstance(peak_rss_kib, int)
+            or isinstance(peak_rss_kib, bool)
+            or peak_rss_kib <= 0
+            or peak_rss_kib > maximum
+        ):
+            raise GateFailure("peak RSS is absent, invalid, or above its hosted bound")
+    elif peak_rss_kib is not None:
+        raise GateFailure("peak RSS is only valid for memory amplification")
+    payload = {
         "schema": "hyphae-native-g3-receipt-v2",
         "status": "passed",
         "requirement": requirement,
@@ -83,6 +101,10 @@ def build_receipt(
         "scope": "bounded-correctness",
         "production_scale": False,
     }
+    if peak_rss_kib is not None:
+        payload["peak_rss_kib"] = peak_rss_kib
+        payload["max_peak_rss_kib"] = row["hosted_metrics"]["max_peak_rss_kib"]
+    return payload
 
 
 def main() -> int:
@@ -94,6 +116,7 @@ def main() -> int:
     parser.add_argument("--platform", required=True)
     parser.add_argument("--toolchain", required=True)
     parser.add_argument("--suite-log", action="append", nargs=2, metavar=("NAME", "PATH"), required=True)
+    parser.add_argument("--peak-rss-kib", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -105,6 +128,7 @@ def main() -> int:
             args.platform,
             args.toolchain,
             [(name, Path(path).read_bytes()) for name, path in args.suite_log],
+            args.peak_rss_kib,
         )
     except (GateFailure, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         print(f"native G3 receipt failed: {error}")

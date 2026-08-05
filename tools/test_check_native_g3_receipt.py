@@ -29,6 +29,16 @@ class ReceiptAuditTests(unittest.TestCase):
         with self.assertRaises(GateFailure):
             validate(receipt, "a" * 40, "streams", "b" * 64)
 
+    def test_memory_receipt_requires_bounded_rss(self):
+        receipt = self.receipt()
+        receipt["requirement"] = "memory-amplification"
+        with self.assertRaises(GateFailure):
+            validate(receipt, "a" * 40, "memory-amplification", "b" * 64)
+        receipt["peak_rss_kib"] = 100
+        receipt["max_peak_rss_kib"] = 200
+        audit = validate(receipt, "a" * 40, "memory-amplification", "b" * 64)
+        self.assertEqual(audit["peak_rss_kib"], 100)
+
 
 if __name__ == "__main__":
     unittest.main()
