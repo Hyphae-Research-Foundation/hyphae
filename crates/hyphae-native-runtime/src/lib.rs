@@ -127,6 +127,7 @@ pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 
 use std::{
+    cmp::Ordering as ValueOrdering,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
@@ -141,9 +142,9 @@ use hyphae_native_blobs::{
 };
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
-    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader,
-    QualifiedName, RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckOperator,
+    ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
+    SearchFieldDefinition, SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{
     ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
@@ -8793,6 +8794,7 @@ impl NativeWriteBatch {
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
+        validate_relation_checks(&self.state.catalog, table, &row)?;
         let projections = secondary_index_projections(&self.state.catalog, table, &row)?;
         let mut relational = self.state.relational.clone();
         relational.insert(table, primary_key.clone(), row.clone())?;
@@ -8838,6 +8840,7 @@ impl NativeWriteBatch {
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
         let old_projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        validate_relation_checks(&self.state.catalog, table, &row)?;
         let new_projections = secondary_index_projections(&self.state.catalog, table, &row)?;
         let mut relational = self.state.relational.clone();
         remove_secondary_index_projections(&mut relational, &old_projections, &primary_key)?;
@@ -11865,6 +11868,7 @@ fn apply_relational_mutation(
         }
         Opcode::InsertRow => {
             state.catalog.require(target, EngineKind::Relational)?;
+            validate_relation_checks(&state.catalog, target, &mutation.value)?;
             let projections = secondary_index_projections(&state.catalog, target, &mutation.value)?;
             state
                 .relational
@@ -11892,6 +11896,7 @@ fn apply_relational_mutation(
                 &mutation.key,
             )?;
             if mutation.opcode == Opcode::UpdateRow {
+                validate_relation_checks(&state.catalog, target, &mutation.value)?;
                 let new_projections =
                     secondary_index_projections(&state.catalog, target, &mutation.value)?;
                 state
@@ -17288,6 +17293,7 @@ fn relational_tree_after_mutations(
             relational,
         )?;
         if mutation.opcode != Opcode::DeleteRow {
+            validate_relation_checks(catalog, target, &mutation.value)?;
             let new_projections = secondary_index_projections(catalog, target, &mutation.value)?;
             tree = write_secondary_index_projection_markers(
                 pages,
@@ -17493,6 +17499,61 @@ fn remove_secondary_index_projections(
 ) -> Result<(), NativeRuntimeError> {
     for projection in projections {
         relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
+    }
+    Ok(())
+}
+
+fn validate_relation_checks(
+    catalog: &CatalogState,
+    relation_id: ObjectId,
+    row: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(relation)) = catalog.object(relation_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    if relation.checks.is_empty() {
+        return Ok(());
+    }
+    let tuple = RowTupleView::decode(row)?;
+    if tuple.column_count() != relation.columns.len() {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    for (column_id, check) in &relation.checks {
+        let index = relation
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let column = &relation.columns[index];
+        let value = match tuple
+            .value(index)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+        {
+            ColumnValueRef::Null => continue,
+            ColumnValueRef::Bytes(encoded) => {
+                ScalarValue::decode_storage(&column.logical_type, encoded)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?
+            }
+        };
+        let left = value
+            .encode_ordered_component(&column.logical_type)
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+        let right = check
+            .operand
+            .encode_ordered_component(&column.logical_type)
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+        let ordering = left.cmp(&right);
+        let passes = match check.operator {
+            ColumnCheckOperator::Equal => ordering == ValueOrdering::Equal,
+            ColumnCheckOperator::NotEqual => ordering != ValueOrdering::Equal,
+            ColumnCheckOperator::Less => ordering == ValueOrdering::Less,
+            ColumnCheckOperator::LessOrEqual => ordering != ValueOrdering::Greater,
+            ColumnCheckOperator::Greater => ordering == ValueOrdering::Greater,
+            ColumnCheckOperator::GreaterOrEqual => ordering != ValueOrdering::Less,
+        };
+        if !passes {
+            return Err(NativeRuntimeError::CheckConstraintViolation);
+        }
     }
     Ok(())
 }
