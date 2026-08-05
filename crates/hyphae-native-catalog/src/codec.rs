@@ -8,7 +8,7 @@ use hyphae_native_types::{
 
 use super::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckConstraint,
-    ColumnCheckOperator, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
+    ColumnCheckOperator, ColumnDefinition, ForeignKeyDefinition, MAX_CATALOG_DEFINITION_BYTES,
     MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
     RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
     SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
@@ -97,7 +97,7 @@ impl Encoder {
         for column in &definition.primary_key {
             self.put_fixed(&column.get().to_le_bytes())?;
         }
-        if !definition.checks.is_empty() {
+        if !definition.checks.is_empty() || !definition.foreign_keys.is_empty() {
             self.put_item_count(definition.checks.len())?;
             for (column, check) in &definition.checks {
                 self.put_fixed(&column.get().to_le_bytes())?;
@@ -109,6 +109,18 @@ impl Encoder {
                     .ok_or(CatalogError::InvalidDefinitionEncoding)?
                     .logical_type;
                 self.put_bytes(&check.operand.encode_storage(logical_type)?)?;
+            }
+            self.put_item_count(definition.foreign_keys.len())?;
+            for foreign_key in &definition.foreign_keys {
+                self.put_item_count(foreign_key.columns.len())?;
+                for column in &foreign_key.columns {
+                    self.put_fixed(&column.get().to_le_bytes())?;
+                }
+                self.put_fixed(&foreign_key.referenced_relation.get().to_le_bytes())?;
+                self.put_item_count(foreign_key.referenced_columns.len())?;
+                for column in &foreign_key.referenced_columns {
+                    self.put_fixed(&column.get().to_le_bytes())?;
+                }
             }
         }
         Ok(())
@@ -295,11 +307,35 @@ impl<'encoded> Decoder<'encoded> {
                 checks.push((column, ColumnCheckConstraint { operator, operand }));
             }
         }
+        let mut foreign_keys = Vec::new();
+        if self.offset < self.encoded.len() {
+            let foreign_key_count = self.item_count()?;
+            foreign_keys.reserve(foreign_key_count);
+            for _ in 0..foreign_key_count {
+                let child_count = self.item_count()?;
+                let mut child_columns = Vec::with_capacity(child_count);
+                for _ in 0..child_count {
+                    child_columns.push(self.column_id()?);
+                }
+                let referenced_relation = self.object_id()?;
+                let parent_count = self.item_count()?;
+                let mut referenced_columns = Vec::with_capacity(parent_count);
+                for _ in 0..parent_count {
+                    referenced_columns.push(self.column_id()?);
+                }
+                foreign_keys.push(ForeignKeyDefinition {
+                    columns: child_columns,
+                    referenced_relation,
+                    referenced_columns,
+                });
+            }
+        }
         Ok(RelationDefinition {
             header,
             columns,
             primary_key,
             checks,
+            foreign_keys,
         })
     }
 
@@ -607,6 +643,7 @@ mod tests {
             ],
             primary_key: vec![ColumnId::new(1)?],
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         }))
     }
 

@@ -71,6 +71,22 @@ legacy relation definitions that end after the primary-key list. Reopen/WAL
 replay preserves enforcement. Table-level predicates, multi-column expressions,
 functions, deferred checks, and named constraints remain outside this slice.
 
+The first immediate foreign-key shape is also admitted:
+
+```text
+FOREIGN KEY (<child-primary-compatible-columns>)
+REFERENCES <parent-table> (<complete-parent-primary-key>)
+```
+
+It uses `MATCH SIMPLE`, immediate `NO ACTION` semantics for child insert: any
+null child component bypasses the lookup; otherwise the complete typed parent
+primary key must be visible in the transaction state. The definition persists
+by relation/column IDs and survives reopen. Composite keys are supported when
+arity/types/order match. Parent delete/update protection, child UPDATE
+revalidation, unique-index targets, commit-time race conflict keys, self
+references, named constraints, cascades and deferred enforcement are not yet
+implemented; those forms fail or remain outside this slice.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,

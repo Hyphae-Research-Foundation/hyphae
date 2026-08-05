@@ -208,6 +208,7 @@ fn legacy_catalog_object(
             ],
             primary_key: vec![ColumnId::new(1).map_err(|_| ModelError::ZeroObjectId)?],
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         })),
         EngineKind::Search => Ok(CatalogObject::Search(SearchCollectionDefinition {
             header,

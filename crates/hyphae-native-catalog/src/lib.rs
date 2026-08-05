@@ -282,6 +282,17 @@ pub struct ColumnCheckConstraint {
     pub operand: ScalarValue,
 }
 
+/// One immediate MATCH SIMPLE primary-key foreign key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignKeyDefinition {
+    /// Ordered child columns.
+    pub columns: Vec<ColumnId>,
+    /// Referenced relation identity.
+    pub referenced_relation: ObjectId,
+    /// Ordered referenced primary-key columns.
+    pub referenced_columns: Vec<ColumnId>,
+}
+
 /// Native relational object definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationDefinition {
@@ -293,6 +304,8 @@ pub struct RelationDefinition {
     pub primary_key: Vec<ColumnId>,
     /// Column-local constraints keyed by stable column identity.
     pub checks: Vec<(ColumnId, ColumnCheckConstraint)>,
+    /// Immediate MATCH SIMPLE foreign keys declared by this relation.
+    pub foreign_keys: Vec<ForeignKeyDefinition>,
 }
 
 impl RelationDefinition {
@@ -365,6 +378,17 @@ impl RelationDefinition {
                 .encode_storage(&definition.logical_type)
                 .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
             previous_check = Some(*column);
+        }
+        for foreign_key in &self.foreign_keys {
+            if foreign_key.columns.is_empty()
+                || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+                || foreign_key
+                    .columns
+                    .iter()
+                    .any(|column| !column_ids.contains(column))
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
         }
         Ok(())
     }
@@ -855,6 +879,7 @@ mod tests {
             }],
             primary_key: vec![ColumnId::new(1)?],
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         }))
     }
 

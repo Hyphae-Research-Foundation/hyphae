@@ -8,7 +8,7 @@ use std::{
 
 use hyphae_native_catalog::{
     CatalogName, CatalogObject, ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition,
-    ObjectHeader, RelationDefinition, SecondaryIndexDefinition,
+    ForeignKeyDefinition, ObjectHeader, RelationDefinition, SecondaryIndexDefinition,
 };
 use hyphae_native_mvcc::Snapshot;
 use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
@@ -93,6 +93,9 @@ pub enum SqlError {
     /// A native SQL CHECK predicate evaluated to false.
     #[error("HYSQL015 native SQL CHECK constraint failed")]
     CheckViolation,
+    /// An immediate native SQL foreign key has no visible parent.
+    #[error("HYSQL016 native SQL FOREIGN KEY constraint failed")]
+    ForeignKeyViolation,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -435,6 +438,7 @@ enum Statement {
         name: String,
         columns: Vec<ParsedColumn>,
         primary_key: Vec<String>,
+        foreign_keys: Vec<ParsedForeignKey>,
     },
     CreateIndex {
         name: String,
@@ -521,6 +525,13 @@ struct ParsedInnerJoin {
 struct ParsedJoinEquality {
     left_column: String,
     right_column: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedForeignKey {
+    columns: Vec<String>,
+    referenced_table: String,
+    referenced_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -986,7 +997,15 @@ pub(crate) fn execute_transaction(
             name,
             columns,
             primary_key,
-        } => execute_create(transaction, &name, &columns, primary_key, parameters),
+            foreign_keys,
+        } => execute_create(
+            transaction,
+            &name,
+            &columns,
+            primary_key,
+            foreign_keys,
+            parameters,
+        ),
         Statement::CreateIndex {
             name,
             table,
@@ -3636,11 +3655,13 @@ fn explain_suffix(residual: bool) -> &'static str {
     if residual { ",residual=true)" } else { ")" }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_create(
     transaction: &mut NativeWriteBatch,
     name: &str,
     parsed_columns: &[ParsedColumn],
     primary_key_names: Vec<String>,
+    parsed_foreign_keys: Vec<ParsedForeignKey>,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
@@ -3701,6 +3722,45 @@ fn execute_create(
             },
         ));
     }
+    let mut foreign_keys = Vec::new();
+    for foreign_key in parsed_foreign_keys {
+        let child_columns = foreign_key
+            .columns
+            .iter()
+            .map(|name| column_index(&columns, name).map(|index| columns[index].id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (parent_id, parent) =
+            relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
+        let parent_columns = foreign_key
+            .referenced_columns
+            .iter()
+            .map(|name| column_index(&parent.columns, name).map(|index| parent.columns[index].id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if parent_columns != parent.primary_key || child_columns.len() != parent_columns.len() {
+            return Err(SqlError::InvalidCatalogObject);
+        }
+        for (child, parent_column) in child_columns.iter().zip(&parent_columns) {
+            let child_type = &columns
+                .iter()
+                .find(|column| column.id == *child)
+                .ok_or(SqlError::UnknownColumn)?
+                .logical_type;
+            let parent_type = &parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_column)
+                .ok_or(SqlError::UnknownColumn)?
+                .logical_type;
+            if child_type != parent_type {
+                return Err(SqlError::TypeMismatch);
+            }
+        }
+        foreign_keys.push(ForeignKeyDefinition {
+            columns: child_columns,
+            referenced_relation: parent_id,
+            referenced_columns: parent_columns,
+        });
+    }
     let mut definition = RelationDefinition {
         header: ObjectHeader {
             id,
@@ -3710,6 +3770,7 @@ fn execute_create(
         columns,
         primary_key,
         checks,
+        foreign_keys,
     };
     if is_legacy_binary_relation(&definition) {
         for column in &mut definition.columns {
@@ -3736,6 +3797,7 @@ fn execute_insert(
     let resolved =
         resolve_mutation_operands(&definition, supplied_values, parameter_count, parameters)?;
     let values = bind_insert_values(&definition, supplied_values, &resolved)?;
+    validate_foreign_keys(transaction, &definition, &values)?;
     if is_legacy_binary_relation(&definition) {
         let primary_key = legacy_binary_value(values[0], false)?;
         let row = legacy_binary_value(values[1], false)?;
@@ -5308,6 +5370,62 @@ fn validate_checks(
     Ok(())
 }
 
+fn validate_foreign_keys(
+    transaction: &NativeWriteBatch,
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<(), SqlError> {
+    for foreign_key in &definition.foreign_keys {
+        let mut key = Vec::new();
+        let mut contains_null = false;
+        let Some(CatalogObject::Relation(parent)) = transaction
+            .state
+            .catalog
+            .object(foreign_key.referenced_relation)
+        else {
+            return Err(SqlError::InvalidCatalogObject);
+        };
+        for (child_column, parent_column) in foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+        {
+            let child_index = definition
+                .columns
+                .iter()
+                .position(|column| column.id == *child_column)
+                .ok_or(SqlError::InvalidCatalogObject)?;
+            let value = values.get(child_index).copied().flatten();
+            if value.is_none_or(|value| matches!(value, SqlValue::Null)) {
+                contains_null = true;
+                break;
+            }
+            let parent_type = &parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type;
+            key.extend_from_slice(
+                &value
+                    .ok_or(SqlError::InvalidCatalogObject)?
+                    .encode_ordered_component(parent_type)
+                    .map_err(|_| SqlError::TypeMismatch)?,
+            );
+        }
+        if !contains_null
+            && transaction
+                .state
+                .relational
+                .select(foreign_key.referenced_relation, &key)
+                .is_none()
+        {
+            return Err(SqlError::ForeignKeyViolation);
+        }
+    }
+    Ok(())
+}
+
 fn bind_insert_values<'value>(
     definition: &RelationDefinition,
     supplied_values: &[ColumnOperand],
@@ -6508,8 +6626,22 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_symbol('(')?;
     let mut columns = Vec::new();
     let mut table_primary_key = None;
+    let mut foreign_keys = Vec::new();
     loop {
-        if parser.consume_keyword("PRIMARY") {
+        if parser.consume_keyword("FOREIGN") {
+            parser.expect_keyword("KEY")?;
+            parser.expect_symbol('(')?;
+            let columns = parser.identifier_list(')')?;
+            parser.expect_keyword("REFERENCES")?;
+            let referenced_table = parser.identifier()?;
+            parser.expect_symbol('(')?;
+            let referenced_columns = parser.identifier_list(')')?;
+            foreign_keys.push(ParsedForeignKey {
+                columns,
+                referenced_table,
+                referenced_columns,
+            });
+        } else if parser.consume_keyword("PRIMARY") {
             if table_primary_key.is_some() {
                 return Err(SqlError::InvalidSyntax);
             }
@@ -6598,6 +6730,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
         name,
         columns,
         primary_key,
+        foreign_keys,
     })
 }
 
