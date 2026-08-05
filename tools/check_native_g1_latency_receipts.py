@@ -11,7 +11,11 @@ import math
 from pathlib import Path
 from typing import Any
 
-EMBEDDED_OPERATIONS = {"structure", "prepared_sql", "search_btree"}
+EMBEDDED_OPERATIONS = {
+    "embedded_structure_get_64b",
+    "embedded_prepared_sql_pk_materialized_scaled_snapshot",
+    "buffered_inverted_btree_bm25_match_top1_rare_term",
+}
 PROTOCOL_OPERATIONS = {
     "persistent_ping_round_trip_32b",
     "persistent_transaction_sql_stage_round_trip",
