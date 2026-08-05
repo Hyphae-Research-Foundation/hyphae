@@ -79,6 +79,15 @@ class NativeG1LatencyReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "finite"):
             validate_receipts(embedded, self.protocol(), "a" * 40)
 
+    def test_zero_nanosecond_bucket_is_valid_but_zero_throughput_is_not(self) -> None:
+        embedded = self.embedded()
+        embedded["operations"]["embedded_structure_get_64b"]["p50_nanos"] = 0
+        result = validate_receipts(embedded, self.protocol(), "a" * 40)
+        self.assertEqual(result["status"], "passed")
+        embedded["operations"]["embedded_structure_get_64b"]["throughput_per_second"] = 0
+        with self.assertRaisesRegex(GateFailure, "throughput"):
+            validate_receipts(embedded, self.protocol(), "a" * 40)
+
     def test_scope_cannot_claim_g7_production_scale(self) -> None:
         embedded = self.embedded()
         embedded["status"] = "passed-production"
