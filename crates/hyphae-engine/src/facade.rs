@@ -1342,7 +1342,10 @@ mod tests {
             },
             &ExactRetrievalLimits::default(),
         )?;
-        assert!(matches!(outcome, ExactRetrievalOutcome::Matches(_)));
+        assert!(matches!(
+            outcome,
+            ExactRetrievalOutcome::Matches { .. }
+        ));
 
         engine.write_batch(
             Uuid::now_v7(),
