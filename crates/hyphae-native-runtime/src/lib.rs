@@ -5771,6 +5771,66 @@ impl NativeDatabase {
         Ok(())
     }
 
+    /// Reads a bounded inclusive stream-ID range from the latest physical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a missing stream, or malformed state.
+    pub fn xrange_latest_stream(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(i64::MIN)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_stream_meta_key(key)?,
+            )?
+            .ok_or(NativeRuntimeError::UnknownStructureStream)?;
+        if is_structure_tombstone(metadata.bytes()) {
+            return Err(NativeRuntimeError::UnknownStructureStream);
+        }
+        let last = u64::from_be_bytes(
+            metadata
+                .bytes()
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let mut entries = Vec::new();
+        for id in start..=end.min(last) {
+            if entries.len() == limit {
+                break;
+            }
+            if let Some(value) = tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_stream_entry_key(key, id)?,
+            )? {
+                if is_structure_tombstone(value.bytes()) {
+                    continue;
+                }
+                let (payload_id, fields) = decode_stream_wal_entry(value.bytes())?;
+                if payload_id != id {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+                entries.push((id, fields));
+            }
+        }
+        Ok(entries)
+    }
+
     /// Reads one list cardinality directly from its physical metadata.
     ///
     /// # Errors
@@ -23972,15 +24032,9 @@ mod tests {
         database.commit_optimistic(batch)?;
         drop(database);
         let reopened = NativeDatabase::open(temporary.path())?;
-        let snapshot = reopened.snapshot(2)?;
-        let entries = snapshot
-            .state
-            .structures
-            .streams
-            .get(b"events".as_slice())
-            .ok_or("missing reopened stream")?;
+        let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8)?;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries.get(&1).unwrap()[0].0, b"kind");
+        assert_eq!(entries[0].1[0].0, b"kind");
         Ok(())
     }
 
