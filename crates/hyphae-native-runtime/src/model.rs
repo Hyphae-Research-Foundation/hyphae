@@ -289,7 +289,7 @@ impl RelationState {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
+    #[allow(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
     pub(crate) fn drop_secondary_index(
         &mut self,
         id: ObjectId,
