@@ -26,7 +26,7 @@
       "evidence": "docs/gates/evidence/closures/native-g3-a839037.json"
     },
     {"id": "G4", "status": "closed", "source_commit": "0059fcee318f7e8fc14ae6651f6b43607ac0b219", "evidence": "docs/gates/evidence/closures/native-g4-0059fce.json"},
-    {"id": "G5", "status": "closure-candidate", "reason": "All eight bounded convergence requirements are implemented locally; hosted exact-SHA evidence is required."},
+    {"id": "G5", "status": "closed", "source_commit": "b7cf651229802f35d39d61d61965f469c9200ac1", "evidence": "docs/gates/evidence/closures/native-g5-b7cf651.json"},
     {"id": "G6", "status": "open"},
     {"id": "G7", "status": "open"},
     {"id": "G8", "status": "open"}

@@ -141,6 +141,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native G2 exact-SHA closure](gates/evidence/closures/native-g2-a839037.json)
 - [Native G3 exact-SHA closure](gates/evidence/closures/native-g3-a839037.json)
 - [Native G4 exact-SHA closure](gates/evidence/closures/native-g4-0059fce.json)
+- [Native G5 exact-SHA closure](gates/evidence/closures/native-g5-b7cf651.json)
 - [Native directory identity and writer exclusion evidence — 2026-08-02](gates/evidence/native-directory-identity-linux-2026-08-02.md)
 - [Native phase-1 kernel evidence — 2026-08-01](gates/evidence/native-phase1-kernel-2026-08-01.md)
 - [Native row, B+tree, and checkpoint evidence — 2026-08-01](gates/evidence/native-row-tree-checkpoint-2026-08-01.md)
