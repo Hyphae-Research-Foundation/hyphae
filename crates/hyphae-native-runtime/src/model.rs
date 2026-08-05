@@ -115,7 +115,6 @@ impl CatalogState {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
     pub(crate) fn remove(&mut self, id: ObjectId) -> Result<CatalogObject, ModelError> {
         let object = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
         if matches!(object, CatalogObject::Relation(_))

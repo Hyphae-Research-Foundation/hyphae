@@ -11728,7 +11728,8 @@ fn apply_mutations_to_state(
             | Opcode::InsertRow
             | Opcode::UpdateRow
             | Opcode::DeleteRow
-            | Opcode::CreateSecondaryIndex => {
+            | Opcode::CreateSecondaryIndex
+            | Opcode::DropSecondaryIndex => {
                 apply_relational_mutation(state, mutation)?;
             }
             Opcode::SetValue
@@ -11921,6 +11922,19 @@ fn apply_relational_mutation(
                 }
                 state.relational.delete(target, &mutation.key)?;
             }
+        }
+        Opcode::DropSecondaryIndex => {
+            if !mutation.key.is_empty()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let Some(CatalogObject::SecondaryIndex(_)) = state.catalog.object(target) else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            state.relational.drop_secondary_index(target)?;
+            state.catalog.remove(target)?;
         }
         Opcode::CreateSecondaryIndex => {
             apply_secondary_index_creation(state, target, mutation)?;
