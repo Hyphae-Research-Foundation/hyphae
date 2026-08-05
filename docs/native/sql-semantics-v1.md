@@ -95,6 +95,12 @@ names within one relation fail catalog validation. Cascades and deferred
 enforcement are not yet implemented; those forms fail or remain outside this
 slice.
 
+`DROP INDEX <name>` is strict: the index must exist and be a relational secondary
+index. Commit removes its catalog object/name/dependency entries and rebuilds
+the relational namespace without its metadata or entry keys. Existing prepared
+plans fail with `CatalogChanged`; reopen preserves the absence. `IF EXISTS` and
+`CASCADE` are not accepted.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,

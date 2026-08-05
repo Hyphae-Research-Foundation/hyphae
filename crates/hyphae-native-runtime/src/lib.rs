@@ -12629,7 +12629,10 @@ fn catalog_root_after_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
-    let rebuild = catalog_requires_full_rebuild(pages, root)?;
+    let rebuild = catalog_requires_full_rebuild(pages, root)?
+        || mutations
+            .iter()
+            .any(|mutation| mutation.opcode == Opcode::DropSecondaryIndex);
     let tree = if rebuild {
         let secondary_indexes = catalog
             .objects
@@ -17194,6 +17197,43 @@ fn search_root_after_mutations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn relational_tree_from_state(
+    pages: &mut PageStore,
+    format: RelationalFormat,
+    creating_csn: Csn,
+    catalog: &CatalogState,
+    relational: &RelationState,
+) -> Result<BTree, NativeRuntimeError> {
+    let mut entries = vec![(RELATIONAL_FORMAT_KEY.to_vec(), format.marker().to_vec())];
+    for table in relational.tables.keys() {
+        entries.push((relational_table_key(*table), Vec::new()));
+    }
+    for (index, state) in &relational.indexes {
+        let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(*index) else {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        };
+        entries.push((
+            relational_secondary_index_key(*index),
+            encode_secondary_index_metadata(definition, state.layout).to_vec(),
+        ));
+        for (index_key, primary_keys) in &state.entries {
+            for primary_key in primary_keys {
+                let identity =
+                    secondary_index_entry_identity(state.layout, index_key, primary_key)?;
+                entries.push((
+                    relational_secondary_entry_key(*index, &identity)?,
+                    vec![RELATIONAL_SECONDARY_ENTRY_LIVE],
+                ));
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(BTree::empty()
+        .upsert_sorted_batch(pages, creating_csn, entries)?
+        .tree)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
@@ -17206,7 +17246,14 @@ fn relational_tree_after_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
-    let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
+    let rebuild_for_drop = mutations
+        .iter()
+        .any(|mutation| mutation.opcode == Opcode::DropSecondaryIndex);
+    let mut tree = if rebuild_for_drop {
+        relational_tree_from_state(pages, format, creating_csn, catalog, relational)?
+    } else {
+        root.map_or_else(BTree::empty, BTree::from_root)
+    };
     if tree.root().is_none() {
         tree = tree
             .insert_unique(
@@ -17224,6 +17271,12 @@ fn relational_tree_after_mutations(
         let target = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        if mutation.opcode == Opcode::DropSecondaryIndex {
+            if !mutation.key.is_empty() || !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            continue;
+        }
         let key = match mutation.opcode {
             Opcode::CreateTable => {
                 tree = tree

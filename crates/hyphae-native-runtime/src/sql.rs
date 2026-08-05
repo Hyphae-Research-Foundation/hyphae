@@ -446,6 +446,9 @@ enum Statement {
         columns: Vec<String>,
         unique: bool,
     },
+    DropIndex {
+        name: String,
+    },
     Insert {
         name: String,
         values: Vec<ColumnOperand>,
@@ -1013,6 +1016,7 @@ pub(crate) fn execute_transaction(
             columns,
             unique,
         } => execute_create_index(transaction, &name, &table, &columns, unique, parameters),
+        Statement::DropIndex { name } => execute_drop_index(transaction, &name, parameters),
         Statement::Insert {
             name,
             values,
@@ -3836,6 +3840,48 @@ fn execute_create(
     }
     definition.validate().map_err(NativeRuntimeError::from)?;
     transaction.create_relation_definition(definition)?;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_drop_index(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .id_named(name, EngineKind::Relational)
+        .map_err(NativeRuntimeError::from)?;
+    let Some(CatalogObject::SecondaryIndex(_)) = transaction.state.catalog.object(id) else {
+        return Err(SqlError::InvalidCatalogObject);
+    };
+    transaction
+        .state
+        .relational
+        .drop_secondary_index(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction
+        .state
+        .catalog
+        .remove(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction.mutations.push(crate::wal_codec::Mutation {
+        engine: EngineKind::Relational,
+        opcode: crate::wal_codec::Opcode::DropSecondaryIndex,
+        target: Some(id),
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_micros: None,
+    });
+    transaction.dirty[0] = true;
+    transaction.dirty[1] = true;
     Ok(SqlResult::Command {
         rows_affected: 0,
         object_id: Some(id),
@@ -6704,6 +6750,11 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
         parse_with_select(&mut parser)?
     } else if parser.consume_keyword("CREATE") {
         parse_create(&mut parser)?
+    } else if parser.consume_keyword("DROP") {
+        parser.expect_keyword("INDEX")?;
+        Statement::DropIndex {
+            name: parser.identifier()?,
+        }
     } else if parser.consume_keyword("INSERT") {
         parse_insert(&mut parser)?
     } else if parser.consume_keyword("UPDATE") {
