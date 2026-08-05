@@ -1528,6 +1528,14 @@ impl StructureState {
             .flatten()
     }
 
+    #[allow(dead_code, reason = "G3 sorted-set lifecycle WAL wiring follows")]
+    pub(crate) fn delete_sorted_set(
+        &mut self,
+        key: &[u8],
+    ) -> Option<BTreeMap<Vec<u8>, SortedSetScore>> {
+        self.sorted_sets.remove(key)
+    }
+
     pub(crate) fn create_sorted_set(&mut self, key: Vec<u8>) -> bool {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
@@ -2171,8 +2179,8 @@ mod tests {
 
     use super::{
         CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, HashPatternModelRequest,
-        HashPatternModelStop, ModelError, RelationState, SearchState, StructureState, TtlValue,
-        legacy_catalog_object, put_bytes, put_len,
+        HashPatternModelStop, ModelError, RelationState, SearchState, SortedSetMemberState,
+        SortedSetScore, StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
     };
 
     #[test]
@@ -2293,6 +2301,26 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_model_delete_is_typed_and_retires_members()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        assert!(state.create_sorted_set(b"scores".to_vec()));
+        let score = SortedSetScore::new(1.0).ok_or("score")?;
+        assert_eq!(
+            state.zadd(b"scores", b"alice".to_vec(), score),
+            SortedSetMemberState::MissingMember
+        );
+        assert_eq!(state.delete_sorted_set(b"scores").unwrap().len(), 1);
+        assert!(matches!(
+            state.zscore(b"scores", b"alice"),
+            SortedSetMemberState::MissingSet
+        ));
+        assert!(state.delete_sorted_set(b"scores").is_none());
+        assert!(state.create_list(b"scores".to_vec()));
         Ok(())
     }
 
