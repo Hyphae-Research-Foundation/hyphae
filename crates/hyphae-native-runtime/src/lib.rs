@@ -549,6 +549,12 @@ pub enum NativeRuntimeError {
     /// The requested native list does not exist.
     #[error("native structure list does not exist")]
     UnknownStructureList,
+    /// The requested native stream does not exist.
+    #[error("native structure stream does not exist")]
+    UnknownStructureStream,
+    /// A native stream entry is empty, duplicate, oversized, or noncanonical.
+    #[error("native structure stream entry is not canonical")]
+    StructureStreamEntryNotCanonical,
     /// The requested native sorted set does not exist.
     #[error("native structure sorted set does not exist")]
     UnknownStructureSortedSet,
@@ -10664,6 +10670,104 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureList)
     }
 
+    /// Creates one explicitly typed empty native stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized key, or an existing key.
+    pub fn create_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+        if self.state.structures.create_stream(key.clone()).is_err() {
+            return Err(NativeRuntimeError::StructureKeyExists);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::CreateStream,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(())
+    }
+
+    /// Appends one exact field/value map and returns its stable entry ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing stream or noncanonical/oversized fields.
+    pub fn xadd(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        fields: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<u64, NativeRuntimeError> {
+        let key = key.into();
+        let id = self
+            .state
+            .structures
+            .xadd(&key, fields.to_vec())
+            .map_err(|_| NativeRuntimeError::StructureStreamEntryNotCanonical)?;
+        let value = encode_stream_wal_entry(id, fields)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::AppendStreamEntry,
+            target: None,
+            key,
+            value,
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(id)
+    }
+
+    /// Returns one bounded inclusive entry-ID range from private stream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is absent.
+    pub fn xrange(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        self.state
+            .structures
+            .xrange(key, start, end, limit)
+            .ok_or(NativeRuntimeError::UnknownStructureStream)
+    }
+
+    /// Deletes one complete stream lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage.
+    pub fn delete_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.delete_stream(&key).is_none() {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteStream,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Creates one explicitly typed empty native sorted set.
     ///
     /// # Errors
@@ -11590,6 +11694,25 @@ fn apply_stream_mutation(
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
     Ok(())
+}
+
+fn encode_stream_wal_entry(
+    id: u64,
+    fields: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let count = u32::try_from(fields.len())
+        .map_err(|_| NativeRuntimeError::StructureStreamEntryNotCanonical)?;
+    let mut encoded = id.to_be_bytes().to_vec();
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for (field, value) in fields {
+        for bytes in [field, value] {
+            let length = u32::try_from(bytes.len())
+                .map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+    }
+    Ok(encoded)
 }
 
 fn decode_stream_wal_entry(
@@ -23639,6 +23762,38 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn private_stream_api_emits_canonical_replay_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        batch.create_stream(b"events".to_vec())?;
+        assert_eq!(
+            batch.xadd(
+                b"events".to_vec(),
+                &[(b"kind".to_vec(), b"created".to_vec())],
+            )?,
+            1
+        );
+        assert_eq!(batch.xrange(b"events", 1, u64::MAX, 8)?.len(), 1);
+        assert!(batch.delete_stream(b"events".to_vec())?);
+        assert!(!batch.delete_stream(b"events".to_vec())?);
+        assert_eq!(
+            batch
+                .mutations
+                .iter()
+                .map(|mutation| mutation.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::CreateStream,
+                Opcode::AppendStreamEntry,
+                Opcode::DeleteStream,
+            ]
+        );
         Ok(())
     }
 
