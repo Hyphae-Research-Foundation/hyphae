@@ -722,6 +722,8 @@ dependencies = [
  "hyphae-native-records",
  "hyphae-native-types",
  "hyphae-native-wal",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
