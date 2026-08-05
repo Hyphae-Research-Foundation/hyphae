@@ -37,6 +37,19 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
         &[],
     )?;
     tx.execute_sql("INSERT INTO nodes (id, parent_id) VALUES (1, 1)", &[])?;
+    assert!(matches!(
+        tx.execute_sql(
+            "CREATE TABLE bad_fk (id BIGINT PRIMARY KEY, parent_id TEXT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+            &[],
+        ),
+        Err(SqlError::TypeMismatch)
+    ));
+    assert!(tx
+        .execute_sql(
+            "CREATE TABLE bad_clause (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE)",
+            &[],
+        )
+        .is_err());
     tx.commit()?;
     drop(database);
 
