@@ -252,6 +252,8 @@ const STRUCTURE_SORTED_SET_MEMBER_PREFIX: u8 = 9;
 const STRUCTURE_SORTED_SET_ORDER_PREFIX: u8 = 10;
 const STRUCTURE_EXPIRY_PREFIX: u8 = 11;
 const STRUCTURE_HASH_FIELD_EXPIRY_PREFIX: u8 = 12;
+const STRUCTURE_STREAM_META_PREFIX: u8 = 13;
+const STRUCTURE_STREAM_ENTRY_PREFIX: u8 = 14;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_HASH_EXPIRING_META_MAGIC: &[u8; 8] = b"HYHSHM02";
@@ -16122,6 +16124,111 @@ fn expire_list_in_tree(
     Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
+fn structure_stream_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if key
+        .len()
+        .checked_add(9)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let mut encoded = Vec::with_capacity(key.len() + 1);
+    encoded.push(STRUCTURE_STREAM_META_PREFIX);
+    encoded.extend_from_slice(key);
+    Ok(encoded)
+}
+
+fn structure_stream_entry_key(key: &[u8], id: u64) -> Result<Vec<u8>, NativeRuntimeError> {
+    let mut encoded = structure_stream_meta_key(key)?;
+    encoded[0] = STRUCTURE_STREAM_ENTRY_PREFIX;
+    encoded.extend_from_slice(&id.to_be_bytes());
+    Ok(encoded)
+}
+
+fn create_stream_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let key = structure_stream_meta_key(&mutation.key)?;
+    if tree.get(pages, &key)?.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(pages, creating_csn, key, 0_u64.to_be_bytes().to_vec())?
+        .tree)
+}
+
+fn append_stream_entry_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let (id, _) = decode_stream_wal_entry(&mutation.value)?;
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let last = u64::from_be_bytes(
+        metadata
+            .as_slice()
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    if id <= last {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let entry_key = structure_stream_entry_key(&mutation.key, id)?;
+    if tree.get(pages, &entry_key)?.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tree = tree
+        .upsert(pages, creating_csn, entry_key, mutation.value.clone())?
+        .tree;
+    Ok(tree
+        .upsert(pages, creating_csn, metadata_key, id.to_be_bytes().to_vec())?
+        .tree)
+}
+
+fn delete_stream_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let last = u64::from_be_bytes(
+        metadata
+            .as_slice()
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    for id in 1..=last {
+        let entry_key = structure_stream_entry_key(&mutation.key, id)?;
+        if tree.get(pages, &entry_key)?.is_some() {
+            tree = tree
+                .upsert(pages, creating_csn, entry_key, structure_tombstone_value())?
+                .tree;
+        }
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            structure_tombstone_value(),
+        )?
+        .tree)
+}
+
 fn create_sorted_set_in_tree(
     pages: &mut PageStore,
     tree: BTree,
@@ -16537,6 +16644,11 @@ fn apply_structure_tree_mutation(
         Opcode::DeleteSet => delete_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::AddSetMember => add_set_member_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteSetMember => delete_set_member_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::CreateStream => create_stream_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::AppendStreamEntry => {
+            append_stream_entry_in_tree(pages, tree, creating_csn, mutation)
+        }
+        Opcode::DeleteStream => delete_stream_in_tree(pages, tree, creating_csn, mutation),
         Opcode::CreateSortedSet => create_sorted_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::UpsertSortedSetMember => {
             upsert_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
@@ -19719,6 +19831,9 @@ struct StructureTreeDecoder {
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
+    streams: BTreeMap<Vec<u8>, model::StreamEntries>,
+    stream_last_ids: BTreeMap<Vec<u8>, u64>,
+    retired_streams: BTreeSet<Vec<u8>>,
     expiry_index: BTreeMap<(i64, Vec<u8>), u8>,
     hash_field_expiry_index: BTreeSet<(i64, Vec<u8>, Vec<u8>)>,
 }
@@ -19794,6 +19909,8 @@ impl StructureTreeDecoder {
             Some(STRUCTURE_SORTED_SET_ORDER_PREFIX) => {
                 self.consume_sorted_set_order(&key[1..], value)?;
             }
+            Some(STRUCTURE_STREAM_META_PREFIX) => self.consume_stream_metadata(&key[1..], value)?,
+            Some(STRUCTURE_STREAM_ENTRY_PREFIX) => self.consume_stream_entry(&key[1..], value)?,
             Some(STRUCTURE_EXPIRY_PREFIX) => {
                 let (expiry, structure_key) = decode_structure_expiry_identity(&key[1..])?;
                 match value {
@@ -19824,6 +19941,71 @@ impl StructureTreeDecoder {
                 }
             }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        }
+        Ok(())
+    }
+
+    fn consume_stream_metadata(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let stream = key.to_vec();
+        if is_structure_tombstone(value) {
+            if !self.retired_streams.insert(stream) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
+        let last = u64::from_be_bytes(
+            value
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        if self.entries.contains_key(&stream)
+            || self.hashes.contains_key(&stream)
+            || self.sets.contains_key(&stream)
+            || self.list_metadata.contains_key(&stream)
+            || self.sorted_sets.contains_key(&stream)
+            || self
+                .streams
+                .insert(stream.clone(), BTreeMap::new())
+                .is_some()
+            || self.stream_last_ids.insert(stream, last).is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_stream_entry(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        if identity.len() < 8 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let split = identity.len() - 8;
+        let key = &identity[..split];
+        if is_structure_tombstone(value) {
+            return Ok(());
+        }
+        let id = u64::from_be_bytes(
+            identity[split..]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let (payload_id, fields) = decode_stream_wal_entry(value)?;
+        if id != payload_id {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entries = self
+            .streams
+            .get_mut(key)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if entries.insert(id, fields).is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
         }
         Ok(())
     }
@@ -20007,6 +20189,9 @@ impl StructureTreeDecoder {
             sorted_sets,
             sorted_set_counts,
             sorted_set_order,
+            streams,
+            stream_last_ids,
+            retired_streams: _,
             expiry_index,
             hash_field_expiry_index,
             require_expiry_index,
@@ -20015,6 +20200,14 @@ impl StructureTreeDecoder {
         validate_set_counts(&sets, set_counts)?;
         let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
         validate_sorted_sets(&sorted_sets, &sorted_set_counts, sorted_set_order)?;
+        for (key, last) in &stream_last_ids {
+            let entries = streams
+                .get(key)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            if entries.last_key_value().map_or(0, |(id, _)| *id) != *last {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        }
         if require_expiry_index {
             validate_expiry_index(
                 &entries,
@@ -20042,7 +20235,7 @@ impl StructureTreeDecoder {
             lists,
             list_expiries,
             sorted_sets,
-            streams: BTreeMap::new(),
+            streams,
         })
     }
 }
@@ -23762,6 +23955,32 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_commit_persists_btree_entries_and_reopens() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        batch.create_stream(b"events".to_vec())?;
+        batch.xadd(
+            b"events".to_vec(),
+            &[(b"kind".to_vec(), b"created".to_vec())],
+        )?;
+        database.commit_optimistic(batch)?;
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(2)?;
+        let entries = snapshot
+            .state
+            .structures
+            .streams
+            .get(b"events".as_slice())
+            .ok_or("missing reopened stream")?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.get(&1).unwrap()[0].0, b"kind");
         Ok(())
     }
 
