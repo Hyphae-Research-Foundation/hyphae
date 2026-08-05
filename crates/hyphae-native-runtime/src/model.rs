@@ -627,6 +627,13 @@ impl StructureState {
         if fields.is_empty() {
             return Err(ModelError::DuplicateEncodedEntry);
         }
+        let mut seen = BTreeSet::new();
+        if fields
+            .iter()
+            .any(|(field, _)| !seen.insert(field.as_slice()))
+        {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
         let stream = self.streams.get_mut(key).ok_or(ModelError::UnknownObject)?;
         let id = stream
             .last_key_value()
@@ -691,6 +698,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1139,6 +1147,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1321,6 +1330,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1480,6 +1490,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -2237,6 +2248,34 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_is_typed_and_rejects_invalid_entries() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        assert!(matches!(
+            state.create_stream(b"events".to_vec()),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(matches!(
+            state.xadd(b"events", Vec::new()),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(matches!(
+            state.xadd(
+                b"events",
+                vec![
+                    (b"kind".to_vec(), b"a".to_vec()),
+                    (b"kind".to_vec(), b"b".to_vec()),
+                ],
+            ),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(!state.create_list(b"events".to_vec()));
+        assert!(!state.create_set(b"events".to_vec()));
         Ok(())
     }
 
