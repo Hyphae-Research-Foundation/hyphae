@@ -12344,6 +12344,9 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::DeleteList
             | Opcode::ExpireList
             | Opcode::CreateSortedSet
+            | Opcode::CreateStream
+            | Opcode::AppendStreamEntry
+            | Opcode::DeleteStream
             | Opcode::PushListHead
             | Opcode::PushListTail
             | Opcode::PopListHead
@@ -24041,6 +24044,38 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_stream_appends_are_first_committer_wins() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        seed.create_stream(b"events".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut first = database.begin_optimistic(2, DurabilityClass::Memory)?;
+        let mut second = database.begin_optimistic(2, DurabilityClass::Memory)?;
+        assert_eq!(
+            first.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?,
+            1
+        );
+        assert_eq!(
+            second.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"b".to_vec())])?,
+            1
+        );
+        database.commit_optimistic(first)?;
+        assert!(matches!(
+            database.commit_optimistic(second),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database
+                .xrange_latest_stream(b"events", 1, u64::MAX, 8)?
+                .len(),
+            1
+        );
         Ok(())
     }
 
