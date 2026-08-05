@@ -11967,6 +11967,13 @@ fn apply_secondary_index_creation(
     Ok(())
 }
 
+fn catalog_object_lifecycle_write_key(object: ObjectId) -> WriteKey {
+    let mut identity = Vec::with_capacity(17);
+    identity.push(1);
+    identity.extend_from_slice(&object.get().to_be_bytes());
+    WriteKey::new(EngineKind::Kernel, None, identity)
+}
+
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
     for mutation in mutations {
@@ -12034,10 +12041,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 | Opcode::CreateAnnIndex
         ) {
             if let Some(object) = mutation.target {
-                let mut object_key = Vec::with_capacity(17);
-                object_key.push(1);
-                object_key.extend_from_slice(&object.get().to_be_bytes());
-                keys.push(WriteKey::new(EngineKind::Kernel, None, object_key));
+                keys.push(catalog_object_lifecycle_write_key(object));
             }
             let name_identity = if mutation.key.is_empty() {
                 mutation.value.as_slice()
@@ -12079,6 +12083,15 @@ fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
 fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = mutation_write_keys(mutations);
     for mutation in mutations {
+        if mutation.engine == EngineKind::Relational
+            && matches!(
+                mutation.opcode,
+                Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow
+            )
+            && let Some(object) = mutation.target
+        {
+            keys.push(catalog_object_lifecycle_write_key(object));
+        }
         if matches!(
             mutation.opcode,
             Opcode::SetHashField | Opcode::DeleteHashField | Opcode::ExpireHashField
