@@ -38,14 +38,20 @@ def _metric_rows(payload: dict[str, Any], required: set[str], label: str) -> Non
         row = operations[name]
         if not isinstance(row, dict):
             raise GateFailure(f"{label} metric row is invalid for {name}")
-        for metric in ("p50_nanos", "p99_nanos"):
+        if label == "embedded":
+            latency_metrics = ("p50_us", "p99_us")
+            throughput_metric = "throughput_ops_s"
+        else:
+            latency_metrics = ("p50_nanos", "p99_nanos")
+            throughput_metric = "throughput_per_second"
+        for metric in latency_metrics:
             value = row.get(metric)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
                 raise GateFailure(f"{label} metric {metric} must be finite and nonnegative")
-        throughput = row.get("throughput_per_second")
+        throughput = row.get(throughput_metric)
         if not isinstance(throughput, (int, float)) or isinstance(throughput, bool) or not math.isfinite(throughput) or throughput <= 0:
             raise GateFailure(f"{label} throughput must be finite and positive")
-        if row["p50_nanos"] > row["p99_nanos"]:
+        if row[latency_metrics[0]] > row[latency_metrics[1]]:
             raise GateFailure(f"{label} percentile order is invalid")
 
 

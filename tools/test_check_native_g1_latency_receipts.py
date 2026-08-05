@@ -19,9 +19,9 @@ class NativeG1LatencyReceiptTests(unittest.TestCase):
             "observations_per_operation": 1_000_000,
             "warmup_per_operation": 100_000,
             "operations": {
-                "embedded_structure_get_64b": {"p50_nanos": 100, "p99_nanos": 200, "throughput_per_second": 10.0},
-                "embedded_prepared_sql_pk_materialized_scaled_snapshot": {"p50_nanos": 110, "p99_nanos": 220, "throughput_per_second": 9.0},
-                "buffered_inverted_btree_bm25_match_top1_rare_term": {"p50_nanos": 120, "p99_nanos": 240, "throughput_per_second": 8.0},
+                "embedded_structure_get_64b": {"p50_us": 0.1, "p99_us": 0.2, "throughput_ops_s": 10.0},
+                "embedded_prepared_sql_pk_materialized_scaled_snapshot": {"p50_us": 0.11, "p99_us": 0.22, "throughput_ops_s": 9.0},
+                "buffered_inverted_btree_bm25_match_top1_rare_term": {"p50_us": 0.12, "p99_us": 0.24, "throughput_ops_s": 8.0},
             },
         }
 
@@ -75,16 +75,16 @@ class NativeG1LatencyReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "operation set"):
             validate_receipts(self.embedded(), protocol, "a" * 40)
         embedded = self.embedded()
-        embedded["operations"]["embedded_structure_get_64b"]["throughput_per_second"] = float("inf")
+        embedded["operations"]["embedded_structure_get_64b"]["throughput_ops_s"] = float("inf")
         with self.assertRaisesRegex(GateFailure, "finite"):
             validate_receipts(embedded, self.protocol(), "a" * 40)
 
     def test_zero_nanosecond_bucket_is_valid_but_zero_throughput_is_not(self) -> None:
         embedded = self.embedded()
-        embedded["operations"]["embedded_structure_get_64b"]["p50_nanos"] = 0
+        embedded["operations"]["embedded_structure_get_64b"]["p50_us"] = 0
         result = validate_receipts(embedded, self.protocol(), "a" * 40)
         self.assertEqual(result["status"], "passed")
-        embedded["operations"]["embedded_structure_get_64b"]["throughput_per_second"] = 0
+        embedded["operations"]["embedded_structure_get_64b"]["throughput_ops_s"] = 0
         with self.assertRaisesRegex(GateFailure, "throughput"):
             validate_receipts(embedded, self.protocol(), "a" * 40)
 
