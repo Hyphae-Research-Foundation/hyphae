@@ -43,11 +43,14 @@ ORDER BY <primary-key>
 LIMIT <n>
 ```
 
-It reuses the native primary-key ordered scan, computes unsigned one-based
+It reuses native primary-key ordered scans, computes unsigned one-based
 ordinals, applies the output limit, and requires the outer order to match the
-window order. Because the order key is a unique primary key, `RANK` and
-`ROW_NUMBER` intentionally coincide in this slice. Partitioning, ties on
-non-unique order keys, multiple/composite order keys, descending/null ordering,
+window order. A single `PARTITION BY` column is supported when it is the first
+component of a two-column primary key and the window order is the second; the
+ordinal resets at each canonical partition boundary. Because the complete
+window order is unique in these admitted shapes, `RANK` and `ROW_NUMBER`
+intentionally coincide. Ties on non-unique order keys,
+multiple partition columns or composite order suffixes, descending/null ordering,
 frames, additional window functions, snapshot/latest prepared execution, and
 spill remain unsupported and fail closed. This slice does not close the G2
 window-function requirement.

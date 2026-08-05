@@ -488,6 +488,7 @@ struct ParsedWindowSelect {
     name: String,
     value_column: String,
     function: WindowFunction,
+    partition_column: Option<String>,
     order_column: String,
     alias: String,
     limit: usize,
@@ -1068,17 +1069,33 @@ fn execute_window_select(
         return Err(SqlError::ParameterMismatch);
     }
     let (_, definition) = relation_named(&transaction.state.catalog, &window.name)?;
-    let primary_key = definition
-        .primary_key
-        .first()
-        .ok_or(SqlError::InvalidPrimaryKey)?;
     let order_index = column_index(&definition.columns, &window.order_column)?;
-    if definition.columns[order_index].id != *primary_key {
+    let partition_index = window
+        .partition_column
+        .as_ref()
+        .map(|column| column_index(&definition.columns, column))
+        .transpose()?;
+    let expected_key = partition_index
+        .into_iter()
+        .chain(std::iter::once(order_index))
+        .map(|index| definition.columns[index].id)
+        .collect::<Vec<_>>();
+    if definition.primary_key != expected_key {
         return Err(SqlError::InvalidSyntax);
     }
+    let order_columns = window
+        .partition_column
+        .iter()
+        .cloned()
+        .chain(std::iter::once(window.order_column.clone()))
+        .collect::<Vec<_>>();
     let query = format!(
         "SELECT {}, {} FROM {} ORDER BY {} LIMIT {}",
-        window.value_column, window.order_column, window.name, window.order_column, window.limit
+        window.value_column,
+        order_columns.join(", "),
+        window.name,
+        order_columns.join(", "),
+        window.limit
     );
     let Statement::Select {
         name,
@@ -1107,9 +1124,20 @@ fn execute_window_select(
         return Err(SqlError::InvalidSyntax);
     };
     let mut output = Vec::with_capacity(rows.len());
-    for (index, row) in rows.into_iter().enumerate() {
+    let mut previous_partition = None;
+    let mut ordinal = 0_u64;
+    for row in rows {
         let value = row.first().cloned().ok_or(SqlError::InvalidStoredRow)?;
-        let ordinal = u64::try_from(index + 1).map_err(|_| SqlError::InvalidSyntax)?;
+        let partition = window
+            .partition_column
+            .as_ref()
+            .map(|_| row.get(1).cloned().ok_or(SqlError::InvalidStoredRow))
+            .transpose()?;
+        if partition != previous_partition {
+            ordinal = 0;
+            previous_partition = partition;
+        }
+        ordinal = ordinal.checked_add(1).ok_or(SqlError::InvalidSyntax)?;
         let rank = match window.function {
             WindowFunction::RowNumber | WindowFunction::Rank => ordinal,
         };
@@ -6543,9 +6571,16 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_symbol(')')?;
     parser.expect_keyword("OVER")?;
     parser.expect_symbol('(')?;
-    if parser.consume_keyword("PARTITION") {
-        return Err(SqlError::InvalidSyntax);
-    }
+    let partition_column = if parser.consume_keyword("PARTITION") {
+        parser.expect_keyword("BY")?;
+        let column = parser.identifier()?;
+        if parser.consume_symbol(',') {
+            return Err(SqlError::InvalidSyntax);
+        }
+        Some(column)
+    } else {
+        None
+    };
     parser.expect_keyword("ORDER")?;
     parser.expect_keyword("BY")?;
     let order_column = parser.identifier()?;
@@ -6560,7 +6595,22 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_keyword("ORDER")?;
     parser.expect_keyword("BY")?;
     let outer_order = parser.identifier()?;
-    if normalize_identifier(&outer_order) != normalize_identifier(&order_column) {
+    let mut outer_order_by = vec![outer_order];
+    while parser.consume_symbol(',') {
+        outer_order_by.push(parser.identifier()?);
+    }
+    let expected_order_by = partition_column
+        .iter()
+        .cloned()
+        .chain(std::iter::once(order_column.clone()))
+        .collect::<Vec<_>>();
+    if outer_order_by
+        .iter()
+        .map(|column| normalize_identifier(column))
+        .ne(expected_order_by
+            .iter()
+            .map(|column| normalize_identifier(column)))
+    {
         return Err(SqlError::InvalidSyntax);
     }
     parser.expect_keyword("LIMIT")?;
@@ -6569,6 +6619,7 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         name,
         value_column,
         function,
+        partition_column,
         order_column,
         alias,
         limit,

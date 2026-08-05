@@ -62,6 +62,55 @@ fn row_number_and_rank_follow_complete_primary_key_order() -> Result<(), Box<dyn
 }
 
 #[test]
+fn partitioned_row_number_resets_on_composite_primary_key_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = std::env::temp_dir().join(format!(
+        "hyphae-native-window-partition-{}",
+        std::process::id()
+    ));
+    let _ignored = std::fs::remove_dir_all(&temporary);
+    let mut database = NativeDatabase::create(&temporary)?;
+    let mut transaction = database.begin_sql(1, DurabilityClass::Memory)?;
+    transaction.execute_sql(
+        "CREATE TABLE events (tenant TEXT NOT NULL, id BIGINT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (tenant, id))",
+        &[],
+    )?;
+    for (tenant, id, payload) in [
+        ("a", 2, "a2"),
+        ("b", 1, "b1"),
+        ("a", 1, "a1"),
+        ("b", 2, "b2"),
+    ] {
+        transaction.execute_sql(
+            "INSERT INTO events (tenant, id, payload) VALUES (?, ?, ?)",
+            &[
+                ScalarValue::Text(tenant.to_owned()),
+                ScalarValue::Signed(id),
+                ScalarValue::Text(payload.to_owned()),
+            ],
+        )?;
+    }
+    assert_eq!(
+        transaction.execute_sql(
+            "SELECT payload, ROW_NUMBER() OVER (PARTITION BY tenant ORDER BY id) AS row_number FROM events ORDER BY tenant, id LIMIT 4",
+            &[],
+        )?,
+        SqlResult::Rows {
+            columns: vec!["payload".to_owned(), "row_number".to_owned()],
+            rows: vec![
+                vec![ScalarValue::Text("a1".to_owned()), ScalarValue::Unsigned(1)],
+                vec![ScalarValue::Text("a2".to_owned()), ScalarValue::Unsigned(2)],
+                vec![ScalarValue::Text("b1".to_owned()), ScalarValue::Unsigned(1)],
+                vec![ScalarValue::Text("b2".to_owned()), ScalarValue::Unsigned(2)],
+            ],
+        }
+    );
+    transaction.rollback();
+    std::fs::remove_dir_all(&temporary)?;
+    Ok(())
+}
+
+#[test]
 fn unsupported_window_shapes_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = std::env::temp_dir().join(format!(
         "hyphae-native-window-negative-{}",
@@ -76,7 +125,7 @@ fn unsupported_window_shapes_fail_closed() -> Result<(), Box<dyn std::error::Err
     )?;
     for statement in [
         "SELECT id, ROW_NUMBER() OVER () AS n FROM accounts LIMIT 1",
-        "SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS n FROM accounts ORDER BY id LIMIT 1",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY name, id ORDER BY id) AS n FROM accounts ORDER BY name, id LIMIT 1",
         "SELECT id, RANK() OVER (ORDER BY name) AS n FROM accounts ORDER BY id LIMIT 1",
         "SELECT id, DENSE_RANK() OVER (ORDER BY id) AS n FROM accounts ORDER BY id LIMIT 1",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS n FROM accounts ORDER BY id LIMIT 1",
