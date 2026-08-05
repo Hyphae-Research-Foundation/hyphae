@@ -26,8 +26,9 @@ SELECT <projection> FROM <name> [LIMIT <n>]
 
 The inner query uses the ordinary catalog-bound native SELECT executor, then
 materializes its bounded rows as one statement-local relation. The outer query
-may project those rows and apply a second bound. Recursive CTEs, nested CTEs,
-parameterized CTEs, outer filters/order, joins against a CTE, multiple CTEs,
+may project those rows and apply a second bound. Parameters are accepted by the
+inner query and retain statement-text ordering. Recursive CTEs, nested CTEs,
+outer filters/order, joins against a CTE, multiple CTEs,
 and durable catalog publication are rejected. This slice is not complete G2
 CTE support and does not change the gate status.
 

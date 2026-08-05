@@ -1046,10 +1046,13 @@ fn execute_cte_select(
     cte: &ParsedCteSelect,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
-    if !parameters.is_empty() {
+    let inner_parameter_count = statement_parameter_count(&cte.inner)?;
+    let outer_parameter_count = statement_parameter_count(&cte.outer)?;
+    if parameters.len() != inner_parameter_count + outer_parameter_count {
         return Err(SqlError::ParameterMismatch);
     }
-    let inner = execute_parsed_transaction(transaction, &cte.inner, parameters)?;
+    let (inner_parameters, outer_parameters) = parameters.split_at(inner_parameter_count);
+    let inner = execute_parsed_transaction(transaction, &cte.inner, inner_parameters)?;
     let SqlResult::Rows { columns, rows } = inner else {
         return Err(SqlError::InvalidSyntax);
     };
@@ -1066,7 +1069,7 @@ fn execute_cte_select(
     };
     if normalize_identifier(name) != normalize_identifier(&cte.name)
         || filter.is_some()
-        || *parameter_count != 0
+        || *parameter_count != outer_parameters.len()
         || !order_by.is_empty()
     {
         return Err(SqlError::InvalidSyntax);
@@ -1103,6 +1106,15 @@ fn execute_cte_select(
         columns: output_columns,
         rows,
     })
+}
+
+fn statement_parameter_count(statement: &Statement) -> Result<usize, SqlError> {
+    match statement {
+        Statement::Select {
+            parameter_count, ..
+        } => Ok(*parameter_count),
+        _ => Err(SqlError::InvalidSyntax),
+    }
 }
 
 fn execute_parsed_transaction(

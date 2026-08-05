@@ -17,7 +17,6 @@ fn recursive_nested_parameterized_and_mismatched_ctes_fail_closed()
     for statement in [
         "WITH RECURSIVE ids AS (SELECT id FROM accounts LIMIT 1) SELECT id FROM ids LIMIT 1",
         "WITH ids AS (WITH nested AS (SELECT id FROM accounts LIMIT 1) SELECT id FROM nested LIMIT 1) SELECT id FROM ids LIMIT 1",
-        "WITH ids AS (SELECT id FROM accounts WHERE id = ? LIMIT 1) SELECT id FROM ids LIMIT 1",
         "WITH ids AS (SELECT id FROM accounts LIMIT 1) SELECT id FROM other LIMIT 1",
     ] {
         assert!(
@@ -50,6 +49,16 @@ fn non_recursive_cte_materializes_one_bound_subquery() -> Result<(), Box<dyn std
         SqlResult::Rows {
             columns: vec!["id".to_owned()],
             rows: vec![vec![ScalarValue::Signed(1)]],
+        }
+    );
+    assert_eq!(
+        transaction.execute_sql(
+            "WITH selected AS (SELECT id FROM accounts WHERE id >= ? ORDER BY id LIMIT 10) SELECT id FROM selected LIMIT 10",
+            &[ScalarValue::Signed(2)],
+        )?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: vec![vec![ScalarValue::Signed(2)]],
         }
     );
     transaction.rollback();
