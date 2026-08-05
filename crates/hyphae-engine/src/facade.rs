@@ -85,6 +85,49 @@ pub enum EngineError {
     EmptyBatch,
 }
 
+/// One typed mutation inside an atomic mixed document/vector batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AtomicMutation {
+    /// Store or replace a canonical structured record.
+    PutRecord(Record),
+    /// Delete one structured record by binary key.
+    DeleteRecord(Vec<u8>),
+    /// Store or replace one vector in a named vector space.
+    UpsertVector {
+        /// Vector space.
+        space: VectorSpaceName,
+        /// Object key shared with the structured record.
+        key: Vec<u8>,
+        /// Canonical Q15 vector.
+        vector: Q15Vector,
+    },
+    /// Delete one vector from a named vector space.
+    DeleteVector {
+        /// Vector space.
+        space: VectorSpaceName,
+        /// Object key.
+        key: Vec<u8>,
+    },
+}
+
+/// Atomic batch spanning structured records and vector projections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AtomicWriteBatch {
+    operations: Vec<AtomicMutation>,
+}
+
+impl AtomicWriteBatch {
+    /// Creates a nonempty batch. Empty batches are rejected by [`HyphaeEngine::write_batch`].
+    pub fn new(operations: Vec<AtomicMutation>) -> Self {
+        Self { operations }
+    }
+
+    /// Operations in durable execution order.
+    pub fn operations(&self) -> &[AtomicMutation] {
+        &self.operations
+    }
+}
+
 /// Failure from the additive engine query entry points that enforce an
 /// aggregate durable byte budget.
 #[derive(Debug, Error)]
@@ -220,6 +263,66 @@ impl HyphaeEngine {
                 record.key.clone(),
                 encode_document(&record.value)?,
             ));
+        }
+        Ok(self.storage.write(transaction_id, &mutations)?)
+    }
+
+    /// Atomically applies a mixed structured-record and vector batch.
+    ///
+    /// Every document is canonically encoded and every duplicate target is
+    /// rejected before one WAL append. A document and its vector may share the
+    /// same key because they occupy distinct durable domains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty batch, duplicate document/vector target,
+    /// invalid document/vector data, unknown vector space, idempotency conflict,
+    /// or durable storage failure.
+    pub fn write_batch(
+        &mut self,
+        transaction_id: Uuid,
+        batch: &AtomicWriteBatch,
+    ) -> Result<AppendOutcome, EngineError> {
+        if batch.operations.is_empty() {
+            return Err(EngineError::EmptyBatch);
+        }
+        let mut document_keys = BTreeSet::new();
+        let mut vector_keys = BTreeSet::new();
+        let mut mutations = Vec::with_capacity(batch.operations.len());
+        for operation in &batch.operations {
+            match operation {
+                AtomicMutation::PutRecord(record) => {
+                    if !document_keys.insert(record.key.as_slice()) {
+                        return Err(EngineError::DuplicateDocumentKey);
+                    }
+                    mutations.push(Mutation::put(
+                        record.key.clone(),
+                        encode_document(&record.value)?,
+                    ));
+                }
+                AtomicMutation::DeleteRecord(key) => {
+                    if !document_keys.insert(key.as_slice()) {
+                        return Err(EngineError::DuplicateDocumentKey);
+                    }
+                    mutations.push(Mutation::delete(key));
+                }
+                AtomicMutation::UpsertVector { space, key, vector } => {
+                    if !vector_keys.insert((space, key.as_slice())) {
+                        return Err(EngineError::DuplicateDocumentKey);
+                    }
+                    mutations.push(Mutation::upsert_vector(
+                        space.clone(),
+                        key.clone(),
+                        vector.clone(),
+                    ));
+                }
+                AtomicMutation::DeleteVector { space, key } => {
+                    if !vector_keys.insert((space, key.as_slice())) {
+                        return Err(EngineError::DuplicateDocumentKey);
+                    }
+                    mutations.push(Mutation::delete_vector(space.clone(), key));
+                }
+            }
         }
         Ok(self.storage.write(transaction_id, &mutations)?)
     }
@@ -1168,7 +1271,8 @@ mod tests {
     };
 
     use super::{
-        BoundedEngineQueryError, EngineError, ExecutionLimits, HyphaeEngine, Query, Record,
+        AtomicMutation, AtomicWriteBatch, BoundedEngineQueryError, EngineError, ExecutionLimits,
+        HyphaeEngine, Query, Record,
     };
 
     struct TestDirectory {
@@ -1202,6 +1306,69 @@ mod tests {
             ("group".to_owned(), Value::String(group.to_owned())),
             ("score".to_owned(), Value::Integer(score)),
         ]))
+    }
+
+    #[test]
+    fn mixed_batch_commits_document_and_vector_together() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new("mixed-batch")?;
+        let mut engine = HyphaeEngine::open(temporary.path())?.engine;
+        let space = VectorSpaceName::new("memory")?;
+        engine.define_vector_space(
+            Uuid::now_v7(),
+            VectorSpaceDefinition::cosine(space.clone(), 2)?,
+        )?;
+        let key = b"memory-1".to_vec();
+        let vector = Q15Vector::new(vec![32_767, 0])?;
+        engine.write_batch(
+            Uuid::now_v7(),
+            &AtomicWriteBatch::new(vec![
+                AtomicMutation::PutRecord(Record::new(key.clone(), value(1, "memory"))),
+                AtomicMutation::UpsertVector {
+                    space: space.clone(),
+                    key: key.clone(),
+                    vector: vector.clone(),
+                },
+            ]),
+        )?;
+        assert!(engine.get_record(&key)?.is_some());
+        let outcome = engine.retrieve_exact(
+            &ExactRetrievalRequest {
+                vector_space: space.clone(),
+                query: vector.clone(),
+                limit: 1,
+                minimum_score_nanos: 0,
+                minimum_margin_nanos: 0,
+            },
+            &ExactRetrievalLimits::default(),
+        )?;
+        assert!(matches!(outcome, ExactRetrievalOutcome::Matches(_)));
+
+        engine.write_batch(
+            Uuid::now_v7(),
+            &AtomicWriteBatch::new(vec![
+                AtomicMutation::DeleteRecord(key.clone()),
+                AtomicMutation::DeleteVector {
+                    space: space.clone(),
+                    key: key.clone(),
+                },
+            ]),
+        )?;
+        assert!(engine.get_record(&key)?.is_none());
+        assert!(matches!(
+            engine.retrieve_exact(
+                &ExactRetrievalRequest {
+                    vector_space: space,
+                    query: vector,
+                    limit: 1,
+                    minimum_score_nanos: 0,
+                    minimum_margin_nanos: 0,
+                },
+                &ExactRetrievalLimits::default(),
+            )?,
+            ExactRetrievalOutcome::Abstained(_)
+        ));
+        Ok(())
     }
 
     #[test]

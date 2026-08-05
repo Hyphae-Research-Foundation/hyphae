@@ -7,7 +7,10 @@ mod facade;
 pub mod proof;
 pub mod retrieval_proof;
 
-pub use facade::{BoundedEngineQueryError, EngineError, HyphaeEngine, OpenedEngine};
+pub use facade::{
+    AtomicMutation, AtomicWriteBatch, BoundedEngineQueryError, EngineError, HyphaeEngine,
+    OpenedEngine,
+};
 pub use hyphae_query::{
     DocumentError, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_NODES, decode_document,
     encode_document,
