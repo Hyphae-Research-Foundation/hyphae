@@ -32,12 +32,12 @@ class GateFailure(ValueError):
 
 def parse_test_count(output: str) -> int:
     matches = TEST_RESULT.findall(output)
-    if len(matches) != 1:
-        raise GateFailure("test output does not contain one exact successful result")
-    count = int(matches[0])
-    if count <= 0:
+    if not matches:
+        raise GateFailure("test output contains no successful result")
+    counts = [int(match) for match in matches]
+    if any(count <= 0 for count in counts):
         raise GateFailure("test output contains zero passing tests")
-    return count
+    return sum(counts)
 
 
 def build_receipt(

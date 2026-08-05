@@ -25,8 +25,15 @@ class NativeG2GenericReceiptTests(unittest.TestCase):
                 [("suite", "test result: ok. 1 passed; 0 failed;\n")],
                 "b" * 64,
             )
+        self.assertEqual(
+            parse_test_count(
+                "test result: ok. 1 passed; 0 failed;\n"
+                "test result: ok. 2 passed; 0 failed;\n"
+            ),
+            3,
+        )
         with self.assertRaises(GateFailure):
-            parse_test_count("test result: ok. 1 passed; 0 failed;\ntest result: ok. 2 passed; 0 failed;\n")
+            parse_test_count("test result: ok. 0 passed; 0 failed;\n")
 
 
 if __name__ == "__main__":
