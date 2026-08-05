@@ -1,0 +1,34 @@
+{
+  "schema": "hyphae-native-g2-tpch-matrix-v1",
+  "scale_factor": "bounded-fixture",
+  "queries": [
+    {"query": 1, "status": "unsupported", "reason": "aggregates-and-grouping"},
+    {"query": 2, "status": "unsupported", "reason": "subquery-min-and-multi-join"},
+    {"query": 3, "status": "admitted-derived", "test": "tpch_correctness_g2"},
+    {"query": 4, "status": "unsupported", "reason": "exists-subquery-and-grouping"},
+    {"query": 5, "status": "unsupported", "reason": "six-way-join-and-aggregation"},
+    {"query": 6, "status": "unsupported", "reason": "arithmetic-aggregation"},
+    {"query": 7, "status": "unsupported", "reason": "multi-join-extract-and-aggregation"},
+    {"query": 8, "status": "unsupported", "reason": "case-extract-and-aggregation"},
+    {"query": 9, "status": "unsupported", "reason": "multi-join-expression-aggregation"},
+    {"query": 10, "status": "unsupported", "reason": "multi-join-and-aggregation"},
+    {"query": 11, "status": "unsupported", "reason": "nested-aggregate-subquery"},
+    {"query": 12, "status": "unsupported", "reason": "case-aggregation"},
+    {"query": 13, "status": "unsupported", "reason": "left-outer-join-and-subquery"},
+    {"query": 14, "status": "unsupported", "reason": "case-arithmetic-aggregation"},
+    {"query": 15, "status": "unsupported", "reason": "view-and-aggregation"},
+    {"query": 16, "status": "unsupported", "reason": "not-in-subquery-and-grouping"},
+    {"query": 17, "status": "unsupported", "reason": "correlated-subquery-and-avg"},
+    {"query": 18, "status": "unsupported", "reason": "having-and-aggregation"},
+    {"query": 19, "status": "unsupported", "reason": "or-heavy-arithmetic-aggregation"},
+    {"query": 20, "status": "unsupported", "reason": "correlated-exists-and-multi-join"},
+    {"query": 21, "status": "unsupported", "reason": "not-exists-and-grouping"},
+    {"query": 22, "status": "unsupported", "reason": "seven-way-join-and-grouping"}
+  ],
+  "derived_shapes": [
+    "secondary-index-filter",
+    "composite-primary-key-prefix",
+    "bounded-materialized-cte",
+    "exact-supplier-lookup"
+  ]
+}

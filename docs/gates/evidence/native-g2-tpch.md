@@ -14,7 +14,11 @@ lookup. Each result is compared with a frozen reference row set.
 
 The test deliberately records current optimizer requirements: the filtered
 customer side and right-side join key need admitted indexes. This is useful
-architectural evidence but is not TPC-H correctness closure. G2 still requires
+architectural evidence but is not TPC-H correctness closure. A versioned matrix
+accounts for all 22 canonical query numbers exactly once: Q3 is marked as an
+admitted derived vertical and the other 21 retain explicit unsupported-feature
+reasons. This prevents a bounded subset from being reported as full TPC-H.
+G2 still requires
 the canonical schema, deterministic scale-factor generator and digests,
 reference outputs for all admitted queries, unsupported-query accounting,
 reopen equivalence, and hosted exact-SHA receipts. Performance claims remain
