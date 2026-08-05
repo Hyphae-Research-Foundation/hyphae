@@ -24048,6 +24048,42 @@ mod tests {
     }
 
     #[test]
+    fn stream_delete_and_append_race_is_first_committer_wins_in_both_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for append_first in [true, false] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Memory)?;
+            seed.create_stream(b"events".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut append = database.begin_optimistic(2, DurabilityClass::Memory)?;
+            append.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Memory)?;
+            assert!(delete.delete_stream(b"events".to_vec())?);
+            let (winner, loser) = if append_first {
+                (append, delete)
+            } else {
+                (delete, append)
+            };
+            database.commit_optimistic(winner)?;
+            assert!(matches!(
+                database.commit_optimistic(loser),
+                Err(NativeRuntimeError::WriteConflict(_))
+            ));
+            let present = database.xrange_latest_stream(b"events", 0, u64::MAX, 8);
+            if append_first {
+                assert_eq!(present?.len(), 1);
+            } else {
+                assert!(matches!(
+                    present,
+                    Err(NativeRuntimeError::UnknownStructureStream)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_stream_appends_are_first_committer_wins() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = TestDirectory::new();
