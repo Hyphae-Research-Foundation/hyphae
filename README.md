@@ -26,12 +26,12 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Development line:** Hyphae Native is the active architecture on `dev`. Its G0
-foundation gate is closed with hosted, content-bound evidence across eight
-requirements: versioned contracts, canonical types and encodings, page/row/blob/
-WAL/MVCC goldens, SQL/structures/search/ANN semantics, local protocol
-conformance on Linux/macOS/Windows, bounded lexical and ANN quality receipts,
-dependency/license/transitive-unsafe review, and clean-room provenance.
+**Development line:** Hyphae Native is the active architecture on `dev`. G0 and
+G1 have historical hosted closure claims, but their exact-SHA aggregates are not
+retained in this checkout and require revalidation. G2 currently has bounded
+relational readiness rather than the broad canonical gate outcome. The
+[native gate status](docs/gates/native-gate-status.md) is the current status
+authority; temporary workflow artifacts alone do not close a gate.
 
 **Published stable release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1)
 is still the version available from crates.io and GitHub Releases. It is the

@@ -20,7 +20,13 @@ class GateFailure(ValueError):
     pass
 
 
-def evaluate(root: Path, profile: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+def evaluate(
+    root: Path,
+    profile: dict[str, Any],
+    evidence: dict[str, Any],
+    expected_commit: str,
+    manifest_sha256: str,
+) -> dict[str, Any]:
     if profile.get("schema") != PROFILE_SCHEMA or profile.get("gate") != "G3":
         raise GateFailure("unsupported G3 profile")
     if evidence.get("schema") != EVIDENCE_SCHEMA or evidence.get("gate") != "G3":
@@ -58,12 +64,18 @@ def evaluate(root: Path, profile: dict[str, Any], evidence: dict[str, Any]) -> d
                 if hashlib.sha256(artifact.read_bytes()).hexdigest() != row["artifact_sha256"]:
                     raise GateFailure(f"artifact digest mismatch for {identifier}")
                 payload = json.loads(artifact.read_text())
-                if payload.get("schema") != "hyphae-native-g3-receipt-audit-v1":
+                if payload.get("schema") != "hyphae-native-g3-receipt-audit-v2":
                     raise GateFailure(f"invalid audit schema for {identifier}")
                 if payload.get("status") != "passed" or payload.get("requirement") != identifier:
                     raise GateFailure(f"invalid audit identity for {identifier}")
                 if payload.get("scope") != "bounded-correctness" or payload.get("production_scale") is not False:
                     raise GateFailure(f"invalid audit scope for {identifier}")
+                if payload.get("source_commit") != expected_commit:
+                    raise GateFailure(f"audit commit mismatch for {identifier}")
+                if payload.get("manifest_sha256") != manifest_sha256:
+                    raise GateFailure(f"audit manifest mismatch for {identifier}")
+                if not isinstance(payload.get("suite_count"), int) or payload["suite_count"] <= 0:
+                    raise GateFailure(f"invalid suite count for {identifier}")
                 if not isinstance(payload.get("test_count"), int) or payload["test_count"] <= 0:
                     raise GateFailure(f"invalid test count for {identifier}")
                 status = "passed"
@@ -84,6 +96,8 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -91,6 +105,8 @@ def main() -> int:
             args.root,
             json.loads(args.profile.read_text()),
             json.loads(args.evidence.read_text()),
+            args.expected_commit,
+            args.manifest_sha256,
         )
     except (GateFailure, OSError, json.JSONDecodeError) as error:
         print(f"native G3 readiness failed: {error}")

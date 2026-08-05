@@ -1,7 +1,8 @@
 # Native local ecosystem phase-1 gate
 
-Status: in progress; G0 specifications are drafted but implementation and
-exit evidence remain incomplete
+Status: in progress. The current closure/revalidation state is maintained in
+[`native-gate-status.md`](native-gate-status.md); this document remains the
+normative definition of gate outcomes.
 
 This is the ordered implementation gate for the Hyphae-owned relational,
 structure, and search ecosystem. It describes future work, not shipped
@@ -879,14 +880,18 @@ member-granular conflicts, chunked-deque lists, and dual-index sorted sets
 with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
 delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
 counters, independent absolute field TTL, bounded set algebra, and complete-set
-TTL, plus complete-list delete/recreate and TTL. It still lacks floating
-counters, sorted-set algebra/TTL,
-relative/conditional expiry, persist/batches, subtree-count order-statistic
-acceleration, streams, adaptive empty-expiry backoff, randomized models for
-every structure family, and a user-facing historical-retention policy
-required to close G3. Ordered cleanup, current-root compaction, and
-page-generation vacuum provide exact first amplification measurements, not
-the complete memory-amplification gate.
+TTL, plus complete-list delete/recreate and TTL. Subsequent G3 work added
+durable sorted-set lifecycle/TTL, append-ordered streams with stable entry IDs
+and TTL, active expiry for both families, crash matrices, seeded models for
+every required family, an all-family restart matrix, and all-family atomic
+conflict evidence. Floating counters, sorted-set algebra, relative/conditional
+expiry, persist semantics, broader model alphabets and negative controls,
+adaptive empty-expiry backoff, and a user-facing historical-retention policy
+remain open. One cleanup call spanning all six families currently fails closed
+with `InvalidStructureTree`; visibility and reopen semantics are covered while
+that cleanup defect remains explicit. Ordered cleanup, current-root compaction,
+page-generation vacuum, and the bounded physical-amplification test provide
+initial measurements, not a complete production-scale memory claim.
 
 ## G1 substrate exit
 

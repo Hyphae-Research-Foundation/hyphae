@@ -25166,7 +25166,13 @@ mod tests {
                 expires_at_micros: None,
             },
         )?;
-        assert_eq!(state.xrange(b"events", 0, u64::MAX, 8).unwrap().len(), 1);
+        assert_eq!(
+            state
+                .xrange(b"events", 0, u64::MAX, 8)
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
         assert!(
             super::apply_structure_mutation(
                 &mut state,

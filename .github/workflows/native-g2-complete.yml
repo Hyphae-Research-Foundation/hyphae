@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -25,6 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$SHA"
           mkdir -p g2-logs g2-receipts g2-audits
           run_suite() {
             name="$1"

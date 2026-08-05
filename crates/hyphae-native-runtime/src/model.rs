@@ -2314,7 +2314,13 @@ mod tests {
             state.zadd(b"scores", b"alice".to_vec(), score),
             SortedSetMemberState::MissingMember
         );
-        assert_eq!(state.delete_sorted_set(b"scores").unwrap().len(), 1);
+        assert_eq!(
+            state
+                .delete_sorted_set(b"scores")
+                .ok_or("missing sorted set")?
+                .len(),
+            1
+        );
         assert!(matches!(
             state.zscore(b"scores", b"alice"),
             SortedSetMemberState::MissingSet
@@ -2375,7 +2381,13 @@ mod tests {
         let mut state = StructureState::default();
         state.create_stream(b"events".to_vec())?;
         state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?;
-        assert_eq!(state.delete_stream(b"events").unwrap().len(), 1);
+        assert_eq!(
+            state
+                .delete_stream(b"events")
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
         assert_eq!(state.xrange(b"events", 0, u64::MAX, 8), None);
         assert!(state.delete_stream(b"events").is_none());
         assert!(state.create_list(b"events".to_vec()));
@@ -2427,7 +2439,13 @@ mod tests {
             state.xrange(b"events", 1, 2, 1),
             Some(vec![(1, vec![(b"kind".to_vec(), b"a".to_vec())])])
         );
-        assert_eq!(state.xrange(b"events", 2, u64::MAX, 8).unwrap().len(), 1);
+        assert_eq!(
+            state
+                .xrange(b"events", 2, u64::MAX, 8)
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
         assert_eq!(state.xrange(b"missing", 0, u64::MAX, 8), None);
         Ok(())
     }

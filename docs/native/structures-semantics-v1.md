@@ -716,6 +716,13 @@ controlled-clock TTL tests, expiry-index reconstruction, bounded cleanup,
 blocking cancellation, memory-amplification receipts, eviction safety, and
 cross-engine transactions.
 
+The G3 readiness profile closes only the structure-engine obligations in this
+list. Cross-engine transactions are G5 convergence evidence. Relation-valued
+iterators, blocking product surfaces, eviction telemetry, and cancellation are
+G6 product evidence unless a structure command introduced before G6 depends on
+them. G3 still requires fail-closed non-claims for those surfaces and may not
+represent their absence as implemented behavior.
+
 Current experimental tests cover a 2,048-key multilevel tree, historical roots,
 direct TTL and expiry reads, canonical tombstones, `NX`/`XX`, racing `NX`
 writers, signed counter bounds, strict reopen, canonical-envelope corruption,
