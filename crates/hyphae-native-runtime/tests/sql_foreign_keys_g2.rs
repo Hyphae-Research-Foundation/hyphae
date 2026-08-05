@@ -37,6 +37,30 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
         &[],
     )?;
     tx.execute_sql("INSERT INTO nodes (id, parent_id) VALUES (1, 1)", &[])?;
+    tx.execute_sql(
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+        &[],
+    )?;
+    tx.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
+    tx.execute_sql(
+        "CREATE TABLE invites (id BIGINT PRIMARY KEY, email TEXT, FOREIGN KEY (email) REFERENCES users (email))",
+        &[],
+    )?;
+    tx.execute_sql(
+        "INSERT INTO users (id, email) VALUES (1, 'a@example.com')",
+        &[],
+    )?;
+    tx.execute_sql(
+        "INSERT INTO invites (id, email) VALUES (1, 'a@example.com')",
+        &[],
+    )?;
+    assert!(matches!(
+        tx.execute_sql(
+            "INSERT INTO invites (id, email) VALUES (2, 'missing@example.com')",
+            &[]
+        ),
+        Err(SqlError::ForeignKeyViolation)
+    ));
     assert!(matches!(
         tx.execute_sql(
             "CREATE TABLE bad_fk (id BIGINT PRIMARY KEY, parent_id TEXT, FOREIGN KEY (parent_id) REFERENCES parents (id))",

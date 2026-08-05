@@ -3729,14 +3729,15 @@ fn execute_create(
             .iter()
             .map(|name| column_index(&columns, name).map(|index| columns[index].id))
             .collect::<Result<Vec<_>, _>>()?;
-        let (parent_id, parent) =
-            if normalize_identifier(&foreign_key.referenced_table) == normalize_identifier(name) {
-                (id, None)
-            } else {
-                let (parent_id, parent) =
-                    relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
-                (parent_id, Some(parent))
-            };
+        let self_reference =
+            normalize_identifier(&foreign_key.referenced_table) == normalize_identifier(name);
+        let (parent_id, parent) = if self_reference {
+            (id, None)
+        } else {
+            let (parent_id, parent) =
+                relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
+            (parent_id, Some(parent))
+        };
         let parent_columns_source =
             parent.map_or(columns.as_slice(), |parent| parent.columns.as_slice());
         let parent_primary_key = parent.map_or(primary_key.as_slice(), |parent| {
@@ -3750,7 +3751,30 @@ fn execute_create(
                     .map(|index| parent_columns_source[index].id)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if parent_columns != parent_primary_key || child_columns.len() != parent_columns.len() {
+        let referenced_index = if parent_columns == parent_primary_key {
+            None
+        } else if self_reference {
+            return Err(SqlError::InvalidCatalogObject);
+        } else {
+            transaction
+                .state
+                .catalog
+                .objects
+                .values()
+                .find_map(|object| match object {
+                    CatalogObject::SecondaryIndex(index)
+                        if index.relation == parent_id
+                            && index.unique
+                            && index.columns == parent_columns =>
+                    {
+                        Some(index.header.id)
+                    }
+                    _ => None,
+                })
+        };
+        if child_columns.len() != parent_columns.len()
+            || (parent_columns != parent_primary_key && referenced_index.is_none())
+        {
             return Err(SqlError::InvalidCatalogObject);
         }
         for (child, parent_column) in child_columns.iter().zip(&parent_columns) {
@@ -3772,6 +3796,7 @@ fn execute_create(
             columns: child_columns,
             referenced_relation: parent_id,
             referenced_columns: parent_columns,
+            referenced_index,
         });
     }
     let mut definition = RelationDefinition {
@@ -5514,14 +5539,25 @@ fn validate_foreign_keys(
         {
             continue;
         }
-        if !contains_null
-            && transaction
-                .state
-                .relational
-                .select(foreign_key.referenced_relation, &key)
-                .is_none()
-        {
-            return Err(SqlError::ForeignKeyViolation);
+        if !contains_null {
+            let parent_exists = if let Some(index) = foreign_key.referenced_index {
+                transaction
+                    .state
+                    .relational
+                    .indexes
+                    .get(&index)
+                    .and_then(|index| index.entries.get(&key))
+                    .is_some_and(|entries| !entries.is_empty())
+            } else {
+                transaction
+                    .state
+                    .relational
+                    .select(foreign_key.referenced_relation, &key)
+                    .is_some()
+            };
+            if !parent_exists {
+                return Err(SqlError::ForeignKeyViolation);
+            }
         }
     }
     Ok(())

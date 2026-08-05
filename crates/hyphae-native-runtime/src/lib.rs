@@ -17631,12 +17631,20 @@ fn validate_relation_foreign_keys(
                     .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
             );
         }
-        if !contains_null
-            && state
+        let parent_exists = if let Some(index) = foreign_key.referenced_index {
+            state
+                .relational
+                .indexes
+                .get(&index)
+                .and_then(|index| index.entries.get(&key))
+                .is_some_and(|entries| !entries.is_empty())
+        } else {
+            state
                 .relational
                 .select(foreign_key.referenced_relation, &key)
-                .is_none()
-        {
+                .is_some()
+        };
+        if !contains_null && !parent_exists {
             return Err(NativeRuntimeError::ForeignKeyConstraintViolation);
         }
     }

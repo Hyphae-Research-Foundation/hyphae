@@ -289,8 +289,10 @@ pub struct ForeignKeyDefinition {
     pub columns: Vec<ColumnId>,
     /// Referenced relation identity.
     pub referenced_relation: ObjectId,
-    /// Ordered referenced primary-key columns.
+    /// Referenced primary-key columns, or ordered unique-index columns.
     pub referenced_columns: Vec<ColumnId>,
+    /// Referenced unique index, or `None` for the primary key.
+    pub referenced_index: Option<ObjectId>,
 }
 
 impl ForeignKeyDefinition {
@@ -307,7 +309,7 @@ impl ForeignKeyDefinition {
     ) -> Result<(), CatalogError> {
         if self.columns.is_empty()
             || self.columns.len() != self.referenced_columns.len()
-            || self.referenced_columns != parent.primary_key
+            || (self.referenced_index.is_none() && self.referenced_columns != parent.primary_key)
         {
             return Err(CatalogError::InvalidDefinitionEncoding);
         }

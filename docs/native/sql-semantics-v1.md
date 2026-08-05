@@ -87,9 +87,11 @@ by relation/column IDs and survives reopen. Composite keys are supported when
 arity/types/order match. Parent primary-key UPDATE is already rejected by the
 native mutation contract. Commit-time rebase and group-admission validation
 protect both race orders; self references are supported when the inserted row's
-own complete PK satisfies the reference. Unique-index targets, named
-constraints, cascades and deferred enforcement are not yet implemented; those
-forms fail or remain outside this slice.
+own complete PK satisfies the reference. A non-null ordered `UNIQUE` secondary
+index may also be the parent target; the catalog persists its stable index ID
+and foreground/rebase enforcement probes the unique index. Named constraints,
+cascades and deferred enforcement are not yet implemented; those forms fail or
+remain outside this slice.
 
 ## Language pipeline
 

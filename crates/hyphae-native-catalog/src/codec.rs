@@ -121,6 +121,13 @@ impl Encoder {
                 for column in &foreign_key.referenced_columns {
                     self.put_fixed(&column.get().to_le_bytes())?;
                 }
+                match foreign_key.referenced_index {
+                    Some(index) => {
+                        self.put_byte(1)?;
+                        self.put_fixed(&index.get().to_le_bytes())?;
+                    }
+                    None => self.put_byte(0)?,
+                }
             }
         }
         Ok(())
@@ -323,10 +330,16 @@ impl<'encoded> Decoder<'encoded> {
                 for _ in 0..parent_count {
                     referenced_columns.push(self.column_id()?);
                 }
+                let referenced_index = match self.byte()? {
+                    0 => None,
+                    1 => Some(self.object_id()?),
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
                 foreign_keys.push(ForeignKeyDefinition {
                     columns: child_columns,
                     referenced_relation,
                     referenced_columns,
+                    referenced_index,
                 });
             }
         }
