@@ -136,6 +136,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [0.2.0 release gate](gates/0.2.0.md)
 - [0.2.1 release gate](gates/0.2.1.md)
 - [Native local ecosystem phase-1 gate](gates/native-local-phase-1.md)
+- [Current native gate status](gates/native-gate-status.md)
 - [Native directory identity and writer exclusion evidence — 2026-08-02](gates/evidence/native-directory-identity-linux-2026-08-02.md)
 - [Native phase-1 kernel evidence — 2026-08-01](gates/evidence/native-phase1-kernel-2026-08-01.md)
 - [Native row, B+tree, and checkpoint evidence — 2026-08-01](gates/evidence/native-row-tree-checkpoint-2026-08-01.md)
