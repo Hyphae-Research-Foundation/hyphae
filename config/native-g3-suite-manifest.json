@@ -1,0 +1,89 @@
+{
+  "schema": "hyphae-native-g3-suite-manifest-v1",
+  "gate": "G3",
+  "package": "hyphae-native-runtime",
+  "requirements": [
+    {
+      "id": "strings-and-counters",
+      "suites": [
+        {"name": "scalar-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "scalar_set_model_g3", "seeded_scalar_counter_trace_matches_model", "--locked"]},
+        {"name": "scalar-recovery", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "scalar_conditions_delete_expire_and_counter_versions_recover", "--locked"]},
+        {"name": "counter-bounds", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "counters_reject_noncanonical_values_and_overflow_without_mutation", "--locked"]}
+      ]
+    },
+    {
+      "id": "hashes",
+      "suites": [
+        {"name": "hash-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "hash_model_equivalence", "--locked"]},
+        {"name": "hash-batches", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "hash_field_batches_are_canonical_and_conflict_per_field", "--locked"]},
+        {"name": "hash-ttl", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "hash_field_ttl_matches_private_snapshot_physical_and_reopen", "--locked"]}
+      ]
+    },
+    {
+      "id": "lists",
+      "suites": [
+        {"name": "list-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "list_model_g3", "--locked"]},
+        {"name": "list-lifecycle", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "list_lifecycle_equivalence", "--locked"]},
+        {"name": "list-ttl", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "list_ttl_equivalence", "--locked"]}
+      ]
+    },
+    {
+      "id": "sets",
+      "suites": [
+        {"name": "set-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "scalar_set_model_g3", "seeded_set_trace_matches_model_across_reopen", "--locked"]},
+        {"name": "set-commands", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "set_commands_equivalence", "--locked"]},
+        {"name": "set-lifecycle", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "set_lifecycle_equivalence", "--locked"]}
+      ]
+    },
+    {
+      "id": "sorted-sets",
+      "suites": [
+        {"name": "sorted-set-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "sorted_set_model_g3", "--locked"]},
+        {"name": "sorted-set-ttl", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "sorted_set_ttl_is_exact_and_survives_reopen", "--locked"]},
+        {"name": "sorted-set-conflicts", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "optimistic_sorted_set_writers_rebase_disjoint_members_and_conflict_per_member", "--locked"]}
+      ]
+    },
+    {
+      "id": "streams",
+      "suites": [
+        {"name": "stream-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "stream_model_g3", "--locked"]},
+        {"name": "stream-recovery", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "every_stream_append_boundary_recovers_prior_or_complete_state", "--locked"]},
+        {"name": "stream-conflicts", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "stream_delete_and_append_race_is_first_committer_wins_in_both_orders", "--locked"]}
+      ]
+    },
+    {
+      "id": "ttl-and-controlled-expiry",
+      "suites": [
+        {"name": "ttl-family-matrix", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "structure_family_matrix_g3", "controlled_expiry_covers_every_structure_family", "--locked"]},
+        {"name": "active-expiry", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "active_expiry_batches_scalar_and_hash_keys_in_one_ordered_csn", "--locked"]}
+      ]
+    },
+    {
+      "id": "atomic-batches-and-conflicts",
+      "suites": [
+        {"name": "atomic-family-matrix", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "structure_family_matrix_g3", "all_family_batch_is_atomic_on_conflict", "--locked"]},
+        {"name": "stream-conflict", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "concurrent_stream_appends_are_first_committer_wins", "--locked"]}
+      ]
+    },
+    {
+      "id": "model-based-randomized-equivalence",
+      "suites": [
+        {"name": "family-models", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "scalar_set_model_g3", "--test", "list_model_g3", "--test", "sorted_set_model_g3", "--test", "stream_model_g3", "--locked"]},
+        {"name": "hash-model", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "hash_model_equivalence", "--locked"]}
+      ]
+    },
+    {
+      "id": "restart-equivalence",
+      "suites": [
+        {"name": "restart-family-matrix", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "structure_family_matrix_g3", "all_structure_families_match_after_reopen", "--locked"]},
+        {"name": "model-reopens", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "scalar_set_model_g3", "--test", "list_model_g3", "--test", "sorted_set_model_g3", "--test", "stream_model_g3", "--locked"]}
+      ]
+    },
+    {
+      "id": "memory-amplification",
+      "suites": [
+        {"name": "amplification", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "memory_amplification_g3", "--locked", "--", "--nocapture"]}
+      ]
+    }
+  ]
+}

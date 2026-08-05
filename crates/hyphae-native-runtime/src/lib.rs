@@ -252,6 +252,8 @@ const STRUCTURE_SORTED_SET_MEMBER_PREFIX: u8 = 9;
 const STRUCTURE_SORTED_SET_ORDER_PREFIX: u8 = 10;
 const STRUCTURE_EXPIRY_PREFIX: u8 = 11;
 const STRUCTURE_HASH_FIELD_EXPIRY_PREFIX: u8 = 12;
+const STRUCTURE_STREAM_META_PREFIX: u8 = 13;
+const STRUCTURE_STREAM_ENTRY_PREFIX: u8 = 14;
 const STRUCTURE_VALUE_MAGIC: &[u8; 8] = b"HYSTRV01";
 const STRUCTURE_HASH_META_MAGIC: &[u8; 8] = b"HYHSHM01";
 const STRUCTURE_HASH_EXPIRING_META_MAGIC: &[u8; 8] = b"HYHSHM02";
@@ -283,6 +285,8 @@ const STRUCTURE_EXPIRY_LIVE: u8 = 1;
 const STRUCTURE_HASH_EXPIRY_LIVE: u8 = 2;
 const STRUCTURE_SET_EXPIRY_LIVE: u8 = 3;
 const STRUCTURE_LIST_EXPIRY_LIVE: u8 = 4;
+const STRUCTURE_STREAM_EXPIRY_LIVE: u8 = 5;
+const STRUCTURE_SORTED_SET_EXPIRY_LIVE: u8 = 6;
 const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 /// Maximum field positions admitted by one native hash multi-field call.
@@ -549,6 +553,12 @@ pub enum NativeRuntimeError {
     /// The requested native list does not exist.
     #[error("native structure list does not exist")]
     UnknownStructureList,
+    /// The requested native stream does not exist.
+    #[error("native structure stream does not exist")]
+    UnknownStructureStream,
+    /// A native stream entry is empty, duplicate, oversized, or noncanonical.
+    #[error("native structure stream entry is not canonical")]
+    StructureStreamEntryNotCanonical,
     /// The requested native sorted set does not exist.
     #[error("native structure sorted set does not exist")]
     UnknownStructureSortedSet,
@@ -1168,6 +1178,8 @@ enum DueStructureKind {
     Hash,
     Set,
     List,
+    Stream,
+    SortedSet,
     HashField,
 }
 
@@ -1523,6 +1535,32 @@ impl NativeSnapshot {
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
         }
+    }
+
+    /// Returns one bounded inclusive stream-ID range from this retained snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing stream.
+    pub fn xrange_stream(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .xrange(key, start, end, limit)
+            .ok_or(NativeRuntimeError::UnknownStructureStream)
     }
 
     /// Returns one hash family's TTL state at snapshot logical time.
@@ -3482,6 +3520,8 @@ impl NativeDatabase {
                         DueStructureKind::Hash => Opcode::DeleteHash,
                         DueStructureKind::Set => Opcode::DeleteSet,
                         DueStructureKind::List => Opcode::DeleteList,
+                        DueStructureKind::Stream => Opcode::DeleteStream,
+                        DueStructureKind::SortedSet => Opcode::DeleteSortedSet,
                         DueStructureKind::HashField => Opcode::DeleteHashField,
                     },
                     target: None,
@@ -4002,6 +4042,37 @@ impl NativeDatabase {
                     decode_live_list_metadata(metadata.bytes())?
                         .ok_or(NativeRuntimeError::InvalidStructureTree)?
                         .expires_at_micros,
+                )
+            }
+            [STRUCTURE_STREAM_EXPIRY_LIVE] => {
+                let metadata = tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_stream_meta_key(key)?,
+                    )?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                let expiry = match metadata.bytes() {
+                    bytes if bytes.len() == 16 => Some(i64::from_be_bytes(
+                        bytes[8..16]
+                            .try_into()
+                            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                    )),
+                    _ => return Err(NativeRuntimeError::InvalidStructureTree),
+                };
+                (DueStructureKind::Stream, expiry)
+            }
+            [STRUCTURE_SORTED_SET_EXPIRY_LIVE] => {
+                let metadata = tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_sorted_set_meta_key(key)?,
+                    )?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                (
+                    DueStructureKind::SortedSet,
+                    decode_sorted_set_metadata_state(metadata.bytes())?.1,
                 )
             }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
@@ -5763,6 +5834,95 @@ impl NativeDatabase {
         Ok(())
     }
 
+    /// Reads a bounded inclusive stream-ID range from the latest physical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, a missing stream, or malformed state.
+    pub fn xrange_latest_stream(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        self.xrange_latest_stream_at(key, start, end, limit, i64::MIN)
+    }
+
+    /// Reads a bounded stream range at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing/due stream or malformed state.
+    pub fn xrange_latest_stream_at(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_stream_meta_key(key)?,
+            )?
+            .ok_or(NativeRuntimeError::UnknownStructureStream)?;
+        if is_structure_tombstone(metadata.bytes()) {
+            return Err(NativeRuntimeError::UnknownStructureStream);
+        }
+        let raw = metadata.bytes();
+        let last = u64::from_be_bytes(
+            raw.get(..8)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let expiry = match raw.len() {
+            8 => None,
+            16 => Some(i64::from_be_bytes(
+                raw[8..16]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )),
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        };
+        if expiry.is_some_and(|expiry| expiry <= logical_time_micros) {
+            return Err(NativeRuntimeError::UnknownStructureStream);
+        }
+        let mut entries = Vec::new();
+        for id in start..=end.min(last) {
+            if entries.len() == limit {
+                break;
+            }
+            if let Some(value) = tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_stream_entry_key(key, id)?,
+            )? {
+                if is_structure_tombstone(value.bytes()) {
+                    continue;
+                }
+                let (payload_id, fields) = decode_stream_wal_entry(value.bytes())?;
+                if payload_id != id {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+                entries.push((id, fields));
+            }
+        }
+        Ok(entries)
+    }
+
     /// Reads one list cardinality directly from its physical metadata.
     ///
     /// # Errors
@@ -5996,6 +6156,20 @@ impl NativeDatabase {
     /// Returns an error for legacy storage, another family, a missing sorted
     /// set, or malformed metadata.
     pub fn zcard_latest_sorted_set(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        self.zcard_latest_sorted_set_at(key, i64::MIN)
+    }
+
+    /// Reads sorted-set cardinality at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, a missing/due set,
+    /// or malformed metadata.
+    pub fn zcard_latest_sorted_set_at(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<usize, NativeRuntimeError> {
         if !self.structure_format.is_btree() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -6011,8 +6185,14 @@ impl NativeDatabase {
         else {
             return self.sorted_set_missing_or_kind_error(tree, key);
         };
-        usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
-            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+        if is_structure_tombstone(metadata.bytes()) {
+            return Err(NativeRuntimeError::UnknownStructureSortedSet);
+        }
+        let (count, expiry) = decode_sorted_set_metadata_state(metadata.bytes())?;
+        if expiry.is_some_and(|expiry| expiry <= logical_time_micros) {
+            return Err(NativeRuntimeError::UnknownStructureSortedSet);
+        }
+        usize::try_from(count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
 
     /// Reads one member's zero-based ascending rank through both physical
@@ -10664,6 +10844,133 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureList)
     }
 
+    /// Creates one explicitly typed empty native stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, an oversized key, or an existing key.
+    pub fn create_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+        if self.state.structures.create_stream(key.clone()).is_err() {
+            return Err(NativeRuntimeError::StructureKeyExists);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::CreateStream,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(())
+    }
+
+    /// Appends one exact field/value map and returns its stable entry ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing stream or noncanonical/oversized fields.
+    pub fn xadd(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        fields: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<u64, NativeRuntimeError> {
+        let key = key.into();
+        let id = self
+            .state
+            .structures
+            .xadd(&key, fields.to_vec())
+            .map_err(|_| NativeRuntimeError::StructureStreamEntryNotCanonical)?;
+        let value = encode_stream_wal_entry(id, fields)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::AppendStreamEntry,
+            target: None,
+            key,
+            value,
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(id)
+    }
+
+    /// Returns one bounded inclusive entry-ID range from private stream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is absent.
+    pub fn xrange(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        self.state
+            .structures
+            .xrange(key, start, end, limit)
+            .ok_or(NativeRuntimeError::UnknownStructureStream)
+    }
+
+    /// Applies an absolute expiry to a live native stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage.
+    pub fn expire_stream(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        expires_at_micros: i64,
+    ) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if !self.state.structures.expire_stream(&key, expires_at_micros) {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::ExpireStream,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Deletes one complete stream lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage.
+    pub fn delete_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.delete_stream(&key).is_none() {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteStream,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
     /// Creates one explicitly typed empty native sorted set.
     ///
     /// # Errors
@@ -10692,6 +10999,61 @@ impl NativeWriteBatch {
         });
         self.dirty[2] = true;
         Ok(())
+    }
+
+    /// Applies an absolute expiry to a live sorted set.
+    ///
+    /// # Errors
+    ///
+    /// This infallible admission surface retains `Result` for family symmetry.
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn expire_sorted_set(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        expires_at_micros: i64,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into();
+        if !self.state.structures.sorted_sets.contains_key(&key) {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::ExpireSortedSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: Some(expires_at_micros),
+        });
+        self.dirty[2] = true;
+        Ok(true)
+    }
+
+    /// Deletes one complete sorted-set lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage.
+    pub fn delete_sorted_set(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.delete_sorted_set(&key).is_none() {
+            return Ok(false);
+        }
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSet,
+            target: None,
+            key,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(true)
     }
 
     /// Adds or rescoring one exact binary sorted-set member.
@@ -11477,7 +11839,17 @@ fn apply_structure_mutation(
         | Opcode::PushListTail
         | Opcode::PopListHead
         | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
-        Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
+        Opcode::CreateStream
+        | Opcode::AppendStreamEntry
+        | Opcode::DeleteStream
+        | Opcode::ExpireStream => {
+            apply_stream_mutation(state, mutation)?;
+        }
+        Opcode::CreateSortedSet
+        | Opcode::DeleteSortedSet
+        | Opcode::ExpireSortedSet
+        | Opcode::UpsertSortedSetMember
+        | Opcode::DeleteSortedSetMember => {
             apply_sorted_set_mutation(state, mutation)?;
         }
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
@@ -11560,18 +11932,142 @@ fn apply_hash_mutation(
     Ok(())
 }
 
+fn apply_stream_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    match mutation.opcode {
+        Opcode::CreateStream => {
+            if !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            state
+                .create_stream(mutation.key.clone())
+                .map_err(NativeRuntimeError::from)?;
+        }
+        Opcode::ExpireStream => {
+            let expiry = mutation
+                .expires_at_micros
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            if !mutation.value.is_empty() || !state.expire_stream(&mutation.key, expiry) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::DeleteStream => {
+            if !mutation.value.is_empty() || state.delete_stream(&mutation.key).is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::AppendStreamEntry => {
+            let (id, fields) = decode_stream_wal_entry(&mutation.value)?;
+            state
+                .xadd_with_id(&mutation.key, id, fields)
+                .map_err(NativeRuntimeError::from)?;
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn encode_stream_wal_entry(
+    id: u64,
+    fields: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let count = u32::try_from(fields.len())
+        .map_err(|_| NativeRuntimeError::StructureStreamEntryNotCanonical)?;
+    let mut encoded = id.to_be_bytes().to_vec();
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for (field, value) in fields {
+        for bytes in [field, value] {
+            let length = u32::try_from(bytes.len())
+                .map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+    }
+    Ok(encoded)
+}
+
+fn decode_stream_wal_entry(
+    encoded: &[u8],
+) -> Result<(u64, model::StreamFields), NativeRuntimeError> {
+    if encoded.len() < 12 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    let id = u64::from_be_bytes(
+        encoded[..8]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    );
+    let count = usize::try_from(u32::from_be_bytes(
+        encoded[8..12]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    let mut offset = 12;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let field = decode_stream_wal_bytes(encoded, &mut offset)?;
+        let value = decode_stream_wal_bytes(encoded, &mut offset)?;
+        fields.push((field, value));
+    }
+    if offset != encoded.len() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok((id, fields))
+}
+
+fn decode_stream_wal_bytes(
+    encoded: &[u8],
+    offset: &mut usize,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let length = usize::try_from(u32::from_be_bytes(
+        encoded
+            .get(*offset..end)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    *offset = end;
+    let end = offset
+        .checked_add(length)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let value = encoded
+        .get(*offset..end)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+        .to_vec();
+    *offset = end;
+    Ok(value)
+}
+
 fn apply_sorted_set_mutation(
     state: &mut StructureState,
     mutation: &Mutation,
 ) -> Result<(), NativeRuntimeError> {
     if mutation.target.is_some()
-        || (mutation.opcode != Opcode::ExpireList && mutation.expires_at_micros.is_some())
+        || (mutation.opcode != Opcode::ExpireSortedSet && mutation.expires_at_micros.is_some())
     {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     match mutation.opcode {
         Opcode::CreateSortedSet => {
             if !mutation.value.is_empty() || !state.create_sorted_set(mutation.key.clone()) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::ExpireSortedSet => {
+            if !mutation.value.is_empty() || mutation.expires_at_micros.is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            return Ok(());
+        }
+        Opcode::DeleteSortedSet => {
+            if !mutation.value.is_empty() || state.delete_sorted_set(&mutation.key).is_none() {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
@@ -11756,8 +12252,14 @@ fn apply_mutations_to_state(
             | Opcode::PopListHead
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
+            | Opcode::DeleteSortedSet
+            | Opcode::ExpireSortedSet
             | Opcode::UpsertSortedSetMember
-            | Opcode::DeleteSortedSetMember => {
+            | Opcode::DeleteSortedSetMember
+            | Opcode::CreateStream
+            | Opcode::AppendStreamEntry
+            | Opcode::DeleteStream
+            | Opcode::ExpireStream => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch => {
@@ -12041,6 +12543,12 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             | Opcode::DeleteList
             | Opcode::ExpireList
             | Opcode::CreateSortedSet
+            | Opcode::DeleteSortedSet
+            | Opcode::ExpireSortedSet
+            | Opcode::CreateStream
+            | Opcode::AppendStreamEntry
+            | Opcode::DeleteStream
+            | Opcode::ExpireStream
             | Opcode::PushListHead
             | Opcode::PushListTail
             | Opcode::PopListHead
@@ -13138,6 +13646,8 @@ fn validate_write_batch_shape(
                                 | Opcode::DeleteHash
                                 | Opcode::DeleteSet
                                 | Opcode::DeleteList
+                                | Opcode::DeleteStream
+                                | Opcode::DeleteSortedSet
                                 | Opcode::DeleteHashField
                         )
                         && mutation.target.is_none()
@@ -13251,7 +13761,10 @@ fn validate_delta_write_batch_shape(
                         && delta.structure_scalars.contains(&mutation.key)
                         && match mutation.opcode {
                             Opcode::SetValue => true,
-                            Opcode::DeleteHash | Opcode::DeleteSet | Opcode::DeleteList => {
+                            Opcode::DeleteHash
+                            | Opcode::DeleteSet
+                            | Opcode::DeleteList
+                            | Opcode::DeleteSortedSet => {
                                 mutation.value.is_empty() && mutation.expires_at_micros.is_none()
                             }
                             _ => false,
@@ -13530,7 +14043,9 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
                 STRUCTURE_EXPIRY_LIVE
                 | STRUCTURE_HASH_EXPIRY_LIVE
                 | STRUCTURE_SET_EXPIRY_LIVE
-                | STRUCTURE_LIST_EXPIRY_LIVE,
+                | STRUCTURE_LIST_EXPIRY_LIVE
+                | STRUCTURE_STREAM_EXPIRY_LIVE
+                | STRUCTURE_SORTED_SET_EXPIRY_LIVE,
             ] => Ok(false),
             _ => Err(NativeRuntimeError::InvalidStructureTree),
         },
@@ -14566,21 +15081,41 @@ fn decode_live_sorted_set_order_entry<'entry>(
 }
 
 fn encode_sorted_set_metadata(member_count: u64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_META_SIZE);
+    encode_sorted_set_metadata_state(member_count, None)
+}
+
+fn encode_sorted_set_metadata_state(member_count: u64, expiry: Option<i64>) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(STRUCTURE_SORTED_SET_META_SIZE + 8);
     encoded.extend_from_slice(STRUCTURE_SORTED_SET_META_MAGIC);
     encoded.extend_from_slice(&member_count.to_le_bytes());
+    if let Some(expiry) = expiry {
+        encoded.extend_from_slice(&expiry.to_le_bytes());
+    }
     encoded
 }
 
-fn decode_sorted_set_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
-    if encoded.len() != STRUCTURE_SORTED_SET_META_SIZE
+fn decode_sorted_set_metadata_state(
+    encoded: &[u8],
+) -> Result<(u64, Option<i64>), NativeRuntimeError> {
+    if !matches!(encoded.len(), STRUCTURE_SORTED_SET_META_SIZE | 24)
         || encoded.get(..8) != Some(STRUCTURE_SORTED_SET_META_MAGIC.as_slice())
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
     let mut count = [0_u8; 8];
     count.copy_from_slice(&encoded[8..16]);
-    Ok(u64::from_le_bytes(count))
+    let expiry = if encoded.len() == 24 {
+        let mut expiry = [0_u8; 8];
+        expiry.copy_from_slice(&encoded[16..24]);
+        Some(i64::from_le_bytes(expiry))
+    } else {
+        None
+    };
+    Ok((u64::from_le_bytes(count), expiry))
+}
+
+fn decode_sorted_set_metadata(encoded: &[u8]) -> Result<u64, NativeRuntimeError> {
+    Ok(decode_sorted_set_metadata_state(encoded)?.0)
 }
 
 fn encode_sorted_set_score(score: SortedSetScore) -> Vec<u8> {
@@ -15907,6 +16442,282 @@ fn expire_list_in_tree(
     Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
+fn structure_stream_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
+    if key
+        .len()
+        .checked_add(9)
+        .is_none_or(|length| length > BTREE_MAX_KEY_SIZE)
+    {
+        return Err(NativeRuntimeError::StructureIdentityTooLarge);
+    }
+    let mut encoded = Vec::with_capacity(key.len() + 1);
+    encoded.push(STRUCTURE_STREAM_META_PREFIX);
+    encoded.extend_from_slice(key);
+    Ok(encoded)
+}
+
+fn structure_stream_entry_key(key: &[u8], id: u64) -> Result<Vec<u8>, NativeRuntimeError> {
+    let mut encoded = structure_stream_meta_key(key)?;
+    encoded[0] = STRUCTURE_STREAM_ENTRY_PREFIX;
+    encoded.extend_from_slice(&id.to_be_bytes());
+    Ok(encoded)
+}
+
+fn create_stream_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let key = structure_stream_meta_key(&mutation.key)?;
+    if tree.get(pages, &key)?.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(pages, creating_csn, key, 0_u64.to_be_bytes().to_vec())?
+        .tree)
+}
+
+fn append_stream_entry_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let (id, _) = decode_stream_wal_entry(&mutation.value)?;
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let last = u64::from_be_bytes(
+        metadata
+            .get(..8)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    if id <= last {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let entry_key = structure_stream_entry_key(&mutation.key, id)?;
+    if tree.get(pages, &entry_key)?.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    tree = tree
+        .upsert(pages, creating_csn, entry_key, mutation.value.clone())?
+        .tree;
+    let mut next_metadata = id.to_be_bytes().to_vec();
+    if metadata.len() == 16 {
+        next_metadata.extend_from_slice(&metadata[8..16]);
+    } else if metadata.len() != 8 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(pages, creating_csn, metadata_key, next_metadata)?
+        .tree)
+}
+
+fn expire_stream_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let expiry = mutation
+        .expires_at_micros
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (last, previous_expiry) = match metadata.len() {
+        8 => (
+            u64::from_be_bytes(
+                metadata[..8]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            ),
+            None,
+        ),
+        16 => (
+            u64::from_be_bytes(
+                metadata[..8]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            ),
+            Some(i64::from_be_bytes(
+                metadata[8..16]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )),
+        ),
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    let mut updated = last.to_be_bytes().to_vec();
+    updated.extend_from_slice(&expiry.to_be_bytes());
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    let mut entries = vec![
+        (key, updated),
+        (expiry_key, vec![STRUCTURE_STREAM_EXPIRY_LIVE]),
+    ];
+    if let Some(previous) = previous_expiry
+        && previous != expiry
+    {
+        let previous_key = structure_expiry_key(previous, &mutation.key)?;
+        if tree.get(pages, &previous_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((previous_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
+}
+
+fn delete_stream_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let last = u64::from_be_bytes(
+        metadata
+            .get(..8)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    let expiry = match metadata.len() {
+        8 => None,
+        16 => Some(i64::from_be_bytes(
+            metadata[8..16]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        )),
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    for id in 1..=last {
+        let entry_key = structure_stream_entry_key(&mutation.key, id)?;
+        if tree.get(pages, &entry_key)?.is_some() {
+            tree = tree
+                .upsert(pages, creating_csn, entry_key, structure_tombstone_value())?
+                .tree;
+        }
+    }
+    if let Some(expiry) = expiry {
+        let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+        if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(
+                pages,
+                creating_csn,
+                expiry_key,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            )?
+            .tree;
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            structure_tombstone_value(),
+        )?
+        .tree)
+}
+
+fn expire_sorted_set_in_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    let expiry = mutation
+        .expires_at_micros
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (count, previous) = decode_sorted_set_metadata_state(&metadata)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    let mut entries = vec![
+        (
+            metadata_key,
+            encode_sorted_set_metadata_state(count, Some(expiry)),
+        ),
+        (expiry_key, vec![STRUCTURE_SORTED_SET_EXPIRY_LIVE]),
+    ];
+    if let Some(previous) = previous
+        && previous != expiry
+    {
+        entries.push((
+            structure_expiry_key(previous, &mutation.key)?,
+            vec![STRUCTURE_EXPIRY_TOMBSTONE],
+        ));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
+}
+
+fn delete_sorted_set_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let count = decode_sorted_set_metadata(&metadata)?;
+    let prefix = structure_sorted_set_member_key(&mutation.key, &[])?;
+    let members = tree.scan_prefix(pages, &prefix)?;
+    let mut live = 0_u64;
+    for (member_key, encoded) in members {
+        let Some(score) = decode_sorted_set_score(&encoded)? else {
+            continue;
+        };
+        let (key, member) = decode_sorted_set_member_identity(&member_key[1..])?;
+        if key != mutation.key {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        live += 1;
+        let order_key = structure_sorted_set_order_key(key, score, member)?;
+        if tree.get(pages, &order_key)?.as_deref() != Some(&set_member_live_value()) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(pages, creating_csn, member_key, structure_tombstone_value())?
+            .tree;
+        tree = tree
+            .upsert(pages, creating_csn, order_key, structure_tombstone_value())?
+            .tree;
+    }
+    if live != count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            structure_tombstone_value(),
+        )?
+        .tree)
+}
+
 fn create_sorted_set_in_tree(
     pages: &mut PageStore,
     tree: BTree,
@@ -16322,7 +17133,15 @@ fn apply_structure_tree_mutation(
         Opcode::DeleteSet => delete_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::AddSetMember => add_set_member_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteSetMember => delete_set_member_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::CreateStream => create_stream_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::AppendStreamEntry => {
+            append_stream_entry_in_tree(pages, tree, creating_csn, mutation)
+        }
+        Opcode::ExpireStream => expire_stream_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteStream => delete_stream_in_tree(pages, tree, creating_csn, mutation),
         Opcode::CreateSortedSet => create_sorted_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteSortedSet => delete_sorted_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::ExpireSortedSet => expire_sorted_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::UpsertSortedSetMember => {
             upsert_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
         }
@@ -16528,6 +17347,12 @@ fn physical_expiry_tree_after_mutations(
             Opcode::DeleteList => {
                 physical_list_expiry_entries(pages, tree, logical_time_micros, mutation)?
             }
+            Opcode::DeleteStream => {
+                physical_stream_expiry_entries(pages, tree, logical_time_micros, mutation)?
+            }
+            Opcode::DeleteSortedSet => {
+                physical_sorted_set_expiry_entries(pages, tree, logical_time_micros, mutation)?
+            }
             Opcode::DeleteHashField => physical_hash_field_expiry_entries(
                 pages,
                 tree,
@@ -16692,6 +17517,92 @@ fn physical_list_expiry_entries(
     mutation: &Mutation,
 ) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
     list_retirement_entries(pages, tree, mutation, Some(logical_time_micros))
+}
+
+fn physical_sorted_set_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (count, expiry) = decode_sorted_set_metadata_state(&metadata)?;
+    let expiry = expiry
+        .filter(|expiry| *expiry <= logical_time_micros)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_SORTED_SET_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut entries = vec![
+        (metadata_key, structure_tombstone_value()),
+        (expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]),
+    ];
+    let prefix = structure_sorted_set_member_key(&mutation.key, &[])?;
+    let mut live = 0_u64;
+    for (member_key, encoded) in tree.scan_prefix(pages, &prefix)? {
+        let Some(score) = decode_sorted_set_score(&encoded)? else {
+            continue;
+        };
+        let (key, member) = decode_sorted_set_member_identity(&member_key[1..])?;
+        let order_key = structure_sorted_set_order_key(key, score, member)?;
+        live += 1;
+        entries.push((member_key, structure_tombstone_value()));
+        entries.push((order_key, structure_tombstone_value()));
+    }
+    if live != count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(entries)
+}
+
+fn physical_stream_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let metadata_key = structure_stream_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    if metadata.len() != 16 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let last = u64::from_be_bytes(
+        metadata[..8]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    let expiry = i64::from_be_bytes(
+        metadata[8..16]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    if expiry > logical_time_micros {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_STREAM_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let capacity = usize::try_from(last)
+        .ok()
+        .and_then(|last| last.checked_add(2))
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut entries = Vec::with_capacity(capacity);
+    entries.push((metadata_key, structure_tombstone_value()));
+    entries.push((expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]));
+    for id in 1..=last {
+        let key = structure_stream_entry_key(&mutation.key, id)?;
+        if tree.get(pages, &key)?.is_some() {
+            entries.push((key, structure_tombstone_value()));
+        }
+    }
+    Ok(entries)
 }
 
 fn physical_hash_field_expiry_entries(
@@ -19501,9 +20412,15 @@ struct StructureTreeDecoder {
     list_chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
     list_expiries: BTreeMap<Vec<u8>, i64>,
     retired_lists: BTreeSet<Vec<u8>>,
+    retired_sorted_sets: BTreeSet<Vec<u8>>,
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
+    sorted_set_expiries: BTreeMap<Vec<u8>, i64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
+    streams: BTreeMap<Vec<u8>, model::StreamEntries>,
+    stream_last_ids: BTreeMap<Vec<u8>, u64>,
+    stream_expiries: BTreeMap<Vec<u8>, i64>,
+    retired_streams: BTreeSet<Vec<u8>>,
     expiry_index: BTreeMap<(i64, Vec<u8>), u8>,
     hash_field_expiry_index: BTreeSet<(i64, Vec<u8>, Vec<u8>)>,
 }
@@ -19579,6 +20496,8 @@ impl StructureTreeDecoder {
             Some(STRUCTURE_SORTED_SET_ORDER_PREFIX) => {
                 self.consume_sorted_set_order(&key[1..], value)?;
             }
+            Some(STRUCTURE_STREAM_META_PREFIX) => self.consume_stream_metadata(&key[1..], value)?,
+            Some(STRUCTURE_STREAM_ENTRY_PREFIX) => self.consume_stream_entry(&key[1..], value)?,
             Some(STRUCTURE_EXPIRY_PREFIX) => {
                 let (expiry, structure_key) = decode_structure_expiry_identity(&key[1..])?;
                 match value {
@@ -19587,7 +20506,9 @@ impl StructureTreeDecoder {
                         marker @ (STRUCTURE_EXPIRY_LIVE
                         | STRUCTURE_HASH_EXPIRY_LIVE
                         | STRUCTURE_SET_EXPIRY_LIVE
-                        | STRUCTURE_LIST_EXPIRY_LIVE),
+                        | STRUCTURE_LIST_EXPIRY_LIVE
+                        | STRUCTURE_STREAM_EXPIRY_LIVE
+                        | STRUCTURE_SORTED_SET_EXPIRY_LIVE),
                     ] if self
                         .expiry_index
                         .insert((expiry, structure_key.to_vec()), *marker)
@@ -19613,12 +20534,103 @@ impl StructureTreeDecoder {
         Ok(())
     }
 
+    fn consume_stream_metadata(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let stream = key.to_vec();
+        if is_structure_tombstone(value) {
+            if !self.retired_streams.insert(stream) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
+        let (last, expiry) = match value.len() {
+            8 => (
+                u64::from_be_bytes(
+                    value
+                        .try_into()
+                        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                ),
+                None,
+            ),
+            16 => (
+                u64::from_be_bytes(
+                    value[..8]
+                        .try_into()
+                        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                ),
+                Some(i64::from_be_bytes(
+                    value[8..]
+                        .try_into()
+                        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                )),
+            ),
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        };
+        if self.entries.contains_key(&stream)
+            || self.hashes.contains_key(&stream)
+            || self.sets.contains_key(&stream)
+            || self.list_metadata.contains_key(&stream)
+            || self.sorted_sets.contains_key(&stream)
+            || self
+                .streams
+                .insert(stream.clone(), BTreeMap::new())
+                .is_some()
+            || self.stream_last_ids.insert(stream.clone(), last).is_some()
+            || expiry.is_some_and(|expiry| self.stream_expiries.insert(stream, expiry).is_some())
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
+    fn consume_stream_entry(
+        &mut self,
+        identity: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        if identity.len() < 8 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let split = identity.len() - 8;
+        let key = &identity[..split];
+        if is_structure_tombstone(value) {
+            return Ok(());
+        }
+        let id = u64::from_be_bytes(
+            identity[split..]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let (payload_id, fields) = decode_stream_wal_entry(value)?;
+        if id != payload_id {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entries = self
+            .streams
+            .get_mut(key)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if entries.insert(id, fields).is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        Ok(())
+    }
+
     fn consume_sorted_set_metadata(
         &mut self,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let sorted_set = key.to_vec();
+        if is_structure_tombstone(value) {
+            if !self.retired_sorted_sets.insert(sorted_set) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
+        let (count, expiry) = decode_sorted_set_metadata_state(value)?;
         if self.entries.contains_key(&sorted_set)
             || self.hashes.contains_key(&sorted_set)
             || self.sets.contains_key(&sorted_set)
@@ -19629,8 +20641,13 @@ impl StructureTreeDecoder {
                 .is_some()
             || self
                 .sorted_set_counts
-                .insert(sorted_set, decode_sorted_set_metadata(value)?)
+                .insert(sorted_set.clone(), count)
                 .is_some()
+            || expiry.is_some_and(|expiry| {
+                self.sorted_set_expiries
+                    .insert(sorted_set.clone(), expiry)
+                    .is_some()
+            })
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -19644,12 +20661,14 @@ impl StructureTreeDecoder {
     ) -> Result<(), NativeRuntimeError> {
         let (sorted_set, member) = decode_sorted_set_member_identity(identity)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-        let members = self
-            .sorted_sets
-            .get_mut(sorted_set)
-            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-        if let Some(score) = decode_sorted_set_score(value)?
-            && members.insert(member.to_vec(), score).is_some()
+        if let Some(members) = self.sorted_sets.get_mut(sorted_set) {
+            if let Some(score) = decode_sorted_set_score(value)?
+                && members.insert(member.to_vec(), score).is_some()
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        } else if !self.retired_sorted_sets.contains(sorted_set)
+            || decode_sorted_set_score(value)?.is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -19662,6 +20681,12 @@ impl StructureTreeDecoder {
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let (sorted_set, score, member) = decode_sorted_set_order_identity(identity)?;
+        if self.retired_sorted_sets.contains(sorted_set) {
+            if decode_set_member_value(value)? {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
         if !self.sorted_sets.contains_key(sorted_set) {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -19789,9 +20814,15 @@ impl StructureTreeDecoder {
             list_chunks,
             list_expiries,
             retired_lists: _,
+            retired_sorted_sets: _,
             sorted_sets,
             sorted_set_counts,
+            sorted_set_expiries,
             sorted_set_order,
+            streams,
+            stream_last_ids,
+            stream_expiries,
+            retired_streams: _,
             expiry_index,
             hash_field_expiry_index,
             require_expiry_index,
@@ -19800,18 +20831,30 @@ impl StructureTreeDecoder {
         validate_set_counts(&sets, set_counts)?;
         let lists = materialize_lists(list_metadata, list_chunks, blobs)?;
         validate_sorted_sets(&sorted_sets, &sorted_set_counts, sorted_set_order)?;
+        for (key, last) in &stream_last_ids {
+            let entries = streams
+                .get(key)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            if entries.last_key_value().map_or(0, |(id, _)| *id) != *last {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        }
         if require_expiry_index {
             validate_expiry_index(
                 &entries,
                 &hash_expiries,
                 &set_expiries,
                 &list_expiries,
+                &stream_expiries,
+                &sorted_set_expiries,
                 &expiry_index,
             )?;
             validate_hash_field_expiry_index(&hash_field_expiries, &hash_field_expiry_index)?;
         } else if !expiry_index.is_empty()
             || !set_expiries.is_empty()
             || !list_expiries.is_empty()
+            || !stream_expiries.is_empty()
+            || !sorted_set_expiries.is_empty()
             || !hash_field_expiries.is_empty()
             || !hash_field_expiry_index.is_empty()
         {
@@ -19827,6 +20870,8 @@ impl StructureTreeDecoder {
             lists,
             list_expiries,
             sorted_sets,
+            streams,
+            stream_expiries,
         })
     }
 }
@@ -19943,6 +20988,8 @@ fn validate_expiry_index(
     hash_expiries: &BTreeMap<Vec<u8>, i64>,
     set_expiries: &BTreeMap<Vec<u8>, i64>,
     list_expiries: &BTreeMap<Vec<u8>, i64>,
+    stream_expiries: &BTreeMap<Vec<u8>, i64>,
+    sorted_set_expiries: &BTreeMap<Vec<u8>, i64>,
     actual: &BTreeMap<(i64, Vec<u8>), u8>,
 ) -> Result<(), NativeRuntimeError> {
     let mut expected = entries
@@ -19972,6 +21019,22 @@ fn validate_expiry_index(
     for (key, expiry) in list_expiries {
         if expected
             .insert(((*expiry), key.clone()), STRUCTURE_LIST_EXPIRY_LIVE)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    for (key, expiry) in stream_expiries {
+        if expected
+            .insert(((*expiry), key.clone()), STRUCTURE_STREAM_EXPIRY_LIVE)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    for (key, expiry) in sorted_set_expiries {
+        if expected
+            .insert(((*expiry), key.clone()), STRUCTURE_SORTED_SET_EXPIRY_LIVE)
             .is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
@@ -23546,6 +24609,584 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn every_sorted_set_expiry_cleanup_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_sorted_set(b"scores".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+            database.commit_optimistic(expiry)?;
+            let result =
+                database.expire_due_structures_at(10, 1, DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(2) => {
+                    assert!(matches!(
+                        reopened.zcard_latest_sorted_set_at(b"scores", 10),
+                        Err(NativeRuntimeError::UnknownStructureSortedSet)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        1
+                    );
+                }
+                Some(3) => {
+                    assert!(matches!(
+                        reopened.zcard_latest_sorted_set(b"scores"),
+                        Err(NativeRuntimeError::UnknownStructureSortedSet)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        0
+                    );
+                }
+                other => return Err(format!("unexpected sorted-set expiry CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_cleanup_removes_due_sorted_set_and_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+        database.commit_optimistic(expiry)?;
+        let first = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(matches!(
+            database.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        let second = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_ttl_is_exact_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+        database.commit_optimistic(expiry)?;
+        assert_eq!(database.zcard_latest_sorted_set_at(b"scores", 9)?, 1);
+        assert!(matches!(
+            database.zcard_latest_sorted_set_at(b"scores", 10),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.zcard_latest_sorted_set_at(b"scores", 9)?, 1);
+        assert!(matches!(
+            reopened.zcard_latest_sorted_set_at(b"scores", 10),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_sorted_set_delete_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_sorted_set(b"scores".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 2.0, b"bob".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(delete.delete_sorted_set(b"scores".to_vec())?);
+            let result = database.commit_optimistic_with_interruption(delete, boundary);
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(reopened.zcard_latest_sorted_set(b"scores")?, 2),
+                Some(2) => assert!(matches!(
+                    reopened.zcard_latest_sorted_set(b"scores"),
+                    Err(NativeRuntimeError::UnknownStructureSortedSet)
+                )),
+                other => return Err(format!("unexpected sorted-set delete CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_delete_persists_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 2.0, b"bob".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(delete.delete_sorted_set(b"scores".to_vec())?);
+        database.commit_optimistic(delete)?;
+        assert!(matches!(
+            database.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert!(matches!(
+            reopened.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_stream_expiry_cleanup_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            assert!(seed.expire_stream(b"events".to_vec(), 10)?);
+            database.commit_optimistic(seed)?;
+            let result =
+                database.expire_due_structures_at(10, 1, DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => {
+                    assert!(matches!(
+                        reopened.xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 10),
+                        Err(NativeRuntimeError::UnknownStructureStream)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        1
+                    );
+                }
+                Some(2) => {
+                    assert!(matches!(
+                        reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8),
+                        Err(NativeRuntimeError::UnknownStructureStream)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        0
+                    );
+                }
+                other => return Err(format!("unexpected stream expiry CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_cleanup_removes_due_stream_and_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_stream(b"events".to_vec())?;
+        seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+        assert!(seed.expire_stream(b"events".to_vec(), 10)?);
+        database.commit_optimistic(seed)?;
+        let first = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(matches!(
+            database.xrange_latest_stream(b"events", 1, u64::MAX, 8),
+            Err(NativeRuntimeError::UnknownStructureStream)
+        ));
+        let second = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_ttl_is_exact_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_stream(b"events".to_vec())?;
+        seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+        assert!(seed.expire_stream(b"events".to_vec(), 10)?);
+        database.commit_optimistic(seed)?;
+        assert_eq!(
+            database
+                .xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 9)?
+                .len(),
+            1
+        );
+        assert!(matches!(
+            database.xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 10),
+            Err(NativeRuntimeError::UnknownStructureStream)
+        ));
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened
+                .xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 9)?
+                .len(),
+            1
+        );
+        assert!(matches!(
+            reopened.xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 10),
+            Err(NativeRuntimeError::UnknownStructureStream)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_stream_delete_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            database.commit_optimistic(seed)?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(delete.delete_stream(b"events".to_vec())?);
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(delete, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8);
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(entries?.len(), 1),
+                Some(2) => assert!(matches!(
+                    entries,
+                    Err(NativeRuntimeError::UnknownStructureStream)
+                )),
+                other => return Err(format!("unexpected stream delete CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_stream_append_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut append = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            append.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(append, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8)?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(entries.is_empty()),
+                Some(2) => assert_eq!(entries.len(), 1),
+                other => return Err(format!("unexpected stream recovery CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_delete_and_append_race_is_first_committer_wins_in_both_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for append_first in [true, false] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Memory)?;
+            seed.create_stream(b"events".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut append = database.begin_optimistic(2, DurabilityClass::Memory)?;
+            append.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Memory)?;
+            assert!(delete.delete_stream(b"events".to_vec())?);
+            let (winner, loser) = if append_first {
+                (append, delete)
+            } else {
+                (delete, append)
+            };
+            database.commit_optimistic(winner)?;
+            assert!(matches!(
+                database.commit_optimistic(loser),
+                Err(NativeRuntimeError::WriteConflict(_))
+            ));
+            let present = database.xrange_latest_stream(b"events", 0, u64::MAX, 8);
+            if append_first {
+                assert_eq!(present?.len(), 1);
+            } else {
+                assert!(matches!(
+                    present,
+                    Err(NativeRuntimeError::UnknownStructureStream)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_stream_appends_are_first_committer_wins() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        seed.create_stream(b"events".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut first = database.begin_optimistic(2, DurabilityClass::Memory)?;
+        let mut second = database.begin_optimistic(2, DurabilityClass::Memory)?;
+        assert_eq!(
+            first.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?,
+            1
+        );
+        assert_eq!(
+            second.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"b".to_vec())])?,
+            1
+        );
+        database.commit_optimistic(first)?;
+        assert!(matches!(
+            database.commit_optimistic(second),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database
+                .xrange_latest_stream(b"events", 1, u64::MAX, 8)?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_stream_snapshot_survives_later_append() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut first = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        first.create_stream(b"events".to_vec())?;
+        first.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+        database.commit_optimistic(first)?;
+        let retained = database.snapshot(2)?;
+        let mut second = database.begin_optimistic(3, DurabilityClass::Memory)?;
+        second.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"b".to_vec())])?;
+        database.commit_optimistic(second)?;
+        assert_eq!(retained.xrange_stream(b"events", 1, u64::MAX, 8)?.len(), 1);
+        assert_eq!(
+            database
+                .xrange_latest_stream(b"events", 1, u64::MAX, 8)?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_commit_persists_btree_entries_and_reopens() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        batch.create_stream(b"events".to_vec())?;
+        batch.xadd(
+            b"events".to_vec(),
+            &[(b"kind".to_vec(), b"created".to_vec())],
+        )?;
+        database.commit_optimistic(batch)?;
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1[0].0, b"kind");
+        Ok(())
+    }
+
+    #[test]
+    fn private_stream_api_emits_canonical_replay_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        batch.create_stream(b"events".to_vec())?;
+        assert_eq!(
+            batch.xadd(
+                b"events".to_vec(),
+                &[(b"kind".to_vec(), b"created".to_vec())],
+            )?,
+            1
+        );
+        assert_eq!(batch.xrange(b"events", 1, u64::MAX, 8)?.len(), 1);
+        assert!(batch.delete_stream(b"events".to_vec())?);
+        assert!(!batch.delete_stream(b"events".to_vec())?);
+        assert_eq!(
+            batch
+                .mutations
+                .iter()
+                .map(|mutation| mutation.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::CreateStream,
+                Opcode::AppendStreamEntry,
+                Opcode::DeleteStream,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_wal_replay_is_strict_and_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = super::model::StructureState::default();
+        super::apply_structure_mutation(
+            &mut state,
+            &Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::CreateStream,
+                target: None,
+                key: b"events".to_vec(),
+                value: Vec::new(),
+                expires_at_micros: None,
+            },
+        )?;
+        let mut value = 7_u64.to_be_bytes().to_vec();
+        value.extend_from_slice(&1_u32.to_be_bytes());
+        value.extend_from_slice(&4_u32.to_be_bytes());
+        value.extend_from_slice(b"kind");
+        value.extend_from_slice(&1_u32.to_be_bytes());
+        value.extend_from_slice(b"a");
+        super::apply_structure_mutation(
+            &mut state,
+            &Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::AppendStreamEntry,
+                target: None,
+                key: b"events".to_vec(),
+                value,
+                expires_at_micros: None,
+            },
+        )?;
+        assert_eq!(
+            state
+                .xrange(b"events", 0, u64::MAX, 8)
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
+        assert!(
+            super::apply_structure_mutation(
+                &mut state,
+                &Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::AppendStreamEntry,
+                    target: None,
+                    key: b"events".to_vec(),
+                    value: vec![0; 12],
+                    expires_at_micros: None,
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -1,0 +1,32 @@
+{
+  "schema": "hyphae-native-gate-status-v1",
+  "program": "native-local-phase-1",
+  "authority": "docs/gates/native-local-phase-1.md",
+  "gates": [
+    {
+      "id": "G0",
+      "status": "closure-claimed-revalidation-required",
+      "reason": "The README records a hosted closure, but the retained evidence map does not reconstruct it."
+    },
+    {
+      "id": "G1",
+      "status": "closure-claimed-revalidation-required",
+      "reason": "The implementation and hosted workflow exist, but no durable exact-SHA aggregate is retained in this checkout."
+    },
+    {
+      "id": "G2",
+      "status": "bounded-readiness-only",
+      "reason": "The hosted workflow covers bounded relational verticals; canonical TPC-H, TPC-C, and broad SQL conformance remain non-claims."
+    },
+    {
+      "id": "G3",
+      "status": "in-progress",
+      "reason": "Structure implementation is substantial, but hosted exact-SHA exit evidence is not complete."
+    },
+    {"id": "G4", "status": "open"},
+    {"id": "G5", "status": "open"},
+    {"id": "G6", "status": "open"},
+    {"id": "G7", "status": "open"},
+    {"id": "G8", "status": "open"}
+  ]
+}

@@ -18,10 +18,12 @@ format.
 
 ## Next program: native local data ecosystem
 
-The next product program is an accepted target but has no release number and
-no completed implementation gate yet. Hyphae will build its own relational
-SQL engine, native keyspace/data-structure engine, and native lexical/vector
-search engine in one process. They share a Hyphae-owned catalog, memory
+The next product program is an accepted target but has no release number.
+Historical G0/G1 closure claims require retained exact-SHA revalidation, G2 has
+bounded relational readiness, and G3 is in progress; see the
+[native gate status](gates/native-gate-status.md). Hyphae will build its own
+relational SQL engine, native keyspace/data-structure engine, and native
+lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory
 manager, page/blob store, WAL, MVCC/commit sequence, scheduler, backup, and
 proof substrate. They are not wrappers around PostgreSQL, Valkey, OpenSearch,
 Redb, or another database engine, and they are not projections of one another.
@@ -33,8 +35,8 @@ The governing documents are:
 - [ADR-0022](adr/0022-cloud-ready-local-primitives.md);
 - [native local ecosystem architecture](architecture/native-local-ecosystem.md);
 - [microsecond-first performance contract](performance/microsecond-first.md);
-  and
-- [ordered phase-1 gate](gates/native-local-phase-1.md).
+- [ordered phase-1 gate](gates/native-local-phase-1.md); and
+- [current native gate status](gates/native-gate-status.md).
 
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
 and model integration do not begin until its release gate is closed.

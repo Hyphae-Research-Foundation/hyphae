@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g3-inventory-v1",
+  "gate": "G3",
+  "requirements": [
+    {"id": "strings-and-counters", "status": "implemented-unhosted", "present": ["binary scalar SET/GET/DELETE", "NX/XX", "signed canonical INCRBY", "seeded counter/reopen model"], "gaps": ["hosted suite-bound exact-SHA receipt", "expected-version SET remains a non-claim"]},
+    {"id": "hashes", "status": "implemented-unhosted", "present": ["typed lifecycle", "field CRUD/batches/counter/scans", "whole and field TTL", "randomized hash model with negative control"], "gaps": ["hosted suite-bound exact-SHA receipt"]},
+    {"id": "lists", "status": "implemented-unhosted", "present": ["chunked deque", "push/pop/range", "whole lifecycle and TTL", "seeded model with periodic reopen"], "gaps": ["broader model alphabet and negative control", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "sets", "status": "implemented-unhosted", "present": ["member CRUD/batches/scans", "algebra", "whole lifecycle and TTL", "seeded model with periodic reopen"], "gaps": ["broader integrated model alphabet and negative control", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "sorted-sets", "status": "implemented-unhosted", "present": ["dual-index CRUD", "rank and score ranges", "whole-family lifecycle and TTL", "seeded model", "crash boundaries"], "gaps": ["broader integrated model alphabet and negative control", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "streams", "status": "implemented-unhosted", "present": ["append-ordered durable format", "stable serialized entry IDs", "read/range/lifecycle/TTL", "restart model", "conflict and crash matrices"], "gaps": ["broader model alphabet and negative control", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "ttl-and-controlled-expiry", "status": "partial", "present": ["deterministic logical-time expiry for all six families", "ordered expiry index", "bounded cleanup and reconstruction", "all-family visibility and reopen matrix"], "gaps": ["one cleanup call spanning all six families currently returns InvalidStructureTree", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "atomic-batches-and-conflicts", "status": "implemented-unhosted", "present": ["multi-field/member atomic batches", "MVCC first-committer-wins", "all-family loser-publishes-nothing matrix", "group commit"], "gaps": ["hosted suite-bound exact-SHA receipt"]},
+    {"id": "model-based-randomized-equivalence", "status": "partial", "present": ["models for scalar/counter, hash, list, set, sorted set, and stream", "fixed seeds and periodic reopen", "hash negative control"], "gaps": ["negative controls for every family", "broader lifecycle/TTL/error alphabets", "hosted suite-bound exact-SHA receipt"]},
+    {"id": "restart-equivalence", "status": "implemented-unhosted", "present": ["periodic model reopen", "per-family crash matrices", "one complete all-family reopen matrix"], "gaps": ["hosted suite-bound exact-SHA receipt"]},
+    {"id": "memory-amplification", "status": "partial", "present": ["mixed six-family workload", "logical live and mutation-byte denominators", "separate retained-page and append-page/WAL metrics", "bounded deterministic regression thresholds"], "gaps": ["hosted Linux peak-RSS threshold", "blob and post-vacuum maintenance observations", "production-scale thresholds"]}
+  ]
+}

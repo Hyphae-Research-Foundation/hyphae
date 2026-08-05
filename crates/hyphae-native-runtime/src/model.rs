@@ -543,6 +543,9 @@ pub(crate) enum TtlValue {
     Remaining(i64),
 }
 
+pub(crate) type StreamFields = Vec<(Vec<u8>, Vec<u8>)>;
+pub(crate) type StreamEntries = BTreeMap<u64, StreamFields>;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
@@ -554,6 +557,8 @@ pub(crate) struct StructureState {
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) list_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
+    pub(crate) streams: BTreeMap<Vec<u8>, StreamEntries>,
+    pub(crate) stream_expiries: BTreeMap<Vec<u8>, i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -609,6 +614,97 @@ pub(crate) struct HashPatternModelRequest<'request> {
 }
 
 impl StructureState {
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn create_stream(&mut self, key: Vec<u8>) -> Result<(), ModelError> {
+        if self.streams.contains_key(&key) {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        self.streams.insert(key, BTreeMap::new());
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn delete_stream(&mut self, key: &[u8]) -> Option<StreamEntries> {
+        self.stream_expiries.remove(key);
+        self.streams.remove(key)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn expire_stream(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.streams.contains_key(key) {
+            return false;
+        }
+        self.stream_expiries.insert(key.to_vec(), expires_at_micros);
+        true
+    }
+
+    pub(crate) fn stream_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.streams.contains_key(key)
+            && self
+                .stream_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xadd_with_id(
+        &mut self,
+        key: &[u8],
+        id: u64,
+        fields: StreamFields,
+    ) -> Result<(), ModelError> {
+        if id == 0 || fields.is_empty() {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        let mut seen = BTreeSet::new();
+        if fields
+            .iter()
+            .any(|(field, _)| !seen.insert(field.as_slice()))
+        {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        let stream = self.streams.get_mut(key).ok_or(ModelError::UnknownObject)?;
+        if stream.last_key_value().is_some_and(|(last, _)| id <= *last) {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        stream.insert(id, fields);
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xadd(&mut self, key: &[u8], fields: StreamFields) -> Result<u64, ModelError> {
+        let id = self
+            .streams
+            .get(key)
+            .ok_or(ModelError::UnknownObject)?
+            .last_key_value()
+            .map_or(Some(1), |(id, _)| id.checked_add(1))
+            .ok_or(ModelError::LengthOverflow)?;
+        self.xadd_with_id(key, id, fields)?;
+        Ok(id)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xrange(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Option<Vec<(u64, StreamFields)>> {
+        let stream = self.streams.get(key)?;
+        if !self.stream_is_visible(key, i64::MIN) {
+            return None;
+        }
+        Some(
+            stream
+                .range(start..=end)
+                .take(limit)
+                .map(|(id, fields)| (*id, fields.clone()))
+                .collect(),
+        )
+    }
+
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
             key,
@@ -646,6 +742,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1094,6 +1191,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1276,6 +1374,7 @@ impl StructureState {
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1429,12 +1528,21 @@ impl StructureState {
             .flatten()
     }
 
+    #[allow(dead_code, reason = "G3 sorted-set lifecycle WAL wiring follows")]
+    pub(crate) fn delete_sorted_set(
+        &mut self,
+        key: &[u8],
+    ) -> Option<BTreeMap<Vec<u8>, SortedSetScore>> {
+        self.sorted_sets.remove(key)
+    }
+
     pub(crate) fn create_sorted_set(&mut self, key: Vec<u8>) -> bool {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
             || self.sets.contains_key(&key)
             || self.lists.contains_key(&key)
             || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
         {
             return false;
         }
@@ -1710,6 +1818,8 @@ impl StructureState {
             lists: BTreeMap::new(),
             list_expiries: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
+            streams: BTreeMap::new(),
+            stream_expiries: BTreeMap::new(),
         })
     }
 }
@@ -2069,8 +2179,8 @@ mod tests {
 
     use super::{
         CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, HashPatternModelRequest,
-        HashPatternModelStop, ModelError, RelationState, SearchState, StructureState, TtlValue,
-        legacy_catalog_object, put_bytes, put_len,
+        HashPatternModelStop, ModelError, RelationState, SearchState, SortedSetMemberState,
+        SortedSetScore, StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
     };
 
     #[test]
@@ -2191,6 +2301,152 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_model_delete_is_typed_and_retires_members()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        assert!(state.create_sorted_set(b"scores".to_vec()));
+        let score = SortedSetScore::new(1.0).ok_or("score")?;
+        assert_eq!(
+            state.zadd(b"scores", b"alice".to_vec(), score),
+            SortedSetMemberState::MissingMember
+        );
+        assert_eq!(
+            state
+                .delete_sorted_set(b"scores")
+                .ok_or("missing sorted set")?
+                .len(),
+            1
+        );
+        assert!(matches!(
+            state.zscore(b"scores", b"alice"),
+            SortedSetMemberState::MissingSet
+        ));
+        assert!(state.delete_sorted_set(b"scores").is_none());
+        assert!(state.create_list(b"scores".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_ttl_is_exact_at_controlled_time() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?;
+        assert!(state.expire_stream(b"events", 10));
+        assert!(state.stream_is_visible(b"events", 9));
+        assert!(!state.stream_is_visible(b"events", 10));
+        assert!(!state.stream_is_visible(b"events", 11));
+        assert!(state.delete_stream(b"events").is_some());
+        assert!(!state.expire_stream(b"events", 20));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_replay_requires_strictly_increasing_explicit_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd_with_id(b"events", 7, vec![(b"kind".to_vec(), b"seed".to_vec())])?;
+        assert!(
+            state
+                .xadd_with_id(
+                    b"events",
+                    7,
+                    vec![(b"kind".to_vec(), b"duplicate".to_vec())],
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .xadd_with_id(
+                    b"events",
+                    6,
+                    vec![(b"kind".to_vec(), b"retrograde".to_vec())],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"next".to_vec())],)?,
+            8
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_delete_is_a_typed_lifecycle_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?;
+        assert_eq!(
+            state
+                .delete_stream(b"events")
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
+        assert_eq!(state.xrange(b"events", 0, u64::MAX, 8), None);
+        assert!(state.delete_stream(b"events").is_none());
+        assert!(state.create_list(b"events".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_is_typed_and_rejects_invalid_entries() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        assert!(matches!(
+            state.create_stream(b"events".to_vec()),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(matches!(
+            state.xadd(b"events", Vec::new()),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(matches!(
+            state.xadd(
+                b"events",
+                vec![
+                    (b"kind".to_vec(), b"a".to_vec()),
+                    (b"kind".to_vec(), b"b".to_vec()),
+                ],
+            ),
+            Err(ModelError::DuplicateEncodedEntry)
+        ));
+        assert!(!state.create_list(b"events".to_vec()));
+        assert!(!state.create_set(b"events".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_assigns_stable_monotonic_ids_and_exact_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?,
+            1
+        );
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"b".to_vec())])?,
+            2
+        );
+        assert_eq!(
+            state.xrange(b"events", 1, 2, 1),
+            Some(vec![(1, vec![(b"kind".to_vec(), b"a".to_vec())])])
+        );
+        assert_eq!(
+            state
+                .xrange(b"events", 2, u64::MAX, 8)
+                .ok_or("missing stream")?
+                .len(),
+            1
+        );
+        assert_eq!(state.xrange(b"missing", 0, u64::MAX, 8), None);
         Ok(())
     }
 
