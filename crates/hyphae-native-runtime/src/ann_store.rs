@@ -118,6 +118,34 @@ impl AnnState {
             .search_exact(query, k)?)
     }
 
+    pub(crate) fn search_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchResult, NativeRuntimeError> {
+        Ok(self
+            .indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+            .search_filtered(query, options, allowlist)?)
+    }
+
+    pub(crate) fn search_exact_filtered(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        Ok(self
+            .indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+            .search_exact_filtered(query, k, allowlist)?)
+    }
+
     fn apply_batch(
         &mut self,
         index: ObjectId,

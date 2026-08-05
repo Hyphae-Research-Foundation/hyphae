@@ -1890,6 +1890,10 @@ pub(crate) struct SearchState {
 }
 
 impl SearchState {
+    pub(crate) fn documents(&self, index: ObjectId) -> Option<&BTreeMap<Vec<u8>, String>> {
+        self.indexes.get(&index)
+    }
+
     pub(crate) fn create_index(&mut self, id: ObjectId) -> Result<(), ModelError> {
         if self.indexes.insert(id, BTreeMap::new()).is_some() {
             return Err(ModelError::DuplicateObjectId);
@@ -2057,9 +2061,10 @@ fn normalize_name(value: &str) -> String {
 }
 
 pub(crate) fn analyze(text: &str) -> Vec<String> {
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_lowercase)
+    crate::CanonicalAnalyzer::analyze(text)
+        .tokens
+        .into_iter()
+        .map(|token| token.term)
         .collect()
 }
 

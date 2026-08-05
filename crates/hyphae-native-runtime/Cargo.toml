@@ -23,7 +23,10 @@ hyphae-native-pages.workspace = true
 hyphae-native-records.workspace = true
 hyphae-native-types.workspace = true
 hyphae-native-wal.workspace = true
+hyphae-retrieval.workspace = true
 thiserror.workspace = true
+unicode-casefold.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

@@ -722,9 +722,12 @@ dependencies = [
  "hyphae-native-records",
  "hyphae-native-types",
  "hyphae-native-wal",
+ "hyphae-retrieval",
  "serde",
  "serde_json",
  "thiserror",
+ "unicode-casefold",
+ "unicode-normalization",
 ]
 
 [[package]]

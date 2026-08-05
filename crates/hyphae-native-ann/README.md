@@ -6,10 +6,11 @@
 - cosine, negative dot-product, and squared-L2 distance;
 - deterministic level selection and rebuild order;
 - bounded HNSW construction and search;
-- an exact full-scan quality oracle;
+- exact full-scan and stable-ID-filtered quality oracles;
 - updates and deletes through canonical graph rebuilds;
-- explicit approximation, breadth, candidate, rerank, and build-identity
-  receipts; and
+- bounded stable-ID allowlist post-filtering without a production recall claim;
+- explicit strategy, recall-risk, breadth, candidate, rerank, and
+  build-identity receipts; and
 - persistence-facing vector and graph records with fail-closed canonical
   restore.
 
