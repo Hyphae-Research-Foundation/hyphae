@@ -87,6 +87,15 @@ class NativeG2ReadinessTests(unittest.TestCase):
         self.assertIn("native-g2-readiness-with-prepared.json", workflow)
         self.assertIn('assert receipt["passed"] == 1', workflow)
 
+    def test_complete_hosted_workflow_targets_all_eight_rows(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g2-complete.yml").read_text(encoding="utf-8")
+        profile = json.loads((ROOT / "config/native-g2-readiness-profile.json").read_text())
+        for row in profile["requirements"]:
+            self.assertIn(f"[{row['id']}]", workflow)
+        self.assertIn('"passed": 8', workflow)
+        self.assertIn('"status": "passed"', workflow)
+        self.assertIn("native-g2-complete-evidence", workflow)
+
     def test_missing_digest_lower_level_or_unknown_row_fails_closed(self) -> None:
         evidence = self.baseline()
         evidence["evidence"]["unknown"] = {}
