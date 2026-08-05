@@ -628,8 +628,13 @@ impl StructureState {
     }
 
     #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
-    pub(crate) fn xadd(&mut self, key: &[u8], fields: StreamFields) -> Result<u64, ModelError> {
-        if fields.is_empty() {
+    pub(crate) fn xadd_with_id(
+        &mut self,
+        key: &[u8],
+        id: u64,
+        fields: StreamFields,
+    ) -> Result<(), ModelError> {
+        if id == 0 || fields.is_empty() {
             return Err(ModelError::DuplicateEncodedEntry);
         }
         let mut seen = BTreeSet::new();
@@ -640,11 +645,23 @@ impl StructureState {
             return Err(ModelError::DuplicateEncodedEntry);
         }
         let stream = self.streams.get_mut(key).ok_or(ModelError::UnknownObject)?;
-        let id = stream
+        if stream.last_key_value().is_some_and(|(last, _)| id <= *last) {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        stream.insert(id, fields);
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xadd(&mut self, key: &[u8], fields: StreamFields) -> Result<u64, ModelError> {
+        let id = self
+            .streams
+            .get(key)
+            .ok_or(ModelError::UnknownObject)?
             .last_key_value()
             .map_or(Some(1), |(id, _)| id.checked_add(1))
             .ok_or(ModelError::LengthOverflow)?;
-        stream.insert(id, fields);
+        self.xadd_with_id(key, id, fields)?;
         Ok(id)
     }
 
@@ -2253,6 +2270,37 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_replay_requires_strictly_increasing_explicit_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd_with_id(b"events", 7, vec![(b"kind".to_vec(), b"seed".to_vec())])?;
+        assert!(
+            state
+                .xadd_with_id(
+                    b"events",
+                    7,
+                    vec![(b"kind".to_vec(), b"duplicate".to_vec())],
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .xadd_with_id(
+                    b"events",
+                    6,
+                    vec![(b"kind".to_vec(), b"retrograde".to_vec())],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"next".to_vec())],)?,
+            8
+        );
         Ok(())
     }
 
