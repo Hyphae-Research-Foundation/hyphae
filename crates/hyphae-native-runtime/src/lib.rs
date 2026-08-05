@@ -11477,6 +11477,9 @@ fn apply_structure_mutation(
         | Opcode::PushListTail
         | Opcode::PopListHead
         | Opcode::PopListTail => apply_list_mutation(state, mutation)?,
+        Opcode::CreateStream | Opcode::AppendStreamEntry | Opcode::DeleteStream => {
+            apply_stream_mutation(state, mutation)?;
+        }
         Opcode::CreateSortedSet | Opcode::UpsertSortedSetMember | Opcode::DeleteSortedSetMember => {
             apply_sorted_set_mutation(state, mutation)?;
         }
@@ -11558,6 +11561,92 @@ fn apply_hash_mutation(
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     }
     Ok(())
+}
+
+fn apply_stream_mutation(
+    state: &mut StructureState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    match mutation.opcode {
+        Opcode::CreateStream => {
+            if !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            state
+                .create_stream(mutation.key.clone())
+                .map_err(NativeRuntimeError::from)?;
+        }
+        Opcode::DeleteStream => {
+            if !mutation.value.is_empty() || state.delete_stream(&mutation.key).is_none() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Opcode::AppendStreamEntry => {
+            let (id, fields) = decode_stream_wal_entry(&mutation.value)?;
+            state
+                .xadd_with_id(&mutation.key, id, fields)
+                .map_err(NativeRuntimeError::from)?;
+        }
+        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+    }
+    Ok(())
+}
+
+fn decode_stream_wal_entry(
+    encoded: &[u8],
+) -> Result<(u64, model::StreamFields), NativeRuntimeError> {
+    if encoded.len() < 12 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    let id = u64::from_be_bytes(
+        encoded[..8]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    );
+    let count = usize::try_from(u32::from_be_bytes(
+        encoded[8..12]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    let mut offset = 12;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let field = decode_stream_wal_bytes(encoded, &mut offset)?;
+        let value = decode_stream_wal_bytes(encoded, &mut offset)?;
+        fields.push((field, value));
+    }
+    if offset != encoded.len() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok((id, fields))
+}
+
+fn decode_stream_wal_bytes(
+    encoded: &[u8],
+    offset: &mut usize,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let length = usize::try_from(u32::from_be_bytes(
+        encoded
+            .get(*offset..end)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+    *offset = end;
+    let end = offset
+        .checked_add(length)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let value = encoded
+        .get(*offset..end)
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+        .to_vec();
+    *offset = end;
+    Ok(value)
 }
 
 fn apply_sorted_set_mutation(
@@ -23550,6 +23639,55 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_wal_replay_is_strict_and_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = super::model::StructureState::default();
+        super::apply_structure_mutation(
+            &mut state,
+            &Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::CreateStream,
+                target: None,
+                key: b"events".to_vec(),
+                value: Vec::new(),
+                expires_at_micros: None,
+            },
+        )?;
+        let mut value = 7_u64.to_be_bytes().to_vec();
+        value.extend_from_slice(&1_u32.to_be_bytes());
+        value.extend_from_slice(&4_u32.to_be_bytes());
+        value.extend_from_slice(b"kind");
+        value.extend_from_slice(&1_u32.to_be_bytes());
+        value.extend_from_slice(b"a");
+        super::apply_structure_mutation(
+            &mut state,
+            &Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::AppendStreamEntry,
+                target: None,
+                key: b"events".to_vec(),
+                value,
+                expires_at_micros: None,
+            },
+        )?;
+        assert_eq!(state.xrange(b"events", 0, u64::MAX, 8).unwrap().len(), 1);
+        assert!(
+            super::apply_structure_mutation(
+                &mut state,
+                &Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::AppendStreamEntry,
+                    target: None,
+                    key: b"events".to_vec(),
+                    value: vec![0; 12],
+                    expires_at_micros: None,
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
