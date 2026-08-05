@@ -4,7 +4,9 @@ Status: partially implemented by the experimental native runtime. Canonical
 `FORMAT` creation and validation, lifetime-held `LOCK` ownership, and lineage
 threading through `HYROOT03` manifests and `HYWAR002` retention anchors are
 implemented. Offline promotion remains unimplemented. ADR-0021 and ADR-0022
-govern this contract. G1 remains open
+govern this contract. The complete offline promotion contract remains work for
+the later product and release gates; it is not part of the closed bounded G1
+substrate profile.
 
 This contract fixes the root-level identity of one native data directory:
 the `FORMAT` marker required by

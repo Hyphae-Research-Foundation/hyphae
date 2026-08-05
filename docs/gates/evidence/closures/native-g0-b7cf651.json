@@ -1,0 +1,33 @@
+{
+  "schema": "hyphae-native-g0-closure-v1",
+  "gate": "G0",
+  "status": "passed",
+  "source_commit": "b7cf651229802f35d39d61d61965f469c9200ac1",
+  "workflow_run": 31052567134,
+  "scope": "constitution-and-native-specifications",
+  "production_scale": false,
+  "performance_gate_claimed": false,
+  "profile_sha256": "5cdc3f9e5dce7dfaa7d8a655575384264b7ab8d4cf22c5f84c1c1d7ea9bca4b3",
+  "evidence_sha256": "901a8db22d988b2e41670fe3f572ea645f74994ba5e41c21332edef82fc91b8b",
+  "readiness_sha256": "66bfcf5f09ac09a168154f099d2a4cef6464f5c2537cd53aabf89ab0639a8655",
+  "required": 8,
+  "passed": 8,
+  "requirements": [
+    "architecture-and-versioned-specifications",
+    "canonical-type-goldens-and-properties",
+    "page-row-blob-wal-mvcc-goldens",
+    "sql-structure-search-ann-contracts",
+    "local-protocol-goldens-and-conformance",
+    "benchmark-and-quality-corpus",
+    "native-dependency-license-unsafe-audit",
+    "clean-room-porting-ledger-review"
+  ],
+  "artifact": "native-g0-final-readiness",
+  "artifact_id": 8949306167,
+  "artifact_archive_sha256": "635aabfdaccca831fe1e495518f212ee09c9d9efcf1032239724b898c15de00b",
+  "non_claims": [
+    "production-scale performance",
+    "release authorization",
+    "G1 through G8 closure by this evidence"
+  ]
+}
