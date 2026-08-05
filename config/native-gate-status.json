@@ -15,13 +15,15 @@
     },
     {
       "id": "G2",
-      "status": "closure-candidate",
-      "reason": "The normative G2 outcome is the versioned bounded relational profile; hosted exact-SHA closure evidence is required."
+      "status": "closed",
+      "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+      "evidence": "docs/gates/evidence/closures/native-g2-a839037.json"
     },
     {
       "id": "G3",
-      "status": "closure-candidate",
-      "reason": "All eleven structure requirements are implemented locally; hosted suite-bound exact-SHA closure evidence is required."
+      "status": "closed",
+      "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+      "evidence": "docs/gates/evidence/closures/native-g3-a839037.json"
     },
     {"id": "G4", "status": "open"},
     {"id": "G5", "status": "open"},

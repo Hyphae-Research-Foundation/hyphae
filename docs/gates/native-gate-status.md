@@ -9,8 +9,8 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 |---|---|---|
 | G0 | Closure claimed; revalidation required | Reconstruct all 8 hosted/governance requirements on one exact commit |
 | G1 | Closure claimed; revalidation required | Reconstruct all 7 hosted requirements after G0 authority is restored |
-| G2 | Closure candidate | 8/8 hosted exact-SHA evidence for the normative bounded relational profile; no universal SQL or official benchmark claim |
-| G3 | Closure candidate | 11/11 hosted, suite-bound, exact-SHA evidence after G2 passes on the same commit |
+| G2 | Closed at `a839037` | [8/8 hosted bounded relational closure](evidence/closures/native-g2-a839037.json); no universal SQL or official benchmark claim |
+| G3 | Closed at `a839037` | [11/11 hosted suite-bound structure closure](evidence/closures/native-g3-a839037.json) |
 | G4-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
 
 `closure-claimed-revalidation-required` preserves a historical closure claim
