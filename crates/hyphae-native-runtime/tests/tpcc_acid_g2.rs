@@ -71,6 +71,79 @@ fn new_order_like_transaction_is_atomic_durable_and_conflict_safe()
 }
 
 #[test]
+fn order_status_and_stock_level_like_reads_are_snapshot_consistent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary =
+        std::env::temp_dir().join(format!("hyphae-native-tpcc-reads-{}", std::process::id()));
+    let _ignored = std::fs::remove_dir_all(&temporary);
+    let mut database = NativeDatabase::create(&temporary)?;
+    let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+    for statement in [
+        "CREATE TABLE customer (c_id BIGINT PRIMARY KEY, c_balance BIGINT NOT NULL)",
+        "CREATE TABLE orders (o_id BIGINT PRIMARY KEY, o_customer_id BIGINT NOT NULL, o_total BIGINT NOT NULL)",
+        "CREATE TABLE stock (s_item_id BIGINT PRIMARY KEY, s_quantity BIGINT NOT NULL)",
+        "INSERT INTO customer (c_id, c_balance) VALUES (100, 500)",
+        "INSERT INTO orders (o_id, o_customer_id, o_total) VALUES (7, 100, 42)",
+        "INSERT INTO stock (s_item_id, s_quantity) VALUES (1, 9)",
+        "INSERT INTO stock (s_item_id, s_quantity) VALUES (2, 30)",
+    ] {
+        seed.execute_sql(statement, &[])?;
+    }
+    seed.commit()?;
+
+    let mut reader = database.begin_optimistic(2, DurabilityClass::Memory)?;
+    assert_eq!(
+        signed_cell(reader.execute_sql("SELECT c_balance FROM customer WHERE c_id = 100", &[])?)?,
+        500
+    );
+    assert_eq!(
+        signed_cell(reader.execute_sql("SELECT o_total FROM orders WHERE o_id = 7", &[])?)?,
+        42
+    );
+    let SqlResult::Rows {
+        rows: low_stock, ..
+    } = reader.execute_sql(
+        "SELECT s_item_id FROM stock WHERE s_quantity < 10 ORDER BY s_item_id LIMIT 100",
+        &[],
+    )?
+    else {
+        return Err("expected stock rows".into());
+    };
+    assert_eq!(low_stock, vec![vec![ScalarValue::Signed(1)]]);
+
+    let mut writer = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    writer.execute_sql("UPDATE stock SET s_quantity = 5 WHERE s_item_id = 2", &[])?;
+    database.commit_optimistic(writer)?;
+    let SqlResult::Rows { rows: retained, .. } = reader.execute_sql(
+        "SELECT s_item_id FROM stock WHERE s_quantity < 10 ORDER BY s_item_id LIMIT 100",
+        &[],
+    )?
+    else {
+        return Err("expected retained stock rows".into());
+    };
+    assert_eq!(retained, low_stock);
+    reader.rollback();
+    let mut current = database.begin_optimistic(3, DurabilityClass::Memory)?;
+    let SqlResult::Rows {
+        rows: current_stock,
+        ..
+    } = current.execute_sql(
+        "SELECT s_item_id FROM stock WHERE s_quantity < 10 ORDER BY s_item_id LIMIT 100",
+        &[],
+    )?
+    else {
+        return Err("expected current stock rows".into());
+    };
+    assert_eq!(
+        current_stock,
+        vec![vec![ScalarValue::Signed(1)], vec![ScalarValue::Signed(2)]]
+    );
+    current.rollback();
+    std::fs::remove_dir_all(&temporary)?;
+    Ok(())
+}
+
+#[test]
 fn delivery_like_transaction_updates_order_and_customer_atomically()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = std::env::temp_dir().join(format!(
