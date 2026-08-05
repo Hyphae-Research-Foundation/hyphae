@@ -84,7 +84,20 @@ jobs:
           python - <<'PY'
           import json
           r = json.load(open("native-g2-readiness.json"))
-          assert r == {"gate": "G2", "passed": 8, "required": 8, "schema": "hyphae-native-g2-readiness-receipt-v1", "status": "passed"}
+          assert r["gate"] == "G2"
+          assert r["status"] == "passed"
+          assert r["required"] == 8
+          assert r["passed"] == 8
+          assert r["requirements"] == [
+              {"id": "native-ddl-dml-and-constraints", "required_evidence": "hosted", "status": "passed"},
+              {"id": "transactions-and-isolation", "required_evidence": "hosted", "status": "passed"},
+              {"id": "indexes-joins-ctes-windows", "required_evidence": "hosted", "status": "passed"},
+              {"id": "prepared-plans-and-explain", "required_evidence": "hosted", "status": "passed"},
+              {"id": "sqllogictest-conformance", "required_evidence": "hosted", "status": "passed"},
+              {"id": "metamorphic-sql-equivalence", "required_evidence": "hosted", "status": "passed"},
+              {"id": "tpch-correctness", "required_evidence": "hosted", "status": "passed"},
+              {"id": "tpcc-acid", "required_evidence": "hosted", "status": "passed"},
+          ]
           PY
 
       - name: Validate evidence tools
