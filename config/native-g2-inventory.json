@@ -42,13 +42,13 @@
       "id": "tpch-correctness",
       "status": "missing",
       "present": [],
-      "gaps": ["TPC-H schema and dataset generator", "supported query corpus", "reference-result comparison", "hosted receipt"]
+      "gaps": ["canonical TPC-H schema and deterministic scale-factor generator", "21 unsupported canonical query shapes", "reference-result comparison for every admitted query", "hosted receipt"]
     },
     {
       "id": "tpcc-acid",
       "status": "missing",
-      "present": [],
-      "gaps": ["TPC-C schema and loader", "transaction profiles", "ACID tests", "hosted receipt"]
+      "present": ["bounded nine-table deterministic loader", "New-Order/Payment/Delivery/Order-Status/Stock-Level derived verticals"],
+      "gaps": ["canonical full-column TPC-C schema", "standard consistency checks", "seeded workload receipt", "hosted receipt"]
     }
   ]
 }
