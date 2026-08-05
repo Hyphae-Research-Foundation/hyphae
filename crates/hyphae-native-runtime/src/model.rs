@@ -115,6 +115,24 @@ impl CatalogState {
         Ok(())
     }
 
+    pub(crate) fn replace(&mut self, object: CatalogObject) -> Result<CatalogObject, ModelError> {
+        object.validate()?;
+        let id = object.header().id;
+        let old = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
+        if old.header().owner != object.header().owner {
+            return Err(ModelError::WrongEngine);
+        }
+        if self.objects.values().any(|candidate| {
+            candidate.header().id != id
+                && same_catalog_lookup(&candidate.header().name, &object.header().name)
+        }) {
+            return Err(ModelError::DuplicateObjectName);
+        }
+        self.objects
+            .insert(id, object)
+            .ok_or(ModelError::UnknownObject)
+    }
+
     pub(crate) fn remove(&mut self, id: ObjectId) -> Result<CatalogObject, ModelError> {
         let object = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
         if matches!(object, CatalogObject::Relation(_))

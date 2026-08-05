@@ -107,6 +107,12 @@ the relation and all row keys, rebuilds catalog/relational roots, invalidates
 prepared plans and preserves absence across reopen. `IF EXISTS` and `CASCADE`
 remain unsupported.
 
+`ALTER TABLE <old> RENAME TO <new>` is metadata-only: it preserves the stable
+relation ID and physical row namespace, atomically replaces the catalog name,
+invalidates old prepared plans and survives reopen. Existing rows remain
+queryable through the new name. Other ALTER forms fail closed until row-codec
+migration semantics are implemented.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,
