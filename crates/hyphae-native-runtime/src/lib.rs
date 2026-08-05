@@ -24613,6 +24613,70 @@ mod tests {
     }
 
     #[test]
+    fn every_sorted_set_expiry_cleanup_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_sorted_set(b"scores".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+            database.commit_optimistic(expiry)?;
+            let result =
+                database.expire_due_structures_at(10, 1, DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(2) => {
+                    assert!(matches!(
+                        reopened.zcard_latest_sorted_set_at(b"scores", 10),
+                        Err(NativeRuntimeError::UnknownStructureSortedSet)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        1
+                    );
+                }
+                Some(3) => {
+                    assert!(matches!(
+                        reopened.zcard_latest_sorted_set(b"scores"),
+                        Err(NativeRuntimeError::UnknownStructureSortedSet)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        0
+                    );
+                }
+                other => return Err(format!("unexpected sorted-set expiry CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn active_expiry_cleanup_removes_due_sorted_set_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
