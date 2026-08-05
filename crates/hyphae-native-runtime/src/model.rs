@@ -558,6 +558,7 @@ pub(crate) struct StructureState {
     pub(crate) list_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     pub(crate) streams: BTreeMap<Vec<u8>, StreamEntries>,
+    pub(crate) stream_expiries: BTreeMap<Vec<u8>, i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -624,7 +625,25 @@ impl StructureState {
 
     #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
     pub(crate) fn delete_stream(&mut self, key: &[u8]) -> Option<StreamEntries> {
+        self.stream_expiries.remove(key);
         self.streams.remove(key)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn expire_stream(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.streams.contains_key(key) {
+            return false;
+        }
+        self.stream_expiries.insert(key.to_vec(), expires_at_micros);
+        true
+    }
+
+    pub(crate) fn stream_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.streams.contains_key(key)
+            && self
+                .stream_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
     }
 
     #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
@@ -674,6 +693,9 @@ impl StructureState {
         limit: usize,
     ) -> Option<Vec<(u64, StreamFields)>> {
         let stream = self.streams.get(key)?;
+        if !self.stream_is_visible(key, i64::MIN) {
+            return None;
+        }
         Some(
             stream
                 .range(start..=end)
@@ -1789,6 +1811,7 @@ impl StructureState {
             list_expiries: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
             streams: BTreeMap::new(),
+            stream_expiries: BTreeMap::new(),
         })
     }
 }
@@ -2270,6 +2293,20 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_ttl_is_exact_at_controlled_time() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?;
+        assert!(state.expire_stream(b"events", 10));
+        assert!(state.stream_is_visible(b"events", 9));
+        assert!(!state.stream_is_visible(b"events", 10));
+        assert!(!state.stream_is_visible(b"events", 11));
+        assert!(state.delete_stream(b"events").is_some());
+        assert!(!state.expire_stream(b"events", 20));
         Ok(())
     }
 

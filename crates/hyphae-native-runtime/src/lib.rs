@@ -20325,6 +20325,7 @@ impl StructureTreeDecoder {
             list_expiries,
             sorted_sets,
             streams,
+            stream_expiries: BTreeMap::new(),
         })
     }
 }
