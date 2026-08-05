@@ -49,7 +49,22 @@ class NativeG2ReadinessTests(unittest.TestCase):
             rows = {}
             for requirement in self.profile()["requirements"]:
                 artifact = root / f"{requirement['id']}.json"
-                artifact.write_text('{"status":"passed"}\n')
+                artifact.write_text(
+                    json.dumps(
+                        {
+                            "schema": "hyphae-native-g2-receipt-audit-v1",
+                            "status": "passed",
+                            "source_commit": "a" * 40,
+                            "requirement": requirement["id"],
+                            "test_count": 1,
+                            "suite_count": 1,
+                            "corpus_sha256": "b" * 64,
+                            "scope": "bounded-correctness",
+                            "production_scale": False,
+                        }
+                    )
+                    + "\n"
+                )
                 rows[requirement["id"]] = {
                     "status": "passed",
                     "level": "hosted",

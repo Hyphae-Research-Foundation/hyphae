@@ -59,8 +59,16 @@ def evaluate(root: Path, profile: dict[str, Any], evidence: dict[str, Any]) -> d
                 if row["artifact_sha256"] != digest:
                     raise GateFailure(f"artifact digest mismatch for {identifier}")
                 payload = json.loads(artifact.read_text(encoding="utf-8"))
+                if payload.get("schema") != "hyphae-native-g2-receipt-audit-v1":
+                    raise GateFailure(f"artifact schema is invalid for {identifier}")
                 if payload.get("status") != "passed":
                     raise GateFailure(f"artifact is not passed for {identifier}")
+                if payload.get("requirement") != identifier:
+                    raise GateFailure(f"artifact requirement mismatch for {identifier}")
+                if payload.get("scope") != "bounded-correctness" or payload.get("production_scale") is not False:
+                    raise GateFailure(f"artifact scope mismatch for {identifier}")
+                if not isinstance(payload.get("test_count"), int) or payload["test_count"] <= 0:
+                    raise GateFailure(f"artifact test count is invalid for {identifier}")
                 status = "passed"
         results.append({"id": identifier, "status": status, "required_evidence": required_level})
     passed = sum(row["status"] == "passed" for row in results)
