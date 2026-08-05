@@ -543,6 +543,9 @@ pub(crate) enum TtlValue {
     Remaining(i64),
 }
 
+pub(crate) type StreamFields = Vec<(Vec<u8>, Vec<u8>)>;
+pub(crate) type StreamEntries = BTreeMap<u64, StreamFields>;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StructureState {
     pub(crate) entries: BTreeMap<Vec<u8>, StructureEntry>,
@@ -554,6 +557,7 @@ pub(crate) struct StructureState {
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) list_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
+    pub(crate) streams: BTreeMap<Vec<u8>, StreamEntries>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -609,6 +613,47 @@ pub(crate) struct HashPatternModelRequest<'request> {
 }
 
 impl StructureState {
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn create_stream(&mut self, key: Vec<u8>) -> Result<(), ModelError> {
+        if self.streams.contains_key(&key) {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        self.streams.insert(key, BTreeMap::new());
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xadd(&mut self, key: &[u8], fields: StreamFields) -> Result<u64, ModelError> {
+        if fields.is_empty() {
+            return Err(ModelError::DuplicateEncodedEntry);
+        }
+        let stream = self.streams.get_mut(key).ok_or(ModelError::UnknownObject)?;
+        let id = stream
+            .last_key_value()
+            .map_or(Some(1), |(id, _)| id.checked_add(1))
+            .ok_or(ModelError::LengthOverflow)?;
+        stream.insert(id, fields);
+        Ok(id)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn xrange(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Option<Vec<(u64, StreamFields)>> {
+        let stream = self.streams.get(key)?;
+        Some(
+            stream
+                .range(start..=end)
+                .take(limit)
+                .map(|(id, fields)| (*id, fields.clone()))
+                .collect(),
+        )
+    }
+
     pub(crate) fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at_micros: Option<i64>) {
         self.entries.insert(
             key,
@@ -1710,6 +1755,7 @@ impl StructureState {
             lists: BTreeMap::new(),
             list_expiries: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
+            streams: BTreeMap::new(),
         })
     }
 }
@@ -2191,6 +2237,28 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_assigns_stable_monotonic_ids_and_exact_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?,
+            1
+        );
+        assert_eq!(
+            state.xadd(b"events", vec![(b"kind".to_vec(), b"b".to_vec())])?,
+            2
+        );
+        assert_eq!(
+            state.xrange(b"events", 1, 2, 1),
+            Some(vec![(1, vec![(b"kind".to_vec(), b"a".to_vec())])])
+        );
+        assert_eq!(state.xrange(b"events", 2, u64::MAX, 8).unwrap().len(), 1);
+        assert_eq!(state.xrange(b"missing", 0, u64::MAX, 8), None);
         Ok(())
     }
 
