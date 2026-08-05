@@ -623,6 +623,11 @@ impl StructureState {
     }
 
     #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
+    pub(crate) fn delete_stream(&mut self, key: &[u8]) -> Option<StreamEntries> {
+        self.streams.remove(key)
+    }
+
+    #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
     pub(crate) fn xadd(&mut self, key: &[u8], fields: StreamFields) -> Result<u64, ModelError> {
         if fields.is_empty() {
             return Err(ModelError::DuplicateEncodedEntry);
@@ -2248,6 +2253,19 @@ mod tests {
             relational.drop_secondary_index(index),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_model_delete_is_a_typed_lifecycle_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut state = StructureState::default();
+        state.create_stream(b"events".to_vec())?;
+        state.xadd(b"events", vec![(b"kind".to_vec(), b"a".to_vec())])?;
+        assert_eq!(state.delete_stream(b"events").unwrap().len(), 1);
+        assert_eq!(state.xrange(b"events", 0, u64::MAX, 8), None);
+        assert!(state.delete_stream(b"events").is_none());
+        assert!(state.create_list(b"events".to_vec()));
         Ok(())
     }
 
