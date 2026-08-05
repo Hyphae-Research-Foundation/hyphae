@@ -76,6 +76,14 @@ class NativeG2ReadinessTests(unittest.TestCase):
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["passed"], 8)
 
+    def test_hosted_workflow_produces_exact_sha_prepared_receipt(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g2.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", workflow)
+        self.assertIn("tools/produce_native_g2_prepared_receipt.py", workflow)
+        self.assertIn("tools/check_native_g2_receipts.py", workflow)
+        self.assertIn("native-g2-prepared-audit.json", workflow)
+
     def test_missing_digest_lower_level_or_unknown_row_fails_closed(self) -> None:
         evidence = self.baseline()
         evidence["evidence"]["unknown"] = {}
