@@ -14,8 +14,10 @@ New-Order-derived transaction over district and order rows. The tests prove:
 - strict-durability results survive reopen; and
 - explicit rollback publishes neither the sequence update nor order row.
 
-This is not complete TPC-C ACID evidence. G2 still requires the canonical TPC-C
-schema and loader, warehouse/district/customer/order/order-line/stock
-transactions, all standard ACID tests, invariants and consistency checks,
+This is not complete TPC-C ACID evidence. A deterministic bounded fixture now
+loads and reopens all nine core table families (`warehouse`, `district`,
+`customer`, `orders`, `new_order`, `order_line`, `item`, `stock`, `history`)
+from a versioned seeded profile and verifies exact row counts. G2 still requires
+the canonical full-column TPC-C schema and loader,
 seeded workload receipts, and hosted exact-SHA execution. Throughput and tail
 latency remain G7 responsibilities.
