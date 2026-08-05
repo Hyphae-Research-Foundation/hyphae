@@ -88,6 +88,16 @@ impl CatalogState {
         {
             return Err(ModelError::DuplicateObjectName);
         }
+        if let CatalogObject::Relation(definition) = &object {
+            for foreign_key in &definition.foreign_keys {
+                let Some(CatalogObject::Relation(parent)) =
+                    self.objects.get(&foreign_key.referenced_relation)
+                else {
+                    return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+                };
+                foreign_key.validate_relations(definition, parent)?;
+            }
+        }
         if let CatalogObject::SecondaryIndex(definition) = &object {
             let Some(CatalogObject::Relation(relation)) = self.objects.get(&definition.relation)
             else {

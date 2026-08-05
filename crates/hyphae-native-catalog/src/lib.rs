@@ -293,6 +293,43 @@ pub struct ForeignKeyDefinition {
     pub referenced_columns: Vec<ColumnId>,
 }
 
+impl ForeignKeyDefinition {
+    /// Validates one immediate primary-key foreign key against both relations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing columns, arity/type mismatch, or a target
+    /// that is not the complete ordered parent primary key.
+    pub fn validate_relations(
+        &self,
+        child: &RelationDefinition,
+        parent: &RelationDefinition,
+    ) -> Result<(), CatalogError> {
+        if self.columns.is_empty()
+            || self.columns.len() != self.referenced_columns.len()
+            || self.referenced_columns != parent.primary_key
+        {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        for (child_id, parent_id) in self.columns.iter().zip(&self.referenced_columns) {
+            let child_column = child
+                .columns
+                .iter()
+                .find(|column| column.id == *child_id)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            let parent_column = parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_id)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            if child_column.logical_type != parent_column.logical_type {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Native relational object definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationDefinition {
@@ -802,6 +839,19 @@ impl CatalogTransaction {
                 .any(|existing| existing.header().name == header.name)
         {
             return Err(CatalogError::DuplicateName(Box::new(header.name.clone())));
+        }
+        if let CatalogObject::Relation(definition) = &object {
+            for foreign_key in &definition.foreign_keys {
+                let parent = self
+                    .additions
+                    .iter()
+                    .find(|existing| existing.header().id == foreign_key.referenced_relation)
+                    .or_else(|| self.base.objects.get(&foreign_key.referenced_relation));
+                let Some(CatalogObject::Relation(parent)) = parent else {
+                    return Err(CatalogError::InvalidDefinitionEncoding);
+                };
+                foreign_key.validate_relations(definition, parent)?;
+            }
         }
         if let CatalogObject::SecondaryIndex(definition) = &object {
             let relation = self
