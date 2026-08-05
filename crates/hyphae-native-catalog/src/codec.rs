@@ -3,15 +3,15 @@
 use std::str;
 
 use hyphae_native_types::{
-    ColumnId, EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType,
+    ColumnId, EngineKind, FieldId, LogicalType, ObjectId, ScalarValue, VectorElement, VectorType,
 };
 
 use super::{
-    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition,
-    MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES,
-    ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-    SearchFieldDefinition, SecondaryIndexDefinition, StructureDefinition, StructureKind,
-    StructureOwnership, VectorMetric,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckConstraint,
+    ColumnCheckOperator, ColumnDefinition, ForeignKeyDefinition, MAX_CATALOG_DEFINITION_BYTES,
+    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
 };
 
 const DEFINITION_MAGIC: [u8; 8] = *b"HYCOBJ01";
@@ -96,6 +96,46 @@ impl Encoder {
         self.put_item_count(definition.primary_key.len())?;
         for column in &definition.primary_key {
             self.put_fixed(&column.get().to_le_bytes())?;
+        }
+        if !definition.checks.is_empty() || !definition.foreign_keys.is_empty() {
+            self.put_item_count(definition.checks.len())?;
+            for (column, check) in &definition.checks {
+                self.put_fixed(&column.get().to_le_bytes())?;
+                self.put_byte(check.operator as u8)?;
+                let logical_type = &definition
+                    .columns
+                    .iter()
+                    .find(|definition| definition.id == *column)
+                    .ok_or(CatalogError::InvalidDefinitionEncoding)?
+                    .logical_type;
+                self.put_bytes(&check.operand.encode_storage(logical_type)?)?;
+            }
+            self.put_item_count(definition.foreign_keys.len())?;
+            for foreign_key in &definition.foreign_keys {
+                match &foreign_key.name {
+                    Some(name) => {
+                        self.put_byte(1)?;
+                        self.put_name(name)?;
+                    }
+                    None => self.put_byte(0)?,
+                }
+                self.put_item_count(foreign_key.columns.len())?;
+                for column in &foreign_key.columns {
+                    self.put_fixed(&column.get().to_le_bytes())?;
+                }
+                self.put_fixed(&foreign_key.referenced_relation.get().to_le_bytes())?;
+                self.put_item_count(foreign_key.referenced_columns.len())?;
+                for column in &foreign_key.referenced_columns {
+                    self.put_fixed(&column.get().to_le_bytes())?;
+                }
+                match foreign_key.referenced_index {
+                    Some(index) => {
+                        self.put_byte(1)?;
+                        self.put_fixed(&index.get().to_le_bytes())?;
+                    }
+                    None => self.put_byte(0)?,
+                }
+            }
         }
         Ok(())
     }
@@ -257,10 +297,71 @@ impl<'encoded> Decoder<'encoded> {
         for _ in 0..primary_key_count {
             primary_key.push(self.column_id()?);
         }
+        let mut checks = Vec::new();
+        if self.offset < self.encoded.len() {
+            let check_count = self.item_count()?;
+            checks.reserve(check_count);
+            for _ in 0..check_count {
+                let column = self.column_id()?;
+                let operator = match self.byte()? {
+                    1 => ColumnCheckOperator::Equal,
+                    2 => ColumnCheckOperator::NotEqual,
+                    3 => ColumnCheckOperator::Less,
+                    4 => ColumnCheckOperator::LessOrEqual,
+                    5 => ColumnCheckOperator::Greater,
+                    6 => ColumnCheckOperator::GreaterOrEqual,
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
+                let logical_type = &columns
+                    .iter()
+                    .find(|definition| definition.id == column)
+                    .ok_or(CatalogError::InvalidDefinitionEncoding)?
+                    .logical_type;
+                let operand = ScalarValue::decode_storage(logical_type, self.bytes()?)?;
+                checks.push((column, ColumnCheckConstraint { operator, operand }));
+            }
+        }
+        let mut foreign_keys = Vec::new();
+        if self.offset < self.encoded.len() {
+            let foreign_key_count = self.item_count()?;
+            foreign_keys.reserve(foreign_key_count);
+            for _ in 0..foreign_key_count {
+                let name = match self.byte()? {
+                    0 => None,
+                    1 => Some(self.name()?),
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
+                let child_count = self.item_count()?;
+                let mut child_columns = Vec::with_capacity(child_count);
+                for _ in 0..child_count {
+                    child_columns.push(self.column_id()?);
+                }
+                let referenced_relation = self.object_id()?;
+                let parent_count = self.item_count()?;
+                let mut referenced_columns = Vec::with_capacity(parent_count);
+                for _ in 0..parent_count {
+                    referenced_columns.push(self.column_id()?);
+                }
+                let referenced_index = match self.byte()? {
+                    0 => None,
+                    1 => Some(self.object_id()?),
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
+                foreign_keys.push(ForeignKeyDefinition {
+                    name,
+                    columns: child_columns,
+                    referenced_relation,
+                    referenced_columns,
+                    referenced_index,
+                });
+            }
+        }
         Ok(RelationDefinition {
             header,
             columns,
             primary_key,
+            checks,
+            foreign_keys,
         })
     }
 
@@ -567,6 +668,8 @@ mod tests {
                 },
             ],
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
         }))
     }
 

@@ -1,0 +1,21 @@
+{
+  "schema": "hyphae-native-g2-tpcc-fixture-v1",
+  "seed": 20260804,
+  "warehouses": 1,
+  "districts_per_warehouse": 2,
+  "customers_per_district": 3,
+  "orders_per_district": 3,
+  "items": 5,
+  "order_lines_per_order": 2,
+  "expected": {
+    "warehouse_rows": 1,
+    "district_rows": 2,
+    "customer_rows": 6,
+    "order_rows": 6,
+    "new_order_rows": 2,
+    "order_line_rows": 12,
+    "item_rows": 5,
+    "stock_rows": 5,
+    "history_rows": 6
+  }
+}

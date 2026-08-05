@@ -88,6 +88,22 @@ impl CatalogState {
         {
             return Err(ModelError::DuplicateObjectName);
         }
+        if let CatalogObject::Relation(definition) = &object {
+            for foreign_key in &definition.foreign_keys {
+                let parent = if foreign_key.referenced_relation == definition.header.id {
+                    Some(definition)
+                } else {
+                    match self.objects.get(&foreign_key.referenced_relation) {
+                        Some(CatalogObject::Relation(parent)) => Some(parent),
+                        _ => None,
+                    }
+                };
+                let Some(parent) = parent else {
+                    return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+                };
+                foreign_key.validate_relations(definition, parent)?;
+            }
+        }
         if let CatalogObject::SecondaryIndex(definition) = &object {
             let Some(CatalogObject::Relation(relation)) = self.objects.get(&definition.relation)
             else {
@@ -97,6 +113,41 @@ impl CatalogState {
         }
         self.objects.insert(id, object);
         Ok(())
+    }
+
+    pub(crate) fn replace(&mut self, object: CatalogObject) -> Result<CatalogObject, ModelError> {
+        object.validate()?;
+        let id = object.header().id;
+        let old = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
+        if old.header().owner != object.header().owner {
+            return Err(ModelError::WrongEngine);
+        }
+        if self.objects.values().any(|candidate| {
+            candidate.header().id != id
+                && same_catalog_lookup(&candidate.header().name, &object.header().name)
+        }) {
+            return Err(ModelError::DuplicateObjectName);
+        }
+        self.objects
+            .insert(id, object)
+            .ok_or(ModelError::UnknownObject)
+    }
+
+    pub(crate) fn remove(&mut self, id: ObjectId) -> Result<CatalogObject, ModelError> {
+        let object = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
+        if matches!(object, CatalogObject::Relation(_))
+            && self.objects.values().any(|candidate| match candidate {
+                CatalogObject::SecondaryIndex(index) => index.relation == id,
+                CatalogObject::Relation(relation) => relation
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_relation == id),
+                CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+            })
+        {
+            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+        }
+        self.objects.remove(&id).ok_or(ModelError::UnknownObject)
     }
 
     pub(crate) fn object(&self, id: ObjectId) -> Option<&CatalogObject> {
@@ -207,6 +258,8 @@ fn legacy_catalog_object(
                 },
             ],
             primary_key: vec![ColumnId::new(1).map_err(|_| ModelError::ZeroObjectId)?],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
         })),
         EngineKind::Search => Ok(CatalogObject::Search(SearchCollectionDefinition {
             header,
@@ -246,11 +299,30 @@ pub(crate) enum SecondaryIndexLayout {
 }
 
 impl RelationState {
+    #[allow(dead_code, reason = "wired by the pending DROP TABLE WAL/SQL vertical")]
+    pub(crate) fn drop_table(
+        &mut self,
+        id: ObjectId,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, ModelError> {
+        if self.indexes.values().any(|index| index.relation == id) {
+            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+        }
+        self.tables.remove(&id).ok_or(ModelError::UnknownObject)
+    }
+
     pub(crate) fn create_table(&mut self, id: ObjectId) -> Result<(), ModelError> {
         if self.tables.insert(id, BTreeMap::new()).is_some() {
             return Err(ModelError::DuplicateObjectId);
         }
         Ok(())
+    }
+
+    #[allow(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
+    pub(crate) fn drop_secondary_index(
+        &mut self,
+        id: ObjectId,
+    ) -> Result<SecondaryIndexState, ModelError> {
+        self.indexes.remove(&id).ok_or(ModelError::UnknownObject)
     }
 
     pub(crate) fn create_secondary_index(
@@ -2080,6 +2152,45 @@ mod tests {
             )?),
             Err(ModelError::DuplicateObjectName)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relational_table_drop_is_restrictive_and_removes_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let mut relational = RelationState::default();
+        relational.create_table(table)?;
+        relational.insert(table, b"pk".to_vec(), b"row".to_vec())?;
+        relational.create_secondary_index(index, table, false, true)?;
+        assert!(relational.drop_table(table).is_err());
+        relational.drop_secondary_index(index)?;
+        let removed = relational.drop_table(table)?;
+        assert_eq!(removed.get(b"pk".as_slice()), Some(&b"row".to_vec()));
+        assert!(matches!(
+            relational.drop_table(table),
+            Err(ModelError::UnknownObject)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn relational_index_drop_is_strict_and_removes_all_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let mut relational = RelationState::default();
+        relational.create_table(table)?;
+        relational.create_secondary_index(index, table, false, true)?;
+        relational.insert_secondary_index(index, b"email".to_vec(), b"pk".to_vec(), false)?;
+        let removed = relational.drop_secondary_index(index)?;
+        assert_eq!(removed.relation, table);
+        assert_eq!(removed.entries.len(), 1);
+        assert!(matches!(
+            relational.drop_secondary_index(index),
+            Err(ModelError::UnknownObject)
+        ));
         Ok(())
     }
 

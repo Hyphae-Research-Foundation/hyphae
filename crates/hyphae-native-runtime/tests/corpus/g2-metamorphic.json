@@ -1,0 +1,41 @@
+{
+  "schema": "hyphae-native-g2-metamorphic-v1",
+  "seed_statements": [
+    "CREATE TABLE events (id BIGINT PRIMARY KEY, tenant TEXT NOT NULL, active BOOLEAN NOT NULL)",
+    "INSERT INTO events (id, tenant, active) VALUES (1, 'a', TRUE)",
+    "INSERT INTO events (id, tenant, active) VALUES (2, 'a', FALSE)",
+    "INSERT INTO events (id, tenant, active) VALUES (3, 'b', TRUE)"
+  ],
+  "equivalences": [
+    {
+      "id": "commute-and",
+      "left": "SELECT id FROM events WHERE tenant = 'a' AND active = TRUE ORDER BY id LIMIT 10",
+      "right": "SELECT id FROM events WHERE active = TRUE AND tenant = 'a' ORDER BY id LIMIT 10"
+    },
+    {
+      "id": "double-negation",
+      "left": "SELECT id FROM events WHERE active = TRUE ORDER BY id LIMIT 10",
+      "right": "SELECT id FROM events WHERE NOT NOT active = TRUE ORDER BY id LIMIT 10"
+    },
+    {
+      "id": "de-morgan",
+      "left": "SELECT id FROM events WHERE NOT (tenant = 'a' OR active = FALSE) ORDER BY id LIMIT 10",
+      "right": "SELECT id FROM events WHERE NOT tenant = 'a' AND NOT active = FALSE ORDER BY id LIMIT 10"
+    },
+    {
+      "id": "range-bound-order",
+      "left": "SELECT id FROM events WHERE id >= 1 AND id <= 3 ORDER BY id LIMIT 10",
+      "right": "SELECT id FROM events WHERE id <= 3 AND id >= 1 ORDER BY id LIMIT 10"
+    },
+    {
+      "id": "or-commutativity",
+      "left": "SELECT id FROM events WHERE tenant = 'b' OR active = FALSE ORDER BY id LIMIT 10",
+      "right": "SELECT id FROM events WHERE active = FALSE OR tenant = 'b' ORDER BY id LIMIT 10"
+    },
+    {
+      "id": "cte-identity",
+      "left": "SELECT id FROM events WHERE active = TRUE ORDER BY id LIMIT 10",
+      "right": "WITH selected AS (SELECT id FROM events WHERE active = TRUE ORDER BY id LIMIT 10) SELECT id FROM selected LIMIT 10"
+    }
+  ]
+}

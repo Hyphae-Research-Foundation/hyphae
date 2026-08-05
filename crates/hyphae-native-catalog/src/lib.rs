@@ -9,7 +9,7 @@ use std::{
 
 use hyphae_native_types::{
     CatalogVersion, ColumnId, EngineKind, FieldId, LogicalType, NativeTypeError, ObjectId,
-    VectorType,
+    ScalarValue, VectorType,
 };
 use thiserror::Error;
 
@@ -255,6 +255,85 @@ pub struct ColumnDefinition {
     pub nullable: bool,
 }
 
+/// Comparison operator admitted by a column CHECK constraint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ColumnCheckOperator {
+    /// `=`.
+    Equal = 1,
+    /// `<>`.
+    NotEqual = 2,
+    /// `<`.
+    Less = 3,
+    /// `<=`.
+    LessOrEqual = 4,
+    /// `>`.
+    Greater = 5,
+    /// `>=`.
+    GreaterOrEqual = 6,
+}
+
+/// One canonical column-local CHECK predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnCheckConstraint {
+    /// Comparison against the literal.
+    pub operator: ColumnCheckOperator,
+    /// Typed literal operand.
+    pub operand: ScalarValue,
+}
+
+/// One immediate MATCH SIMPLE primary-key foreign key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignKeyDefinition {
+    /// Optional normalized constraint name.
+    pub name: Option<CatalogName>,
+    /// Ordered child columns.
+    pub columns: Vec<ColumnId>,
+    /// Referenced relation identity.
+    pub referenced_relation: ObjectId,
+    /// Referenced primary-key columns, or ordered unique-index columns.
+    pub referenced_columns: Vec<ColumnId>,
+    /// Referenced unique index, or `None` for the primary key.
+    pub referenced_index: Option<ObjectId>,
+}
+
+impl ForeignKeyDefinition {
+    /// Validates one immediate primary-key foreign key against both relations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing columns, arity/type mismatch, or a target
+    /// that is not the complete ordered parent primary key.
+    pub fn validate_relations(
+        &self,
+        child: &RelationDefinition,
+        parent: &RelationDefinition,
+    ) -> Result<(), CatalogError> {
+        if self.columns.is_empty()
+            || self.columns.len() != self.referenced_columns.len()
+            || (self.referenced_index.is_none() && self.referenced_columns != parent.primary_key)
+        {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        for (child_id, parent_id) in self.columns.iter().zip(&self.referenced_columns) {
+            let child_column = child
+                .columns
+                .iter()
+                .find(|column| column.id == *child_id)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            let parent_column = parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_id)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            if child_column.logical_type != parent_column.logical_type {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Native relational object definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationDefinition {
@@ -264,6 +343,10 @@ pub struct RelationDefinition {
     pub columns: Vec<ColumnDefinition>,
     /// Ordered primary-key column identities.
     pub primary_key: Vec<ColumnId>,
+    /// Column-local constraints keyed by stable column identity.
+    pub checks: Vec<(ColumnId, ColumnCheckConstraint)>,
+    /// Immediate MATCH SIMPLE foreign keys declared by this relation.
+    pub foreign_keys: Vec<ForeignKeyDefinition>,
 }
 
 impl RelationDefinition {
@@ -316,6 +399,42 @@ impl RelationDefinition {
                 .is_some_and(|definition| definition.nullable)
             {
                 return Err(CatalogError::NullablePrimaryKeyColumn(*column));
+            }
+        }
+        let mut previous_check = None;
+        for (column, check) in &self.checks {
+            if previous_check.is_some_and(|previous| previous >= *column)
+                || !column_ids.contains(column)
+                || matches!(check.operand, ScalarValue::Null)
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
+            let definition = self
+                .columns
+                .iter()
+                .find(|definition| definition.id == *column)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            check
+                .operand
+                .encode_storage(&definition.logical_type)
+                .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
+            previous_check = Some(*column);
+        }
+        let mut names = BTreeSet::new();
+        for foreign_key in &self.foreign_keys {
+            if let Some(name) = &foreign_key.name
+                && !names.insert(name.lookup())
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
+            if foreign_key.columns.is_empty()
+                || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+                || foreign_key
+                    .columns
+                    .iter()
+                    .any(|column| !column_ids.contains(column))
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
             }
         }
         Ok(())
@@ -695,6 +814,7 @@ impl CatalogSnapshot {
 pub struct CatalogTransaction {
     base: Arc<CatalogSnapshot>,
     additions: Vec<CatalogObject>,
+    removals: BTreeSet<ObjectId>,
 }
 
 impl CatalogTransaction {
@@ -703,6 +823,7 @@ impl CatalogTransaction {
         Self {
             base,
             additions: Vec::new(),
+            removals: BTreeSet::new(),
         }
     }
 
@@ -731,6 +852,26 @@ impl CatalogTransaction {
         {
             return Err(CatalogError::DuplicateName(Box::new(header.name.clone())));
         }
+        if let CatalogObject::Relation(definition) = &object {
+            for foreign_key in &definition.foreign_keys {
+                let parent = if foreign_key.referenced_relation == definition.header.id {
+                    Some(definition)
+                } else {
+                    self.additions
+                        .iter()
+                        .find(|existing| existing.header().id == foreign_key.referenced_relation)
+                        .or_else(|| self.base.objects.get(&foreign_key.referenced_relation))
+                        .and_then(|object| match object {
+                            CatalogObject::Relation(parent) => Some(parent),
+                            _ => None,
+                        })
+                };
+                let Some(parent) = parent else {
+                    return Err(CatalogError::InvalidDefinitionEncoding);
+                };
+                foreign_key.validate_relations(definition, parent)?;
+            }
+        }
         if let CatalogObject::SecondaryIndex(definition) = &object {
             let relation = self
                 .additions
@@ -748,12 +889,46 @@ impl CatalogTransaction {
         Ok(())
     }
 
+    /// Stages strict object removal with dependency checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object is absent or still owns a dependent
+    /// secondary index or foreign-key edge.
+    pub fn remove(&mut self, id: ObjectId) -> Result<(), CatalogError> {
+        let object = self
+            .additions
+            .iter()
+            .find(|object| object.header().id == id)
+            .or_else(|| self.base.objects.get(&id))
+            .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+        if matches!(object, CatalogObject::Relation(_))
+            && self
+                .additions
+                .iter()
+                .chain(self.base.objects.values())
+                .filter(|candidate| !self.removals.contains(&candidate.header().id))
+                .any(|candidate| match candidate {
+                    CatalogObject::SecondaryIndex(index) => index.relation == id,
+                    CatalogObject::Relation(relation) => relation
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_relation == id),
+                    CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+                })
+        {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        self.removals.insert(id);
+        Ok(())
+    }
+
     /// Commits a new immutable in-memory catalog snapshot.
     ///
     /// # Errors
     ///
     /// Returns an error when catalog version space is exhausted.
-    pub fn commit(self) -> Result<Arc<CatalogSnapshot>, CatalogError> {
+    pub fn commit(mut self) -> Result<Arc<CatalogSnapshot>, CatalogError> {
         let version = self
             .base
             .version
@@ -761,6 +936,17 @@ impl CatalogTransaction {
             .ok_or(CatalogError::VersionExhausted)?;
         let mut objects = self.base.objects.clone();
         let mut names = self.base.names.clone();
+        for id in self.removals {
+            if let Some(object) = objects.remove(&id) {
+                names.remove(&object.header().name);
+            } else if let Some(index) = self
+                .additions
+                .iter()
+                .position(|object| object.header().id == id)
+            {
+                self.additions.remove(index);
+            }
+        }
         for object in self.additions {
             let header = object.header();
             names.insert(header.name.clone(), header.id);
@@ -806,6 +992,8 @@ mod tests {
                 nullable: false,
             }],
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
         }))
     }
 
@@ -864,6 +1052,21 @@ mod tests {
             transaction.create(relation(1, "other")?),
             Err(CatalogError::DuplicateObjectId(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_rejects_unknown_and_dependent_objects() -> Result<(), Box<dyn std::error::Error>> {
+        let base = CatalogSnapshot::empty(CatalogVersion::new(1)?);
+        let mut transaction = CatalogTransaction::begin(base);
+        transaction.create(relation(1, "accounts")?)?;
+        transaction.create(secondary_index(2, 1, 1)?)?;
+        assert!(transaction.remove(ObjectId::new(1)?).is_err());
+        transaction.remove(ObjectId::new(2)?)?;
+        transaction.remove(ObjectId::new(1)?)?;
+        assert!(transaction.remove(ObjectId::new(99)?).is_err());
+        let committed = transaction.commit()?;
+        assert!(committed.is_empty());
         Ok(())
     }
 

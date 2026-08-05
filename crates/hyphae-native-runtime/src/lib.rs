@@ -127,6 +127,7 @@ pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
 
 use std::{
+    cmp::Ordering as ValueOrdering,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
@@ -141,9 +142,9 @@ use hyphae_native_blobs::{
 };
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
-    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader,
-    QualifiedName, RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckOperator,
+    ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
+    SearchFieldDefinition, SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{
     ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
@@ -476,6 +477,12 @@ pub enum NativeRuntimeError {
     /// A non-null native unique secondary-index key already identifies a row.
     #[error("native relational unique secondary index is violated")]
     UniqueSecondaryIndexViolation,
+    /// One persisted relation CHECK predicate rejected a row.
+    #[error("native relational CHECK constraint is violated")]
+    CheckConstraintViolation,
+    /// One immediate relation foreign key is violated.
+    #[error("native relational FOREIGN KEY constraint is violated")]
+    ForeignKeyConstraintViolation,
     /// The requested native secondary index does not exist in the current root.
     #[error("native relational secondary index {index} does not exist")]
     UnknownSecondaryIndex {
@@ -8790,6 +8797,7 @@ impl NativeWriteBatch {
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
+        validate_relation_checks(&self.state.catalog, table, &row)?;
         let projections = secondary_index_projections(&self.state.catalog, table, &row)?;
         let mut relational = self.state.relational.clone();
         relational.insert(table, primary_key.clone(), row.clone())?;
@@ -8835,6 +8843,7 @@ impl NativeWriteBatch {
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
         let old_projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        validate_relation_checks(&self.state.catalog, table, &row)?;
         let new_projections = secondary_index_projections(&self.state.catalog, table, &row)?;
         let mut relational = self.state.relational.clone();
         remove_secondary_index_projections(&mut relational, &old_projections, &primary_key)?;
@@ -11719,7 +11728,10 @@ fn apply_mutations_to_state(
             | Opcode::InsertRow
             | Opcode::UpdateRow
             | Opcode::DeleteRow
-            | Opcode::CreateSecondaryIndex => {
+            | Opcode::CreateSecondaryIndex
+            | Opcode::DropSecondaryIndex
+            | Opcode::RenameTable
+            | Opcode::DropTable => {
                 apply_relational_mutation(state, mutation)?;
             }
             Opcode::SetValue
@@ -11847,6 +11859,7 @@ fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntim
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_relational_mutation(
     state: &mut MaterializedState,
     mutation: &Mutation,
@@ -11862,6 +11875,8 @@ fn apply_relational_mutation(
         }
         Opcode::InsertRow => {
             state.catalog.require(target, EngineKind::Relational)?;
+            validate_relation_checks(&state.catalog, target, &mutation.value)?;
+            validate_relation_foreign_keys(state, target, &mutation.value)?;
             let projections = secondary_index_projections(&state.catalog, target, &mutation.value)?;
             state
                 .relational
@@ -11877,6 +11892,9 @@ fn apply_relational_mutation(
         }
         Opcode::UpdateRow | Opcode::DeleteRow => {
             state.catalog.require(target, EngineKind::Relational)?;
+            if mutation.opcode == Opcode::DeleteRow {
+                validate_parent_not_referenced_state(state, target, &mutation.key)?;
+            }
             let old_row = state
                 .relational
                 .select(target, &mutation.key)
@@ -11889,6 +11907,8 @@ fn apply_relational_mutation(
                 &mutation.key,
             )?;
             if mutation.opcode == Opcode::UpdateRow {
+                validate_relation_checks(&state.catalog, target, &mutation.value)?;
+                validate_relation_foreign_keys(state, target, &mutation.value)?;
                 let new_projections =
                     secondary_index_projections(&state.catalog, target, &mutation.value)?;
                 state
@@ -11905,6 +11925,48 @@ fn apply_relational_mutation(
                 }
                 state.relational.delete(target, &mutation.key)?;
             }
+        }
+        Opcode::RenameTable => {
+            if mutation.key.is_empty()
+                || mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let object = CatalogObject::decode_definition(&mutation.value)?;
+            let CatalogObject::Relation(definition) = &object else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            if definition.header.id != target {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            state.catalog.replace(object)?;
+        }
+        Opcode::DropTable => {
+            if !mutation.key.is_empty()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let Some(CatalogObject::Relation(_)) = state.catalog.object(target) else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            state.relational.drop_table(target)?;
+            state.catalog.remove(target)?;
+        }
+        Opcode::DropSecondaryIndex => {
+            if !mutation.key.is_empty()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let Some(CatalogObject::SecondaryIndex(_)) = state.catalog.object(target) else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            state.relational.drop_secondary_index(target)?;
+            state.catalog.remove(target)?;
         }
         Opcode::CreateSecondaryIndex => {
             apply_secondary_index_creation(state, target, mutation)?;
@@ -11949,6 +12011,13 @@ fn apply_secondary_index_creation(
         )?;
     }
     Ok(())
+}
+
+fn catalog_object_lifecycle_write_key(object: ObjectId) -> WriteKey {
+    let mut identity = Vec::with_capacity(17);
+    identity.push(1);
+    identity.extend_from_slice(&object.get().to_be_bytes());
+    WriteKey::new(EngineKind::Kernel, None, identity)
 }
 
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
@@ -12018,10 +12087,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 | Opcode::CreateAnnIndex
         ) {
             if let Some(object) = mutation.target {
-                let mut object_key = Vec::with_capacity(17);
-                object_key.push(1);
-                object_key.extend_from_slice(&object.get().to_be_bytes());
-                keys.push(WriteKey::new(EngineKind::Kernel, None, object_key));
+                keys.push(catalog_object_lifecycle_write_key(object));
             }
             let name_identity = if mutation.key.is_empty() {
                 mutation.value.as_slice()
@@ -12063,6 +12129,15 @@ fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
 fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = mutation_write_keys(mutations);
     for mutation in mutations {
+        if mutation.engine == EngineKind::Relational
+            && matches!(
+                mutation.opcode,
+                Opcode::InsertRow | Opcode::UpdateRow | Opcode::DeleteRow
+            )
+            && let Some(object) = mutation.target
+        {
+            keys.push(catalog_object_lifecycle_write_key(object));
+        }
         if matches!(
             mutation.opcode,
             Opcode::SetHashField | Opcode::DeleteHashField | Opcode::ExpireHashField
@@ -12586,7 +12661,13 @@ fn catalog_root_after_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
-    let rebuild = catalog_requires_full_rebuild(pages, root)?;
+    let rebuild = catalog_requires_full_rebuild(pages, root)?
+        || mutations.iter().any(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::DropSecondaryIndex | Opcode::DropTable | Opcode::RenameTable
+            )
+        });
     let tree = if rebuild {
         let secondary_indexes = catalog
             .objects
@@ -17151,6 +17232,62 @@ fn search_root_after_mutations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn relational_tree_from_state(
+    pages: &mut PageStore,
+    format: RelationalFormat,
+    creating_csn: Csn,
+    catalog: &CatalogState,
+    relational: &RelationState,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let mut entries = vec![(RELATIONAL_FORMAT_KEY.to_vec(), format.marker().to_vec())];
+    for (table, rows) in &relational.tables {
+        entries.push((relational_table_key(*table), Vec::new()));
+        for (primary_key, stored) in rows {
+            let row = RowRecord::new(
+                relational_row_id(*table, primary_key)?,
+                creating_csn,
+                None,
+                vec![
+                    Some(primary_key.clone()),
+                    Some(relational_storage_value(stored, blob_references)?),
+                ],
+            )?;
+            let value = match format {
+                RelationalFormat::InlineRowV1 => row.encode()?,
+                RelationalFormat::VersionChainV2 => {
+                    append_row_version(pages, None, &row, creating_csn)?
+                }
+            };
+            entries.push((relational_row_key(*table, primary_key), value));
+        }
+    }
+    for (index, state) in &relational.indexes {
+        let Some(CatalogObject::SecondaryIndex(definition)) = catalog.object(*index) else {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        };
+        entries.push((
+            relational_secondary_index_key(*index),
+            encode_secondary_index_metadata(definition, state.layout).to_vec(),
+        ));
+        for (index_key, primary_keys) in &state.entries {
+            for primary_key in primary_keys {
+                let identity =
+                    secondary_index_entry_identity(state.layout, index_key, primary_key)?;
+                entries.push((
+                    relational_secondary_entry_key(*index, &identity)?,
+                    vec![RELATIONAL_SECONDARY_ENTRY_LIVE],
+                ));
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(BTree::empty()
+        .upsert_sorted_batch(pages, creating_csn, entries)?
+        .tree)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn relational_tree_after_mutations(
     pages: &mut PageStore,
@@ -17163,7 +17300,24 @@ fn relational_tree_after_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
-    let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
+    let rebuild_for_drop = mutations.iter().any(|mutation| {
+        matches!(
+            mutation.opcode,
+            Opcode::DropSecondaryIndex | Opcode::DropTable | Opcode::RenameTable
+        )
+    });
+    let mut tree = if rebuild_for_drop {
+        relational_tree_from_state(
+            pages,
+            format,
+            creating_csn,
+            catalog,
+            relational,
+            blob_references,
+        )?
+    } else {
+        root.map_or_else(BTree::empty, BTree::from_root)
+    };
     if tree.root().is_none() {
         tree = tree
             .insert_unique(
@@ -17181,6 +17335,18 @@ fn relational_tree_after_mutations(
         let target = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        if mutation.opcode == Opcode::RenameTable {
+            continue;
+        }
+        if matches!(
+            mutation.opcode,
+            Opcode::DropSecondaryIndex | Opcode::DropTable
+        ) {
+            if !mutation.key.is_empty() || !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            continue;
+        }
         let key = match mutation.opcode {
             Opcode::CreateTable => {
                 tree = tree
@@ -17285,6 +17451,7 @@ fn relational_tree_after_mutations(
             relational,
         )?;
         if mutation.opcode != Opcode::DeleteRow {
+            validate_relation_checks(catalog, target, &mutation.value)?;
             let new_projections = secondary_index_projections(catalog, target, &mutation.value)?;
             tree = write_secondary_index_projection_markers(
                 pages,
@@ -17490,6 +17657,201 @@ fn remove_secondary_index_projections(
 ) -> Result<(), NativeRuntimeError> {
     for projection in projections {
         relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
+    }
+    Ok(())
+}
+
+fn validate_parent_not_referenced_state(
+    state: &MaterializedState,
+    parent_id: ObjectId,
+    parent_key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(parent)) = state.catalog.object(parent_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    for object in state.catalog.objects.values() {
+        let CatalogObject::Relation(child) = object else {
+            continue;
+        };
+        for foreign_key in &child.foreign_keys {
+            if foreign_key.referenced_relation != parent_id {
+                continue;
+            }
+            let Some(rows) = state.relational.tables.get(&child.header.id) else {
+                continue;
+            };
+            for stored in rows.values() {
+                let tuple = RowTupleView::decode(stored)?;
+                let mut key = Vec::new();
+                let mut contains_null = false;
+                for (child_id, parent_column_id) in foreign_key
+                    .columns
+                    .iter()
+                    .zip(&foreign_key.referenced_columns)
+                {
+                    let child_index = child
+                        .columns
+                        .iter()
+                        .position(|column| column.id == *child_id)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                    let parent_type = &parent
+                        .columns
+                        .iter()
+                        .find(|column| column.id == *parent_column_id)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                        .logical_type;
+                    let value = match tuple
+                        .value(child_index)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                    {
+                        ColumnValueRef::Null => {
+                            contains_null = true;
+                            break;
+                        }
+                        ColumnValueRef::Bytes(encoded) => {
+                            ScalarValue::decode_storage(parent_type, encoded)
+                                .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?
+                        }
+                    };
+                    key.extend_from_slice(
+                        &value
+                            .encode_ordered_component(parent_type)
+                            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+                    );
+                }
+                if !contains_null && key == parent_key {
+                    return Err(NativeRuntimeError::ForeignKeyConstraintViolation);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_relation_foreign_keys(
+    state: &MaterializedState,
+    relation_id: ObjectId,
+    row: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(relation)) = state.catalog.object(relation_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    if relation.foreign_keys.is_empty() {
+        return Ok(());
+    }
+    let tuple = RowTupleView::decode(row)?;
+    for foreign_key in &relation.foreign_keys {
+        let Some(CatalogObject::Relation(parent)) =
+            state.catalog.object(foreign_key.referenced_relation)
+        else {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        };
+        let mut key = Vec::new();
+        let mut contains_null = false;
+        for (child_id, parent_id) in foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+        {
+            let child_index = relation
+                .columns
+                .iter()
+                .position(|column| column.id == *child_id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let parent_type = &parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                .logical_type;
+            let value = match tuple
+                .value(child_index)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+            {
+                ColumnValueRef::Null => {
+                    contains_null = true;
+                    break;
+                }
+                ColumnValueRef::Bytes(encoded) => ScalarValue::decode_storage(parent_type, encoded)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            };
+            key.extend_from_slice(
+                &value
+                    .encode_ordered_component(parent_type)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            );
+        }
+        let parent_exists = if let Some(index) = foreign_key.referenced_index {
+            state
+                .relational
+                .indexes
+                .get(&index)
+                .and_then(|index| index.entries.get(&key))
+                .is_some_and(|entries| !entries.is_empty())
+        } else {
+            state
+                .relational
+                .select(foreign_key.referenced_relation, &key)
+                .is_some()
+        };
+        if !contains_null && !parent_exists {
+            return Err(NativeRuntimeError::ForeignKeyConstraintViolation);
+        }
+    }
+    Ok(())
+}
+
+fn validate_relation_checks(
+    catalog: &CatalogState,
+    relation_id: ObjectId,
+    row: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(relation)) = catalog.object(relation_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    if relation.checks.is_empty() {
+        return Ok(());
+    }
+    let tuple = RowTupleView::decode(row)?;
+    if tuple.column_count() != relation.columns.len() {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    for (column_id, check) in &relation.checks {
+        let index = relation
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let column = &relation.columns[index];
+        let value = match tuple
+            .value(index)
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+        {
+            ColumnValueRef::Null => continue,
+            ColumnValueRef::Bytes(encoded) => {
+                ScalarValue::decode_storage(&column.logical_type, encoded)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?
+            }
+        };
+        let left = value
+            .encode_ordered_component(&column.logical_type)
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+        let right = check
+            .operand
+            .encode_ordered_component(&column.logical_type)
+            .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?;
+        let ordering = left.cmp(&right);
+        let passes = match check.operator {
+            ColumnCheckOperator::Equal => ordering == ValueOrdering::Equal,
+            ColumnCheckOperator::NotEqual => ordering != ValueOrdering::Equal,
+            ColumnCheckOperator::Less => ordering == ValueOrdering::Less,
+            ColumnCheckOperator::LessOrEqual => ordering != ValueOrdering::Greater,
+            ColumnCheckOperator::Greater => ordering == ValueOrdering::Greater,
+            ColumnCheckOperator::GreaterOrEqual => ordering != ValueOrdering::Less,
+        };
+        if !passes {
+            return Err(NativeRuntimeError::CheckConstraintViolation);
+        }
     }
     Ok(())
 }
@@ -19995,6 +20357,8 @@ fn binary_relation_definition(
             },
         ],
         primary_key: vec![ColumnId::new(1).map_err(|_| CatalogError::EmptyName)?],
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
     };
     definition.validate()?;
     Ok(definition)
@@ -20190,6 +20554,8 @@ mod tests {
             },
             columns,
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
         })
     }
 
@@ -23178,6 +23544,138 @@ mod tests {
             assert!(matches!(
                 super::load_structure_state(&database.pages, &database.blobs, &forged),
                 Err(NativeRuntimeError::InvalidStructureTree)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_drop_table_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql("CREATE TABLE people (id BIGINT PRIMARY KEY)", &[])?;
+            seed.execute_sql("INSERT INTO people (id) VALUES (1)", &[])?;
+            seed.commit()?;
+            let mut drop_table = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            drop_table.execute_sql("DROP TABLE people", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(drop_table, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let query = reopened.prepare_sql_latest("SELECT id FROM people WHERE id = 1");
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(query.is_ok()),
+                Some(2) => assert!(query.is_err()),
+                other => return Err(format!("unexpected DROP TABLE CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_drop_index_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql(
+                "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+                &[],
+            )?;
+            seed.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+            seed.execute_sql(
+                "INSERT INTO people (id, email) VALUES (1, 'a@example.com')",
+                &[],
+            )?;
+            seed.commit()?;
+            let mut drop_index = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            drop_index.execute_sql("DROP INDEX people_email", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(drop_index, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let index_query = reopened.prepare_sql_latest("SELECT id FROM people WHERE email = ?");
+            let primary_query =
+                reopened.prepare_sql_latest("SELECT email FROM people WHERE id = 1");
+            assert!(primary_query.is_ok());
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(index_query.is_ok()),
+                Some(2) => assert!(index_query.is_err()),
+                other => return Err(format!("unexpected DDL CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_ddl_boundary_recovers_prior_or_complete_catalog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql(
+                "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT)",
+                &[],
+            )?;
+            seed.execute_sql(
+                "INSERT INTO people (id, email) VALUES (1, 'a@example.com')",
+                &[],
+            )?;
+            seed.commit()?;
+            let mut rename = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            rename.execute_sql("ALTER TABLE people RENAME TO contacts", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(rename, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let old = reopened.prepare_sql_latest("SELECT email FROM people WHERE id = 1");
+            let new = reopened.prepare_sql_latest("SELECT email FROM contacts WHERE id = 1");
+            assert!(matches!(
+                (old.is_ok(), new.is_ok()),
+                (true, false) | (false, true)
             ));
         }
         Ok(())

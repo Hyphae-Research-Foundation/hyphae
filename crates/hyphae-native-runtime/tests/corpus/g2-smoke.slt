@@ -1,0 +1,48 @@
+# Hyphae Native G2 bounded SQLLogicTest corpus v1
+
+statement ok
+CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)
+
+statement ok
+INSERT INTO accounts (id, name, active) VALUES (1, 'alpha', TRUE)
+
+statement ok
+INSERT INTO accounts (id, name, active) VALUES (2, 'beta', FALSE)
+
+query IT rowsort
+SELECT id, name FROM accounts ORDER BY id LIMIT 10
+----
+1 alpha
+2 beta
+
+query I
+SELECT id FROM accounts WHERE id = 2
+----
+2
+
+statement ok
+UPDATE accounts SET name = 'beta-2' WHERE id = 2
+
+query T
+SELECT name FROM accounts WHERE id = 2
+----
+beta-2
+
+query I
+WITH selected AS (SELECT id FROM accounts WHERE active = TRUE LIMIT 10) SELECT id FROM selected LIMIT 10
+----
+1
+
+query II rowsort
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS row_number FROM accounts ORDER BY id LIMIT 10
+----
+1 1
+2 2
+
+statement ok
+DELETE FROM accounts WHERE id = 1
+
+query I
+SELECT id FROM accounts ORDER BY id LIMIT 10
+----
+2

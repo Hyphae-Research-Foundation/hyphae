@@ -15,6 +15,104 @@ scans are implemented experimentally as described below. G2 remains open
 Hyphae SQL is a native SQL implementation. Its familiar syntax does not imply
 an embedded PostgreSQL engine or PostgreSQL-specific semantics.
 
+The first bounded non-recursive CTE materialization slice is also implemented:
+
+```text
+WITH <name> AS (
+  SELECT <projection> FROM <base-table> [WHERE ...] LIMIT <n>
+)
+SELECT <projection> FROM <name> [LIMIT <n>]
+```
+
+The inner query uses the ordinary catalog-bound native SELECT executor, then
+materializes its bounded rows as one statement-local relation. The outer query
+may project those rows and apply a second bound. Parameters are accepted by the
+inner query and retain statement-text ordering. Recursive CTEs, nested CTEs,
+outer filters/order, joins against a CTE, multiple CTEs,
+and durable catalog publication are rejected. This slice is not complete G2
+CTE support and does not change the gate status.
+
+The first bounded streaming window slice is implemented for single-column
+primary keys:
+
+```text
+SELECT <column>,
+       { ROW_NUMBER() | RANK() } OVER (ORDER BY <primary-key>) AS <alias>
+FROM <table>
+ORDER BY <primary-key>
+LIMIT <n>
+```
+
+It reuses native primary-key ordered scans, computes unsigned one-based
+ordinals, applies the output limit, and requires the outer order to match the
+window order. A single `PARTITION BY` column is supported when it is the first
+component of a two-column primary key and the window order is the second; the
+ordinal resets at each canonical partition boundary. Because the complete
+window order is unique in these admitted shapes, `RANK` and `ROW_NUMBER`
+intentionally coincide. Ties on non-unique order keys,
+multiple partition columns or composite order suffixes, descending/null ordering,
+frames, additional window functions, snapshot/latest prepared execution, and
+spill remain unsupported and fail closed. This slice does not close the G2
+window-function requirement.
+
+The current typed DDL also admits one persistent column-local CHECK shape:
+
+```text
+<column> <type> [NOT NULL] CHECK (<same-column> <comparison> <typed-literal>)
+```
+
+The constraint binds its literal to the declared logical type, persists by
+stable column ID in the canonical catalog definition, and is enforced before
+`INSERT` or `UPDATE` mutates private relational/index state. SQL null satisfies
+this first CHECK slice as `UNKNOWN`; `NOT NULL` remains the separate null gate.
+Mismatched columns, parameters, duplicate CHECK clauses, null literals, and
+unsupported expressions fail binding. Catalog decoding remains compatible with
+legacy relation definitions that end after the primary-key list. Reopen/WAL
+replay preserves enforcement. Table-level predicates, multi-column expressions,
+functions, deferred checks, and named constraints remain outside this slice.
+
+The first immediate foreign-key shape is also admitted:
+
+```text
+FOREIGN KEY (<child-primary-compatible-columns>)
+REFERENCES <parent-table> (<complete-parent-primary-key>)
+```
+
+It uses `MATCH SIMPLE`, immediate `NO ACTION` semantics for child insert: any
+null child component bypasses the lookup; otherwise the complete typed parent
+primary key must be visible in the transaction state. Child inserts and updates
+are revalidated, and parent deletion uses immediate `NO ACTION` by scanning
+transaction-visible child rows. The definition persists
+by relation/column IDs and survives reopen. Composite keys are supported when
+arity/types/order match. Parent primary-key UPDATE is already rejected by the
+native mutation contract. Commit-time rebase and group-admission validation
+protect both race orders; self references are supported when the inserted row's
+own complete PK satisfies the reference. A non-null ordered `UNIQUE` secondary
+index may also be the parent target; the catalog persists its stable index ID
+and foreground/rebase enforcement probes the unique index. `CONSTRAINT name`
+is accepted for table-level foreign keys, normalized and persisted; duplicate
+names within one relation fail catalog validation. Cascades and deferred
+enforcement are not yet implemented; those forms fail or remain outside this
+slice.
+
+`DROP INDEX <name>` is strict: the index must exist and be a relational secondary
+index. Commit removes its catalog object/name/dependency entries and rebuilds
+the relational namespace without its metadata or entry keys. Existing prepared
+plans fail with `CatalogChanged`; reopen preserves the absence. `IF EXISTS` and
+`CASCADE` are not accepted.
+
+`DROP TABLE <name>` uses strict `RESTRICT` semantics: live secondary indexes or
+incoming foreign keys block it. After dependencies are removed, commit removes
+the relation and all row keys, rebuilds catalog/relational roots, invalidates
+prepared plans and preserves absence across reopen. `IF EXISTS` and `CASCADE`
+remain unsupported.
+
+`ALTER TABLE <old> RENAME TO <new>` is metadata-only: it preserves the stable
+relation ID and physical row namespace, atomically replaces the catalog name,
+invalidates old prepared plans and survives reopen. Existing rows remain
+queryable through the new name. Other ALTER forms fail closed until row-codec
+migration semantics are implemented.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,
