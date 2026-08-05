@@ -115,6 +115,24 @@ impl CatalogState {
         Ok(())
     }
 
+    #[expect(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
+    pub(crate) fn remove(&mut self, id: ObjectId) -> Result<CatalogObject, ModelError> {
+        let object = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
+        if matches!(object, CatalogObject::Relation(_))
+            && self.objects.values().any(|candidate| match candidate {
+                CatalogObject::SecondaryIndex(index) => index.relation == id,
+                CatalogObject::Relation(relation) => relation
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_relation == id),
+                CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+            })
+        {
+            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+        }
+        self.objects.remove(&id).ok_or(ModelError::UnknownObject)
+    }
+
     pub(crate) fn object(&self, id: ObjectId) -> Option<&CatalogObject> {
         self.objects.get(&id)
     }
@@ -269,6 +287,14 @@ impl RelationState {
             return Err(ModelError::DuplicateObjectId);
         }
         Ok(())
+    }
+
+    #[expect(dead_code, reason = "wired by the pending DROP INDEX WAL/SQL vertical")]
+    pub(crate) fn drop_secondary_index(
+        &mut self,
+        id: ObjectId,
+    ) -> Result<SecondaryIndexState, ModelError> {
+        self.indexes.remove(&id).ok_or(ModelError::UnknownObject)
     }
 
     pub(crate) fn create_secondary_index(
@@ -2098,6 +2124,25 @@ mod tests {
             )?),
             Err(ModelError::DuplicateObjectName)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relational_index_drop_is_strict_and_removes_all_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let mut relational = RelationState::default();
+        relational.create_table(table)?;
+        relational.create_secondary_index(index, table, false, true)?;
+        relational.insert_secondary_index(index, b"email".to_vec(), b"pk".to_vec(), false)?;
+        let removed = relational.drop_secondary_index(index)?;
+        assert_eq!(removed.relation, table);
+        assert_eq!(removed.entries.len(), 1);
+        assert!(matches!(
+            relational.drop_secondary_index(index),
+            Err(ModelError::UnknownObject)
+        ));
         Ok(())
     }
 
