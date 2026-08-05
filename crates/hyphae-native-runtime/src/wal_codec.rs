@@ -1204,8 +1204,12 @@ mod tests {
             decode_opcode(40)?,
             (Opcode::DropSecondaryIndex, EngineKind::Relational)
         );
+        assert_eq!(
+            decode_opcode(41)?,
+            (Opcode::RenameTable, EngineKind::Relational)
+        );
         assert!(matches!(
-            decode_opcode(41),
+            decode_opcode(42),
             Err(WalSemanticError::InvalidBody)
         ));
         Ok(())
