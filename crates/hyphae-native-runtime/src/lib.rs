@@ -133,8 +133,9 @@ pub use local_transaction::{
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use native_hybrid::{
-    MAX_NATIVE_HYBRID_BRANCH_HITS, MAX_NATIVE_HYBRID_RETURNED, NativeHybridError,
-    NativeHybridReceipt, NativeHybridRequest, NativeVectorBranch,
+    MAX_NATIVE_HYBRID_BRANCH_HITS, MAX_NATIVE_HYBRID_RETURNED, NATIVE_HYBRID_RRF_CONSTANT,
+    NativeHybridError, NativeHybridExplanation, NativeHybridFusion, NativeHybridMatch,
+    NativeHybridOutcome, NativeHybridReceipt, NativeHybridRequest, NativeVectorBranch,
 };
 pub use search_doc_values::{
     DocValue, DocValueAggregation, DocValueAggregationValue, DocValueCandidate, DocValueError,

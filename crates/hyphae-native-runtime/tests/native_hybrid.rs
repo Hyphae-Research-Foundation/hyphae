@@ -3,11 +3,10 @@
 //! Embedded native hybrid retrieval coverage.
 
 use hyphae_native_runtime::{
-    AnnSearchOptions, HnswConfig, NativeDatabase, NativeHybridError, NativeHybridRequest,
-    NativeVectorBranch, Vector, VectorMetric,
+    AnnSearchOptions, HnswConfig, NativeDatabase, NativeHybridError, NativeHybridFusion,
+    NativeHybridOutcome, NativeHybridRequest, NativeVectorBranch, Vector, VectorMetric,
 };
 use hyphae_native_types::{DurabilityClass, ObjectId};
-use hyphae_retrieval::{HybridOutcome, HybridRequest};
 
 static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -51,7 +50,7 @@ fn request(
         vector_query: query,
         vector_branch,
         vector_limit: 3,
-        fusion: HybridRequest {
+        fusion: NativeHybridFusion {
             lexical_weight: 1,
             vector_weight: 1,
             limit: 3,
@@ -96,10 +95,10 @@ fn exact_hybrid_fuses_stable_ids_on_one_snapshot_with_explanations()
     assert_eq!(receipt.lexical_candidates, 2);
     assert_eq!(receipt.vector_candidates, 3);
     assert!(receipt.ann.is_none());
-    let HybridOutcome::Matches { matches, .. } = receipt.outcome else {
+    let NativeHybridOutcome::Matches(matches) = receipt.outcome else {
         return Err(std::io::Error::other("hybrid unexpectedly abstained").into());
     };
-    assert_eq!(matches[0].key, shared.get().to_be_bytes());
+    assert_eq!(matches[0].object_id, shared);
     assert_eq!(matches[0].explanation.lexical_rank, Some(2));
     assert_eq!(matches[0].explanation.vector_rank, Some(1));
     assert_eq!(matches[0].explanation.final_rank, 1);
@@ -154,13 +153,13 @@ fn ann_hybrid_exposes_ann_receipt_and_rejects_branch_limit_mismatch()
     request.vector_limit = 2;
     assert!(matches!(
         database.retrieve_hybrid_latest(0, &request),
-        Err(NativeHybridError::InvalidLimit)
+        Err(NativeHybridError::InvalidRequest)
     ));
     request.vector_limit = 1;
     request.lexical_limit = 0;
     assert!(matches!(
         database.retrieve_hybrid_latest(0, &request),
-        Err(NativeHybridError::InvalidLimit)
+        Err(NativeHybridError::InvalidRequest)
     ));
     Ok(())
 }

@@ -239,12 +239,44 @@
       "rationale": "Procedural macro implementation for thiserror."
     },
     {
+      "name": "tinyvec",
+      "version": "1.12.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "category": "Unicode analyzer primitive",
+      "rationale": "Bounded vector storage used transitively by Unicode normalization tables."
+    },
+    {
+      "name": "tinyvec_macros",
+      "version": "0.1.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0 OR Zlib",
+      "category": "Unicode analyzer primitive",
+      "rationale": "Macro support used transitively by tinyvec."
+    },
+    {
+      "name": "unicode-casefold",
+      "version": "0.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT/Apache-2.0",
+      "category": "Unicode analyzer primitive",
+      "rationale": "Unicode default case folding for the versioned native analyzer; no search engine semantics."
+    },
+    {
       "name": "unicode-ident",
       "version": "1.0.24",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
       "category": "derive build primitive",
       "rationale": "Unicode identifier tables used by proc-macro2 and syn."
+    },
+    {
+      "name": "unicode-normalization",
+      "version": "0.1.25",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "Unicode analyzer primitive",
+      "rationale": "NFKC normalization for the versioned native analyzer; no search engine semantics."
     },
     {
       "name": "zmij",
