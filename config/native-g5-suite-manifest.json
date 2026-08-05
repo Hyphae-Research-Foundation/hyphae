@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-g5-suite-manifest-v1",
+  "gate": "G5",
+  "requirements": [
+    {"id": "all-engine-atomicity", "workloads": ["three-engine-commit"], "suites": [{"name": "four-surface-atomicity", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "all_engine_transaction_g5", "--locked"]}]},
+    {"id": "concurrent-readers", "workloads": ["reader-snapshots"], "suites": [{"name": "mixed-csn-harness", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "concurrent_reader_consistency_g5", "concurrent_readers_never_observe_mixed_generation_or_csn", "--locked"]}]},
+    {"id": "stable-ids-and-links", "workloads": ["identity-links"], "suites": [{"name": "object-id-joins", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "convergence", "search_sources_join_on_object_id_with_oracle_metrics_and_snapshot_stability", "--locked"]}, {"name": "catalog-links", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "catalog_relation_index_dependencies_are_complete_and_fail_closed", "--locked"]}]},
+    {"id": "structure-source", "workloads": ["structure-relation"], "suites": [{"name": "relation-valued-structures", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "convergence", "all_structure_families_are_relation_valued_and_bounded", "--locked"]}]},
+    {"id": "search-source", "workloads": ["search-relation"], "suites": [{"name": "relation-valued-search", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "convergence", "search_sources_join_on_object_id_with_oracle_metrics_and_snapshot_stability", "--locked"]}]},
+    {"id": "joins-aggregates-pushdown", "workloads": ["cross-operator-plan"], "suites": [{"name": "convergence-operators", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "convergence", "--locked"]}]},
+    {"id": "checkpoint-complete-state", "workloads": ["complete-checkpoint"], "suites": [{"name": "four-surface-recovery", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "all_engine_transaction_g5", "embedded_seven_boundaries_reopen_to_prior_or_complete_four_surface_commit", "--locked"]}, {"name": "immutable-checkpoint", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "immutable_checkpoint_round_trips_without_advancing_csn", "--locked"]}]},
+    {"id": "backup-restore", "workloads": ["complete-restore"], "suites": [{"name": "native-backup-restore", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "native_backup_round_trip_opens_and_preserves_logical_state", "--locked"]}, {"name": "restore-failure-paths", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "corruption_missing_files_and_existing_destination_never_activate", "--locked"]}]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

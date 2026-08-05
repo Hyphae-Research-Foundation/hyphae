@@ -1,0 +1,8 @@
+{
+  "schema": "hyphae-native-g5-readiness-evidence-v1",
+  "gate": "G5",
+  "predecessor": null,
+  "evidence": {},
+  "claims": [],
+  "closure_declared": false
+}

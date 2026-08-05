@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g5-readiness-profile-v1",
+  "gate": "G5",
+  "scope": "cross-engine-convergence",
+  "requirements": [
+    {"id": "all-engine-atomicity", "required_evidence": "hosted"},
+    {"id": "concurrent-readers", "required_evidence": "hosted"},
+    {"id": "stable-ids-and-links", "required_evidence": "hosted"},
+    {"id": "structure-source", "required_evidence": "hosted"},
+    {"id": "search-source", "required_evidence": "hosted"},
+    {"id": "joins-aggregates-pushdown", "required_evidence": "hosted"},
+    {"id": "checkpoint-complete-state", "required_evidence": "hosted"},
+    {"id": "backup-restore", "required_evidence": "hosted"}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

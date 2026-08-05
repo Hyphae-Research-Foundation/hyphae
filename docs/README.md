@@ -124,6 +124,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Manifest format v1](storage/manifest-format-v1.md)
 - [Compaction protocol v1](storage/compaction-v1.md)
 - [Native page-generation vacuum v1](native/page-vacuum-v1.md)
+- [Native backup and restore v1](native/native-backup-v1.md)
 
 ## Decisions and governance
 

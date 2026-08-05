@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const CATALOG_MAGIC_V1: [u8; 8] = *b"HYCAT001";
 const CATALOG_MAGIC_V2: [u8; 8] = *b"HYCAT002";
+const CATALOG_MAGIC_V3: [u8; 8] = *b"HYCAT005";
 const STRUCTURE_MAGIC: [u8; 8] = *b"HYSTR001";
 const SEARCH_MAGIC: [u8; 8] = *b"HYSEA001";
 
@@ -68,9 +69,19 @@ pub(crate) enum ModelError {
     Catalog(#[from] CatalogError),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogState {
     pub(crate) objects: BTreeMap<ObjectId, CatalogObject>,
+    next_object_id: Option<u128>,
+}
+
+impl Default for CatalogState {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            next_object_id: Some(1),
+        }
+    }
 }
 
 impl CatalogState {
@@ -111,6 +122,20 @@ impl CatalogState {
             };
             definition.validate_relation(relation)?;
         }
+        if let CatalogObject::CrossEngineLink(definition) = &object {
+            let source = self.objects.get(&definition.source);
+            let target = self.objects.get(&definition.target);
+            let (Some(source), Some(target)) = (source, target) else {
+                return Err(ModelError::Catalog(CatalogError::InvalidCrossEngineLink));
+            };
+            if source.header().owner == target.header().owner {
+                return Err(ModelError::Catalog(CatalogError::InvalidCrossEngineLink));
+            }
+        }
+        self.next_object_id = match (self.next_object_id, id.get().checked_add(1)) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (_, None) | (None, _) => None,
+        };
         self.objects.insert(id, object);
         Ok(())
     }
@@ -134,17 +159,18 @@ impl CatalogState {
     }
 
     pub(crate) fn remove(&mut self, id: ObjectId) -> Result<CatalogObject, ModelError> {
-        let object = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
-        if matches!(object, CatalogObject::Relation(_))
-            && self.objects.values().any(|candidate| match candidate {
-                CatalogObject::SecondaryIndex(index) => index.relation == id,
-                CatalogObject::Relation(relation) => relation
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_relation == id),
-                CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
-            })
-        {
+        if !self.objects.contains_key(&id) {
+            return Err(ModelError::UnknownObject);
+        }
+        if self.objects.values().any(|candidate| match candidate {
+            CatalogObject::SecondaryIndex(index) => index.relation == id,
+            CatalogObject::Relation(relation) => relation
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_relation == id),
+            CatalogObject::CrossEngineLink(link) => link.source == id || link.target == id,
+            CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+        }) {
             return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
         }
         self.objects.remove(&id).ok_or(ModelError::UnknownObject)
@@ -174,16 +200,35 @@ impl CatalogState {
     }
 
     pub(crate) fn next_object_id(&self) -> Result<ObjectId, ModelError> {
-        let next = self.objects.keys().next_back().map_or(Ok(1_u128), |id| {
-            id.get().checked_add(1).ok_or(ModelError::ObjectIdExhausted)
-        })?;
-        ObjectId::new(next).map_err(|_| ModelError::ZeroObjectId)
+        ObjectId::new(self.next_object_id.ok_or(ModelError::ObjectIdExhausted)?)
+            .map_err(|_| ModelError::ObjectIdExhausted)
+    }
+
+    pub(crate) const fn next_object_id_raw(&self) -> Option<u128> {
+        self.next_object_id
+    }
+
+    pub(crate) fn set_next_object_id_raw(
+        &mut self,
+        next_object_id: Option<u128>,
+    ) -> Result<(), ModelError> {
+        let valid = match (self.next_object_id, next_object_id) {
+            (None, None) => true,
+            (Some(required), Some(found)) => required <= found,
+            _ => false,
+        };
+        if !valid {
+            return Err(ModelError::DuplicateObjectId);
+        }
+        self.next_object_id = next_object_id;
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CATALOG_MAGIC_V2);
+        bytes.extend_from_slice(&CATALOG_MAGIC_V3);
+        bytes.extend_from_slice(&self.next_object_id.unwrap_or(0).to_le_bytes());
         put_len(&mut bytes, self.objects.len())?;
         for object in self.objects.values() {
             put_bytes(&mut bytes, &object.encode_definition()?)?;
@@ -195,6 +240,36 @@ impl CatalogState {
         if bytes.get(..8) == Some(CATALOG_MAGIC_V1.as_slice()) {
             return Self::decode_v1(bytes);
         }
+        if bytes.get(..8) == Some(CATALOG_MAGIC_V2.as_slice()) {
+            return Self::decode_v2(bytes);
+        }
+        let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V3)?;
+        let persisted_next = u128::from_le_bytes(
+            decoder
+                .take(16)?
+                .try_into()
+                .map_err(|_| ModelError::Truncated)?,
+        );
+        let count = decoder.len()?;
+        let mut state = Self::default();
+        for _ in 0..count {
+            state.create(CatalogObject::decode_definition(&decoder.bytes()?)?)?;
+        }
+        decoder.finish()?;
+        let persisted_next = (persisted_next != 0).then_some(persisted_next);
+        let valid_authority = match (state.next_object_id, persisted_next) {
+            (None, None) => true,
+            (Some(required), Some(found)) => required <= found,
+            _ => false,
+        };
+        if !valid_authority {
+            return Err(ModelError::DuplicateObjectId);
+        }
+        state.next_object_id = persisted_next;
+        Ok(state)
+    }
+
+    fn decode_v2(bytes: &[u8]) -> Result<Self, ModelError> {
         let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V2)?;
         let count = decoder.len()?;
         let mut state = Self::default();
@@ -2179,11 +2254,14 @@ impl<'bytes> Decoder<'bytes> {
 
 #[cfg(test)]
 mod tests {
-    use hyphae_native_catalog::CatalogObject;
+    use hyphae_native_catalog::{
+        CatalogName, CatalogObject, CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior,
+        CrossEngineLinkMaintenance, CrossEngineLinkMapping, ObjectHeader, QualifiedName,
+    };
     use hyphae_native_types::{EngineKind, ObjectId};
 
     use super::{
-        CATALOG_MAGIC_V1, CATALOG_MAGIC_V2, CatalogState, HashPatternModelRequest,
+        CATALOG_MAGIC_V1, CATALOG_MAGIC_V3, CatalogState, HashPatternModelRequest,
         HashPatternModelStop, ModelError, RelationState, SearchState, SortedSetMemberState,
         SortedSetScore, StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
     };
@@ -2201,6 +2279,7 @@ mod tests {
         )?)?;
         catalog.create(legacy_catalog_object(index, EngineKind::Search, "Notes")?)?;
         assert_eq!(CatalogState::decode(&catalog.encode()?)?, catalog);
+        assert!(catalog.encode()?.starts_with(&CATALOG_MAGIC_V3));
 
         let mut relational = RelationState::default();
         relational.create_table(table)?;
@@ -2246,7 +2325,108 @@ mod tests {
         };
         assert_eq!(search.fields.len(), 1);
         assert_eq!(search.header.name.object.lookup(), "notes");
-        assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V2));
+        assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V3));
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_object_ids_are_monotonic_across_drop_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = ObjectId::new(1)?;
+        let mut catalog = CatalogState::default();
+        catalog.create(legacy_catalog_object(
+            first,
+            EngineKind::Relational,
+            "first",
+        )?)?;
+        assert_eq!(catalog.next_object_id()?, ObjectId::new(2)?);
+        catalog.remove(first)?;
+        assert_eq!(catalog.next_object_id()?, ObjectId::new(2)?);
+
+        let reopened = CatalogState::decode(&catalog.encode()?)?;
+        assert_eq!(reopened.next_object_id()?, ObjectId::new(2)?);
+        assert_ne!(reopened.next_object_id()?, first);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_engine_links_survive_rename_reopen_and_restrict_endpoint_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = ObjectId::new(1)?;
+        let target = ObjectId::new(2)?;
+        let link = ObjectId::new(3)?;
+        let mut catalog = CatalogState::default();
+        catalog.create(legacy_catalog_object(
+            source,
+            EngineKind::Relational,
+            "accounts",
+        )?)?;
+        catalog.create(legacy_catalog_object(
+            target,
+            EngineKind::Search,
+            "documents",
+        )?)?;
+        catalog.create(CatalogObject::CrossEngineLink(CrossEngineLinkDefinition {
+            header: ObjectHeader {
+                id: link,
+                owner: EngineKind::Kernel,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted("account_documents")?,
+                ),
+            },
+            source,
+            target,
+            mapping: vec![CrossEngineLinkMapping {
+                source: 1,
+                target: 1,
+            }],
+            maintenance: CrossEngineLinkMaintenance::Derived,
+            delete_behavior: CrossEngineLinkDeleteBehavior::Cascade,
+            synchronous: true,
+        }))?;
+
+        let Some(CatalogObject::Relation(relation)) = catalog.object(source) else {
+            return Err("missing source relation".into());
+        };
+        let mut renamed = relation.clone();
+        renamed.header.name.object = CatalogName::unquoted("customers")?;
+        catalog.replace(CatalogObject::Relation(renamed))?;
+        assert!(catalog.remove(source).is_err());
+
+        let reopened = CatalogState::decode(&catalog.encode()?)?;
+        let Some(CatalogObject::CrossEngineLink(definition)) = reopened.object(link) else {
+            return Err("missing reopened link".into());
+        };
+        assert_eq!((definition.source, definition.target), (source, target));
+        assert_eq!(
+            reopened.id_named("customers", EngineKind::Relational)?,
+            source
+        );
+        assert_eq!(reopened.next_object_id()?, ObjectId::new(4)?);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_authority_decode_fails_closed_on_truncation_and_regression()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = CatalogState::default();
+        catalog.create(legacy_catalog_object(
+            ObjectId::new(7)?,
+            EngineKind::Relational,
+            "accounts",
+        )?)?;
+        let encoded = catalog.encode()?;
+        for length in 0..encoded.len() {
+            assert!(CatalogState::decode(&encoded[..length]).is_err());
+        }
+        let mut regressed = encoded;
+        regressed[8..24].copy_from_slice(&7_u128.to_le_bytes());
+        assert_eq!(
+            CatalogState::decode(&regressed),
+            Err(ModelError::DuplicateObjectId)
+        );
         Ok(())
     }
 
