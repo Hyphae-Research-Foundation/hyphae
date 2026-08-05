@@ -304,7 +304,7 @@ impl HyphaeEngine {
                     if !document_keys.insert(key.as_slice()) {
                         return Err(EngineError::DuplicateDocumentKey);
                     }
-                    mutations.push(Mutation::delete(key));
+                    mutations.push(Mutation::delete(key.clone()));
                 }
                 AtomicMutation::UpsertVector { space, key, vector } => {
                     if !vector_keys.insert((space, key.as_slice())) {
@@ -320,7 +320,7 @@ impl HyphaeEngine {
                     if !vector_keys.insert((space, key.as_slice())) {
                         return Err(EngineError::DuplicateDocumentKey);
                     }
-                    mutations.push(Mutation::delete_vector(space.clone(), key));
+                    mutations.push(Mutation::delete_vector(space.clone(), key.clone()));
                 }
             }
         }
