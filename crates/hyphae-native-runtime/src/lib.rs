@@ -23550,6 +23550,96 @@ mod tests {
     }
 
     #[test]
+    fn every_drop_table_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql("CREATE TABLE people (id BIGINT PRIMARY KEY)", &[])?;
+            seed.execute_sql("INSERT INTO people (id) VALUES (1)", &[])?;
+            seed.commit()?;
+            let mut drop_table = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            drop_table.execute_sql("DROP TABLE people", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(drop_table, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let query = reopened.prepare_sql_latest("SELECT id FROM people WHERE id = 1");
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(query.is_ok()),
+                Some(2) => assert!(query.is_err()),
+                other => return Err(format!("unexpected DROP TABLE CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_drop_index_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql(
+                "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+                &[],
+            )?;
+            seed.execute_sql("CREATE INDEX people_email ON people (email)", &[])?;
+            seed.execute_sql(
+                "INSERT INTO people (id, email) VALUES (1, 'a@example.com')",
+                &[],
+            )?;
+            seed.commit()?;
+            let mut drop_index = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            drop_index.execute_sql("DROP INDEX people_email", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(drop_index, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let index_query = reopened.prepare_sql_latest("SELECT id FROM people WHERE email = ?");
+            let primary_query =
+                reopened.prepare_sql_latest("SELECT email FROM people WHERE id = 1");
+            assert!(primary_query.is_ok());
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(index_query.is_ok()),
+                Some(2) => assert!(index_query.is_err()),
+                other => return Err(format!("unexpected DDL CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn every_ddl_boundary_recovers_prior_or_complete_catalog()
     -> Result<(), Box<dyn std::error::Error>> {
         for boundary in [
