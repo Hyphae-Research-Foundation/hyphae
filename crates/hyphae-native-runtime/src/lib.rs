@@ -286,6 +286,7 @@ const STRUCTURE_HASH_EXPIRY_LIVE: u8 = 2;
 const STRUCTURE_SET_EXPIRY_LIVE: u8 = 3;
 const STRUCTURE_LIST_EXPIRY_LIVE: u8 = 4;
 const STRUCTURE_STREAM_EXPIRY_LIVE: u8 = 5;
+const STRUCTURE_SORTED_SET_EXPIRY_LIVE: u8 = 6;
 const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
 /// Maximum field positions admitted by one native hash multi-field call.
@@ -1178,6 +1179,7 @@ enum DueStructureKind {
     Set,
     List,
     Stream,
+    SortedSet,
     HashField,
 }
 
@@ -3519,6 +3521,7 @@ impl NativeDatabase {
                         DueStructureKind::Set => Opcode::DeleteSet,
                         DueStructureKind::List => Opcode::DeleteList,
                         DueStructureKind::Stream => Opcode::DeleteStream,
+                        DueStructureKind::SortedSet => Opcode::DeleteSortedSet,
                         DueStructureKind::HashField => Opcode::DeleteHashField,
                     },
                     target: None,
@@ -4058,6 +4061,19 @@ impl NativeDatabase {
                     _ => return Err(NativeRuntimeError::InvalidStructureTree),
                 };
                 (DueStructureKind::Stream, expiry)
+            }
+            [STRUCTURE_SORTED_SET_EXPIRY_LIVE] => {
+                let metadata = tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &structure_sorted_set_meta_key(key)?,
+                    )?
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                (
+                    DueStructureKind::SortedSet,
+                    decode_sorted_set_metadata_state(metadata.bytes())?.1,
+                )
             }
             _ => return Err(NativeRuntimeError::InvalidStructureTree),
         };
@@ -13631,6 +13647,7 @@ fn validate_write_batch_shape(
                                 | Opcode::DeleteSet
                                 | Opcode::DeleteList
                                 | Opcode::DeleteStream
+                                | Opcode::DeleteSortedSet
                                 | Opcode::DeleteHashField
                         )
                         && mutation.target.is_none()
@@ -13744,7 +13761,10 @@ fn validate_delta_write_batch_shape(
                         && delta.structure_scalars.contains(&mutation.key)
                         && match mutation.opcode {
                             Opcode::SetValue => true,
-                            Opcode::DeleteHash | Opcode::DeleteSet | Opcode::DeleteList => {
+                            Opcode::DeleteHash
+                            | Opcode::DeleteSet
+                            | Opcode::DeleteList
+                            | Opcode::DeleteSortedSet => {
                                 mutation.value.is_empty() && mutation.expires_at_micros.is_none()
                             }
                             _ => false,
@@ -14023,7 +14043,9 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
                 STRUCTURE_EXPIRY_LIVE
                 | STRUCTURE_HASH_EXPIRY_LIVE
                 | STRUCTURE_SET_EXPIRY_LIVE
-                | STRUCTURE_LIST_EXPIRY_LIVE,
+                | STRUCTURE_LIST_EXPIRY_LIVE
+                | STRUCTURE_STREAM_EXPIRY_LIVE
+                | STRUCTURE_SORTED_SET_EXPIRY_LIVE,
             ] => Ok(false),
             _ => Err(NativeRuntimeError::InvalidStructureTree),
         },
@@ -16625,15 +16647,25 @@ fn expire_sorted_set_in_tree(
     let metadata = tree
         .get(pages, &metadata_key)?
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    let (count, _) = decode_sorted_set_metadata_state(&metadata)?;
-    Ok(tree
-        .upsert(
-            pages,
-            creating_csn,
+    let (count, previous) = decode_sorted_set_metadata_state(&metadata)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    let mut entries = vec![
+        (
             metadata_key,
             encode_sorted_set_metadata_state(count, Some(expiry)),
-        )?
-        .tree)
+        ),
+        (expiry_key, vec![STRUCTURE_SORTED_SET_EXPIRY_LIVE]),
+    ];
+    if let Some(previous) = previous
+        && previous != expiry
+    {
+        entries.push((
+            structure_expiry_key(previous, &mutation.key)?,
+            vec![STRUCTURE_EXPIRY_TOMBSTONE],
+        ));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tree.upsert_sorted_batch(pages, creating_csn, entries)?.tree)
 }
 
 fn delete_sorted_set_in_tree(
@@ -17318,6 +17350,9 @@ fn physical_expiry_tree_after_mutations(
             Opcode::DeleteStream => {
                 physical_stream_expiry_entries(pages, tree, logical_time_micros, mutation)?
             }
+            Opcode::DeleteSortedSet => {
+                physical_sorted_set_expiry_entries(pages, tree, logical_time_micros, mutation)?
+            }
             Opcode::DeleteHashField => physical_hash_field_expiry_entries(
                 pages,
                 tree,
@@ -17482,6 +17517,46 @@ fn physical_list_expiry_entries(
     mutation: &Mutation,
 ) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
     list_retirement_entries(pages, tree, mutation, Some(logical_time_micros))
+}
+
+fn physical_sorted_set_expiry_entries(
+    pages: &PageStore,
+    tree: BTree,
+    logical_time_micros: i64,
+    mutation: &Mutation,
+) -> Result<PhysicalStructureEntries, NativeRuntimeError> {
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let (count, expiry) = decode_sorted_set_metadata_state(&metadata)?;
+    let expiry = expiry
+        .filter(|expiry| *expiry <= logical_time_micros)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let expiry_key = structure_expiry_key(expiry, &mutation.key)?;
+    if tree.get(pages, &expiry_key)?.as_deref() != Some(&[STRUCTURE_SORTED_SET_EXPIRY_LIVE]) {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut entries = vec![
+        (metadata_key, structure_tombstone_value()),
+        (expiry_key, vec![STRUCTURE_EXPIRY_TOMBSTONE]),
+    ];
+    let prefix = structure_sorted_set_member_key(&mutation.key, &[])?;
+    let mut live = 0_u64;
+    for (member_key, encoded) in tree.scan_prefix(pages, &prefix)? {
+        let Some(score) = decode_sorted_set_score(&encoded)? else {
+            continue;
+        };
+        let (key, member) = decode_sorted_set_member_identity(&member_key[1..])?;
+        let order_key = structure_sorted_set_order_key(key, score, member)?;
+        live += 1;
+        entries.push((member_key, structure_tombstone_value()));
+        entries.push((order_key, structure_tombstone_value()));
+    }
+    if live != count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(entries)
 }
 
 fn physical_stream_expiry_entries(
@@ -20340,6 +20415,7 @@ struct StructureTreeDecoder {
     retired_sorted_sets: BTreeSet<Vec<u8>>,
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
+    sorted_set_expiries: BTreeMap<Vec<u8>, i64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
     streams: BTreeMap<Vec<u8>, model::StreamEntries>,
     stream_last_ids: BTreeMap<Vec<u8>, u64>,
@@ -20431,7 +20507,8 @@ impl StructureTreeDecoder {
                         | STRUCTURE_HASH_EXPIRY_LIVE
                         | STRUCTURE_SET_EXPIRY_LIVE
                         | STRUCTURE_LIST_EXPIRY_LIVE
-                        | STRUCTURE_STREAM_EXPIRY_LIVE),
+                        | STRUCTURE_STREAM_EXPIRY_LIVE
+                        | STRUCTURE_SORTED_SET_EXPIRY_LIVE),
                     ] if self
                         .expiry_index
                         .insert((expiry, structure_key.to_vec()), *marker)
@@ -20553,6 +20630,7 @@ impl StructureTreeDecoder {
             }
             return Ok(());
         }
+        let (count, expiry) = decode_sorted_set_metadata_state(value)?;
         if self.entries.contains_key(&sorted_set)
             || self.hashes.contains_key(&sorted_set)
             || self.sets.contains_key(&sorted_set)
@@ -20563,8 +20641,13 @@ impl StructureTreeDecoder {
                 .is_some()
             || self
                 .sorted_set_counts
-                .insert(sorted_set, decode_sorted_set_metadata(value)?)
+                .insert(sorted_set.clone(), count)
                 .is_some()
+            || expiry.is_some_and(|expiry| {
+                self.sorted_set_expiries
+                    .insert(sorted_set.clone(), expiry)
+                    .is_some()
+            })
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -20734,6 +20817,7 @@ impl StructureTreeDecoder {
             retired_sorted_sets: _,
             sorted_sets,
             sorted_set_counts,
+            sorted_set_expiries,
             sorted_set_order,
             streams,
             stream_last_ids,
@@ -20762,6 +20846,7 @@ impl StructureTreeDecoder {
                 &set_expiries,
                 &list_expiries,
                 &stream_expiries,
+                &sorted_set_expiries,
                 &expiry_index,
             )?;
             validate_hash_field_expiry_index(&hash_field_expiries, &hash_field_expiry_index)?;
@@ -20769,6 +20854,7 @@ impl StructureTreeDecoder {
             || !set_expiries.is_empty()
             || !list_expiries.is_empty()
             || !stream_expiries.is_empty()
+            || !sorted_set_expiries.is_empty()
             || !hash_field_expiries.is_empty()
             || !hash_field_expiry_index.is_empty()
         {
@@ -20903,6 +20989,7 @@ fn validate_expiry_index(
     set_expiries: &BTreeMap<Vec<u8>, i64>,
     list_expiries: &BTreeMap<Vec<u8>, i64>,
     stream_expiries: &BTreeMap<Vec<u8>, i64>,
+    sorted_set_expiries: &BTreeMap<Vec<u8>, i64>,
     actual: &BTreeMap<(i64, Vec<u8>), u8>,
 ) -> Result<(), NativeRuntimeError> {
     let mut expected = entries
@@ -20940,6 +21027,14 @@ fn validate_expiry_index(
     for (key, expiry) in stream_expiries {
         if expected
             .insert(((*expiry), key.clone()), STRUCTURE_STREAM_EXPIRY_LIVE)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    for (key, expiry) in sorted_set_expiries {
+        if expected
+            .insert(((*expiry), key.clone()), STRUCTURE_SORTED_SET_EXPIRY_LIVE)
             .is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
@@ -24514,6 +24609,29 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn active_expiry_cleanup_removes_due_sorted_set_and_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut expiry = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(expiry.expire_sorted_set(b"scores".to_vec(), 10)?);
+        database.commit_optimistic(expiry)?;
+        let first = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 1);
+        assert!(matches!(
+            database.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        let second = database.expire_due_structures(10, 1, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 0);
         Ok(())
     }
 
