@@ -24276,6 +24276,68 @@ mod tests {
     }
 
     #[test]
+    fn every_stream_expiry_cleanup_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            assert!(seed.expire_stream(b"events".to_vec(), 10)?);
+            database.commit_optimistic(seed)?;
+            let result =
+                database.expire_due_structures_at(10, 1, DurabilityClass::Strict, Some(boundary));
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => {
+                    assert!(matches!(
+                        reopened.xrange_latest_stream_at(b"events", 1, u64::MAX, 8, 10),
+                        Err(NativeRuntimeError::UnknownStructureStream)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        1
+                    );
+                }
+                Some(2) => {
+                    assert!(matches!(
+                        reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8),
+                        Err(NativeRuntimeError::UnknownStructureStream)
+                    ));
+                    assert_eq!(
+                        reopened
+                            .expire_due_structures(10, 1, DurabilityClass::Strict)?
+                            .expired_keys,
+                        0
+                    );
+                }
+                other => return Err(format!("unexpected stream expiry CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn active_expiry_cleanup_removes_due_stream_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
