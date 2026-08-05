@@ -6155,6 +6155,9 @@ impl NativeDatabase {
         else {
             return self.sorted_set_missing_or_kind_error(tree, key);
         };
+        if is_structure_tombstone(metadata.bytes()) {
+            return Err(NativeRuntimeError::UnknownStructureSortedSet);
+        }
         usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)
     }
@@ -16536,6 +16539,56 @@ fn delete_stream_in_tree(
         .tree)
 }
 
+fn delete_sorted_set_in_tree(
+    pages: &mut PageStore,
+    mut tree: BTree,
+    creating_csn: Csn,
+    mutation: &Mutation,
+) -> Result<BTree, NativeRuntimeError> {
+    if !mutation.value.is_empty() || mutation.expires_at_micros.is_some() {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let metadata_key = structure_sorted_set_meta_key(&mutation.key)?;
+    let metadata = tree
+        .get(pages, &metadata_key)?
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let count = decode_sorted_set_metadata(&metadata)?;
+    let prefix = structure_sorted_set_member_key(&mutation.key, &[])?;
+    let members = tree.scan_prefix(pages, &prefix)?;
+    let mut live = 0_u64;
+    for (member_key, encoded) in members {
+        let Some(score) = decode_sorted_set_score(&encoded)? else {
+            continue;
+        };
+        let (key, member) = decode_sorted_set_member_identity(&member_key[1..])?;
+        if key != mutation.key {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        live += 1;
+        let order_key = structure_sorted_set_order_key(key, score, member)?;
+        if tree.get(pages, &order_key)?.as_deref() != Some(&set_member_live_value()) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        tree = tree
+            .upsert(pages, creating_csn, member_key, structure_tombstone_value())?
+            .tree;
+        tree = tree
+            .upsert(pages, creating_csn, order_key, structure_tombstone_value())?
+            .tree;
+    }
+    if live != count {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(tree
+        .upsert(
+            pages,
+            creating_csn,
+            metadata_key,
+            structure_tombstone_value(),
+        )?
+        .tree)
+}
+
 fn create_sorted_set_in_tree(
     pages: &mut PageStore,
     tree: BTree,
@@ -16958,6 +17011,7 @@ fn apply_structure_tree_mutation(
         Opcode::ExpireStream => expire_stream_in_tree(pages, tree, creating_csn, mutation),
         Opcode::DeleteStream => delete_stream_in_tree(pages, tree, creating_csn, mutation),
         Opcode::CreateSortedSet => create_sorted_set_in_tree(pages, tree, creating_csn, mutation),
+        Opcode::DeleteSortedSet => delete_sorted_set_in_tree(pages, tree, creating_csn, mutation),
         Opcode::UpsertSortedSetMember => {
             upsert_sorted_set_member_in_tree(pages, tree, creating_csn, mutation)
         }
@@ -20185,6 +20239,7 @@ struct StructureTreeDecoder {
     list_chunks: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u8>>>>,
     list_expiries: BTreeMap<Vec<u8>, i64>,
     retired_lists: BTreeSet<Vec<u8>>,
+    retired_sorted_sets: BTreeSet<Vec<u8>>,
     sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
     sorted_set_counts: BTreeMap<Vec<u8>, u64>,
     sorted_set_order: BTreeMap<Vec<u8>, BTreeSet<(SortedSetScore, Vec<u8>)>>,
@@ -20394,6 +20449,12 @@ impl StructureTreeDecoder {
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let sorted_set = key.to_vec();
+        if is_structure_tombstone(value) {
+            if !self.retired_sorted_sets.insert(sorted_set) {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
         if self.entries.contains_key(&sorted_set)
             || self.hashes.contains_key(&sorted_set)
             || self.sets.contains_key(&sorted_set)
@@ -20419,12 +20480,14 @@ impl StructureTreeDecoder {
     ) -> Result<(), NativeRuntimeError> {
         let (sorted_set, member) = decode_sorted_set_member_identity(identity)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-        let members = self
-            .sorted_sets
-            .get_mut(sorted_set)
-            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-        if let Some(score) = decode_sorted_set_score(value)?
-            && members.insert(member.to_vec(), score).is_some()
+        if let Some(members) = self.sorted_sets.get_mut(sorted_set) {
+            if let Some(score) = decode_sorted_set_score(value)?
+                && members.insert(member.to_vec(), score).is_some()
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        } else if !self.retired_sorted_sets.contains(sorted_set)
+            || decode_sorted_set_score(value)?.is_some()
         {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -20437,6 +20500,12 @@ impl StructureTreeDecoder {
         value: &[u8],
     ) -> Result<(), NativeRuntimeError> {
         let (sorted_set, score, member) = decode_sorted_set_order_identity(identity)?;
+        if self.retired_sorted_sets.contains(sorted_set) {
+            if decode_set_member_value(value)? {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(());
+        }
         if !self.sorted_sets.contains_key(sorted_set) {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
@@ -20564,6 +20633,7 @@ impl StructureTreeDecoder {
             list_chunks,
             list_expiries,
             retired_lists: _,
+            retired_sorted_sets: _,
             sorted_sets,
             sorted_set_counts,
             sorted_set_order,
@@ -24346,6 +24416,31 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_delete_persists_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 2.0, b"bob".to_vec())?;
+        database.commit_optimistic(seed)?;
+        let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+        assert!(delete.delete_sorted_set(b"scores".to_vec())?);
+        database.commit_optimistic(delete)?;
+        assert!(matches!(
+            database.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert!(matches!(
+            reopened.zcard_latest_sorted_set(b"scores"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
         Ok(())
     }
 
