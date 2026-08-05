@@ -24048,6 +24048,88 @@ mod tests {
     }
 
     #[test]
+    fn every_stream_delete_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            seed.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            database.commit_optimistic(seed)?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(delete.delete_stream(b"events".to_vec())?);
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(delete, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8);
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(entries?.len(), 1),
+                Some(2) => assert!(matches!(
+                    entries,
+                    Err(NativeRuntimeError::UnknownStructureStream)
+                )),
+                other => return Err(format!("unexpected stream delete CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_stream_append_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_stream(b"events".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut append = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            append.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(append, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8)?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert!(entries.is_empty()),
+                Some(2) => assert_eq!(entries.len(), 1),
+                other => return Err(format!("unexpected stream recovery CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn stream_delete_and_append_race_is_first_committer_wins_in_both_orders()
     -> Result<(), Box<dyn std::error::Error>> {
         for append_first in [true, false] {
