@@ -24420,6 +24420,50 @@ mod tests {
     }
 
     #[test]
+    fn every_sorted_set_delete_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_optimistic(1, DurabilityClass::Strict)?;
+            seed.create_sorted_set(b"scores".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+            seed.zadd(b"scores".to_vec(), 2.0, b"bob".to_vec())?;
+            database.commit_optimistic(seed)?;
+            let mut delete = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            assert!(delete.delete_sorted_set(b"scores".to_vec())?);
+            let result = database.commit_optimistic_with_interruption(delete, boundary);
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            match reopened
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+            {
+                Some(1) => assert_eq!(reopened.zcard_latest_sorted_set(b"scores")?, 2),
+                Some(2) => assert!(matches!(
+                    reopened.zcard_latest_sorted_set(b"scores"),
+                    Err(NativeRuntimeError::UnknownStructureSortedSet)
+                )),
+                other => return Err(format!("unexpected sorted-set delete CSN {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sorted_set_delete_persists_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
