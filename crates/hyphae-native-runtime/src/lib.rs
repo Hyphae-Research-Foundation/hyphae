@@ -11729,7 +11729,8 @@ fn apply_mutations_to_state(
             | Opcode::UpdateRow
             | Opcode::DeleteRow
             | Opcode::CreateSecondaryIndex
-            | Opcode::DropSecondaryIndex => {
+            | Opcode::DropSecondaryIndex
+            | Opcode::DropTable => {
                 apply_relational_mutation(state, mutation)?;
             }
             Opcode::SetValue
@@ -11922,6 +11923,19 @@ fn apply_relational_mutation(
                 }
                 state.relational.delete(target, &mutation.key)?;
             }
+        }
+        Opcode::DropTable => {
+            if !mutation.key.is_empty()
+                || !mutation.value.is_empty()
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            let Some(CatalogObject::Relation(_)) = state.catalog.object(target) else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            state.relational.drop_table(target)?;
+            state.catalog.remove(target)?;
         }
         Opcode::DropSecondaryIndex => {
             if !mutation.key.is_empty()
@@ -12630,9 +12644,12 @@ fn catalog_root_after_mutations(
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
     let rebuild = catalog_requires_full_rebuild(pages, root)?
-        || mutations
-            .iter()
-            .any(|mutation| mutation.opcode == Opcode::DropSecondaryIndex);
+        || mutations.iter().any(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::DropSecondaryIndex | Opcode::DropTable
+            )
+        });
     let tree = if rebuild {
         let secondary_indexes = catalog
             .objects
@@ -17265,9 +17282,12 @@ fn relational_tree_after_mutations(
     mutations: &[Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
-    let rebuild_for_drop = mutations
-        .iter()
-        .any(|mutation| mutation.opcode == Opcode::DropSecondaryIndex);
+    let rebuild_for_drop = mutations.iter().any(|mutation| {
+        matches!(
+            mutation.opcode,
+            Opcode::DropSecondaryIndex | Opcode::DropTable
+        )
+    });
     let mut tree = if rebuild_for_drop {
         relational_tree_from_state(
             pages,
@@ -17297,7 +17317,10 @@ fn relational_tree_after_mutations(
         let target = mutation
             .target
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-        if mutation.opcode == Opcode::DropSecondaryIndex {
+        if matches!(
+            mutation.opcode,
+            Opcode::DropSecondaryIndex | Opcode::DropTable
+        ) {
             if !mutation.key.is_empty() || !mutation.value.is_empty() {
                 return Err(NativeRuntimeError::InvalidRelationalTree);
             }

@@ -77,6 +77,7 @@ pub(crate) enum Opcode {
     DeleteDocument = 38,
     CompactSearch = 39,
     DropSecondaryIndex = 40,
+    DropTable = 43,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -629,6 +630,7 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DropSecondaryIndex as u8 => {
             (Opcode::DropSecondaryIndex, EngineKind::Relational)
         }
+        value if value == Opcode::DropTable as u8 => (Opcode::DropTable, EngineKind::Relational),
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
@@ -772,7 +774,7 @@ fn validate_mutation_shape(
     }
     validate_mutation_target_shape(opcode, has_target)?;
     match opcode {
-        Opcode::DropSecondaryIndex
+        Opcode::DropSecondaryIndex | Opcode::DropTable
             if value_length != 0 || !key.is_empty() || expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -867,6 +869,7 @@ fn validate_mutation_target_shape(
             | Opcode::InsertRow
             | Opcode::CreateSecondaryIndex
             | Opcode::DropSecondaryIndex
+            | Opcode::DropTable
             | Opcode::CreateIndex
             | Opcode::IndexDocument
             | Opcode::ReplaceDocument

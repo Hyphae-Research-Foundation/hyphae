@@ -101,6 +101,12 @@ the relational namespace without its metadata or entry keys. Existing prepared
 plans fail with `CatalogChanged`; reopen preserves the absence. `IF EXISTS` and
 `CASCADE` are not accepted.
 
+`DROP TABLE <name>` uses strict `RESTRICT` semantics: live secondary indexes or
+incoming foreign keys block it. After dependencies are removed, commit removes
+the relation and all row keys, rebuilds catalog/relational roots, invalidates
+prepared plans and preserves absence across reopen. `IF EXISTS` and `CASCADE`
+remain unsupported.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,
