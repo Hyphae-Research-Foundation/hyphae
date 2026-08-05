@@ -83,6 +83,9 @@ class NativeG2ReadinessTests(unittest.TestCase):
         self.assertIn("tools/produce_native_g2_prepared_receipt.py", workflow)
         self.assertIn("tools/check_native_g2_receipts.py", workflow)
         self.assertIn("native-g2-prepared-audit.json", workflow)
+        self.assertIn("tools/inject_native_g2_evidence.py", workflow)
+        self.assertIn("native-g2-readiness-with-prepared.json", workflow)
+        self.assertIn('assert receipt["passed"] == 1', workflow)
 
     def test_missing_digest_lower_level_or_unknown_row_fails_closed(self) -> None:
         evidence = self.baseline()
