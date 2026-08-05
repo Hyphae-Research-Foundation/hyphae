@@ -19995,6 +19995,7 @@ fn binary_relation_definition(
             },
         ],
         primary_key: vec![ColumnId::new(1).map_err(|_| CatalogError::EmptyName)?],
+        checks: Vec::new(),
     };
     definition.validate()?;
     Ok(definition)
@@ -20190,6 +20191,7 @@ mod tests {
             },
             columns,
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
         })
     }
 

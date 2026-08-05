@@ -9,7 +9,7 @@ use std::{
 
 use hyphae_native_types::{
     CatalogVersion, ColumnId, EngineKind, FieldId, LogicalType, NativeTypeError, ObjectId,
-    VectorType,
+    ScalarValue, VectorType,
 };
 use thiserror::Error;
 
@@ -255,6 +255,33 @@ pub struct ColumnDefinition {
     pub nullable: bool,
 }
 
+/// Comparison operator admitted by a column CHECK constraint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ColumnCheckOperator {
+    /// `=`.
+    Equal = 1,
+    /// `<>`.
+    NotEqual = 2,
+    /// `<`.
+    Less = 3,
+    /// `<=`.
+    LessOrEqual = 4,
+    /// `>`.
+    Greater = 5,
+    /// `>=`.
+    GreaterOrEqual = 6,
+}
+
+/// One canonical column-local CHECK predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnCheckConstraint {
+    /// Comparison against the literal.
+    pub operator: ColumnCheckOperator,
+    /// Typed literal operand.
+    pub operand: ScalarValue,
+}
+
 /// Native relational object definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationDefinition {
@@ -264,6 +291,8 @@ pub struct RelationDefinition {
     pub columns: Vec<ColumnDefinition>,
     /// Ordered primary-key column identities.
     pub primary_key: Vec<ColumnId>,
+    /// Column-local constraints keyed by stable column identity.
+    pub checks: Vec<(ColumnId, ColumnCheckConstraint)>,
 }
 
 impl RelationDefinition {
@@ -317,6 +346,25 @@ impl RelationDefinition {
             {
                 return Err(CatalogError::NullablePrimaryKeyColumn(*column));
             }
+        }
+        let mut previous_check = None;
+        for (column, check) in &self.checks {
+            if previous_check.is_some_and(|previous| previous >= *column)
+                || !column_ids.contains(column)
+                || matches!(check.operand, ScalarValue::Null)
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
+            let definition = self
+                .columns
+                .iter()
+                .find(|definition| definition.id == *column)
+                .ok_or(CatalogError::InvalidDefinitionEncoding)?;
+            check
+                .operand
+                .encode_storage(&definition.logical_type)
+                .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
+            previous_check = Some(*column);
         }
         Ok(())
     }
@@ -806,6 +854,7 @@ mod tests {
                 nullable: false,
             }],
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
         }))
     }
 

@@ -55,6 +55,22 @@ frames, additional window functions, snapshot/latest prepared execution, and
 spill remain unsupported and fail closed. This slice does not close the G2
 window-function requirement.
 
+The current typed DDL also admits one persistent column-local CHECK shape:
+
+```text
+<column> <type> [NOT NULL] CHECK (<same-column> <comparison> <typed-literal>)
+```
+
+The constraint binds its literal to the declared logical type, persists by
+stable column ID in the canonical catalog definition, and is enforced before
+`INSERT` or `UPDATE` mutates private relational/index state. SQL null satisfies
+this first CHECK slice as `UNKNOWN`; `NOT NULL` remains the separate null gate.
+Mismatched columns, parameters, duplicate CHECK clauses, null literals, and
+unsupported expressions fail binding. Catalog decoding remains compatible with
+legacy relation definitions that end after the primary-key list. Reopen/WAL
+replay preserves enforcement. Table-level predicates, multi-column expressions,
+functions, deferred checks, and named constraints remain outside this slice.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,

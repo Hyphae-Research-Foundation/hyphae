@@ -7,8 +7,8 @@ use std::{
 };
 
 use hyphae_native_catalog::{
-    CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
-    SecondaryIndexDefinition,
+    CatalogName, CatalogObject, ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition,
+    ObjectHeader, RelationDefinition, SecondaryIndexDefinition,
 };
 use hyphae_native_mvcc::Snapshot;
 use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
@@ -90,6 +90,9 @@ pub enum SqlError {
     /// Secondary-index range bounds are duplicated or malformed.
     #[error("HYSQL014 native SQL secondary-index range binding is invalid")]
     InvalidSecondaryIndexRange,
+    /// A native SQL CHECK predicate evaluated to false.
+    #[error("HYSQL015 native SQL CHECK constraint failed")]
+    CheckViolation,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -526,6 +529,13 @@ struct ParsedColumn {
     logical_type: LogicalType,
     nullable: bool,
     inline_primary_key: bool,
+    check: Option<ParsedColumnCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedColumnCheck {
+    operator: ComparisonOperator,
+    operand: ScalarOperand,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -976,7 +986,7 @@ pub(crate) fn execute_transaction(
             name,
             columns,
             primary_key,
-        } => execute_create(transaction, &name, columns, primary_key, parameters),
+        } => execute_create(transaction, &name, &columns, primary_key, parameters),
         Statement::CreateIndex {
             name,
             table,
@@ -3629,7 +3639,7 @@ fn explain_suffix(residual: bool) -> &'static str {
 fn execute_create(
     transaction: &mut NativeWriteBatch,
     name: &str,
-    parsed_columns: Vec<ParsedColumn>,
+    parsed_columns: &[ParsedColumn],
     primary_key_names: Vec<String>,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
@@ -3642,15 +3652,15 @@ fn execute_create(
         .next_object_id()
         .map_err(NativeRuntimeError::from)?;
     let mut columns = Vec::with_capacity(parsed_columns.len());
-    for (index, parsed) in parsed_columns.into_iter().enumerate() {
+    for (index, parsed) in parsed_columns.iter().enumerate() {
         let raw_id = u32::try_from(index)
             .ok()
             .and_then(|value| value.checked_add(1))
             .ok_or(SqlError::InvalidSyntax)?;
         columns.push(ColumnDefinition {
             id: ColumnId::new(raw_id).map_err(|_| SqlError::InvalidSyntax)?,
-            name: CatalogName::unquoted(parsed.name).map_err(NativeRuntimeError::from)?,
-            logical_type: parsed.logical_type,
+            name: CatalogName::unquoted(parsed.name.clone()).map_err(NativeRuntimeError::from)?,
+            logical_type: parsed.logical_type.clone(),
             nullable: parsed.nullable,
         });
     }
@@ -3667,6 +3677,30 @@ fn execute_create(
     if primary_key.is_empty() {
         return Err(SqlError::InvalidPrimaryKey);
     }
+    let mut checks = Vec::new();
+    for parsed in parsed_columns {
+        let Some(check) = &parsed.check else {
+            continue;
+        };
+        let index = columns
+            .iter()
+            .position(|column| column.name.lookup() == normalize_identifier(&parsed.name))
+            .ok_or(SqlError::UnknownColumn)?;
+        let column = &columns[index];
+        let operand = match bind_scalar_operand(&column.logical_type, &check.operand)? {
+            BoundScalarOperand::Literal(value) if !matches!(value, SqlValue::Null) => value,
+            BoundScalarOperand::Literal(_) | BoundScalarOperand::Parameter(_) => {
+                return Err(SqlError::InvalidSyntax);
+            }
+        };
+        checks.push((
+            column.id,
+            ColumnCheckConstraint {
+                operator: catalog_check_operator(check.operator),
+                operand,
+            },
+        ));
+    }
     let mut definition = RelationDefinition {
         header: ObjectHeader {
             id,
@@ -3675,6 +3709,7 @@ fn execute_create(
         },
         columns,
         primary_key,
+        checks,
     };
     if is_legacy_binary_relation(&definition) {
         for column in &mut definition.columns {
@@ -5225,6 +5260,54 @@ fn same_column_set(left: &[usize], right: &[usize]) -> bool {
     left.len() == right.len() && left.iter().all(|column| right.contains(column))
 }
 
+fn catalog_check_operator(operator: ComparisonOperator) -> ColumnCheckOperator {
+    match operator {
+        ComparisonOperator::Equal => ColumnCheckOperator::Equal,
+        ComparisonOperator::NotEqual => ColumnCheckOperator::NotEqual,
+        ComparisonOperator::Less => ColumnCheckOperator::Less,
+        ComparisonOperator::LessOrEqual => ColumnCheckOperator::LessOrEqual,
+        ComparisonOperator::Greater => ColumnCheckOperator::Greater,
+        ComparisonOperator::GreaterOrEqual => ColumnCheckOperator::GreaterOrEqual,
+    }
+}
+
+fn validate_checks(
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<(), SqlError> {
+    for (column_id, check) in &definition.checks {
+        let index = definition
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or(SqlError::InvalidCatalogObject)?;
+        let Some(value) = values.get(index).copied().flatten() else {
+            continue;
+        };
+        if matches!(value, SqlValue::Null) {
+            continue;
+        }
+        let ordering = compare_sql_values(
+            &definition.columns[index].logical_type,
+            value,
+            &check.operand,
+        )?
+        .ok_or(SqlError::CheckViolation)?;
+        let passes = match check.operator {
+            ColumnCheckOperator::Equal => ordering == Ordering::Equal,
+            ColumnCheckOperator::NotEqual => ordering != Ordering::Equal,
+            ColumnCheckOperator::Less => ordering == Ordering::Less,
+            ColumnCheckOperator::LessOrEqual => ordering != Ordering::Greater,
+            ColumnCheckOperator::Greater => ordering == Ordering::Greater,
+            ColumnCheckOperator::GreaterOrEqual => ordering != Ordering::Less,
+        };
+        if !passes {
+            return Err(SqlError::CheckViolation);
+        }
+    }
+    Ok(())
+}
+
 fn bind_insert_values<'value>(
     definition: &RelationDefinition,
     supplied_values: &[ColumnOperand],
@@ -5246,6 +5329,7 @@ fn bind_insert_values<'value>(
             return Err(SqlError::NullViolation);
         }
     }
+    validate_checks(definition, &values)?;
     Ok(values)
 }
 
@@ -5382,6 +5466,22 @@ fn encode_updated_tuple(
             .ok_or(SqlError::InvalidCatalogObject)?
             .clone_from(&assignment.value);
     }
+    let decoded = definition
+        .columns
+        .iter()
+        .zip(&values)
+        .map(|(column, value)| {
+            value
+                .as_ref()
+                .map(|encoded| {
+                    SqlValue::decode_storage(&column.logical_type, encoded)
+                        .map_err(|_| SqlError::InvalidStoredRow)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let references = decoded.iter().map(Option::as_ref).collect::<Vec<_>>();
+    validate_checks(definition, &references)?;
     RowTuple::new(values)
         .and_then(|tuple| tuple.encode())
         .map_err(|_| SqlError::InvalidStoredRow)
@@ -6393,6 +6493,7 @@ fn parse_with_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
     let unique = parser.consume_keyword("UNIQUE");
     if parser.consume_keyword("INDEX") {
@@ -6421,6 +6522,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
             let mut nullable = true;
             let mut nullability_seen = false;
             let mut inline_primary_key = false;
+            let mut check = None;
             loop {
                 if parser.consume_keyword("NOT") {
                     if nullability_seen {
@@ -6442,6 +6544,24 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
                     parser.expect_keyword("KEY")?;
                     nullable = false;
                     inline_primary_key = true;
+                } else if parser.consume_keyword("CHECK") {
+                    if check.is_some() {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_symbol('(')?;
+                    if normalize_identifier(&parser.identifier()?)
+                        != normalize_identifier(&column_name)
+                    {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    let operator = parser.comparison_operator()?;
+                    let mut parameters = 0;
+                    let operand = parser.scalar_operand(&mut parameters)?;
+                    if parameters != 0 {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_symbol(')')?;
+                    check = Some(ParsedColumnCheck { operator, operand });
                 } else {
                     break;
                 }
@@ -6451,6 +6571,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
                 logical_type,
                 nullable,
                 inline_primary_key,
+                check,
             });
         }
         if parser.consume_symbol(')') {

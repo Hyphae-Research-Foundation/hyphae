@@ -3,15 +3,15 @@
 use std::str;
 
 use hyphae_native_types::{
-    ColumnId, EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType,
+    ColumnId, EngineKind, FieldId, LogicalType, ObjectId, ScalarValue, VectorElement, VectorType,
 };
 
 use super::{
-    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition,
-    MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES,
-    ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-    SearchFieldDefinition, SecondaryIndexDefinition, StructureDefinition, StructureKind,
-    StructureOwnership, VectorMetric,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckConstraint,
+    ColumnCheckOperator, ColumnDefinition, MAX_CATALOG_DEFINITION_BYTES,
+    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
 };
 
 const DEFINITION_MAGIC: [u8; 8] = *b"HYCOBJ01";
@@ -96,6 +96,20 @@ impl Encoder {
         self.put_item_count(definition.primary_key.len())?;
         for column in &definition.primary_key {
             self.put_fixed(&column.get().to_le_bytes())?;
+        }
+        if !definition.checks.is_empty() {
+            self.put_item_count(definition.checks.len())?;
+            for (column, check) in &definition.checks {
+                self.put_fixed(&column.get().to_le_bytes())?;
+                self.put_byte(check.operator as u8)?;
+                let logical_type = &definition
+                    .columns
+                    .iter()
+                    .find(|definition| definition.id == *column)
+                    .ok_or(CatalogError::InvalidDefinitionEncoding)?
+                    .logical_type;
+                self.put_bytes(&check.operand.encode_storage(logical_type)?)?;
+            }
         }
         Ok(())
     }
@@ -257,10 +271,35 @@ impl<'encoded> Decoder<'encoded> {
         for _ in 0..primary_key_count {
             primary_key.push(self.column_id()?);
         }
+        let mut checks = Vec::new();
+        if self.offset < self.encoded.len() {
+            let check_count = self.item_count()?;
+            checks.reserve(check_count);
+            for _ in 0..check_count {
+                let column = self.column_id()?;
+                let operator = match self.byte()? {
+                    1 => ColumnCheckOperator::Equal,
+                    2 => ColumnCheckOperator::NotEqual,
+                    3 => ColumnCheckOperator::Less,
+                    4 => ColumnCheckOperator::LessOrEqual,
+                    5 => ColumnCheckOperator::Greater,
+                    6 => ColumnCheckOperator::GreaterOrEqual,
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
+                let logical_type = &columns
+                    .iter()
+                    .find(|definition| definition.id == column)
+                    .ok_or(CatalogError::InvalidDefinitionEncoding)?
+                    .logical_type;
+                let operand = ScalarValue::decode_storage(logical_type, self.bytes()?)?;
+                checks.push((column, ColumnCheckConstraint { operator, operand }));
+            }
+        }
         Ok(RelationDefinition {
             header,
             columns,
             primary_key,
+            checks,
         })
     }
 
@@ -567,6 +606,7 @@ mod tests {
                 },
             ],
             primary_key: vec![ColumnId::new(1)?],
+            checks: Vec::new(),
         }))
     }
 
