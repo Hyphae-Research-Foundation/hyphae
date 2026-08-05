@@ -1533,6 +1533,32 @@ impl NativeSnapshot {
         }
     }
 
+    /// Returns one bounded inclusive stream-ID range from this retained snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing stream.
+    pub fn xrange_stream(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
+        if self.state.structures.entries.contains_key(key)
+            || self.state.structures.hashes.contains_key(key)
+            || self.state.structures.sets.contains_key(key)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        self.state
+            .structures
+            .xrange(key, start, end, limit)
+            .ok_or(NativeRuntimeError::UnknownStructureStream)
+    }
+
     /// Returns one hash family's TTL state at snapshot logical time.
     pub fn ttl_hash(&self, key: &[u8]) -> Ttl {
         match self
@@ -24015,6 +24041,28 @@ mod tests {
                 Err(NativeRuntimeError::InvalidStructureTree)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_stream_snapshot_survives_later_append() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut first = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        first.create_stream(b"events".to_vec())?;
+        first.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"a".to_vec())])?;
+        database.commit_optimistic(first)?;
+        let retained = database.snapshot(2)?;
+        let mut second = database.begin_optimistic(3, DurabilityClass::Memory)?;
+        second.xadd(b"events".to_vec(), &[(b"kind".to_vec(), b"b".to_vec())])?;
+        database.commit_optimistic(second)?;
+        assert_eq!(retained.xrange_stream(b"events", 1, u64::MAX, 8)?.len(), 1);
+        assert_eq!(
+            database
+                .xrange_latest_stream(b"events", 1, u64::MAX, 8)?
+                .len(),
+            2
+        );
         Ok(())
     }
 
