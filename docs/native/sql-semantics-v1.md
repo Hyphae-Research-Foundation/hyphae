@@ -32,6 +32,26 @@ outer filters/order, joins against a CTE, multiple CTEs,
 and durable catalog publication are rejected. This slice is not complete G2
 CTE support and does not change the gate status.
 
+The first bounded streaming window slice is implemented for single-column
+primary keys:
+
+```text
+SELECT <column>,
+       { ROW_NUMBER() | RANK() } OVER (ORDER BY <primary-key>) AS <alias>
+FROM <table>
+ORDER BY <primary-key>
+LIMIT <n>
+```
+
+It reuses the native primary-key ordered scan, computes unsigned one-based
+ordinals, applies the output limit, and requires the outer order to match the
+window order. Because the order key is a unique primary key, `RANK` and
+`ROW_NUMBER` intentionally coincide in this slice. Partitioning, ties on
+non-unique order keys, multiple/composite order keys, descending/null ordering,
+frames, additional window functions, snapshot/latest prepared execution, and
+spill remain unsupported and fail closed. This slice does not close the G2
+window-function requirement.
+
 ## Language pipeline
 
 Hyphae owns lexer, parser, binder, rewriter, logical planner, cost optimizer,

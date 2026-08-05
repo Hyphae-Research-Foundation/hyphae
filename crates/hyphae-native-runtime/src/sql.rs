@@ -474,6 +474,23 @@ enum Statement {
     SelectJoin(ParsedInnerJoin),
     ExplainSelectJoin(ParsedInnerJoin),
     WithSelect(ParsedCteSelect),
+    SelectWindow(ParsedWindowSelect),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowFunction {
+    RowNumber,
+    Rank,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedWindowSelect {
+    name: String,
+    value_column: String,
+    function: WindowFunction,
+    order_column: String,
+    alias: String,
+    limit: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1038,7 +1055,70 @@ pub(crate) fn execute_transaction(
             execute_indexed_join_explain(transaction, &join, parameters)
         }
         Statement::WithSelect(cte) => execute_cte_select(transaction, &cte, parameters),
+        Statement::SelectWindow(window) => execute_window_select(transaction, &window, parameters),
     }
+}
+
+fn execute_window_select(
+    transaction: &mut NativeWriteBatch,
+    window: &ParsedWindowSelect,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let (_, definition) = relation_named(&transaction.state.catalog, &window.name)?;
+    let primary_key = definition
+        .primary_key
+        .first()
+        .ok_or(SqlError::InvalidPrimaryKey)?;
+    let order_index = column_index(&definition.columns, &window.order_column)?;
+    if definition.columns[order_index].id != *primary_key {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let query = format!(
+        "SELECT {}, {} FROM {} ORDER BY {} LIMIT {}",
+        window.value_column, window.order_column, window.name, window.order_column, window.limit
+    );
+    let Statement::Select {
+        name,
+        projection,
+        filter,
+        parameter_count,
+        order_by,
+        limit,
+    } = parse(&query)?
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let SqlResult::Rows { columns: _, rows } = execute_select(
+        transaction,
+        SelectQuery {
+            name: &name,
+            projection: &projection,
+            filter: filter.as_ref(),
+            parameter_count,
+            order_by: &order_by,
+            limit,
+        },
+        &[],
+    )?
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let mut output = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let value = row.first().cloned().ok_or(SqlError::InvalidStoredRow)?;
+        let ordinal = u64::try_from(index + 1).map_err(|_| SqlError::InvalidSyntax)?;
+        let rank = match window.function {
+            WindowFunction::RowNumber | WindowFunction::Rank => ordinal,
+        };
+        output.push(vec![value, SqlValue::Unsigned(rank)]);
+    }
+    Ok(SqlResult::Rows {
+        columns: vec![window.value_column.clone(), window.alias.clone()],
+        rows: output,
+    })
 }
 
 fn execute_cte_select(
@@ -6449,7 +6529,56 @@ fn parse_delete(parser: &mut Parser) -> Result<Statement, SqlError> {
     })
 }
 
+fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    let value_column = parser.identifier()?;
+    parser.expect_symbol(',')?;
+    let function = if parser.consume_keyword("ROW_NUMBER") {
+        WindowFunction::RowNumber
+    } else if parser.consume_keyword("RANK") {
+        WindowFunction::Rank
+    } else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    parser.expect_symbol('(')?;
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("OVER")?;
+    parser.expect_symbol('(')?;
+    if parser.consume_keyword("PARTITION") {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.expect_keyword("ORDER")?;
+    parser.expect_keyword("BY")?;
+    let order_column = parser.identifier()?;
+    if parser.consume_keyword("DESC") || parser.consume_symbol(',') {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("AS")?;
+    let alias = parser.identifier()?;
+    parser.expect_keyword("FROM")?;
+    let name = parser.identifier()?;
+    parser.expect_keyword("ORDER")?;
+    parser.expect_keyword("BY")?;
+    let outer_order = parser.identifier()?;
+    if normalize_identifier(&outer_order) != normalize_identifier(&order_column) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.expect_keyword("LIMIT")?;
+    let limit = parser.number_usize()?;
+    Ok(Statement::SelectWindow(ParsedWindowSelect {
+        name,
+        value_column,
+        function,
+        order_column,
+        alias,
+        limit,
+    }))
+}
+
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    if parser.looks_like_window_select() {
+        return parse_window_select(parser);
+    }
     let projection = if parser.consume_symbol('*') {
         Projection::All
     } else {
@@ -6786,6 +6915,16 @@ struct Parser {
 impl Parser {
     const fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, offset: 0 }
+    }
+
+    fn looks_like_window_select(&self) -> bool {
+        matches!(self.tokens.get(self.offset), Some(Token::Word(_)))
+            && self.tokens.get(self.offset + 1) == Some(&Token::Symbol(','))
+            && matches!(
+                self.tokens.get(self.offset + 2),
+                Some(Token::Word(value))
+                    if value.eq_ignore_ascii_case("ROW_NUMBER") || value.eq_ignore_ascii_case("RANK")
+            )
     }
 
     fn consume_keyword(&mut self, expected: &str) -> bool {
