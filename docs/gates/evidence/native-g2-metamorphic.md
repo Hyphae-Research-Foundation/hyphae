@@ -14,7 +14,10 @@ runner currently checks:
 - CTE identity for a bounded materialized projection.
 
 Every pair must return the same output schema and byte-equivalent logical rows.
-This corpus is an initial transformation oracle, not the complete randomized
+A second seeded generator (`seed = 20260804`) executes 256 deterministic cases
+with three rewrites per case (768 comparisons) over a 64-row typed dataset,
+covering boolean commutation, range-bound permutation, and double negation.
+This is still not the complete randomized
 metamorphic evidence required for G2. Closure still requires generated typed
 datasets, seeded reproducibility, broad expression and join rewrites, failure
 shrinking, exact corpus/generator digests, and hosted exact-SHA receipts.
