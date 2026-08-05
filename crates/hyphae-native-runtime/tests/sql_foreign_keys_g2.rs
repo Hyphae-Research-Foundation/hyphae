@@ -2,7 +2,7 @@
 
 //! Immediate MATCH SIMPLE foreign keys over native primary keys.
 
-use hyphae_native_runtime::{NativeDatabase, NativeRuntimeError, SqlError};
+use hyphae_native_runtime::{GroupCommitOutcome, NativeDatabase, NativeRuntimeError, SqlError};
 use hyphae_native_types::DurabilityClass;
 
 #[test]
@@ -102,5 +102,42 @@ fn concurrent_child_commit_wins_and_parent_delete_rebase_fails()
         Err(NativeRuntimeError::ForeignKeyConstraintViolation)
     ));
     std::fs::remove_dir_all(&temporary)?;
+    Ok(())
+}
+
+#[test]
+fn group_commit_rejects_second_fk_racer_in_both_orders() -> Result<(), Box<dyn std::error::Error>> {
+    for child_first in [true, false] {
+        let temporary = std::env::temp_dir().join(format!(
+            "hyphae-native-fk-group-{child_first}-{}",
+            std::process::id()
+        ));
+        let _ignored = std::fs::remove_dir_all(&temporary);
+        let mut database = NativeDatabase::create(&temporary)?;
+        let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+        seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
+        seed.execute_sql(
+            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+            &[],
+        )?;
+        seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;
+        seed.commit()?;
+        let mut child = database.begin_optimistic(2, DurabilityClass::Group)?;
+        child.execute_sql("INSERT INTO children (id, parent_id) VALUES (1, 1)", &[])?;
+        let mut parent_delete = database.begin_optimistic(2, DurabilityClass::Group)?;
+        parent_delete.execute_sql("DELETE FROM parents WHERE id = 1", &[])?;
+        let batches = if child_first {
+            vec![child, parent_delete]
+        } else {
+            vec![parent_delete, child]
+        };
+        let outcomes = database.commit_group(batches)?.outcomes;
+        assert!(matches!(outcomes[0], GroupCommitOutcome::Committed(_)));
+        assert!(matches!(
+            outcomes[1],
+            GroupCommitOutcome::Rejected(NativeRuntimeError::ForeignKeyConstraintViolation)
+        ));
+        std::fs::remove_dir_all(&temporary)?;
+    }
     Ok(())
 }
