@@ -71,6 +71,67 @@ fn new_order_like_transaction_is_atomic_durable_and_conflict_safe()
 }
 
 #[test]
+fn payment_like_transaction_updates_warehouse_district_and_customer_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary =
+        std::env::temp_dir().join(format!("hyphae-native-tpcc-payment-{}", std::process::id()));
+    let _ignored = std::fs::remove_dir_all(&temporary);
+    let mut database = NativeDatabase::create(&temporary)?;
+    let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+    for statement in [
+        "CREATE TABLE warehouse (w_id BIGINT PRIMARY KEY, w_ytd BIGINT NOT NULL)",
+        "CREATE TABLE district (d_id BIGINT PRIMARY KEY, d_ytd BIGINT NOT NULL)",
+        "CREATE TABLE customer (c_id BIGINT PRIMARY KEY, c_balance BIGINT NOT NULL, c_ytd_payment BIGINT NOT NULL, c_payment_cnt BIGINT NOT NULL)",
+        "INSERT INTO warehouse (w_id, w_ytd) VALUES (1, 1000)",
+        "INSERT INTO district (d_id, d_ytd) VALUES (10, 100)",
+        "INSERT INTO customer (c_id, c_balance, c_ytd_payment, c_payment_cnt) VALUES (100, 500, 0, 0)",
+    ] {
+        seed.execute_sql(statement, &[])?;
+    }
+    seed.commit()?;
+
+    let mut payment = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    payment.execute_sql("UPDATE warehouse SET w_ytd = 1042 WHERE w_id = 1", &[])?;
+    payment.execute_sql("UPDATE district SET d_ytd = 142 WHERE d_id = 10", &[])?;
+    payment.execute_sql(
+        "UPDATE customer SET c_balance = 458, c_ytd_payment = 42, c_payment_cnt = 1 WHERE c_id = 100",
+        &[],
+    )?;
+    database.commit_optimistic(payment)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&temporary)?;
+    let mut observed = reopened.begin_optimistic(3, DurabilityClass::Memory)?;
+    assert_eq!(
+        signed_cell(observed.execute_sql("SELECT w_ytd FROM warehouse WHERE w_id = 1", &[])?)?,
+        1042
+    );
+    assert_eq!(
+        signed_cell(observed.execute_sql("SELECT d_ytd FROM district WHERE d_id = 10", &[])?)?,
+        142
+    );
+    assert_eq!(
+        signed_cell(observed.execute_sql("SELECT c_balance FROM customer WHERE c_id = 100", &[])?)?,
+        458
+    );
+    assert_eq!(
+        signed_cell(
+            observed.execute_sql("SELECT c_ytd_payment FROM customer WHERE c_id = 100", &[])?
+        )?,
+        42
+    );
+    assert_eq!(
+        signed_cell(
+            observed.execute_sql("SELECT c_payment_cnt FROM customer WHERE c_id = 100", &[])?
+        )?,
+        1
+    );
+    observed.rollback();
+    std::fs::remove_dir_all(&temporary)?;
+    Ok(())
+}
+
+#[test]
 fn aborted_new_order_like_transaction_publishes_nothing() -> Result<(), Box<dyn std::error::Error>>
 {
     let temporary =
