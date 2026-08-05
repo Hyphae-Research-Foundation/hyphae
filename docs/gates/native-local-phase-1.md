@@ -15,7 +15,7 @@ earlier gate is red.
 |---|---|---|
 | G0 | Constitution and native specifications | Accepted architecture; versioned type, row, page, blob, WAL, MVCC, SQL, structure, search, ANN, local-protocol and benchmark contracts; clean-room/dependency inventory |
 | G1 | Native substrate | Hyphae page/blob store, WAL, catalog, CSN/MVCC, partitioned memory and scheduler; no Redb on the target path; crash injection at every commit/checkpoint boundary |
-| G2 | Relational engine | Native DDL/DML, constraints, transactions, indexes, joins, CTEs, windows, prepared plans and `EXPLAIN`; SQLLogicTest, metamorphic tests, isolation litmus, TPC-H correctness and TPC-C ACID evidence |
+| G2 | Bounded relational engine | The complete versioned Hyphae SQL G2 bounded profile: catalog-backed bounded DDL/DML and immediate constraints; snapshot transactions; primary, secondary and unique indexes; admitted bounded inner-join, nonrecursive CTE, window, prepared-plan and `EXPLAIN` shapes. Unsupported SQL fails closed. Exit evidence is hosted exact-SHA SQLLogicTest-format bounded conformance, metamorphic and isolation suites, plus canonical-derived bounded TPC-H correctness and TPC-C ACID fixtures. This does not claim universal SQL compatibility, official benchmark conformance, complete canonical benchmark execution or performance. |
 | G3 | Structure engine | Native strings, counters, hashes, lists, sets, sorted sets, streams, TTL and atomic batches; model-based randomized tests, expiry under controlled time, restart equivalence and memory-amplification evidence |
 | G4 | Search engine | Native analyzers, postings, BM25, phrase/prefix/fuzzy, doc values, facets, aggregations, exact vector, ANN and hybrid; scoring goldens, NDCG/recall, rebuild and corruption evidence |
 | G5 | Convergence | One transaction mutates all three engines; concurrent readers never observe a mixed CSN; SQL joins and aggregates native structure/search sources through stable IDs and native operators; one checkpoint, backup and restore preserves the complete state |
@@ -887,11 +887,11 @@ every required family, an all-family restart matrix, and all-family atomic
 conflict evidence. Floating counters, sorted-set algebra, relative/conditional
 expiry, persist semantics, broader model alphabets and negative controls,
 adaptive empty-expiry backoff, and a user-facing historical-retention policy
-remain open. One cleanup call spanning all six families currently fails closed
-with `InvalidStructureTree`; visibility and reopen semantics are covered while
-that cleanup defect remains explicit. Ordered cleanup, current-root compaction,
-page-generation vacuum, and the bounded physical-amplification test provide
-initial measurements, not a complete production-scale memory claim.
+remain open. One cleanup transaction now retires all six families under one
+CSN, and explicit sorted-set deletion retires its TTL index before reopen.
+Ordered cleanup, current-root compaction, page-generation vacuum, and the
+bounded physical-amplification test provide initial measurements, not a
+complete production-scale memory claim.
 
 ## G1 substrate exit
 

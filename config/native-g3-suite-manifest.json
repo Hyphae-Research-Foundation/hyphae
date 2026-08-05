@@ -82,8 +82,11 @@
     {
       "id": "memory-amplification",
       "suites": [
-        {"name": "amplification", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "memory_amplification_g3", "--locked", "--", "--nocapture"]}
-      ]
+        {"name": "amplification", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--test", "memory_amplification_g3", "--locked", "--", "--nocapture"]},
+        {"name": "blob-maintenance", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "deleted_multichunk_blob_list_compacts_vacuums_and_collects_without_resurrection", "--locked"]},
+        {"name": "expiry-blob-maintenance", "command": ["cargo", "test", "-p", "hyphae-native-runtime", "--lib", "expired_blob_list_compacts_vacuums_and_collects_without_resurrection", "--locked"]}
+      ],
+      "hosted_metrics": {"max_peak_rss_kib": 1048576}
     }
   ]
 }

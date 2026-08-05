@@ -136,6 +136,11 @@ fn controlled_expiry_covers_every_structure_family() -> Result<(), Box<dyn std::
     let mut database = NativeDatabase::create(&path)?;
     seed_all_families(&mut database, Some(10))?;
 
+    let sweep = database.expire_due_structures(10, 6, DurabilityClass::Strict)?;
+    assert_eq!(sweep.expired_keys, 6);
+    assert!(!sweep.more_due);
+    assert!(sweep.commit.is_some());
+
     assert_eq!(database.get_latest_structure(b"scalar", 10)?, None);
     assert!(matches!(
         database.hget_latest_hash_at(b"hash", b"field", 10),
@@ -165,6 +170,44 @@ fn controlled_expiry_covers_every_structure_family() -> Result<(), Box<dyn std::
         reopened.xrange_latest_stream_at(b"stream", 0, u64::MAX, 8, 10),
         Err(NativeRuntimeError::UnknownStructureStream)
     ));
+    drop(reopened);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn deleting_ttl_sorted_set_retires_expiry_index_before_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("sorted-set-delete-ttl");
+    let _ = std::fs::remove_dir_all(&path);
+    let mut database = NativeDatabase::create(&path)?;
+    let mut create = database.begin_optimistic(1, DurabilityClass::Strict)?;
+    create.create_sorted_set(b"scores".to_vec())?;
+    create.zadd(b"scores".to_vec(), 1.0, b"member".to_vec())?;
+    database.commit_optimistic(create)?;
+    let mut ttl = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    assert!(ttl.expire_sorted_set(b"scores".to_vec(), 10)?);
+    database.commit_optimistic(ttl)?;
+    let mut delete = database.begin_optimistic(3, DurabilityClass::Strict)?;
+    assert!(delete.delete_sorted_set(b"scores".to_vec())?);
+    database.commit_optimistic(delete)?;
+
+    let sweep = database.expire_due_structures(10, 8, DurabilityClass::Strict)?;
+    assert_eq!(sweep.expired_keys, 0);
+    assert!(sweep.commit.is_none());
+    drop(database);
+
+    let mut reopened = NativeDatabase::open(&path)?;
+    assert!(matches!(
+        reopened.zcard_latest_sorted_set_at(b"scores", 10),
+        Err(NativeRuntimeError::UnknownStructureSortedSet)
+    ));
+    assert_eq!(
+        reopened
+            .expire_due_structures(10, 8, DurabilityClass::Strict)?
+            .expired_keys,
+        0
+    );
     drop(reopened);
     std::fs::remove_dir_all(path)?;
     Ok(())

@@ -1,6 +1,9 @@
 {
   "schema": "hyphae-native-g2-readiness-profile-v1",
   "gate": "G2",
+  "scope": "bounded-correctness",
+  "universal_sql_compatibility_required": false,
+  "performance_evidence_permitted": false,
   "requirements": [
     {"id": "native-ddl-dml-and-constraints", "required_evidence": "hosted"},
     {"id": "transactions-and-isolation", "required_evidence": "hosted"},

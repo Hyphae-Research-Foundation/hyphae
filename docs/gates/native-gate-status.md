@@ -9,8 +9,8 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 |---|---|---|
 | G0 | Closure claimed; revalidation required | Reconstruct all 8 hosted/governance requirements on one exact commit |
 | G1 | Closure claimed; revalidation required | Reconstruct all 7 hosted requirements after G0 authority is restored |
-| G2 | Bounded readiness only | The current 8/8 workflow does not claim broad SQLLogicTest, canonical TPC-H, or canonical TPC-C completion |
-| G3 | In progress | 11/11 hosted, suite-bound, exact-SHA evidence after prior-gate authority is restored |
+| G2 | Closure candidate | 8/8 hosted exact-SHA evidence for the normative bounded relational profile; no universal SQL or official benchmark claim |
+| G3 | Closure candidate | 11/11 hosted, suite-bound, exact-SHA evidence after G2 passes on the same commit |
 | G4-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
 
 `closure-claimed-revalidation-required` preserves a historical closure claim
@@ -41,8 +41,7 @@ Workspace Clippy, format, rustdoc, and all Python evidence-tool tests also
 passed. These remain local observations rather than hosted gate receipts;
 `native-g3.yml` is the authority for exact-SHA G3 evidence.
 
-The all-family test exposed a real open defect: one active-expiry cleanup call
-that spans all six structure families returns `InvalidStructureTree`. Logical
-expiry visibility and reopen semantics remain fail-closed and covered. G3 must
-not be declared closed until the cleanup path is repaired and represented in
-the suite manifest.
+The all-family test exposed an expiry-index retirement defect in explicit
+sorted-set deletion. The deletion path now validates and retires the matching
+TTL index entry. One cleanup transaction spanning scalar, hash, set, list,
+sorted set, and stream is covered together with reopen and no-op retry.

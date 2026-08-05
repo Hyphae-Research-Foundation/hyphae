@@ -22,6 +22,9 @@ class NativeG2ReadinessTests(unittest.TestCase):
     def test_profile_preserves_complete_normative_g2_scope(self) -> None:
         profile = self.profile()
         self.assertEqual(profile["gate"], "G2")
+        self.assertEqual(profile["scope"], "bounded-correctness")
+        self.assertFalse(profile["universal_sql_compatibility_required"])
+        self.assertFalse(profile["performance_evidence_permitted"])
         self.assertEqual(
             [row["id"] for row in profile["requirements"]],
             [
@@ -94,7 +97,7 @@ class NativeG2ReadinessTests(unittest.TestCase):
             self.assertIn(f"[{row['id']}]", workflow)
         self.assertIn('r["passed"] == 8', workflow)
         self.assertIn('r["status"] == "passed"', workflow)
-        self.assertIn("native-g2-complete-evidence", workflow)
+        self.assertIn("native-g2-bounded-closure-evidence", workflow)
 
     def test_missing_digest_lower_level_or_unknown_row_fails_closed(self) -> None:
         evidence = self.baseline()

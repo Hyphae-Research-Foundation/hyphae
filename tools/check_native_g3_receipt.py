@@ -53,7 +53,7 @@ def validate(payload: dict[str, Any], expected_commit: str, expected_requirement
         raise GateFailure("aggregate test count mismatch")
     if payload.get("scope") != "bounded-correctness" or payload.get("production_scale") is not False:
         raise GateFailure("receipt scope is invalid")
-    return {
+    audit = {
         "schema": "hyphae-native-g3-receipt-audit-v2",
         "status": "passed",
         "source_commit": commit,
@@ -66,6 +66,24 @@ def validate(payload: dict[str, Any], expected_commit: str, expected_requirement
         "scope": "bounded-correctness",
         "production_scale": False,
     }
+    if expected_requirement == "memory-amplification":
+        peak = payload.get("peak_rss_kib")
+        maximum = payload.get("max_peak_rss_kib")
+        if (
+            not isinstance(peak, int)
+            or isinstance(peak, bool)
+            or not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or peak <= 0
+            or maximum <= 0
+            or peak > maximum
+        ):
+            raise GateFailure("memory amplification RSS bound is invalid")
+        audit["peak_rss_kib"] = peak
+        audit["max_peak_rss_kib"] = maximum
+    elif "peak_rss_kib" in payload or "max_peak_rss_kib" in payload:
+        raise GateFailure("unexpected RSS metrics")
+    return audit
 
 
 def main() -> int:
