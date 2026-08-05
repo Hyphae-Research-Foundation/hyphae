@@ -23550,6 +23550,48 @@ mod tests {
     }
 
     #[test]
+    fn every_ddl_boundary_recovers_prior_or_complete_catalog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
+            seed.execute_sql(
+                "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT)",
+                &[],
+            )?;
+            seed.execute_sql(
+                "INSERT INTO people (id, email) VALUES (1, 'a@example.com')",
+                &[],
+            )?;
+            seed.commit()?;
+            let mut rename = database.begin_optimistic(2, DurabilityClass::Strict)?;
+            rename.execute_sql("ALTER TABLE people RENAME TO contacts", &[])?;
+            assert!(matches!(
+                database.commit_optimistic_with_interruption(rename, boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let old = reopened.prepare_sql_latest("SELECT email FROM people WHERE id = 1");
+            let new = reopened.prepare_sql_latest("SELECT email FROM contacts WHERE id = 1");
+            assert!(matches!(
+                (old.is_ok(), new.is_ok()),
+                (true, false) | (false, true)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn every_expiry_cleanup_boundary_recovers_prior_or_complete_index()
     -> Result<(), Box<dyn std::error::Error>> {
         for boundary in [
