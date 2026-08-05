@@ -281,6 +281,17 @@ pub(crate) enum SecondaryIndexLayout {
 }
 
 impl RelationState {
+    #[allow(dead_code, reason = "wired by the pending DROP TABLE WAL/SQL vertical")]
+    pub(crate) fn drop_table(
+        &mut self,
+        id: ObjectId,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, ModelError> {
+        if self.indexes.values().any(|index| index.relation == id) {
+            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+        }
+        self.tables.remove(&id).ok_or(ModelError::UnknownObject)
+    }
+
     pub(crate) fn create_table(&mut self, id: ObjectId) -> Result<(), ModelError> {
         if self.tables.insert(id, BTreeMap::new()).is_some() {
             return Err(ModelError::DuplicateObjectId);
@@ -2123,6 +2134,26 @@ mod tests {
             )?),
             Err(ModelError::DuplicateObjectName)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relational_table_drop_is_restrictive_and_removes_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = ObjectId::new(1)?;
+        let index = ObjectId::new(2)?;
+        let mut relational = RelationState::default();
+        relational.create_table(table)?;
+        relational.insert(table, b"pk".to_vec(), b"row".to_vec())?;
+        relational.create_secondary_index(index, table, false, true)?;
+        assert!(relational.drop_table(table).is_err());
+        relational.drop_secondary_index(index)?;
+        let removed = relational.drop_table(table)?;
+        assert_eq!(removed.get(b"pk".as_slice()), Some(&b"row".to_vec()));
+        assert!(matches!(
+            relational.drop_table(table),
+            Err(ModelError::UnknownObject)
+        ));
         Ok(())
     }
 
