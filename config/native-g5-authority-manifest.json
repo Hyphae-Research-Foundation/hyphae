@@ -1,0 +1,20 @@
+{
+  "schema": "hyphae-native-g5-authority-manifest-v1",
+  "gate": "G5",
+  "scope": "cross-engine-convergence-candidate-evidence",
+  "evidence_class": "supporting-not-closure",
+  "requirements": [
+    "all-engine-atomicity",
+    "concurrent-readers",
+    "stable-ids-and-links",
+    "structure-source",
+    "search-source",
+    "joins-aggregates-pushdown",
+    "checkpoint-complete-state",
+    "backup-restore"
+  ],
+  "required_predecessors": ["G2", "G3", "G4"],
+  "allowed_commands": ["cargo", "python3"],
+  "claims": [],
+  "closure_declared": false
+}

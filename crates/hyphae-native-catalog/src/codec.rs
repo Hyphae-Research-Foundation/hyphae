@@ -8,10 +8,12 @@ use hyphae_native_types::{
 
 use super::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckConstraint,
-    ColumnCheckOperator, ColumnDefinition, ForeignKeyDefinition, MAX_CATALOG_DEFINITION_BYTES,
-    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName,
-    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
+    ColumnCheckOperator, ColumnDefinition, CrossEngineLinkDefinition,
+    CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
+    ForeignKeyDefinition, MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS,
+    MAX_CATALOG_NAME_BYTES, ObjectHeader, QualifiedName, RelationDefinition,
+    SearchCollectionDefinition, SearchFieldDefinition, SecondaryIndexDefinition,
+    StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
 };
 
 const DEFINITION_MAGIC: [u8; 8] = *b"HYCOBJ01";
@@ -19,6 +21,7 @@ const OBJECT_RELATION: u8 = 1;
 const OBJECT_STRUCTURE: u8 = 2;
 const OBJECT_SEARCH: u8 = 3;
 const OBJECT_SECONDARY_INDEX: u8 = 4;
+const OBJECT_CROSS_ENGINE_LINK: u8 = 5;
 
 impl CatalogObject {
     /// Encodes one complete canonical catalog object definition.
@@ -34,6 +37,7 @@ impl CatalogObject {
             Self::SecondaryIndex(_) => OBJECT_SECONDARY_INDEX,
             Self::Structure(_) => OBJECT_STRUCTURE,
             Self::Search(_) => OBJECT_SEARCH,
+            Self::CrossEngineLink(_) => OBJECT_CROSS_ENGINE_LINK,
         };
         let mut encoder = Encoder::new(tag);
         encoder.put_header(self.header())?;
@@ -42,6 +46,7 @@ impl CatalogObject {
             Self::SecondaryIndex(definition) => encoder.put_secondary_index(definition)?,
             Self::Structure(definition) => encoder.put_structure(definition)?,
             Self::Search(definition) => encoder.put_search(definition)?,
+            Self::CrossEngineLink(definition) => encoder.put_cross_engine_link(definition)?,
         }
         encoder.finish()
     }
@@ -62,6 +67,7 @@ impl CatalogObject {
             OBJECT_SECONDARY_INDEX => Self::SecondaryIndex(decoder.secondary_index(header)?),
             OBJECT_STRUCTURE => Self::Structure(decoder.structure(header)?),
             OBJECT_SEARCH => Self::Search(decoder.search(header)?),
+            OBJECT_CROSS_ENGINE_LINK => Self::CrossEngineLink(decoder.cross_engine_link(header)?),
             _ => return Err(CatalogError::InvalidDefinitionEncoding),
         };
         decoder.finish()?;
@@ -197,6 +203,22 @@ impl Encoder {
             (None, Some(_)) => return Err(CatalogError::AnnRequiresVector),
         }
         Ok(())
+    }
+
+    fn put_cross_engine_link(
+        &mut self,
+        definition: &CrossEngineLinkDefinition,
+    ) -> Result<(), CatalogError> {
+        self.put_fixed(&definition.source.get().to_le_bytes())?;
+        self.put_fixed(&definition.target.get().to_le_bytes())?;
+        self.put_item_count(definition.mapping.len())?;
+        for mapping in &definition.mapping {
+            self.put_fixed(&mapping.source.to_le_bytes())?;
+            self.put_fixed(&mapping.target.to_le_bytes())?;
+        }
+        self.put_byte(definition.maintenance as u8)?;
+        self.put_byte(definition.delete_behavior as u8)?;
+        self.put_bool(definition.synchronous)
     }
 
     fn put_header(&mut self, header: &ObjectHeader) -> Result<(), CatalogError> {
@@ -484,6 +506,42 @@ impl<'encoded> Decoder<'encoded> {
         })
     }
 
+    fn cross_engine_link(
+        &mut self,
+        header: ObjectHeader,
+    ) -> Result<CrossEngineLinkDefinition, CatalogError> {
+        let source = self.object_id()?;
+        let target = self.object_id()?;
+        let count = self.item_count()?;
+        let mut mapping = Vec::with_capacity(count);
+        for _ in 0..count {
+            mapping.push(CrossEngineLinkMapping {
+                source: u32::from_le_bytes(self.fixed()?),
+                target: u32::from_le_bytes(self.fixed()?),
+            });
+        }
+        let maintenance = match self.byte()? {
+            1 => CrossEngineLinkMaintenance::Manual,
+            2 => CrossEngineLinkMaintenance::Derived,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        let delete_behavior = match self.byte()? {
+            1 => CrossEngineLinkDeleteBehavior::Restrict,
+            2 => CrossEngineLinkDeleteBehavior::Cascade,
+            3 => CrossEngineLinkDeleteBehavior::Retain,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        Ok(CrossEngineLinkDefinition {
+            header,
+            source,
+            target,
+            mapping,
+            maintenance,
+            delete_behavior,
+            synchronous: self.boolean()?,
+        })
+    }
+
     fn header(&mut self) -> Result<ObjectHeader, CatalogError> {
         Ok(ObjectHeader {
             id: self.object_id()?,
@@ -606,9 +664,11 @@ mod tests {
 
     use super::{
         AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnDefinition,
-        MAX_CATALOG_DEFINITION_BYTES, ObjectHeader, QualifiedName, RelationDefinition,
-        SearchCollectionDefinition, SearchFieldDefinition, SecondaryIndexDefinition,
-        StructureDefinition, StructureKind, StructureOwnership, VectorMetric,
+        CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance,
+        CrossEngineLinkMapping, MAX_CATALOG_DEFINITION_BYTES, ObjectHeader, QualifiedName,
+        RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+        SecondaryIndexDefinition, StructureDefinition, StructureKind, StructureOwnership,
+        VectorMetric,
     };
     use crate::MAX_CATALOG_NAME_BYTES;
 
@@ -737,10 +797,37 @@ mod tests {
         }))
     }
 
+    fn cross_engine_link() -> Result<CatalogObject, Box<dyn std::error::Error>> {
+        Ok(CatalogObject::CrossEngineLink(CrossEngineLinkDefinition {
+            header: header(6, EngineKind::Kernel, "accounts_to_documents")?,
+            source: ObjectId::new(1)?,
+            target: ObjectId::new(3)?,
+            mapping: vec![
+                CrossEngineLinkMapping {
+                    source: 1,
+                    target: 1,
+                },
+                CrossEngineLinkMapping {
+                    source: 2,
+                    target: 2,
+                },
+            ],
+            maintenance: CrossEngineLinkMaintenance::Derived,
+            delete_behavior: CrossEngineLinkDeleteBehavior::Cascade,
+            synchronous: true,
+        }))
+    }
+
     #[test]
     fn every_object_definition_has_one_canonical_round_trip()
     -> Result<(), Box<dyn std::error::Error>> {
-        for object in [relation()?, structure()?, search()?, secondary_index()?] {
+        for object in [
+            relation()?,
+            structure()?,
+            search()?,
+            secondary_index()?,
+            cross_engine_link()?,
+        ] {
             let encoded = object.encode_definition()?;
             if object.header().id.get() == 1 {
                 assert_eq!(hex(&encoded)?, RELATION_GOLDEN_HEX);
@@ -797,7 +884,13 @@ mod tests {
     #[test]
     fn definition_decoder_rejects_every_truncated_prefix_and_corruption()
     -> Result<(), Box<dyn std::error::Error>> {
-        for object in [relation()?, structure()?, search()?, secondary_index()?] {
+        for object in [
+            relation()?,
+            structure()?,
+            search()?,
+            secondary_index()?,
+            cross_engine_link()?,
+        ] {
             let encoded = object.encode_definition()?;
             for length in 0..encoded.len() {
                 assert!(CatalogObject::decode_definition(&encoded[..length]).is_err());
@@ -906,6 +999,28 @@ mod tests {
         assert_eq!(
             CatalogName::quoted("x".repeat(MAX_CATALOG_NAME_BYTES + 1)),
             Err(CatalogError::NameTooLong)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cross_engine_link_codec_rejects_unbounded_and_noncanonical_mappings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let CatalogObject::CrossEngineLink(mut definition) = cross_engine_link()? else {
+            return Err("expected cross-engine link".into());
+        };
+        definition.mapping.swap(0, 1);
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidCrossEngineLink)
+        );
+        definition.mapping = vec![CrossEngineLinkMapping {
+            source: 0,
+            target: 1,
+        }];
+        assert_eq!(
+            CatalogObject::CrossEngineLink(definition).encode_definition(),
+            Err(CatalogError::InvalidCrossEngineLink)
         );
         Ok(())
     }

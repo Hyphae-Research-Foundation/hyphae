@@ -2,7 +2,7 @@
 
 //! Strict DROP TABLE RESTRICT vertical.
 
-use hyphae_native_runtime::{NativeDatabase, SqlError};
+use hyphae_native_runtime::{NativeDatabase, SqlError, SqlResult};
 use hyphae_native_types::DurabilityClass;
 
 #[test]
@@ -30,6 +30,16 @@ fn drop_table_is_restrictive_invalidates_plans_and_survives_reopen()
     ddl.execute_sql("DROP INDEX people_email", &[])?;
     ddl.execute_sql("DROP TABLE people", &[])?;
     ddl.commit()?;
+    let mut recreate = database.begin_sql(4, DurabilityClass::Strict)?;
+    let SqlResult::Command {
+        object_id: Some(recreated_id),
+        ..
+    } = recreate.execute_sql("CREATE TABLE people (id BIGINT PRIMARY KEY)", &[])?
+    else {
+        return Err("CREATE TABLE did not return an object ID".into());
+    };
+    assert!(recreated_id.get() > 2);
+    recreate.commit()?;
     assert!(matches!(
         database.execute_prepared_latest(&prepared, &[]),
         Err(SqlError::CatalogChanged)
@@ -43,8 +53,8 @@ fn drop_table_is_restrictive_invalidates_plans_and_survives_reopen()
     let reopened = NativeDatabase::open(&temporary)?;
     assert!(
         reopened
-            .prepare_sql_latest("SELECT email FROM people WHERE id = 1")
-            .is_err()
+            .prepare_sql_latest("SELECT id FROM people WHERE id = 1")
+            .is_ok()
     );
     std::fs::remove_dir_all(&temporary)?;
     Ok(())

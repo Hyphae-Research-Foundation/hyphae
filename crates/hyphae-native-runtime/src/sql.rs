@@ -6780,7 +6780,8 @@ fn relation_by_id(
         Some(
             CatalogObject::SecondaryIndex(_)
             | CatalogObject::Structure(_)
-            | CatalogObject::Search(_),
+            | CatalogObject::Search(_)
+            | CatalogObject::CrossEngineLink(_),
         )
         | None => Err(SqlError::InvalidCatalogObject),
     }
@@ -6793,7 +6794,10 @@ fn secondary_index_by_id(
     match catalog.object(id) {
         Some(CatalogObject::SecondaryIndex(definition)) => Ok(definition),
         Some(
-            CatalogObject::Relation(_) | CatalogObject::Structure(_) | CatalogObject::Search(_),
+            CatalogObject::Relation(_)
+            | CatalogObject::Structure(_)
+            | CatalogObject::Search(_)
+            | CatalogObject::CrossEngineLink(_),
         )
         | None => Err(SqlError::InvalidCatalogObject),
     }

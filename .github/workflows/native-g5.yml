@@ -1,0 +1,121 @@
+name: Native G5 Convergence Closure Evidence
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-evidence:
+    name: G5 exact-SHA convergence closure evidence
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+
+      - name: Verify exact checkout and G5 authorities
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test -z "$(git status --porcelain)"
+          PYTHONPATH=. python -m unittest tools.test_native_g5_infrastructure -v
+          python tools/check_native_g5_manifests.py \
+            --profile config/native-g5-readiness-profile.json \
+            --inventory config/native-g5-inventory.json \
+            --authority config/native-g5-authority-manifest.json \
+            --workload config/native-g5-workload-manifest.json \
+            --suite config/native-g5-suite-manifest.json \
+            --predecessor config/native-g5-predecessor-manifest.json \
+            --output native-g5-manifest-audit.json
+
+      - name: Execute exact authorized suites and assemble candidate evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          SUITE=config/native-g5-suite-manifest.json
+          AUTHORITY=config/native-g5-authority-manifest.json
+          WORKLOAD=config/native-g5-workload-manifest.json
+          PREDECESSOR=config/native-g5-predecessor-manifest.json
+          SUITE_SHA="$(shasum -a 256 "$SUITE" | cut -d' ' -f1)"
+          AUTHORITY_SHA="$(shasum -a 256 "$AUTHORITY" | cut -d' ' -f1)"
+          WORKLOAD_SHA="$(shasum -a 256 "$WORKLOAD" | cut -d' ' -f1)"
+          PREDECESSOR_SHA="$(shasum -a 256 "$PREDECESSOR" | cut -d' ' -f1)"
+          mkdir -p g5-logs g5-receipts g5-audits
+          cp config/native-g5-readiness-evidence.json g5-evidence.json
+          PYTHONPATH=. python tools/check_native_g5_predecessors.py --manifest "$PREDECESSOR" \
+            --manifest-sha256 "$PREDECESSOR_SHA" --output g5-predecessor-audit.json
+          PYTHONPATH=. python tools/inject_native_g5_evidence.py --baseline g5-evidence.json \
+            --kind predecessor --reference g5-predecessor-audit.json --expected-commit "$SHA" \
+            --output g5-evidence-next.json
+          mv g5-evidence-next.json g5-evidence.json
+          python - "$SUITE" "$SHA" "$SUITE_SHA" "$AUTHORITY_SHA" "$WORKLOAD_SHA" "$PREDECESSOR_SHA" <<'PY'
+          import json, pathlib, subprocess, sys
+          suite_path, sha, suite_sha, authority_sha, workload_sha, predecessor_sha = sys.argv[1:]
+          for requirement in json.load(open(suite_path))["requirements"]:
+              args = []
+              for suite in requirement["suites"]:
+                  log = pathlib.Path("g5-logs") / f"{requirement['id']}--{suite['name']}.log"
+                  with log.open("w") as output:
+                      output.write("G5_COMMAND: " + json.dumps(suite["command"], separators=(",", ":")) + "\n")
+                      output.flush()
+                      subprocess.run(suite["command"], stdout=output, stderr=subprocess.STDOUT, check=True)
+                  args += ["--suite-log", suite["name"], str(log)]
+              subprocess.run([sys.executable, "tools/produce_native_g5_receipt.py", "--source-commit", sha,
+                  "--requirement", requirement["id"], "--suite-manifest", suite_path,
+                  "--suite-manifest-sha256", suite_sha, "--authority-manifest-sha256", authority_sha,
+                  "--workload-manifest-sha256", workload_sha, "--predecessor-audit-sha256", predecessor_sha,
+                  "--platform", "ubuntu-24.04", "--toolchain", "1.96.0", *args,
+                  "--output", f"g5-receipts/{requirement['id']}.json"], check=True)
+          PY
+          while IFS= read -r requirement; do
+            PYTHONPATH=. python tools/check_native_g5_receipt.py --receipt "g5-receipts/$requirement.json" \
+              --expected-commit "$SHA" --expected-requirement "$requirement" \
+              --suite-manifest-sha256 "$SUITE_SHA" --authority-manifest-sha256 "$AUTHORITY_SHA" \
+              --workload-manifest-sha256 "$WORKLOAD_SHA" --predecessor-audit-sha256 "$PREDECESSOR_SHA" \
+              --output "g5-audits/$requirement.json"
+            PYTHONPATH=. python tools/inject_native_g5_evidence.py --baseline g5-evidence.json --kind requirement \
+              --requirement "$requirement" --reference "g5-audits/$requirement.json" \
+              --expected-commit "$SHA" --output g5-evidence-next.json
+            mv g5-evidence-next.json g5-evidence.json
+          done < <(python -c 'import json; print("\n".join(r["id"] for r in json.load(open("config/native-g5-suite-manifest.json"))["requirements"]))')
+          PYTHONPATH=. python tools/check_native_g5_readiness.py --profile config/native-g5-readiness-profile.json \
+            --evidence g5-evidence.json --expected-commit "$SHA" \
+            --suite-manifest-sha256 "$SUITE_SHA" --authority-manifest-sha256 "$AUTHORITY_SHA" \
+            --workload-manifest-sha256 "$WORKLOAD_SHA" --predecessor-manifest-sha256 "$PREDECESSOR_SHA" \
+            --output native-g5-readiness.json
+          python -c 'import json; r=json.load(open("native-g5-readiness.json")); assert r["status"] == "candidate-evidence-complete" and r["passed"] == r["required"] == 8 and r["predecessors_passed"] == r["predecessors_required"] == 3 and r["closure_declared"] is False and r["claims"] == []'
+
+      - name: Upload exact-SHA G5 closure evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g5-closure-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            g5-logs/
+            g5-receipts/
+            g5-audits/
+            g5-predecessor-audit.json
+            g5-evidence.json
+            native-g5-manifest-audit.json
+            native-g5-readiness.json
+            config/native-g5-*.json

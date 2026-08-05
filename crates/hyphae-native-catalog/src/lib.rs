@@ -109,6 +109,9 @@ pub enum CatalogError {
     /// A nested native logical-type descriptor is invalid.
     #[error(transparent)]
     NativeType(#[from] NativeTypeError),
+    /// A cross-engine link endpoint or mapping is malformed.
+    #[error("cross-engine link definition is invalid")]
+    InvalidCrossEngineLink,
     /// Catalog version space is exhausted.
     #[error("catalog version space is exhausted")]
     VersionExhausted,
@@ -668,6 +671,88 @@ pub struct SearchCollectionDefinition {
     pub ann: Option<AnnIndexDefinition>,
 }
 
+/// One stable member-identity correspondence in a cross-engine link.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CrossEngineLinkMapping {
+    /// Stable member identity in the source object.
+    pub source: u32,
+    /// Stable member identity in the target object.
+    pub target: u32,
+}
+
+/// How a cross-engine link is maintained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CrossEngineLinkMaintenance {
+    /// The application maintains both endpoints explicitly.
+    Manual = 1,
+    /// Hyphae derives target changes from source changes.
+    Derived = 2,
+}
+
+/// Behavior when a linked source value is deleted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CrossEngineLinkDeleteBehavior {
+    /// Reject deletion while a linked target value exists.
+    Restrict = 1,
+    /// Delete the linked target value.
+    Cascade = 2,
+    /// Leave the target value unchanged.
+    Retain = 3,
+}
+
+/// Explicit stable-ID link between objects owned by different native engines.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossEngineLinkDefinition {
+    /// Shared object metadata; links are owned by the kernel.
+    pub header: ObjectHeader,
+    /// Stable source object identity.
+    pub source: ObjectId,
+    /// Stable target object identity.
+    pub target: ObjectId,
+    /// Canonically ordered stable member-ID mappings.
+    pub mapping: Vec<CrossEngineLinkMapping>,
+    /// Maintenance policy.
+    pub maintenance: CrossEngineLinkMaintenance,
+    /// Source-delete policy.
+    pub delete_behavior: CrossEngineLinkDeleteBehavior,
+    /// Whether derived updates commit in the originating transaction.
+    pub synchronous: bool,
+}
+
+impl CrossEngineLinkDefinition {
+    /// Validates endpoint and bounded canonical mapping invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for self-links, zero or noncanonical mappings, or an
+    /// excessive mapping count.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.source == self.target
+            || self.header.id == self.source
+            || self.header.id == self.target
+            || self.mapping.is_empty()
+        {
+            return Err(CatalogError::InvalidCrossEngineLink);
+        }
+        if self.mapping.len() > MAX_CATALOG_DEFINITION_ITEMS {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        let mut previous = None;
+        for mapping in &self.mapping {
+            if mapping.source == 0
+                || mapping.target == 0
+                || previous.is_some_and(|value| value >= *mapping)
+            {
+                return Err(CatalogError::InvalidCrossEngineLink);
+            }
+            previous = Some(*mapping);
+        }
+        Ok(())
+    }
+}
+
 impl SearchCollectionDefinition {
     /// Validates one search definition.
     ///
@@ -716,6 +801,8 @@ pub enum CatalogObject {
     Structure(StructureDefinition),
     /// Search collection.
     Search(SearchCollectionDefinition),
+    /// Explicit cross-engine stable-ID link.
+    CrossEngineLink(CrossEngineLinkDefinition),
 }
 
 impl CatalogObject {
@@ -726,6 +813,7 @@ impl CatalogObject {
             Self::SecondaryIndex(definition) => &definition.header,
             Self::Structure(definition) => &definition.header,
             Self::Search(definition) => &definition.header,
+            Self::CrossEngineLink(definition) => &definition.header,
         }
     }
 
@@ -757,6 +845,12 @@ impl CatalogObject {
             }
             Self::Search(definition) => {
                 if definition.header.owner != EngineKind::Search {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                definition.validate()
+            }
+            Self::CrossEngineLink(definition) => {
+                if definition.header.owner != EngineKind::Kernel {
                     return Err(CatalogError::WrongObjectOwner);
                 }
                 definition.validate()
@@ -885,6 +979,24 @@ impl CatalogTransaction {
             };
             definition.validate_relation(relation)?;
         }
+        if let CatalogObject::CrossEngineLink(definition) = &object {
+            let source = self
+                .additions
+                .iter()
+                .find(|existing| existing.header().id == definition.source)
+                .or_else(|| self.base.objects.get(&definition.source));
+            let target = self
+                .additions
+                .iter()
+                .find(|existing| existing.header().id == definition.target)
+                .or_else(|| self.base.objects.get(&definition.target));
+            let (Some(source), Some(target)) = (source, target) else {
+                return Err(CatalogError::InvalidCrossEngineLink);
+            };
+            if source.header().owner == target.header().owner {
+                return Err(CatalogError::InvalidCrossEngineLink);
+            }
+        }
         self.additions.push(object);
         Ok(())
     }
@@ -896,26 +1008,25 @@ impl CatalogTransaction {
     /// Returns an error when the object is absent or still owns a dependent
     /// secondary index or foreign-key edge.
     pub fn remove(&mut self, id: ObjectId) -> Result<(), CatalogError> {
-        let object = self
-            .additions
+        self.additions
             .iter()
             .find(|object| object.header().id == id)
             .or_else(|| self.base.objects.get(&id))
             .ok_or(CatalogError::InvalidDefinitionEncoding)?;
-        if matches!(object, CatalogObject::Relation(_))
-            && self
-                .additions
-                .iter()
-                .chain(self.base.objects.values())
-                .filter(|candidate| !self.removals.contains(&candidate.header().id))
-                .any(|candidate| match candidate {
-                    CatalogObject::SecondaryIndex(index) => index.relation == id,
-                    CatalogObject::Relation(relation) => relation
-                        .foreign_keys
-                        .iter()
-                        .any(|foreign_key| foreign_key.referenced_relation == id),
-                    CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
-                })
+        if self
+            .additions
+            .iter()
+            .chain(self.base.objects.values())
+            .filter(|candidate| !self.removals.contains(&candidate.header().id))
+            .any(|candidate| match candidate {
+                CatalogObject::SecondaryIndex(index) => index.relation == id,
+                CatalogObject::Relation(relation) => relation
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_relation == id),
+                CatalogObject::CrossEngineLink(link) => link.source == id || link.target == id,
+                CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
+            })
         {
             return Err(CatalogError::InvalidDefinitionEncoding);
         }
