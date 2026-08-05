@@ -85,9 +85,11 @@ are revalidated, and parent deletion uses immediate `NO ACTION` by scanning
 transaction-visible child rows. The definition persists
 by relation/column IDs and survives reopen. Composite keys are supported when
 arity/types/order match. Parent primary-key UPDATE is already rejected by the
-native mutation contract. Unique-index targets, commit-time race conflict keys,
-self references, named constraints, cascades and deferred enforcement are not
-yet implemented; those forms fail or remain outside this slice.
+native mutation contract. Commit-time rebase and group-admission validation
+protect both race orders; self references are supported when the inserted row's
+own complete PK satisfies the reference. Unique-index targets, named
+constraints, cascades and deferred enforcement are not yet implemented; those
+forms fail or remain outside this slice.
 
 ## Language pipeline
 

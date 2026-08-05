@@ -3730,13 +3730,27 @@ fn execute_create(
             .map(|name| column_index(&columns, name).map(|index| columns[index].id))
             .collect::<Result<Vec<_>, _>>()?;
         let (parent_id, parent) =
-            relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
+            if normalize_identifier(&foreign_key.referenced_table) == normalize_identifier(name) {
+                (id, None)
+            } else {
+                let (parent_id, parent) =
+                    relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
+                (parent_id, Some(parent))
+            };
+        let parent_columns_source =
+            parent.map_or(columns.as_slice(), |parent| parent.columns.as_slice());
+        let parent_primary_key = parent.map_or(primary_key.as_slice(), |parent| {
+            parent.primary_key.as_slice()
+        });
         let parent_columns = foreign_key
             .referenced_columns
             .iter()
-            .map(|name| column_index(&parent.columns, name).map(|index| parent.columns[index].id))
+            .map(|name| {
+                column_index(parent_columns_source, name)
+                    .map(|index| parent_columns_source[index].id)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        if parent_columns != parent.primary_key || child_columns.len() != parent_columns.len() {
+        if parent_columns != parent_primary_key || child_columns.len() != parent_columns.len() {
             return Err(SqlError::InvalidCatalogObject);
         }
         for (child, parent_column) in child_columns.iter().zip(&parent_columns) {
@@ -3745,8 +3759,7 @@ fn execute_create(
                 .find(|column| column.id == *child)
                 .ok_or(SqlError::UnknownColumn)?
                 .logical_type;
-            let parent_type = &parent
-                .columns
+            let parent_type = &parent_columns_source
                 .iter()
                 .find(|column| column.id == *parent_column)
                 .ok_or(SqlError::UnknownColumn)?
@@ -5494,6 +5507,12 @@ fn validate_foreign_keys(
                     .encode_ordered_component(parent_type)
                     .map_err(|_| SqlError::TypeMismatch)?,
             );
+        }
+        if !contains_null
+            && foreign_key.referenced_relation == definition.header.id
+            && encode_primary_key(definition, values)? == key
+        {
+            continue;
         }
         if !contains_null
             && transaction

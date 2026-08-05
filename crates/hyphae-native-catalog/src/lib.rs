@@ -842,12 +842,19 @@ impl CatalogTransaction {
         }
         if let CatalogObject::Relation(definition) = &object {
             for foreign_key in &definition.foreign_keys {
-                let parent = self
-                    .additions
-                    .iter()
-                    .find(|existing| existing.header().id == foreign_key.referenced_relation)
-                    .or_else(|| self.base.objects.get(&foreign_key.referenced_relation));
-                let Some(CatalogObject::Relation(parent)) = parent else {
+                let parent = if foreign_key.referenced_relation == definition.header.id {
+                    Some(definition)
+                } else {
+                    self.additions
+                        .iter()
+                        .find(|existing| existing.header().id == foreign_key.referenced_relation)
+                        .or_else(|| self.base.objects.get(&foreign_key.referenced_relation))
+                        .and_then(|object| match object {
+                            CatalogObject::Relation(parent) => Some(parent),
+                            _ => None,
+                        })
+                };
+                let Some(parent) = parent else {
                     return Err(CatalogError::InvalidDefinitionEncoding);
                 };
                 foreign_key.validate_relations(definition, parent)?;

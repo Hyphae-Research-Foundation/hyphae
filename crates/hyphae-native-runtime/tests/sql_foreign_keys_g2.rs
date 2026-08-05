@@ -32,6 +32,11 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
         Err(SqlError::ForeignKeyViolation)
     ));
     tx.execute_sql("INSERT INTO children (id, parent_id) VALUES (2, NULL)", &[])?;
+    tx.execute_sql(
+        "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES nodes (id))",
+        &[],
+    )?;
+    tx.execute_sql("INSERT INTO nodes (id, parent_id) VALUES (1, 1)", &[])?;
     tx.commit()?;
     drop(database);
 

@@ -90,9 +90,15 @@ impl CatalogState {
         }
         if let CatalogObject::Relation(definition) = &object {
             for foreign_key in &definition.foreign_keys {
-                let Some(CatalogObject::Relation(parent)) =
-                    self.objects.get(&foreign_key.referenced_relation)
-                else {
+                let parent = if foreign_key.referenced_relation == definition.header.id {
+                    Some(definition)
+                } else {
+                    match self.objects.get(&foreign_key.referenced_relation) {
+                        Some(CatalogObject::Relation(parent)) => Some(parent),
+                        _ => None,
+                    }
+                };
+                let Some(parent) = parent else {
                     return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
                 };
                 foreign_key.validate_relations(definition, parent)?;
