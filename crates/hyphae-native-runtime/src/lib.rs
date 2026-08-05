@@ -11757,7 +11757,10 @@ fn apply_mutations_to_state(
             | Opcode::PopListTail
             | Opcode::CreateSortedSet
             | Opcode::UpsertSortedSetMember
-            | Opcode::DeleteSortedSetMember => {
+            | Opcode::DeleteSortedSetMember
+            | Opcode::CreateStream
+            | Opcode::AppendStreamEntry
+            | Opcode::DeleteStream => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch => {

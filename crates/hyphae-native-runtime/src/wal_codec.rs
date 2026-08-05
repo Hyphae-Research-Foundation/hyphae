@@ -79,6 +79,9 @@ pub(crate) enum Opcode {
     DropSecondaryIndex = 40,
     RenameTable = 41,
     DropTable = 43,
+    CreateStream = 44,
+    AppendStreamEntry = 45,
+    DeleteStream = 46,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -635,6 +638,15 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
             (Opcode::RenameTable, EngineKind::Relational)
         }
         value if value == Opcode::DropTable as u8 => (Opcode::DropTable, EngineKind::Relational),
+        value if value == Opcode::CreateStream as u8 => {
+            (Opcode::CreateStream, EngineKind::Structure)
+        }
+        value if value == Opcode::AppendStreamEntry as u8 => {
+            (Opcode::AppendStreamEntry, EngineKind::Structure)
+        }
+        value if value == Opcode::DeleteStream as u8 => {
+            (Opcode::DeleteStream, EngineKind::Structure)
+        }
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
@@ -778,7 +790,7 @@ fn validate_mutation_shape(
     }
     validate_mutation_target_shape(opcode, has_target)?;
     match opcode {
-        Opcode::RenameTable
+        Opcode::RenameTable | Opcode::AppendStreamEntry
             if key.is_empty() || value_length == 0 || expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -792,6 +804,8 @@ fn validate_mutation_shape(
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::DeleteValue
+        | Opcode::CreateStream
+        | Opcode::DeleteStream
         | Opcode::CreateHash
         | Opcode::DeleteHash
         | Opcode::DeleteHashField
@@ -815,7 +829,8 @@ fn validate_mutation_shape(
         {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::PushListHead
+        Opcode::AppendStreamEntry
+        | Opcode::PushListHead
         | Opcode::PushListTail
         | Opcode::PopListHead
         | Opcode::PopListTail
@@ -848,6 +863,9 @@ fn validate_mutation_target_shape(
     let forbids_target = matches!(
         opcode,
         Opcode::SetValue
+            | Opcode::CreateStream
+            | Opcode::AppendStreamEntry
+            | Opcode::DeleteStream
             | Opcode::DeleteValue
             | Opcode::ExpireValue
             | Opcode::CreateHash
@@ -1194,6 +1212,25 @@ mod tests {
             PageId::new(3)?,
             PageId::new(4)?,
         ])
+    }
+
+    #[test]
+    fn stream_opcodes_are_stable_engine_bound_and_shape_checked()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (byte, opcode) in [
+            (44, Opcode::CreateStream),
+            (45, Opcode::AppendStreamEntry),
+            (46, Opcode::DeleteStream),
+        ] {
+            assert_eq!(opcode as u8, byte);
+            assert_eq!(decode_opcode(byte)?, (opcode, EngineKind::Structure));
+        }
+        assert!(validate_mutation_shape(Opcode::CreateStream, false, 0, None, b"s").is_ok());
+        assert!(validate_mutation_shape(Opcode::DeleteStream, false, 0, None, b"s").is_ok());
+        assert!(validate_mutation_shape(Opcode::AppendStreamEntry, false, 1, None, b"s").is_ok());
+        assert!(validate_mutation_shape(Opcode::AppendStreamEntry, false, 0, None, b"s").is_err());
+        assert!(validate_mutation_shape(Opcode::AppendStreamEntry, true, 1, None, b"s").is_err());
+        Ok(())
     }
 
     #[test]
