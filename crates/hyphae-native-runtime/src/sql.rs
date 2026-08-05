@@ -6579,6 +6579,7 @@ pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
     match error {
         NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
         NativeRuntimeError::CheckConstraintViolation => SqlError::CheckViolation,
+        NativeRuntimeError::ForeignKeyConstraintViolation => SqlError::ForeignKeyViolation,
         error => SqlError::Runtime(error),
     }
 }

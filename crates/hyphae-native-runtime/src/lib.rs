@@ -480,6 +480,9 @@ pub enum NativeRuntimeError {
     /// One persisted relation CHECK predicate rejected a row.
     #[error("native relational CHECK constraint is violated")]
     CheckConstraintViolation,
+    /// One immediate relation foreign key is violated.
+    #[error("native relational FOREIGN KEY constraint is violated")]
+    ForeignKeyConstraintViolation,
     /// The requested native secondary index does not exist in the current root.
     #[error("native relational secondary index {index} does not exist")]
     UnknownSecondaryIndex {
@@ -11869,6 +11872,7 @@ fn apply_relational_mutation(
         Opcode::InsertRow => {
             state.catalog.require(target, EngineKind::Relational)?;
             validate_relation_checks(&state.catalog, target, &mutation.value)?;
+            validate_relation_foreign_keys(state, target, &mutation.value)?;
             let projections = secondary_index_projections(&state.catalog, target, &mutation.value)?;
             state
                 .relational
@@ -11897,6 +11901,7 @@ fn apply_relational_mutation(
             )?;
             if mutation.opcode == Opcode::UpdateRow {
                 validate_relation_checks(&state.catalog, target, &mutation.value)?;
+                validate_relation_foreign_keys(state, target, &mutation.value)?;
                 let new_projections =
                     secondary_index_projections(&state.catalog, target, &mutation.value)?;
                 state
@@ -17499,6 +17504,71 @@ fn remove_secondary_index_projections(
 ) -> Result<(), NativeRuntimeError> {
     for projection in projections {
         relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
+    }
+    Ok(())
+}
+
+fn validate_relation_foreign_keys(
+    state: &MaterializedState,
+    relation_id: ObjectId,
+    row: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    let Some(CatalogObject::Relation(relation)) = state.catalog.object(relation_id) else {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    };
+    if relation.foreign_keys.is_empty() {
+        return Ok(());
+    }
+    let tuple = RowTupleView::decode(row)?;
+    for foreign_key in &relation.foreign_keys {
+        let Some(CatalogObject::Relation(parent)) =
+            state.catalog.object(foreign_key.referenced_relation)
+        else {
+            return Err(NativeRuntimeError::InvalidRelationalTree);
+        };
+        let mut key = Vec::new();
+        let mut contains_null = false;
+        for (child_id, parent_id) in foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+        {
+            let child_index = relation
+                .columns
+                .iter()
+                .position(|column| column.id == *child_id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let parent_type = &parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                .logical_type;
+            let value = match tuple
+                .value(child_index)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+            {
+                ColumnValueRef::Null => {
+                    contains_null = true;
+                    break;
+                }
+                ColumnValueRef::Bytes(encoded) => ScalarValue::decode_storage(parent_type, encoded)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            };
+            key.extend_from_slice(
+                &value
+                    .encode_ordered_component(parent_type)
+                    .map_err(|_| NativeRuntimeError::InvalidRelationalTree)?,
+            );
+        }
+        if !contains_null
+            && state
+                .relational
+                .select(foreign_key.referenced_relation, &key)
+                .is_none()
+        {
+            return Err(NativeRuntimeError::ForeignKeyConstraintViolation);
+        }
     }
     Ok(())
 }
