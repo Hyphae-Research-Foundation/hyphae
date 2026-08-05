@@ -61,9 +61,9 @@ jobs:
           PREDECESSOR_SHA="$(shasum -a 256 "$PREDECESSOR" | cut -d' ' -f1)"
           mkdir -p g5-logs g5-receipts g5-audits
           cp config/native-g5-readiness-evidence.json g5-evidence.json
-          python tools/check_native_g5_predecessors.py --manifest "$PREDECESSOR" \
+          PYTHONPATH=. python tools/check_native_g5_predecessors.py --manifest "$PREDECESSOR" \
             --manifest-sha256 "$PREDECESSOR_SHA" --output g5-predecessor-audit.json
-          python tools/inject_native_g5_evidence.py --baseline g5-evidence.json \
+          PYTHONPATH=. python tools/inject_native_g5_evidence.py --baseline g5-evidence.json \
             --kind predecessor --reference g5-predecessor-audit.json --expected-commit "$SHA" \
             --output g5-evidence-next.json
           mv g5-evidence-next.json g5-evidence.json
@@ -87,17 +87,17 @@ jobs:
                   "--output", f"g5-receipts/{requirement['id']}.json"], check=True)
           PY
           while IFS= read -r requirement; do
-            python tools/check_native_g5_receipt.py --receipt "g5-receipts/$requirement.json" \
+            PYTHONPATH=. python tools/check_native_g5_receipt.py --receipt "g5-receipts/$requirement.json" \
               --expected-commit "$SHA" --expected-requirement "$requirement" \
               --suite-manifest-sha256 "$SUITE_SHA" --authority-manifest-sha256 "$AUTHORITY_SHA" \
               --workload-manifest-sha256 "$WORKLOAD_SHA" --predecessor-audit-sha256 "$PREDECESSOR_SHA" \
               --output "g5-audits/$requirement.json"
-            python tools/inject_native_g5_evidence.py --baseline g5-evidence.json --kind requirement \
+            PYTHONPATH=. python tools/inject_native_g5_evidence.py --baseline g5-evidence.json --kind requirement \
               --requirement "$requirement" --reference "g5-audits/$requirement.json" \
               --expected-commit "$SHA" --output g5-evidence-next.json
             mv g5-evidence-next.json g5-evidence.json
           done < <(python -c 'import json; print("\n".join(r["id"] for r in json.load(open("config/native-g5-suite-manifest.json"))["requirements"]))')
-          python tools/check_native_g5_readiness.py --profile config/native-g5-readiness-profile.json \
+          PYTHONPATH=. python tools/check_native_g5_readiness.py --profile config/native-g5-readiness-profile.json \
             --evidence g5-evidence.json --expected-commit "$SHA" \
             --suite-manifest-sha256 "$SUITE_SHA" --authority-manifest-sha256 "$AUTHORITY_SHA" \
             --workload-manifest-sha256 "$WORKLOAD_SHA" --predecessor-manifest-sha256 "$PREDECESSOR_SHA" \
