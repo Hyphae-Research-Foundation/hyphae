@@ -3817,6 +3817,23 @@ fn execute_insert(
     })
 }
 
+fn decode_stored_values(
+    definition: &RelationDefinition,
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
+    decode_complete_row(definition, false, &[], stored)
+}
+
+fn validate_updated_foreign_keys(
+    transaction: &NativeWriteBatch,
+    definition: &RelationDefinition,
+    stored: &[u8],
+) -> Result<(), SqlError> {
+    let values = decode_stored_values(definition, stored)?;
+    let references = values.iter().map(Some).collect::<Vec<_>>();
+    validate_foreign_keys(transaction, definition, &references)
+}
+
 fn execute_update(
     transaction: &mut NativeWriteBatch,
     name: &str,
@@ -3850,10 +3867,74 @@ fn execute_update(
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
+    if !is_legacy_binary_relation(&definition) {
+        validate_updated_foreign_keys(transaction, &definition, &update)?;
+    }
     transaction
         .update(table, primary_key, update)
         .map_err(map_runtime_error)?;
     Ok(command_result(1))
+}
+
+fn validate_parent_not_referenced(
+    transaction: &NativeWriteBatch,
+    parent: ObjectId,
+    parent_key: &[u8],
+) -> Result<(), SqlError> {
+    for object in transaction.state.catalog.objects.values() {
+        let CatalogObject::Relation(child) = object else {
+            continue;
+        };
+        for foreign_key in &child.foreign_keys {
+            if foreign_key.referenced_relation != parent {
+                continue;
+            }
+            let Some(rows) = transaction.state.relational.tables.get(&child.header.id) else {
+                continue;
+            };
+            for (child_key, stored) in rows {
+                let values = decode_complete_row(child, false, child_key, stored)?;
+                let mut key = Vec::new();
+                let mut contains_null = false;
+                for (child_column, parent_column) in foreign_key
+                    .columns
+                    .iter()
+                    .zip(&foreign_key.referenced_columns)
+                {
+                    let child_index = child
+                        .columns
+                        .iter()
+                        .position(|column| column.id == *child_column)
+                        .ok_or(SqlError::InvalidCatalogObject)?;
+                    let value = &values[child_index];
+                    if matches!(value, SqlValue::Null) {
+                        contains_null = true;
+                        break;
+                    }
+                    let Some(CatalogObject::Relation(parent_definition)) =
+                        transaction.state.catalog.object(parent)
+                    else {
+                        return Err(SqlError::InvalidCatalogObject);
+                    };
+                    let parent_type = &parent_definition
+                        .columns
+                        .iter()
+                        .find(|column| column.id == *parent_column)
+                        .ok_or(SqlError::InvalidCatalogObject)?
+                        .logical_type;
+                    key.extend_from_slice(
+                        &value
+                            .encode_ordered_component(parent_type)
+                            .map_err(|_| SqlError::TypeMismatch)?,
+                    );
+                }
+                if !contains_null && key == parent_key {
+                    return Err(SqlError::ForeignKeyViolation);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_delete(
@@ -3871,6 +3952,7 @@ fn execute_delete(
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
+    validate_parent_not_referenced(transaction, table, &primary_key)?;
     transaction
         .delete(table, primary_key)
         .map_err(map_runtime_error)?;

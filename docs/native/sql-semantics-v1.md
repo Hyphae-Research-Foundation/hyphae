@@ -80,12 +80,14 @@ REFERENCES <parent-table> (<complete-parent-primary-key>)
 
 It uses `MATCH SIMPLE`, immediate `NO ACTION` semantics for child insert: any
 null child component bypasses the lookup; otherwise the complete typed parent
-primary key must be visible in the transaction state. The definition persists
+primary key must be visible in the transaction state. Child inserts and updates
+are revalidated, and parent deletion uses immediate `NO ACTION` by scanning
+transaction-visible child rows. The definition persists
 by relation/column IDs and survives reopen. Composite keys are supported when
-arity/types/order match. Parent delete/update protection, child UPDATE
-revalidation, unique-index targets, commit-time race conflict keys, self
-references, named constraints, cascades and deferred enforcement are not yet
-implemented; those forms fail or remain outside this slice.
+arity/types/order match. Parent primary-key UPDATE is already rejected by the
+native mutation contract. Unique-index targets, commit-time race conflict keys,
+self references, named constraints, cascades and deferred enforcement are not
+yet implemented; those forms fail or remain outside this slice.
 
 ## Language pipeline
 
