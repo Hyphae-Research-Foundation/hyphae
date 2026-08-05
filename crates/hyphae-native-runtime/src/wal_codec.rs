@@ -82,6 +82,7 @@ pub(crate) enum Opcode {
     CreateStream = 44,
     AppendStreamEntry = 45,
     DeleteStream = 46,
+    ExpireStream = 47,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -647,6 +648,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteStream as u8 => {
             (Opcode::DeleteStream, EngineKind::Structure)
         }
+        value if value == Opcode::ExpireStream as u8 => {
+            (Opcode::ExpireStream, EngineKind::Structure)
+        }
         value if value == Opcode::SetValue as u8 => (Opcode::SetValue, EngineKind::Structure),
         value if value == Opcode::DeleteValue as u8 => (Opcode::DeleteValue, EngineKind::Structure),
         value if value == Opcode::ExpireValue as u8 => (Opcode::ExpireValue, EngineKind::Structure),
@@ -824,7 +828,11 @@ fn validate_mutation_shape(
         Opcode::ExpireValue if expires_at_micros.is_none() => {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::ExpireHash | Opcode::ExpireHashField | Opcode::ExpireSet | Opcode::ExpireList
+        Opcode::ExpireHash
+        | Opcode::ExpireHashField
+        | Opcode::ExpireSet
+        | Opcode::ExpireList
+        | Opcode::ExpireStream
             if value_length != 0 || expires_at_micros.is_none() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -866,6 +874,7 @@ fn validate_mutation_target_shape(
             | Opcode::CreateStream
             | Opcode::AppendStreamEntry
             | Opcode::DeleteStream
+            | Opcode::ExpireStream
             | Opcode::DeleteValue
             | Opcode::ExpireValue
             | Opcode::CreateHash
