@@ -530,6 +530,7 @@ struct ParsedJoinEquality {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedForeignKey {
     columns: Vec<String>,
+    name: Option<String>,
     referenced_table: String,
     referenced_columns: Vec<String>,
 }
@@ -3793,6 +3794,11 @@ fn execute_create(
             }
         }
         foreign_keys.push(ForeignKeyDefinition {
+            name: foreign_key
+                .name
+                .map(CatalogName::unquoted)
+                .transpose()
+                .map_err(NativeRuntimeError::from)?,
             columns: child_columns,
             referenced_relation: parent_id,
             referenced_columns: parent_columns,
@@ -6766,6 +6772,11 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
     let mut table_primary_key = None;
     let mut foreign_keys = Vec::new();
     loop {
+        let constraint_name = if parser.consume_keyword("CONSTRAINT") {
+            Some(parser.identifier()?)
+        } else {
+            None
+        };
         if parser.consume_keyword("FOREIGN") {
             parser.expect_keyword("KEY")?;
             parser.expect_symbol('(')?;
@@ -6776,9 +6787,12 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
             let referenced_columns = parser.identifier_list(')')?;
             foreign_keys.push(ParsedForeignKey {
                 columns,
+                name: constraint_name,
                 referenced_table,
                 referenced_columns,
             });
+        } else if constraint_name.is_some() {
+            return Err(SqlError::InvalidSyntax);
         } else if parser.consume_keyword("PRIMARY") {
             if table_primary_key.is_some() {
                 return Err(SqlError::InvalidSyntax);

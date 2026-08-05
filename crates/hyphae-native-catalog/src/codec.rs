@@ -112,6 +112,13 @@ impl Encoder {
             }
             self.put_item_count(definition.foreign_keys.len())?;
             for foreign_key in &definition.foreign_keys {
+                match &foreign_key.name {
+                    Some(name) => {
+                        self.put_byte(1)?;
+                        self.put_name(name)?;
+                    }
+                    None => self.put_byte(0)?,
+                }
                 self.put_item_count(foreign_key.columns.len())?;
                 for column in &foreign_key.columns {
                     self.put_fixed(&column.get().to_le_bytes())?;
@@ -319,6 +326,11 @@ impl<'encoded> Decoder<'encoded> {
             let foreign_key_count = self.item_count()?;
             foreign_keys.reserve(foreign_key_count);
             for _ in 0..foreign_key_count {
+                let name = match self.byte()? {
+                    0 => None,
+                    1 => Some(self.name()?),
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
+                };
                 let child_count = self.item_count()?;
                 let mut child_columns = Vec::with_capacity(child_count);
                 for _ in 0..child_count {
@@ -336,6 +348,7 @@ impl<'encoded> Decoder<'encoded> {
                     _ => return Err(CatalogError::InvalidDefinitionEncoding),
                 };
                 foreign_keys.push(ForeignKeyDefinition {
+                    name,
                     columns: child_columns,
                     referenced_relation,
                     referenced_columns,

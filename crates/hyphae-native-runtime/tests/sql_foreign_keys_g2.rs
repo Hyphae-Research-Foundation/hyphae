@@ -14,7 +14,7 @@ fn foreign_key_rejects_missing_parent_and_survives_reopen() -> Result<(), Box<dy
     let mut tx = database.begin_sql(1, DurabilityClass::Strict)?;
     tx.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
     tx.execute_sql(
-        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents (id))",
         &[],
     )?;
     assert!(matches!(
@@ -98,7 +98,7 @@ fn concurrent_parent_delete_wins_and_child_rebase_fails() -> Result<(), Box<dyn 
     let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
     seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
     seed.execute_sql(
-        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents (id))",
         &[],
     )?;
     seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;
@@ -129,7 +129,7 @@ fn concurrent_child_commit_wins_and_parent_delete_rebase_fails()
     let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
     seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
     seed.execute_sql(
-        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents (id))",
         &[],
     )?;
     seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;
@@ -159,7 +159,7 @@ fn group_commit_rejects_second_fk_racer_in_both_orders() -> Result<(), Box<dyn s
         let mut seed = database.begin_sql(1, DurabilityClass::Strict)?;
         seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
         seed.execute_sql(
-            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT children_parent_fk FOREIGN KEY (parent_id) REFERENCES parents (id))",
             &[],
         )?;
         seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;

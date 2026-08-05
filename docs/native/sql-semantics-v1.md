@@ -89,9 +89,11 @@ native mutation contract. Commit-time rebase and group-admission validation
 protect both race orders; self references are supported when the inserted row's
 own complete PK satisfies the reference. A non-null ordered `UNIQUE` secondary
 index may also be the parent target; the catalog persists its stable index ID
-and foreground/rebase enforcement probes the unique index. Named constraints,
-cascades and deferred enforcement are not yet implemented; those forms fail or
-remain outside this slice.
+and foreground/rebase enforcement probes the unique index. `CONSTRAINT name`
+is accepted for table-level foreign keys, normalized and persisted; duplicate
+names within one relation fail catalog validation. Cascades and deferred
+enforcement are not yet implemented; those forms fail or remain outside this
+slice.
 
 ## Language pipeline
 

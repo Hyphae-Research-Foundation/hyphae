@@ -285,6 +285,8 @@ pub struct ColumnCheckConstraint {
 /// One immediate MATCH SIMPLE primary-key foreign key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForeignKeyDefinition {
+    /// Optional normalized constraint name.
+    pub name: Option<CatalogName>,
     /// Ordered child columns.
     pub columns: Vec<ColumnId>,
     /// Referenced relation identity.
@@ -418,7 +420,13 @@ impl RelationDefinition {
                 .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
             previous_check = Some(*column);
         }
+        let mut names = BTreeSet::new();
         for foreign_key in &self.foreign_keys {
+            if let Some(name) = &foreign_key.name
+                && !names.insert(name.lookup())
+            {
+                return Err(CatalogError::InvalidDefinitionEncoding);
+            }
             if foreign_key.columns.is_empty()
                 || foreign_key.columns.len() != foreign_key.referenced_columns.len()
                 || foreign_key
