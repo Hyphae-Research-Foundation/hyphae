@@ -491,6 +491,7 @@ struct ParsedWindowSelect {
     partition_column: Option<String>,
     order_column: String,
     alias: String,
+    outer_order_by: Vec<String>,
     limit: usize,
 }
 
@@ -1094,7 +1095,7 @@ fn execute_window_select(
         window.value_column,
         order_columns.join(", "),
         window.name,
-        order_columns.join(", "),
+        window.outer_order_by.join(", "),
         window.limit
     );
     let Statement::Select {
@@ -6622,6 +6623,7 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         partition_column,
         order_column,
         alias,
+        outer_order_by,
         limit,
     }))
 }
