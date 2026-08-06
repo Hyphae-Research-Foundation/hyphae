@@ -1,0 +1,68 @@
+name: Native G6 Local Product Foundation
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-foundation:
+    name: G6 exact-SHA contract foundation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+
+      - name: Audit open G6 authorities
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test -z "$(git status --porcelain)"
+          PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
+          python tools/check_native_gate_closures.py
+          python tools/check_native_g6_foundation.py \
+            --expected-commit "$SHA" \
+            --profile config/native-g6-readiness-profile.json \
+            --evidence config/native-g6-readiness-evidence.json \
+            --inventory config/native-g6-inventory.json \
+            --authority config/native-g6-authority-manifest.json \
+            --workload config/native-g6-workload-manifest.json \
+            --suite config/native-g6-suite-manifest.json \
+            --predecessor config/native-g6-predecessor-manifest.json \
+            --output native-g6-foundation-audit.json
+          python - <<'PY'
+          import json
+          result = json.load(open("native-g6-foundation-audit.json"))
+          assert result["status"] == "foundation-complete"
+          assert result["source_commit"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+          assert result["requirements"] == result["planned_requirements"] == 14
+          assert result["implemented_requirements"] == 0
+          assert result["predecessors"] == 6
+          assert set(result["manifest_sha256"]) == {"profile", "evidence", "inventory", "authority", "workload", "suite", "predecessor"}
+          assert result["closure_status"] == "open"
+          assert result["claims"] == []
+          assert result["closure_declared"] is False
+          PY
+
+      - name: Upload exact-SHA open G6 foundation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g6-foundation-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            native-g6-foundation-audit.json
+            config/native-g6-*.json

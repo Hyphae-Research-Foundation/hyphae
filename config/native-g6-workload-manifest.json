@@ -1,0 +1,22 @@
+{
+  "schema": "hyphae-native-g6-workload-manifest-v1",
+  "gate": "G6",
+  "workloads": [
+    {"id": "surface-error-parity", "requirement": "shared-contracts-and-errors", "oracle": "same stable code, retry class and transaction state on every surface", "acceptance": ["stable-code-registry", "unknown-commit", "redaction", "local-http-sdk-parity"]},
+    {"id": "catalog-identity", "requirement": "catalog-and-collection-model", "oracle": "same stable IDs, definitions and dependencies on one snapshot", "acceptance": ["bounded-enumeration", "catalogued-keyspaces", "fielded-collections", "named-vectors", "dependency-integrity"]},
+    {"id": "embedded-product", "requirement": "embedded-product-facade", "oracle": "curated facade reaches every admitted family with bounded direct execution", "acceptance": ["curated-api", "direct-engine-calls", "limits-deadlines-cancellation", "durability-policy"]},
+    {"id": "integrated-search", "requirement": "competitive-search-surface", "oracle": "same-snapshot BM25, exact, ANN, hybrid, filters, sort, facets, metrics and named vectors", "acceptance": ["persistent-doc-values", "filter-aware-ann", "exact-filtered-oracle", "adaptive-exact-ann", "multi-target-vectors", "streaming-ingest-backpressure", "no-partial-mutation"]},
+    {"id": "incremental-ann", "requirement": "incremental-ann-lifecycle", "oracle": "bounded upsert/delete, interrupted consolidation and snapshot-safe reclamation without per-mutation rebuild", "acceptance": ["incremental-upsert", "incremental-delete", "durable-delta", "interrupted-consolidation", "atomic-generation-switch", "snapshot-safe-reclamation", "no-per-mutation-full-rebuild"]},
+    {"id": "offline-proof", "requirement": "native-offline-proofs", "oracle": "origin-independent verification and exact-versus-approximate tamper controls", "acceptance": ["point-sql-search-proofs", "ann-approximation-binding", "hybrid-branch-binding", "origin-unavailable", "tamper-matrix"]},
+    {"id": "local-daemon", "requirement": "native-local-daemon", "oracle": "multi-client UDS and named-pipe parity with cancellation and flow control", "acceptance": ["uds", "windows-named-pipe", "multi-client", "handshake-capabilities", "peer-identity", "prepared-handles", "provisional-read-completion", "flow-control", "cancel-deadline", "disconnect-transaction-outcome", "graceful-shutdown"]},
+    {"id": "http-v2", "requirement": "native-http-v2", "oracle": "loopback-first HTTP v2 parity, authentication, bounds and no internal serialized hop", "acceptance": ["openapi-json-schema", "authentication", "bounded-streaming", "provisional-read-completion", "request-id", "v1-compatibility-policy"]},
+    {"id": "one-binary", "requirement": "single-binary-cli", "oracle": "one executable owns native operations and starts no implicit listener", "acceptance": ["native-default-authority", "no-native-switch", "no-implicit-listener", "stable-exit-classes", "full-admitted-operation-corpus"]},
+    {"id": "sdk-parity", "requirement": "rust-python-typescript-sdks", "oracle": "three SDKs match over native-local and HTTP transports", "acceptance": ["rust", "python", "typescript", "native-local", "http-v2", "typed-errors-proofs"]},
+    {"id": "admin-explain", "requirement": "administration-and-explain", "oracle": "typed plans and bounded authorized maintenance preserve foreground correctness", "acceptance": ["typed-explain", "authorization", "progress-cancellation", "foreground-interference"]},
+    {"id": "telemetry-doctor", "requirement": "telemetry-and-doctor", "oracle": "redacted bounded observations and fail-closed whole-product diagnosis", "acceptance": ["separate-clocks", "bounded-cardinality", "redaction", "whole-product-corruption", "lock-contention"]},
+    {"id": "product-restore", "requirement": "backup-restore-product-surface", "oracle": "verified native restore preserves complete catalogued state and passes doctor", "acceptance": ["facade-cli-surface", "offline-verification", "doctor-after-restore", "complete-state-equivalence"]},
+    {"id": "all-surface-conformance", "requirement": "cross-surface-conformance", "oracle": "IDs, CSN, results, errors, explain and proofs agree across platforms and surfaces", "acceptance": ["linux-macos-windows", "embedded-local-cli-http", "rust-python-typescript", "identity-csn-result-error-explain-proof", "failure-paths"]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

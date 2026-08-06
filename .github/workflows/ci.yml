@@ -37,6 +37,18 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
+      - name: Verify open G6 contract foundation
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
+          python tools/check_native_g6_foundation.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --profile config/native-g6-readiness-profile.json \
+            --evidence config/native-g6-readiness-evidence.json \
+            --inventory config/native-g6-inventory.json \
+            --authority config/native-g6-authority-manifest.json \
+            --workload config/native-g6-workload-manifest.json \
+            --suite config/native-g6-suite-manifest.json \
+            --predecessor config/native-g6-predecessor-manifest.json
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:

@@ -37,6 +37,15 @@ The governing documents are:
 - [ordered phase-1 gate](gates/native-local-phase-1.md); and
 - [current native gate status](gates/native-gate-status.md).
 
+The accepted [G6 execution roadmap](roadmaps/native-g6-roadmap.md) makes the
+next gate a competitive local product rather than a thin wrapper. It fixes the
+embedded/local-first strategy, native HTTP `/v2`, Rust/Python/TypeScript SDKs,
+optional provider adapters, integrated filtered/hybrid search, incremental ANN
+lifecycle, and native offline proofs. Closing G8 will establish readiness for
+that bounded local contract, not universal superiority over a distributed
+vector platform; matched comparative evidence and distributed capabilities are
+later programs.
+
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
 and model integration do not begin until G8 closes on one exact commit.
 
