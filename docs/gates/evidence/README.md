@@ -30,8 +30,8 @@ artifacts expire. The SHA in each filename identifies the tested source
 candidate; the summary is necessarily committed later and does not claim its
 own commit as the evaluated source.
 
-- [Native G0 exact-SHA closure](closures/native-g0-b7cf651.json)
-- [Native G1 exact-SHA closure](closures/native-g1-b7cf651.json)
+- [Native G0 exact-SHA closure](closures/native-g0-14b4ec9.json)
+- [Native G1 exact-SHA closure](closures/native-g1-14b4ec9.json)
 - [Native G2 exact-SHA closure](closures/native-g2-a839037.json)
 - [Native G3 exact-SHA closure](closures/native-g3-a839037.json)
 - [Native G4 exact-SHA closure](closures/native-g4-0059fce.json)

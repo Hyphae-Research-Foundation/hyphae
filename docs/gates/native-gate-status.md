@@ -7,8 +7,8 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 
 | Gate | Current status | Closure authority |
 |---|---|---|
-| G0 | Closed at `b7cf651` | [8/8 hosted and governance exact-SHA closure](evidence/closures/native-g0-b7cf651.json) |
-| G1 | Closed at `b7cf651` | [7/7 hosted exact-SHA substrate closure](evidence/closures/native-g1-b7cf651.json) |
+| G0 | Closed at `14b4ec9` | [8/8 hosted and governance exact-SHA closure](evidence/closures/native-g0-14b4ec9.json) |
+| G1 | Closed at `14b4ec9` | [7/7 hosted exact-SHA substrate closure](evidence/closures/native-g1-14b4ec9.json) |
 | G2 | Closed at `a839037` | [8/8 hosted bounded relational closure](evidence/closures/native-g2-a839037.json); no universal SQL or official benchmark claim |
 | G3 | Closed at `a839037` | [11/11 hosted suite-bound structure closure](evidence/closures/native-g3-a839037.json) |
 | G4 | Closed at `0059fce` | [12/12 hosted corpus-bound search closure](evidence/closures/native-g4-0059fce.json) |
