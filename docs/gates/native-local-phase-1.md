@@ -75,6 +75,10 @@ benchmark corpus, and implementation-facing tests exist.
 
 ## Current experimental evidence
 
+The status language in dated evidence below records the state at each source
+commit. It does not override the current retained closure index in
+[`native-gate-status.md`](native-gate-status.md).
+
 The [native directory identity and writer exclusion
 evidence](evidence/native-directory-identity-linux-2026-08-02.md) binds
 canonical native `FORMAT`, UUIDv7 lineage identity, fail-closed marker-family

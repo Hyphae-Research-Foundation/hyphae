@@ -138,6 +138,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [0.2.1 release gate](gates/0.2.1.md)
 - [Native local ecosystem phase-1 gate](gates/native-local-phase-1.md)
 - [Current native gate status](gates/native-gate-status.md)
+- [Native G0 exact-SHA closure](gates/evidence/closures/native-g0-14b4ec9.json)
+- [Native G1 exact-SHA closure](gates/evidence/closures/native-g1-14b4ec9.json)
 - [Native G2 exact-SHA closure](gates/evidence/closures/native-g2-a839037.json)
 - [Native G3 exact-SHA closure](gates/evidence/closures/native-g3-a839037.json)
 - [Native G4 exact-SHA closure](gates/evidence/closures/native-g4-0059fce.json)

@@ -23,6 +23,22 @@ commit before its tag can be published.
 
 ## Native phase-1 observations
 
+### Retained gate closures
+
+These reviewed summaries preserve hosted evidence after temporary workflow
+artifacts expire. The SHA in each filename identifies the tested source
+candidate; the summary is necessarily committed later and does not claim its
+own commit as the evaluated source.
+
+- [Native G0 exact-SHA closure](closures/native-g0-14b4ec9.json)
+- [Native G1 exact-SHA closure](closures/native-g1-14b4ec9.json)
+- [Native G2 exact-SHA closure](closures/native-g2-a839037.json)
+- [Native G3 exact-SHA closure](closures/native-g3-a839037.json)
+- [Native G4 exact-SHA closure](closures/native-g4-0059fce.json)
+- [Native G5 exact-SHA closure](closures/native-g5-b7cf651.json)
+
+### Source-bound observations
+
 - [Native phase-1 kernel evidence — 2026-08-01](native-phase1-kernel-2026-08-01.md)
   records the first page/WAL/MVCC/catalog convergence vertical and its explicit
   remaining gates.
@@ -427,8 +443,9 @@ commit before its tag can be published.
   and host-observed unsafe metrics to one source commit.
 - `native-dependency-closure-wsl2.json` records 11 native workspace packages,
   19 external primitives/build dependencies, zero native unsafe findings, and
-  every external parser/exclusion residual. Semantic third-party unsafe review
-  and the remaining G0 corpus/conformance work stay open.
+  every external parser/exclusion residual. At that source commit, semantic
+  third-party unsafe review and the remaining G0 corpus/conformance work were
+  still open.
 - [Native bounded-WAL-replay evidence —
   2026-08-02](native-wal-replay-2026-08-02.md) binds fixed-size retention
   anchors, identity-preserving prefix retirement, suffix-only recovery, six

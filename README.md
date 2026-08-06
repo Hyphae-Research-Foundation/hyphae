@@ -26,9 +26,9 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Development line:** Hyphae Native is the active architecture on `dev`. G0 and
-G1 have hosted exact-SHA workflows, G2 and G3 are closed, and G4 is a closure
-candidate for its versioned bounded search profile. The
+**Development line:** Hyphae Native is the active architecture on `dev`. G0
+through G5 are closed for their versioned, bounded profiles; G6 through G8
+remain open. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 
@@ -38,9 +38,9 @@ compatibility baseline, not a description of the current `dev` architecture.
 Its publication receipt remains available at
 [`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
 
-The target release for the native line is `1.0.0`. G1-G8 remain development
-gates and `main` will not receive the native line until the complete product is
-implemented, tested, and ready to replace `0.2.1`.
+The target release for the native line is `1.0.0`. The remaining G6-G8 product,
+performance, and release gates must close before `main` receives the native
+line and replaces `0.2.1`.
 
 ## What Hyphae does
 

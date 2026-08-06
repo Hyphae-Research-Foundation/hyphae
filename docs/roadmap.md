@@ -18,10 +18,9 @@ format.
 
 ## Next program: native local data ecosystem
 
-The next product program is an accepted target but has no release number.
-G0/G1 hosted closure evidence is reproducible, while G2 and G3 are exact-SHA
-closure candidates for their versioned profiles; see the
-[native gate status](gates/native-gate-status.md). Hyphae will build its own
+The next product program targets `1.0.0`. G0 through G5 have retained exact-SHA
+closure for their versioned, bounded profiles; G6 through G8 remain open. See
+the [native gate status](gates/native-gate-status.md). Hyphae will build its own
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory
 manager, page/blob store, WAL, MVCC/commit sequence, scheduler, backup, and
@@ -39,7 +38,7 @@ The governing documents are:
 - [current native gate status](gates/native-gate-status.md).
 
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
-and model integration do not begin until its release gate is closed.
+and model integration do not begin until G8 closes on one exact commit.
 
 The historical `0.2.0` implementation record remains in
 [`roadmap-0.2.md`](roadmap-0.2.md); its retained evidence limitations do not

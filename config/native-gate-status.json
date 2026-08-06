@@ -5,28 +5,46 @@
   "gates": [
     {
       "id": "G0",
-      "status": "closure-claimed-revalidation-required",
-      "reason": "The README records a hosted closure, but the retained evidence map does not reconstruct it."
+      "status": "closed",
+      "source_commit": "14b4ec9d5b5503572ff283585ef83aec8ab50ac6",
+      "evidence": "docs/gates/evidence/closures/native-g0-14b4ec9.json",
+      "evidence_sha256": "1c50fde44bda0743e0f11586fe54912ad1fbacdc5305f5a0bdf8c9fb9269e896"
     },
     {
       "id": "G1",
-      "status": "closure-claimed-revalidation-required",
-      "reason": "The implementation and hosted workflow exist, but no durable exact-SHA aggregate is retained in this checkout."
+      "status": "closed",
+      "source_commit": "14b4ec9d5b5503572ff283585ef83aec8ab50ac6",
+      "evidence": "docs/gates/evidence/closures/native-g1-14b4ec9.json",
+      "evidence_sha256": "c5a094a691a4c434ec9533f1ea00c2e7854463b1670b80c0136c32517b5541a1"
     },
     {
       "id": "G2",
       "status": "closed",
       "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
-      "evidence": "docs/gates/evidence/closures/native-g2-a839037.json"
+      "evidence": "docs/gates/evidence/closures/native-g2-a839037.json",
+      "evidence_sha256": "a9686adbd23192070e7cc4c31707c33bebeb3f1ba6f696e5a0c0c17063151fb8"
     },
     {
       "id": "G3",
       "status": "closed",
       "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
-      "evidence": "docs/gates/evidence/closures/native-g3-a839037.json"
+      "evidence": "docs/gates/evidence/closures/native-g3-a839037.json",
+      "evidence_sha256": "2625885c10197f7462a66defb68d6be9185a47405458830011418f8063c796f2"
     },
-    {"id": "G4", "status": "closed", "source_commit": "0059fcee318f7e8fc14ae6651f6b43607ac0b219", "evidence": "docs/gates/evidence/closures/native-g4-0059fce.json"},
-    {"id": "G5", "status": "closed", "source_commit": "b7cf651229802f35d39d61d61965f469c9200ac1", "evidence": "docs/gates/evidence/closures/native-g5-b7cf651.json"},
+    {
+      "id": "G4",
+      "status": "closed",
+      "source_commit": "0059fcee318f7e8fc14ae6651f6b43607ac0b219",
+      "evidence": "docs/gates/evidence/closures/native-g4-0059fce.json",
+      "evidence_sha256": "13fd1854fafccfcf9365574007cfc202ecc403ea64a547e13bdcd9606ffeaa13"
+    },
+    {
+      "id": "G5",
+      "status": "closed",
+      "source_commit": "b7cf651229802f35d39d61d61965f469c9200ac1",
+      "evidence": "docs/gates/evidence/closures/native-g5-b7cf651.json",
+      "evidence_sha256": "37250d8a7730878a764ca0f0cab2ebdd3b4ea72e89dfe26c505ca95d96c800be"
+    },
     {"id": "G6", "status": "open"},
     {"id": "G7", "status": "open"},
     {"id": "G8", "status": "open"}
