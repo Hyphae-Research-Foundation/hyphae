@@ -180,6 +180,12 @@ impl CatalogState {
         self.objects.get(&id)
     }
 
+    pub(crate) fn object_qualified(&self, name: &QualifiedName) -> Option<&CatalogObject> {
+        self.objects
+            .values()
+            .find(|object| same_catalog_lookup(&object.header().name, name))
+    }
+
     pub(crate) fn require(&self, id: ObjectId, owner: EngineKind) -> Result<(), ModelError> {
         let entry = self.objects.get(&id).ok_or(ModelError::UnknownObject)?;
         if entry.header().owner != owner {

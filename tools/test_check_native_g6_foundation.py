@@ -54,7 +54,16 @@ class NativeG6FoundationTests(unittest.TestCase):
         self.assertEqual(result["status"], "foundation-complete")
         self.assertEqual(result["requirements"], len(REQUIREMENTS))
         self.assertEqual(result["implemented_requirements"], 0)
-        self.assertEqual(result["planned_requirements"], len(REQUIREMENTS))
+        self.assertEqual(result["partial_requirements"], 2)
+        self.assertEqual(result["planned_requirements"], len(REQUIREMENTS) - 2)
+        self.assertEqual(
+            result["rust_toolchain"],
+            {
+                "channel": "1.96.0",
+                "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+                "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+            },
+        )
         self.assertEqual(result["closure_status"], "open")
         self.assertFalse(result["closure_declared"])
 
@@ -88,8 +97,8 @@ class NativeG6FoundationTests(unittest.TestCase):
 
     def test_suite_rows_cannot_claim_implementation_without_suites(self) -> None:
         changed = payloads()
-        changed[5]["requirements"][0]["status"] = "implemented"
-        with self.assertRaisesRegex(GateFailure, "explicitly planned"):
+        changed[5]["requirements"][0]["suites"] = []
+        with self.assertRaisesRegex(GateFailure, "invalid G6 implementation status"):
             validate_changed(changed)
 
     def test_workload_acceptance_drift_fails_closed(self) -> None:

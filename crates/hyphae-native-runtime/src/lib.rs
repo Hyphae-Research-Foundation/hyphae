@@ -739,6 +739,261 @@ pub enum NativeRuntimeError {
     UnexpectedFullStateLoad,
 }
 
+impl NativeRuntimeError {
+    /// Returns the underlying operating-system error kind when this failure is
+    /// one of the runtime's explicit filesystem I/O variants.
+    pub fn io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io(source)
+            | Self::Directory(NativeDirectoryError::Io { source, .. })
+            | Self::Page(PageStoreError::Io(source))
+            | Self::BufferPool(BufferPoolError::Store(PageStoreError::Io(source)))
+            | Self::Blob(BlobError::Io(source))
+            | Self::BTree(
+                BTreeError::Store(PageStoreError::Io(source))
+                | BTreeError::BufferPool(BufferPoolError::Store(PageStoreError::Io(source))),
+            )
+            | Self::Wal(WalError::Io(source))
+            | Self::Manifest(ManifestError::Io(source))
+            | Self::SnapshotPin(SnapshotPinError::Io(source)) => Some(source.kind()),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this runtime failure wraps an explicit filesystem I/O
+    /// error rather than a codec, semantic, or corruption failure.
+    pub fn is_io(&self) -> bool {
+        self.io_error_kind().is_some()
+    }
+
+    /// Returns whether this runtime failure identifies malformed durable or
+    /// logical authority rather than I/O, capacity, or operational state.
+    pub fn is_corruption(&self) -> bool {
+        match self {
+            Self::Wal(source) => wal_error_is_corruption(source),
+            Self::Page(source) => page_store_error_is_corruption(source),
+            Self::BufferPool(BufferPoolError::Store(source)) => {
+                page_store_error_is_corruption(source)
+            }
+            Self::Blob(source) => blob_error_is_corruption(source),
+            Self::BTree(source) => btree_error_is_corruption(source),
+            Self::Manifest(source) => manifest_error_is_corruption(source),
+            Self::SnapshotPin(source) => snapshot_pin_error_is_corruption(source),
+            Self::WalSemantic(_)
+            | Self::Model(_)
+            | Self::InvalidCatalogTree
+            | Self::InvalidRelationalTree
+            | Self::InvalidStructureTree
+            | Self::InvalidSearchTree
+            | Self::InvalidAnnTree
+            | Self::InvalidCommittedRoot
+            | Self::InvalidCheckpoint
+            | Self::NoncontiguousCommitSequence
+            | Self::FuturePage => true,
+            Self::Record(source) => record_error_is_corruption(source),
+            Self::Catalog(source) => catalog_error_is_corruption(source),
+            _ => false,
+        }
+    }
+}
+
+fn wal_error_is_corruption(source: &WalError) -> bool {
+    matches!(
+        source,
+        WalError::InvalidBlockLength { .. }
+            | WalError::InvalidMagic
+            | WalError::UnsupportedFormat { .. }
+            | WalError::BlockSequenceMismatch { .. }
+            | WalError::PreviousDigestMismatch { .. }
+            | WalError::ReservedNonzero
+            | WalError::BlockPayloadTooLarge { .. }
+            | WalError::NonzeroPadding
+            | WalError::BlockChecksumMismatch
+            | WalError::BlockDigestMismatch
+            | WalError::EmptyBlock
+            | WalError::InvalidRecordLength { .. }
+            | WalError::UnknownRecordKind(_)
+            | WalError::UnknownEngineKind(_)
+            | WalError::RecordReservedNonzero
+            | WalError::RecordLsnMismatch { .. }
+            | WalError::RecordChecksumMismatch { .. }
+            | WalError::InvalidRetentionAnchorLength { .. }
+            | WalError::InvalidRetentionAnchorPreamble
+            | WalError::InvalidRetentionAnchorIdentity
+            | WalError::RetentionAnchorChecksumMismatch
+            | WalError::RetentionAnchorDigestMismatch
+            | WalError::InvalidPhysicalBase
+            | WalError::UnexpectedRetentionEntry
+            | WalError::InvalidRetentionAnchorChain
+            | WalError::RetentionAnchorLineageMismatch
+    )
+}
+
+fn page_store_error_is_corruption(source: &PageStoreError) -> bool {
+    match source {
+        PageStoreError::Page(source) => matches!(
+            source,
+            hyphae_native_pages::PageError::InvalidLength { .. }
+                | hyphae_native_pages::PageError::InvalidMagic
+                | hyphae_native_pages::PageError::UnsupportedFormat { .. }
+                | hyphae_native_pages::PageError::UnknownKind(_)
+                | hyphae_native_pages::PageError::ReservedNonzero
+                | hyphae_native_pages::PageError::PageIdMismatch { .. }
+                | hyphae_native_pages::PageError::PayloadTooLarge { .. }
+                | hyphae_native_pages::PageError::NonzeroPadding
+                | hyphae_native_pages::PageError::ChecksumMismatch
+                | hyphae_native_pages::PageError::DigestMismatch
+        ),
+        PageStoreError::InvalidFileLength { .. } => true,
+        PageStoreError::Io(_) | PageStoreError::Poisoned | PageStoreError::PageIdExhausted => false,
+    }
+}
+
+fn blob_error_is_corruption(source: &BlobError) -> bool {
+    matches!(
+        source,
+        BlobError::InvalidPreamble
+            | BlobError::Identity(_)
+            | BlobError::InvalidLength
+            | BlobError::ChecksumMismatch
+            | BlobError::IdentityMismatch
+            | BlobError::UnexpectedDirectoryEntry
+            | BlobError::IdentityCollision
+            | BlobError::InconsistentGeneration
+    )
+}
+
+fn btree_error_is_corruption(source: &BTreeError) -> bool {
+    match source {
+        BTreeError::Store(source) => page_store_error_is_corruption(source),
+        BTreeError::BufferPool(BufferPoolError::Store(source)) => {
+            page_store_error_is_corruption(source)
+        }
+        BTreeError::WrongPageKind
+        | BTreeError::InvalidLength
+        | BTreeError::InvalidPreamble
+        | BTreeError::InvalidCount
+        | BTreeError::NoncanonicalKeyOrder
+        | BTreeError::InvalidSeparator
+        | BTreeError::ZeroChild
+        | BTreeError::HeightExceeded
+        | BTreeError::Cycle
+        | BTreeError::Unbalanced
+        | BTreeError::FuturePage => true,
+        BTreeError::BufferPool(_)
+        | BTreeError::LengthOverflow
+        | BTreeError::KeyTooLarge
+        | BTreeError::EntryTooLarge
+        | BTreeError::NoValidSplit
+        | BTreeError::DuplicateKey => false,
+    }
+}
+
+fn manifest_error_is_corruption(source: &ManifestError) -> bool {
+    matches!(
+        source,
+        ManifestError::Mvcc(
+            MvccError::InvalidWalAnchor
+                | MvccError::UncommittedRootSet
+                | MvccError::InvalidStorageTransition
+        ) | ManifestError::InvalidLength
+            | ManifestError::InvalidPreamble
+            | ManifestError::ChecksumMismatch
+            | ManifestError::DigestMismatch
+            | ManifestError::InvalidIdentity
+            | ManifestError::InvalidStorageState
+            | ManifestError::NoncanonicalRoots
+            | ManifestError::InvalidChain
+            | ManifestError::LineageMismatch
+            | ManifestError::UnexpectedDirectoryEntry
+    )
+}
+
+fn snapshot_pin_error_is_corruption(source: &SnapshotPinError) -> bool {
+    matches!(
+        source,
+        SnapshotPinError::InvalidIdentity
+            | SnapshotPinError::InvalidLength
+            | SnapshotPinError::InvalidPreamble
+            | SnapshotPinError::ChecksumMismatch
+            | SnapshotPinError::FilenameIdentityMismatch
+            | SnapshotPinError::LineageMismatch
+            | SnapshotPinError::UnexpectedDirectoryEntry
+    )
+}
+
+fn record_error_is_corruption(source: &RecordError) -> bool {
+    matches!(
+        source,
+        RecordError::Truncated
+            | RecordError::LengthMismatch
+            | RecordError::UnknownFlags
+            | RecordError::EmptyRegularRow
+            | RecordError::ColumnCountOverflow
+            | RecordError::LengthOverflow
+            | RecordError::ZeroIdentity
+            | RecordError::InvalidVersionWindow
+            | RecordError::InvalidTombstone
+            | RecordError::NoncanonicalNullBitmap
+            | RecordError::InvalidOffsets
+            | RecordError::NullHasBytes
+            | RecordError::InvalidBlobReferenceLength
+            | RecordError::InvalidRowVersionPointer
+            | RecordError::InvalidTupleHeader
+    )
+}
+
+fn catalog_error_is_corruption(source: &CatalogError) -> bool {
+    match source {
+        CatalogError::EmptyName
+        | CatalogError::NameTooLong
+        | CatalogError::DuplicateObjectId(_)
+        | CatalogError::DuplicateName(_)
+        | CatalogError::DuplicateColumnId(_)
+        | CatalogError::DuplicateColumnName(_)
+        | CatalogError::NoncanonicalColumnOrder
+        | CatalogError::EmptyRelation
+        | CatalogError::DuplicateFieldId(_)
+        | CatalogError::DuplicateFieldName(_)
+        | CatalogError::NoncanonicalFieldOrder
+        | CatalogError::AnnRequiresVector
+        | CatalogError::InvalidAnnM
+        | CatalogError::InvalidAnnEfConstruction
+        | CatalogError::InvalidAnnEfSearch
+        | CatalogError::MissingPrimaryKeyColumn(_)
+        | CatalogError::DuplicatePrimaryKeyColumn(_)
+        | CatalogError::NullablePrimaryKeyColumn(_)
+        | CatalogError::EmptySecondaryIndex
+        | CatalogError::DuplicateSecondaryIndexColumn(_)
+        | CatalogError::SelfReferentialSecondaryIndex
+        | CatalogError::MissingSecondaryIndexRelation(_)
+        | CatalogError::MissingSecondaryIndexColumn(_)
+        | CatalogError::WrongObjectOwner
+        | CatalogError::TooManyDefinitionItems
+        | CatalogError::DefinitionTooLarge
+        | CatalogError::InvalidDefinitionEncoding
+        | CatalogError::InvalidCrossEngineLink => true,
+        CatalogError::NativeType(source) => native_type_error_is_corruption(*source),
+        CatalogError::VersionExhausted => false,
+    }
+}
+
+fn native_type_error_is_corruption(source: hyphae_native_types::NativeTypeError) -> bool {
+    !matches!(
+        source,
+        hyphae_native_types::NativeTypeError::ZeroIdentity(_)
+            | hyphae_native_types::NativeTypeError::InvalidDecimalPrecision
+            | hyphae_native_types::NativeTypeError::InvalidDecimalScale
+            | hyphae_native_types::NativeTypeError::EmptyVector
+            | hyphae_native_types::NativeTypeError::ScalarTypeMismatch
+            | hyphae_native_types::NativeTypeError::NullRequiresRowBitmap
+            | hyphae_native_types::NativeTypeError::ScalarOutOfRange
+            | hyphae_native_types::NativeTypeError::UnsupportedOrderedType
+            | hyphae_native_types::NativeTypeError::UnsupportedScalarType
+            | hyphae_native_types::NativeTypeError::ScalarLengthExceeded
+    )
+}
+
 impl From<WalSemanticError> for NativeRuntimeError {
     fn from(source: WalSemanticError) -> Self {
         Self::WalSemantic(source.to_string())
@@ -1149,6 +1404,19 @@ pub struct NativePhysicalObservation {
     pub process_full_catalog_loads: u64,
 }
 
+/// Current catalog point lookup plus its exact immutable root-set identity.
+#[derive(Clone, Debug)]
+pub struct IdentifiedCatalogObject {
+    /// Visible CSN used by the lookup.
+    pub visible_csn: Option<Csn>,
+    /// Catalog version used by the lookup.
+    pub catalog_version: CatalogVersion,
+    /// Complete root-set digest used by the lookup.
+    pub root_digest: [u8; 32],
+    /// Requested object, absent when no live definition matches.
+    pub object: Option<CatalogObject>,
+}
+
 /// Receipt for one cross-engine native commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitReceipt {
@@ -1556,10 +1824,25 @@ impl NativeSnapshot {
         self.metadata.catalog_version
     }
 
+    /// Returns the logical time used for TTL and temporal visibility.
+    pub const fn logical_time_micros(&self) -> i64 {
+        self.metadata.logical_time_micros
+    }
+
+    /// Returns the complete immutable root-set digest for this snapshot.
+    pub fn root_digest(&self) -> [u8; 32] {
+        self.metadata.roots().digest()
+    }
+
     /// Returns one immutable catalog object definition pinned by this
     /// snapshot.
     pub fn catalog_object(&self, id: ObjectId) -> Option<&CatalogObject> {
         self.state.catalog.object(id)
+    }
+
+    /// Returns one immutable catalog object by normalized qualified name.
+    pub fn catalog_object_named(&self, name: &QualifiedName) -> Option<&CatalogObject> {
+        self.state.catalog.object_qualified(name)
     }
 
     /// Executes a resource-bounded compound lexical query over this snapshot.
@@ -2608,11 +2891,34 @@ impl NativeDatabase {
         &self,
         id: ObjectId,
     ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+        self.catalog_object_latest_identified(id)
+            .map(|identified| identified.object)
+    }
+
+    /// Looks up one current catalog definition and returns the exact snapshot
+    /// identity used by the bounded physical lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same storage and corruption failures as
+    /// [`Self::catalog_object_latest`].
+    pub fn catalog_object_latest_identified(
+        &self,
+        id: ObjectId,
+    ) -> Result<IdentifiedCatalogObject, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
-        let Some(root) = snapshot.roots().root(SLOT_CATALOG) else {
-            return Ok(None);
-        };
-        self.catalog_object_at_root(root, id)
+        let object = snapshot
+            .roots()
+            .root(SLOT_CATALOG)
+            .map(|root| self.catalog_object_at_root(root, id))
+            .transpose()?
+            .flatten();
+        Ok(IdentifiedCatalogObject {
+            visible_csn: snapshot.visible_csn,
+            catalog_version: snapshot.catalog_version,
+            root_digest: snapshot.roots().digest(),
+            object,
+        })
     }
 
     /// Looks up one current catalog definition by normalized qualified name.
@@ -2628,11 +2934,34 @@ impl NativeDatabase {
         &self,
         name: &QualifiedName,
     ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+        self.catalog_object_named_latest_identified(name)
+            .map(|identified| identified.object)
+    }
+
+    /// Looks up one current catalog definition by name and returns the exact
+    /// snapshot identity used by the bounded physical lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same storage and corruption failures as
+    /// [`Self::catalog_object_named_latest`].
+    pub fn catalog_object_named_latest_identified(
+        &self,
+        name: &QualifiedName,
+    ) -> Result<IdentifiedCatalogObject, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
-        let Some(root) = snapshot.roots().root(SLOT_CATALOG) else {
-            return Ok(None);
-        };
-        self.catalog_object_named_at_root(root, name)
+        let object = snapshot
+            .roots()
+            .root(SLOT_CATALOG)
+            .map(|root| self.catalog_object_named_at_root(root, name))
+            .transpose()?
+            .flatten();
+        Ok(IdentifiedCatalogObject {
+            visible_csn: snapshot.visible_csn,
+            catalog_version: snapshot.catalog_version,
+            root_digest: snapshot.roots().digest(),
+            object,
+        })
     }
 
     fn catalog_object_named_at_root(
@@ -2992,15 +3321,21 @@ impl NativeDatabase {
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
-        self.execute_prepared_latest_with_csn(prepared, parameters)
-            .map(|(_, result)| result)
+        self.execute_prepared_latest_identified(prepared, parameters)
+            .map(|(_, _, _, result)| result)
     }
 
-    pub(crate) fn execute_prepared_latest_with_csn(
+    /// Executes one current catalog-bound SQL plan and returns the exact CSN
+    /// and catalog version used by physical execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_prepared_latest`].
+    pub fn execute_prepared_latest_identified(
         &self,
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
-    ) -> Result<(Csn, SqlResult), SqlError> {
+    ) -> Result<(Csn, CatalogVersion, [u8; 32], SqlResult), SqlError> {
         let metadata = self
             .coordinator
             .snapshot(0)
@@ -3008,8 +3343,19 @@ impl NativeDatabase {
         let visible_csn = metadata
             .visible_csn
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog_version = metadata.catalog_version;
+        let root_digest = metadata.roots().digest();
         let result = sql::execute_prepared_latest(self, &metadata, prepared, parameters)?;
-        Ok((visible_csn, result))
+        Ok((visible_csn, catalog_version, root_digest, result))
+    }
+
+    pub(crate) fn execute_prepared_latest_with_csn(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+    ) -> Result<(Csn, SqlResult), SqlError> {
+        self.execute_prepared_latest_identified(prepared, parameters)
+            .map(|(csn, _, _, result)| (csn, result))
     }
 
     /// Performs an owned primary-key lookup through the current relational

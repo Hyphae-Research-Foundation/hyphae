@@ -34,6 +34,7 @@ CARGO_MANIFESTS = (
     "crates/hyphae-native-manifest/Cargo.toml",
     "crates/hyphae-native-mvcc/Cargo.toml",
     "crates/hyphae-native-pages/Cargo.toml",
+    "crates/hyphae-native-product/Cargo.toml",
     "crates/hyphae-native-records/Cargo.toml",
     "crates/hyphae-native-runtime/Cargo.toml",
     "crates/hyphae-native-types/Cargo.toml",

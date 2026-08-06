@@ -96,6 +96,9 @@ pub enum SqlError {
     /// An immediate native SQL foreign key has no visible parent.
     #[error("HYSQL016 native SQL FOREIGN KEY constraint failed")]
     ForeignKeyViolation,
+    /// A referenced relation does not exist in the bound catalog.
+    #[error("HYSQL017 native SQL relation does not exist")]
+    UnknownRelation,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -114,7 +117,8 @@ impl PreparedStatement {
         self.catalog_version
     }
 
-    pub(crate) fn parameter_count(&self) -> usize {
+    /// Returns the exact parameter count required by this plan.
+    pub fn parameter_count(&self) -> usize {
         self.plan.parameter_count()
     }
 
@@ -122,7 +126,8 @@ impl PreparedStatement {
         self.plan.result_schema()
     }
 
-    pub(crate) fn maximum_result_rows(&self) -> Option<usize> {
+    /// Returns the maximum materialized row count for this bounded plan.
+    pub fn maximum_result_rows(&self) -> Option<usize> {
         self.plan.maximum_result_rows()
     }
 }
@@ -6767,8 +6772,14 @@ fn relation_named<'catalog>(
 ) -> Result<(ObjectId, &'catalog RelationDefinition), SqlError> {
     let id = catalog
         .id_named(name, EngineKind::Relational)
-        .map_err(NativeRuntimeError::from)?;
-    Ok((id, relation_by_id(catalog, id)?))
+        .map_err(|error| match error {
+            crate::model::ModelError::UnknownObject => SqlError::UnknownRelation,
+            error => SqlError::Runtime(NativeRuntimeError::from(error)),
+        })?;
+    match catalog.object(id) {
+        Some(CatalogObject::Relation(definition)) => Ok((id, definition)),
+        Some(_) | None => Err(SqlError::UnknownRelation),
+    }
 }
 
 fn relation_by_id(
@@ -6782,8 +6793,8 @@ fn relation_by_id(
             | CatalogObject::Structure(_)
             | CatalogObject::Search(_)
             | CatalogObject::CrossEngineLink(_),
-        )
-        | None => Err(SqlError::InvalidCatalogObject),
+        ) => Err(SqlError::InvalidCatalogObject),
+        None => Err(SqlError::UnknownRelation),
     }
 }
 

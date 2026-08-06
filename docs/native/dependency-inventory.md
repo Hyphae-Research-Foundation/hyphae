@@ -53,13 +53,14 @@ dependency, performance and replacement-cost review.
 | `proptest` | property tests | allowed test primitive |
 | `redb` | shipped `0.2` reconstructible index | compatibility only; forbidden as native target evidence |
 
-## Native-slice dependency capture
+## Native product dependency capture
 
-The experimental target path currently consists of:
+The native product target path currently consists of:
 
 - `hyphae-native-ann`;
 - `hyphae-native-types`;
 - `hyphae-native-pages`;
+- `hyphae-native-product`;
 - `hyphae-native-wal`;
 - `hyphae-native-catalog`;
 - `hyphae-native-mvcc`;
@@ -69,9 +70,12 @@ The experimental target path currently consists of:
 - `hyphae-native-manifest`; and
 - `hyphae-native-runtime`.
 
-`cargo tree -p hyphae-native-runtime --locked` on 2026-08-01 showed only the
-workspace crates above plus `blake3 1.8.5`, `crc32c 0.6.8`, and `thiserror
-2.0.19` at runtime. Their proc-macro/build dependencies were `arrayref`,
+The historical `cargo tree -p hyphae-native-runtime --locked` capture on
+2026-08-01 covered the engine closure before the G6 product facade existed.
+The current gate is rooted at `hyphae-native-product`, which adds only that
+Hyphae-owned facade to the reviewed runtime closure. The captured external
+primitives include `blake3`, `crc32c`, `thiserror`, Unicode and receipt JSON
+support. Their proc-macro/build dependencies include `arrayref`,
 `arrayvec`, `cfg-if`, `constant_time_eq`, `cpufeatures`, `cc`,
 `find-msvc-tools`, `shlex`, `rustc_version`, `semver`, `proc-macro2`, `quote`,
 `syn`, and `unicode-ident`.
@@ -120,7 +124,7 @@ Before G0 closes:
 
 ## Exact native-closure gate
 
-The G0 dependency gate is rooted at the `hyphae-native-runtime` package. It
+The native dependency gate is rooted at the `hyphae-native-product` package. It
 uses `cargo metadata --locked --format-version 1` and follows every non-dev
 normal and build edge, including target-conditioned edges. Development-only
 dependencies are outside this runtime closure and require their existing

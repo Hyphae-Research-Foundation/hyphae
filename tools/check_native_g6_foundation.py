@@ -14,6 +14,11 @@ from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+RUST_TOOLCHAIN = {
+    "channel": "1.96.0",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+}
 REQUIREMENTS = [
     "shared-contracts-and-errors",
     "catalog-and-collection-model",
@@ -230,13 +235,38 @@ def validate(
     for requirement, raw_row in zip(REQUIREMENTS, suite_rows, strict=True):
         row = _object(raw_row, "G6 suite row")
         expected_workload = workload_rows[REQUIREMENTS.index(requirement)]["id"]
-        if (
-            set(row) != {"id", "workloads", "status", "suites"}
-            or row["workloads"] != [expected_workload]
-            or row["status"] != "planned"
-            or row["suites"] != []
-        ):
-            raise GateFailure(f"G6 suite {requirement} must remain explicitly planned")
+        if set(row) != {"id", "workloads", "status", "suites"} or row["workloads"] != [expected_workload]:
+            raise GateFailure(f"G6 suite binding mismatch for {requirement}")
+        suites = row["suites"]
+        if row["status"] == "planned":
+            if suites != []:
+                raise GateFailure(f"planned G6 suite {requirement} must remain empty")
+            continue
+        if row["status"] != "partial-unhosted" or not isinstance(suites, list) or not suites:
+            raise GateFailure(f"invalid G6 implementation status for {requirement}")
+        names: set[str] = set()
+        for raw_suite in suites:
+            item = _object(raw_suite, f"G6 suite {requirement}")
+            if set(item) != {"name", "command"}:
+                raise GateFailure(f"invalid G6 suite fields for {requirement}")
+            name, command = item["name"], item["command"]
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in names
+                or not isinstance(command, list)
+                or len(command) < 2
+                or command[0] != "cargo"
+                or command[1] != "test"
+                or not any(
+                    command[index : index + 2] == ["-p", "hyphae-native-product"]
+                    for index in range(len(command) - 1)
+                )
+                or command[-1] != "--locked"
+                or any(not isinstance(part, str) or not part for part in command)
+            ):
+                raise GateFailure(f"invalid G6 suite command for {requirement}")
+            names.add(name)
 
     predecessor_rows = predecessor.get("predecessors")
     if not isinstance(predecessor_rows, list) or [row.get("gate") for row in predecessor_rows if isinstance(row, dict)] != PREDECESSORS:
@@ -289,6 +319,7 @@ def validate(
         ):
             raise GateFailure(f"unpassed G6 predecessor {row['gate']}")
 
+    partial = sum(row["status"] == "partial-unhosted" for row in suite_rows)
     return {
         "schema": "hyphae-native-g6-foundation-audit-v1",
         "gate": "G6",
@@ -296,10 +327,12 @@ def validate(
         "source_commit": expected_commit,
         "requirements": len(REQUIREMENTS),
         "implemented_requirements": 0,
-        "planned_requirements": len(REQUIREMENTS),
+        "partial_requirements": partial,
+        "planned_requirements": len(REQUIREMENTS) - partial,
         "contracts": len(contracts),
         "predecessors": len(PREDECESSORS),
         "manifest_sha256": manifest_digests,
+        "rust_toolchain": RUST_TOOLCHAIN,
         "closure_status": "open",
         "claims": [],
         "closure_declared": False,
