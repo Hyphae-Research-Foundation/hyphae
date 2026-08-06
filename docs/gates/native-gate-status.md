@@ -13,7 +13,8 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 | G3 | Closed at `a839037` | [11/11 hosted suite-bound structure closure](evidence/closures/native-g3-a839037.json) |
 | G4 | Closed at `0059fce` | [12/12 hosted corpus-bound search closure](evidence/closures/native-g4-0059fce.json) |
 | G5 | Closed at `b7cf651` | [8/8 hosted exact-SHA convergence closure](evidence/closures/native-g5-b7cf651.json) |
-| G6-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
+| G6 | Open; contract foundation | [Accepted competitive local-product roadmap](../roadmaps/native-g6-roadmap.md); machine-readable profile is open and claim-free |
+| G7-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
 
 `bounded-readiness-only` records useful hosted evidence without promoting a
 deliberately restricted vertical into the broader normative gate outcome.

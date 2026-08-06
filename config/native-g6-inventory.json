@@ -1,0 +1,92 @@
+{
+  "schema": "hyphae-native-g6-inventory-v1",
+  "gate": "G6",
+  "requirements": [
+    {
+      "id": "shared-contracts-and-errors",
+      "status": "partial",
+      "present": ["canonical native values and stable IDs", "typed runtime, catalog, SQL, protocol and backup errors"],
+      "gaps": ["transport-independent public contract crate", "stable common code registry", "exhaustive cross-surface mappings and uncertain-commit semantics"]
+    },
+    {
+      "id": "catalog-and-collection-model",
+      "status": "partial",
+      "present": ["versioned catalog definitions", "stable IDs, relations, secondary indexes, search collections and cross-engine links", "bounded point lookup"],
+      "gaps": ["bounded public list/describe/dependency API", "catalogued keyspace authority", "integrated fielded collection and multiple named vectors", "complete evolution and plan invalidation"]
+    },
+    {
+      "id": "embedded-product-facade",
+      "status": "partial",
+      "present": ["NativeDatabase, NativeSnapshot and NativeWriteBatch", "closed G2-G5 execution paths"],
+      "gaps": ["curated stable product facade", "central limits, deadlines, cancellation, durability and authorization policy", "public embedding examples"]
+    },
+    {
+      "id": "competitive-search-surface",
+      "status": "partial",
+      "present": ["BM25, boolean, phrase, prefix and fuzzy execution", "typed doc-value filtering, sort, facets and metrics", "exact, ANN and hybrid components"],
+      "gaps": ["one persistent fielded collection query surface", "persistent multi-field doc values", "filter-aware ANN planning", "named and multi-target vector queries", "bounded streaming ingestion"]
+    },
+    {
+      "id": "incremental-ann-lifecycle",
+      "status": "open",
+      "present": ["deterministic HNSW build, exact oracle, WAL-backed vector lifecycle and snapshot generations"],
+      "gaps": ["incremental graph upsert and delete", "durable deltas and interruption-safe consolidation", "snapshot-safe generation reclamation", "no full rebuild per mutation"]
+    },
+    {
+      "id": "native-offline-proofs",
+      "status": "open",
+      "present": ["published format-2 proof discipline", "native lineage, root-set, catalog and receipt identities"],
+      "gaps": ["native proof codec and witness", "point, SQL, search, ANN, hybrid and catalog proof generation", "offline verifier and tamper matrix", "explicit approximate-proof semantics"]
+    },
+    {
+      "id": "native-local-daemon",
+      "status": "partial",
+      "present": ["HYPHLCL1 frame codec", "engine-bearing serial UDS session", "bounded SQL, scalar structure, lexical and all-engine transaction slices"],
+      "gaps": ["multi-client daemon", "Windows named pipes", "complete handshake and peer identity", "flow control, streaming, deadlines and cancellation", "complete admitted product operation matrix"]
+    },
+    {
+      "id": "native-http-v2",
+      "status": "open",
+      "present": ["loopback-first format-2 HTTP v1 patterns", "OpenAPI and JSON Schema tooling"],
+      "gaps": ["native HTTP v2 contracts and server adapter", "native streaming and error parity", "exact v1 compatibility decision over one native authority"]
+    },
+    {
+      "id": "single-binary-cli",
+      "status": "open",
+      "present": ["one packaged hyphae executable with format-2 operations"],
+      "gaps": ["native runtime in the product binary", "native SQL, structures, search, transactions and explain", "native daemon, admin, doctor, backup, restore and proof commands", "stable exit classes"]
+    },
+    {
+      "id": "rust-python-typescript-sdks",
+      "status": "open",
+      "present": ["bounded format-2 HTTP Rust, Python and TypeScript clients", "shared generated-model and conformance patterns"],
+      "gaps": ["native high-level local-protocol clients", "native HTTP v2 clients", "complete capability parity and cross-language binary goldens", "transaction, explain and proof APIs"]
+    },
+    {
+      "id": "administration-and-explain",
+      "status": "partial",
+      "present": ["checkpoint, compaction, vacuum, retention, collection and expiry primitives", "bounded SQL and convergence explanations"],
+      "gaps": ["typed administration facade and authorization", "progress and cancellation boundaries", "stable cross-engine explain schema", "foreground/background resource-policy integration"]
+    },
+    {
+      "id": "telemetry-and-doctor",
+      "status": "partial",
+      "present": ["recovery reports, physical counters, scheduler timings, ANN and convergence receipts", "fail-closed native open validation"],
+      "gaps": ["bounded telemetry registry and redaction rules", "cross-surface telemetry snapshots", "native doctor schema and CLI", "whole-product corruption and lock-contention matrix"]
+    },
+    {
+      "id": "backup-restore-product-surface",
+      "status": "partial",
+      "present": ["G5 native offline backup, verification and atomic restore", "failure-path tests"],
+      "gaps": ["facade and single-binary exposure", "common errors, telemetry, progress and safe cancellation", "doctor-after-restore and cross-surface equivalence"]
+    },
+    {
+      "id": "cross-surface-conformance",
+      "status": "open",
+      "present": ["individual embedded and UDS verticals", "format-2 public-client conformance patterns"],
+      "gaps": ["one G6 corpus across embedded, UDS, named pipes, CLI, HTTP and six SDK transport lanes", "identity, CSN, result, error, explain and proof equality", "complete security and failure-path matrix"]
+    }
+  ],
+  "claims": [],
+  "closure_declared": false
+}

@@ -1,0 +1,22 @@
+{
+  "schema": "hyphae-native-g6-suite-manifest-v1",
+  "gate": "G6",
+  "requirements": [
+    {"id": "shared-contracts-and-errors", "workloads": ["surface-error-parity"], "status": "planned", "suites": []},
+    {"id": "catalog-and-collection-model", "workloads": ["catalog-identity"], "status": "planned", "suites": []},
+    {"id": "embedded-product-facade", "workloads": ["embedded-product"], "status": "planned", "suites": []},
+    {"id": "competitive-search-surface", "workloads": ["integrated-search"], "status": "planned", "suites": []},
+    {"id": "incremental-ann-lifecycle", "workloads": ["incremental-ann"], "status": "planned", "suites": []},
+    {"id": "native-offline-proofs", "workloads": ["offline-proof"], "status": "planned", "suites": []},
+    {"id": "native-local-daemon", "workloads": ["local-daemon"], "status": "planned", "suites": []},
+    {"id": "native-http-v2", "workloads": ["http-v2"], "status": "planned", "suites": []},
+    {"id": "single-binary-cli", "workloads": ["one-binary"], "status": "planned", "suites": []},
+    {"id": "rust-python-typescript-sdks", "workloads": ["sdk-parity"], "status": "planned", "suites": []},
+    {"id": "administration-and-explain", "workloads": ["admin-explain"], "status": "planned", "suites": []},
+    {"id": "telemetry-and-doctor", "workloads": ["telemetry-doctor"], "status": "planned", "suites": []},
+    {"id": "backup-restore-product-surface", "workloads": ["product-restore"], "status": "planned", "suites": []},
+    {"id": "cross-surface-conformance", "workloads": ["all-surface-conformance"], "status": "planned", "suites": []}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

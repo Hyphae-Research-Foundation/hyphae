@@ -20,6 +20,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Data model](concepts/data-model.md)
 - [Architecture overview](architecture/overview.md)
 - [Native local ecosystem target](architecture/native-local-ecosystem.md)
+- [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
 
 ## Build and embed
 
@@ -79,6 +80,13 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native lexical tombstone compaction v1](native/search-tombstone-compaction-v1.md)
 - [Native ANN semantics v1](native/ann-semantics-v1.md)
 - [Native local protocol v1](native/local-protocol-v1.md)
+- [Native local product contract v1](native/local-product-v1.md)
+- [Native product error model v1](native/product-error-v1.md)
+- [Native catalog API v1](native/catalog-api-v1.md)
+- [Native product EXPLAIN v1](native/explain-v1.md)
+- [Native local telemetry v1](native/telemetry-v1.md)
+- [Native result proof v1](native/native-proof-v1.md)
+- [Native HTTP API v2](native/http-v2.md)
 - [Native local UDS transport v1](native/local-uds-transport-v1.md)
 - [Native local structure GET v1](native/local-structure-get-v1.md)
 - [Native local structure SET and TTL v1](native/local-structure-set-ttl-v1.md)
@@ -249,6 +257,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0020: Native local data ecosystem](adr/0020-native-local-data-ecosystem.md)
 - [ADR-0021: Native cutover and format evolution](adr/0021-native-cutover-and-format-evolution.md)
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
+- [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
 
 ## Documentation contract
 
