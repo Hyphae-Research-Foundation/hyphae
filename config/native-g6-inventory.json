@@ -5,8 +5,8 @@
     {
       "id": "shared-contracts-and-errors",
       "status": "partial",
-      "present": ["canonical native values and stable IDs", "typed runtime, catalog, SQL, protocol and backup errors"],
-      "gaps": ["transport-independent public contract crate", "stable common code registry", "exhaustive cross-surface mappings and uncertain-commit semantics"]
+      "present": ["canonical native values and stable IDs", "typed runtime, catalog, SQL, protocol and backup errors", "transport-independent native product crate", "initial stable error code/category/retry mappings with stable string identities"],
+      "gaps": ["exhaustive runtime, catalog, protocol, backup and search mappings", "request IDs, typed limit details and transaction state", "cross-surface mappings and uncertain-commit semantics"]
     },
     {
       "id": "catalog-and-collection-model",
@@ -17,8 +17,8 @@
     {
       "id": "embedded-product-facade",
       "status": "partial",
-      "present": ["NativeDatabase, NativeSnapshot and NativeWriteBatch", "closed G2-G5 execution paths"],
-      "gaps": ["curated stable product facade", "central limits, deadlines, cancellation, durability and authorization policy", "public embedding examples"]
+      "present": ["NativeDatabase, NativeSnapshot and NativeWriteBatch", "closed G2-G5 execution paths", "curated read facade for directory lifecycle, snapshots, catalog point lookup, prepared SQL and scalar structure reads", "product-owned prepared-plan, SQL result, TTL and snapshot wrappers"],
+      "gaps": ["remaining SQL, structure, search, transaction, proof and administration families", "central limits, deadlines, cancellation, durability and authorization policy", "public embedding examples"]
     },
     {
       "id": "competitive-search-surface",

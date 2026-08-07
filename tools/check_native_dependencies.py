@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Audit the exact non-dev dependency closure of the native Hyphae runtime."""
+"""Audit the exact non-dev dependency closure of the native Hyphae product."""
 
 from __future__ import annotations
 
@@ -538,7 +538,7 @@ def build_receipt(
     )
 
     _run_required(["cargo", "deny", "check"], root, commands)
-    runtime_manifest = next(
+    root_manifest = next(
         Path(str(entry["manifest_path"])).absolute()
         for entry in closure["packages"]
         if entry["name"] == closure["root_package"]
@@ -550,7 +550,7 @@ def build_receipt(
         "cargo",
         "geiger",
         "--manifest-path",
-        str(runtime_manifest),
+        str(root_manifest),
         "--all-features",
         "--build-dependencies",
         "--locked",

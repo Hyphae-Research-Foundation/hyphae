@@ -698,6 +698,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-product"
+version = "0.2.1"
+dependencies = [
+ "hyphae-native-blobs",
+ "hyphae-native-btree",
+ "hyphae-native-catalog",
+ "hyphae-native-manifest",
+ "hyphae-native-pages",
+ "hyphae-native-records",
+ "hyphae-native-runtime",
+ "hyphae-native-types",
+ "hyphae-native-wal",
+]
+
+[[package]]
 name = "hyphae-native-records"
 version = "0.2.1"
 dependencies = [

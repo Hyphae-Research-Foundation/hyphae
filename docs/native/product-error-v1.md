@@ -42,6 +42,38 @@ typed fields rather than parsing messages.
 - Unknown future codes decode as an unknown typed error while preserving the
   raw stable code and safe fields.
 
+## V1 code registry
+
+This is the exact append-only v1 code registry. Category is stable for every
+listed code. Retry is the stable default where deterministic;
+`failure-dependent` means the error's typed cause selects the retry class. In
+v1, `io` uses `after-backoff` for interrupted, would-block, and timed-out
+operations and `after-recovery` for other I/O failures.
+
+| Code | Category | Retry default |
+| --- | --- | --- |
+| `data_directory_exists` | `conflict` | `never` |
+| `data_directory_locked` | `unavailable` | `after-backoff` |
+| `invalid_data_directory` | `corruption` | `after-recovery` |
+| `format2_directory` | `invalid-request` | `never` |
+| `catalog_object_not_found` | `not-found` | `never` |
+| `sql_invalid_syntax` | `invalid-request` | `never` |
+| `sql_parameter_mismatch` | `invalid-request` | `never` |
+| `sql_catalog_changed` | `conflict` | `new-snapshot` |
+| `sql_foreign_prepared` | `conflict` | `never` |
+| `sql_unknown_object` | `not-found` | `never` |
+| `sql_invalid_value` | `invalid-request` | `never` |
+| `sql_no_access_path` | `invalid-request` | `never` |
+| `sql_unique_violation` | `conflict` | `never` |
+| `sql_check_violation` | `conflict` | `never` |
+| `sql_foreign_key_violation` | `conflict` | `never` |
+| `write_conflict` | `conflict` | `new-snapshot` |
+| `object_not_found` | `not-found` | `never` |
+| `limit_exceeded` | `limit` | `never` |
+| `corruption` | `corruption` | `after-recovery` |
+| `io` | `io` | `failure-dependent` |
+| `internal` | `internal` | `never` |
+
 The native frame header retains its independent 64-bit stream/request
 correlation ID. The product request identity is negotiated or carried in the
 request/error payload and remains stable across retries or transport changes;

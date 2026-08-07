@@ -1,6 +1,6 @@
 {
   "schema": "hyphae-native-dependency-policy-v1",
-  "root_package": "hyphae-native-runtime",
+  "root_package": "hyphae-native-product",
   "workspace_packages": [
     "hyphae-native-ann",
     "hyphae-native-blobs",
@@ -9,6 +9,7 @@
     "hyphae-native-manifest",
     "hyphae-native-mvcc",
     "hyphae-native-pages",
+    "hyphae-native-product",
     "hyphae-native-records",
     "hyphae-native-runtime",
     "hyphae-native-types",

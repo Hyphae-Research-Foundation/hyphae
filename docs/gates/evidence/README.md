@@ -438,7 +438,7 @@ own commit as the evaluated source.
   open.
 - [Native dependency-closure evidence —
   2026-08-02](native-dependency-closure-2026-08-02.md) binds the exact
-  non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
+  historical non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
   sources/licenses, forbidden-engine rejection, workspace lint inheritance,
   and host-observed unsafe metrics to one source commit.
 - `native-dependency-closure-wsl2.json` records 11 native workspace packages,

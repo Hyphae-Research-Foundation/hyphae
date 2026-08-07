@@ -51,7 +51,7 @@ jobs:
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-geiger --version 0.13.0 --locked
-      - name: Audit the exact native runtime closure
+      - name: Audit the exact native product closure
         run: |
           python -m unittest tools/test_check_native_dependencies.py -v
           python tools/check_native_dependencies.py \

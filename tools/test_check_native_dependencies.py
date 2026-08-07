@@ -42,11 +42,13 @@ def dependency(package_id: str, kind: str | None) -> dict[str, object]:
 def metadata(
     packages: list[dict[str, object]],
     root_dependencies: list[dict[str, object]],
+    *,
+    root_name: str = "hyphae-native-runtime",
 ) -> dict[str, object]:
     nodes = [
         {
             "id": package_record["id"],
-            "deps": root_dependencies if package_record["name"] == "hyphae-native-runtime" else [],
+            "deps": root_dependencies if package_record["name"] == root_name else [],
         }
         for package_record in packages
     ]
@@ -69,10 +71,11 @@ def policy(
     external_packages: list[dict[str, object]],
     *,
     forbidden_packages: list[str] | None = None,
+    root_package: str = "hyphae-native-runtime",
 ) -> dict[str, object]:
     return {
         "schema": "hyphae-native-dependency-policy-v1",
-        "root_package": "hyphae-native-runtime",
+        "root_package": root_package,
         "workspace_packages": workspace_packages,
         "forbidden_packages": forbidden_packages or ["redb", "tantivy"],
         "external_packages": [
@@ -110,6 +113,26 @@ def geiger_package(
 
 
 class NativeDependencyGateTests(unittest.TestCase):
+    def test_product_root_includes_the_runtime_closure(self) -> None:
+        product = package("hyphae-native-product")
+        runtime = package("hyphae-native-runtime")
+        report = audit_metadata(
+            metadata(
+                [product, runtime],
+                [dependency(str(runtime["id"]), None)],
+                root_name="hyphae-native-product",
+            ),
+            policy(
+                ["hyphae-native-product", "hyphae-native-runtime"],
+                [],
+                root_package="hyphae-native-product",
+            ),
+        )
+        self.assertEqual(
+            [entry["name"] for entry in report["packages"]],
+            ["hyphae-native-product", "hyphae-native-runtime"],
+        )
+
     def test_metadata_closure_includes_build_and_excludes_dev_edges(self) -> None:
         root = package("hyphae-native-runtime")
         runtime = package("blake3", source=REGISTRY)

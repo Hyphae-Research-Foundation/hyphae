@@ -24,11 +24,11 @@
   "required_sdks": ["rust", "python", "typescript"],
   "required_transports": ["embedded", "native-local", "http-v2"],
   "contracts": [
-    {"reference": "docs/gates/native-local-phase-1.md", "sha256": "bca05205fb81048be9738e4fee02eacda2dc94609de534bf753741ab7eb9b9b0"},
+    {"reference": "docs/gates/native-local-phase-1.md", "sha256": "8485902024822b70fd4c3a4dc4f62d8a8c67f0716aa6f8e0ece71f44282e11e4"},
     {"reference": "docs/adr/0023-native-local-product-and-competitive-scope.md", "sha256": "c4fc93447a3bbf109668c50b86a0f8031dacccc99fc87d6d028189098c03a3a0"},
     {"reference": "docs/roadmaps/native-g6-roadmap.md", "sha256": "3fce3f5f63f10021cc4aa2eaa5de5b469469cb5cd2a3f3b1cb3560bb43c22dd3"},
     {"reference": "docs/native/local-product-v1.md", "sha256": "225833acbe40441254f7be9ee60e1df5700563bc2c7dde2c1e3f200c59f1c486"},
-    {"reference": "docs/native/product-error-v1.md", "sha256": "e91dd7700c591986ebed2eb9cf3cebb1eb7ec3487f4d20ebc03287b75782f7b3"},
+    {"reference": "docs/native/product-error-v1.md", "sha256": "0f1e4bcecadd894edac00507ed3aff078efad4372c9bb1f8a0aae6803185124f"},
     {"reference": "docs/native/catalog-api-v1.md", "sha256": "7577b60f2bebf357e0e5384af5e5a799776b603a2401932087f49730f36d407b"},
     {"reference": "docs/native/explain-v1.md", "sha256": "22fa5a97c17f30bf82fcc3ea5b7c95e5b4c06814823871013cf6acbfbf8fe261"},
     {"reference": "docs/native/telemetry-v1.md", "sha256": "86cb59f57ad5ce2e2ea1dc0f46ab6c8886ed365166d92ca89c61f580cb0469a6"},

@@ -508,14 +508,14 @@ milliseconds, so neither is claimed as a microsecond maintenance path.
 Multi-generation retention, blob/WAL collection, background scheduling, and
 the complete G1/G7 matrices remain open.
 
-The [native dependency-closure
-evidence](evidence/native-dependency-closure-2026-08-02.md) makes the non-dev
-normal/build graph rooted at `hyphae-native-runtime` an exact fail-closed
-allowlist. Its clean WSL2 receipt contains 11 Hyphae-owned packages, 19
-reviewed external primitive/build packages, no forbidden engine, and zero
-native unsafe findings. Reported third-party unsafe syntax still requires
-semantic review, and the remaining golden/corpus/conformance requirements keep
-G0 open.
+The historical [native dependency-closure
+evidence](evidence/native-dependency-closure-2026-08-02.md) made the then-current
+non-dev graph rooted at `hyphae-native-runtime` an exact fail-closed allowlist.
+Its clean WSL2 receipt contains 11 Hyphae-owned packages, 19 reviewed external
+primitive/build packages, no forbidden engine, and zero native unsafe findings.
+G6 later moved the live dependency gate root to `hyphae-native-product`; current
+hosted receipts must report that expanded closure and do not rewrite the
+historical receipt.
 
 The [native group-commit
 evidence](evidence/native-group-commit-2026-08-02.md) adds a bounded
