@@ -42,7 +42,8 @@ pub use hyphae_native_catalog::{
 };
 pub use hyphae_native_runtime::BoundedSearchQuery;
 use hyphae_native_runtime::{
-    NativeDatabase, NativeSnapshot, PreparedStatement, SqlError, SqlResult,
+    HnswConfig, NativeDatabase, NativeSnapshot, PreparedStatement, SqlError, SqlResult,
+    Vector as RuntimeVector, VectorMetric as RuntimeVectorMetric,
 };
 pub use hyphae_native_types::{
     CanonicalF32, CanonicalF64, CatalogVersion, Csn, ObjectId, ScalarValue as ProductValue,
@@ -109,6 +110,32 @@ pub const MAX_PRODUCT_SQL_STATEMENT_BYTES: usize = 64 * 1024;
 pub const MAX_PRODUCT_SQL_PARAMETERS: usize = 1_024;
 /// Maximum rows materialized by the current embedded product slice.
 pub const MAX_PRODUCT_SQL_ROWS: usize = 1_024;
+
+const MIGRATION_STORAGE_PREFIX: &[u8] = b"\0hyphae.migration.v1\0";
+
+/// One source lexical index prepared for offline migration.
+#[derive(Clone, Debug)]
+pub struct MigrationLexicalIndexInput {
+    /// Stable Native physical index identity.
+    pub index: ObjectId,
+    /// Physical index name.
+    pub name: String,
+    /// Source documents and their weighted lexical text.
+    pub documents: Vec<(Vec<u8>, String)>,
+}
+
+/// One source vector space prepared for offline migration.
+#[derive(Clone, Debug)]
+pub struct MigrationVectorIndexInput {
+    /// Stable Native physical index identity.
+    pub index: ObjectId,
+    /// Physical index name.
+    pub name: String,
+    /// Fixed source dimension.
+    pub dimension: u16,
+    /// Source document identities and finite vector components.
+    pub vectors: Vec<(ObjectId, Vec<f32>)>,
+}
 
 /// Transport-independent result of one native SQL execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,6 +344,163 @@ impl NativeProduct {
         self.database.data_directory()
     }
 
+    /// Returns the stable native directory identity used by migration evidence.
+    pub fn directory_identity(&self) -> &hyphae_native_runtime::NativeDirectoryIdentity {
+        self.database.directory_identity()
+    }
+
+    /// Stores exact migration witness entries under one strict native commit.
+    pub fn migration_store_entries(
+        &mut self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if entries.is_empty() {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        for (key, value) in entries {
+            let mut storage_key = MIGRATION_STORAGE_PREFIX.to_vec();
+            storage_key.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            storage_key.extend_from_slice(key);
+            transaction.set(storage_key, value.clone(), None)?;
+        }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Stores exact legacy values in the public scalar structure namespace.
+    pub fn migration_store_public_entries(
+        &mut self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if entries.is_empty() {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        for (key, value) in entries {
+            transaction.set(key.clone(), value.clone(), None)?;
+        }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Checks exact migration witness entries at one immutable native snapshot.
+    pub fn migration_verify_entries(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<bool, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        Ok(entries.iter().all(|(key, value)| {
+            let mut storage_key = MIGRATION_STORAGE_PREFIX.to_vec();
+            storage_key.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            storage_key.extend_from_slice(key);
+            snapshot
+                .structure_get(&storage_key)
+                .is_some_and(|actual| actual == value)
+        }))
+    }
+
+    /// Verifies exact values in the public scalar structure namespace.
+    pub fn migration_verify_public_entries(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<bool, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        Ok(entries.iter().all(|(key, value)| {
+            snapshot
+                .structure_get(key)
+                .is_some_and(|actual| actual == value)
+        }))
+    }
+
+    /// Imports source lexical and vector payloads into independent Native
+    /// physical indexes under one strict commit.
+    pub fn migration_store_search(
+        &mut self,
+        lexical_indexes: &[MigrationLexicalIndexInput],
+        vector_indexes: &[MigrationVectorIndexInput],
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if lexical_indexes.is_empty() && vector_indexes.is_empty() {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        for index in lexical_indexes {
+            transaction.create_search_index(index.index, &index.name)?;
+        }
+        for index in vector_indexes {
+            let config = HnswConfig::new(8, 32, 16, 4_096, index.index.get() as u64)
+                .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+            transaction.create_vector_index(
+                index.index,
+                &index.name,
+                index.dimension,
+                RuntimeVectorMetric::Cosine,
+                config,
+            )?;
+        }
+        for index in lexical_indexes {
+            for (document_id, text) in &index.documents {
+                transaction.index_document(index.index, document_id.clone(), text.clone())?;
+            }
+        }
+        for index in vector_indexes {
+            for (document_id, values) in &index.vectors {
+                transaction.upsert_vector(
+                    index.index,
+                    *document_id,
+                    RuntimeVector::new(values.iter().copied())
+                        .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?,
+                )?;
+            }
+        }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Verifies migrated physical lexical and vector indexes against source
+    /// payloads without changing the target.
+    pub fn migration_verify_search(
+        &self,
+        lexical_indexes: &[(ObjectId, Vec<(Vec<u8>, String)>)],
+        vector_indexes: &[(ObjectId, Vec<(ObjectId, Vec<f32>)>)],
+    ) -> Result<bool, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        for (index, expected) in lexical_indexes {
+            let Some(mut actual) = snapshot.inner.search_documents(*index) else {
+                return Ok(false);
+            };
+            actual.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut expected = expected.clone();
+            expected.sort_by(|left, right| left.0.cmp(&right.0));
+            if actual != expected {
+                return Ok(false);
+            }
+        }
+        for (index, expected) in vector_indexes {
+            let mut actual = snapshot.inner.vector_records(*index)?;
+            actual.sort_by_key(|record| record.object_id);
+            let mut expected = expected.clone();
+            expected.sort_by_key(|record| record.0);
+            if actual.len() != expected.len()
+                || actual.iter().zip(expected).any(|(actual, expected)| {
+                    actual.object_id != expected.0
+                        || actual
+                            .vector
+                            .values()
+                            .iter()
+                            .zip(expected.1)
+                            .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                })
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Returns admitted product, catalog-format, and hard-limit capabilities.
     #[expect(
         clippy::unused_self,
@@ -338,6 +522,32 @@ impl NativeProduct {
                 telemetry: TelemetryRegistry::default(),
             })
             .map_err(Into::into)
+    }
+
+    /// Creates a Native migration target that is not authoritative until
+    /// [`Self::promote_pending`] is called.
+    pub fn create_pending(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        NativeDatabase::create_pending(path)
+            .map(|database| Self {
+                database,
+                telemetry: TelemetryRegistry::default(),
+            })
+            .map_err(Into::into)
+    }
+
+    /// Opens an importer-owned pending migration target.
+    pub fn open_pending(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        NativeDatabase::open_pending(path)
+            .map(|database| Self {
+                database,
+                telemetry: TelemetryRegistry::default(),
+            })
+            .map_err(Into::into)
+    }
+
+    /// Publishes a pending migration target after the importer has validated it.
+    pub fn promote_pending(&mut self) -> Result<(), ProductError> {
+        self.database.promote_pending().map_err(Into::into)
     }
 
     /// Opens and verifies an existing native product directory.

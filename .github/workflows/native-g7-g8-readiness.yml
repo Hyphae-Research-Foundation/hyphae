@@ -2,6 +2,32 @@ name: Native G7 G8 Readiness Spine
 
 on:
   workflow_dispatch:
+    inputs:
+      g7_mode:
+        description: G7 authority-only validation or one controlled benchmark cell
+        required: true
+        default: authority
+        type: choice
+        options:
+          - authority
+          - benchmark
+      g7_state:
+        description: Controlled benchmark state
+        required: false
+        default: warm
+        type: choice
+        options:
+          - warm
+          - cold
+      g7_concurrency:
+        description: Controlled benchmark concurrency
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "8"
+          - "32"
 
 concurrency:
   group: native-g7-g8-${{ github.ref }}
@@ -36,3 +62,134 @@ jobs:
           path: native-g7-g8-readiness-audit.json
           if-no-files-found: error
           retention-days: 14
+
+  g7-benchmark:
+    name: G7 controlled benchmark cell
+    if: inputs.g7_mode == 'benchmark'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Build and run one controlled G7 cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          cargo run --manifest-path conformance/g7/runners/rust/Cargo.toml --locked --release -- \
+            "$SHA" linux "${{ inputs.g7_state }}" "${{ inputs.g7_concurrency }}" > native-g7-receipt.json
+          PYTHONPATH=. python tools/check_native_g7_receipt.py \
+            --receipt native-g7-receipt.json \
+            --expected-commit "$SHA" \
+            --output native-g7-receipt-audit.json
+      - name: Upload G7 receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g7-cell-${{ github.sha }}-${{ inputs.g7_state }}-${{ inputs.g7_concurrency }}
+          path: |
+            native-g7-receipt.json
+            native-g7-receipt-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+  g7-matrix:
+    name: G7 complete Linux matrix
+    if: inputs.g7_mode == 'benchmark'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: macos-15
+            platform: macos
+          - os: windows-2025
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Run complete G7 matrix
+        shell: bash
+        env:
+          HYPHAE_G7_BACKGROUND: "1"
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          PYTHONPATH=. python tools/run_native_g7.py \
+            --source-commit "$SHA" \
+            --platform "${{ matrix.platform }}" \
+            --output native-g7-matrix.json
+          PYTHONPATH=. python tools/check_native_g7_matrix.py \
+            --matrix native-g7-matrix.json \
+            --expected-commit "$SHA" \
+            --output native-g7-matrix-audit.json
+      - name: Upload complete G7 matrix
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g7-matrix-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            native-g7-matrix.json
+            native-g7-matrix-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+  g7-aggregate:
+    name: G7 exact-SHA aggregate
+    if: inputs.g7_mode == 'benchmark'
+    needs: [g7-matrix]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Download platform matrices
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: native-g7-matrix-*-${{ github.sha }}
+          path: g7-platforms
+          merge-multiple: false
+      - name: Validate exact-SHA aggregate
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          for platform in linux macos windows; do
+            mkdir -p "g7-normalized/$platform"
+            cp "g7-platforms/native-g7-matrix-$platform-$SHA/native-g7-matrix.json" "g7-normalized/$platform/native-g7-matrix.json"
+          done
+          PYTHONPATH=. python tools/aggregate_native_g7.py \
+            --source-commit "$SHA" \
+            --platform-root g7-normalized \
+            --output native-g7-aggregate.json
+      - name: Upload exact-SHA aggregate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g7-aggregate-${{ github.sha }}
+          path: native-g7-aggregate.json
+          if-no-files-found: error
+          retention-days: 90

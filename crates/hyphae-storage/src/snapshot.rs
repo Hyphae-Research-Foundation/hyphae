@@ -114,6 +114,8 @@ pub struct SnapshotContents {
     pub vectors: Vec<SnapshotVectorEntry>,
     /// Strictly name-ordered immutable lexical-index definitions.
     pub lexical_indexes: Vec<LexicalIndexDefinition>,
+    /// Strictly transaction-ID-ordered durable idempotency receipts.
+    pub receipts: Vec<CommitReceipt>,
 }
 
 /// One verified durable vector loaded from a canonical snapshot.
@@ -616,7 +618,7 @@ fn snapshot_info(
 ///
 /// The same pass that collects records validates their canonical order,
 /// resource bounds, checksum, and digest. Durable idempotency receipts are
-/// verified but are not retained in the returned witness.
+/// verified and retained in the returned witness.
 ///
 /// # Errors
 ///
@@ -657,6 +659,7 @@ fn load_snapshot_inner(
         vector_spaces: Vec::new(),
         vectors: Vec::new(),
         lexical_indexes: Vec::new(),
+        receipts: Vec::new(),
         decoded_bytes: 0,
         limits,
     };
@@ -667,6 +670,7 @@ fn load_snapshot_inner(
         vector_spaces: collector.vector_spaces,
         vectors: collector.vectors,
         lexical_indexes: collector.lexical_indexes,
+        receipts: collector.receipts,
     })
 }
 
@@ -801,6 +805,7 @@ fn validate_read_limits(
         info.vector_space_count,
         info.vector_count,
         info.lexical_index_count,
+        info.receipt_count,
         limits,
     )
 }
@@ -810,12 +815,14 @@ fn validate_logical_record_limit(
     vector_space_count: u64,
     vector_count: u64,
     lexical_index_count: u64,
+    receipt_count: u64,
     limits: &SnapshotReadLimits,
 ) -> Result<(), SnapshotError> {
     let logical_records = entry_count
         .checked_add(vector_space_count)
         .and_then(|count| count.checked_add(vector_count))
         .and_then(|count| count.checked_add(lexical_index_count))
+        .and_then(|count| count.checked_add(receipt_count))
         .ok_or(SnapshotError::EntryLimitExceeded {
             actual: u64::MAX,
             maximum: limits.entries,
@@ -834,6 +841,7 @@ struct SnapshotCollector<'limits> {
     vector_spaces: Vec<VectorSpaceDefinition>,
     vectors: Vec<SnapshotVectorEntry>,
     lexical_indexes: Vec<LexicalIndexDefinition>,
+    receipts: Vec<CommitReceipt>,
     decoded_bytes: u64,
     limits: &'limits SnapshotReadLimits,
 }
@@ -880,7 +888,31 @@ impl SnapshotRecordVisitor for SnapshotCollector<'_> {
         Ok(())
     }
 
-    fn receipt(&mut self, _receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+    fn receipt(&mut self, receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+        let next_count = u64::try_from(self.receipts.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(SnapshotError::EntryLimitExceeded {
+                actual: u64::MAX,
+                maximum: self.limits.entries,
+            })?;
+        if next_count > self.limits.entries {
+            return Err(SnapshotError::EntryLimitExceeded {
+                actual: next_count,
+                maximum: self.limits.entries,
+            });
+        }
+        self.decoded_bytes = self.decoded_bytes.checked_add(RECEIPT_LENGTH_U64).ok_or(
+            SnapshotError::DecodedBytesLimitExceeded {
+                maximum: self.limits.decoded_bytes,
+            },
+        )?;
+        if self.decoded_bytes > self.limits.decoded_bytes {
+            return Err(SnapshotError::DecodedBytesLimitExceeded {
+                maximum: self.limits.decoded_bytes,
+            });
+        }
+        self.receipts.push(*receipt);
         Ok(())
     }
 
@@ -1059,6 +1091,7 @@ fn verify_payload(
             vector_space_count,
             vector_count,
             lexical_index_count,
+            decoded.receipt_count,
             limits,
         )?;
     }

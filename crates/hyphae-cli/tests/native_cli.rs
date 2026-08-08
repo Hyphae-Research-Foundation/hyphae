@@ -19,6 +19,7 @@ use hyphae_native_product::proof::{
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
     bundle_native_witness, encode_native_proof,
 };
+use hyphae_storage::{SnapshotReadLimits, load_snapshot};
 use uuid::Uuid;
 
 struct TestDirectory(PathBuf);
@@ -58,6 +59,29 @@ fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
 
 fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn materialize_format2_fixture(destination: &Path) -> Result<(), Box<dyn Error>> {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../compatibility/v2/data-directory.json"
+    ))?;
+    for (relative, encoded) in fixture["files_hex"]
+        .as_object()
+        .ok_or("fixture files_hex is not an object")?
+    {
+        let output = destination.join(relative);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = encoded.as_str().ok_or("fixture file is not hex")?;
+        let bytes = bytes
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        fs::write(output, bytes)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -133,6 +157,157 @@ fn init_is_explicit_and_read_only_commands_never_create() -> Result<(), Box<dyn 
     assert!(!data.join("hyphae.sock").exists());
     assert!(!data.join("indexes").exists());
     assert!(!data.join("log").exists());
+    Ok(())
+}
+
+#[test]
+fn format2_migration_runs_verifies_promotes_and_keeps_source_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("source");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("migration.json");
+    materialize_format2_fixture(&source)?;
+    let source_snapshot = load_snapshot(
+        source.join("snapshots/snapshot-00000000000000000014.hysnap"),
+        &SnapshotReadLimits::default(),
+    )?;
+    let expected_values = source_snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let before = fs::read_dir(&source)?
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.path(), fs::metadata(entry.path())?.len()))
+        })
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+
+    let imported = run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["documents"], 2);
+    assert_eq!(imported["receipts"], 4);
+    assert!(target.join("FORMAT.pending").exists());
+
+    let verified = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["pending"], true);
+
+    let promoted = run(&[
+        "migrate",
+        "promote",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(promoted["status"], "promoted");
+    assert!(target.join("FORMAT").exists());
+    assert!(!target.join("FORMAT.pending").exists());
+    let reopened = run(&["status", "--data-dir", &path(&target)])?;
+    assert_eq!(reopened["status"], "ready");
+    for key in ["alpha", "beta"] {
+        let request = serde_json::json!({
+            "operation": "string_get",
+            "keyspace": 3,
+            "key": key,
+        })
+        .to_string();
+        let read = run(&[
+            "structure",
+            "--data-dir",
+            &path(&target),
+            "read",
+            "--request-json",
+            &request,
+        ])?;
+        let expected = expected_values
+            .get(key.as_bytes())
+            .ok_or("missing expected migrated record")?;
+        let expected_hex = expected
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(read["result"]["value_hex"], expected_hex);
+    }
+
+    for (path, length) in before {
+        assert_eq!(
+            fs::metadata(&path)?.len(),
+            length,
+            "source changed: {}",
+            path.display()
+        );
+    }
+    assert!(source.join("FORMAT").exists());
+    Ok(())
+}
+
+#[test]
+fn migration_rejects_source_output_overlap_and_rolls_back_pending_target()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("source");
+    materialize_format2_fixture(&source)?;
+    let output_inside_source = source.join("manifest.json");
+    let rejected = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&temporary.0.join("target")),
+        "--manifest",
+        &path(&output_inside_source),
+    ])?;
+    assert!(!rejected.status.success());
+    assert!(!output_inside_source.exists());
+
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("manifest.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert!(target.join("FORMAT.pending").exists());
+    let rolled_back = run(&[
+        "migrate",
+        "rollback",
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert!(!target.exists());
+    assert!(source.exists());
     Ok(())
 }
 

@@ -984,6 +984,7 @@ mod tests {
         let witness = load_snapshot(&created.path, &SnapshotReadLimits::default())?;
         assert_eq!(witness.info, created);
         assert_eq!(witness.entries.len(), 2);
+        assert_eq!(witness.receipts.len(), 1);
         assert_eq!(witness.entries[0].key, b"alpha");
         assert_eq!(witness.entries[0].value, b"first");
         assert!(matches!(
