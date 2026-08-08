@@ -42,6 +42,12 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
+      - name: Verify open G7 and G8 authority
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
+          PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --output native-g7-g8-readiness-audit.json
       - name: Verify G6 manifests
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v

@@ -1,0 +1,25 @@
+{
+  "schema": "hyphae-native-g7-readiness-profile-v1",
+  "gate": "G7",
+  "scope": "controlled-performance-matrix",
+  "status": "open",
+  "required_cells": [
+    "embedded-structure-point-get",
+    "embedded-prepared-sql-primary-key",
+    "local-structure-point-get",
+    "local-prepared-sql-primary-key",
+    "indexed-sql-bounded-read",
+    "bm25-top10",
+    "filtered-bm25-top10",
+    "ann-top10-recall-095",
+    "hybrid-top10",
+    "strict-group-commit"
+  ],
+  "required_states": ["warm", "cold"],
+  "required_concurrency": [1, 8, 32],
+  "required_saturation": true,
+  "required_background_interference": true,
+  "required_counters": ["allocations", "rss", "cpu_cycles", "cache_misses", "page_faults", "bytes_read", "bytes_written"],
+  "claims": [],
+  "closure_declared": false
+}

@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g8-suite-manifest-v1",
+  "gate": "G8",
+  "requirements": [
+    {"id": "native-soak", "status": "supporting-incomplete", "acceptance": ["kill-restart", "backup-restore", "doctor-after-restore"]},
+    {"id": "process-crash-recovery", "status": "supporting-incomplete", "acceptance": ["commit-boundaries", "checkpoint-boundaries", "snapshot-pins"]},
+    {"id": "power-loss-replay", "status": "supporting-incomplete", "acceptance": ["bounded-replay", "recovery-equivalence", "safety-checks"]},
+    {"id": "corruption-matrix", "status": "planned", "acceptance": ["pages", "wal", "manifest", "blobs", "indexes", "proofs"]},
+    {"id": "resource-exhaustion", "status": "planned", "acceptance": ["disk-full", "read-only", "memory", "descriptors", "bounded-input"]},
+    {"id": "format2-to-native-migration", "status": "planned", "acceptance": ["read-only-source", "identity-mapping", "semantic-equivalence", "promotion", "rollback"]},
+    {"id": "multiplatform-packaging", "status": "supporting-incomplete", "acceptance": ["linux", "macos", "windows", "installed-smoke"]},
+    {"id": "sbom-signatures-provenance", "status": "supporting-incomplete", "acceptance": ["spdx", "cyclonedx", "checksums", "cosign", "provenance"]},
+    {"id": "independent-restore-verification", "status": "planned", "acceptance": ["independent-tool", "offline", "state-equivalence"]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

@@ -201,6 +201,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native active-expiry scheduler evidence — 2026-08-02](gates/evidence/native-active-expiry-scheduler-2026-08-02.md)
 - [Native bounded-WAL-replay evidence — 2026-08-02](gates/evidence/native-wal-replay-2026-08-02.md)
 - [Native manifest-retention evidence — 2026-08-02](gates/evidence/native-manifest-retention-2026-08-02.md)
+- [Native G7/G8 open readiness authority](../config/native-g7-readiness-profile.json)
 - [Native immutable-blob collection evidence — 2026-08-02](gates/evidence/native-blob-collection-2026-08-02.md)
 - [Native G6 exact-SHA local-product closure](gates/evidence/closures/native-g6-c57cc07.json)
 - [Native lineage-threading Linux evidence — 2026-08-02](gates/evidence/native-lineage-threading-linux-2026-08-02.md)

@@ -1,0 +1,20 @@
+{
+  "schema": "hyphae-native-g8-readiness-profile-v1",
+  "gate": "G8",
+  "scope": "exact-commit-release-evidence",
+  "status": "open",
+  "required_requirements": [
+    "native-soak",
+    "process-crash-recovery",
+    "power-loss-replay",
+    "corruption-matrix",
+    "resource-exhaustion",
+    "format2-to-native-migration",
+    "multiplatform-packaging",
+    "sbom-signatures-provenance",
+    "independent-restore-verification"
+  ],
+  "required_platforms": ["linux", "macos", "windows"],
+  "claims": [],
+  "closure_declared": false
+}

@@ -1,0 +1,38 @@
+name: Native G7 G8 Readiness Spine
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: native-g7-g8-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  authority:
+    name: Validate open G7 G8 authority
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Validate open authority
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
+          PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
+            --expected-commit "${{ github.sha }}" \
+            --output native-g7-g8-readiness-audit.json
+      - name: Upload open readiness audit
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g7-g8-readiness-${{ github.sha }}
+          path: native-g7-g8-readiness-audit.json
+          if-no-files-found: error
+          retention-days: 14
