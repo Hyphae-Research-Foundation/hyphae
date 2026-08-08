@@ -30,7 +30,16 @@ FILES = {
 
 
 def version(command: list[str]) -> str:
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    if os.name == "nt" and command[0] == "npm":
+        command = ["npm.cmd", *command[1:]]
+    elif os.name == "nt" and command[0] == "node":
+        command = ["node.exe", *command[1:]]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return (completed.stdout or completed.stderr).strip()
 
 

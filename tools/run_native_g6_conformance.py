@@ -78,6 +78,11 @@ def required_executable(name: str) -> str:
 
 
 def run_command(command: list[str], environment: dict[str, str], timeout: int = 900) -> str:
+    executable = Path(command[0]).name.lower()
+    if os.name == "nt" and executable == "npm":
+        command = ["npm.cmd", *command[1:]]
+    elif os.name == "nt" and executable == "node":
+        command = ["node.exe", *command[1:]]
     completed = subprocess.run(
         command,
         cwd=ROOT,
