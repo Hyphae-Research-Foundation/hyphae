@@ -149,7 +149,7 @@ async function executeCases(client, denied) {
 try {
   for (let attempt = 0; attempt < 400; attempt += 1) {
     if (server.exitCode !== null) throw new Error("G6 server exited before SDK execution");
-    if (lane.endsWith("-local") ? existsSync(endpoint) : existsSync(portFile)) {
+    if (existsSync(portFile)) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
       break;
     }

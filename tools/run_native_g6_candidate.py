@@ -112,6 +112,7 @@ def main() -> int:
                 completed = subprocess.run(host_command(command), cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
                 stream.write(f"G6_EXIT_CODE: {completed.returncode}\n")
             if completed.returncode != 0:
+                print(log.read_text(encoding="utf-8"), file=sys.stderr, end="")
                 return completed.returncode
             receipt_args += ["--suite-log", item["name"], str(log)]
 

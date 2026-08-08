@@ -179,7 +179,7 @@ try:
     for _ in range(400):
         if server.poll() is not None:
             raise RuntimeError(server.stderr.read() if server.stderr else "G6 server exited")
-        if endpoint.exists() if lane.endswith("-local") else port_file.exists():
+        if port_file.exists():
             time.sleep(0.1)
             break
         time.sleep(0.025)
