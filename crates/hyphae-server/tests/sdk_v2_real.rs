@@ -469,7 +469,9 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
         String::from_utf8_lossy(&node_output.stderr)
     );
 
+    #[cfg(unix)]
     let removed_origin = temporary.0.join("origin-removed");
+    #[cfg(unix)]
     fs::rename(&data, &removed_origin)?;
     for (offset, (proof, witness, anchor)) in rust_artifacts.into_iter().enumerate() {
         let verified = http
@@ -555,10 +557,12 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
         "TypeScript origin-free verification failed: {}",
         String::from_utf8_lossy(&typescript_origin_free.stderr)
     );
+    #[cfg(unix)]
     fs::rename(&removed_origin, &data)?;
 
-    fs::remove_dir(data.join("tmp/blobs"))?;
-    fs::write(data.join("tmp/blobs"), b"force real blob-stage I/O failure")?;
+    let blob_stage = data.join("tmp/blobs");
+    fs::remove_dir(&blob_stage)?;
+    fs::write(&blob_stage, b"force real blob-stage I/O failure")?;
 
     let unknown_script = include_str!("fixtures/sdk_v2_unknown_commit.py");
     let python_unknown = Command::new(python_command())

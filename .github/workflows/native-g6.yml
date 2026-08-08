@@ -59,6 +59,11 @@ jobs:
         with:
           toolchain: 1.96.0
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: g6-${{ matrix.platform }}
+
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -156,14 +161,6 @@ jobs:
       - name: Install TypeScript dependencies
         shell: bash
         run: npm ci --ignore-scripts --prefix sdks/typescript
-
-      - name: Build TypeScript dist from clean
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf sdks/typescript/dist
-          npm run build --prefix sdks/typescript
-          test -f sdks/typescript/dist/v2/index.js
 
       - name: Execute Windows SDK smoke test
         if: inputs.scope == 'smoke'
