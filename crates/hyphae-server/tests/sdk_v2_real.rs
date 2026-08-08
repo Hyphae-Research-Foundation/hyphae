@@ -50,6 +50,14 @@ fn options(request_id: u64) -> RequestOptions {
     }
 }
 
+fn python_command() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
+fn npm_command() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
 fn near_deadline() -> Result<i64, Box<dyn std::error::Error>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
     Ok(i64::try_from(now)?.saturating_add(5_000))
@@ -418,7 +426,7 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let python_artifact = temporary.0.join("python-proof.bin");
     let python_script = include_str!("fixtures/sdk_v2_acceptance.py");
-    let python_output = Command::new("python3")
+    let python_output = Command::new(python_command())
         .arg("-c")
         .arg(python_script)
         .env("PYTHONPATH", workspace.join("sdks/python/src"))
@@ -436,7 +444,7 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
 
     let typescript = workspace.join("sdks/typescript");
     let typescript_artifact = temporary.0.join("typescript-proof.bin");
-    let build = Command::new("npm")
+    let build = Command::new(npm_command())
         .arg("run")
         .arg("build")
         .current_dir(&typescript)
@@ -522,7 +530,7 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
             matches!(verified, ProductResponse::ProofVerification(report) if report.semantic_reexecution_performed)
         );
     }
-    let python_origin_free = Command::new("python3")
+    let python_origin_free = Command::new(python_command())
         .arg("-c")
         .arg(include_str!("fixtures/sdk_v2_origin_free.py"))
         .env("PYTHONPATH", workspace.join("sdks/python/src"))
@@ -553,7 +561,7 @@ async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
     fs::write(data.join("tmp/blobs"), b"force real blob-stage I/O failure")?;
 
     let unknown_script = include_str!("fixtures/sdk_v2_unknown_commit.py");
-    let python_unknown = Command::new("python3")
+    let python_unknown = Command::new(python_command())
         .arg("-c")
         .arg(unknown_script)
         .env("PYTHONPATH", workspace.join("sdks/python/src"))
