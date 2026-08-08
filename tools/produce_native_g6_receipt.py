@@ -30,6 +30,7 @@ NODE_TESTS = re.compile(r"(?m)^(?:#|ℹ) tests ([0-9]+)\s*$")
 NODE_PASS = re.compile(r"(?m)^(?:#|ℹ) pass ([0-9]+)\s*$")
 NODE_FAIL = re.compile(r"(?m)^(?:#|ℹ) fail 0\s*$")
 NODE_FAILURE = re.compile(r"(?m)^(?:#|ℹ) fail [1-9][0-9]*\s*$")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _canonical_sha256(value: object) -> str:
@@ -50,9 +51,9 @@ def _cargo_result(command: list[str], text: str) -> int:
     targets: list[tuple[str, int]] = []
     current = ""
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Running "):
-            current = stripped.removeprefix("Running ")
+        stripped = ANSI_ESCAPE.sub("", line).strip()
+        if "Running " in stripped:
+            current = stripped.split("Running ", 1)[1]
         match = CARGO_RESULT.search(stripped)
         if match is not None:
             targets.append((current, int(match.group(1))))

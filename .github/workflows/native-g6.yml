@@ -11,7 +11,6 @@ permissions:
 
 env:
   RUSTUP_TOOLCHAIN: 1.96.0
-  PYTHON_VERSION: 3.11.15
   NODE_VERSION: 24.10.0
 
 jobs:
@@ -30,6 +29,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Install pinned Python
+        if: matrix.platform == 'linux'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.11.15
@@ -125,7 +125,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: 3.11.15
+          python-version: 3.13.7
 
       - name: Install pinned Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -183,7 +183,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: 3.11.15
+          python-version: 3.13.7
 
       - name: Download exact-SHA manifest authority
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0

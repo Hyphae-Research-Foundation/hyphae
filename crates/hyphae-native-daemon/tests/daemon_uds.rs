@@ -397,7 +397,8 @@ async fn prepared_handle_can_be_deallocated() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     assert_eq!(client.response(1, 4).await?, ProductResponse::Deallocated);
-    client
+    let missing = Client::connect(&test.socket, 64 * 1024).await?;
+    missing
         .send_request(
             1,
             5,
@@ -407,7 +408,8 @@ async fn prepared_handle_can_be_deallocated() -> Result<(), Box<dyn Error>> {
             }),
         )
         .await?;
-    assert!(client.response(1, 5).await.is_err());
+    assert!(missing.response(1, 5).await.is_err());
+    drop(missing);
     drop(client);
     daemon.shutdown().await?;
     Ok(())

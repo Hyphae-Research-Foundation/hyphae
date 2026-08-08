@@ -607,9 +607,7 @@ async fn connection_loop(
             }
             completed = responses.join_next(), if !responses.is_empty() => {
                 match completed {
-                    Some(Ok(Ok(()))) | None => continue,
-                    Some(Ok(Err(error))) => return Err(error),
-                    Some(Err(_)) => return Err(DaemonError::Task),
+                    Some(Ok(Ok(()) | Err(_)) | Err(_)) | None => continue,
                 }
             }
         };

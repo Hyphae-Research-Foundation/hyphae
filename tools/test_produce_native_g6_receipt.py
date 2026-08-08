@@ -75,6 +75,29 @@ class NativeG6ReceiptProducerTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "Cargo library suite executed no tests"):
             build_receipt(COMMIT, "shared-contracts-and-errors", raw, manifest_sha256, "linux", self.tool_versions(), changed)
 
+    def test_colored_cargo_output_retains_the_selected_target(self) -> None:
+        raw, manifest_sha256, logs = self.fixture()
+        name, log = logs[0]
+        colored = log.replace(
+            b"Running unittests src/lib.rs",
+            b"\x1b[1m\x1b[92m     Running\x1b[0m unittests src/lib.rs",
+        ).replace(
+            b"test result: ok.",
+            b"\x1b[1m\x1b[92mtest result: ok.\x1b[0m",
+        )
+        changed = list(logs)
+        changed[0] = (name, colored)
+        receipt = build_receipt(
+            COMMIT,
+            "shared-contracts-and-errors",
+            raw,
+            manifest_sha256,
+            "linux",
+            self.tool_versions(),
+            changed,
+        )
+        self.assertGreater(receipt["test_count"], 0)
+
     def test_zero_test_python_and_npm_fail(self) -> None:
         raw = implemented_raw()
         documents = {name: json.loads(value) for name, value in raw.items()}

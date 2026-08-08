@@ -228,10 +228,13 @@ async fn malformed_pipe_client_is_isolated_and_committed_outcome_remains_queryab
             },
         )
         .await?;
-    assert!(matches!(
-        writer.response(3, 20).await?,
-        ProductResponse::StructureSet(_)
-    ));
+    let ProductResponse::StructureSet(hyphae_native_product::ProductCommitOutcome::Committed(
+        receipt,
+    )) = writer.response(3, 20).await?
+    else {
+        return Err("structure set did not commit".into());
+    };
+    let transaction_id = receipt.transaction_id;
     drop(writer);
 
     let resolver = Client::connect(&test.endpoint).await?;
@@ -239,10 +242,7 @@ async fn malformed_pipe_client_is_isolated_and_committed_outcome_remains_queryab
         .send_request(
             4,
             21,
-            ProductOperation::TransactionStatus {
-                transaction_id: hyphae_native_product::ProductTransactionId::new(20)
-                    .ok_or("invalid transaction ID")?,
-            },
+            ProductOperation::TransactionStatus { transaction_id },
         )
         .await?;
     assert!(matches!(
