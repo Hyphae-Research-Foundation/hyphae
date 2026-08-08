@@ -548,7 +548,9 @@ async fn serve_connection(
     )
     .await;
     cleanup_connection_state(&request_state, &pending_controls, &window);
-    drop(client);
+    if let Ok(client) = Arc::try_unwrap(client) {
+        let _ignored = client.close();
+    }
     result
 }
 
