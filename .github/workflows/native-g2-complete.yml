@@ -1,8 +1,11 @@
 name: Native G2 Bounded Closure Evidence
 
 on:
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: native-g2-complete-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

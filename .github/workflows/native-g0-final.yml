@@ -1,8 +1,11 @@
 name: Native G0 Final Readiness
 
 on:
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: native-g0-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   actions: read

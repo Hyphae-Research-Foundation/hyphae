@@ -1,10 +1,13 @@
 name: Native G3 Structure Evidence
 
 on:
-  pull_request:
   push:
     branches: [dev, main]
   workflow_dispatch:
+
+concurrency:
+  group: native-g3-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

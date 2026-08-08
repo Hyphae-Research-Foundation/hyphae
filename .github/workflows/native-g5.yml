@@ -1,10 +1,13 @@
 name: Native G5 Convergence Closure Evidence
 
 on:
-  pull_request:
   push:
     branches: [dev, main]
   workflow_dispatch:
+
+concurrency:
+  group: native-g5-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

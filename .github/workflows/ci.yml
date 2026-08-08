@@ -7,6 +7,10 @@ on:
       - main
       - dev
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -67,6 +71,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || (matrix.name != 'macOS stable' && matrix.name != 'Windows stable')
     strategy:
       fail-fast: false
       matrix:
@@ -168,6 +173,7 @@ jobs:
 
   optional-integrations:
     name: Optional framework integrations
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

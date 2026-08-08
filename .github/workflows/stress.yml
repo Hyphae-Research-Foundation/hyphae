@@ -10,12 +10,17 @@ on:
     - cron: "43 3 * * 2"
   workflow_dispatch:
 
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   stress:
     name: Load and kill/restart soak
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

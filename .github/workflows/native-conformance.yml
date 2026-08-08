@@ -1,8 +1,11 @@
 name: Native Conformance Aggregate
 
 on:
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: native-conformance-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   actions: read

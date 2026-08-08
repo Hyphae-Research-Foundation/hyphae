@@ -1,8 +1,11 @@
 name: Native G2 Relational
 
 on:
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: native-g2-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

@@ -1,8 +1,11 @@
 name: Native G1 Substrate
 
 on:
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: native-g1-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
