@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from hyphae_sdk.v2 import HyphaeClient, RequestOptions, Response
 from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
-from hyphae_sdk.v2.local import _windows_pipe_namespace
+from hyphae_sdk.v2.local import LocalTransport, _windows_pipe_namespace
 from hyphae_sdk.v2.protocol import (
     FRAME_KINDS,
     decode_frame,
@@ -72,6 +72,20 @@ class FakeHttpConnection:
         pass
 
 
+class ShortWriteStream:
+    def __init__(self) -> None:
+        self.encoded = bytearray()
+        self.flushes = 0
+
+    def write(self, encoded: bytes) -> int:
+        length = min(7, len(encoded))
+        self.encoded.extend(encoded[:length])
+        return length
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
 class V2Tests(unittest.TestCase):
     def test_completion_blake3_matches_published_vectors(self) -> None:
         self.assertEqual(
@@ -117,6 +131,15 @@ class V2Tests(unittest.TestCase):
         self.assertEqual(_windows_pipe_namespace("\\\\.\\pipe\\hyphae-test"), "hyphae-test")
         with self.assertRaisesRegex(Exception, "local named-pipe namespace"):
             _windows_pipe_namespace("\\\\server\\pipe\\hyphae-test")
+
+    def test_local_pipe_write_completes_short_writes(self) -> None:
+        transport = LocalTransport("hyphae-test")
+        stream = ShortWriteStream()
+        transport._stream = stream  # type: ignore[assignment]
+        encoded = encode_frame(FRAME_KINDS["hello"], 0, 17, b"")
+        transport._write(encoded)
+        self.assertEqual(stream.encoded, encoded)
+        self.assertEqual(stream.flushes, 1)
 
     def test_high_level_api_is_transport_independent(self) -> None:
         transport = FakeTransport()

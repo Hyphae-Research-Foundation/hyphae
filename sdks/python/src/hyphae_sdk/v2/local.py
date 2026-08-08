@@ -170,7 +170,12 @@ class LocalTransport:
             if isinstance(self._stream, socket.socket):
                 self._stream.sendall(encoded)
             else:
-                self._stream.write(encoded)
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = self._stream.write(remaining)
+                    if written is None or written <= 0:
+                        raise OSError("native-local stream accepted no bytes")
+                    remaining = remaining[written:]
                 self._stream.flush()
         except OSError as error:
             self.close()
