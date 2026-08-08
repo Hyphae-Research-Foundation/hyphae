@@ -138,7 +138,8 @@ jobs:
           PYTHONPATH=. python tools/run_native_g7.py \
             --source-commit "$SHA" \
             --platform "${{ matrix.platform }}" \
-            --output native-g7-matrix.json
+            --output native-g7-matrix.json \
+            --background
           PYTHONPATH=. python tools/check_native_g7_matrix.py \
             --matrix native-g7-matrix.json \
             --expected-commit "$SHA" \

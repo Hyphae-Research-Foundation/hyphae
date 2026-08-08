@@ -22,7 +22,7 @@ STATES = ("warm", "cold")
 CONCURRENCIES = (1, 8, 32)
 
 
-def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: int) -> dict:
+def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: int, environment: dict[str, str] | None = None) -> dict:
     base_command = [str(binary), commit, platform, state, str(concurrency)]
     command = base_command
     perf_output: Path | None = None
@@ -42,7 +42,7 @@ def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: 
             *base_command,
         ]
     started = time.monotonic()
-    environment = os.environ.copy()
+    environment = dict(os.environ if environment is None else environment)
     environment["RUST_BACKTRACE"] = "1"
     process = subprocess.Popen(
         command,
@@ -257,6 +257,9 @@ def main() -> int:
     parser.add_argument("--platform", default=sys.platform)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--observations", type=int, default=1_000_000)
+    parser.add_argument("--warmup", type=int, default=100_000)
+    parser.add_argument("--background", action="store_true")
     arguments = parser.parse_args()
     binary = ROOT / "conformance" / "g7" / "runners" / "rust" / "target" / "release" / "hyphae-native-g7-runner"
     if os.name == "nt":
@@ -276,11 +279,23 @@ def main() -> int:
         )
     if not binary.is_file():
         raise RuntimeError(f"G7 runner not found: {binary}")
-    receipts = [
-        run_cell(binary, arguments.source_commit, arguments.platform, state, concurrency)
-        for state in STATES
-        for concurrency in CONCURRENCIES
-    ]
+    environment = os.environ.copy()
+    environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
+    environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
+    if arguments.background:
+        environment["HYPHAE_G7_BACKGROUND"] = "1"
+    receipts = []
+    for state in STATES:
+        for concurrency in CONCURRENCIES:
+            receipt = run_cell(
+                binary,
+                arguments.source_commit,
+                arguments.platform,
+                state,
+                concurrency,
+                environment,
+            )
+            receipts.append(receipt)
     for receipt in receipts:
         receipt.pop("controller", None)
     result = {
