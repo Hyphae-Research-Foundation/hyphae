@@ -132,24 +132,40 @@ jobs:
             platform: windows
             python: python
     runs-on: ${{ matrix.os }}
-    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == matrix.platform
     steps:
+      - name: Select requested platform
+        id: selected
+        shell: bash
+        env:
+          REQUESTED_PLATFORM: ${{ inputs.platform }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push || "$REQUESTED_PLATFORM" == all || "$REQUESTED_PLATFORM" == "$MATRIX_PLATFORM" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out exact commit
+        if: steps.selected.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install pinned Rust
+        if: steps.selected.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
 
       - name: Install pinned Python
+        if: steps.selected.outputs.run == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.13.7
 
       - name: Install pinned Node
+        if: steps.selected.outputs.run == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.10.0
@@ -157,10 +173,12 @@ jobs:
           cache-dependency-path: sdks/typescript/package-lock.json
 
       - name: Install TypeScript dependencies
+        if: steps.selected.outputs.run == 'true'
         shell: bash
         run: npm ci --ignore-scripts --prefix sdks/typescript
 
       - name: Build TypeScript dist from clean
+        if: steps.selected.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -169,6 +187,7 @@ jobs:
           test -f sdks/typescript/dist/v2/index.js
 
       - name: Execute every authorized suite and produce one receipt per requirement
+        if: steps.selected.outputs.run == 'true'
         shell: bash
         env:
           G6_PLATFORM: ${{ matrix.platform }}
@@ -185,6 +204,7 @@ jobs:
             --output-dir g6-candidate
 
       - name: Upload platform receipts
+        if: steps.selected.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-g6-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
