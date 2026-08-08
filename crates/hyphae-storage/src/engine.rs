@@ -874,8 +874,8 @@ mod tests {
     use crate::{
         AppendOutcome, DataDirectory, MaintenanceLimits, ManifestError, Mutation, SnapshotError,
         SnapshotReadLimits, StorageLimitError, StorageLimits, index::MaterializedIndex,
-        load_snapshot, load_snapshot_with_timeout, storage_limit_from_io,
-        test_support::TestDirectory, verify_snapshot,
+        load_snapshot, load_snapshot_for_migration, load_snapshot_with_timeout,
+        storage_limit_from_io, test_support::TestDirectory, verify_snapshot,
     };
 
     fn lexical_document(text: &str) -> Result<Vec<u8>, hyphae_query::DocumentError> {
@@ -981,9 +981,11 @@ mod tests {
         assert_eq!(created.receipt_count, 1);
         assert_eq!(verify_snapshot(&created.path)?, created);
         assert_eq!(opened.storage.snapshot()?, created);
-        let witness = load_snapshot(&created.path, &SnapshotReadLimits::default())?;
+        let (witness, receipts) =
+            load_snapshot_for_migration(&created.path, &SnapshotReadLimits::default())?;
         assert_eq!(witness.info, created);
         assert_eq!(witness.entries.len(), 2);
+        assert_eq!(receipts.0.len(), 1);
         assert_eq!(witness.entries[0].key, b"alpha");
         assert_eq!(witness.entries[0].value, b"first");
         assert!(matches!(

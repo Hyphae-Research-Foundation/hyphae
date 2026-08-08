@@ -86,7 +86,7 @@ pub use hash_pattern::{
 };
 pub use hyphae_native_ann::{
     AnnRecallRisk, AnnSearchStrategy, HnswConfig, Metric as VectorMetric,
-    SearchOptions as AnnSearchOptions, Vector, VectorHit,
+    SearchOptions as AnnSearchOptions, Vector, VectorHit, VectorRecord,
 };
 pub use local_operation::{
     LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LOCAL_STRUCTURE_SET_HEADER_SIZE,
@@ -145,8 +145,15 @@ pub use local_transaction::{
     encode_local_transaction_rollback, encode_local_transaction_rollback_receipt,
     encode_local_transaction_stage_receipt,
 };
+pub mod migration;
 #[cfg(unix)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
+pub use migration::{
+    MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
+    MigrationManifestError, MigrationManifestLimits, MigrationObject, MigrationProofAnchor,
+    MigrationReceipt, MigrationSource, MigrationTarget, MigrationVectorSpace,
+    NATIVE_MIGRATION_MANIFEST_KIND, NATIVE_MIGRATION_MANIFEST_VERSION,
+};
 pub use native_hybrid::{
     MAX_NATIVE_HYBRID_BRANCH_HITS, MAX_NATIVE_HYBRID_RETURNED, NATIVE_HYBRID_RRF_CONSTANT,
     NativeHybridError, NativeHybridExplanation, NativeHybridFusion, NativeHybridMatch,
@@ -2245,6 +2252,16 @@ impl NativeSnapshot {
         bounded_search::search_documents(documents, query, limit, limits)
     }
 
+    /// Returns the exact retained source text for one physical lexical index.
+    pub fn search_documents(&self, index: ObjectId) -> Option<Vec<(Vec<u8>, String)>> {
+        self.state.search.documents(index).map(|documents| {
+            documents
+                .iter()
+                .map(|(id, text)| (id.clone(), text.clone()))
+                .collect()
+        })
+    }
+
     /// Performs a relational primary-key lookup.
     pub fn select(&self, table: ObjectId, primary_key: &[u8]) -> Option<&[u8]> {
         self.state.relational.select(table, primary_key)
@@ -2948,6 +2965,15 @@ impl NativeSnapshot {
         self.state.ann.search_exact(index, query, k)
     }
 
+    /// Returns the exact current vector records for one physical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index does not exist or is corrupt.
+    pub fn vector_records(&self, index: ObjectId) -> Result<Vec<VectorRecord>, NativeRuntimeError> {
+        self.state.ann.vector_records(index)
+    }
+
     /// Executes the complete exact vector oracle over a stable-ID allowlist on
     /// this immutable snapshot.
     ///
@@ -3076,12 +3102,31 @@ impl NativeDatabase {
     ///
     /// Returns an error if the target already exists or cannot be initialized.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
-        let path = path.as_ref();
+        Self::create_with_marker(path.as_ref(), false)
+    }
+
+    /// Creates a new native migration target with an unpromoted FORMAT marker.
+    ///
+    /// The directory can only be used by this returned importer-owned handle
+    /// until [`Self::promote_pending`] atomically publishes the marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target already exists or cannot be initialized.
+    pub fn create_pending(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
+        Self::create_with_marker(path.as_ref(), true)
+    }
+
+    fn create_with_marker(path: &Path, pending: bool) -> Result<Self, NativeRuntimeError> {
         if path.exists() {
             return Err(NativeRuntimeError::DataDirectoryExists);
         }
         fs::create_dir(path)?;
-        let directory_guard = NativeDirectoryGuard::initialize(path)?;
+        let directory_guard = if pending {
+            NativeDirectoryGuard::initialize_pending(path)?
+        } else {
+            NativeDirectoryGuard::initialize(path)?
+        };
         let pages = PageStore::create(path.join(PAGE_FILE))?;
         let buffer_pool =
             BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
@@ -3154,6 +3199,27 @@ impl NativeDatabase {
         })
     }
 
+    /// Atomically publishes a pending migration target as Native authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the marker cannot be promoted or the parent cannot
+    /// be synchronized.
+    pub fn promote_pending(&mut self) -> Result<(), NativeRuntimeError> {
+        self.directory_guard
+            .promote_pending(&self.data_directory)
+            .map_err(Into::into)
+    }
+
+    /// Opens an importer-owned pending migration target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not an unpromoted migration target.
+    pub fn open_pending(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker(path.as_ref(), true)
+    }
+
     /// Opens, verifies, and recovers an existing native data directory.
     ///
     /// # Errors
@@ -3161,9 +3227,16 @@ impl NativeDatabase {
     /// Returns an error for any complete corruption, malformed committed
     /// transaction, missing referenced page, or noncontiguous CSN.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker(path.as_ref(), false)
+    }
+
+    fn open_with_marker(path: &Path, pending: bool) -> Result<Self, NativeRuntimeError> {
         let open_started = Instant::now();
-        let path = path.as_ref();
-        let directory_guard = NativeDirectoryGuard::open(path)?;
+        let directory_guard = if pending {
+            NativeDirectoryGuard::open_pending(path)?
+        } else {
+            NativeDirectoryGuard::open(path)?
+        };
         let mut snapshot_pins =
             SnapshotPinStore::open_or_create(path, directory_guard.identity().lineage())?;
         let (mut blobs, blob_verification_time) = open_blob_store(path)?;
@@ -24511,6 +24584,27 @@ mod tests {
         assert_eq!(fields[2], "epoch=1");
         assert_eq!(database.directory_identity().directory_id(), directory_id);
         assert_eq!(database.directory_identity().history_epoch(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_pending_target_promotes_and_reopens() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create_pending(directory.path())?;
+        assert!(!directory.path().join("FORMAT").exists());
+        assert!(directory.path().join("FORMAT.pending").exists());
+        drop(database);
+        assert!(matches!(
+            expected_open_error(directory.path())?,
+            NativeRuntimeError::Directory(NativeDirectoryError::PendingMigration(_))
+        ));
+        database = NativeDatabase::open_pending(directory.path())?;
+        database.promote_pending()?;
+        assert!(directory.path().join("FORMAT").exists());
+        assert!(!directory.path().join("FORMAT.pending").exists());
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.directory_identity().history_epoch(), 1);
         Ok(())
     }
 

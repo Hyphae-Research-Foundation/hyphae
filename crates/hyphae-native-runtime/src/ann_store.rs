@@ -340,6 +340,16 @@ pub(crate) struct AnnState {
 }
 
 impl AnnState {
+    pub(crate) fn vector_records(
+        &self,
+        index: ObjectId,
+    ) -> Result<Vec<VectorRecord>, NativeRuntimeError> {
+        self.indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })
+            .map(AnnIndexState::effective_vectors)
+    }
+
     pub(crate) fn create(
         &mut self,
         definition: VectorIndexDefinition,

@@ -14,7 +14,8 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 | G4 | Closed at `0059fce` | [12/12 hosted corpus-bound search closure](evidence/closures/native-g4-0059fce.json) |
 | G5 | Closed at `b7cf651` | [8/8 hosted exact-SHA convergence closure](evidence/closures/native-g5-b7cf651.json) |
 | G6 | Closed at `c57cc07` | [14/14 requirements and 42/42 exact-SHA platform cells](evidence/closures/native-g6-c57cc07.json) |
-| G7-G8 | Open | Their exit evidence is not yet defined as retained machine-readable profiles |
+| G7 | Open; authority defined | [Controlled-performance readiness profile](../../config/native-g7-readiness-profile.json); no performance closure claimed |
+| G8 | Open; authority defined | [Exact-commit release readiness profile](../../config/native-g8-readiness-profile.json); no release closure claimed |
 
 `bounded-readiness-only` records useful hosted evidence without promoting a
 deliberately restricted vertical into the broader normative gate outcome.

@@ -17,6 +17,7 @@ This page explains semantics and side effects that do not fit in short help.
 - `delete`
 - `query`
 - `snapshot`
+- `migrate`
 - `init`
 - `capabilities`
 - `catalog`

@@ -30,8 +30,9 @@ pub use manifest::ManifestError;
 pub use mutation::{MAX_KEY_BYTES, Mutation, MutationError};
 pub use snapshot::{
     SnapshotContents, SnapshotEntry, SnapshotError, SnapshotInfo, SnapshotReadLimits,
-    SnapshotVectorEntry, load_snapshot, load_snapshot_with_timeout,
-    open_verified_snapshot_with_limits, verify_snapshot, verify_snapshot_with_limits,
+    SnapshotReceipts, SnapshotVectorEntry, load_snapshot, load_snapshot_for_migration,
+    load_snapshot_with_timeout, open_verified_snapshot_with_limits, verify_snapshot,
+    verify_snapshot_with_limits,
 };
 
 #[cfg(test)]

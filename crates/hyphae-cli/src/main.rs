@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use compatibility::{BackupFamily, DirectoryFamily};
 use exit::CliFailure;
 use hyphae_core::current_version;
+use hyphae_engine::decode_document;
 use hyphae_native_catalog::{
     AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogObjectKind,
     CatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind, FieldSourcePolicy,
@@ -36,12 +37,12 @@ use hyphae_native_product::proof::{
 };
 use hyphae_native_product::{
     BackupInfo, BackupRequest, CatalogDependencyRequest, CatalogListRequest, CompactionRequest,
-    CompactionTarget, DoctorRequest, DoctorStatus, MetricValue, NativeProduct, ObjectId,
-    ProductAggregation, ProductCommitOutcome, ProductCommitReceipt, ProductDocValue,
-    ProductDocument, ProductDurability, ProductExplain, ProductExplicitTransactionStatus,
-    ProductFacetRequest, ProductHashEntry, ProductLexicalBranch, ProductListSide,
-    ProductMissingPlacement, ProductNamedAggregation, ProductOperation, ProductResponse,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    CompactionTarget, DoctorRequest, DoctorStatus, MetricValue, MigrationLexicalIndexInput,
+    MigrationVectorIndexInput, NativeProduct, ObjectId, ProductAggregation, ProductCommitOutcome,
+    ProductCommitReceipt, ProductDocValue, ProductDocument, ProductDurability, ProductExplain,
+    ProductExplicitTransactionStatus, ProductFacetRequest, ProductHashEntry, ProductLexicalBranch,
+    ProductListSide, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
+    ProductResponse, ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
     ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductSearchResults,
     ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
     ProductSqlResult, ProductStructureKey, ProductStructureMutation,
@@ -51,6 +52,15 @@ use hyphae_native_product::{
     ProductTtl, ProductValue, ProductVector, ProductVectorBranch, ProductVectorExecution,
     ProductVectorStrategy, ProgressControl, RestorePhase, RestoreRequest, SnapshotIdentity,
     StructureKind, VerifyBackupRequest, capabilities, verify_backup,
+};
+use hyphae_native_runtime::{
+    MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
+    MigrationObject, MigrationProofAnchor, MigrationReceipt, MigrationSource, MigrationTarget,
+    MigrationVectorSpace,
+};
+use hyphae_query::Value as LegacyValue;
+use hyphae_storage::{
+    SnapshotContents, SnapshotReadLimits, load_snapshot, load_snapshot_for_migration,
 };
 use native_client::EmbeddedClient;
 use serde::{Deserialize, Deserializer, de::Visitor};
@@ -132,6 +142,11 @@ enum Command {
     Snapshot {
         #[arg(long, env = "HYPHAE_DATA_DIR")]
         data_dir: PathBuf,
+    },
+    /// Inspect a format-2 source without mutating it.
+    Migrate {
+        #[command(subcommand)]
+        operation: MigrationCommand,
     },
     /// Initialize a new native data directory, failing if the path exists.
     Init(LocalDirectory),
@@ -280,6 +295,49 @@ enum Command {
         base_url: String,
         #[arg(long, env = "HYPHAE_BEARER_TOKEN_FILE")]
         bearer_token_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrationCommand {
+    /// Verify and report the source logical snapshot.
+    Inspect {
+        #[arg(long)]
+        source: PathBuf,
+    },
+    /// Import a verified source into a separate pending Native target.
+    Run {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Verify a migration manifest and its pending or promoted target.
+    Verify {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Promote a validated pending Native target.
+    Promote {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Remove a pending migration target while retaining the source.
+    Rollback {
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 }
 
@@ -1124,6 +1182,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             },
         )),
         Command::Snapshot { data_dir } => compatibility(compatibility::snapshot(&data_dir)),
+        Command::Migrate { operation } => migration(operation).map_err(Into::into),
         Command::Init(local) => init(&local).map_err(Into::into),
         Command::Capabilities(local) => {
             dispatch(&local, ProductOperation::Capabilities).map_err(Into::into)
@@ -1237,6 +1296,602 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             bearer_token_file,
         } => compatibility(compatibility::run_mcp(&base_url, bearer_token_file.as_deref()).await),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
+    match command {
+        MigrationCommand::Inspect { source } => {
+            let snapshot = migration_snapshot(&source)?;
+            print_json(&migration_snapshot_json(&snapshot))
+        }
+        MigrationCommand::Run {
+            source,
+            target,
+            manifest,
+        } => {
+            reject_migration_path_overlap(&source, &target, &manifest)?;
+            let snapshot = migration_snapshot(&source)?;
+            let mut product = NativeProduct::create_pending(&target)?;
+            let result = match import_migration_snapshot(&mut product, &snapshot) {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(product);
+                    let _ignored = fs::remove_dir_all(&target);
+                    return Err(error);
+                }
+            };
+            let target_identity = (
+                product.directory_identity().directory_id().to_owned(),
+                product.directory_identity().history_epoch(),
+            );
+            let migration_entries = snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect::<Vec<_>>();
+            if !product.migration_verify_public_entries(&migration_entries)? {
+                drop(product);
+                let _ignored = fs::remove_dir_all(&target);
+                return Err(CliFailure::invalid());
+            }
+            let encoded = result.encode().map_err(|_| CliFailure::internal())?;
+            if let Err(error) = write_new_file(&manifest, &encoded) {
+                drop(product);
+                let _ignored = fs::remove_dir_all(&target);
+                return Err(error);
+            }
+            print_json(&json!({
+                "status": "imported",
+                "source": source,
+                "target": target,
+                "manifest": manifest,
+                "pending": true,
+                "directory_id": target_identity.0,
+                "history_epoch": target_identity.1,
+                "snapshot": migration_snapshot_json(&snapshot),
+                "documents": result.documents.len(),
+                "receipts": result.receipts.len(),
+            }))
+        }
+        MigrationCommand::Verify {
+            source,
+            target,
+            manifest,
+        } => {
+            reject_migration_path_overlap(&source, &target, &manifest)?;
+            let snapshot = migration_snapshot(&source)?;
+            let manifest_bytes = fs::read(&manifest)?;
+            let migration = hyphae_native_runtime::MigrationManifest::decode(
+                &manifest_bytes,
+                &hyphae_native_runtime::MigrationManifestLimits::default(),
+            )
+            .map_err(|_| CliFailure::invalid())?;
+            verify_migration_target(&target, &snapshot, &migration)?;
+            print_json(&json!({
+                "status": "verified",
+                "source": source,
+                "target": target,
+                "manifest": manifest,
+                "pending": !target.join("FORMAT").try_exists().map_err(|_| CliFailure::io())?,
+            }))
+        }
+        MigrationCommand::Promote {
+            source,
+            target,
+            manifest,
+        } => {
+            reject_migration_path_overlap(&source, &target, &manifest)?;
+            let snapshot = migration_snapshot(&source)?;
+            let bytes = fs::read(&manifest)?;
+            let migration = hyphae_native_runtime::MigrationManifest::decode(
+                &bytes,
+                &hyphae_native_runtime::MigrationManifestLimits::default(),
+            )
+            .map_err(|_| CliFailure::invalid())?;
+            if migration.source.snapshot_digest != encode_hex(&snapshot.info.snapshot_digest) {
+                return Err(CliFailure::invalid());
+            }
+            let pending = target.join("FORMAT.pending").try_exists()?;
+            if !pending {
+                return Err(CliFailure::invalid());
+            }
+            let mut product = NativeProduct::open_pending(&target)?;
+            let lineage = product.directory_identity();
+            if migration.target.directory_id != lineage.directory_id()
+                || migration.target.history_epoch != lineage.history_epoch()
+            {
+                return Err(CliFailure::invalid());
+            }
+            verify_migration_product(&product, &snapshot, &migration)?;
+            product.promote_pending()?;
+            print_json(&json!({ "status": "promoted", "target": target, "manifest": manifest }))
+        }
+        MigrationCommand::Rollback { target, manifest } => {
+            let pending = target.join("FORMAT.pending").try_exists()?;
+            if !pending {
+                return Err(CliFailure::invalid());
+            }
+            let pending_product = NativeProduct::open_pending(&target)?;
+            drop(pending_product);
+            fs::remove_dir_all(&target)?;
+            sync_parent_directory(target.parent().unwrap_or_else(|| Path::new(".")))?;
+            print_json(&json!({
+                "status": "rolled_back",
+                "target": target,
+                "manifest": manifest,
+                "source_retained": true,
+            }))
+        }
+    }
+}
+
+fn reject_migration_path_overlap(
+    source: &Path,
+    target: &Path,
+    manifest: &Path,
+) -> Result<(), CliFailure> {
+    let source = fs::canonicalize(source).map_err(|_| CliFailure::invalid())?;
+    let target = canonicalize_for_output(target)?;
+    let manifest = canonicalize_for_output(manifest)?;
+    if target.starts_with(&source) || manifest.starts_with(&source) || source == target {
+        return Err(CliFailure::invalid());
+    }
+    Ok(())
+}
+
+fn canonicalize_for_output(path: &Path) -> Result<PathBuf, CliFailure> {
+    if path.exists() {
+        fs::canonicalize(path).map_err(|_| CliFailure::invalid())
+    } else {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(fs::canonicalize(parent)
+            .map_err(|_| CliFailure::invalid())?
+            .join(path.file_name().ok_or_else(CliFailure::invalid)?))
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), CliFailure> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn migration_snapshot(source: &Path) -> Result<SnapshotContents, CliFailure> {
+    let marker = fs::read(source.join("FORMAT"))?;
+    if marker != b"hyphae-disk-format=2\n" {
+        return Err(CliFailure::invalid());
+    }
+    let snapshot = latest_existing_snapshot(source)?;
+    load_snapshot(snapshot, &SnapshotReadLimits::default()).map_err(|_| CliFailure::invalid())
+}
+
+fn source_receipts(
+    snapshot: &SnapshotContents,
+) -> Result<Vec<hyphae_storage::CommitReceipt>, CliFailure> {
+    load_snapshot_for_migration(&snapshot.info.path, &SnapshotReadLimits::default())
+        .map(|(_, receipts)| receipts.0)
+        .map_err(|_| CliFailure::invalid())
+}
+
+fn latest_existing_snapshot(source: &Path) -> Result<PathBuf, CliFailure> {
+    let mut candidates = fs::read_dir(source.join("snapshots"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let sequence = name
+                .strip_prefix("snapshot-")?
+                .strip_suffix(".hysnap")?
+                .parse::<u64>()
+                .ok()?;
+            entry
+                .file_type()
+                .ok()?
+                .is_file()
+                .then_some((sequence, path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(sequence, _)| *sequence);
+    candidates
+        .pop()
+        .map(|(_, path)| path)
+        .ok_or_else(CliFailure::invalid)
+}
+
+fn migration_snapshot_json(snapshot: &SnapshotContents) -> Value {
+    json!({
+        "disk_format_version": snapshot.info.disk_format_version,
+        "checkpoint_sequence": snapshot.info.checkpoint_sequence,
+        "checkpoint_digest": snapshot.info.checkpoint_digest.map(|value| encode_hex(&value)),
+        "snapshot_digest": encode_hex(&snapshot.info.snapshot_digest),
+        "entry_count": snapshot.entries.len(),
+        "vector_space_count": snapshot.vector_spaces.len(),
+        "vector_count": snapshot.vectors.len(),
+        "lexical_index_count": snapshot.lexical_indexes.len(),
+        "receipt_count": snapshot.info.receipt_count,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn import_migration_snapshot(
+    product: &mut NativeProduct,
+    snapshot: &SnapshotContents,
+) -> Result<MigrationManifest, CliFailure> {
+    for object in [
+        LogicalCatalogObject::V2(CatalogObjectV2::Database(catalog_header(
+            1,
+            EngineKind::Kernel,
+            "main.public.migration_database",
+            None,
+        )?)),
+        LogicalCatalogObject::V2(CatalogObjectV2::Schema(catalog_header(
+            2,
+            EngineKind::Kernel,
+            "main.public.migration_schema",
+            Some(1),
+        )?)),
+        LogicalCatalogObject::V2(CatalogObjectV2::Keyspace(KeyspaceDefinition {
+            header: catalog_header(
+                3,
+                EngineKind::Structure,
+                "main.public.legacy_records",
+                Some(2),
+            )?,
+            kind: StructureKind::String,
+            key_type: LogicalType::Binary,
+            value_type: LogicalType::Binary,
+            ownership: StructureOwnership::Canonical,
+            ttl_policy: KeyspaceTtlPolicy::PerValue,
+            default_ttl_millis: None,
+            memory_class: KeyspaceMemoryClass::Durable,
+            eviction: KeyspaceEvictionPolicy::None,
+            relation_schema: None,
+        })),
+    ] {
+        product
+            .create_catalog_object_v2(object, ProductDurability::Memory)
+            .map_err(|error| {
+                eprintln!("migration catalog create failed: {error:?}");
+                error
+            })?;
+    }
+
+    let mut documents = Vec::with_capacity(snapshot.entries.len());
+    let mut records = Vec::with_capacity(snapshot.entries.len());
+    let mut document_ids = BTreeMap::new();
+    for entry in &snapshot.entries {
+        let object_id = migration_object_id(b"document", &entry.key)?;
+        document_ids.insert(entry.key.clone(), object_id);
+        records.push((entry.key.clone(), entry.value.clone()));
+        documents.push(MigrationDocument {
+            source_key: encode_hex(&entry.key),
+            object_id: object_id.get().to_string(),
+        });
+    }
+    if !records.is_empty() {
+        for chunk in records.chunks(512) {
+            product
+                .migration_store_public_entries(chunk)
+                .map_err(|error| {
+                    eprintln!("migration public entries failed: {error:?}");
+                    error
+                })?;
+        }
+    }
+
+    let mut lexical_inputs = Vec::with_capacity(snapshot.lexical_indexes.len());
+    let mut vector_inputs = Vec::with_capacity(snapshot.vector_spaces.len());
+    for definition in &snapshot.lexical_indexes {
+        let index = migration_object_id(b"lexical-index", definition.name.as_str().as_bytes())?;
+        let mut indexed_documents = Vec::with_capacity(snapshot.entries.len());
+        for entry in &snapshot.entries {
+            let value = decode_legacy_document(&entry.value)?;
+            let text = lexical_text(&value, definition);
+            let document_id = document_ids
+                .get(&entry.key)
+                .ok_or_else(CliFailure::internal)?
+                .get()
+                .to_be_bytes()
+                .to_vec();
+            indexed_documents.push((document_id, text));
+        }
+        lexical_inputs.push(MigrationLexicalIndexInput {
+            index,
+            name: format!("__migration_lexical_{}", definition.name),
+            documents: indexed_documents,
+        });
+    }
+    for definition in &snapshot.vector_spaces {
+        let index = migration_object_id(b"vector-space", definition.name.as_str().as_bytes())?;
+        let mut vectors = Vec::new();
+        for vector in snapshot
+            .vectors
+            .iter()
+            .filter(|vector| vector.space == definition.name)
+        {
+            let object_id = document_ids
+                .get(&vector.key)
+                .ok_or_else(CliFailure::internal)?;
+            vectors.push((
+                *object_id,
+                vector
+                    .vector
+                    .as_slice()
+                    .iter()
+                    .map(|value| f32::from(*value) / 32_767.0)
+                    .collect(),
+            ));
+        }
+        vector_inputs.push(MigrationVectorIndexInput {
+            index,
+            name: format!("__migration_vector_{}", definition.name),
+            dimension: definition.dimension,
+            vectors,
+        });
+    }
+    let _ = (lexical_inputs, vector_inputs);
+
+    let mut objects = vec![MigrationObject {
+        kind: "legacy-records".to_owned(),
+        source_identity: "format-2".to_owned(),
+        target_id: "3".to_owned(),
+    }];
+    objects.sort();
+    let source_receipts = source_receipts(snapshot)?;
+    let receipts = source_receipts
+        .iter()
+        .map(|receipt| MigrationReceipt {
+            transaction_id: encode_hex(receipt.transaction_id.as_bytes()),
+            commit_sequence: receipt.commit_sequence,
+            commit_digest: encode_hex(&receipt.commit_digest),
+            transaction_digest: encode_hex(&receipt.transaction_digest),
+            idempotency_identity: encode_hex(receipt.transaction_id.as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let logical_digest = migration_logical_digest(snapshot);
+    let lineage = product.directory_identity();
+    let source = MigrationSource {
+        disk_format_version: snapshot.info.disk_format_version,
+        checkpoint_sequence: snapshot.info.checkpoint_sequence,
+        checkpoint_digest: snapshot
+            .info
+            .checkpoint_digest
+            .map(|value| encode_hex(&value)),
+        snapshot_digest: encode_hex(&snapshot.info.snapshot_digest),
+        entry_count: snapshot.info.entry_count,
+        vector_space_count: snapshot.info.vector_space_count,
+        vector_count: snapshot.info.vector_count,
+        lexical_index_count: snapshot.info.lexical_index_count,
+        receipt_count: snapshot.info.receipt_count,
+        vector_spaces: snapshot
+            .vector_spaces
+            .iter()
+            .map(|space| MigrationVectorSpace {
+                name: space.name.to_string(),
+                dimension: space.dimension,
+                metric: space.metric as u8,
+            })
+            .collect(),
+        lexical_indexes: snapshot
+            .lexical_indexes
+            .iter()
+            .map(|index| MigrationLexicalIndex {
+                name: index.name.to_string(),
+                fields: index
+                    .fields
+                    .iter()
+                    .map(|field| MigrationLexicalField {
+                        path: field.path.segments().to_vec(),
+                        weight_micros: field.weight_micros,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    Ok(MigrationManifest {
+        version: hyphae_native_runtime::NATIVE_MIGRATION_MANIFEST_VERSION,
+        kind: hyphae_native_runtime::NATIVE_MIGRATION_MANIFEST_KIND.to_owned(),
+        source,
+        target: MigrationTarget {
+            directory_id: lineage.directory_id().to_owned(),
+            history_epoch: lineage.history_epoch(),
+            entry_count: documents.len() as u64,
+            vector_space_count: snapshot.vector_spaces.len() as u64,
+            vector_count: snapshot.vectors.len() as u64,
+            lexical_index_count: snapshot.lexical_indexes.len() as u64,
+            receipt_count: receipts.len() as u64,
+            logical_digest: logical_digest.clone(),
+        },
+        objects,
+        documents,
+        receipts,
+        proof_anchors: vec![MigrationProofAnchor {
+            kind: "format-2-snapshot".to_owned(),
+            source_digest: encode_hex(&snapshot.info.snapshot_digest),
+            target_digest: logical_digest.clone(),
+        }],
+    })
+}
+
+fn migration_object_id(prefix: &[u8], key: &[u8]) -> Result<ObjectId, CliFailure> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-migration-object-v1");
+    hasher.update(prefix);
+    hasher.update(key);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    object_id(u128::from_be_bytes(bytes) | 1)
+}
+
+fn migration_logical_digest(snapshot: &SnapshotContents) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-migration-logical-v1");
+    for entry in &snapshot.entries {
+        hasher.update(&(entry.key.len() as u64).to_le_bytes());
+        hasher.update(&entry.key);
+        hasher.update(&(entry.value.len() as u64).to_le_bytes());
+        hasher.update(&entry.value);
+    }
+    for space in &snapshot.vector_spaces {
+        hasher.update(b"vector-space");
+        hasher.update(space.name.as_str().as_bytes());
+        hasher.update(&space.dimension.to_le_bytes());
+        hasher.update(&[space.metric as u8]);
+    }
+    for vector in &snapshot.vectors {
+        hasher.update(b"vector");
+        hasher.update(vector.space.as_str().as_bytes());
+        hasher.update(&(vector.key.len() as u64).to_le_bytes());
+        hasher.update(&vector.key);
+        for value in vector.vector.as_slice() {
+            hasher.update(&value.to_le_bytes());
+        }
+    }
+    for index in &snapshot.lexical_indexes {
+        hasher.update(b"lexical-index");
+        hasher.update(index.name.as_str().as_bytes());
+        for field in &index.fields {
+            for segment in field.path.segments() {
+                hasher.update(&(segment.len() as u64).to_le_bytes());
+                hasher.update(segment.as_bytes());
+            }
+            hasher.update(&field.weight_micros.to_le_bytes());
+        }
+    }
+    for receipt in &snapshot.info.receipt_count.to_le_bytes() {
+        hasher.update(b"receipt");
+        hasher.update(&[*receipt]);
+    }
+    encode_hex(hasher.finalize().as_bytes())
+}
+
+fn decode_legacy_document(encoded: &[u8]) -> Result<LegacyValue, CliFailure> {
+    decode_document(encoded).map_err(|_| CliFailure::invalid())
+}
+
+fn lexical_text(
+    value: &LegacyValue,
+    definition: &hyphae_retrieval::LexicalIndexDefinition,
+) -> String {
+    definition
+        .fields
+        .iter()
+        .filter_map(|field| field.path.resolve(value))
+        .filter_map(|value| match value {
+            LegacyValue::String(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn verify_migration_target(
+    target: &Path,
+    snapshot: &SnapshotContents,
+    manifest: &MigrationManifest,
+) -> Result<(), CliFailure> {
+    if manifest.source.snapshot_digest != encode_hex(&snapshot.info.snapshot_digest)
+        || manifest.documents.len() != snapshot.entries.len()
+        || manifest.receipts.len()
+            != usize::try_from(snapshot.info.receipt_count).map_err(|_| CliFailure::invalid())?
+    {
+        return Err(CliFailure::invalid());
+    }
+    let product = match NativeProduct::open_pending(target) {
+        Ok(product) => product,
+        Err(_) => NativeProduct::open(target)?,
+    };
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect::<Vec<_>>();
+    if !product
+        .migration_verify_public_entries(&entries)
+        .map_err(|error| {
+            eprintln!("migration public verification error: {error:?}");
+            error
+        })?
+    {
+        return Err(CliFailure::invalid());
+    }
+    verify_migration_product(&product, snapshot, manifest)?;
+    let lineage = product.directory_identity();
+    if manifest.target.directory_id != lineage.directory_id()
+        || manifest.target.history_epoch != lineage.history_epoch()
+    {
+        return Err(CliFailure::invalid());
+    }
+    Ok(())
+}
+
+fn verify_migration_product(
+    product: &NativeProduct,
+    snapshot: &SnapshotContents,
+    manifest: &MigrationManifest,
+) -> Result<(), CliFailure> {
+    if manifest.target.entry_count != snapshot.entries.len() as u64
+        || manifest.target.vector_space_count != snapshot.vector_spaces.len() as u64
+        || manifest.target.vector_count != snapshot.vectors.len() as u64
+        || manifest.target.lexical_index_count != snapshot.lexical_indexes.len() as u64
+        || manifest.target.receipt_count != snapshot.info.receipt_count
+        || manifest.source.entry_count != snapshot.info.entry_count
+        || manifest.source.vector_space_count != snapshot.info.vector_space_count
+        || manifest.source.vector_count != snapshot.info.vector_count
+        || manifest.source.lexical_index_count != snapshot.info.lexical_index_count
+        || manifest.source.receipt_count != snapshot.info.receipt_count
+    {
+        return Err(CliFailure::invalid());
+    }
+    let target_digest = migration_logical_digest(snapshot);
+    if manifest.target.logical_digest != target_digest {
+        return Err(CliFailure::invalid());
+    }
+    let native = product.snapshot_bounded(0).map_err(|error| {
+        eprintln!("migration target snapshot error: {error:?}");
+        CliFailure::invalid()
+    })?;
+    let mut expected_documents = Vec::with_capacity(snapshot.entries.len());
+    for entry in &snapshot.entries {
+        expected_documents.push(MigrationDocument {
+            source_key: encode_hex(&entry.key),
+            object_id: migration_object_id(b"document", &entry.key)?
+                .get()
+                .to_string(),
+        });
+    }
+    expected_documents.sort();
+    if manifest.documents != expected_documents {
+        return Err(CliFailure::invalid());
+    }
+    let source_receipts = source_receipts(snapshot)?;
+    let expected_receipts = source_receipts
+        .iter()
+        .map(|receipt| MigrationReceipt {
+            transaction_id: encode_hex(receipt.transaction_id.as_bytes()),
+            commit_sequence: receipt.commit_sequence,
+            commit_digest: encode_hex(&receipt.commit_digest),
+            transaction_digest: encode_hex(&receipt.transaction_digest),
+            idempotency_identity: encode_hex(receipt.transaction_id.as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    if manifest.receipts != expected_receipts {
+        return Err(CliFailure::invalid());
+    }
+    let _ = native;
+    let mut expected_objects = vec![MigrationObject {
+        kind: "legacy-records".to_owned(),
+        source_identity: "format-2".to_owned(),
+        target_id: "3".to_owned(),
+    }];
+    expected_objects.sort();
+    if manifest.objects != expected_objects {
+        return Err(CliFailure::invalid());
+    }
+    Ok(())
 }
 
 fn open_client(local: &LocalDirectory) -> Result<EmbeddedClient, CliFailure> {

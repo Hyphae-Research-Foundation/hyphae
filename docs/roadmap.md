@@ -19,7 +19,8 @@ format.
 ## Next program: native local data ecosystem
 
 The next product program targets `1.0.0`. G0 through G6 have retained exact-SHA
-closure for their versioned, bounded profiles; G7 and G8 remain open. See
+closure for their versioned, bounded profiles; G7 and G8 remain open with
+machine-readable authority now defined. See
 the [native gate status](gates/native-gate-status.md). Hyphae will build its own
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory

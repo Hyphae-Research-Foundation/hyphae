@@ -3,7 +3,7 @@
 //! Native data-directory identity and single-writer ownership.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -118,29 +118,71 @@ pub enum NativeDirectoryError {
 #[derive(Debug)]
 pub(crate) struct NativeDirectoryGuard {
     identity: NativeDirectoryIdentity,
+    pending: bool,
     _lock: File,
 }
 
 impl NativeDirectoryGuard {
     pub(crate) fn initialize(path: &Path) -> Result<Self, NativeDirectoryError> {
+        Self::initialize_with_marker(path, false)
+    }
+
+    pub(crate) fn initialize_pending(path: &Path) -> Result<Self, NativeDirectoryError> {
+        Self::initialize_with_marker(path, true)
+    }
+
+    fn initialize_with_marker(path: &Path, pending: bool) -> Result<Self, NativeDirectoryError> {
         let lock = acquire_lock(path, true)?;
         let identity =
             NativeDirectoryIdentity::new(generate_directory_id(path)?, HistoryEpoch::FIRST);
-        write_format_marker(path, &identity)?;
+        write_format_marker(path, &identity, pending)?;
         Ok(Self {
             identity,
+            pending,
             _lock: lock,
         })
     }
 
     pub(crate) fn open(path: &Path) -> Result<Self, NativeDirectoryError> {
+        Self::open_with_pending(path, false)
+    }
+
+    pub(crate) fn open_pending(path: &Path) -> Result<Self, NativeDirectoryError> {
+        Self::open_with_pending(path, true)
+    }
+
+    fn open_with_pending(path: &Path, allow_pending: bool) -> Result<Self, NativeDirectoryError> {
         let lock = acquire_lock(path, false)?;
-        let identity = read_and_validate_marker(path)?;
+        let identity = read_and_validate_marker(path, allow_pending)?;
         reject_mixed_format_families(path)?;
         Ok(Self {
             identity,
+            pending: !path
+                .join(FORMAT_FILE)
+                .try_exists()
+                .map_err(|source| io_error(&path.join(FORMAT_FILE), source))?,
             _lock: lock,
         })
+    }
+
+    pub(crate) fn promote_pending(&mut self, path: &Path) -> Result<(), NativeDirectoryError> {
+        if !self.pending {
+            return Ok(());
+        }
+        let pending_path = path.join(PENDING_FORMAT_FILE);
+        let format_path = path.join(FORMAT_FILE);
+        if format_path
+            .try_exists()
+            .map_err(|source| io_error(&format_path, source))?
+        {
+            return Err(NativeDirectoryError::ConflictingFormatMarkers(
+                path.to_path_buf(),
+            ));
+        }
+        fs::rename(&pending_path, &format_path)
+            .map_err(|source| io_error(&pending_path, source))?;
+        self.pending = false;
+        sync_parent_directory(path)
     }
 
     pub(crate) const fn identity(&self) -> &NativeDirectoryIdentity {
@@ -178,8 +220,13 @@ fn acquire_lock(path: &Path, create: bool) -> Result<File, NativeDirectoryError>
 fn write_format_marker(
     path: &Path,
     identity: &NativeDirectoryIdentity,
+    pending: bool,
 ) -> Result<(), NativeDirectoryError> {
-    let format_path = path.join(FORMAT_FILE);
+    let format_path = path.join(if pending {
+        PENDING_FORMAT_FILE
+    } else {
+        FORMAT_FILE
+    });
     let mut format = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -195,7 +242,10 @@ fn write_format_marker(
     Ok(())
 }
 
-fn read_and_validate_marker(path: &Path) -> Result<NativeDirectoryIdentity, NativeDirectoryError> {
+fn read_and_validate_marker(
+    path: &Path,
+    allow_pending: bool,
+) -> Result<NativeDirectoryIdentity, NativeDirectoryError> {
     let format_path = path.join(FORMAT_FILE);
     let pending_path = path.join(PENDING_FORMAT_FILE);
     let has_format = format_path
@@ -212,21 +262,33 @@ fn read_and_validate_marker(path: &Path) -> Result<NativeDirectoryIdentity, Nati
             ));
         }
         (false, true) => {
-            return Err(NativeDirectoryError::PendingMigration(path.to_path_buf()));
+            if !allow_pending {
+                return Err(NativeDirectoryError::PendingMigration(path.to_path_buf()));
+            }
         }
         (false, false) => {
             return Err(NativeDirectoryError::MissingFormat(path.to_path_buf()));
         }
+        (true, false) if allow_pending => {
+            return Err(NativeDirectoryError::ConflictingFormatMarkers(
+                path.to_path_buf(),
+            ));
+        }
         (true, false) => {}
     }
 
+    let marker_path = if has_format {
+        format_path.clone()
+    } else {
+        pending_path
+    };
     let mut marker = Vec::new();
-    File::open(&format_path)
-        .map_err(|source| io_error(&format_path, source))?
+    File::open(&marker_path)
+        .map_err(|source| io_error(&marker_path, source))?
         .take(MAX_FORMAT_READ_BYTES)
         .read_to_end(&mut marker)
-        .map_err(|source| io_error(&format_path, source))?;
-    parse_marker(&format_path, &marker)
+        .map_err(|source| io_error(&marker_path, source))?;
+    parse_marker(&marker_path, &marker)
 }
 
 fn parse_marker(

@@ -19,6 +19,7 @@ name = "hyphae"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 clap.workspace = true
 hyphae-client.workspace = true
 hyphae-contracts.workspace = true

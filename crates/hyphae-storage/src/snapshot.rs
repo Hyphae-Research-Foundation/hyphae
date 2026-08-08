@@ -116,6 +116,11 @@ pub struct SnapshotContents {
     pub lexical_indexes: Vec<LexicalIndexDefinition>,
 }
 
+/// Receipts retained by an offline migration witness without changing the
+/// public snapshot payload shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotReceipts(pub Vec<CommitReceipt>);
+
 /// One verified durable vector loaded from a canonical snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotVectorEntry {
@@ -616,7 +621,7 @@ fn snapshot_info(
 ///
 /// The same pass that collects records validates their canonical order,
 /// resource bounds, checksum, and digest. Durable idempotency receipts are
-/// verified but are not retained in the returned witness.
+/// verified and retained in the returned witness.
 ///
 /// # Errors
 ///
@@ -626,7 +631,19 @@ pub fn load_snapshot(
     path: impl AsRef<Path>,
     limits: &SnapshotReadLimits,
 ) -> Result<SnapshotContents, SnapshotError> {
-    load_snapshot_inner(path.as_ref(), limits, None)
+    load_snapshot_inner(path.as_ref(), limits, None, false).map(|(contents, _)| contents)
+}
+
+/// Loads a migration witness with durable source receipts.
+///
+/// # Errors
+///
+/// Returns a snapshot validation, I/O, limit, or timeout error.
+pub fn load_snapshot_for_migration(
+    path: impl AsRef<Path>,
+    limits: &SnapshotReadLimits,
+) -> Result<(SnapshotContents, SnapshotReceipts), SnapshotError> {
+    load_snapshot_inner(path.as_ref(), limits, None, true)
 }
 
 /// Loads a verified snapshot under explicit resource limits and a cooperative
@@ -643,31 +660,37 @@ pub fn load_snapshot_with_timeout(
     timeout: Duration,
 ) -> Result<SnapshotContents, SnapshotError> {
     let deadline = OperationDeadline::new(timeout);
-    load_snapshot_inner(path.as_ref(), limits, Some(&deadline))
+    load_snapshot_inner(path.as_ref(), limits, Some(&deadline), false).map(|(contents, _)| contents)
 }
 
 fn load_snapshot_inner(
     path: &Path,
     limits: &SnapshotReadLimits,
     deadline: Option<&OperationDeadline>,
-) -> Result<SnapshotContents, SnapshotError> {
+    retain_receipts: bool,
+) -> Result<(SnapshotContents, SnapshotReceipts), SnapshotError> {
     check_snapshot_deadline(deadline)?;
     let mut collector = SnapshotCollector {
         entries: Vec::new(),
         vector_spaces: Vec::new(),
         vectors: Vec::new(),
         lexical_indexes: Vec::new(),
+        receipts: Vec::new(),
         decoded_bytes: 0,
+        retain_receipts,
         limits,
     };
     let info = read_snapshot_records_with_limits(path, &mut collector, Some(limits), deadline)?;
-    Ok(SnapshotContents {
-        info,
-        entries: collector.entries,
-        vector_spaces: collector.vector_spaces,
-        vectors: collector.vectors,
-        lexical_indexes: collector.lexical_indexes,
-    })
+    Ok((
+        SnapshotContents {
+            info,
+            entries: collector.entries,
+            vector_spaces: collector.vector_spaces,
+            vectors: collector.vectors,
+            lexical_indexes: collector.lexical_indexes,
+        },
+        SnapshotReceipts(collector.receipts),
+    ))
 }
 
 /// Receives provisional records during an authenticated snapshot pass.
@@ -834,7 +857,9 @@ struct SnapshotCollector<'limits> {
     vector_spaces: Vec<VectorSpaceDefinition>,
     vectors: Vec<SnapshotVectorEntry>,
     lexical_indexes: Vec<LexicalIndexDefinition>,
+    receipts: Vec<CommitReceipt>,
     decoded_bytes: u64,
+    retain_receipts: bool,
     limits: &'limits SnapshotReadLimits,
 }
 
@@ -880,7 +905,34 @@ impl SnapshotRecordVisitor for SnapshotCollector<'_> {
         Ok(())
     }
 
-    fn receipt(&mut self, _receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+    fn receipt(&mut self, receipt: &CommitReceipt) -> Result<(), SnapshotError> {
+        if !self.retain_receipts {
+            return Ok(());
+        }
+        let next_count = u64::try_from(self.receipts.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(SnapshotError::EntryLimitExceeded {
+                actual: u64::MAX,
+                maximum: self.limits.entries,
+            })?;
+        if next_count > self.limits.entries {
+            return Err(SnapshotError::EntryLimitExceeded {
+                actual: next_count,
+                maximum: self.limits.entries,
+            });
+        }
+        self.decoded_bytes = self.decoded_bytes.checked_add(RECEIPT_LENGTH_U64).ok_or(
+            SnapshotError::DecodedBytesLimitExceeded {
+                maximum: self.limits.decoded_bytes,
+            },
+        )?;
+        if self.decoded_bytes > self.limits.decoded_bytes {
+            return Err(SnapshotError::DecodedBytesLimitExceeded {
+                maximum: self.limits.decoded_bytes,
+            });
+        }
+        self.receipts.push(*receipt);
         Ok(())
     }
 

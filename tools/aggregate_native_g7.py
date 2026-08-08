@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+"""Aggregate one exact-SHA G7 matrix for Linux, macOS, and Windows."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from tools.check_native_g7_matrix import GateFailure, validate_matrix
+
+
+PLATFORMS = ("linux", "macos", "windows")
+
+
+def aggregate(root: Path, source_commit: str) -> dict:
+    matrices = {}
+    for platform in PLATFORMS:
+        path = root / platform / "native-g7-matrix.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        audit = validate_matrix(payload, source_commit)
+        if payload.get("platform") != platform:
+            raise GateFailure(f"G7 matrix platform mismatch: {platform}")
+        matrices[platform] = {
+            "audit": audit,
+            "matrix_sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+            "counter_status": {
+                name: (
+                    "measured"
+                    if all(
+                        receipt["counters"][name]["status"] == "measured"
+                        for receipt in payload["receipts"]
+                    )
+                    else "unavailable"
+                )
+                for name in payload["receipts"][0]["counters"]
+            },
+        }
+    return {
+        "schema": "hyphae-native-g7-aggregate-v1",
+        "gate": "G7",
+        "status": "supporting-incomplete",
+        "source_commit": source_commit,
+        "platforms": matrices,
+        "claims": [],
+        "closure_declared": False,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--platform-root", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    arguments = parser.parse_args()
+    try:
+        result = aggregate(arguments.platform_root, arguments.source_commit)
+        arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    except (GateFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
+        print(f"native G7 aggregate failed: {error}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
