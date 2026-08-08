@@ -106,7 +106,7 @@ def main() -> int:
             authorized = item.get("platform_commands", {}).get(args.platform, item["command"])
             command = [args.python_command if part == "python" else part for part in authorized]
             log = logs / f"{requirement['id']}--{item['name']}.log"
-            with log.open("w", encoding="utf-8") as stream:
+            with log.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write("G6_COMMAND: " + json.dumps(authorized, separators=(",", ":")) + "\n")
                 stream.flush()
                 completed = subprocess.run(host_command(command), cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
