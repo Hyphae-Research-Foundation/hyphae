@@ -1466,8 +1466,9 @@ async fn local_transport_failure_cases(endpoint: &Path) -> Result<Vec<Value>, Bo
         .as_ref()
         .to_fs_name::<interprocess::local_socket::GenericFilePath>()?;
     #[cfg(windows)]
-    let name = endpoint
-        .to_string_lossy()
+    let endpoint_text = endpoint.to_string_lossy();
+    #[cfg(windows)]
+    let name = endpoint_text
         .as_ref()
         .to_ns_name::<interprocess::local_socket::GenericNamespaced>()?;
     let malformed = Stream::connect(name).await?;
@@ -1652,8 +1653,9 @@ impl RawLocalClient {
             .as_ref()
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()?;
         #[cfg(windows)]
-        let name = path
-            .to_string_lossy()
+        let path_text = path.to_string_lossy();
+        #[cfg(windows)]
+        let name = path_text
             .as_ref()
             .to_ns_name::<interprocess::local_socket::GenericNamespaced>()?;
         let stream = interprocess::local_socket::tokio::Stream::connect(name).await?;
