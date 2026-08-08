@@ -4,6 +4,25 @@ on:
   push:
     branches: [dev, main]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform lane to execute
+        required: true
+        default: windows
+        type: choice
+        options:
+          - windows
+          - linux
+          - macos
+          - all
+      mode:
+        description: Targeted lane or final exact-SHA matrix
+        required: true
+        default: targeted
+        type: choice
+        options:
+          - targeted
+          - final
 
 concurrency:
   group: native-g6-${{ github.ref }}
@@ -113,6 +132,7 @@ jobs:
             platform: windows
             python: python
     runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == matrix.platform
     steps:
       - name: Check out exact commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -175,6 +195,7 @@ jobs:
   readiness:
     name: G6 exact-SHA candidate readiness
     needs: [manifests, suites]
+    if: github.event_name == 'push' || inputs.mode == 'final'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out exact commit
