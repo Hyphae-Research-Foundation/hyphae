@@ -45,7 +45,13 @@
       "evidence": "docs/gates/evidence/closures/native-g5-b7cf651.json",
       "evidence_sha256": "37250d8a7730878a764ca0f0cab2ebdd3b4ea72e89dfe26c505ca95d96c800be"
     },
-    {"id": "G6", "status": "open"},
+    {
+      "id": "G6",
+      "status": "closed",
+      "source_commit": "c57cc07c17ba56efc2ea40d61fb62a2cc6befc8f",
+      "evidence": "docs/gates/evidence/closures/native-g6-c57cc07.json",
+      "evidence_sha256": "90aefb59db1527c87d0e4f8f3778ad8cc1fe83fc748aa2cd4eea04810472aa8f"
+    },
     {"id": "G7", "status": "open"},
     {"id": "G8", "status": "open"}
   ]

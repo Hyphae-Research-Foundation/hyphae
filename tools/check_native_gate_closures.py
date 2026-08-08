@@ -21,6 +21,7 @@ EXPECTED_SCHEMAS = {
     "G3": "hyphae-native-g3-readiness-v1",
     "G4": "hyphae-native-g4-closure-v1",
     "G5": "hyphae-native-g5-closure-v1",
+    "G6": "hyphae-native-g6-closure-v1",
 }
 
 

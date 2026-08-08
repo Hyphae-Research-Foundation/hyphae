@@ -36,6 +36,7 @@ own commit as the evaluated source.
 - [Native G3 exact-SHA closure](closures/native-g3-a839037.json)
 - [Native G4 exact-SHA closure](closures/native-g4-0059fce.json)
 - [Native G5 exact-SHA closure](closures/native-g5-b7cf651.json)
+- [Native G6 exact-SHA local-product closure](closures/native-g6-c57cc07.json)
 
 ### Source-bound observations
 

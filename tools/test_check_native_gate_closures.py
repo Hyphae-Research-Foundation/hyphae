@@ -16,8 +16,8 @@ class NativeGateClosureTests(unittest.TestCase):
     def test_checked_in_closure_prefix_is_complete_and_bound(self) -> None:
         result = validate(ROOT)
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["closed"], ["G0", "G1", "G2", "G3", "G4", "G5"])
-        self.assertEqual(result["open"], ["G6", "G7", "G8"])
+        self.assertEqual(result["closed"], ["G0", "G1", "G2", "G3", "G4", "G5", "G6"])
+        self.assertEqual(result["open"], ["G7", "G8"])
 
     def fixture(self, directory: str) -> Path:
         root = Path(directory)
