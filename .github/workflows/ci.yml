@@ -119,8 +119,20 @@ jobs:
           retention-days: 14
           overwrite: true
 
-  test-platform:
+  # Pull requests use Linux lanes only; platform lanes run on protected branch pushes.
+  test-platform-pr:
     name: Test (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        name: [macOS stable, Windows stable]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Defer platform execution to protected branch push
+        run: echo "Platform tests run on dev/main pushes to conserve hosted-runner minutes."
+
+  test-platform-push:
+    name: Platform test (${{ matrix.name }})
     if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
     strategy:
       fail-fast: false
@@ -130,41 +142,37 @@ jobs:
             os: macos-latest
             toolchain: 1.96.0
             native-platform: macos
-            run-native-conformance: true
           - name: Windows stable
             os: windows-latest
             toolchain: 1.96.0
             native-platform: windows
-            run-native-conformance: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Run tests
+      - name: Run platform tests
         run: cargo test --workspace --all-features --locked
       - name: Run native conformance profile
-        if: matrix.run-native-conformance
         shell: bash
         run: |
           python tools/check_native_conformance.py \
             --profile config/native-conformance-profile.json \
             --platform "${{ matrix.native-platform }}" \
-            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --source-commit "${{ github.sha }}" \
             --run \
             --output "native-conformance-${{ matrix.native-platform }}.json"
       - name: Upload native conformance receipt
-        if: matrix.run-native-conformance && always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7.0.1
         with:
-          name: native-conformance-${{ matrix.native-platform }}
+          name: native-conformance-${{ matrix.native-platform }}-${{ github.sha }}
           path: native-conformance-${{ matrix.native-platform }}.json
           if-no-files-found: error
           retention-days: 14
