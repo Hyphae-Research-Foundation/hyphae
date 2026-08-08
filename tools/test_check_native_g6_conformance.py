@@ -178,6 +178,17 @@ class NativeG6ConformanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ConformanceFailure, "source_commit"):
             aggregate(different_sha)
 
+    def test_aggregate_normalizes_platform_local_snapshot_identity(self) -> None:
+        receipts = [receipt(platform) for platform in PLATFORMS]
+        for index, value in enumerate(receipts):
+            for lane in value["lanes"]:  # type: ignore[union-attr]
+                for case in lane["cases"]:
+                    snapshot = case["outcome"].get("snapshot")
+                    if isinstance(snapshot, dict):
+                        snapshot["directory_lineage"] = f"{index + 1:02x}" * 24
+            value["transcript_digest"] = digest(canonical_cross_lane(value["lanes"]))  # type: ignore[index]
+        self.assertEqual(aggregate(receipts)["status"], "passed")
+
 
 if __name__ == "__main__":
     unittest.main()

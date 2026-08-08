@@ -237,6 +237,15 @@ def comparable_transcript(value: dict[str, Any]) -> dict[str, Any]:
     return {"cases": cases}
 
 
+def platform_comparable(value: dict[str, Any]) -> dict[str, Any]:
+    value = json.loads(json.dumps(value))
+    for case in value["cases"]:
+        snapshot = case["outcome"].get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot.pop("directory_lineage", None)
+    return value
+
+
 def canonical_cross_lane(transcripts: list[dict[str, Any]]) -> dict[str, Any]:
     by_lane = {
         transcript["lane"]: {case["id"]: case for case in comparable_transcript(transcript)["cases"]}
@@ -309,9 +318,13 @@ def aggregate(receipts: list[object]) -> dict[str, Any]:
     checked = [validate_receipt(value) for value in receipts]
     if [value["platform"] for value in checked] != list(PLATFORMS):
         raise ConformanceFailure("aggregate receipts must be ordered linux, macos, windows")
-    for field in ("source_commit", "corpus_digest", "schema_digest", "transcript_digest"):
+    for field in ("source_commit", "corpus_digest", "schema_digest"):
         if len({value[field] for value in checked}) != 1:
             raise ConformanceFailure(f"platform receipts disagree on {field}")
+    canonical = [platform_comparable(canonical_cross_lane(value["lanes"])) for value in checked]
+    if any(value != canonical[0] for value in canonical[1:]):
+        raise ConformanceFailure("platform receipts disagree on canonical semantics")
+    transcript_digest = digest(canonical[0])
     return {
         "schema": "hyphae-native-g6-conformance-aggregate-v1",
         "source_commit": checked[0]["source_commit"],
@@ -319,7 +332,7 @@ def aggregate(receipts: list[object]) -> dict[str, Any]:
         "platforms": list(PLATFORMS),
         "corpus_digest": checked[0]["corpus_digest"],
         "schema_digest": checked[0]["schema_digest"],
-        "transcript_digest": checked[0]["transcript_digest"],
+        "transcript_digest": transcript_digest,
     }
 
 
