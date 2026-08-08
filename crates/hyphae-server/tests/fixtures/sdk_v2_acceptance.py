@@ -98,7 +98,8 @@ with open(os.environ["HYPHAE_PYTHON_ARTIFACT"], "wb") as artifact:
         artifact.write(len(value).to_bytes(8, "little"))
         artifact.write(value)
 
-proven = local.prove_sql(
+proof_local = HyphaeClient.local(os.environ["HYPHAE_SOCKET"])
+proven = proof_local.prove_sql(
     "SELECT label FROM proof_items WHERE id = ?", [7], options=RequestOptions(request_id=20_122)
 )
 assert proven.value["proof"].startswith(b"HYNPRF02")
@@ -109,6 +110,7 @@ verified = http.verify_proof(
 )
 assert verified.kind == "proof_verification"
 assert verified.value["semantic_reexecution_performed"]
+proof_local.close()
 
 local.close()
 denied_local.close()
