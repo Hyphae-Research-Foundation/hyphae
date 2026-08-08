@@ -19,5 +19,11 @@ hyphae-client = "0.2.1"
 The client consumes only public versioned contracts and never opens or owns a
 local Hyphae data directory.
 
+The additive `hyphae_client::v2` module exposes equivalent high-level Native
+operations over canonical HTTP `/v2/execute` product envelopes and exact
+`HYPHLCL1` AF_UNIX/Windows named-pipe transport. It uses product-owned contract
+types and preserves typed product errors, deadlines, cancellation, and
+transaction outcome state.
+
 Apache-2.0. Source, examples, and security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

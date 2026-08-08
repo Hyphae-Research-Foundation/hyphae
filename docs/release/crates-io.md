@@ -1,9 +1,21 @@
 # Publish the Rust crates
 
-Hyphae publishes ten independently consumable Rust packages at the same
-product version. crates.io publication is permanent: an uploaded version
-cannot be overwritten or deleted. Run this procedure only from the exact
-release commit after its complete hosted gate is green.
+Hyphae published ten independently consumable Rust packages at version
+`0.2.1`; the immutable list and checksums are in the
+[publication receipt](receipts/0.2.1.md). crates.io publication is permanent:
+an uploaded version cannot be overwritten or deleted. Run this procedure only
+from an exact, newly versioned release commit after its complete hosted gate is
+green.
+
+The native crates remain unpublished at `0.2.1`. The current
+`hyphae-client`, `hyphae-server`, and `hyphae-cli` source packages use those
+native internals and are therefore also marked `publish = false`.
+`hyphae-pliegors` is likewise unpublished because its normal dependency on
+`hyphae-client` would not resolve from crates.io. These packages remain in the
+workspace for local builds and packaging, but are not publication candidates.
+A future release must first assign a new version and establish a complete
+publishable dependency closure; it must not add publication commands for these
+packages while that closure is unpublished.
 
 ## Preconditions
 
@@ -27,7 +39,10 @@ release commit after its complete hosted gate is green.
 
 ## Dependency order
 
-Publish one package at a time in this order:
+The current publishable package audit covers these packages in dependency
+order. The commands show the current publishable closure but must not be run
+at `0.2.1`, which already exists. A future release procedure must first update
+the workspace version:
 
 ```bash
 cargo publish --locked -p hyphae-core
@@ -36,10 +51,6 @@ cargo publish --locked -p hyphae-retrieval
 cargo publish --locked -p hyphae-storage
 cargo publish --locked -p hyphae-engine
 cargo publish --locked -p hyphae-contracts
-cargo publish --locked -p hyphae-client
-cargo publish --locked -p hyphae-server
-cargo publish --locked -p hyphae-pliegors
-cargo publish --locked -p hyphae-cli
 ```
 
 After each upload, wait until crates.io and the registry index expose that

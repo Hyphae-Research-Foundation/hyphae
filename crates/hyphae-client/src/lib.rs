@@ -5,6 +5,9 @@
 //! This crate depends only on public wire contracts. It does not import the
 //! server, engine, storage, query, or retrieval implementations.
 
+/// Native product API v2 clients and transports.
+pub mod v2;
+
 use std::time::Duration;
 
 use hyphae_contracts::v1::{

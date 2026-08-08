@@ -9,8 +9,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = false
+readme = "README.md"
 
 [dependencies]
+blake3.workspace = true
 hyphae-native-catalog.workspace = true
 hyphae-native-runtime.workspace = true
 hyphae-native-types.workspace = true

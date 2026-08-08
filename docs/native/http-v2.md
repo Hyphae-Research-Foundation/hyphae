@@ -1,6 +1,7 @@
 # Native HTTP API v2
 
-Status: accepted G6 planning contract; implementation incomplete
+Status: implemented bounded Native HTTP v2 adapter and versioned contract;
+broader G6 cross-platform and hosted receipts remain incomplete
 
 HTTP `/v2` is an optional edge adapter over the native product facade. The
 embedded API and native local protocol remain the primary performance
@@ -42,6 +43,34 @@ cutover, an explicitly retained `/v1` route calls the native facade only when
 its complete semantics and proof behavior map exactly. Otherwise it returns a
 documented incompatibility error. `/v1` never opens a format-2 directory in the
 Native 1.0 process.
+
+The implementation makes that boundary structural: `NativeHttpV2Server::new`
+accepts only `NativeProductHandle`. It has no data-directory path and no API
+that can construct `HyphaeEngine`, `NativeProduct`, or format-2 authority. The
+existing `HyphaeServer` retains its current `/v1` behavior as a separate
+format-2 service. On the Native server, `/v1` compatibility is exact mappings
+only; the current mapping set is empty because the published v1 proof and data
+semantics are not exact Native equivalents, so every v1 request fails
+explicitly with `invalid_request` and HTTP 409.
+
+## Implemented framing
+
+- Canonical `HYPREQ01` and `HYPRSP01` product envelopes use media type
+  `application/vnd.hyphae.product-v1` at the HTTP edge. Handlers decode directly
+  to `ProductOperation`, submit through `NativeProductHandle`, and encode the
+  resulting `ProductResponse`.
+- JSON Product errors retain code, category, retry, message, request, trace,
+  object, transaction, limit, source-span, and typed-detail fields. Clients can
+  request exact `HYPERR01` bytes with `Accept:
+  application/vnd.hyphae.error-v1`.
+- `X-Hyphae-Request-Id` is a nonzero canonical decimal `u128`; the server
+  accepts one caller value or generates one and uses it as the Product request
+  ID.
+- `X-Hyphae-Deadline-Micros`, when present, must exactly match the deadline in
+  the canonical request envelope.
+- `/v2/read-stream` emits provisional base64 chunks as NDJSON and one mandatory
+  terminal `completion` record. A connection ending before that record has no
+  successful logical result.
 
 ## Verification
 

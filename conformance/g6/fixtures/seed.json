@@ -1,0 +1,23 @@
+{
+  "schema": "hyphae-native-g6-seed-v1",
+  "logical_time_micros": 1700000000000000,
+  "request_id_base": 6000,
+  "sql": {
+    "create": "CREATE TABLE g6_items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+    "insert": "INSERT INTO g6_items (id, label) VALUES (?, ?)",
+    "select": "SELECT id, label FROM g6_items WHERE id = ?",
+    "explain": "SELECT id, label FROM g6_items WHERE id = 1"
+  },
+  "scalar": {"key_hex": "67362d7363616c6172", "value_hex": "7265616479"},
+  "errors": {
+    "syntax_statement": "SELEC bad",
+    "missing_index": "999"
+  },
+  "normalization": {
+    "bytes": "lowercase-hex",
+    "u128": "unsigned-decimal-string",
+    "paths": "lane-placeholder",
+    "telemetry_runtime_values": "typed-marker",
+    "preserved": ["directory-lineage", "catalog-version", "csn", "object-id", "order", "error", "explain", "proof"]
+  }
+}

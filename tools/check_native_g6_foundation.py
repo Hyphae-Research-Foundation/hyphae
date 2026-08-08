@@ -9,7 +9,7 @@ import argparse
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -39,6 +39,7 @@ PLATFORMS = ["linux", "macos", "windows"]
 SDKS = ["rust", "python", "typescript"]
 TRANSPORTS = ["embedded", "native-local", "http-v2"]
 PREDECESSORS = ["G0", "G1", "G2", "G3", "G4", "G5"]
+SUITE_STATUSES = {"partial-unhosted", "implemented-unhosted"}
 CONTRACTS = [
     "docs/gates/native-local-phase-1.md",
     "docs/adr/0023-native-local-product-and-competitive-scope.md",
@@ -49,12 +50,21 @@ CONTRACTS = [
     "docs/native/explain-v1.md",
     "docs/native/telemetry-v1.md",
     "docs/native/native-proof-v1.md",
+    "docs/native/native-witness-v1.md",
     "docs/native/http-v2.md",
     "docs/native/local-protocol-v1.md",
     "docs/native/catalog-v1.md",
     "docs/native/search-semantics-v1.md",
     "docs/native/ann-semantics-v1.md",
     "docs/native/native-backup-v1.md",
+    "contracts/openapi/hyphae-v2.yaml",
+    "contracts/json-schema/native-v2.schema.json",
+    "contracts/json-schema/product-error-v2.schema.json",
+    "contracts/json-schema/read-stream-v2.schema.json",
+    "contracts/json-schema/v1-compatibility-v2.schema.json",
+    "compatibility/native-protocol-v1-structure-get.bin",
+    "config/native-golden-inventory.json",
+    "config/native-golden-requirements.json",
 ]
 WORKLOAD_ACCEPTANCE = {
     "shared-contracts-and-errors": {"stable-code-registry", "unknown-commit", "redaction", "local-http-sdk-parity"},
@@ -96,6 +106,39 @@ def _fields(payload: dict[str, Any], expected: set[str], label: str) -> None:
         raise GateFailure(f"{label} fields mismatch")
 
 
+def validate_suite_command(command: object) -> None:
+    if (
+        not isinstance(command, list)
+        or len(command) < 2
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        raise GateFailure("invalid G6 suite command")
+    if any(Path(part).is_absolute() or PureWindowsPath(part).is_absolute() or ".." in Path(part).parts for part in command[1:]):
+        raise GateFailure("unsafe G6 suite command path")
+    executable = command[0]
+    if executable == "cargo":
+        if command[1] != "test":
+            raise GateFailure("invalid G6 Cargo suite command")
+        return
+    if executable in {"python", "python3"}:
+        if (
+            command[1] == "-m"
+            and len(command) >= 3
+            and command[2] in {"unittest", "pytest"}
+        ):
+            return
+        raise GateFailure("invalid G6 Python suite command")
+    if executable == "node":
+        if command[1] == "--test":
+            return
+        raise GateFailure("invalid G6 Node suite command")
+    if executable == "npm":
+        if command[1] == "test" and "--prefix" in command:
+            return
+        raise GateFailure("invalid G6 npm suite command")
+    raise GateFailure("G6 suite command is not allowlisted")
+
+
 def validate(
     root: Path,
     profile: dict[str, Any],
@@ -131,7 +174,7 @@ def validate(
         {"schema", "gate", "scope", "evidence_class", "requirements", "required_predecessors", "required_platforms", "required_sdks", "required_transports", "contracts", "claims", "closure_declared"},
         "G6 authority",
     )
-    _fields(workload, {"schema", "gate", "workloads", "claims", "closure_declared"}, "G6 workload")
+    _fields(workload, {"schema", "gate", "required_platforms", "workloads", "claims", "closure_declared"}, "G6 workload")
     _fields(suite, {"schema", "gate", "requirements", "claims", "closure_declared"}, "G6 suite")
     _fields(predecessor, {"schema", "gate", "predecessors", "claims", "closure_declared"}, "G6 predecessor")
     if HEX40.fullmatch(expected_commit) is None:
@@ -169,7 +212,8 @@ def validate(
             row.get("status") not in {"open", "partial", "implemented-unhosted"}
             or not isinstance(row.get("present"), list)
             or not isinstance(row.get("gaps"), list)
-            or not row["gaps"]
+            or (row["status"] != "implemented-unhosted" and not row["gaps"])
+            or any(not isinstance(value, str) or not value for value in row["present"] + row["gaps"])
         ):
             raise GateFailure(f"G6 inventory must retain concrete gaps for {row.get('id')}")
 
@@ -181,6 +225,7 @@ def validate(
         or authority.get("required_platforms") != PLATFORMS
         or authority.get("required_sdks") != SDKS
         or authority.get("required_transports") != TRANSPORTS
+        or workload.get("required_platforms") != PLATFORMS
     ):
         raise GateFailure("G6 authority scope mismatch")
     contracts = authority.get("contracts")
@@ -235,38 +280,88 @@ def validate(
     for requirement, raw_row in zip(REQUIREMENTS, suite_rows, strict=True):
         row = _object(raw_row, "G6 suite row")
         expected_workload = workload_rows[REQUIREMENTS.index(requirement)]["id"]
-        if set(row) != {"id", "workloads", "status", "suites"} or row["workloads"] != [expected_workload]:
+        if set(row) != {"id", "workloads", "status", "uncovered_acceptance", "suites"} or row["workloads"] != [expected_workload]:
             raise GateFailure(f"G6 suite binding mismatch for {requirement}")
         suites = row["suites"]
-        if row["status"] == "planned":
-            if suites != []:
-                raise GateFailure(f"planned G6 suite {requirement} must remain empty")
-            continue
-        if row["status"] != "partial-unhosted" or not isinstance(suites, list) or not suites:
+        if row["status"] not in SUITE_STATUSES:
+            raise GateFailure(f"invalid G6 implementation status for {requirement}")
+        inventory_status = inventory_rows[REQUIREMENTS.index(requirement)]["status"]
+        if row["status"] == "implemented-unhosted" and inventory_status != "implemented-unhosted":
+            raise GateFailure(f"implemented G6 suite lacks implemented inventory for {requirement}")
+        if inventory_status == "implemented-unhosted" and row["status"] != "implemented-unhosted":
+            raise GateFailure(f"implemented G6 inventory lacks implemented suite for {requirement}")
+        uncovered = row["uncovered_acceptance"]
+        acceptance = set(workload_rows[REQUIREMENTS.index(requirement)]["acceptance"])
+        if (
+            not isinstance(uncovered, list)
+            or len(uncovered) != len(set(uncovered))
+            or any(not isinstance(value, str) or not value for value in uncovered)
+            or not set(uncovered).issubset(acceptance)
+            or (row["status"] == "implemented-unhosted" and uncovered)
+            or (row["status"] == "partial-unhosted" and not uncovered)
+        ):
+            raise GateFailure(f"invalid G6 acceptance coverage for {requirement}")
+        if not isinstance(suites, list) or not suites:
             raise GateFailure(f"invalid G6 implementation status for {requirement}")
         names: set[str] = set()
+        covered_values: list[str] = []
         for raw_suite in suites:
             item = _object(raw_suite, f"G6 suite {requirement}")
-            if set(item) != {"name", "command"}:
+            required_suite_fields = {"name", "acceptance", "coverage", "command"}
+            if not required_suite_fields.issubset(item) or not set(item).issubset(required_suite_fields | {"platform_commands", "platforms"}):
                 raise GateFailure(f"invalid G6 suite fields for {requirement}")
             name, command = item["name"], item["command"]
+            covered = item["acceptance"]
+            coverage = item["coverage"]
+            suite_platforms = item.get("platforms", PLATFORMS)
             if (
                 not isinstance(name, str)
                 or not name
                 or name in names
-                or not isinstance(command, list)
-                or len(command) < 2
-                or command[0] != "cargo"
-                or command[1] != "test"
-                or not any(
-                    command[index : index + 2] == ["-p", "hyphae-native-product"]
-                    for index in range(len(command) - 1)
-                )
-                or command[-1] != "--locked"
-                or any(not isinstance(part, str) or not part for part in command)
+                or not isinstance(covered, list)
+                or len(covered) != len(set(covered))
+                or any(not isinstance(value, str) or not value for value in covered)
+                or not set(covered).issubset(acceptance)
+                or not isinstance(coverage, dict)
+                or set(coverage) != {"sdks", "transports"}
+                or not isinstance(coverage["sdks"], list)
+                or coverage["sdks"] != [value for value in SDKS if value in coverage["sdks"]]
+                or not isinstance(coverage["transports"], list)
+                or coverage["transports"] != [value for value in TRANSPORTS if value in coverage["transports"]]
+                or not covered and not coverage["sdks"] and not coverage["transports"]
+                or not isinstance(suite_platforms, list)
+                or suite_platforms != [value for value in PLATFORMS if value in suite_platforms]
+                or not suite_platforms
             ):
                 raise GateFailure(f"invalid G6 suite command for {requirement}")
+            try:
+                validate_suite_command(command)
+            except GateFailure as error:
+                raise GateFailure(f"invalid G6 suite command for {requirement}: {error}") from error
+            platform_commands = item.get("platform_commands", {})
+            if (
+                not isinstance(platform_commands, dict)
+                or not set(platform_commands).issubset(suite_platforms)
+                or any(value == command for value in platform_commands.values())
+            ):
+                raise GateFailure(f"invalid G6 platform suite command for {requirement}")
+            for platform, platform_command in platform_commands.items():
+                try:
+                    validate_suite_command(platform_command)
+                except GateFailure as error:
+                    raise GateFailure(f"invalid G6 {platform} suite command for {requirement}: {error}") from error
             names.add(name)
+            covered_values.extend(covered)
+        covered_acceptance = set(covered_values)
+        if (
+            len(covered_values) != len(covered_acceptance)
+            or covered_acceptance | set(uncovered) != acceptance
+            or covered_acceptance & set(uncovered)
+        ):
+            raise GateFailure(f"incomplete G6 acceptance coverage for {requirement}")
+        for platform in PLATFORMS:
+            if not any(platform in item.get("platforms", PLATFORMS) for item in suites):
+                raise GateFailure(f"G6 requirement {requirement} has no {platform} suite evidence")
 
     predecessor_rows = predecessor.get("predecessors")
     if not isinstance(predecessor_rows, list) or [row.get("gate") for row in predecessor_rows if isinstance(row, dict)] != PREDECESSORS:
@@ -319,6 +414,7 @@ def validate(
         ):
             raise GateFailure(f"unpassed G6 predecessor {row['gate']}")
 
+    implemented = sum(row["status"] == "implemented-unhosted" for row in suite_rows)
     partial = sum(row["status"] == "partial-unhosted" for row in suite_rows)
     return {
         "schema": "hyphae-native-g6-foundation-audit-v1",
@@ -326,9 +422,9 @@ def validate(
         "status": "foundation-complete",
         "source_commit": expected_commit,
         "requirements": len(REQUIREMENTS),
-        "implemented_requirements": 0,
+        "implemented_requirements": implemented,
         "partial_requirements": partial,
-        "planned_requirements": len(REQUIREMENTS) - partial,
+        "planned_requirements": 0,
         "contracts": len(contracts),
         "predecessors": len(PREDECESSORS),
         "manifest_sha256": manifest_digests,

@@ -9,10 +9,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = false
+include = ["Cargo.toml", "README.md", "src/**", "tests/**", "examples/**"]
 
 [dependencies]
 blake3.workspace = true
 crc32c.workspace = true
+getrandom.workspace = true
 hyphae-native-ann.workspace = true
 hyphae-native-blobs.workspace = true
 hyphae-native-btree.workspace = true

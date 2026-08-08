@@ -12,15 +12,18 @@ keywords.workspace = true
 categories.workspace = true
 description = "Secure loopback-first HTTP server for the Hyphae data engine."
 documentation = "https://docs.rs/hyphae-server"
-publish.workspace = true
+publish = false
 
 [dependencies]
 axum.workspace = true
 base64.workspace = true
 blake3.workspace = true
+futures-util.workspace = true
 hyphae-contracts.workspace = true
 hyphae-core.workspace = true
 hyphae-engine.workspace = true
+hyphae-native-product.workspace = true
+hyphae-native-protocol.workspace = true
 hyphae-query.workspace = true
 hyphae-retrieval.workspace = true
 hyphae-storage.workspace = true
@@ -33,6 +36,10 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+hyphae-client.workspace = true
+hyphae-native-catalog.workspace = true
+hyphae-native-daemon.workspace = true
+hyphae-native-types.workspace = true
 tower.workspace = true
 
 [lints]

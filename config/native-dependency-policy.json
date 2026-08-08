@@ -1,15 +1,17 @@
 {
   "schema": "hyphae-native-dependency-policy-v1",
-  "root_package": "hyphae-native-product",
+  "root_package": "hyphae-native-daemon",
   "workspace_packages": [
     "hyphae-native-ann",
     "hyphae-native-blobs",
     "hyphae-native-btree",
     "hyphae-native-catalog",
+    "hyphae-native-daemon",
     "hyphae-native-manifest",
     "hyphae-native-mvcc",
     "hyphae-native-pages",
     "hyphae-native-product",
+    "hyphae-native-protocol",
     "hyphae-native-records",
     "hyphae-native-runtime",
     "hyphae-native-types",
@@ -72,6 +74,14 @@
       "rationale": "Content identity and authenticated page, WAL, manifest, and root digests."
     },
     {
+      "name": "bytes",
+      "version": "1.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "asynchronous I/O primitive",
+      "rationale": "Reference-counted byte buffers used transitively by Tokio for daemon and protocol I/O."
+    },
+    {
       "name": "cc",
       "version": "1.2.67",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -85,7 +95,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "platform primitive",
-      "rationale": "Compile-time target selection used transitively by BLAKE3."
+      "rationale": "Compile-time target selection used transitively by BLAKE3 and getrandom."
     },
     {
       "name": "constant_time_eq",
@@ -112,12 +122,52 @@
       "rationale": "Fast accidental-corruption detection for native pages, WAL, blobs, and manifests."
     },
     {
+      "name": "doctest-file",
+      "version": "1.1.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "0BSD",
+      "category": "documentation macro primitive",
+      "rationale": "Procedural macro support selected transitively by interprocess; it supplies documentation assembly and no runtime semantics."
+    },
+    {
+      "name": "errno",
+      "version": "0.3.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "operating-system error primitive",
+      "rationale": "Portable errno access used transitively by Tokio's Unix signal registration path."
+    },
+    {
       "name": "find-msvc-tools",
       "version": "0.1.9",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "build primitive",
       "rationale": "MSVC discovery used transitively by the cc build primitive."
+    },
+    {
+      "name": "futures-core",
+      "version": "0.3.32",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "asynchronous trait primitive",
+      "rationale": "Core Future and Stream traits selected by interprocess's asynchronous local-socket integration."
+    },
+    {
+      "name": "getrandom",
+      "version": "0.3.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "operating-system entropy primitive",
+      "rationale": "Obtains operating-system entropy for durable transaction resolution identities without supplying storage or transaction semantics."
+    },
+    {
+      "name": "interprocess",
+      "version": "2.4.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "0BSD OR Apache-2.0",
+      "category": "local IPC operating-system wrapper",
+      "rationale": "Provides safe Unix-domain-socket and Windows named-pipe listeners, peer credentials, and Windows security-descriptor attachment for the native daemon."
     },
     {
       "name": "itoa",
@@ -133,7 +183,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "platform primitive",
-      "rationale": "Target-conditioned CPU feature support outside Hyphae-owned semantics."
+      "rationale": "Operating-system bindings used by CPU detection, entropy, Tokio, Mio, interprocess, socket, signal, and error primitives."
     },
     {
       "name": "memchr",
@@ -144,12 +194,28 @@
       "rationale": "Byte scanning used transitively by serde_json parsing."
     },
     {
+      "name": "mio",
+      "version": "1.2.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "asynchronous I/O primitive",
+      "rationale": "Operating-system event polling used transitively by Tokio for daemon local-socket I/O."
+    },
+    {
+      "name": "pin-project-lite",
+      "version": "0.2.17",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 OR MIT",
+      "category": "asynchronous implementation primitive",
+      "rationale": "Declarative projection helpers used internally by Tokio's asynchronous state machines."
+    },
+    {
       "name": "proc-macro2",
       "version": "1.0.106",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "derive build primitive",
-      "rationale": "Compiler token representation used by the thiserror derive path."
+      "rationale": "Compiler token representation used by serde, thiserror, and Tokio procedural macros."
     },
     {
       "name": "quote",
@@ -157,7 +223,23 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "derive build primitive",
-      "rationale": "Compiler token generation used by the thiserror derive path."
+      "rationale": "Compiler token generation used by serde, thiserror, and Tokio procedural macros."
+    },
+    {
+      "name": "r-efi",
+      "version": "5.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "category": "target-conditioned entropy platform binding",
+      "rationale": "UEFI protocol constants used by getrandom's target-conditioned EFI entropy backend."
+    },
+    {
+      "name": "recvmsg",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "0BSD",
+      "category": "local IPC operating-system primitive",
+      "rationale": "Target-conditioned reliable message-receive traits used by interprocess's Windows named-pipe implementation."
     },
     {
       "name": "rustc_version",
@@ -180,16 +262,16 @@
       "version": "1.0.229",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
-      "category": "canonical JSON primitive",
-      "rationale": "Serialization facade selected transitively by serde_json."
+      "category": "canonical serialization primitive",
+      "rationale": "Serialization facade used directly for native backup manifests and transitively by serde_json."
     },
     {
       "name": "serde_core",
       "version": "1.0.229",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
-      "category": "canonical JSON primitive",
-      "rationale": "Core serialization traits used transitively by serde_json."
+      "category": "canonical serialization primitive",
+      "rationale": "Core serialization traits used by serde and serde_json."
     },
     {
       "name": "serde_derive",
@@ -197,7 +279,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "derive build primitive",
-      "rationale": "Procedural macro implementation selected transitively by serde_core."
+      "rationale": "Procedural macro implementation for native backup manifest serialization."
     },
     {
       "name": "serde_json",
@@ -214,6 +296,30 @@
       "license": "MIT OR Apache-2.0",
       "category": "build primitive",
       "rationale": "Command-line tokenization used transitively by the cc build primitive."
+    },
+    {
+      "name": "signal-hook-registry",
+      "version": "1.4.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "operating-system signal primitive",
+      "rationale": "Unix signal-handler registration used transitively by the reviewed Tokio runtime configuration."
+    },
+    {
+      "name": "socket2",
+      "version": "0.6.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "operating-system socket primitive",
+      "rationale": "Cross-platform socket configuration used transitively by Tokio's local I/O runtime."
+    },
+    {
+      "name": "syn",
+      "version": "2.0.119",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "derive build primitive",
+      "rationale": "Rust syntax parsing used by the Tokio procedural macro path."
     },
     {
       "name": "syn",
@@ -256,6 +362,22 @@
       "rationale": "Macro support used transitively by tinyvec."
     },
     {
+      "name": "tokio",
+      "version": "1.53.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "asynchronous runtime primitive",
+      "rationale": "Schedules bounded daemon clients and provides asynchronous local IPC I/O outside the embedded execution hot path."
+    },
+    {
+      "name": "tokio-macros",
+      "version": "2.7.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "asynchronous runtime macro primitive",
+      "rationale": "Procedural macro implementation selected by the reviewed Tokio feature set."
+    },
+    {
       "name": "unicode-casefold",
       "version": "0.2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -269,7 +391,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
       "category": "derive build primitive",
-      "rationale": "Unicode identifier tables used by proc-macro2 and syn."
+      "rationale": "Unicode identifier tables used by proc-macro2 and both reviewed syn versions."
     },
     {
       "name": "unicode-normalization",
@@ -278,6 +400,54 @@
       "license": "MIT OR Apache-2.0",
       "category": "Unicode analyzer primitive",
       "rationale": "NFKC normalization for the versioned native analyzer; no search engine semantics."
+    },
+    {
+      "name": "wasi",
+      "version": "0.11.1+wasi-snapshot-preview1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "target-conditioned asynchronous I/O binding",
+      "rationale": "WASI preview1 API bindings selected by Mio's target-conditioned event I/O path."
+    },
+    {
+      "name": "wasip2",
+      "version": "1.0.4+wasi-0.2.12",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "target-conditioned entropy platform binding",
+      "rationale": "WASI preview2 API bindings selected by getrandom's target-conditioned entropy backend."
+    },
+    {
+      "name": "widestring",
+      "version": "1.2.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "Windows encoding primitive",
+      "rationale": "Constructs the UTF-16 security descriptor used to restrict the native daemon's Windows named pipe."
+    },
+    {
+      "name": "windows-link",
+      "version": "0.2.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "Windows platform binding primitive",
+      "rationale": "Link directives used transitively by windows-sys for Windows IPC, socket, signal, and error APIs."
+    },
+    {
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "Windows platform binding primitive",
+      "rationale": "Raw Windows API bindings used by interprocess, Tokio, Mio, socket2, errno, and signal support; it supplies no data-engine semantics."
+    },
+    {
+      "name": "wit-bindgen",
+      "version": "0.57.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "target-conditioned component binding primitive",
+      "rationale": "Generated WIT runtime bindings selected transitively by wasip2 for getrandom's WASI preview2 backend."
     },
     {
       "name": "zmij",

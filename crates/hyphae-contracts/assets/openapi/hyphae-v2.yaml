@@ -1,0 +1,181 @@
+openapi: 3.1.0
+info:
+  title: Hyphae Native HTTP API
+  version: 2.0.0-alpha
+  description: >-
+    Optional loopback-first adapter over one existing NativeProductService.
+    It never opens HyphaeEngine, a second NativeProduct, or format-2 state.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+x-hyphae-authority: existing-one-owner-native-product-service
+x-hyphae-v1-compatibility:
+  exact-mappings-only: true
+  unmappable-fails-explicitly: true
+  opens-format-2-state: false
+x-hyphae-provisional-streams: >-
+  Every application/x-ndjson data record is provisional. Success exists only
+  after a terminal completion record with status complete.
+servers:
+  - url: http://127.0.0.1:8788
+    description: Default loopback-only listener
+paths:
+  /v2/capabilities:
+    get:
+      operationId: nativeCapabilitiesV2
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/execute:
+    post:
+      operationId: executeNativeOperationV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/catalog:
+    post:
+      operationId: executeCatalogV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/sql:
+    post:
+      operationId: executeSqlV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/structures:
+    post:
+      operationId: executeStructureV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/search:
+    post:
+      operationId: executeSearchV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/search/collection:
+    post:
+      operationId: searchNativeCollectionV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/search/ingest:
+    post:
+      operationId: ingestNativeCollectionV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/admin:
+    post:
+      operationId: executeAdminV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/telemetry:
+    post:
+      operationId: telemetryV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/doctor:
+    post:
+      operationId: doctorV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/backup:
+    post:
+      operationId: backupV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/restore:
+    post:
+      operationId: restoreNativeBackupV2
+      description: Explicitly unsupported until ProductOperation exposes restore.
+      security: [{ BearerAuth: [] }, {}]
+      responses:
+        "501": { $ref: "#/components/responses/ProductError" }
+  /v2/proofs/verify:
+    post:
+      operationId: verifyNativeProofV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/transactions/status:
+    post:
+      operationId: transactionStatusV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
+  /v2/read-stream:
+    post:
+      operationId: streamNativeReadV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200":
+          description: Provisional records followed by mandatory completion
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: "../json-schema/read-stream-v2.schema.json"
+        default: { $ref: "#/components/responses/ProductError" }
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+  requestBodies:
+    ProductRequest:
+      required: true
+      content:
+        application/vnd.hyphae.product-v1:
+          schema: { type: string, format: binary }
+  responses:
+    ProductResponse:
+      description: Canonical HYPRSP01 Product response
+      headers:
+        X-Hyphae-Session-Id:
+          description: Opaque principal-bound HTTP session identity when state is retained
+          schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+      content:
+        application/vnd.hyphae.product-v1:
+          schema: { type: string, format: binary }
+    ProductError:
+      description: ProductError field parity; HYPERR01 is available by Accept negotiation
+      content:
+        application/json:
+          schema:
+            $ref: "../json-schema/product-error-v2.schema.json"
+        application/vnd.hyphae.error-v1:
+          schema: { type: string, format: binary }

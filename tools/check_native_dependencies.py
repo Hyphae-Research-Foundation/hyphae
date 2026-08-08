@@ -47,8 +47,14 @@ def _require_list(value: object, label: str) -> list[Any]:
     return value
 
 
-def _reviewed_external(policy: dict[str, Any]) -> dict[str, dict[str, str]]:
-    reviewed: dict[str, dict[str, str]] = {}
+def _external_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(entry.get("name")), str(entry.get("version")), str(entry.get("source")))
+
+
+def _reviewed_external(
+    policy: dict[str, Any],
+) -> dict[tuple[str, str, str], dict[str, str]]:
+    reviewed: dict[tuple[str, str, str], dict[str, str]] = {}
     for raw in _require_list(policy.get("external_packages"), "external_packages"):
         entry = _require_mapping(raw, "external package entry")
         required = ("name", "version", "source", "license", "category", "rationale")
@@ -57,10 +63,13 @@ def _reviewed_external(policy: dict[str, Any]) -> dict[str, dict[str, str]]:
                 raise GateFailure(
                     f"external package entry requires nonempty string field {field}"
                 )
-        name = entry["name"]
-        if name in reviewed:
-            raise GateFailure(f"duplicate external package inventory entry {name}")
-        reviewed[name] = {field: entry[field] for field in required}
+        identity = _external_identity(entry)
+        if identity in reviewed:
+            raise GateFailure(
+                "duplicate external package inventory entry "
+                f"{identity[0]}@{identity[1]} from {identity[2]}"
+            )
+        reviewed[identity] = {field: entry[field] for field in required}
     return reviewed
 
 
@@ -136,14 +145,9 @@ def audit_metadata(
             queue.append(dependency_id)
 
     reachable = [package_by_id[package_id] for package_id in reachable_ids]
-    names: dict[str, dict[str, Any]] = {}
+    packages_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in reachable:
-        name = str(item.get("name"))
-        if name in names:
-            raise GateFailure(
-                f"native closure contains multiple versions of package {name}"
-            )
-        names[name] = item
+        packages_by_name[str(item.get("name"))].append(item)
 
     forbidden = {
         str(item)
@@ -151,7 +155,7 @@ def audit_metadata(
             policy.get("forbidden_packages"), "forbidden_packages"
         )
     }
-    for name in sorted(names):
+    for name in sorted(packages_by_name):
         if name in forbidden:
             raise GateFailure(f"forbidden package {name} is reachable from {root_name}")
 
@@ -179,33 +183,70 @@ def audit_metadata(
 
     reviewed_external = _reviewed_external(policy)
     actual_external = {
-        str(item.get("name")) for item in reachable if item.get("source") is not None
+        _external_identity(item) for item in reachable if item.get("source") is not None
     }
     unreviewed_external = actual_external - reviewed_external.keys()
     if unreviewed_external:
+        for name, version, source in sorted(unreviewed_external):
+            same_name = [
+                identity
+                for identity in reviewed_external
+                if identity[0] == name
+            ]
+            if same_name and all(identity[1] != version for identity in same_name):
+                expected = ", ".join(sorted(identity[1] for identity in same_name))
+                raise GateFailure(
+                    f"external package {name} version differs: "
+                    f"expected one of {expected}, found {version!r}"
+                )
+            same_version = [
+                identity
+                for identity in same_name
+                if identity[1] == version
+            ]
+            if same_version and all(identity[2] != source for identity in same_version):
+                expected = ", ".join(sorted(identity[2] for identity in same_version))
+                raise GateFailure(
+                    f"external package {name}@{version} source differs: "
+                    f"expected one of {expected}, found {source!r}"
+                )
         raise GateFailure(
-            "unreviewed external package " + ", ".join(sorted(unreviewed_external))
+            "unreviewed external package "
+            + ", ".join(
+                f"{name}@{version}" for name, version, _source in sorted(unreviewed_external)
+            )
         )
     stale_external = reviewed_external.keys() - actual_external
     if stale_external:
         raise GateFailure(
-            "stale external inventory entry " + ", ".join(sorted(stale_external))
+            "stale external inventory entry "
+            + ", ".join(
+                f"{name}@{version}" for name, version, _source in sorted(stale_external)
+            )
         )
 
-    for name in sorted(actual_external):
-        actual = names[name]
-        reviewed = reviewed_external[name]
-        for field in ("version", "source", "license"):
+    external_by_identity = {
+        _external_identity(item): item
+        for item in reachable
+        if item.get("source") is not None
+    }
+    for identity in sorted(actual_external):
+        actual = external_by_identity[identity]
+        reviewed = reviewed_external[identity]
+        for field in ("license",):
             found = actual.get(field)
             expected = reviewed[field]
             if found != expected:
                 raise GateFailure(
-                    f"external package {name} {field} differs: "
+                    f"external package {identity[0]}@{identity[1]} {field} differs: "
                     f"expected {expected!r}, found {found!r}"
                 )
 
     ordered_packages: list[dict[str, Any]] = []
     dependency_kinds: dict[str, list[str]] = {}
+    name_counts: dict[str, int] = defaultdict(int)
+    for item in reachable:
+        name_counts[str(item.get("name"))] += 1
     for item in sorted(
         reachable,
         key=lambda package: (str(package.get("name")), str(package.get("version"))),
@@ -214,7 +255,8 @@ def audit_metadata(
         name = str(item.get("name"))
         workspace = item.get("source") is None
         kinds = sorted(kinds_by_id[package_id])
-        dependency_kinds[name] = kinds
+        label = name if name_counts[name] == 1 else f"{name}@{item.get('version')}"
+        dependency_kinds[label] = kinds
         record: dict[str, Any] = {
             "name": name,
             "version": str(item.get("version")),
@@ -225,8 +267,9 @@ def audit_metadata(
             "manifest_path": item.get("manifest_path"),
         }
         if not workspace:
-            record["category"] = reviewed_external[name]["category"]
-            record["rationale"] = reviewed_external[name]["rationale"]
+            reviewed = reviewed_external[_external_identity(item)]
+            record["category"] = reviewed["category"]
+            record["rationale"] = reviewed["rationale"]
         ordered_packages.append(record)
 
     return {

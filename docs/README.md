@@ -86,6 +86,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native product EXPLAIN v1](native/explain-v1.md)
 - [Native local telemetry v1](native/telemetry-v1.md)
 - [Native result proof v1](native/native-proof-v1.md)
+- [Native directory witness v2](native/native-witness-v1.md)
 - [Native HTTP API v2](native/http-v2.md)
 - [Native local UDS transport v1](native/local-uds-transport-v1.md)
 - [Native local structure GET v1](native/local-structure-get-v1.md)

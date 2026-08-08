@@ -1,0 +1,1126 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Black-box conformance for the native-authority single binary.
+
+use std::{
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use hyphae_native_product::proof::{
+    AdmittedProofLimits, CanonicalBytes, CompletionStatus, NativeProof, NativeProofAnchor,
+    NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
+    bundle_native_witness, encode_native_proof,
+};
+use uuid::Uuid;
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!("hyphae-native-cli-{}", Uuid::now_v7()));
+        fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ignored = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run(arguments: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = output(arguments)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hyphae {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(arguments)
+        .output()?)
+}
+
+fn path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn init_is_explicit_and_read_only_commands_never_create() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    let help = output(&["--help"])?;
+    let help = String::from_utf8(help.stdout)?;
+    for family in [
+        "capabilities",
+        "init",
+        "catalog",
+        "sql",
+        "structure",
+        "search",
+        "transaction",
+        "explain",
+        "status",
+        "telemetry",
+        "doctor",
+        "checkpoint",
+        "compact",
+        "vacuum",
+        "backup",
+        "restore",
+        "proof",
+        "serve",
+    ] {
+        assert!(help.contains(family), "missing command family {family}");
+    }
+    assert!(!help.contains("--native"));
+    for compatibility in [
+        "put",
+        "get",
+        "delete",
+        "query",
+        "snapshot",
+        "backup-verify",
+        "verify",
+        "verify-retrieval",
+        "remote",
+        "mcp",
+    ] {
+        assert!(
+            help.contains(compatibility),
+            "missing compatibility command {compatibility}"
+        );
+    }
+
+    for arguments in [
+        vec!["status", "--data-dir", &data_text],
+        vec!["catalog", "--data-dir", &data_text, "list"],
+    ] {
+        let failed = output(&arguments)?;
+        assert!(!failed.status.success());
+        assert!(!data.exists());
+    }
+    let doctor = run(&["doctor", "--data-dir", &data_text])?;
+    assert_eq!(doctor["status"], "corrupt");
+    assert!(!data.exists());
+
+    let initialized = run(&["init", "--data-dir", &data_text])?;
+    assert_eq!(initialized["status"], "initialized");
+    assert_eq!(initialized["native_directory_format"], 1);
+    let repeated = output(&["init", "--data-dir", &data_text])?;
+    assert_eq!(repeated.status.code(), Some(4));
+    let capabilities = run(&["capabilities", "--data-dir", &data_text])?;
+    assert_eq!(capabilities["native_directory_format"], 1);
+    let compatibility = output(&["get", "--data-dir", &data_text, "--key", "native"])?;
+    assert!(!compatibility.status.success());
+    assert!(fs::read_to_string(data.join("FORMAT"))?.starts_with("hyphae-native-format=1 "));
+    assert!(!data.join("hyphae.sock").exists());
+    assert!(!data.join("indexes").exists());
+    assert!(!data.join("log").exists());
+    Ok(())
+}
+
+#[test]
+fn version_json_keeps_the_release_contract() -> Result<(), Box<dyn Error>> {
+    let version = run(&["version", "--json"])?;
+    assert_eq!(version["product"], "hyphae");
+    assert_eq!(version["engine_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(version["api_version"], "v1");
+    assert_eq!(version["disk_format_version"], 2);
+    assert_eq!(version["product_api_version"], 1);
+    assert_eq!(version["native_directory_format"], 1);
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_busy_corrupt_and_io_without_preopening() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+
+    let product = hyphae_native_product::NativeProduct::open(&data)?;
+    let busy = run(&["doctor", "--data-dir", &data_text])?;
+    assert_eq!(busy["status"], "busy");
+    assert_eq!(busy["verified_open"], false);
+    drop(product);
+
+    let corrupt = temporary.0.join("corrupt");
+    fs::create_dir(&corrupt)?;
+    let corrupt = run(&["doctor", "--data-dir", &path(&corrupt)])?;
+    assert_eq!(corrupt["status"], "corrupt");
+
+    let not_a_directory = temporary.0.join("not-a-directory");
+    fs::write(&not_a_directory, b"file")?;
+    let io_path = not_a_directory.join("child");
+    let io = run(&["doctor", "--data-dir", &path(&io_path)])?;
+    assert_eq!(io["status"], "io");
+    assert_eq!(io["verified_open"], false);
+
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+
+    let created = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+    ])?;
+    assert_eq!(created["commit"]["status"], "committed");
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO items (id, name) VALUES (?, ?)",
+        "--parameter",
+        "1",
+        "--parameter",
+        r#""alpha""#,
+    ])?;
+    let selected = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "SELECT id, name FROM items WHERE id = ?",
+        "--parameter",
+        "1",
+    ])?;
+    assert_eq!(
+        selected["result"]["rows"][0],
+        serde_json::json!([1, "alpha"])
+    );
+
+    assert_eq!(
+        run(&[
+            "structure",
+            "--data-dir",
+            &data_text,
+            "set",
+            "--key",
+            "session",
+            "--value",
+            "ready",
+        ])?["status"],
+        "committed"
+    );
+    let read = run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "get",
+        "--key",
+        "session",
+    ])?;
+    assert_eq!(read["value"], "ready");
+    assert_eq!(
+        run(&["status", "--data-dir", &data_text])?["status"],
+        "ready"
+    );
+    assert_eq!(
+        run(&["doctor", "--data-dir", &data_text])?["status"],
+        "healthy"
+    );
+    assert_eq!(
+        run(&["checkpoint", "--data-dir", &data_text])?["status"],
+        "checkpointed"
+    );
+    assert!(run(&["catalog", "--data-dir", &data_text, "list"])?["items"].is_array());
+    assert!(run(&["telemetry", "--data-dir", &data_text])?["metrics"].is_array());
+    let explained = run(&[
+        "explain",
+        "--data-dir",
+        &data_text,
+        "sql",
+        "--statement",
+        "SELECT id, name FROM items WHERE id = 1",
+    ])?;
+    assert_eq!(explained["type"], "sql_plan_text");
+    assert_eq!(
+        run(&[
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "status",
+            "--id",
+            "999",
+        ])?["status"],
+        "unknown"
+    );
+    let compacted = run(&["compact", "--data-dir", &data_text])?;
+    assert!(matches!(
+        compacted["status"].as_str(),
+        Some("compacted" | "no_changes")
+    ));
+    let vacuumed = run(&["vacuum", "--data-dir", &data_text])?;
+    assert!(matches!(
+        vacuumed["status"].as_str(),
+        Some("vacuumed" | "no_changes")
+    ));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_backup_restore_and_proof_verification_are_offline() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let backup = temporary.0.join("backup");
+    let restored = temporary.0.join("restored");
+    let data_text = path(&data);
+    let backup_text = path(&backup);
+    let restored_text = path(&restored);
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "set",
+        "--key",
+        "durable",
+        "--value",
+        "yes",
+    ])?;
+    assert_eq!(
+        run(&[
+            "backup",
+            "create",
+            "--data-dir",
+            &data_text,
+            "--out",
+            &backup_text,
+        ])?["status"],
+        "created"
+    );
+    assert_eq!(
+        run(&["backup", "verify", "--backup", &backup_text])?["status"],
+        "verified"
+    );
+    assert_eq!(
+        run(&[
+            "restore",
+            "--backup",
+            &backup_text,
+            "--data-dir",
+            &restored_text,
+        ])?["status"],
+        "restored"
+    );
+    assert_eq!(
+        run(&[
+            "structure",
+            "--data-dir",
+            &restored_text,
+            "get",
+            "--key",
+            "durable",
+        ])?["value"],
+        "yes"
+    );
+
+    let origin = temporary.0.join("witness-origin");
+    fs::create_dir(&origin)?;
+    fs::write(origin.join("ROOT"), b"native proof fixture")?;
+    let anchor = NativeProofAnchor {
+        directory_lineage: [3; 24],
+        history_epoch: 1,
+        visible_csn: 1,
+        catalog_version: 1,
+        root_digest: [4; 32],
+        checkpoint_sequence: 1,
+        checkpoint_digest: [5; 32],
+    };
+    let witness = bundle_native_witness(&origin, anchor, &WitnessCodecLimits::default())?;
+    let proof = NativeProof::new(NativeProofContent {
+        kind: NativeProofKind::Point,
+        anchor,
+        semantics_version: 1,
+        ordering_version: 1,
+        objects: Vec::new(),
+        request: CanonicalBytes::new(b"request".to_vec()),
+        result: CanonicalBytes::new(b"result".to_vec()),
+        evidence: CanonicalBytes::new(b"evidence".to_vec()),
+        limits: AdmittedProofLimits {
+            result_items: 1,
+            candidate_items: 0,
+            evidence_bytes: 8,
+        },
+        completion: CompletionStatus::Complete,
+        witness: witness.reference()?,
+        ann: None,
+        hybrid: None,
+    })?;
+    let proof_path = temporary.0.join("proof.hynproof");
+    let witness_path = temporary.0.join("witness.hynwit");
+    fs::write(
+        &proof_path,
+        encode_native_proof(&proof, &ProofCodecLimits::default())?,
+    )?;
+    fs::write(&witness_path, witness.bytes)?;
+    let verified = run(&[
+        "proof",
+        "verify",
+        "--proof",
+        &path(&proof_path),
+        "--witness",
+        &path(&witness_path),
+        "--anchor",
+        &encode_hex(&anchor.digest()),
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["kind"], "point");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn exercise_service(data: &Path) -> Result<(), Box<dyn Error>> {
+    let endpoint = std::env::temp_dir().join(format!("hyphae-cli-{}.sock", Uuid::now_v7()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data)
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !endpoint.exists() && Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            let error = read_child_stderr(&mut child)?;
+            return Err(std::io::Error::other(error).into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(endpoint.exists());
+    let _guard = ChildGuard(&mut child);
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn exercise_service(data: &Path) -> Result<(), Box<dyn Error>> {
+    let endpoint = format!("hyphae-cli-{}", Uuid::now_v7());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data)
+        .arg("--endpoint")
+        .arg(endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    thread::sleep(Duration::from_millis(500));
+    if child.try_wait()?.is_some() {
+        let error = read_child_stderr(&mut child)?;
+        return Err(std::io::Error::other(error).into());
+    }
+    let _guard = ChildGuard(&mut child);
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let backup = temporary.0.join("backup");
+    let restored = temporary.0.join("restored");
+    let proof = temporary.0.join("read.hynproof");
+    let witness = temporary.0.join("read.hynwit");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+
+    assert_eq!(
+        run(&["capabilities", "--data-dir", &data_text])?["product_api_version"],
+        1
+    );
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.products",
+    ])?;
+    for (id, family, name) in [
+        (20, "string", "strings"),
+        (21, "counter", "counters"),
+        (22, "hash", "hashes"),
+        (23, "list", "lists"),
+        (24, "set", "sets"),
+        (25, "sorted-set", "sorted"),
+        (26, "stream", "streams"),
+    ] {
+        run(&[
+            "catalog",
+            "--data-dir",
+            &data_text,
+            "create-keyspace",
+            "--id",
+            &id.to_string(),
+            "--parent",
+            "11",
+            "--name",
+            &format!("main.public.{name}"),
+            "--family",
+            family,
+        ])?;
+    }
+    assert!(run(&["catalog", "--data-dir", &data_text, "list"])?["items"].is_array());
+    assert_eq!(
+        run(&[
+            "catalog",
+            "--data-dir",
+            &data_text,
+            "describe",
+            "--id",
+            "13",
+        ])?["object"]["kind"],
+        "search_collection"
+    );
+    assert_eq!(
+        run(&[
+            "catalog",
+            "--data-dir",
+            &data_text,
+            "resolve",
+            "--name",
+            "main.public.products",
+        ])?["object"]["id"],
+        "13"
+    );
+    assert!(
+        run(&[
+            "catalog",
+            "--data-dir",
+            &data_text,
+            "dependencies",
+            "--id",
+            "13",
+        ])?["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    assert_eq!(
+        run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--statement",
+            "CREATE TABLE events (id BIGINT PRIMARY KEY, body TEXT NOT NULL)",
+        ])?["commit"]["status"],
+        "committed"
+    );
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO events (id, body) VALUES (?, ?)",
+        "--parameter",
+        "1",
+        "--parameter",
+        r#""first""#,
+    ])?;
+    assert_eq!(
+        run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--statement",
+            "SELECT id, body FROM events WHERE id = ?",
+            "--parameter",
+            "1",
+        ])?["result"]["rows"][0],
+        serde_json::json!([1, "first"])
+    );
+    assert_eq!(
+        run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "prepared",
+            "--statement",
+            "SELECT id, body FROM events WHERE id = ?",
+            "--parameter",
+            "1",
+        ])?["deallocated"],
+        true
+    );
+    assert_eq!(
+        run(&[
+            "explain",
+            "--data-dir",
+            &data_text,
+            "sql",
+            "--statement",
+            "SELECT id, body FROM events WHERE id = 1",
+        ])?["type"],
+        "sql_plan_text"
+    );
+
+    run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "set",
+        "--key",
+        "scalar",
+        "--value",
+        "native",
+    ])?;
+    assert_eq!(
+        run(&[
+            "structure",
+            "--data-dir",
+            &data_text,
+            "get",
+            "--key",
+            "scalar",
+        ])?["value"],
+        "native"
+    );
+    assert_eq!(
+        run(&[
+            "structure",
+            "--data-dir",
+            &data_text,
+            "ttl",
+            "--key",
+            "scalar",
+        ])?["status"],
+        "persistent"
+    );
+    assert!(matches!(
+        run(&["compact", "--data-dir", &data_text])?["status"].as_str(),
+        Some("compacted" | "no_changes")
+    ));
+    let mutations = serde_json::json!([
+        {"operation":"string_set","keyspace":20,"key":"message","value":"hello","expires_at_micros":4_000_000_000_000_000_000_i64},
+        {"operation":"counter_add","keyspace":21,"key":"count","delta":3},
+        {"operation":"create","keyspace":22,"key":"hash","family":"hash"},
+        {"operation":"hash_set","keyspace":22,"key":"hash","field":"name","value":"hyphae"},
+        {"operation":"hash_counter_add","keyspace":22,"key":"hash","field":"visits","delta":2},
+        {"operation":"hash_expire_field","keyspace":22,"key":"hash","field":"name","expires_at_micros":4_000_000_000_000_000_000_i64},
+        {"operation":"create","keyspace":23,"key":"list","family":"list"},
+        {"operation":"list_push","keyspace":23,"key":"list","side":"right","value":"item"},
+        {"operation":"create","keyspace":24,"key":"set-a","family":"set"},
+        {"operation":"set_add","keyspace":24,"key":"set-a","member":"shared"},
+        {"operation":"create","keyspace":24,"key":"set-b","family":"set"},
+        {"operation":"set_add","keyspace":24,"key":"set-b","member":"shared"},
+        {"operation":"set_add","keyspace":24,"key":"set-b","member":"second"},
+        {"operation":"create","keyspace":25,"key":"ranked","family":"sorted_set"},
+        {"operation":"sorted_set_add","keyspace":25,"key":"ranked","member":"first","score":1.5},
+        {"operation":"create","keyspace":26,"key":"events","family":"stream"},
+        {"operation":"stream_add","keyspace":26,"key":"events","fields":{"kind":"created"}}
+    ]).to_string();
+    assert_eq!(
+        run(&[
+            "structure",
+            "--data-dir",
+            &data_text,
+            "batch",
+            "--mutations-json",
+            &mutations,
+        ])?["status"],
+        "committed"
+    );
+    for (request, expected) in [
+        (
+            serde_json::json!({"operation":"string_get","keyspace":20,"key":"message"}),
+            "value",
+        ),
+        (
+            serde_json::json!({"operation":"counter_get","keyspace":21,"key":"count"}),
+            "counter",
+        ),
+        (
+            serde_json::json!({"operation":"ttl","keyspace":20,"key":"message","family":"string"}),
+            "ttl",
+        ),
+        (
+            serde_json::json!({"operation":"hash_scan","keyspace":22,"key":"hash","start_after":null,"limit":8}),
+            "hash_entries",
+        ),
+        (
+            serde_json::json!({"operation":"list_range","keyspace":23,"key":"list","start":0,"stop":-1}),
+            "values",
+        ),
+        (
+            serde_json::json!({"operation":"set_members","keyspace":24,"key":"set-a","start_after":null,"limit":8}),
+            "values",
+        ),
+        (
+            serde_json::json!({"operation":"set_algebra","keyspace":24,"operation_kind":"union","keys":["set-a","set-b"],"output_member_limit":8,"visit_limit":32}),
+            "set_algebra",
+        ),
+        (
+            serde_json::json!({"operation":"sorted_set_range","keyspace":25,"key":"ranked","start":0,"stop":-1,"order":"ascending"}),
+            "sorted_set_entries",
+        ),
+        (
+            serde_json::json!({"operation":"stream_range","keyspace":26,"key":"events","start":0,"end":u64::MAX,"limit":8}),
+            "stream_entries",
+        ),
+    ] {
+        assert_eq!(
+            run(&[
+                "structure",
+                "--data-dir",
+                &data_text,
+                "read",
+                "--request-json",
+                &request.to_string(),
+            ])?["result"]["type"],
+            expected
+        );
+    }
+
+    let provisioned = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let lexical_index = provisioned["binding"]["lexical_index"]
+        .as_str()
+        .ok_or("missing lexical index")?
+        .to_owned();
+    let ann_index = provisioned["binding"]["vectors"]
+        .as_array()
+        .and_then(|vectors| vectors.iter().find(|vector| vector["name"] == "ann"))
+        .and_then(|vector| vector["index"].as_str())
+        .ok_or("missing ANN index")?
+        .to_owned();
+    let documents = serde_json::json!([
+        {"id":201,"text":"rust database engine","doc_values":{"category":"book","price":30},"vectors":{"exact":[0.0,0.0],"ann":[0.0,0.0]}},
+        {"id":202,"text":"rust field guide","doc_values":{"category":"book","price":10},"vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}},
+        {"id":203,"text":"database hardware","doc_values":{"category":"gear","price":20},"vectors":{"exact":[2.0,0.0],"ann":[2.0,0.0]}}
+    ]).to_string();
+    run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        &documents,
+    ])?;
+    assert!(
+        !run(&[
+            "search",
+            "--data-dir",
+            &data_text,
+            "query",
+            "--index",
+            &lexical_index,
+            "--query",
+            "rust",
+        ])?["hits"]
+            .as_array()
+            .ok_or("missing lexical hits")?
+            .is_empty()
+    );
+    let exact = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--vector-target",
+        "exact",
+        "--vector",
+        "0",
+        "--vector",
+        "0",
+        "--vector-strategy",
+        "exact",
+    ])?;
+    assert_eq!(exact["vector_branches"][0]["strategy"], "exact_filtered");
+    let ann = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--vector-target",
+        "ann",
+        "--vector",
+        "0",
+        "--vector",
+        "0",
+        "--vector-strategy",
+        "ann",
+    ])?;
+    assert_eq!(ann["vector_branches"][0]["strategy"], "filter_aware_ann");
+    let hybrid = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "rust",
+        "--vector-target",
+        "exact",
+        "--vector",
+        "0",
+        "--vector",
+        "0",
+        "--filter-json",
+        r#"{"operation":"compare","field":"category","operator":"equal","value":"book"}"#,
+        "--sort-json",
+        r#"[{"source":"field","field":"price","direction":"ascending","missing":"last"}]"#,
+        "--facets-json",
+        r#"[{"field":"category","limit":4}]"#,
+        "--metrics-json",
+        r#"[{"name":"count","operation":"count"},{"name":"sum_price","operation":"sum","field":"price"}]"#,
+    ])?;
+    assert_eq!(hybrid["facets"][0]["buckets"][0]["count"], 2);
+    assert_eq!(hybrid["aggregations"][1]["value"], "40");
+    let updated = serde_json::json!({
+        "id":201,
+        "text":"updated rust database",
+        "doc_values":{"category":"book","price":31},
+        "vectors":{"exact":[0.0,0.0],"ann":[0.0,0.0]}
+    })
+    .to_string();
+    run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "update",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "2",
+        "--document-json",
+        &updated,
+    ])?;
+    run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "delete",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "3",
+        "--document",
+        "203",
+    ])?;
+
+    let transaction = serde_json::json!([
+        {"operation":"status"},
+        {"operation":"stage_sql","statement":"INSERT INTO events (id, body) VALUES (?, ?)","parameters":[2,"transaction"]},
+        {"operation":"stage_structure","mutation":{"operation":"string_set","keyspace":20,"key":"transaction","value":"committed","expires_at_micros":null}},
+        {"operation":"stage_search","action":"index","index":lexical_index.parse::<u128>()?,"document_id":"transaction","text":"transaction search"},
+        {"operation":"stage_vector","action":"upsert","index":ann_index.parse::<u128>()?,"object_id":301,"vector":[0.5,0.5]},
+        {"operation":"commit"}
+    ]).to_string();
+    let committed = run(&[
+        "transaction",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--steps-json",
+        &transaction,
+    ])?;
+    assert_eq!(committed["steps"][0]["status"], "active");
+    assert_eq!(committed["steps"][1]["status"], "active");
+    assert_eq!(committed["steps"][6]["status"], "committed");
+    let transaction_id = committed["steps"][6]["commit"]["transaction_id"]
+        .as_str()
+        .ok_or("missing transaction ID")?;
+    assert_eq!(
+        run(&[
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "status",
+            "--id",
+            transaction_id,
+        ])?["status"],
+        "committed"
+    );
+    let rollback = serde_json::json!([
+        {"operation":"stage_structure","mutation":{"operation":"string_set","keyspace":20,"key":"rollback","value":"discarded","expires_at_micros":null}},
+        {"operation":"rollback"}
+    ]).to_string();
+    let rolled_back = run(&[
+        "transaction",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--steps-json",
+        &rollback,
+    ])?;
+    assert_eq!(rolled_back["steps"][2]["status"], "rolled_back");
+
+    assert_eq!(
+        run(&["status", "--data-dir", &data_text])?["status"],
+        "ready"
+    );
+    assert!(run(&["telemetry", "--data-dir", &data_text])?["metrics"].is_array());
+    assert_eq!(
+        run(&["doctor", "--data-dir", &data_text])?["status"],
+        "healthy"
+    );
+    assert_eq!(
+        run(&["checkpoint", "--data-dir", &data_text])?["status"],
+        "checkpointed"
+    );
+    assert!(matches!(
+        run(&["vacuum", "--data-dir", &data_text])?["status"].as_str(),
+        Some("vacuumed" | "no_changes")
+    ));
+
+    let generated = run(&[
+        "proof",
+        "generate",
+        "--data-dir",
+        &data_text,
+        "--operation-json",
+        r#"{"operation":"sql","statement":"SELECT id, body FROM events WHERE id = ?","parameters":[1]}"#,
+        "--proof-out",
+        &path(&proof),
+        "--witness-out",
+        &path(&witness),
+    ])?;
+    assert_eq!(generated["status"], "generated");
+    assert_eq!(
+        run(&[
+            "proof",
+            "verify",
+            "--proof",
+            &path(&proof),
+            "--witness",
+            &path(&witness),
+            "--anchor",
+            generated["anchor"].as_str().ok_or("missing anchor")?,
+        ])?["semantic_reexecution_performed"],
+        true
+    );
+    assert_eq!(
+        run(&[
+            "backup",
+            "create",
+            "--data-dir",
+            &data_text,
+            "--out",
+            &path(&backup),
+        ])?["status"],
+        "created"
+    );
+    assert_eq!(
+        run(&["backup", "verify", "--backup", &path(&backup)])?["status"],
+        "verified"
+    );
+    assert_eq!(
+        run(&[
+            "restore",
+            "--backup",
+            &path(&backup),
+            "--data-dir",
+            &path(&restored),
+        ])?["status"],
+        "restored"
+    );
+    exercise_service(&restored)?;
+    Ok(())
+}
+
+#[test]
+fn product_error_categories_drive_stable_machine_readable_exit_classes()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let missing = path(&temporary.0.join("missing"));
+    let invalid = output(&["catalog", "--data-dir", &missing, "describe", "--id", "0"])?;
+    assert_eq!(invalid.status.code(), Some(2));
+    let invalid_error: serde_json::Value = serde_json::from_slice(&invalid.stderr)?;
+    assert_eq!(invalid_error["error"]["category"], "invalid-request");
+    assert_eq!(invalid_error["exit_class"], 2);
+
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    let missing_object = output(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "describe",
+        "--id",
+        "999",
+    ])?;
+    assert_eq!(missing_object.status.code(), Some(0));
+    let described: serde_json::Value = serde_json::from_slice(&missing_object.stdout)?;
+    assert_eq!(described["found"], false);
+
+    fs::create_dir(temporary.0.join("format2"))?;
+    fs::write(
+        temporary.0.join("format2/FORMAT"),
+        b"hyphae-disk-format=2\n",
+    )?;
+    fs::write(temporary.0.join("format2/LOCK"), b"")?;
+    let format2 = output(&["status", "--data-dir", &path(&temporary.0.join("format2"))])?;
+    assert_eq!(format2.status.code(), Some(2));
+    let format2_error: serde_json::Value = serde_json::from_slice(&format2.stderr)?;
+    assert_eq!(format2_error["error"]["code"], "format2_directory");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_is_the_only_command_that_binds_the_native_listener() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let endpoint = std::env::temp_dir().join(format!("hyphae-cli-{}.sock", Uuid::now_v7()));
+    run(&["init", "--data-dir", &path(&data)])?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !endpoint.exists() && Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            let error = read_child_stderr(&mut child)?;
+            return Err(std::io::Error::other(error).into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(endpoint.exists());
+    let _guard = ChildGuard(&mut child);
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_can_share_one_product_service_with_native_http_v2() -> Result<(), Box<dyn Error>> {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let endpoint = std::env::temp_dir().join(format!("hyphae-cli-{}.sock", Uuid::now_v7()));
+    run(&["init", "--data-dir", &path(&data)])?;
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--http-bind")
+        .arg(address.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(_error) if Instant::now() < deadline => {
+                if child.try_wait()?.is_some() {
+                    let error = read_child_stderr(&mut child)?;
+                    return Err(std::io::Error::other(error).into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let _guard = ChildGuard(&mut child);
+    stream.write_all(
+        b"GET /v1/capabilities HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    assert!(response.starts_with("HTTP/1.1 409"));
+    assert!(endpoint.exists());
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+struct ChildGuard<'a>(&'a mut Child);
+
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        let _ignored = self.0.kill();
+        let _ignored = self.0.wait();
+    }
+}
+
+fn read_child_stderr(child: &mut Child) -> Result<String, std::io::Error> {
+    use std::io::Read as _;
+
+    let mut error = String::new();
+    if let Some(stderr) = child.stderr.as_mut() {
+        stderr.read_to_string(&mut error)?;
+    }
+    Ok(error)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}

@@ -1,6 +1,6 @@
 # Native local telemetry v1
 
-Status: accepted G6 planning contract; implementation incomplete
+Status: implemented G6 contract
 
 Telemetry is an optional local observation surface. It is not durable data
 authority and requires no cloud service, metrics database, or exporter.
@@ -9,8 +9,8 @@ authority and requires no cloud service, metrics database, or exporter.
 
 The product facade owns a bounded registry of monotonic counters, gauges,
 bounded histograms, and structured lifecycle events. A snapshot reports a
-registry version, process start identity, capture time, catalog version, and
-stable metric rows.
+registry version, process start identity, process-local session/open identity,
+capture time, catalog version, and stable metric rows.
 
 Required timing families remain separate:
 
@@ -18,10 +18,15 @@ Required timing families remain separate:
 - parse, bind, optimize, or prepared lookup;
 - engine execution;
 - local or HTTP transport;
-- result encoding and proof construction;
+- request decoding, result encoding, proof construction, and proof verification;
 - WAL append;
-- page synchronization; and
-- WAL synchronization.
+- page synchronization;
+- WAL synchronization; and
+- the complete selected durability boundary.
+
+Metric IDs are fixed numeric discriminants in registry order. New metrics append
+IDs; callers cannot register metrics or labels. Counters, histogram counts,
+sums, buckets, and dropped-event counts saturate at `u64::MAX`.
 
 Required operational families include scheduler saturation, active expiry,
 checkpoint, compaction, vacuum, retention, blob collection, ANN consolidation,
@@ -44,6 +49,11 @@ Embedded administration returns typed snapshots. CLI and HTTP `/v2` can render
 or encode the same snapshot. Local-protocol and SDK access follows the same
 authorization policy. Optional Prometheus or OpenTelemetry exporters may be
 added later as public adapters; they are not G6 core dependencies.
+
+The `Telemetry` product operation is the cross-surface authority. Embedded,
+native-local, HTTP `/v2`, CLI, and SDK adapters encode the same snapshot type.
+Transport adapters record only fixed decode, encode, and transport clocks into
+the registry owned by the sole product service.
 
 ## Verification
 

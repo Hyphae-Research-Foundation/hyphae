@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/schema/native-g6-aggregate-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source_commit", "status", "platforms", "corpus_digest", "schema_digest", "transcript_digest"],
+  "properties": {
+    "schema": {"const": "hyphae-native-g6-conformance-aggregate-v1"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "status": {"const": "passed"},
+    "platforms": {"const": ["linux", "macos", "windows"]},
+    "corpus_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schema_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "transcript_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

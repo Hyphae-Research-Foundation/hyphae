@@ -1,0 +1,25 @@
+[package]
+name = "hyphae-native-daemon"
+description = "Multi-client UDS and Windows named-pipe daemon for Hyphae Native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+hyphae-native-product.workspace = true
+hyphae-native-protocol.workspace = true
+interprocess.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+widestring.workspace = true
+
+[lints]
+workspace = true

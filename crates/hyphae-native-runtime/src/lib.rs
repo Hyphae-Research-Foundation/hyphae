@@ -54,6 +54,7 @@ pub use analyzer::{
     Analysis, AnalyzedToken, AnalyzerIdentity, CANONICAL_ANALYZER_NAME, CANONICAL_ANALYZER_VERSION,
     CanonicalAnalyzer, MAX_CANONICAL_TOKEN_BYTES,
 };
+pub use ann_store::{MAX_ANN_CONSOLIDATION_VECTORS, MAX_ANN_DELTA_BYTES, MAX_ANN_DELTA_RECORDS};
 pub use backup::{
     NativeBackupError, NativeBackupInfo, NativeBackupLimits, NativeRestoreInfo,
     restore_native_backup, restore_native_backup_with_limits, verify_native_backup,
@@ -184,9 +185,11 @@ use hyphae_native_blobs::{
 };
 use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
 use hyphae_native_catalog::{
-    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, ColumnCheckOperator,
-    ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-    SearchFieldDefinition, SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
+    AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, CatalogObjectKind,
+    ColumnCheckOperator, ColumnDefinition, DependencyDirection, DependencyEdge, DependencyKind,
+    IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{
     ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
@@ -247,7 +250,7 @@ use crate::{
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
     wal_codec::{
         Mutation, Opcode, RecoveredWal, TransactionPlan, WalSemanticBase, WalSemanticError,
-        encode_abort, encode_checkpoint, encode_transaction, recover_wal_after,
+        encode_abort, encode_checkpoint, encode_outcome, encode_transaction, recover_wal_after,
     },
 };
 
@@ -257,10 +260,13 @@ const CATALOG_FORMAT_KEY: &[u8] = b"\x00";
 const CATALOG_FORMAT_VALUE_V3: &[u8] = b"HYCAT003";
 const CATALOG_FORMAT_VALUE_V4: &[u8] = b"HYCAT004";
 const CATALOG_FORMAT_VALUE_V5: &[u8] = b"HYCAT005";
+const CATALOG_FORMAT_VALUE_V6: &[u8] = b"HYCAT006";
 const CATALOG_ID_AUTHORITY_KEY: &[u8] = b"\x00\x01";
 const CATALOG_OBJECT_PREFIX: u8 = 1;
 const CATALOG_NAME_PREFIX: u8 = 2;
 const CATALOG_RELATION_INDEX_PREFIX: u8 = 3;
+const CATALOG_DEPENDENCY_OUTGOING_PREFIX: u8 = 4;
+const CATALOG_DEPENDENCY_INCOMING_PREFIX: u8 = 5;
 const CATALOG_VALUE_MAGIC: &[u8; 8] = b"HYCVAL01";
 const CATALOG_VALUE_HEADER_SIZE: usize = 16;
 const CATALOG_VALUE_INLINE: u8 = 0;
@@ -333,6 +339,12 @@ const STRUCTURE_STREAM_EXPIRY_LIVE: u8 = 5;
 const STRUCTURE_SORTED_SET_EXPIRY_LIVE: u8 = 6;
 const STRUCTURE_HASH_FIELD_EXPIRY_LIVE: u8 = 1;
 const MAX_EXPIRY_SWEEP_KEYS: usize = 4_096;
+/// Maximum catalog summaries or dependency edges returned by one request.
+pub const MAX_CATALOG_READ_ITEMS: usize = 4_096;
+/// Maximum physical catalog namespace entries visited by one request.
+pub const MAX_CATALOG_READ_VISITS: usize = 16_384;
+/// Maximum canonical output bytes returned by one catalog request.
+pub const MAX_CATALOG_READ_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum field positions admitted by one native hash multi-field call.
 pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
 /// Maximum member positions admitted by one native set multi-member call.
@@ -342,6 +354,7 @@ const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
 type SearchTermFrequencies = BTreeMap<Vec<u8>, u32>;
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
 const SEARCH_FORMAT_VALUE_V2: &[u8] = b"HYSEABT2";
+const SEARCH_FORMAT_VALUE_V3: &[u8] = b"HYSEABT3";
 const SEARCH_INDEX_META_PREFIX: u8 = 1;
 const SEARCH_DOCUMENT_PREFIX: u8 = 2;
 const SEARCH_TERM_META_PREFIX: u8 = 3;
@@ -353,6 +366,7 @@ const SEARCH_POSTING_MAGIC: &[u8; 8] = b"HYPOST01";
 const SEARCH_DOCUMENT_TOMBSTONE: &[u8; 8] = b"HYDOCT01";
 const SEARCH_TERM_META_TOMBSTONE: &[u8; 8] = b"HYTERMT1";
 const SEARCH_POSTING_TOMBSTONE: &[u8; 8] = b"HYPOSTT1";
+const ANN_CREATION_MAGIC: &[u8; 8] = b"HYANNCF1";
 type PhysicalStructureEntries = Vec<(Vec<u8>, Vec<u8>)>;
 const SEARCH_INDEX_META_SIZE: usize = 24;
 const SEARCH_DOCUMENT_HEADER_SIZE: usize = 24;
@@ -449,17 +463,19 @@ enum SearchFormat {
 enum PhysicalSearchFormat {
     V1,
     V2,
+    V3,
 }
 
 impl PhysicalSearchFormat {
     const fn admits_tombstones(self) -> bool {
-        matches!(self, Self::V2)
+        matches!(self, Self::V2 | Self::V3)
     }
 
     fn decode(marker: &[u8]) -> Result<Self, NativeRuntimeError> {
         match marker {
             SEARCH_FORMAT_VALUE_V1 => Ok(Self::V1),
             SEARCH_FORMAT_VALUE_V2 => Ok(Self::V2),
+            SEARCH_FORMAT_VALUE_V3 => Ok(Self::V3),
             _ => Err(NativeRuntimeError::InvalidSearchTree),
         }
     }
@@ -558,6 +574,15 @@ pub enum NativeRuntimeError {
     /// The catalog B+tree contains malformed or cross-linked namespace entries.
     #[error("native catalog B+tree namespace is invalid")]
     InvalidCatalogTree,
+    /// Logical V2 catalog APIs require a `HYCAT006` catalog root.
+    #[error("logical catalog V2 is unavailable on this legacy catalog snapshot")]
+    CatalogV2Unavailable,
+    /// One bounded catalog request has zero or above-contract limits.
+    #[error("native catalog read limits are invalid")]
+    InvalidCatalogReadLimit,
+    /// A catalog snapshot belongs to another native directory lineage.
+    #[error("native catalog snapshot belongs to another directory")]
+    CatalogSnapshotMismatch,
     /// The relational B+tree contains malformed namespace keys or markers.
     #[error("native relational B+tree namespace is invalid")]
     InvalidRelationalTree,
@@ -655,6 +680,21 @@ pub enum NativeRuntimeError {
     /// Search reachability compaction requires the native inverted B+tree.
     #[error("native search compaction requires a HYSEABT search root")]
     SearchCompactionUnsupported,
+    /// An ANN foreground mutation would exceed the durable hard delta bound.
+    #[error("native ANN delta exceeds its hard record or byte limit")]
+    AnnDeltaLimitExceeded,
+    /// ANN consolidation received a zero or above-contract work bound.
+    #[error("native ANN consolidation bounds are invalid")]
+    InvalidAnnConsolidationLimit,
+    /// The captured ANN consolidation exceeds its caller-supplied work bound.
+    #[error("native ANN consolidation capture exceeds its bounded work limit")]
+    AnnConsolidationLimitExceeded,
+    /// The selected ANN view has no delta to consolidate.
+    #[error("native ANN consolidation requires a nonempty delta")]
+    AnnConsolidationNotNeeded,
+    /// The ANN base selected by a captured consolidation plan is no longer current.
+    #[error("native ANN consolidation plan is stale")]
+    AnnConsolidationStale,
     /// A search document or analyzed term cannot fit one canonical B+tree key.
     #[error("native search identity exceeds the canonical B+tree key limit")]
     SearchIdentityTooLarge,
@@ -972,7 +1012,16 @@ fn catalog_error_is_corruption(source: &CatalogError) -> bool {
         | CatalogError::TooManyDefinitionItems
         | CatalogError::DefinitionTooLarge
         | CatalogError::InvalidDefinitionEncoding
-        | CatalogError::InvalidCrossEngineLink => true,
+        | CatalogError::InvalidCrossEngineLink
+        | CatalogError::InvalidDefinitionVersion
+        | CatalogError::InvalidObjectHierarchy
+        | CatalogError::DuplicateAnalyzerFilter
+        | CatalogError::InvalidSearchFieldPolicy
+        | CatalogError::DuplicateVectorId(_)
+        | CatalogError::DuplicateVectorName(_)
+        | CatalogError::InvalidVectorPolicy
+        | CatalogError::InvalidKeyspacePolicy
+        | CatalogError::MissingDependencyTarget(_) => true,
         CatalogError::NativeType(source) => native_type_error_is_corruption(*source),
         CatalogError::VersionExhausted => false,
     }
@@ -1268,6 +1317,15 @@ struct OpenRecoveryReport<'recovery> {
     recovered_temporary_wal_anchors: usize,
 }
 
+struct OpenRecoveryState {
+    transaction_resolutions: BTreeMap<TransactionId, DurableTransactionResolution>,
+    transaction_receipts: BTreeMap<TransactionId, CommitReceipt>,
+    checkpoint_validation: CheckpointValidation,
+    recovered_page_generation_files: usize,
+    manifest_prune: Option<ManifestPruneReceipt>,
+    manifest_pruning_time: Duration,
+}
+
 /// Reopen evidence for the native data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReport {
@@ -1417,6 +1475,140 @@ pub struct IdentifiedCatalogObject {
     pub object: Option<CatalogObject>,
 }
 
+/// Exact immutable identity used by one bounded catalog read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogSnapshotIdentity {
+    /// Latest commit visible to the catalog root, absent for an empty directory.
+    pub visible_csn: Option<Csn>,
+    /// Catalog version bound to the root.
+    pub catalog_version: CatalogVersion,
+    /// Digest of the complete immutable all-engine root set.
+    pub root_digest: [u8; 32],
+}
+
+/// Lightweight immutable catalog-only snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCatalogSnapshot {
+    identity: CatalogSnapshotIdentity,
+    directory_lineage: [u8; 24],
+    root: Option<PageId>,
+}
+
+impl NativeCatalogSnapshot {
+    /// Returns the exact immutable root-set identity.
+    pub const fn identity(&self) -> CatalogSnapshotIdentity {
+        self.identity
+    }
+}
+
+/// One stable-ID ordered lightweight catalog object summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogObjectSummary {
+    /// Stable object identity.
+    pub id: ObjectId,
+    /// Stable logical object family.
+    pub kind: CatalogObjectKind,
+    /// Owning native engine.
+    pub owner: EngineKind,
+    /// Qualified display and normalized lookup name.
+    pub name: QualifiedName,
+    /// Stable hierarchy parent when persisted by logical V2.
+    pub parent: Option<ObjectId>,
+}
+
+/// Bounded catalog object-list request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogListRequest {
+    /// Optional hierarchy parent filter.
+    pub parent: Option<ObjectId>,
+    /// Optional stable object-kind filter.
+    pub kind: Option<CatalogObjectKind>,
+    /// Exclusive stable-ID cursor.
+    pub start_after: Option<ObjectId>,
+    /// Maximum returned summaries.
+    pub item_limit: usize,
+    /// Maximum physical object entries visited.
+    pub visit_limit: usize,
+    /// Maximum returned summary bytes.
+    pub byte_limit: usize,
+}
+
+/// Why one bounded catalog traversal stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogPageStop {
+    /// The selected physical namespace was exhausted.
+    Exhausted,
+    /// The item bound stopped traversal.
+    ItemLimit,
+    /// The physical-visit bound stopped traversal.
+    VisitLimit,
+    /// The output byte bound stopped traversal before the next matching item.
+    ByteLimit,
+}
+
+/// One bounded page of catalog summaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogObjectPage {
+    /// Exact snapshot used by this page and any continuation.
+    pub snapshot: CatalogSnapshotIdentity,
+    /// Stable-ID ordered summaries.
+    pub items: Vec<CatalogObjectSummary>,
+    /// Exclusive stable-ID continuation when traversal stopped early.
+    pub continuation: Option<ObjectId>,
+    /// Traversal stop reason.
+    pub stop: CatalogPageStop,
+    /// Physical object definitions visited.
+    pub visited: usize,
+    /// Canonical bytes charged to returned summaries.
+    pub returned_bytes: usize,
+}
+
+/// Bounded dependency-list request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogDependencyRequest {
+    /// Object whose outgoing dependencies or incoming dependents are selected.
+    pub object: ObjectId,
+    /// Directed namespace to traverse.
+    pub direction: DependencyDirection,
+    /// Exclusive adjacent-object cursor.
+    pub start_after: Option<ObjectId>,
+    /// Maximum returned edges.
+    pub item_limit: usize,
+    /// Maximum physical dependency entries visited.
+    pub visit_limit: usize,
+    /// Maximum returned edge bytes.
+    pub byte_limit: usize,
+}
+
+/// One bounded page of canonical dependency edges.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogDependencyPage {
+    /// Exact snapshot used by this page and any continuation.
+    pub snapshot: CatalogSnapshotIdentity,
+    /// Canonical directed dependency edges.
+    pub items: Vec<DependencyEdge>,
+    /// Exclusive adjacent-object continuation when traversal stopped early.
+    pub continuation: Option<ObjectId>,
+    /// Traversal stop reason.
+    pub stop: CatalogPageStop,
+    /// Physical dependency entries visited.
+    pub visited: usize,
+    /// Canonical bytes charged to returned edges.
+    pub returned_bytes: usize,
+}
+
+/// Point description from one immutable catalog snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogDescription {
+    /// Exact snapshot used by the lookup.
+    pub snapshot: CatalogSnapshotIdentity,
+    /// Complete logical V2 object, absent when the ID is not live.
+    ///
+    /// Canonical `HYCOBJ01` definitions are returned through their
+    /// deterministic lossless V2-compatible wrapper.
+    pub object: Option<LogicalCatalogObject>,
+}
+
 /// Receipt for one cross-engine native commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitReceipt {
@@ -1436,13 +1628,96 @@ pub struct CommitReceipt {
     pub durability_cohort_size: usize,
     /// Zero-based position of this transaction in its durability cohort.
     pub durability_cohort_position: usize,
+    /// Complete database-side commit execution time.
+    pub execution_time: Duration,
+    /// WAL append time excluding synchronization.
+    pub wal_append_time: Duration,
+    /// Page-file synchronization time.
+    pub page_synchronization_time: Duration,
+    /// WAL synchronization time.
+    pub wal_synchronization_time: Duration,
+}
+
+/// Durable transaction outcome retained by the native WAL authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionOutcome {
+    /// The runtime transaction committed at the recorded CSN.
+    Committed {
+        /// Stable internal runtime transaction identity.
+        runtime_transaction_id: TransactionId,
+        /// Shared all-engine commit sequence.
+        commit_csn: Csn,
+    },
+    /// Publication was proven not to have committed.
+    RolledBack {
+        /// Stable internal runtime transaction identity.
+        runtime_transaction_id: TransactionId,
+    },
+    /// Publication remains unresolved and requires recovery or retry.
+    OutcomeUnknown {
+        /// Stable internal runtime transaction identity.
+        runtime_transaction_id: TransactionId,
+    },
+}
+
+/// Authorization-bound durable outcome record returned by runtime lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionResolution {
+    /// Non-guessable product-facing resolution identity.
+    pub resolution_id: TransactionId,
+    /// Hash of the authenticated product principal that owns the record.
+    pub principal_hash: [u8; 32],
+    /// Hash of the caller's explicit idempotency token.
+    pub idempotency_token: [u8; 32],
+    /// Proven or unresolved native outcome.
+    pub outcome: DurableTransactionOutcome,
+}
+
+/// Failure from a resolved detached commit, retaining its durable identity.
+#[derive(Debug)]
+pub struct ResolvedCommitError {
+    resolution: Box<Option<DurableTransactionResolution>>,
+    source: Box<NativeRuntimeError>,
+}
+
+impl ResolvedCommitError {
+    /// Returns the reserved resolution when reservation reached the WAL.
+    pub const fn resolution(&self) -> Option<DurableTransactionResolution> {
+        *self.resolution
+    }
+
+    /// Returns the underlying runtime failure.
+    pub const fn source(&self) -> &NativeRuntimeError {
+        &self.source
+    }
+
+    /// Consumes this wrapper and returns the runtime failure.
+    pub fn into_source(self) -> NativeRuntimeError {
+        *self.source
+    }
 }
 
 struct SingletonCommitReport {
     commit: CommitReceipt,
-    execution_time: Duration,
+}
+
+struct PageCommitInput<'commit> {
+    roots: [Option<PageId>; 4],
+    relational_format: RelationalFormat,
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+    commit_csn: Csn,
+    batch: &'commit NativeWriteBatch,
+    staged_blobs: BTreeMap<[u8; 32], StagedBlob>,
+    synchronize: bool,
+    interruption: Option<CommitBoundary>,
+}
+
+struct PageCommitOutput {
+    roots: [PageId; 4],
+    blob_generation: u64,
     page_synchronization_time: Duration,
-    wal_synchronization_time: Duration,
+    blob_references: BTreeMap<[u8; 32], BlobReference>,
 }
 
 /// Independent result for one request submitted in a group-commit cohort.
@@ -1545,6 +1820,101 @@ pub struct SearchCompactionReceipt {
     pub pages_appended: u64,
     /// Native maintenance commit, absent when no tombstone existed.
     pub commit: Option<CommitReceipt>,
+}
+
+/// Selected base-plus-delta identity and physical counters for one ANN index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnIndexObservation {
+    /// Canonical immutable HNSW base generation.
+    pub base_identity: [u8; 32],
+    /// Logical selected view identity over the base and current object delta.
+    pub view_identity: [u8; 32],
+    /// Vectors physically represented by the selected base graph.
+    pub base_vector_count: usize,
+    /// Vectors visible after applying upserts and tombstones.
+    pub effective_vector_count: usize,
+    /// Current object-keyed delta record count.
+    pub delta_records: usize,
+    /// Current encoded delta bytes.
+    pub delta_bytes: usize,
+    /// Selected-base vector and graph-layer records in the current root.
+    pub generation_records: usize,
+    /// Vector and graph-layer records belonging to the selected base only.
+    pub selected_generation_records: usize,
+    /// Durable per-index lifecycle policy selected by metadata.
+    pub lifecycle: IncrementalVectorLifecycle,
+    /// Whether the immutable-delta threshold requires maintenance planning.
+    pub maintenance_due: bool,
+}
+
+/// Scheduler-compatible ANN maintenance signal for one durable index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnMaintenanceStatus {
+    /// Stable index identity.
+    pub index_id: ObjectId,
+    /// Durable per-index lifecycle policy.
+    pub lifecycle: IncrementalVectorLifecycle,
+    /// Current object-keyed delta records.
+    pub delta_records: usize,
+    /// Current encoded delta bytes.
+    pub delta_bytes: usize,
+    /// Whether consolidation should be scheduled.
+    pub due: bool,
+}
+
+/// Immutable bounded ANN consolidation capture.
+#[derive(Clone, Debug)]
+pub struct AnnConsolidationPlan {
+    inner: ann_store::ConsolidationPlan,
+}
+
+impl AnnConsolidationPlan {
+    /// Vector index selected by this plan.
+    pub const fn index_id(&self) -> ObjectId {
+        self.inner.index()
+    }
+
+    /// Base generation that must still be selected at publication.
+    pub const fn base_identity(&self) -> [u8; 32] {
+        self.inner.base_identity()
+    }
+
+    /// Captured base-plus-delta view identity.
+    pub const fn captured_view_identity(&self) -> [u8; 32] {
+        self.inner.captured_view_identity()
+    }
+
+    /// Number of object delta versions captured by the replacement build.
+    pub fn captured_delta_count(&self) -> usize {
+        self.inner.captured_delta_count()
+    }
+
+    /// Number of effective vectors captured by the replacement build.
+    pub fn effective_vector_count(&self) -> usize {
+        self.inner.effective_vector_count()
+    }
+
+    /// Canonical replacement base generation identity.
+    pub const fn replacement_identity(&self) -> [u8; 32] {
+        self.inner.replacement_identity()
+    }
+}
+
+/// Result of one ordinary-root ANN consolidation publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnConsolidationReceipt {
+    /// Base selected by the captured plan.
+    pub previous_base_identity: [u8; 32],
+    /// Newly selected canonical base generation.
+    pub replacement_base_identity: [u8; 32],
+    /// Captured delta versions consumed when unchanged at publication.
+    pub consumed_delta_records: usize,
+    /// Effective vectors used to construct the replacement generation.
+    pub effective_vector_count: usize,
+    /// Current delta versions preserved because they postdate the capture.
+    pub preserved_later_delta_records: usize,
+    /// Ordinary native root commit selecting the replacement generation.
+    pub commit: CommitReceipt,
 }
 
 /// Receipt for one current-root physical page-generation vacuum.
@@ -1724,7 +2094,8 @@ pub struct AnnSearchReceipt {
     pub snapshot_csn: Option<Csn>,
     /// Explicit approximation label.
     pub approximate: bool,
-    /// Canonical physical graph-generation identity.
+    /// Selected base-plus-delta view identity. It equals the legacy graph
+    /// identity when the selected view has no delta.
     pub build_identity: [u8; 32],
     /// Fixed index metric.
     pub metric: VectorMetric,
@@ -1838,6 +2209,11 @@ impl NativeSnapshot {
     /// snapshot.
     pub fn catalog_object(&self, id: ObjectId) -> Option<&CatalogObject> {
         self.state.catalog.object(id)
+    }
+
+    /// Returns one immutable logical V2 catalog definition pinned by this snapshot.
+    pub fn logical_catalog_object(&self, id: ObjectId) -> Option<&LogicalCatalogObject> {
+        self.state.catalog.logical_object(id)
     }
 
     /// Returns one immutable catalog object by normalized qualified name.
@@ -1956,6 +2332,27 @@ impl NativeSnapshot {
             None => Ttl::Missing,
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
+        }
+    }
+
+    /// Returns one sorted-set family's TTL state in this snapshot.
+    pub fn ttl_sorted_set(&self, key: &[u8]) -> Ttl {
+        if self.state.structures.sorted_sets.contains_key(key) {
+            Ttl::Persistent
+        } else {
+            Ttl::Missing
+        }
+    }
+
+    /// Returns one stream family's TTL state in this snapshot.
+    pub fn ttl_stream(&self, key: &[u8]) -> Ttl {
+        match self.state.structures.stream_expiries.get(key).copied() {
+            _ if !self.state.structures.streams.contains_key(key) => Ttl::Missing,
+            None => Ttl::Persistent,
+            Some(expiry) if expiry > self.metadata.logical_time_micros => {
+                Ttl::RemainingMicros(expiry.saturating_sub(self.metadata.logical_time_micros))
+            }
+            Some(_) => Ttl::Missing,
         }
     }
 
@@ -2515,7 +2912,7 @@ impl NativeSnapshot {
         Ok(ann_search_receipt(index, self.metadata.visible_csn, result))
     }
 
-    /// Executes bounded ANN traversal and post-filters candidates through a
+    /// Executes filter-aware traversal or adaptive exact scoring through a
     /// stable-object-ID allowlist on this immutable snapshot.
     ///
     /// # Errors
@@ -2663,7 +3060,11 @@ pub struct NativeDatabase {
     structure_format: StructureFormat,
     search_format: SearchFormat,
     next_transaction_id: u128,
+    transaction_resolutions: BTreeMap<TransactionId, DurableTransactionResolution>,
+    transaction_receipts: BTreeMap<TransactionId, CommitReceipt>,
     last_checkpoint_lsn: Option<Lsn>,
+    last_checkpoint_visible_csn: Option<Csn>,
+    last_checkpoint_manifest_digest: Option<[u8; 32]>,
     recovery: RecoveryReport,
     directory_guard: NativeDirectoryGuard,
 }
@@ -2707,7 +3108,11 @@ impl NativeDatabase {
             structure_format: StructureFormat::BTreeV2,
             search_format: SearchFormat::InvertedBTreeV1,
             next_transaction_id: 1,
+            transaction_resolutions: BTreeMap::new(),
+            transaction_receipts: BTreeMap::new(),
             last_checkpoint_lsn: None,
+            last_checkpoint_visible_csn: None,
+            last_checkpoint_manifest_digest: None,
             recovery: RecoveryReport {
                 page_tail_bytes_removed: 0,
                 wal_tail_bytes_removed: 0,
@@ -2792,33 +3197,24 @@ impl NativeDatabase {
             wal_state.base_root.take(),
         )?;
         let root_validation_time = root_validation_started.elapsed();
-        let checkpoint_validation = validate_checkpoints(
-            &wal_state.recovered_wal,
-            &wal_state.manifest_recovery.manifests,
-            &committed_roots,
-            retention_anchor.as_ref(),
-        )?;
-        let recovered_page_generation_files = recover_snapshot_pin_files(
-            path,
-            &mut snapshot_pins,
-            &wal_state.manifest_recovery.manifests,
-            &wal_state.recovered_wal,
-            retention_anchor.as_ref(),
-            &blobs,
-            active_page_generation,
-        )?;
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
         let coordinator = restore_commit_coordinator(latest_root)?;
         let metadata = wal_recovery_metadata_for_open(path, retention_anchor, &wal_state)?;
-        let (manifest_prune, manifest_pruning_time) =
-            prune_recovered_manifest_prefix(&mut wal_state.manifests, retention_anchor)?;
-        cleanup_stale_wal_anchors(&mut wal_state.wal_retention, retention_anchor)?;
+        let recovered = finish_open_recovery(
+            path,
+            &mut snapshot_pins,
+            &mut wal_state,
+            &committed_roots,
+            retention_anchor,
+            &blobs,
+            active_page_generation,
+        )?;
         let recovery = build_recovery_report(&OpenRecoveryReport {
             open_started,
             opened_pages: &opened_pages,
             opened_wal: &wal_state.opened_wal,
-            replayed_transactions: commits.len(),
+            replayed_transactions: wal_state.recovered_wal.commits.len(),
             metadata: &metadata,
             retention_anchor,
             wal_physical_verification_time: wal_state.wal_physical_verification_time,
@@ -2826,12 +3222,12 @@ impl NativeDatabase {
             root_validation_time,
             active_page_generation,
             retention_floor_csn,
-            recovered_page_generation_files,
+            recovered_page_generation_files: recovered.recovered_page_generation_files,
             manifest_recovery: &wal_state.manifest_recovery,
-            manifest_prune,
+            manifest_prune: recovered.manifest_prune,
             manifest_verification_time: wal_state.manifest_verification_time,
-            manifest_pruning_time,
-            checkpoint_validation: &checkpoint_validation,
+            manifest_pruning_time: recovered.manifest_pruning_time,
+            checkpoint_validation: &recovered.checkpoint_validation,
             blob_recovery: &blob_recovery,
             blob_verification_time,
             recovered_temporary_wal_anchors: wal_state.recovered_temporary_wal_anchors,
@@ -2851,7 +3247,11 @@ impl NativeDatabase {
             structure_format,
             search_format,
             next_transaction_id: metadata.next_transaction_id,
-            last_checkpoint_lsn: checkpoint_validation.last_checkpoint_lsn,
+            transaction_resolutions: recovered.transaction_resolutions,
+            transaction_receipts: recovered.transaction_receipts,
+            last_checkpoint_lsn: recovered.checkpoint_validation.last_checkpoint_lsn,
+            last_checkpoint_visible_csn: recovered.checkpoint_validation.latest_visible_csn,
+            last_checkpoint_manifest_digest: recovered.checkpoint_validation.latest_digest,
             recovery,
             directory_guard,
         })
@@ -2872,10 +3272,47 @@ impl NativeDatabase {
         &self.recovery
     }
 
-    pub(crate) fn last_checkpoint_manifest_digest(&self) -> Option<[u8; 32]> {
-        self.manifests
-            .current()
-            .map(hyphae_native_manifest::RootManifest::digest)
+    /// Returns a retained durable outcome by its opaque resolution identity.
+    pub fn transaction_resolution(
+        &self,
+        resolution_id: TransactionId,
+    ) -> Option<DurableTransactionResolution> {
+        self.transaction_resolutions.get(&resolution_id).copied()
+    }
+
+    /// Returns a retained durable outcome for one principal/idempotency binding.
+    pub fn transaction_resolution_for_token(
+        &self,
+        principal_hash: [u8; 32],
+        idempotency_token: [u8; 32],
+    ) -> Option<DurableTransactionResolution> {
+        self.transaction_resolutions
+            .values()
+            .find(|resolution| {
+                resolution.principal_hash == principal_hash
+                    && resolution.idempotency_token == idempotency_token
+            })
+            .copied()
+    }
+
+    /// Returns recovered commit evidence for one stable runtime transaction.
+    pub fn transaction_commit_receipt(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Option<CommitReceipt> {
+        self.transaction_receipts.get(&transaction_id).copied()
+    }
+
+    /// Returns the latest semantically verified durable checkpoint authority.
+    pub fn last_checkpoint_authority(&self) -> Option<(u64, [u8; 32])> {
+        Some((
+            self.last_checkpoint_visible_csn?.get(),
+            self.last_checkpoint_manifest_digest?,
+        ))
+    }
+
+    pub(crate) const fn last_checkpoint_manifest_digest(&self) -> Option<[u8; 32]> {
+        self.last_checkpoint_manifest_digest
     }
 
     /// Looks up one current catalog definition by stable object identity.
@@ -2964,6 +3401,343 @@ impl NativeDatabase {
         })
     }
 
+    /// Captures an immutable catalog-only snapshot without materializing any
+    /// relational, structure, search, ANN, or complete catalog state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot coordination failure.
+    pub fn catalog_snapshot(&self) -> Result<NativeCatalogSnapshot, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        Ok(NativeCatalogSnapshot {
+            identity: CatalogSnapshotIdentity {
+                visible_csn: snapshot.visible_csn,
+                catalog_version: snapshot.catalog_version,
+                root_digest: snapshot.roots().digest(),
+            },
+            directory_lineage: self.directory_guard.identity().lineage().encode(),
+            root: snapshot.roots().root(SLOT_CATALOG),
+        })
+    }
+
+    /// Creates one generic logical catalog V2 object and publishes it through
+    /// the ordinary durable root/WAL commit protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid catalog semantics or commit persistence.
+    pub fn create_catalog_object_v2(
+        &mut self,
+        object: LogicalCatalogObject,
+        durability: DurabilityClass,
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        let mut transaction = self.begin(0, durability)?;
+        transaction.create_catalog_object_v2(object)?;
+        transaction.commit()
+    }
+
+    /// Lists lightweight logical V2 summaries through a bounded immutable-root
+    /// traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero/oversized limits, malformed cursor identity,
+    /// unsupported legacy catalog roots, or durable catalog corruption.
+    pub fn catalog_list(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+        request: CatalogListRequest,
+    ) -> Result<CatalogObjectPage, NativeRuntimeError> {
+        self.require_catalog_snapshot(snapshot)?;
+        validate_catalog_read_limits(request.item_limit, request.visit_limit, request.byte_limit)?;
+        let mut page = CatalogObjectPage {
+            snapshot: snapshot.identity,
+            items: Vec::new(),
+            continuation: None,
+            stop: CatalogPageStop::Exhausted,
+            visited: 0,
+            returned_bytes: 0,
+        };
+        let resume = request.start_after;
+        let Some(root) = snapshot.root else {
+            return Ok(page);
+        };
+        self.require_catalog_v6(root)?;
+        let start_key = request.start_after.map(catalog_object_key);
+        let mut failure = None;
+        let visit = BTree::from_root(root).visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &[CATALOG_OBJECT_PREFIX],
+            start_key.as_deref(),
+            |key, stored| {
+                page.visited += 1;
+                let decoded = (|| {
+                    let id = decode_catalog_object_key(key)?;
+                    let definition = decode_catalog_definition_storage_value(stored, &self.blobs)?;
+                    let object = decode_logical_catalog_definition(&definition, id)?;
+                    if request
+                        .parent
+                        .is_some_and(|parent| object.parent() != Some(parent))
+                        || request.kind.is_some_and(|kind| object.kind() != kind)
+                    {
+                        if page.visited == request.visit_limit {
+                            page.stop = CatalogPageStop::VisitLimit;
+                            page.continuation = Some(id);
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    let summary = logical_catalog_summary(&object);
+                    let bytes = catalog_summary_bytes(&summary)?;
+                    if page
+                        .returned_bytes
+                        .checked_add(bytes)
+                        .is_none_or(|total| total > request.byte_limit)
+                    {
+                        page.stop = CatalogPageStop::ByteLimit;
+                        page.continuation = page.items.last().map(|item| item.id).or(resume);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    page.returned_bytes += bytes;
+                    page.items.push(summary);
+                    if page.items.len() == request.item_limit {
+                        page.stop = CatalogPageStop::ItemLimit;
+                        page.continuation = Some(id);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    if page.visited == request.visit_limit {
+                        page.stop = CatalogPageStop::VisitLimit;
+                        page.continuation = Some(id);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                })();
+                match decoded {
+                    Ok(control) => control,
+                    Err(error) => {
+                        failure = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if visit.is_continue() {
+            page.stop = CatalogPageStop::Exhausted;
+            page.continuation = None;
+        }
+        Ok(page)
+    }
+
+    /// Describes one complete logical V2 object by stable identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported legacy roots or durable corruption.
+    pub fn catalog_describe(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+        id: ObjectId,
+    ) -> Result<CatalogDescription, NativeRuntimeError> {
+        self.require_catalog_snapshot(snapshot)?;
+        let object = snapshot
+            .root
+            .map(|root| {
+                self.require_catalog_v6(root)?;
+                self.logical_catalog_object_at_root(root, id)
+            })
+            .transpose()?
+            .flatten();
+        Ok(CatalogDescription {
+            snapshot: snapshot.identity,
+            object,
+        })
+    }
+
+    /// Resolves one logical V2 object by normalized qualified name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported legacy roots or durable corruption.
+    pub fn catalog_resolve(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+        name: &QualifiedName,
+    ) -> Result<CatalogDescription, NativeRuntimeError> {
+        self.require_catalog_snapshot(snapshot)?;
+        let object = snapshot
+            .root
+            .map(|root| {
+                self.require_catalog_v6(root)?;
+                self.logical_catalog_object_named_at_root(root, name)
+            })
+            .transpose()?
+            .flatten();
+        Ok(CatalogDescription {
+            snapshot: snapshot.identity,
+            object,
+        })
+    }
+
+    /// Lists canonical outgoing dependencies or incoming dependents through a
+    /// bounded derived namespace traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, unsupported legacy roots, or
+    /// malformed dependency namespace entries.
+    pub fn catalog_dependencies(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+        request: CatalogDependencyRequest,
+    ) -> Result<CatalogDependencyPage, NativeRuntimeError> {
+        self.require_catalog_snapshot(snapshot)?;
+        validate_catalog_read_limits(request.item_limit, request.visit_limit, request.byte_limit)?;
+        let mut page = CatalogDependencyPage {
+            snapshot: snapshot.identity,
+            items: Vec::new(),
+            continuation: None,
+            stop: CatalogPageStop::Exhausted,
+            visited: 0,
+            returned_bytes: 0,
+        };
+        let resume = request.start_after;
+        let Some(root) = snapshot.root else {
+            return Ok(page);
+        };
+        self.require_catalog_v6(root)?;
+        let prefix = catalog_dependency_prefix(request.object, request.direction);
+        let start_key = request.start_after.map(|adjacent| {
+            catalog_dependency_cursor_key(request.object, request.direction, adjacent)
+        });
+        let mut failure = None;
+        let visit = BTree::from_root(root).visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            start_key.as_deref(),
+            |key, value| {
+                page.visited += 1;
+                match decode_catalog_dependency_entry(key, value, request.direction) {
+                    Ok((edge, adjacent)) => {
+                        const EDGE_BYTES: usize = 33;
+                        if page.returned_bytes + EDGE_BYTES > request.byte_limit {
+                            page.stop = CatalogPageStop::ByteLimit;
+                            page.continuation = page
+                                .items
+                                .last()
+                                .map(|edge| match request.direction {
+                                    DependencyDirection::Outgoing => edge.prerequisite,
+                                    DependencyDirection::Incoming => edge.dependent,
+                                })
+                                .or(resume);
+                            return ControlFlow::Break(());
+                        }
+                        page.returned_bytes += EDGE_BYTES;
+                        page.items.push(edge);
+                        if page.items.len() == request.item_limit {
+                            page.stop = CatalogPageStop::ItemLimit;
+                            page.continuation = Some(adjacent);
+                            return ControlFlow::Break(());
+                        }
+                        if page.visited == request.visit_limit {
+                            page.stop = CatalogPageStop::VisitLimit;
+                            page.continuation = Some(adjacent);
+                            return ControlFlow::Break(());
+                        }
+                        ControlFlow::Continue(())
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if visit.is_continue() {
+            page.stop = CatalogPageStop::Exhausted;
+            page.continuation = None;
+        }
+        Ok(page)
+    }
+
+    fn require_catalog_snapshot(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+    ) -> Result<(), NativeRuntimeError> {
+        if snapshot.directory_lineage != self.directory_guard.identity().lineage().encode() {
+            return Err(NativeRuntimeError::CatalogSnapshotMismatch);
+        }
+        Ok(())
+    }
+
+    fn require_catalog_v6(&self, root: PageId) -> Result<(), NativeRuntimeError> {
+        let page = self.buffer_pool.get_or_load(&self.pages, root)?;
+        if !matches!(
+            page.page().kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ) {
+            return Err(NativeRuntimeError::CatalogV2Unavailable);
+        }
+        let marker = BTree::from_root(root)
+            .get_cached_pinned(&self.pages, &self.buffer_pool, CATALOG_FORMAT_KEY)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if marker.bytes() == CATALOG_FORMAT_VALUE_V6 {
+            Ok(())
+        } else if marker.bytes() == CATALOG_FORMAT_VALUE_V3
+            || marker.bytes() == CATALOG_FORMAT_VALUE_V4
+            || marker.bytes() == CATALOG_FORMAT_VALUE_V5
+        {
+            Err(NativeRuntimeError::CatalogV2Unavailable)
+        } else {
+            Err(NativeRuntimeError::InvalidCatalogTree)
+        }
+    }
+
+    fn logical_catalog_object_at_root(
+        &self,
+        root: PageId,
+        id: ObjectId,
+    ) -> Result<Option<LogicalCatalogObject>, NativeRuntimeError> {
+        let Some(stored) = BTree::from_root(root).get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &catalog_object_key(id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let definition = decode_catalog_definition_storage_value(stored.bytes(), &self.blobs)?;
+        decode_logical_catalog_definition(&definition, id).map(Some)
+    }
+
+    fn logical_catalog_object_named_at_root(
+        &self,
+        root: PageId,
+        name: &QualifiedName,
+    ) -> Result<Option<LogicalCatalogObject>, NativeRuntimeError> {
+        let name_key = catalog_name_key_from_qualified(name)?;
+        let tree = BTree::from_root(root);
+        let Some(encoded_id) = tree.get_cached_pinned(&self.pages, &self.buffer_pool, &name_key)?
+        else {
+            return Ok(None);
+        };
+        let id = decode_catalog_name_value(encoded_id.bytes())?;
+        let object = self
+            .logical_catalog_object_at_root(root, id)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if catalog_name_key_from_qualified(object.name())? != name_key {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        Ok(Some(object))
+    }
+
     fn catalog_object_named_at_root(
         &self,
         root: PageId,
@@ -3004,9 +3778,12 @@ impl NativeDatabase {
                 .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
         ))
         .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
-        let object = self
-            .catalog_object_at_root(root, id)?
-            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        let Some(object) = self.catalog_object_at_root(root, id)? else {
+            if self.logical_catalog_object_at_root(root, id)?.is_some() {
+                return Ok(None);
+            }
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        };
         if catalog_name_key(object.header())? != name_key {
             return Err(NativeRuntimeError::InvalidCatalogTree);
         }
@@ -3055,7 +3832,10 @@ impl NativeDatabase {
                 })
                 .collect());
         }
-        if marker.bytes() != CATALOG_FORMAT_VALUE_V4 && marker.bytes() != CATALOG_FORMAT_VALUE_V5 {
+        if marker.bytes() != CATALOG_FORMAT_VALUE_V4
+            && marker.bytes() != CATALOG_FORMAT_VALUE_V5
+            && marker.bytes() != CATALOG_FORMAT_VALUE_V6
+        {
             return Err(NativeRuntimeError::InvalidCatalogTree);
         }
 
@@ -3113,6 +3893,9 @@ impl NativeDatabase {
             return Ok(None);
         };
         let definition = decode_catalog_definition_storage_value(stored.bytes(), &self.blobs)?;
+        if definition.starts_with(b"HYCOBJ02") {
+            return Ok(None);
+        }
         let object = CatalogObject::decode_definition(&definition)?;
         if object.header().id != id {
             return Err(NativeRuntimeError::InvalidCatalogTree);
@@ -4010,6 +4793,9 @@ impl NativeDatabase {
                 conflict_read_csn: snapshot.visible_csn,
                 transaction_id,
                 next_transaction_id: &mut self.next_transaction_id,
+                transaction_resolutions: &mut self.transaction_resolutions,
+                transaction_receipts: &mut self.transaction_receipts,
+                resolution: None,
                 batch: NativeWriteBatch {
                     snapshot,
                     state: MaterializedState::default(),
@@ -4020,6 +4806,7 @@ impl NativeDatabase {
                     search_format: self.search_format,
                     mode: NativeWriteBatchMode::PhysicalStructureExpiry,
                     delta: None,
+                    ann_consolidation: None,
                 },
             }
         } else {
@@ -4116,6 +4903,9 @@ impl NativeDatabase {
             conflict_read_csn: snapshot.visible_csn,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
             batch: NativeWriteBatch {
                 snapshot,
                 state: MaterializedState::default(),
@@ -4133,6 +4923,7 @@ impl NativeDatabase {
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalStructureCompaction,
                 delta: None,
+                ann_consolidation: None,
             },
         };
         let commit = match interruption {
@@ -4237,6 +5028,9 @@ impl NativeDatabase {
             conflict_read_csn: snapshot.visible_csn,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
             batch: NativeWriteBatch {
                 snapshot,
                 state: MaterializedState::default(),
@@ -4254,6 +5048,7 @@ impl NativeDatabase {
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalSearchCompaction,
                 delta: None,
+                ann_consolidation: None,
             },
         };
         let commit = match interruption {
@@ -4281,6 +5076,243 @@ impl NativeDatabase {
             reachable_pages_after,
             pages_appended,
             commit: Some(commit),
+        })
+    }
+
+    /// Captures and builds one bounded replacement ANN base without holding
+    /// writer admission or changing the current root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index, malformed root, invalid bounds,
+    /// or a capture larger than either caller-supplied bound.
+    pub fn plan_ann_consolidation(
+        &self,
+        index: ObjectId,
+        max_vectors: usize,
+        max_delta_records: usize,
+    ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        Ok(AnnConsolidationPlan {
+            inner: ann_store::plan_consolidation(
+                &self.pages,
+                root,
+                &catalog,
+                index,
+                max_vectors,
+                max_delta_records,
+            )?,
+        })
+    }
+
+    /// Returns a scheduler-compatible due signal from durable index metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or malformed current root.
+    pub fn ann_maintenance_status(
+        &self,
+        index: ObjectId,
+    ) -> Result<AnnMaintenanceStatus, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let status = ann_store::maintenance_status(&self.pages, root, &catalog, index)?;
+        Ok(AnnMaintenanceStatus {
+            index_id: index,
+            lifecycle: status.lifecycle,
+            delta_records: status.delta_records,
+            delta_bytes: status.delta_bytes,
+            due: status.due,
+        })
+    }
+
+    /// Builds a bounded consolidation plan only when policy marks it due.
+    ///
+    /// `None` is a scheduler no-op, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or malformed ANN index, invalid bounds,
+    /// or failure to read the current catalog, page, or ANN state.
+    pub fn plan_due_ann_consolidation(
+        &self,
+        index: ObjectId,
+        max_vectors: usize,
+    ) -> Result<Option<AnnConsolidationPlan>, NativeRuntimeError> {
+        let status = self.ann_maintenance_status(index)?;
+        if !status.due {
+            return Ok(None);
+        }
+        self.plan_ann_consolidation(
+            index,
+            max_vectors,
+            usize::try_from(status.lifecycle.delta_max_entries)
+                .map_err(|_| NativeRuntimeError::InvalidAnnConsolidationLimit)?,
+        )
+        .map(Some)
+    }
+
+    /// Atomically selects a captured ANN replacement through the ordinary root
+    /// commit protocol.
+    ///
+    /// Unchanged captured object deltas are consumed. Object deltas written
+    /// after capture remain above the replacement base. Publication rejects a
+    /// plan whose selected base generation has changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale plan, malformed root, persistence,
+    /// synchronization, WAL, or MVCC publication failure.
+    pub fn consolidate_ann(
+        &mut self,
+        plan: AnnConsolidationPlan,
+        durability: DurabilityClass,
+    ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
+        self.consolidate_ann_at(plan, durability, None)
+    }
+
+    /// Publishes ANN consolidation with one deterministic ordinary-commit
+    /// interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedCrash`] at the selected boundary,
+    /// or the same failures as [`Self::consolidate_ann`].
+    pub fn consolidate_ann_with_interruption(
+        &mut self,
+        plan: AnnConsolidationPlan,
+        durability: DurabilityClass,
+        boundary: CommitBoundary,
+    ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
+        self.consolidate_ann_at(plan, durability, Some(boundary))
+    }
+
+    fn consolidate_ann_at(
+        &mut self,
+        plan: AnnConsolidationPlan,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
+        if self.search_format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let before = ann_store::observe(&self.pages, root, &catalog, plan.inner.index())?;
+        if before.base_identity != plan.inner.base_identity() {
+            return Err(NativeRuntimeError::AnnConsolidationStale);
+        }
+        let previous_base_identity = plan.inner.base_identity();
+        let index_id = plan.inner.index();
+        let replacement_base_identity = plan.inner.replacement_identity();
+        let consumed_delta_records = plan.inner.captured_delta_count();
+        let effective_vector_count = plan.inner.effective_vector_count();
+        let mutation_value = ann_store::encode_consolidation_mutation(&plan.inner);
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        if root_transaction.base_roots() != snapshot.roots() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState {
+                    catalog,
+                    ..MaterializedState::default()
+                },
+                mutations: vec![Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::ConsolidateAnn,
+                    target: Some(plan.inner.index()),
+                    key: Vec::new(),
+                    value: mutation_value,
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, false, true],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalAnnConsolidation,
+                delta: None,
+                ann_consolidation: Some(plan.inner),
+            },
+        };
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+        let current = self.coordinator.snapshot(0)?;
+        let current_root = current
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let current_catalog = load_catalog_state(&self.pages, &self.blobs, current.roots())?;
+        let after = ann_store::observe(&self.pages, current_root, &current_catalog, index_id)?;
+        Ok(AnnConsolidationReceipt {
+            previous_base_identity,
+            replacement_base_identity,
+            consumed_delta_records,
+            effective_vector_count,
+            preserved_later_delta_records: after.delta_records,
+            commit,
+        })
+    }
+
+    /// Returns the selected ANN generation and base-plus-delta physical counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or malformed current root.
+    pub fn observe_ann_index(
+        &self,
+        index: ObjectId,
+    ) -> Result<AnnIndexObservation, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let observed = ann_store::observe(&self.pages, root, &catalog, index)?;
+        Ok(AnnIndexObservation {
+            base_identity: observed.base_identity,
+            view_identity: observed.view_identity,
+            base_vector_count: observed.base_vector_count,
+            effective_vector_count: observed.effective_vector_count,
+            delta_records: observed.delta_records,
+            delta_bytes: observed.delta_bytes,
+            generation_records: observed.generation_records,
+            selected_generation_records: observed.selected_generation_records,
+            lifecycle: observed.lifecycle,
+            maintenance_due: observed.maintenance_due,
         })
     }
 
@@ -6391,6 +7423,53 @@ impl NativeDatabase {
         Ok(entries)
     }
 
+    /// Returns one current physical stream family's TTL at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or malformed physical state.
+    pub fn ttl_latest_stream(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Ttl, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+            return Ok(Ttl::Missing);
+        };
+        let tree = BTree::from_root(root);
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_stream_meta_key(key)?,
+        )?
+        else {
+            return Ok(Ttl::Missing);
+        };
+        if is_structure_tombstone(metadata.bytes()) {
+            return Ok(Ttl::Missing);
+        }
+        let expiry = match metadata.bytes().len() {
+            8 => None,
+            16 => Some(i64::from_be_bytes(
+                metadata.bytes()[8..16]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )),
+            _ => return Err(NativeRuntimeError::InvalidStructureTree),
+        };
+        Ok(match expiry {
+            None => Ttl::Persistent,
+            Some(expiry) if expiry > logical_time_micros => {
+                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
+            }
+            Some(_) => Ttl::Missing,
+        })
+    }
+
     /// Reads one list cardinality directly from its physical metadata.
     ///
     /// # Errors
@@ -6661,6 +7740,45 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::UnknownStructureSortedSet);
         }
         usize::try_from(count).map_err(|_| NativeRuntimeError::InvalidStructureTree)
+    }
+
+    /// Returns one current physical sorted-set family's TTL at explicit logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage or malformed physical state.
+    pub fn ttl_latest_sorted_set(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Ttl, NativeRuntimeError> {
+        if !self.structure_format.is_btree() {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+            return Ok(Ttl::Missing);
+        };
+        let tree = BTree::from_root(root);
+        let Some(metadata) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_sorted_set_meta_key(key)?,
+        )?
+        else {
+            return Ok(Ttl::Missing);
+        };
+        if is_structure_tombstone(metadata.bytes()) {
+            return Ok(Ttl::Missing);
+        }
+        let (_, expiry) = decode_sorted_set_metadata_state(metadata.bytes())?;
+        Ok(match expiry {
+            None => Ttl::Persistent,
+            Some(expiry) if expiry > logical_time_micros => {
+                Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
+            }
+            Some(_) => Ttl::Missing,
+        })
     }
 
     /// Reads one member's zero-based ascending rank through both physical
@@ -7296,7 +8414,7 @@ impl NativeDatabase {
         Ok(ann_search_receipt(index, snapshot.visible_csn, result))
     }
 
-    /// Executes bounded ANN traversal with stable-ID allowlist post-filtering
+    /// Executes filter-aware ANN traversal or adaptive exact filtering
     /// against the current committed root set.
     ///
     /// # Errors
@@ -7452,6 +8570,7 @@ impl NativeDatabase {
             search_format: self.search_format,
             mode: NativeWriteBatchMode::Materialized,
             delta: None,
+            ann_consolidation: None,
         })
     }
 
@@ -7488,6 +8607,7 @@ impl NativeDatabase {
             search_format: self.search_format,
             mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
             delta: Some(DeltaOverlay::default()),
+            ann_consolidation: None,
         })
     }
 
@@ -8051,6 +9171,9 @@ impl NativeDatabase {
             conflict_read_csn: batch.snapshot.visible_csn,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
             batch,
         })
     }
@@ -8085,6 +9208,149 @@ impl NativeDatabase {
         self.commit_optimistic_at(batch, None)
     }
 
+    /// Commits a detached batch with an authorization-bound resolution record
+    /// durably reserved before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the durable resolution identity, when reserved, together with
+    /// any validation, persistence, synchronization, or publication failure.
+    pub fn commit_optimistic_resolved(
+        &mut self,
+        batch: NativeWriteBatch,
+        principal_hash: [u8; 32],
+        idempotency_token: [u8; 32],
+    ) -> Result<(DurableTransactionResolution, CommitReceipt), ResolvedCommitError> {
+        let resolution = self
+            .reserve_optimistic_resolution(principal_hash, idempotency_token)
+            .map_err(|error| {
+                let (resolution, source) = *error;
+                ResolvedCommitError {
+                    resolution: Box::new(resolution),
+                    source: Box::new(source),
+                }
+            })?;
+        let result = self.commit_optimistic_report_at(
+            batch,
+            None,
+            Some((principal_hash, idempotency_token, resolution)),
+        );
+        match result {
+            Ok(report) => Ok((resolution, report.commit)),
+            Err(source) => Err(ResolvedCommitError {
+                resolution: Box::new(Some(resolution)),
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    /// Commits a resolved detached batch with deterministic interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns the durable resolution identity, when reserved, together with
+    /// the injected interruption or another commit failure.
+    pub fn commit_optimistic_resolved_with_interruption(
+        &mut self,
+        batch: NativeWriteBatch,
+        principal_hash: [u8; 32],
+        idempotency_token: [u8; 32],
+        boundary: CommitBoundary,
+    ) -> Result<(DurableTransactionResolution, CommitReceipt), ResolvedCommitError> {
+        let resolution = self
+            .reserve_optimistic_resolution(principal_hash, idempotency_token)
+            .map_err(|error| {
+                let (resolution, source) = *error;
+                ResolvedCommitError {
+                    resolution: Box::new(resolution),
+                    source: Box::new(source),
+                }
+            })?;
+        let result = self.commit_optimistic_report_at(
+            batch,
+            Some(boundary),
+            Some((principal_hash, idempotency_token, resolution)),
+        );
+        match result {
+            Ok(report) => Ok((resolution, report.commit)),
+            Err(source) => Err(ResolvedCommitError {
+                resolution: Box::new(Some(resolution)),
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    fn reserve_optimistic_resolution(
+        &mut self,
+        principal_hash: [u8; 32],
+        idempotency_token: [u8; 32],
+    ) -> Result<
+        DurableTransactionResolution,
+        Box<(Option<DurableTransactionResolution>, NativeRuntimeError)>,
+    > {
+        if principal_hash == [0; 32] || idempotency_token == [0; 32] {
+            return Err(Box::new((
+                None,
+                NativeRuntimeError::InvalidPreparedMutation,
+            )));
+        }
+        if let Some(existing) =
+            self.transaction_resolution_for_token(principal_hash, idempotency_token)
+        {
+            return Err(Box::new((
+                Some(existing),
+                NativeRuntimeError::InvalidPreparedMutation,
+            )));
+        }
+        let runtime_transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| Box::new((None, NativeRuntimeError::TransactionIdExhausted)))?;
+        let resolution_id = loop {
+            let mut encoded = [0; 16];
+            getrandom::fill(&mut encoded).map_err(|error| {
+                Box::new((
+                    None,
+                    NativeRuntimeError::Io(std::io::Error::other(error.to_string())),
+                ))
+            })?;
+            if let Ok(id) = TransactionId::new(u128::from_le_bytes(encoded))
+                && !self.transaction_resolutions.contains_key(&id)
+            {
+                break id;
+            }
+        };
+        self.wal
+            .append_records(
+                vec![
+                    encode_outcome(
+                        resolution_id,
+                        runtime_transaction_id,
+                        principal_hash,
+                        idempotency_token,
+                        3,
+                        None,
+                    )
+                    .map_err(|error| (None, error.into()))?,
+                ],
+                true,
+            )
+            .map_err(|error| (None, error.into()))?;
+        self.next_transaction_id = runtime_transaction_id
+            .get()
+            .checked_add(1)
+            .ok_or((None, NativeRuntimeError::TransactionIdExhausted))?;
+        let resolution = DurableTransactionResolution {
+            resolution_id,
+            principal_hash,
+            idempotency_token,
+            outcome: DurableTransactionOutcome::OutcomeUnknown {
+                runtime_transaction_id,
+            },
+        };
+        self.transaction_resolutions
+            .insert(resolution_id, resolution);
+        Ok(resolution)
+    }
+
     /// Publishes a detached batch with one deterministic crash interruption.
     ///
     /// After an injected interruption the caller must drop the database handle
@@ -8107,7 +9373,7 @@ impl NativeDatabase {
         batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_optimistic_report_at(batch, interruption)
+        self.commit_optimistic_report_at(batch, interruption, None)
             .map(|report| report.commit)
     }
 
@@ -8115,13 +9381,14 @@ impl NativeDatabase {
         &mut self,
         batch: NativeWriteBatch,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
-        self.commit_optimistic_report_at(batch, None)
+        self.commit_optimistic_report_at(batch, None, None)
     }
 
     fn commit_optimistic_report_at(
         &mut self,
         mut batch: NativeWriteBatch,
         interruption: Option<CommitBoundary>,
+        resolution_binding: Option<([u8; 32], [u8; 32], DurableTransactionResolution)>,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
         if !matches!(
             batch.mode,
@@ -8155,9 +9422,19 @@ impl NativeDatabase {
             apply_mutations_to_state(&mut state, &batch.mutations)?;
             batch.state = state;
         }
-        let transaction_id = TransactionId::new(self.next_transaction_id)
-            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
-        NativeTransaction {
+        let transaction_id = resolution_binding.map_or_else(
+            || {
+                TransactionId::new(self.next_transaction_id)
+                    .map_err(|_| NativeRuntimeError::TransactionIdExhausted)
+            },
+            |(_, _, resolution)| match resolution.outcome {
+                DurableTransactionOutcome::OutcomeUnknown {
+                    runtime_transaction_id,
+                } => Ok(runtime_transaction_id),
+                _ => Err(NativeRuntimeError::InvalidPreparedMutation),
+            },
+        )?;
+        let mut transaction = NativeTransaction {
             pages: &mut self.pages,
             blobs: &mut self.blobs,
             wal: &mut self.wal,
@@ -8169,9 +9446,15 @@ impl NativeDatabase {
             conflict_read_csn,
             transaction_id,
             next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
             batch,
+        };
+        if let Some((_, _, resolution)) = resolution_binding {
+            transaction.resolution = Some(resolution);
         }
-        .commit_report_at(interruption)
+        transaction.commit_report_at(interruption)
     }
 
     /// Commits independent group-durability batches with one page and WAL sync.
@@ -8252,7 +9535,7 @@ impl NativeDatabase {
             });
         }
 
-        let storage_receipt = GroupCommitStorage {
+        let mut storage_receipt = GroupCommitStorage {
             pages: &mut self.pages,
             blobs: &mut self.blobs,
             wal: &mut self.wal,
@@ -8262,6 +9545,12 @@ impl NativeDatabase {
             search_format: self.search_format,
         }
         .commit(accepted, initial_state, interruption)?;
+        let execution_time = execution_started.elapsed();
+        for (_, receipt) in &mut storage_receipt.committed {
+            receipt.execution_time = execution_time;
+            receipt.page_synchronization_time = storage_receipt.page_synchronization_time;
+            receipt.wal_synchronization_time = storage_receipt.wal_synchronization_time;
+        }
         self.conflicts = conflicts_after_commit;
         self.next_transaction_id = next_transaction_id;
         for (request_index, receipt) in storage_receipt.committed {
@@ -8273,7 +9562,7 @@ impl NativeDatabase {
             accepted_commits,
             page_synchronizations: 1,
             wal_synchronizations: 1,
-            execution_time: execution_started.elapsed(),
+            execution_time,
             page_synchronization_time: storage_receipt.page_synchronization_time,
             wal_synchronization_time: storage_receipt.wal_synchronization_time,
         })
@@ -8313,6 +9602,7 @@ impl NativeDatabase {
         &mut self,
         interruption: Option<VacuumBoundary>,
     ) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        let execution_started = Instant::now();
         let current = self.coordinator.snapshot(0)?;
         let previous_generation = current.roots().page_generation();
         let previous_page_count = self.pages.page_count();
@@ -8369,7 +9659,6 @@ impl NativeDatabase {
             },
             interruption,
         )?;
-
         for (slot, page) in ROOT_SLOTS.into_iter().zip(candidate.roots) {
             root_transaction.set_root(slot, page);
         }
@@ -8409,6 +9698,10 @@ impl NativeDatabase {
                 durability: DurabilityClass::Strict,
                 durability_cohort_size: 1,
                 durability_cohort_position: 0,
+                execution_time: execution_started.elapsed(),
+                wal_append_time: wal_receipt.append_time,
+                page_synchronization_time: Duration::ZERO,
+                wal_synchronization_time: wal_receipt.synchronization_time,
             }),
         })
     }
@@ -8507,6 +9800,8 @@ impl NativeDatabase {
             .checked_add(1)
             .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
         self.last_checkpoint_lsn = Some(block.last_lsn);
+        self.last_checkpoint_visible_csn = Some(visible_csn);
+        self.last_checkpoint_manifest_digest = Some(manifest.digest());
         Ok(CheckpointReceipt {
             transaction_id,
             visible_csn,
@@ -8618,6 +9913,11 @@ impl NativeDatabase {
     }
 
     fn prepare_wal_retention(&self) -> Result<PreparedWalRetention, NativeRuntimeError> {
+        if !self.transaction_resolutions.is_empty() {
+            // Resolution records currently live in WAL authority; retention
+            // must not discard them before an anchor format carries them.
+            return Err(NativeRuntimeError::WalRetentionIneligible);
+        }
         let snapshot = self.coordinator.snapshot(0)?;
         let visible_csn = snapshot
             .visible_csn
@@ -9122,7 +10422,7 @@ fn read_list_range_from_tail(
     Ok(segments.into_iter().flatten().collect())
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct DeltaOverlay {
     relational_rows: BTreeSet<(ObjectId, Vec<u8>)>,
     structure_scalars: BTreeSet<Vec<u8>>,
@@ -9140,7 +10440,7 @@ struct DeltaUniqueProbe {
 ///
 /// A batch owns no file handle and holds no writer guard. It may be prepared
 /// concurrently and later submitted to [`NativeDatabase::commit_optimistic`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeWriteBatch {
     snapshot: Snapshot,
     state: MaterializedState,
@@ -9151,6 +10451,7 @@ pub struct NativeWriteBatch {
     search_format: SearchFormat,
     mode: NativeWriteBatchMode,
     delta: Option<DeltaOverlay>,
+    ann_consolidation: Option<ann_store::ConsolidationPlan>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9160,6 +10461,7 @@ enum NativeWriteBatchMode {
     PhysicalStructureExpiry,
     PhysicalStructureCompaction,
     PhysicalSearchCompaction,
+    PhysicalAnnConsolidation,
 }
 
 #[derive(Debug)]
@@ -9297,7 +10599,9 @@ impl GroupCommitStorage<'_, '_> {
             page_generation,
             retention_floor_csn,
         })?;
+        let wal_append_started = Instant::now();
         let receipts = self.wal.append_records(pending, false)?;
+        let wal_append_time = wal_append_started.elapsed();
         let block = receipts.last().ok_or(WalError::EmptyBlock)?;
         let commit_lsn = block.last_lsn;
         let wal_block_digest = block.digest;
@@ -9318,6 +10622,10 @@ impl GroupCommitStorage<'_, '_> {
                 durability: DurabilityClass::Group,
                 durability_cohort_size: cohort_size,
                 durability_cohort_position: cohort_position,
+                execution_time: Duration::ZERO,
+                wal_append_time,
+                page_synchronization_time: Duration::ZERO,
+                wal_synchronization_time: Duration::ZERO,
             },
         ))
     }
@@ -9341,6 +10649,9 @@ pub struct NativeTransaction<'database> {
     conflict_read_csn: Option<Csn>,
     transaction_id: TransactionId,
     next_transaction_id: &'database mut u128,
+    transaction_resolutions: &'database mut BTreeMap<TransactionId, DurableTransactionResolution>,
+    transaction_receipts: &'database mut BTreeMap<TransactionId, CommitReceipt>,
+    resolution: Option<DurableTransactionResolution>,
     batch: NativeWriteBatch,
 }
 
@@ -9359,6 +10670,39 @@ impl DerefMut for NativeTransaction<'_> {
 }
 
 impl NativeWriteBatch {
+    /// Returns the next catalog identity owned by this transaction's private
+    /// catalog state.
+    ///
+    /// Creating an object advances the returned identity, allowing one batch
+    /// to allocate a related physical object set without a second authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog identity space is exhausted.
+    pub fn next_catalog_object_id(&self) -> Result<ObjectId, NativeRuntimeError> {
+        self.state.catalog.next_object_id().map_err(Into::into)
+    }
+
+    /// Returns the number of physical mutations currently retained by this batch.
+    pub fn mutation_count(&self) -> usize {
+        self.mutations.len()
+    }
+
+    /// Returns the deterministic logical time fixed when this batch began.
+    pub const fn logical_time_micros(&self) -> i64 {
+        self.snapshot.logical_time_micros
+    }
+
+    /// Returns one V1-compatible catalog definition from the batch snapshot.
+    pub fn catalog_object(&self, id: ObjectId) -> Option<&CatalogObject> {
+        self.state.catalog.object(id)
+    }
+
+    /// Returns one logical V2 catalog definition from the batch snapshot.
+    pub fn logical_catalog_object(&self, id: ObjectId) -> Option<&LogicalCatalogObject> {
+        self.state.catalog.logical_object(id)
+    }
+
     /// Executes one statement in the current native SQL slice.
     ///
     /// The supported grammar includes typed `CREATE TABLE`, `CREATE INDEX`
@@ -9399,6 +10743,36 @@ impl NativeWriteBatch {
     /// Returns an error for invalid names or duplicate catalog identity/name.
     pub fn create_relation(&mut self, id: ObjectId, name: &str) -> Result<(), NativeRuntimeError> {
         self.create_relation_definition(binary_relation_definition(id, name)?)
+    }
+
+    /// Creates one generic logical catalog V2 object without projecting it
+    /// into any engine's physical data namespace.
+    ///
+    /// Dependencies must already exist in this transaction's immutable catalog
+    /// view. The complete canonical `HYCOBJ02` definition is carried by WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid hierarchy, dependencies, duplicate ID/name,
+    /// or a noncanonical definition.
+    pub fn create_catalog_object_v2(
+        &mut self,
+        object: LogicalCatalogObject,
+    ) -> Result<(), NativeRuntimeError> {
+        let id = object.id();
+        let encoded_definition = object.encode_definition_v2()?;
+        let name_identity = catalog_name_identity_from_qualified(object.name())?;
+        self.state.catalog.create_logical(object)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Kernel,
+            opcode: Opcode::CreateCatalogObjectV2,
+            target: Some(id),
+            key: name_identity,
+            value: encoded_definition,
+            expires_at_micros: None,
+        });
+        self.dirty[0] = true;
+        Ok(())
     }
 
     fn create_relation_definition(
@@ -11964,16 +13338,42 @@ impl NativeWriteBatch {
         metric: VectorMetric,
         config: HnswConfig,
     ) -> Result<(), NativeRuntimeError> {
+        self.create_vector_index_with_lifecycle(
+            id,
+            name,
+            dimension,
+            metric,
+            config,
+            ann_store::DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
+        )
+    }
+
+    /// Creates one catalog-bound vector index with durable lifecycle policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ANN or lifecycle bounds, duplicate
+    /// identity/name, or unsupported search storage.
+    pub fn create_vector_index_with_lifecycle(
+        &mut self,
+        id: ObjectId,
+        name: &str,
+        dimension: u16,
+        metric: VectorMetric,
+        config: HnswConfig,
+        lifecycle: IncrementalVectorLifecycle,
+    ) -> Result<(), NativeRuntimeError> {
         if self.search_format == SearchFormat::InlineStateV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
+        lifecycle.validate()?;
         let definition = vector_search_definition(id, name, dimension, metric, config)?;
         let native_definition = ann_store::definition_from_search(&definition)?;
         let object = CatalogObject::Search(definition);
-        let encoded_definition = object.encode_definition()?;
+        let encoded_definition = encode_ann_creation(&object, lifecycle)?;
         let name_identity = catalog_name_identity(object.header())?;
         self.state.catalog.create(object)?;
-        self.state.ann.create(native_definition)?;
+        self.state.ann.create(native_definition, lifecycle)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Search,
             opcode: Opcode::CreateAnnIndex,
@@ -12102,7 +13502,7 @@ impl NativeWriteBatch {
         Ok(ann_search_receipt(index, self.snapshot.visible_csn, result))
     }
 
-    /// Executes bounded ANN traversal with stable-ID allowlist post-filtering
+    /// Executes filter-aware ANN traversal or adaptive exact filtering
     /// over the snapshot plus private writes.
     ///
     /// # Errors
@@ -12167,6 +13567,93 @@ impl NativeWriteBatch {
 }
 
 impl NativeTransaction<'_> {
+    /// Reserves a durable product outcome identity before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero identities, conflicting reservations, random
+    /// identity generation failure, or WAL append/synchronization failure.
+    pub fn begin_resolution(
+        &mut self,
+        principal_hash: [u8; 32],
+        idempotency_token: [u8; 32],
+    ) -> Result<DurableTransactionResolution, NativeRuntimeError> {
+        if principal_hash == [0; 32] || idempotency_token == [0; 32] {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        if let Some(existing) = self.transaction_resolutions.values().find(|resolution| {
+            resolution.principal_hash == principal_hash
+                && resolution.idempotency_token == idempotency_token
+        }) {
+            let runtime_transaction_id = match existing.outcome {
+                DurableTransactionOutcome::Committed {
+                    runtime_transaction_id,
+                    ..
+                }
+                | DurableTransactionOutcome::RolledBack {
+                    runtime_transaction_id,
+                }
+                | DurableTransactionOutcome::OutcomeUnknown {
+                    runtime_transaction_id,
+                } => runtime_transaction_id,
+            };
+            if runtime_transaction_id == self.transaction_id {
+                return Ok(*existing);
+            }
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let resolution_id = loop {
+            let mut encoded = [0; 16];
+            getrandom::fill(&mut encoded).map_err(|error| {
+                NativeRuntimeError::Io(std::io::Error::other(error.to_string()))
+            })?;
+            if let Ok(id) = TransactionId::new(u128::from_le_bytes(encoded))
+                && !self.transaction_resolutions.contains_key(&id)
+            {
+                break id;
+            }
+        };
+        let pending = encode_outcome(
+            resolution_id,
+            self.transaction_id,
+            principal_hash,
+            idempotency_token,
+            3,
+            None,
+        )?;
+        self.wal.append_records(vec![pending], true)?;
+        let resolution = DurableTransactionResolution {
+            resolution_id,
+            principal_hash,
+            idempotency_token,
+            outcome: DurableTransactionOutcome::OutcomeUnknown {
+                runtime_transaction_id: self.transaction_id,
+            },
+        };
+        self.transaction_resolutions
+            .insert(resolution_id, resolution);
+        self.resolution = Some(resolution);
+        Ok(resolution)
+    }
+
+    /// Returns the stable runtime identity allocated before publication.
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the transaction and commit identities reserved for this private
+    /// write set before publication.
+    ///
+    /// These identities become the returned receipt identities if this exact
+    /// transaction commits successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the MVCC sequence cannot advance.
+    pub fn pending_commit_identity(&self) -> Result<(TransactionId, Csn), NativeRuntimeError> {
+        Ok((self.transaction_id, self.root_transaction.commit_csn()?))
+    }
+
     /// Commits through the normal native path.
     ///
     /// # Errors
@@ -12235,29 +13722,23 @@ impl NativeTransaction<'_> {
         let roots = roots_from_snapshot(batch.snapshot.roots());
         let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
         let staged_blobs = stage_large_values(self.blobs, &batch, rebuild_catalog, synchronize)?;
-        interrupt(interruption, CommitBoundary::BlobStaged)?;
-        let blob_references = publish_staged_blobs(self.blobs, staged_blobs, synchronize)?;
-        let blob_generation = self.blobs.generation()?;
-        interrupt(interruption, CommitBoundary::BlobPromoted)?;
-
-        let roots = commit_engine_roots(
+        let page_commit = commit_pages_and_blobs(
             self.pages,
             self.blobs,
-            roots,
-            self.relational_format,
-            self.structure_format,
-            self.search_format,
-            commit_csn,
-            &batch,
-            &blob_references,
+            PageCommitInput {
+                roots,
+                relational_format: self.relational_format,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                commit_csn,
+                batch: &batch,
+                staged_blobs,
+                synchronize,
+                interruption,
+            },
         )?;
-        interrupt(interruption, CommitBoundary::PageAppended)?;
-        let page_synchronization_time =
-            measure_optional_synchronization(synchronize, || self.pages.sync_data())?;
-        interrupt(interruption, CommitBoundary::PageSynchronized)?;
 
-        let concrete_roots = require_roots(roots)?;
-        let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
+        let wal_mutations = wal_mutations(&batch.mutations, &page_commit.blob_references)?;
         let page_generation = self.root_transaction.base_roots().page_generation();
         let retention_floor_csn = self
             .root_transaction
@@ -12272,22 +13753,25 @@ impl NativeTransaction<'_> {
             durability: batch.durability,
             mutations: &wal_mutations,
             commit_csn,
-            roots: concrete_roots,
-            blob_generation,
+            roots: page_commit.roots,
+            blob_generation: page_commit.blob_generation,
             page_generation,
             retention_floor_csn,
         })?;
+        let wal_append_started = Instant::now();
         let receipts = self.wal.append_records(pending, false)?;
+        let wal_append_time = wal_append_started.elapsed();
         interrupt(interruption, CommitBoundary::WalAppended)?;
         let wal_synchronization_time =
             measure_optional_synchronization(synchronize, || self.wal.sync_data())?;
         interrupt(interruption, CommitBoundary::WalSynchronized)?;
 
         let block = receipts.last().ok_or(WalError::EmptyBlock)?;
-        for (slot, page) in ROOT_SLOTS.into_iter().zip(concrete_roots) {
+        for (slot, page) in ROOT_SLOTS.into_iter().zip(page_commit.roots) {
             self.root_transaction.set_root(slot, page);
         }
-        self.root_transaction.set_blob_generation(blob_generation);
+        self.root_transaction
+            .set_blob_generation(page_commit.blob_generation);
         self.root_transaction.commit(
             catalog_version,
             WalAnchor::new(block.last_lsn, block.digest)?,
@@ -12298,23 +13782,66 @@ impl NativeTransaction<'_> {
             .get()
             .checked_add(1)
             .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
-        interrupt(interruption, CommitBoundary::RootPublished)?;
-        Ok(SingletonCommitReport {
-            commit: CommitReceipt {
-                transaction_id: self.transaction_id,
-                commit_csn,
-                catalog_version,
-                commit_lsn: block.last_lsn,
-                wal_block_digest: block.digest,
-                durability: batch.durability,
-                durability_cohort_size: 1,
-                durability_cohort_position: 0,
-            },
-            execution_time: execution_started.elapsed(),
-            page_synchronization_time,
+        let execution_time = execution_started.elapsed();
+        let commit = CommitReceipt {
+            transaction_id: self.transaction_id,
+            commit_csn,
+            catalog_version,
+            commit_lsn: block.last_lsn,
+            wal_block_digest: block.digest,
+            durability: batch.durability,
+            durability_cohort_size: 1,
+            durability_cohort_position: 0,
+            execution_time,
+            wal_append_time,
+            page_synchronization_time: page_commit.page_synchronization_time,
             wal_synchronization_time,
-        })
+        };
+        self.transaction_receipts
+            .insert(self.transaction_id, commit);
+        if let Some(mut resolution) = self.resolution {
+            resolution.outcome = DurableTransactionOutcome::Committed {
+                runtime_transaction_id: self.transaction_id,
+                commit_csn,
+            };
+            self.transaction_resolutions
+                .insert(resolution.resolution_id, resolution);
+        }
+        interrupt(interruption, CommitBoundary::RootPublished)?;
+        Ok(SingletonCommitReport { commit })
     }
+}
+
+fn commit_pages_and_blobs(
+    pages: &mut PageStore,
+    blobs: &mut BlobStore,
+    input: PageCommitInput<'_>,
+) -> Result<PageCommitOutput, NativeRuntimeError> {
+    interrupt(input.interruption, CommitBoundary::BlobStaged)?;
+    let blob_references = publish_staged_blobs(blobs, input.staged_blobs, input.synchronize)?;
+    let blob_generation = blobs.generation()?;
+    interrupt(input.interruption, CommitBoundary::BlobPromoted)?;
+    let roots = commit_engine_roots(
+        pages,
+        blobs,
+        input.roots,
+        input.relational_format,
+        input.structure_format,
+        input.search_format,
+        input.commit_csn,
+        input.batch,
+        &blob_references,
+    )?;
+    interrupt(input.interruption, CommitBoundary::PageAppended)?;
+    let page_synchronization_time =
+        measure_optional_synchronization(input.synchronize, || pages.sync_data())?;
+    interrupt(input.interruption, CommitBoundary::PageSynchronized)?;
+    Ok(PageCommitOutput {
+        roots: require_roots(roots)?,
+        blob_generation,
+        page_synchronization_time,
+        blob_references,
+    })
 }
 
 fn apply_structure_mutation(
@@ -12768,6 +14295,7 @@ fn apply_mutations_to_state(
 ) -> Result<(), NativeRuntimeError> {
     for mutation in mutations {
         match mutation.opcode {
+            Opcode::CreateCatalogObjectV2 => apply_catalog_v2_creation(state, mutation)?,
             Opcode::CreateTable
             | Opcode::InsertRow
             | Opcode::UpdateRow
@@ -12810,7 +14338,10 @@ fn apply_mutations_to_state(
             | Opcode::ExpireStream => {
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
-            Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch => {
+            Opcode::CompactStructure
+            | Opcode::VacuumPageGeneration
+            | Opcode::CompactSearch
+            | Opcode::ConsolidateAnn => {
                 validate_maintenance_mutation(mutation)?;
             }
             Opcode::CreateIndex
@@ -12822,6 +14353,27 @@ fn apply_mutations_to_state(
             | Opcode::DeleteVector => apply_search_mutation_to_state(state, mutation)?,
         }
     }
+    Ok(())
+}
+
+fn apply_catalog_v2_creation(
+    state: &mut MaterializedState,
+    mutation: &Mutation,
+) -> Result<(), NativeRuntimeError> {
+    let id = mutation
+        .target
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    if mutation.engine != EngineKind::Kernel
+        || mutation.key.is_empty()
+        || mutation.expires_at_micros.is_some()
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    let object = LogicalCatalogObject::decode_definition_v2(&mutation.value)?;
+    if object.id() != id || mutation.key != catalog_name_identity_from_qualified(object.name())? {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    state.catalog.create_logical(object)?;
     Ok(())
 }
 
@@ -12864,13 +14416,13 @@ fn apply_search_mutation_to_state(
             state.search.delete_document(index, &mutation.key)?;
         }
         Opcode::CreateAnnIndex => {
-            let object = decode_ann_creation(index, mutation)?;
+            let (object, lifecycle) = decode_ann_creation(index, mutation)?;
             let CatalogObject::Search(definition) = &object else {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             };
             let definition = ann_store::definition_from_search(definition)?;
             state.catalog.create(object)?;
-            state.ann.create(definition)?;
+            state.ann.create(definition, lifecycle)?;
         }
         Opcode::UpsertVector => state.ann.upsert(
             index,
@@ -12895,13 +14447,15 @@ fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntim
     let expected_engine = match mutation.opcode {
         Opcode::CompactStructure => EngineKind::Structure,
         Opcode::VacuumPageGeneration => EngineKind::Kernel,
-        Opcode::CompactSearch => EngineKind::Search,
+        Opcode::CompactSearch | Opcode::ConsolidateAnn => EngineKind::Search,
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     };
     if mutation.engine != expected_engine
-        || mutation.target.is_some()
+        || (mutation.opcode != Opcode::ConsolidateAnn && mutation.target.is_some())
         || !mutation.key.is_empty()
-        || !mutation.value.is_empty()
+        || (mutation.opcode != Opcode::ConsolidateAnn && !mutation.value.is_empty())
+        || (mutation.opcode == Opcode::ConsolidateAnn
+            && (mutation.target.is_none() || mutation.value.len() != 112))
         || mutation.expires_at_micros.is_some()
     {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -13132,6 +14686,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             }
             Opcode::CompactStructure => vec![5],
             Opcode::CompactSearch => vec![6],
+            Opcode::ConsolidateAnn => vec![7],
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
@@ -13141,6 +14696,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 | Opcode::CreateSecondaryIndex
                 | Opcode::CreateIndex
                 | Opcode::CreateAnnIndex
+                | Opcode::CreateCatalogObjectV2
         ) {
             if let Some(object) = mutation.target {
                 keys.push(catalog_object_lifecycle_write_key(object));
@@ -13457,7 +15013,9 @@ fn interrupt_blob_collection(
 
 struct CheckpointValidation {
     last_checkpoint_lsn: Option<Lsn>,
+    latest_visible_csn: Option<Csn>,
     latest_generation: Option<ManifestGeneration>,
+    latest_digest: Option<[u8; 32]>,
     unanchored_manifest_suffix: usize,
 }
 
@@ -13523,6 +15081,82 @@ fn recover_snapshot_pin_files(
         collect_page_generation_files(data_directory, active_page_generation, &pinned_generations)?
             .removed_files,
     )
+}
+
+fn validate_open_snapshots(
+    data_directory: &Path,
+    pins: &mut SnapshotPinStore,
+    wal: &WalOpenState,
+    committed_roots: &BTreeMap<Csn, RootSet>,
+    retention_anchor: Option<&WalRetentionAnchor>,
+    blobs: &BlobStore,
+    active_page_generation: PageGeneration,
+) -> Result<(CheckpointValidation, usize), NativeRuntimeError> {
+    let checkpoint_validation = validate_checkpoints(
+        &wal.recovered_wal,
+        &wal.manifest_recovery.manifests,
+        committed_roots,
+        retention_anchor,
+    )?;
+    let recovered_page_generation_files = recover_snapshot_pin_files(
+        data_directory,
+        pins,
+        &wal.manifest_recovery.manifests,
+        &wal.recovered_wal,
+        retention_anchor,
+        blobs,
+        active_page_generation,
+    )?;
+    Ok((checkpoint_validation, recovered_page_generation_files))
+}
+
+fn finish_open_recovery(
+    data_directory: &Path,
+    pins: &mut SnapshotPinStore,
+    wal: &mut WalOpenState,
+    committed_roots: &BTreeMap<Csn, RootSet>,
+    retention_anchor: Option<WalRetentionAnchor>,
+    blobs: &BlobStore,
+    active_page_generation: PageGeneration,
+) -> Result<OpenRecoveryState, NativeRuntimeError> {
+    let (checkpoint_validation, recovered_page_generation_files) = validate_open_snapshots(
+        data_directory,
+        pins,
+        wal,
+        committed_roots,
+        retention_anchor.as_ref(),
+        blobs,
+        active_page_generation,
+    )?;
+    let transaction_resolutions = recover_transaction_resolutions(&wal.recovered_wal)?;
+    let recovered_outcome_updates = transaction_resolutions
+        .values()
+        .filter(|resolution| {
+            wal.recovered_wal.outcomes.iter().any(|outcome| {
+                outcome.resolution_id == resolution.resolution_id
+                    && outcome.state == 3
+                    && !matches!(
+                        resolution.outcome,
+                        DurableTransactionOutcome::OutcomeUnknown { .. }
+                    )
+            })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    persist_recovered_outcome_updates(&mut wal.opened_wal.wal, &recovered_outcome_updates)?;
+    let transaction_receipts =
+        recover_transaction_receipts(&wal.recovered_wal, &wal.opened_wal.recovery)?;
+    let (manifest_prune, manifest_pruning_time) =
+        prune_recovered_manifest_prefix(&mut wal.manifests, retention_anchor)?;
+    cleanup_stale_wal_anchors(&mut wal.wal_retention, retention_anchor)?;
+    Ok(OpenRecoveryState {
+        transaction_resolutions,
+        transaction_receipts,
+        checkpoint_validation,
+        recovered_page_generation_files,
+        manifest_prune,
+        manifest_pruning_time,
+    })
 }
 
 fn snapshot_pin_has_checkpoint_authority(
@@ -13604,9 +15238,15 @@ fn validate_checkpoints(
         last_checkpoint_lsn: latest
             .map(|checkpoint| checkpoint.checkpoint_lsn)
             .or_else(|| base_anchor.map(|anchor| anchor.fields().retired_checkpoint_lsn)),
+        latest_visible_csn: latest
+            .map(|checkpoint| checkpoint.visible_csn)
+            .or_else(|| base_anchor.map(|anchor| anchor.fields().base_visible_csn)),
         latest_generation: latest
             .map(|checkpoint| checkpoint.manifest_generation)
             .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_generation)),
+        latest_digest: latest
+            .map(|checkpoint| checkpoint.manifest_digest)
+            .or_else(|| base_anchor.map(|anchor| anchor.fields().manifest_digest)),
         unanchored_manifest_suffix,
     })
 }
@@ -13678,6 +15318,7 @@ fn commit_engine_roots(
                 state: &batch.state.search,
                 mutations: &batch.mutations,
                 blob_references,
+                ann_consolidation: batch.ann_consolidation.as_ref(),
             },
         )?;
     }
@@ -13699,8 +15340,10 @@ fn catalog_requires_full_rebuild(
                 .get(pages, CATALOG_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
             match marker.as_slice() {
-                CATALOG_FORMAT_VALUE_V5 => Ok(false),
-                CATALOG_FORMAT_VALUE_V3 | CATALOG_FORMAT_VALUE_V4 => Ok(true),
+                CATALOG_FORMAT_VALUE_V6 => Ok(false),
+                CATALOG_FORMAT_VALUE_V3 | CATALOG_FORMAT_VALUE_V4 | CATALOG_FORMAT_VALUE_V5 => {
+                    Ok(true)
+                }
                 _ => Err(NativeRuntimeError::InvalidCatalogTree),
             }
         }
@@ -13730,18 +15373,37 @@ fn catalog_root_after_mutations(
             .values()
             .filter(|object| matches!(object, CatalogObject::SecondaryIndex(_)))
             .count();
+        let dependency_entries = catalog
+            .objects
+            .values()
+            .map(CatalogObject::dependencies)
+            .chain(
+                catalog
+                    .logical_objects
+                    .values()
+                    .map(LogicalCatalogObject::dependencies),
+            )
+            .try_fold(0_usize, |count, dependencies| {
+                count
+                    .checked_add(dependencies.len().saturating_mul(2))
+                    .ok_or(NativeRuntimeError::InvalidCatalogTree)
+            })?;
         let mut entries = Vec::with_capacity(
             catalog
                 .objects
                 .len()
                 .checked_mul(2)
                 .and_then(|count| count.checked_add(secondary_indexes))
+                .and_then(|count| {
+                    count.checked_add(catalog.logical_objects.len().saturating_mul(2))
+                })
+                .and_then(|count| count.checked_add(dependency_entries))
                 .and_then(|count| count.checked_add(2))
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
         );
         entries.push((
             CATALOG_FORMAT_KEY.to_vec(),
-            CATALOG_FORMAT_VALUE_V5.to_vec(),
+            CATALOG_FORMAT_VALUE_V6.to_vec(),
         ));
         entries.push((
             CATALOG_ID_AUTHORITY_KEY.to_vec(),
@@ -13753,6 +15415,9 @@ fn catalog_root_after_mutations(
         ));
         for object in catalog.objects.values() {
             append_catalog_object_entries(&mut entries, object, blob_references)?;
+        }
+        for object in catalog.logical_objects.values() {
+            append_logical_catalog_object_entries(&mut entries, object, blob_references)?;
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         BTree::empty()
@@ -13775,14 +15440,14 @@ fn catalog_root_after_mutations(
             .filter(|mutation| is_catalog_creation(mutation.opcode))
         {
             let object = catalog_object_from_creation_mutation(mutation)?;
-            let object_key = catalog_object_key(object.header().id);
-            let name_key = catalog_name_key(object.header())?;
+            let object_key = catalog_object_key(object.id());
+            let name_key = catalog_name_key_from_qualified(object.name())?;
             if existing.get(pages, &object_key)?.is_some()
                 || existing.get(pages, &name_key)?.is_some()
             {
                 return Err(NativeRuntimeError::InvalidCatalogTree);
             }
-            append_catalog_object_entries(&mut entries, &object, blob_references)?;
+            append_any_catalog_object_entries(&mut entries, &object, blob_references)?;
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         existing
@@ -13816,7 +15481,80 @@ fn append_catalog_object_entries(
             Vec::new(),
         ));
     }
+    for edge in object.dependencies() {
+        entries.push((
+            catalog_dependency_key(edge, DependencyDirection::Outgoing),
+            Vec::new(),
+        ));
+        entries.push((
+            catalog_dependency_key(edge, DependencyDirection::Incoming),
+            Vec::new(),
+        ));
+    }
     Ok(())
+}
+
+fn append_logical_catalog_object_entries(
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    object: &LogicalCatalogObject,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<(), NativeRuntimeError> {
+    let definition = object.encode_definition_v2()?;
+    entries.push((
+        catalog_object_key(object.id()),
+        catalog_definition_storage_value(&definition, blob_references)?,
+    ));
+    entries.push((
+        catalog_name_key_from_qualified(object.name())?,
+        object.id().get().to_be_bytes().to_vec(),
+    ));
+    for edge in object.dependencies() {
+        entries.push((
+            catalog_dependency_key(edge, DependencyDirection::Outgoing),
+            Vec::new(),
+        ));
+        entries.push((
+            catalog_dependency_key(edge, DependencyDirection::Incoming),
+            Vec::new(),
+        ));
+    }
+    Ok(())
+}
+
+enum PersistedCatalogObject {
+    Legacy(CatalogObject),
+    Logical(LogicalCatalogObject),
+}
+
+impl PersistedCatalogObject {
+    const fn id(&self) -> ObjectId {
+        match self {
+            Self::Legacy(object) => object.header().id,
+            Self::Logical(object) => object.id(),
+        }
+    }
+
+    const fn name(&self) -> &QualifiedName {
+        match self {
+            Self::Legacy(object) => &object.header().name,
+            Self::Logical(object) => object.name(),
+        }
+    }
+}
+
+fn append_any_catalog_object_entries(
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    object: &PersistedCatalogObject,
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<(), NativeRuntimeError> {
+    match object {
+        PersistedCatalogObject::Legacy(object) => {
+            append_catalog_object_entries(entries, object, blob_references)
+        }
+        PersistedCatalogObject::Logical(object) => {
+            append_logical_catalog_object_entries(entries, object, blob_references)
+        }
+    }
 }
 
 fn catalog_definition_storage_value(
@@ -13854,6 +15592,164 @@ fn catalog_object_key(id: ObjectId) -> Vec<u8> {
     key.push(CATALOG_OBJECT_PREFIX);
     key.extend_from_slice(&id.get().to_be_bytes());
     key
+}
+
+fn decode_catalog_object_key(key: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
+    if key.len() != 17 || key.first() != Some(&CATALOG_OBJECT_PREFIX) {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    ObjectId::new(u128::from_be_bytes(
+        key[1..]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)
+}
+
+fn decode_catalog_name_value(value: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
+    if value.len() != 16 {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    ObjectId::new(u128::from_be_bytes(
+        value
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)
+}
+
+fn catalog_dependency_prefix(object: ObjectId, direction: DependencyDirection) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(match direction {
+        DependencyDirection::Outgoing => CATALOG_DEPENDENCY_OUTGOING_PREFIX,
+        DependencyDirection::Incoming => CATALOG_DEPENDENCY_INCOMING_PREFIX,
+    });
+    key.extend_from_slice(&object.get().to_be_bytes());
+    key
+}
+
+fn catalog_dependency_cursor_key(
+    object: ObjectId,
+    direction: DependencyDirection,
+    adjacent: ObjectId,
+) -> Vec<u8> {
+    let mut key = catalog_dependency_prefix(object, direction);
+    key.extend_from_slice(&adjacent.get().to_be_bytes());
+    key.push(u8::MAX);
+    key
+}
+
+fn catalog_dependency_key(edge: DependencyEdge, direction: DependencyDirection) -> Vec<u8> {
+    let (object, adjacent) = match direction {
+        DependencyDirection::Outgoing => (edge.dependent, edge.prerequisite),
+        DependencyDirection::Incoming => (edge.prerequisite, edge.dependent),
+    };
+    let mut key = catalog_dependency_prefix(object, direction);
+    key.extend_from_slice(&adjacent.get().to_be_bytes());
+    key.push(edge.kind as u8);
+    key
+}
+
+fn decode_catalog_dependency_entry(
+    key: &[u8],
+    value: &[u8],
+    direction: DependencyDirection,
+) -> Result<(DependencyEdge, ObjectId), NativeRuntimeError> {
+    let expected_prefix = match direction {
+        DependencyDirection::Outgoing => CATALOG_DEPENDENCY_OUTGOING_PREFIX,
+        DependencyDirection::Incoming => CATALOG_DEPENDENCY_INCOMING_PREFIX,
+    };
+    if key.len() != 34 || key.first() != Some(&expected_prefix) || !value.is_empty() {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let object = ObjectId::new(u128::from_be_bytes(
+        key[1..17]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+    let adjacent = ObjectId::new(u128::from_be_bytes(
+        key[17..33]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+    let kind = match key[33] {
+        1 => DependencyKind::Parent,
+        2 => DependencyKind::SecondaryIndexRelation,
+        3 => DependencyKind::ForeignKey,
+        4 => DependencyKind::Analyzer,
+        5 => DependencyKind::LinkEndpoint,
+        6 => DependencyKind::RelationSchema,
+        _ => return Err(NativeRuntimeError::InvalidCatalogTree),
+    };
+    let edge = match direction {
+        DependencyDirection::Outgoing => DependencyEdge::new(object, adjacent, kind),
+        DependencyDirection::Incoming => DependencyEdge::new(adjacent, object, kind),
+    };
+    Ok((edge, adjacent))
+}
+
+fn decode_logical_catalog_definition(
+    definition: &[u8],
+    id: ObjectId,
+) -> Result<LogicalCatalogObject, NativeRuntimeError> {
+    if !definition.starts_with(b"HYCOBJ02") {
+        let object = CatalogObject::decode_definition(definition)?;
+        if object.header().id != id {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        return Ok(LogicalCatalogObject::from_legacy(object));
+    }
+    let object = LogicalCatalogObject::decode_definition_v2(definition)?;
+    if object.id() != id {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    Ok(object)
+}
+
+fn logical_catalog_summary(object: &LogicalCatalogObject) -> CatalogObjectSummary {
+    CatalogObjectSummary {
+        id: object.id(),
+        kind: object.kind(),
+        owner: object.owner(),
+        name: object.name().clone(),
+        parent: object.parent(),
+    }
+}
+
+fn catalog_summary_bytes(summary: &CatalogObjectSummary) -> Result<usize, NativeRuntimeError> {
+    [
+        summary.name.database.display(),
+        summary.name.database.lookup(),
+        summary.name.schema.display(),
+        summary.name.schema.lookup(),
+        summary.name.object.display(),
+        summary.name.object.lookup(),
+    ]
+    .into_iter()
+    .try_fold(
+        43_usize + usize::from(summary.parent.is_some()) * 16,
+        |total, value| {
+            total
+                .checked_add(value.len())
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)
+        },
+    )
+}
+
+fn validate_catalog_read_limits(
+    item_limit: usize,
+    visit_limit: usize,
+    byte_limit: usize,
+) -> Result<(), NativeRuntimeError> {
+    if !(1..=MAX_CATALOG_READ_ITEMS).contains(&item_limit)
+        || !(1..=MAX_CATALOG_READ_VISITS).contains(&visit_limit)
+        || !(1..=MAX_CATALOG_READ_BYTES).contains(&byte_limit)
+    {
+        return Err(NativeRuntimeError::InvalidCatalogReadLimit);
+    }
+    Ok(())
 }
 
 fn catalog_relation_index_prefix(relation: ObjectId) -> Vec<u8> {
@@ -13897,22 +15793,38 @@ const fn is_catalog_creation(opcode: Opcode) -> bool {
             | Opcode::CreateSecondaryIndex
             | Opcode::CreateIndex
             | Opcode::CreateAnnIndex
+            | Opcode::CreateCatalogObjectV2
     )
 }
 
 fn catalog_object_from_creation_mutation(
     mutation: &Mutation,
-) -> Result<CatalogObject, NativeRuntimeError> {
+) -> Result<PersistedCatalogObject, NativeRuntimeError> {
     let id = mutation
         .target
         .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
     match (mutation.engine, mutation.opcode) {
-        (EngineKind::Relational, Opcode::CreateTable) => decode_relation_creation(id, mutation),
-        (EngineKind::Relational, Opcode::CreateSecondaryIndex) => {
-            decode_secondary_index_creation(id, mutation)
+        (EngineKind::Relational, Opcode::CreateTable) => {
+            decode_relation_creation(id, mutation).map(PersistedCatalogObject::Legacy)
         }
-        (EngineKind::Search, Opcode::CreateIndex) => decode_search_creation(id, mutation),
-        (EngineKind::Search, Opcode::CreateAnnIndex) => decode_ann_creation(id, mutation),
+        (EngineKind::Relational, Opcode::CreateSecondaryIndex) => {
+            decode_secondary_index_creation(id, mutation).map(PersistedCatalogObject::Legacy)
+        }
+        (EngineKind::Search, Opcode::CreateIndex) => {
+            decode_search_creation(id, mutation).map(PersistedCatalogObject::Legacy)
+        }
+        (EngineKind::Search, Opcode::CreateAnnIndex) => decode_ann_creation(id, mutation)
+            .map(|(object, _)| PersistedCatalogObject::Legacy(object)),
+        (EngineKind::Kernel, Opcode::CreateCatalogObjectV2) => {
+            let object = LogicalCatalogObject::decode_definition_v2(&mutation.value)?;
+            if object.id() != id
+                || mutation.key != catalog_name_identity_from_qualified(object.name())?
+                || mutation.expires_at_micros.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Ok(PersistedCatalogObject::Logical(object))
+        }
         _ => Err(NativeRuntimeError::InvalidPreparedMutation),
     }
 }
@@ -13947,6 +15859,8 @@ struct VacuumWalContext {
 struct VacuumWalReceipt {
     lsn: Lsn,
     digest: [u8; 32],
+    append_time: Duration,
+    synchronization_time: Duration,
 }
 
 fn append_vacuum_wal(
@@ -13976,15 +15890,21 @@ fn append_vacuum_wal(
         retention_floor_csn: context.commit_csn,
     })?;
     let commit_record = pending.pop().ok_or(WalError::EmptyBlock)?;
+    let append_started = Instant::now();
     wal.append_records(pending, false)?;
     interrupt_vacuum(interruption, VacuumBoundary::WalAppended)?;
     let receipts = wal.append_records(vec![commit_record], false)?;
+    let append_time = append_started.elapsed();
+    let synchronization_started = Instant::now();
     wal.sync_data()?;
+    let synchronization_time = synchronization_started.elapsed();
     interrupt_vacuum(interruption, VacuumBoundary::WalSynchronized)?;
     let block = receipts.last().ok_or(WalError::EmptyBlock)?;
     Ok(VacuumWalReceipt {
         lsn: block.last_lsn,
         digest: block.digest,
+        append_time,
+        synchronization_time,
     })
 }
 
@@ -14193,95 +16113,138 @@ fn validate_write_batch_shape(
             validate_delta_write_batch_shape(batch, roots, structure_format, search_format)
         }
         NativeWriteBatchMode::PhysicalStructureExpiry => {
-            let valid_roots = roots.iter().all(Option::is_some);
-            let valid_formats = structure_format == StructureFormat::BTreeV2
-                && batch.structure_format == StructureFormat::BTreeV2
-                && batch.search_format == search_format;
-            let valid_state = batch.state == MaterializedState::default();
-            let valid_mutations = !batch.mutations.is_empty()
-                && batch.mutations.iter().all(|mutation| {
-                    mutation.engine == EngineKind::Structure
-                        && matches!(
-                            mutation.opcode,
-                            Opcode::DeleteValue
-                                | Opcode::DeleteHash
-                                | Opcode::DeleteSet
-                                | Opcode::DeleteList
-                                | Opcode::DeleteStream
-                                | Opcode::DeleteSortedSet
-                                | Opcode::DeleteHashField
-                        )
-                        && mutation.target.is_none()
-                        && mutation.value.is_empty()
-                        && mutation.expires_at_micros.is_none()
-                });
-            if valid_roots
-                && valid_formats
-                && valid_state
-                && batch.dirty == [false, false, true, false]
-                && valid_mutations
-            {
-                Ok(())
-            } else {
-                Err(NativeRuntimeError::InvalidPreparedMutation)
-            }
+            validate_physical_structure_expiry(batch, roots, structure_format, search_format)
         }
-        NativeWriteBatchMode::PhysicalStructureCompaction => {
-            let valid_roots = roots.iter().all(Option::is_some);
-            let valid_formats = structure_format == StructureFormat::BTreeV2
-                && batch.structure_format == StructureFormat::BTreeV2
-                && batch.search_format == search_format;
-            let valid_state = batch.state == MaterializedState::default();
-            let valid_mutations = matches!(
-                batch.mutations.as_slice(),
-                [Mutation {
-                    engine: EngineKind::Structure,
-                    opcode: Opcode::CompactStructure,
-                    target: None,
-                    key,
-                    value,
-                    expires_at_micros: None,
-                }] if key.is_empty() && value.is_empty()
-            );
-            if valid_roots
-                && valid_formats
-                && valid_state
-                && batch.dirty == [false, false, true, false]
-                && valid_mutations
-            {
-                Ok(())
-            } else {
-                Err(NativeRuntimeError::InvalidPreparedMutation)
-            }
+        NativeWriteBatchMode::PhysicalStructureCompaction => validate_physical_compaction(
+            batch,
+            roots,
+            structure_format,
+            search_format,
+            EngineKind::Structure,
+            Opcode::CompactStructure,
+        ),
+        NativeWriteBatchMode::PhysicalSearchCompaction => validate_physical_compaction(
+            batch,
+            roots,
+            structure_format,
+            search_format,
+            EngineKind::Search,
+            Opcode::CompactSearch,
+        ),
+        NativeWriteBatchMode::PhysicalAnnConsolidation => {
+            validate_physical_ann_consolidation(batch, roots, structure_format, search_format)
         }
-        NativeWriteBatchMode::PhysicalSearchCompaction => {
-            let valid_roots = roots.iter().all(Option::is_some);
-            let valid_formats = search_format == SearchFormat::InvertedBTreeV1
-                && batch.search_format == SearchFormat::InvertedBTreeV1
-                && batch.structure_format == structure_format;
-            let valid_state = batch.state == MaterializedState::default();
-            let valid_mutations = matches!(
-                batch.mutations.as_slice(),
-                [Mutation {
-                    engine: EngineKind::Search,
-                    opcode: Opcode::CompactSearch,
-                    target: None,
-                    key,
-                    value,
-                    expires_at_micros: None,
-                }] if key.is_empty() && value.is_empty()
-            );
-            if valid_roots
-                && valid_formats
-                && valid_state
-                && batch.dirty == [false, false, false, true]
-                && valid_mutations
-            {
-                Ok(())
-            } else {
-                Err(NativeRuntimeError::InvalidPreparedMutation)
-            }
-        }
+    }
+}
+
+fn validate_physical_structure_expiry(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_mutations = !batch.mutations.is_empty()
+        && batch.mutations.iter().all(|mutation| {
+            mutation.engine == EngineKind::Structure
+                && matches!(
+                    mutation.opcode,
+                    Opcode::DeleteValue
+                        | Opcode::DeleteHash
+                        | Opcode::DeleteSet
+                        | Opcode::DeleteList
+                        | Opcode::DeleteStream
+                        | Opcode::DeleteSortedSet
+                        | Opcode::DeleteHashField
+                )
+                && mutation.target.is_none()
+                && mutation.value.is_empty()
+                && mutation.expires_at_micros.is_none()
+        });
+    if roots.iter().all(Option::is_some)
+        && structure_format == StructureFormat::BTreeV2
+        && batch.structure_format == StructureFormat::BTreeV2
+        && batch.search_format == search_format
+        && batch.state == MaterializedState::default()
+        && batch.dirty == [false, false, true, false]
+        && valid_mutations
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
+    }
+}
+
+fn validate_physical_compaction(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+    engine: EngineKind,
+    opcode: Opcode,
+) -> Result<(), NativeRuntimeError> {
+    let valid_formats = if engine == EngineKind::Structure {
+        structure_format == StructureFormat::BTreeV2
+            && batch.structure_format == StructureFormat::BTreeV2
+            && batch.search_format == search_format
+    } else {
+        search_format == SearchFormat::InvertedBTreeV1
+            && batch.search_format == SearchFormat::InvertedBTreeV1
+            && batch.structure_format == structure_format
+    };
+    let dirty = if engine == EngineKind::Structure {
+        [false, false, true, false]
+    } else {
+        [false, false, false, true]
+    };
+    let valid_mutation = matches!(batch.mutations.as_slice(), [mutation]
+        if mutation.engine == engine
+            && mutation.opcode == opcode
+            && mutation.target.is_none()
+            && mutation.key.is_empty()
+            && mutation.value.is_empty()
+            && mutation.expires_at_micros.is_none());
+    if roots.iter().all(Option::is_some)
+        && valid_formats
+        && batch.state == MaterializedState::default()
+        && batch.dirty == dirty
+        && valid_mutation
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
+    }
+}
+
+fn validate_physical_ann_consolidation(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_plan = batch.ann_consolidation.as_ref().is_some_and(|plan| {
+        matches!(batch.mutations.as_slice(), [mutation]
+            if mutation.engine == EngineKind::Search
+                && mutation.opcode == Opcode::ConsolidateAnn
+                && mutation.target == Some(plan.index())
+                && mutation.key.is_empty()
+                && mutation.value == ann_store::encode_consolidation_mutation(plan)
+                && mutation.expires_at_micros.is_none())
+    });
+    if roots.iter().all(Option::is_some)
+        && search_format == SearchFormat::InvertedBTreeV1
+        && batch.search_format == SearchFormat::InvertedBTreeV1
+        && batch.structure_format == structure_format
+        && batch.state.relational == RelationState::default()
+        && batch.state.structures == StructureState::default()
+        && batch.state.search == SearchState::default()
+        && batch.state.ann == ann_store::AnnState::default()
+        && batch.dirty == [false, false, false, true]
+        && batch.delta.is_none()
+        && valid_plan
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
     }
 }
 
@@ -14381,14 +16344,22 @@ fn stage_large_values(
                     stage_blob_value(blobs, &mut staged, &definition, synchronize)?;
                 }
             }
+            for object in batch.state.catalog.logical_objects.values() {
+                let definition = object.encode_definition_v2()?;
+                if definition.len() > CATALOG_INLINE_VALUE_LIMIT {
+                    stage_blob_value(blobs, &mut staged, &definition, synchronize)?;
+                }
+            }
         } else {
             for mutation in batch
                 .mutations
                 .iter()
                 .filter(|mutation| is_catalog_creation(mutation.opcode))
             {
-                let definition =
-                    catalog_object_from_creation_mutation(mutation)?.encode_definition()?;
+                let definition = match catalog_object_from_creation_mutation(mutation)? {
+                    PersistedCatalogObject::Legacy(object) => object.encode_definition()?,
+                    PersistedCatalogObject::Logical(object) => object.encode_definition_v2()?,
+                };
                 if definition.len() > CATALOG_INLINE_VALUE_LIMIT {
                     stage_blob_value(blobs, &mut staged, &definition, synchronize)?;
                 }
@@ -18310,7 +20281,7 @@ fn plan_search_compaction(
 }
 
 fn compactable_search_tombstone(format: PhysicalSearchFormat, key: &[u8], value: &[u8]) -> bool {
-    if format != PhysicalSearchFormat::V2 {
+    if !format.admits_tombstones() {
         return false;
     }
     match key.first().copied() {
@@ -18688,6 +20659,7 @@ struct SearchMutationContext<'a> {
     state: &'a SearchState,
     mutations: &'a [Mutation],
     blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
+    ann_consolidation: Option<&'a ann_store::ConsolidationPlan>,
 }
 
 fn search_root_after_mutations(
@@ -18696,6 +20668,21 @@ fn search_root_after_mutations(
     creating_csn: Csn,
     context: &SearchMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
+    if context.mode == NativeWriteBatchMode::PhysicalAnnConsolidation {
+        if context.format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let plan = context
+            .ann_consolidation
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let replacement =
+            ann_store::consolidate_tree(pages, root, creating_csn, context.catalog, plan)?;
+        let replacement_root = replacement
+            .root()
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        load_search_state_root(pages, context.blobs, replacement_root)?;
+        return Ok(Some(replacement_root));
+    }
     if context.mode == NativeWriteBatchMode::PhysicalSearchCompaction {
         if context.format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -20238,6 +22225,107 @@ fn checked_recovery_total(base: u64, suffix: usize) -> Option<usize> {
         .and_then(|total| usize::try_from(total).ok())
 }
 
+fn recover_transaction_resolutions(
+    recovered: &RecoveredWal,
+) -> Result<BTreeMap<TransactionId, DurableTransactionResolution>, NativeRuntimeError> {
+    recovered
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            let recovered_commit = recovered
+                .commits
+                .iter()
+                .find(|commit| commit.transaction_id == outcome.runtime_transaction_id);
+            let resolved = match (outcome.state, outcome.commit_csn, recovered_commit) {
+                (1, Some(commit_csn), _) => DurableTransactionOutcome::Committed {
+                    runtime_transaction_id: outcome.runtime_transaction_id,
+                    commit_csn,
+                },
+                (2, None, _) | (3, None, None) => DurableTransactionOutcome::RolledBack {
+                    runtime_transaction_id: outcome.runtime_transaction_id,
+                },
+                (3, None, Some(commit)) => DurableTransactionOutcome::Committed {
+                    runtime_transaction_id: outcome.runtime_transaction_id,
+                    commit_csn: commit.manifest.commit_csn,
+                },
+                _ => {
+                    return Err(NativeRuntimeError::WalSemantic(
+                        "invalid outcome state".into(),
+                    ));
+                }
+            };
+            Ok((
+                outcome.resolution_id,
+                DurableTransactionResolution {
+                    resolution_id: outcome.resolution_id,
+                    principal_hash: outcome.principal_hash,
+                    idempotency_token: outcome.idempotency_token,
+                    outcome: resolved,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn recover_transaction_receipts(
+    recovered: &RecoveredWal,
+    physical: &WalRecovery,
+) -> Result<BTreeMap<TransactionId, CommitReceipt>, NativeRuntimeError> {
+    recovered
+        .commits
+        .iter()
+        .map(|commit| {
+            Ok((
+                commit.transaction_id,
+                CommitReceipt {
+                    transaction_id: commit.transaction_id,
+                    commit_csn: commit.manifest.commit_csn,
+                    catalog_version: commit.manifest.catalog_version,
+                    commit_lsn: commit.commit_lsn,
+                    wal_block_digest: digest_for_lsn(physical, commit.commit_lsn)?,
+                    durability: commit.durability,
+                    durability_cohort_size: 1,
+                    durability_cohort_position: 0,
+                    execution_time: Duration::ZERO,
+                    wal_append_time: Duration::ZERO,
+                    page_synchronization_time: Duration::ZERO,
+                    wal_synchronization_time: Duration::ZERO,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn persist_recovered_outcome_updates(
+    wal: &mut WalFile,
+    resolutions: &[DurableTransactionResolution],
+) -> Result<(), NativeRuntimeError> {
+    for resolution in resolutions {
+        let (runtime_transaction_id, state, commit_csn) = match resolution.outcome {
+            DurableTransactionOutcome::Committed {
+                runtime_transaction_id,
+                commit_csn,
+            } => (runtime_transaction_id, 1, Some(commit_csn)),
+            DurableTransactionOutcome::RolledBack {
+                runtime_transaction_id,
+            } => (runtime_transaction_id, 2, None),
+            DurableTransactionOutcome::OutcomeUnknown { .. } => continue,
+        };
+        wal.append_records(
+            vec![encode_outcome(
+                resolution.resolution_id,
+                runtime_transaction_id,
+                resolution.principal_hash,
+                resolution.idempotency_token,
+                state,
+                commit_csn,
+            )?],
+            true,
+        )?;
+    }
+    Ok(())
+}
+
 fn recovered_blob_generation_floor(
     base_root: Option<&RootSet>,
     commits: &[wal_codec::RecoveredCommit],
@@ -20598,17 +22686,22 @@ fn load_catalog_state_root(
     if format_key != CATALOG_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidCatalogTree);
     }
-    let (has_relation_indexes, has_id_authority) = match format_value.as_slice() {
-        CATALOG_FORMAT_VALUE_V3 => (false, false),
-        CATALOG_FORMAT_VALUE_V4 => (true, false),
-        CATALOG_FORMAT_VALUE_V5 => (true, true),
-        _ => return Err(NativeRuntimeError::InvalidCatalogTree),
-    };
+    let (has_relation_indexes, has_id_authority, has_logical_dependencies) =
+        match format_value.as_slice() {
+            CATALOG_FORMAT_VALUE_V3 => (false, false, false),
+            CATALOG_FORMAT_VALUE_V4 => (true, false, false),
+            CATALOG_FORMAT_VALUE_V5 => (true, true, false),
+            CATALOG_FORMAT_VALUE_V6 => (true, true, true),
+            _ => return Err(NativeRuntimeError::InvalidCatalogTree),
+        };
 
     let mut objects = Vec::new();
+    let mut logical_objects = Vec::new();
     let mut persisted_next_object_id = None;
     let mut names = BTreeMap::new();
     let mut relation_indexes = BTreeSet::new();
+    let mut outgoing_dependencies = BTreeSet::new();
+    let mut incoming_dependencies = BTreeSet::new();
     for (key, value) in iterator {
         match key.first().copied() {
             Some(0) if has_id_authority && key == CATALOG_ID_AUTHORITY_KEY && value.len() == 16 => {
@@ -20628,11 +22721,22 @@ fn load_catalog_state_root(
                 ))
                 .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
                 let definition = decode_catalog_definition_storage_value(&value, blobs)?;
-                let object = CatalogObject::decode_definition(&definition)?;
-                if object.header().id != id {
-                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                if definition.starts_with(b"HYCOBJ02") {
+                    if !has_logical_dependencies {
+                        return Err(NativeRuntimeError::InvalidCatalogTree);
+                    }
+                    let object = LogicalCatalogObject::decode_definition_v2(&definition)?;
+                    if object.id() != id {
+                        return Err(NativeRuntimeError::InvalidCatalogTree);
+                    }
+                    logical_objects.push(object);
+                } else {
+                    let object = CatalogObject::decode_definition(&definition)?;
+                    if object.header().id != id {
+                        return Err(NativeRuntimeError::InvalidCatalogTree);
+                    }
+                    objects.push(object);
                 }
-                objects.push(object);
             }
             Some(CATALOG_NAME_PREFIX) if key.len() > 1 && value.len() == 16 => {
                 let id = ObjectId::new(u128::from_be_bytes(
@@ -20649,6 +22753,20 @@ fn load_catalog_state_root(
             Some(CATALOG_RELATION_INDEX_PREFIX) if has_relation_indexes => {
                 let dependency = decode_catalog_relation_index_entry(&key, &value)?;
                 if !relation_indexes.insert(dependency) {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+            }
+            Some(CATALOG_DEPENDENCY_OUTGOING_PREFIX) if has_logical_dependencies => {
+                let (edge, _) =
+                    decode_catalog_dependency_entry(&key, &value, DependencyDirection::Outgoing)?;
+                if !outgoing_dependencies.insert(edge) {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+            }
+            Some(CATALOG_DEPENDENCY_INCOMING_PREFIX) if has_logical_dependencies => {
+                let (edge, _) =
+                    decode_catalog_dependency_entry(&key, &value, DependencyDirection::Incoming)?;
+                if !incoming_dependencies.insert(edge) {
                     return Err(NativeRuntimeError::InvalidCatalogTree);
                 }
             }
@@ -20669,10 +22787,35 @@ fn load_catalog_state_root(
             expected_relation_indexes.insert((definition.relation, definition.header.id));
         }
     }
-    if names != expected_names || names.len() != objects.len() {
+    let mut expected_dependencies = BTreeSet::new();
+    if has_logical_dependencies {
+        expected_dependencies.extend(objects.iter().flat_map(CatalogObject::dependencies));
+    }
+    for object in &logical_objects {
+        if expected_names
+            .insert(catalog_name_key_from_qualified(object.name())?, object.id())
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        expected_dependencies.extend(object.dependencies());
+    }
+    if names != expected_names
+        || names.len()
+            != objects
+                .len()
+                .checked_add(logical_objects.len())
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?
+    {
         return Err(NativeRuntimeError::InvalidCatalogTree);
     }
     if has_relation_indexes && relation_indexes != expected_relation_indexes {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    if has_logical_dependencies
+        && (outgoing_dependencies != expected_dependencies
+            || incoming_dependencies != expected_dependencies)
+    {
         return Err(NativeRuntimeError::InvalidCatalogTree);
     }
     if has_id_authority && persisted_next_object_id.is_none() {
@@ -20700,10 +22843,14 @@ fn load_catalog_state_root(
     {
         catalog.create(object)?;
     }
+    for object in logical_objects {
+        catalog.insert_logical_unchecked(object)?;
+    }
+    catalog.validate_all_logical_dependencies()?;
     if let Some(authority) = persisted_next_object_id {
         catalog.set_next_object_id_raw(authority)?;
     }
-    if catalog.objects.len() != names.len() {
+    if catalog.objects.len() + catalog.logical_objects.len() != names.len() {
         return Err(NativeRuntimeError::InvalidCatalogTree);
     }
     Ok(catalog)
@@ -21486,6 +23633,7 @@ impl StructureTreeDecoder {
             lists,
             list_expiries,
             sorted_sets,
+            sorted_set_expiries,
             streams,
             stream_expiries,
         })
@@ -21887,7 +24035,10 @@ fn search_format_for_root(
             let marker = BTree::from_root(root)
                 .get(pages, SEARCH_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-            if marker == SEARCH_FORMAT_VALUE_V1 || marker == SEARCH_FORMAT_VALUE_V2 {
+            if marker == SEARCH_FORMAT_VALUE_V1
+                || marker == SEARCH_FORMAT_VALUE_V2
+                || marker == SEARCH_FORMAT_VALUE_V3
+            {
                 Ok(SearchFormat::InvertedBTreeV1)
             } else {
                 Err(NativeRuntimeError::InvalidSearchTree)
@@ -21968,14 +24119,46 @@ fn decode_search_creation(
 fn decode_ann_creation(
     id: ObjectId,
     mutation: &Mutation,
-) -> Result<CatalogObject, NativeRuntimeError> {
-    if mutation.key.is_empty()
-        || mutation.expires_at_micros.is_some()
-        || !mutation.value.starts_with(b"HYCOBJ01")
-    {
+) -> Result<(CatalogObject, IncrementalVectorLifecycle), NativeRuntimeError> {
+    if mutation.key.is_empty() || mutation.expires_at_micros.is_some() {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
-    let object = CatalogObject::decode_definition(&mutation.value)?;
+    let (definition, lifecycle) = if mutation.value.starts_with(b"HYCOBJ01") {
+        (
+            mutation.value.as_slice(),
+            ann_store::DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
+        )
+    } else {
+        if mutation.value.len() < 20
+            || mutation.value.get(..8) != Some(ANN_CREATION_MAGIC)
+            || mutation.value[16..20]
+                != u32::try_from(mutation.value.len() - 20)
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?
+                    .to_le_bytes()
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let lifecycle = IncrementalVectorLifecycle {
+            delta_max_entries: u32::from_le_bytes(
+                mutation.value[8..12]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+            ),
+            consolidate_after_deltas: u16::from_le_bytes(
+                mutation.value[12..14]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+            ),
+            retain_generations: u16::from_le_bytes(
+                mutation.value[14..16]
+                    .try_into()
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+            ),
+        };
+        lifecycle.validate()?;
+        (&mutation.value[20..], lifecycle)
+    };
+    let object = CatalogObject::decode_definition(definition)?;
     let CatalogObject::Search(definition) = &object else {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     };
@@ -21983,7 +24166,27 @@ fn decode_ann_creation(
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     validate_catalog_creation_identity(&object, mutation)?;
-    Ok(object)
+    Ok((object, lifecycle))
+}
+
+fn encode_ann_creation(
+    object: &CatalogObject,
+    lifecycle: IncrementalVectorLifecycle,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    lifecycle.validate()?;
+    let definition = object.encode_definition()?;
+    let mut encoded = Vec::with_capacity(20 + definition.len());
+    encoded.extend_from_slice(ANN_CREATION_MAGIC);
+    encoded.extend_from_slice(&lifecycle.delta_max_entries.to_le_bytes());
+    encoded.extend_from_slice(&lifecycle.consolidate_after_deltas.to_le_bytes());
+    encoded.extend_from_slice(&lifecycle.retain_generations.to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(definition.len())
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&definition);
+    Ok(encoded)
 }
 
 fn validate_catalog_creation_identity(
@@ -22125,6 +24328,13 @@ mod tests {
     };
 
     use hyphae_native_btree::BTree;
+    use hyphae_native_catalog::{
+        CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
+        CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
+        DefinitionVersion, DependencyDirection, DependencyEdge, DependencyKind,
+        LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition, StructureDefinition,
+        StructureKind, StructureOwnership,
+    };
     use hyphae_native_mvcc::WriteKey;
     use hyphae_native_pages::PageKind;
     use hyphae_native_types::{
@@ -22137,24 +24347,27 @@ mod tests {
     use super::{
         ActiveExpiryConfig, ActiveExpiryFailure, AnnRecallRisk, AnnSearchOptions,
         AnnSearchStrategy, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
-        CATALOG_FORMAT_VALUE_V4, CATALOG_FORMAT_VALUE_V5, CATALOG_INLINE_VALUE_LIMIT,
-        CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX, CATALOG_RELATION_INDEX_PREFIX,
-        CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC,
-        CatalogName, CatalogObject, CatalogState, CheckpointBoundary, ColumnDefinition,
-        CommitBoundary, CommitCancellationOutcome, EngineKind, GroupCommitBoundary,
-        GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError, HashFieldEntry,
-        HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
-        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitControl,
-        NativeCommitScheduler, NativeDatabase, NativeDirectoryError, NativeRuntimeError,
-        NativeSchedulerClock, NativeTransaction, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
-        PageStore, RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
-        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, binary_relation_definition,
-        catalog_definition_storage_value, catalog_name_identity, catalog_name_key,
-        catalog_object_key, catalog_relation_index_key, catalog_relation_index_prefix,
-        catalog_requires_full_rebuild, catalog_root_after_mutations,
-        decode_catalog_definition_storage_value, page_generation_path,
+        CATALOG_FORMAT_VALUE_V4, CATALOG_FORMAT_VALUE_V5, CATALOG_FORMAT_VALUE_V6,
+        CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX,
+        CATALOG_RELATION_INDEX_PREFIX, CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE,
+        CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogDependencyRequest, CatalogListRequest,
+        CatalogName, CatalogObject, CatalogPageStop, CatalogState, CheckpointBoundary,
+        ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
+        GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
+        HashFieldEntry, HashPatternError, HashPatternScanPage, HashPatternScanRequest,
+        HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError, Mutation,
+        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
+        NativeRuntimeError, NativeSchedulerClock, NativeTransaction, NativeWriteBatch,
+        ObjectHeader, Opcode, PAGE_FILE, PageStore, QualifiedName, RelationDefinition,
+        RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition, SetOutcome,
+        SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult,
+        SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError, WalRetentionAnchor,
+        WalRetentionBoundary, ZAddOutcome, append_catalog_object_entries,
+        binary_relation_definition, catalog_definition_storage_value, catalog_dependency_prefix,
+        catalog_name_identity, catalog_name_key, catalog_object_key, catalog_relation_index_key,
+        catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
+        decode_catalog_definition_storage_value, decode_catalog_dependency_entry,
+        decode_logical_catalog_definition, page_generation_path,
         physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
         validate_commit_sequence,
     };
@@ -22187,6 +24400,7 @@ mod tests {
     ) -> Result<RecoveredCommit, Box<dyn std::error::Error>> {
         Ok(RecoveredCommit {
             transaction_id: TransactionId::new(u128::from(csn))?,
+            durability: DurabilityClass::Strict,
             commit_lsn: Lsn::new(csn)?,
             manifest: CommitManifest {
                 read_csn: (csn > 1).then(|| Csn::new(csn - 1)).transpose()?,
@@ -22451,6 +24665,8 @@ mod tests {
         assert_eq!(CATALOG_FORMAT_KEY, &[0]);
         assert_eq!(CATALOG_FORMAT_VALUE_V3, b"HYCAT003");
         assert_eq!(CATALOG_FORMAT_VALUE_V4, b"HYCAT004");
+        assert_eq!(CATALOG_FORMAT_VALUE_V5, b"HYCAT005");
+        assert_eq!(CATALOG_FORMAT_VALUE_V6, b"HYCAT006");
         let index = ObjectId::new(0x0304)?;
         let mut expected_relation_index_key = vec![CATALOG_RELATION_INDEX_PREFIX];
         expected_relation_index_key.extend_from_slice(&id.get().to_be_bytes());
@@ -22459,6 +24675,241 @@ mod tests {
             catalog_relation_index_key(id, index),
             expected_relation_index_key
         );
+        Ok(())
+    }
+
+    fn logical_header(
+        id: u128,
+        name: &str,
+        parent: Option<u128>,
+    ) -> Result<ObjectHeaderV2, Box<dyn std::error::Error>> {
+        Ok(ObjectHeaderV2 {
+            id: ObjectId::new(id)?,
+            owner: EngineKind::Kernel,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted(name)?,
+            ),
+            parent: parent.map(ObjectId::new).transpose()?,
+            definition_version: DefinitionVersion::FIRST,
+        })
+    }
+
+    #[test]
+    fn catalog_v2_persists_with_bounded_snapshot_queries_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let database_object = LogicalCatalogObject::V2(CatalogObjectV2::Database(logical_header(
+            10, "database", None,
+        )?));
+        let schema_object = LogicalCatalogObject::V2(CatalogObjectV2::Schema(logical_header(
+            11,
+            "schema",
+            Some(10),
+        )?));
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_catalog_object_v2(database_object.clone())?;
+        transaction.create_catalog_object_v2(schema_object.clone())?;
+        transaction.commit()?;
+        exercise_bounded_catalog_queries(&database, &database_object, &schema_object)?;
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        let reopened_snapshot = reopened.catalog_snapshot()?;
+        assert_eq!(
+            reopened
+                .catalog_describe(&reopened_snapshot, ObjectId::new(10)?)?
+                .object,
+            Some(database_object)
+        );
+        Ok(())
+    }
+
+    fn exercise_bounded_catalog_queries(
+        database: &NativeDatabase,
+        database_object: &LogicalCatalogObject,
+        schema_object: &LogicalCatalogObject,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = database.catalog_snapshot()?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+        let first = database.catalog_list(
+            &snapshot,
+            CatalogListRequest {
+                parent: None,
+                kind: None,
+                start_after: None,
+                item_limit: 1,
+                visit_limit: 2,
+                byte_limit: 4_096,
+            },
+        )?;
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.stop, CatalogPageStop::ItemLimit);
+        let second = database.catalog_list(
+            &snapshot,
+            CatalogListRequest {
+                parent: None,
+                kind: None,
+                start_after: first.continuation,
+                item_limit: 2,
+                visit_limit: 2,
+                byte_limit: 4_096,
+            },
+        )?;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.stop, CatalogPageStop::Exhausted);
+        assert_eq!(
+            database
+                .catalog_describe(&snapshot, ObjectId::new(11)?)?
+                .object,
+            Some(schema_object.clone())
+        );
+        assert_eq!(
+            database
+                .catalog_resolve(&snapshot, schema_object.name())?
+                .object,
+            Some(schema_object.clone())
+        );
+        let outgoing = database.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: ObjectId::new(11)?,
+                direction: DependencyDirection::Outgoing,
+                start_after: None,
+                item_limit: 1,
+                visit_limit: 1,
+                byte_limit: 33,
+            },
+        )?;
+        assert_eq!(outgoing.items.len(), 1);
+        assert_eq!(outgoing.items[0].prerequisite, ObjectId::new(10)?);
+        let incoming = database.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: ObjectId::new(10)?,
+                direction: DependencyDirection::Incoming,
+                start_after: None,
+                item_limit: 1,
+                visit_limit: 1,
+                byte_limit: 33,
+            },
+        )?;
+        assert_eq!(incoming.items[0].dependent, ObjectId::new(11)?);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+        let root = snapshot
+            .root
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        assert_eq!(
+            BTree::from_root(root)
+                .get(&database.pages, CATALOG_FORMAT_KEY)?
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
+            CATALOG_FORMAT_VALUE_V6
+        );
+        assert_eq!(database_object.id(), ObjectId::new(10)?);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_catalog_apis_remain_available_after_v2_catalog_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let relation = ObjectId::new(1)?;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_relation(relation, "accounts")?;
+        transaction.create_catalog_object_v2(LogicalCatalogObject::V2(
+            CatalogObjectV2::Database(logical_header(10, "database", None)?),
+        ))?;
+        transaction.commit()?;
+        assert!(matches!(
+            database.catalog_object_latest(relation)?,
+            Some(CatalogObject::Relation(_))
+        ));
+        assert_eq!(
+            database
+                .catalog_list(
+                    &database.catalog_snapshot()?,
+                    CatalogListRequest {
+                        parent: None,
+                        kind: Some(CatalogObjectKind::Database),
+                        start_after: None,
+                        item_limit: 1,
+                        visit_limit: 2,
+                        byte_limit: 4_096,
+                    },
+                )?
+                .items
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sql_ddl_is_visible_through_hycat006_after_migration_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let relation_id = u128::MAX - 2;
+        let mut sql = database.begin_sql(0, DurabilityClass::Strict)?;
+        sql.execute_sql("CREATE TABLE ddl_accounts (id BIGINT PRIMARY KEY)", &[])?;
+        sql.commit()?;
+        let sql_relation = database
+            .catalog_object_named_latest(&qualified_name("ddl_accounts")?)?
+            .ok_or("SQL relation was not created")?
+            .header()
+            .id;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_relation(ObjectId::new(relation_id)?, "high_accounts")?;
+        transaction.create_catalog_object_v2(LogicalCatalogObject::V2(
+            CatalogObjectV2::Database(logical_header(10, "database", None)?),
+        ))?;
+        transaction.commit()?;
+
+        let assert_visible = |database: &NativeDatabase| -> Result<(), Box<dyn std::error::Error>> {
+            let snapshot = database.catalog_snapshot()?;
+            let described = database
+                .catalog_describe(&snapshot, ObjectId::new(relation_id)?)?
+                .object
+                .ok_or("legacy relation absent from HYCAT006 describe")?;
+            assert_eq!(described.kind(), CatalogObjectKind::Relation);
+            assert_eq!(described.parent(), None);
+            assert_eq!(
+                database
+                    .catalog_resolve(&snapshot, described.name())?
+                    .object,
+                Some(described.clone())
+            );
+            let listed = database.catalog_list(
+                &snapshot,
+                CatalogListRequest {
+                    parent: None,
+                    kind: Some(CatalogObjectKind::Relation),
+                    start_after: Some(ObjectId::new(relation_id - 1)?),
+                    item_limit: 2,
+                    visit_limit: 2,
+                    byte_limit: 4_096,
+                },
+            )?;
+            assert_eq!(listed.items.len(), 1);
+            assert_eq!(listed.items[0].id, ObjectId::new(relation_id)?);
+            assert_eq!(
+                database
+                    .catalog_describe(&snapshot, sql_relation)?
+                    .object
+                    .ok_or("SQL DDL relation absent from HYCAT006")?
+                    .kind(),
+                CatalogObjectKind::Relation
+            );
+            Ok(())
+        };
+        assert_visible(&database)?;
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_visible(&reopened)?;
         Ok(())
     }
 
@@ -22575,6 +25026,8 @@ mod tests {
             .into_iter()
             .filter(|(key, _)| {
                 key.first() != Some(&CATALOG_RELATION_INDEX_PREFIX)
+                    && key.first() != Some(&super::CATALOG_DEPENDENCY_OUTGOING_PREFIX)
+                    && key.first() != Some(&super::CATALOG_DEPENDENCY_INCOMING_PREFIX)
                     && key.as_slice() != super::CATALOG_ID_AUTHORITY_KEY
             })
             .collect::<Vec<_>>();
@@ -22613,7 +25066,7 @@ mod tests {
             BTree::from_root(migrated_root)
                 .get(&database.pages, CATALOG_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
-            CATALOG_FORMAT_VALUE_V5
+            CATALOG_FORMAT_VALUE_V6
         );
         assert_eq!(
             super::load_catalog_state_root(&database.pages, &database.blobs, migrated_root)?,
@@ -22623,6 +25076,237 @@ mod tests {
             super::load_catalog_state_root(&database.pages, &database.blobs, v3_root)?,
             retained_v3
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hycat005_migration_promotes_every_legacy_object_kind_with_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let relation = ObjectId::new(1)?;
+        let secondary = ObjectId::new(2)?;
+        let search = ObjectId::new(3)?;
+        let ann = ObjectId::new(4)?;
+        let structure = ObjectId::new(5)?;
+        let link = ObjectId::new(6)?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.create_relation(relation, "accounts")?;
+        seed.create_secondary_index_definition(&SecondaryIndexDefinition {
+            header: ObjectHeader {
+                id: secondary,
+                owner: EngineKind::Relational,
+                name: qualified_name("accounts_pk_copy")?,
+            },
+            relation,
+            columns: vec![ColumnId::new(1)?],
+            unique: false,
+            nulls_distinct: true,
+        })?;
+        seed.create_search_index(search, "documents")?;
+        seed.create_vector_index(ann, "vectors", 2, VectorMetric::SquaredL2, ann_config()?)?;
+        seed.commit()?;
+
+        let root = database
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        let mut catalog = super::load_catalog_state_root(&database.pages, &database.blobs, root)?;
+        add_legacy_catalog_kinds(&mut catalog, relation, search, structure, link)?;
+        let v5_root = write_hycat005_root(&mut database, &catalog)?;
+        let loaded = super::load_catalog_state_root(&database.pages, &database.blobs, v5_root)?;
+        let migrated = catalog_root_after_mutations(
+            &mut database.pages,
+            &database.blobs,
+            Some(v5_root),
+            Csn::new(3)?,
+            &loaded,
+            &[],
+            &BTreeMap::new(),
+        )?
+        .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        for id in [relation, secondary, search, ann, structure, link] {
+            let definition = BTree::from_root(migrated)
+                .get(&database.pages, &catalog_object_key(id))?
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            let definition = decode_catalog_definition_storage_value(&definition, &database.blobs)?;
+            let logical = decode_logical_catalog_definition(&definition, id)?;
+            assert_eq!(logical.id(), id);
+            assert_eq!(logical.parent(), None);
+        }
+        let outgoing = BTree::from_root(migrated).scan_prefix(
+            &database.pages,
+            &catalog_dependency_prefix(secondary, DependencyDirection::Outgoing),
+        )?;
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(
+            decode_catalog_dependency_entry(
+                &outgoing[0].0,
+                &outgoing[0].1,
+                DependencyDirection::Outgoing,
+            )?
+            .0,
+            DependencyEdge::new(secondary, relation, DependencyKind::SecondaryIndexRelation,)
+        );
+        Ok(())
+    }
+
+    fn add_legacy_catalog_kinds(
+        catalog: &mut CatalogState,
+        relation: ObjectId,
+        search: ObjectId,
+        structure: ObjectId,
+        link: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        catalog.create(CatalogObject::Structure(StructureDefinition {
+            header: ObjectHeader {
+                id: structure,
+                owner: EngineKind::Structure,
+                name: qualified_name("sessions")?,
+            },
+            kind: StructureKind::String,
+            key_type: LogicalType::Binary,
+            value_type: LogicalType::Binary,
+            ownership: StructureOwnership::Canonical,
+            ttl_enabled: false,
+        }))?;
+        catalog.create(CatalogObject::CrossEngineLink(CrossEngineLinkDefinition {
+            header: ObjectHeader {
+                id: link,
+                owner: EngineKind::Kernel,
+                name: qualified_name("account_documents")?,
+            },
+            source: relation,
+            target: search,
+            mapping: vec![CrossEngineLinkMapping {
+                source: 1,
+                target: 1,
+            }],
+            maintenance: CrossEngineLinkMaintenance::Manual,
+            delete_behavior: CrossEngineLinkDeleteBehavior::Retain,
+            synchronous: false,
+        }))?;
+        Ok(())
+    }
+
+    fn write_hycat005_root(
+        database: &mut NativeDatabase,
+        catalog: &CatalogState,
+    ) -> Result<PageId, Box<dyn std::error::Error>> {
+        let mut v5_entries = vec![
+            (
+                CATALOG_FORMAT_KEY.to_vec(),
+                CATALOG_FORMAT_VALUE_V5.to_vec(),
+            ),
+            (
+                super::CATALOG_ID_AUTHORITY_KEY.to_vec(),
+                catalog
+                    .next_object_id_raw()
+                    .unwrap_or(0)
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+        ];
+        for object in catalog.objects.values() {
+            append_catalog_object_entries(&mut v5_entries, object, &BTreeMap::new())?;
+        }
+        v5_entries.retain(|(key, _)| {
+            !matches!(
+                key.first(),
+                Some(
+                    &super::CATALOG_DEPENDENCY_OUTGOING_PREFIX
+                        | &super::CATALOG_DEPENDENCY_INCOMING_PREFIX
+                )
+            )
+        });
+        v5_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(BTree::empty()
+            .upsert_sorted_batch(&mut database.pages, Csn::new(2)?, v5_entries)?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?)
+    }
+
+    #[test]
+    fn catalog_v3_v4_and_v5_markers_remain_readable() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.create_relation(ObjectId::new(1)?, "accounts")?;
+        transaction.commit()?;
+        let root = database
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        let current = super::load_catalog_state_root(&database.pages, &database.blobs, root)?;
+
+        for marker in [
+            CATALOG_FORMAT_VALUE_V3,
+            CATALOG_FORMAT_VALUE_V4,
+            CATALOG_FORMAT_VALUE_V5,
+        ] {
+            let mut entries = BTree::from_root(root)
+                .scan(&database.pages)?
+                .into_iter()
+                .filter(|(key, _)| {
+                    marker == CATALOG_FORMAT_VALUE_V5
+                        || key.as_slice() != super::CATALOG_ID_AUTHORITY_KEY
+                })
+                .collect::<Vec<_>>();
+            entries[0].1 = marker.to_vec();
+            let compatible_root = BTree::empty()
+                .upsert_sorted_batch(&mut database.pages, Csn::new(2)?, entries)?
+                .tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            assert_eq!(
+                super::load_catalog_state_root(&database.pages, &database.blobs, compatible_root,)?,
+                current
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_catalog_v2_create_boundary_recovers_absent_or_complete_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let directory = TestDirectory::new();
+            let mut database = NativeDatabase::create(directory.path())?;
+            let object = LogicalCatalogObject::V2(CatalogObjectV2::Database(logical_header(
+                10, "database", None,
+            )?));
+            let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+            transaction.create_catalog_object_v2(object.clone())?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(directory.path())?;
+            let snapshot = reopened.catalog_snapshot()?;
+            let described = reopened
+                .catalog_describe(&snapshot, ObjectId::new(10)?)?
+                .object;
+            assert!(described.is_none() || described == Some(object.clone()));
+            assert_eq!(
+                reopened.catalog_resolve(&snapshot, object.name())?.object,
+                described
+            );
+        }
         Ok(())
     }
 
@@ -31200,6 +33884,58 @@ mod tests {
     }
 
     #[test]
+    fn resolved_commit_boundaries_reopen_to_a_definite_outcome()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let principal_hash = [0x31; 32];
+        for (index, boundary) in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+            batch.set(b"resolution".to_vec(), vec![u8::try_from(index)?], None)?;
+            let idempotency_token = [u8::try_from(index + 1)?; 32];
+            let interrupted = database.commit_optimistic_resolved_with_interruption(
+                batch,
+                principal_hash,
+                idempotency_token,
+                boundary,
+            );
+            assert!(matches!(
+                interrupted.as_ref().map_err(super::ResolvedCommitError::source),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == &boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let resolution = reopened
+                .transaction_resolution_for_token(principal_hash, idempotency_token)
+                .ok_or("durable resolution was lost")?;
+            match resolution.outcome {
+                super::DurableTransactionOutcome::Committed { .. } => {
+                    assert!(reopened.snapshot(0)?.get(b"resolution").is_some());
+                }
+                super::DurableTransactionOutcome::RolledBack { .. } => {
+                    assert!(reopened.snapshot(0)?.get(b"resolution").is_none());
+                }
+                super::DurableTransactionOutcome::OutcomeUnknown { .. } => {
+                    return Err("reopen did not resolve the outcome".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_optimistic_preparation_rebases_disjoint_writes_and_rejects_conflicts()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -38085,11 +40821,11 @@ mod tests {
         assert_eq!(approximate.hits, exact);
         assert_eq!(
             approximate.strategy,
-            AnnSearchStrategy::StableIdAllowlistPostFilter
+            AnnSearchStrategy::StableIdAdaptiveExact
         );
         assert_eq!(
             approximate.recall_risk,
-            AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+            AnnRecallRisk::ExactFilteredCandidates
         );
         assert_eq!(approximate.eligible_candidate_count, 2);
         assert!(approximate.candidate_count >= approximate.eligible_candidate_count);

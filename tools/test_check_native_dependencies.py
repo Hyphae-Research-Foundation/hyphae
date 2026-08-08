@@ -212,6 +212,38 @@ class NativeDependencyGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(GateFailure, field):
                     audit_metadata(graph, candidate)
 
+    def test_multiple_reviewed_external_versions_are_retained_exactly(self) -> None:
+        root = package("hyphae-native-runtime")
+        syn_v2 = package("syn", version="2.0.119", source=REGISTRY)
+        syn_v3 = package("syn", version="3.0.2", source=REGISTRY)
+        report = audit_metadata(
+            metadata(
+                [root, syn_v2, syn_v3],
+                [
+                    dependency(str(syn_v2["id"]), None),
+                    dependency(str(syn_v3["id"]), "build"),
+                ],
+            ),
+            policy(["hyphae-native-runtime"], [syn_v2, syn_v3]),
+        )
+
+        self.assertEqual(
+            [
+                (entry["name"], entry["version"])
+                for entry in report["packages"]
+                if not entry["workspace"]
+            ],
+            [("syn", "2.0.119"), ("syn", "3.0.2")],
+        )
+        self.assertEqual(
+            report["dependency_kinds"],
+            {
+                "hyphae-native-runtime": ["root"],
+                "syn@2.0.119": ["normal"],
+                "syn@3.0.2": ["build"],
+            },
+        )
+
     def test_workspace_lints_must_forbid_unsafe_and_be_inherited(self) -> None:
         workspace = {"workspace": {"lints": {"rust": {"unsafe_code": "forbid"}}}}
         manifests = {"hyphae-native-runtime": {"lints": {"workspace": True}}}

@@ -10,6 +10,7 @@ homepage.workspace = true
 readme = "README.md"
 description = "Immutable versioned catalog model for Hyphae's native engines."
 publish = false
+include = ["Cargo.toml", "README.md", "src/**"]
 
 [dependencies]
 hyphae-native-types.workspace = true

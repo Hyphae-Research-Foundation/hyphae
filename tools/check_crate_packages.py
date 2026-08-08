@@ -11,18 +11,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLISHABLE_CRATES = (
-    "hyphae-core",
-    "hyphae-query",
-    "hyphae-retrieval",
-    "hyphae-storage",
-    "hyphae-engine",
-    "hyphae-contracts",
-    "hyphae-client",
-    "hyphae-server",
-    "hyphae-pliegors",
-    "hyphae-cli",
-)
 LITERAL_INCLUDE = re.compile(
     r'include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)', re.MULTILINE
 )
@@ -58,10 +46,15 @@ def main() -> int:
         package["name"]: Path(package["manifest_path"]).resolve()
         for package in metadata["packages"]
     }
+    publishable_crates = tuple(
+        package["name"]
+        for package in metadata["packages"]
+        if package["publish"] != []
+    )
     failures: list[str] = []
     checked_assets = 0
 
-    for crate in PUBLISHABLE_CRATES:
+    for crate in publishable_crates:
         manifest = manifests.get(crate)
         if manifest is None:
             failures.append(f"{crate}: package is missing from cargo metadata")
@@ -120,7 +113,7 @@ def main() -> int:
         return 1
 
     print(
-        f"crate package audit passed: {len(PUBLISHABLE_CRATES)} packages, "
+        f"crate package audit passed: {len(publishable_crates)} packages, "
         f"{checked_assets} compile-time assets"
     )
     return 0

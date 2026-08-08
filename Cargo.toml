@@ -15,8 +15,10 @@ members = [
     "crates/hyphae-native-btree",
     "crates/hyphae-native-mvcc",
     "crates/hyphae-native-manifest",
+    "crates/hyphae-native-daemon",
     "crates/hyphae-native-pages",
     "crates/hyphae-native-product",
+    "crates/hyphae-native-protocol",
     "crates/hyphae-native-records",
     "crates/hyphae-native-runtime",
     "crates/hyphae-native-types",
@@ -49,7 +51,10 @@ blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 crc32c = "0.6.8"
 fs4 = "1.1.0"
+futures-util = "0.3.31"
+getrandom = "0.3.4"
 http = "1.4.0"
+interprocess = { version = "2.4.3", features = ["tokio"] }
 hyphae-contracts = { path = "crates/hyphae-contracts", version = "=0.2.1" }
 hyphae-client = { path = "crates/hyphae-client", version = "=0.2.1" }
 hyphae-core = { path = "crates/hyphae-core", version = "=0.2.1" }
@@ -60,8 +65,10 @@ hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=0.2
 hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=0.2.1" }
 hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=0.2.1" }
 hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=0.2.1" }
+hyphae-native-daemon = { path = "crates/hyphae-native-daemon", version = "=0.2.1" }
 hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=0.2.1" }
 hyphae-native-product = { path = "crates/hyphae-native-product", version = "=0.2.1" }
+hyphae-native-protocol = { path = "crates/hyphae-native-protocol", version = "=0.2.1" }
 hyphae-native-records = { path = "crates/hyphae-native-records", version = "=0.2.1" }
 hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=0.2.1" }
 hyphae-native-types = { path = "crates/hyphae-native-types", version = "=0.2.1" }
@@ -82,6 +89,7 @@ subtle = "2.6.1"
 thiserror = "2.0.18"
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1.25"
+widestring = "1.2.1"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 tower = "0.5.3"
@@ -89,6 +97,22 @@ tower-http = { version = "0.6.8", features = ["catch-panic", "cors", "limit", "r
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
+
+[patch.crates-io]
+hyphae-native-ann = { path = "crates/hyphae-native-ann" }
+hyphae-native-blobs = { path = "crates/hyphae-native-blobs" }
+hyphae-native-btree = { path = "crates/hyphae-native-btree" }
+hyphae-native-catalog = { path = "crates/hyphae-native-catalog" }
+hyphae-native-daemon = { path = "crates/hyphae-native-daemon" }
+hyphae-native-manifest = { path = "crates/hyphae-native-manifest" }
+hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc" }
+hyphae-native-pages = { path = "crates/hyphae-native-pages" }
+hyphae-native-product = { path = "crates/hyphae-native-product" }
+hyphae-native-protocol = { path = "crates/hyphae-native-protocol" }
+hyphae-native-records = { path = "crates/hyphae-native-records" }
+hyphae-native-runtime = { path = "crates/hyphae-native-runtime" }
+hyphae-native-types = { path = "crates/hyphae-native-types" }
+hyphae-native-wal = { path = "crates/hyphae-native-wal" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

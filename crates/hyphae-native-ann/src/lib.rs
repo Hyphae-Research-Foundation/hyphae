@@ -270,8 +270,10 @@ pub struct VectorHit {
 pub enum AnnSearchStrategy {
     /// Ordinary bounded graph traversal without a filter.
     GraphTraversal,
-    /// Bounded graph traversal followed by a stable-object-ID allowlist.
-    StableIdAllowlistPostFilter,
+    /// Layer-zero graph navigation retains a separate eligible allowlist set.
+    StableIdEligibilityTraversal,
+    /// The admitted set was restrictive enough for complete exact scoring.
+    StableIdAdaptiveExact,
 }
 
 /// Honest recall qualification for one ANN execution strategy.
@@ -279,9 +281,11 @@ pub enum AnnSearchStrategy {
 pub enum AnnRecallRisk {
     /// Results remain subject to ordinary bounded graph-traversal recall.
     ApproximateTraversal,
-    /// Post-filtering a bounded candidate set may miss allowed neighbors and
-    /// may return fewer than `k` hits even when enough allowed vectors exist.
-    PostFilterMayMissAllowedNeighbors,
+    /// Filter eligibility participates in bounded layer-zero traversal, while
+    /// navigation may still visit disallowed connector nodes.
+    FilteredApproximateTraversal,
+    /// The complete admitted set was scored exactly.
+    ExactFilteredCandidates,
 }
 
 /// Per-query ANN bounds.
@@ -657,12 +661,11 @@ impl HnswIndex {
         self.search_allowlist(query, options, None)
     }
 
-    /// Traverses the graph with bounded breadth and post-filters its candidate
-    /// set through a stable-ID allowlist.
+    /// Traverses the graph with separate navigation and allowlist eligibility.
     ///
-    /// This is deliberately not a production-recall claim: disallowed graph
-    /// nodes may be traversed, only at most the bounded layer-zero candidates
-    /// are filtered, and the result may underfill `k`.
+    /// Disallowed graph nodes remain available as connectors, but do not
+    /// consume the bounded eligible candidate set. Restrictive admitted sets
+    /// no larger than `ef_search` use the complete exact filtered path.
     ///
     /// # Errors
     ///
@@ -674,6 +677,30 @@ impl HnswIndex {
         options: SearchOptions,
         allowlist: &BTreeSet<ObjectId>,
     ) -> Result<AnnSearchResult, AnnError> {
+        validate_vector(self.definition, query)?;
+        if options.ef_search > usize::from(self.definition.config.ef_search_max) {
+            return Err(AnnError::SearchBreadthExceeded);
+        }
+        let eligible_count = allowlist
+            .iter()
+            .filter(|object_id| self.entries.contains_key(object_id))
+            .count();
+        if eligible_count <= options.ef_search {
+            let hits = self.search_exact_filtered(query, options.k, allowlist)?;
+            return Ok(AnnSearchResult {
+                approximate: false,
+                build_identity: self.build_identity,
+                metric: self.definition.metric,
+                ef_search: options.ef_search,
+                candidate_count: eligible_count,
+                eligible_candidate_count: eligible_count,
+                strategy: AnnSearchStrategy::StableIdAdaptiveExact,
+                recall_risk: AnnRecallRisk::ExactFilteredCandidates,
+                exact_reranked: true,
+                visited_nodes: eligible_count,
+                hits,
+            });
+        }
         self.search_allowlist(query, options, Some(allowlist))
     }
 
@@ -711,17 +738,24 @@ impl HnswIndex {
             .exact_rerank
             .unwrap_or(options.ef_search)
             .max(options.k);
-        let mut candidates = self.search_layer(
-            query,
-            &[current],
-            0,
-            options.ef_search.max(breadth),
-            &mut visited,
-        )?;
-        let candidate_count = candidates.len();
-        if let Some(allowlist) = allowlist {
-            candidates.retain(|candidate| allowlist.contains(&candidate.object_id));
-        }
+        let mut candidates = if let Some(allowlist) = allowlist {
+            self.search_layer_filtered(
+                query,
+                &[current],
+                options.ef_search.max(breadth),
+                allowlist,
+                &mut visited,
+            )?
+        } else {
+            self.search_layer(
+                query,
+                &[current],
+                0,
+                options.ef_search.max(breadth),
+                &mut visited,
+            )?
+        };
+        let candidate_count = visited.len();
         let eligible_candidate_count = candidates.len();
         if let Some(rerank_count) = options.exact_rerank {
             candidates.truncate(rerank_count);
@@ -1086,6 +1120,96 @@ impl HnswIndex {
         Ok(best)
     }
 
+    fn search_layer_filtered(
+        &self,
+        query: &Vector,
+        entry_points: &[ObjectId],
+        breadth: usize,
+        allowlist: &BTreeSet<ObjectId>,
+        visited: &mut BTreeSet<ObjectId>,
+    ) -> Result<Vec<Candidate>, AnnError> {
+        let mut layer_visited = BTreeSet::new();
+        let mut frontier = Vec::new();
+        let mut navigation = Vec::new();
+        let mut eligible = Vec::new();
+        for entry_point in entry_points {
+            if !self.nodes.contains_key(entry_point) {
+                return Err(AnnError::CorruptGraph);
+            }
+            layer_visited.insert(*entry_point);
+            visited.insert(*entry_point);
+            let candidate = Candidate {
+                object_id: *entry_point,
+                distance: distance(
+                    self.definition.metric,
+                    query,
+                    &self.entry(*entry_point)?.vector,
+                )?,
+            };
+            frontier.push(candidate);
+            navigation.push(candidate);
+            if allowlist.contains(entry_point) {
+                eligible.push(candidate);
+            }
+        }
+        sort_and_deduplicate_candidates(&mut frontier);
+        sort_and_deduplicate_candidates(&mut navigation);
+        sort_and_deduplicate_candidates(&mut eligible);
+        navigation.truncate(breadth);
+        eligible.truncate(breadth);
+        while !frontier.is_empty() {
+            frontier.sort_by(compare_candidates);
+            let candidate = frontier.remove(0);
+            if navigation.len() >= breadth
+                && navigation
+                    .last()
+                    .is_some_and(|worst| compare_candidates(&candidate, worst) == Ordering::Greater)
+                && eligible.len() >= breadth
+            {
+                break;
+            }
+            let neighbors = self
+                .nodes
+                .get(&candidate.object_id)
+                .and_then(|node| node.neighbors.first())
+                .ok_or(AnnError::CorruptGraph)?;
+            for neighbor in neighbors {
+                if !layer_visited.insert(*neighbor) {
+                    continue;
+                }
+                visited.insert(*neighbor);
+                let neighbor = Candidate {
+                    object_id: *neighbor,
+                    distance: distance(
+                        self.definition.metric,
+                        query,
+                        &self.entry(*neighbor)?.vector,
+                    )?,
+                };
+                let navigation_admitted = navigation.len() < breadth
+                    || navigation.last().is_some_and(|worst| {
+                        compare_candidates(&neighbor, worst) == Ordering::Less
+                    });
+                if navigation_admitted || allowlist.contains(&neighbor.object_id) {
+                    frontier.push(neighbor);
+                }
+                if navigation_admitted {
+                    navigation.push(neighbor);
+                    navigation.sort_by(compare_candidates);
+                    navigation.dedup_by_key(|candidate| candidate.object_id);
+                    navigation.truncate(breadth);
+                }
+                if allowlist.contains(&neighbor.object_id) {
+                    eligible.push(neighbor);
+                    eligible.sort_by(compare_candidates);
+                    eligible.dedup_by_key(|candidate| candidate.object_id);
+                    eligible.truncate(breadth);
+                }
+            }
+        }
+        Ok(eligible)
+    }
+
     fn level_for(&self, object_id: ObjectId) -> u16 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"hyphae-hnsw-level-v1");
@@ -1199,7 +1323,7 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
 
 fn strategy(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnSearchStrategy {
     if allowlist.is_some() {
-        AnnSearchStrategy::StableIdAllowlistPostFilter
+        AnnSearchStrategy::StableIdEligibilityTraversal
     } else {
         AnnSearchStrategy::GraphTraversal
     }
@@ -1207,7 +1331,7 @@ fn strategy(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnSearchStrategy {
 
 fn recall_risk(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnRecallRisk {
     if allowlist.is_some() {
-        AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+        AnnRecallRisk::FilteredApproximateTraversal
     } else {
         AnnRecallRisk::ApproximateTraversal
     }
@@ -1449,11 +1573,11 @@ mod tests {
         assert_eq!(approximate.hits, exact);
         assert_eq!(
             approximate.strategy,
-            AnnSearchStrategy::StableIdAllowlistPostFilter
+            AnnSearchStrategy::StableIdAdaptiveExact
         );
         assert_eq!(
             approximate.recall_risk,
-            AnnRecallRisk::PostFilterMayMissAllowedNeighbors
+            AnnRecallRisk::ExactFilteredCandidates
         );
         assert_eq!(approximate.eligible_candidate_count, 3);
         assert!(approximate.candidate_count >= approximate.eligible_candidate_count);
@@ -1490,6 +1614,49 @@ mod tests {
                 .search_exact_filtered(&query, 4, &BTreeSet::new())?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_layer_zero_eligibility_does_not_spend_candidates_on_connectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(93)?,
+            2,
+            Metric::SquaredL2,
+            HnswConfig::new(4, 24, 4, 32, 0xfeed)?,
+        )?;
+        let records = (1..=96_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: Vector::new([f32::from(value), 0.0])?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let index = HnswIndex::build(definition, records)?;
+        let allowlist = (1..=96_u16)
+            .filter(|value| value % 3 == 0)
+            .map(|value| object(u128::from(value)))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let query = Vector::new([47.5, 0.0])?;
+        let exact = index.search_exact_filtered(&query, 4, &allowlist)?;
+        let filtered =
+            index.search_filtered(&query, SearchOptions::new(4, 8, Some(8))?, &allowlist)?;
+
+        assert_eq!(filtered.hits, exact);
+        assert_eq!(
+            filtered.strategy,
+            AnnSearchStrategy::StableIdEligibilityTraversal
+        );
+        assert_eq!(
+            filtered.recall_risk,
+            AnnRecallRisk::FilteredApproximateTraversal
+        );
+        assert!(filtered.eligible_candidate_count >= 4);
+        assert!(filtered.eligible_candidate_count <= 8);
+        assert!(filtered.candidate_count >= filtered.eligible_candidate_count);
         Ok(())
     }
 

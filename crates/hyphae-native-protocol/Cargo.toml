@@ -1,0 +1,23 @@
+[package]
+name = "hyphae-native-protocol"
+description = "Portable native local protocol and product wire codecs for Hyphae Native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+blake3.workspace = true
+hyphae-native-product.workspace = true
+hyphae-native-runtime.workspace = true
+hyphae-native-catalog.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+{
+  "schema": "hyphae-native-g6-corpus-v1",
+  "lanes": [
+    "embedded-rust",
+    "cli",
+    "local-daemon",
+    "http",
+    "rust-sdk-local",
+    "rust-sdk-http",
+    "python-sdk-local",
+    "python-sdk-http",
+    "typescript-sdk-local",
+    "typescript-sdk-http"
+  ],
+  "families": {
+    "capabilities": ["capabilities"],
+    "catalog": ["catalog-list", "catalog-describe", "catalog-dependencies"],
+    "sql": ["sql-ddl", "sql-dml", "sql-prepared", "sql-explain"],
+    "structures": ["scalar", "hash", "set", "list", "sorted-set", "stream"],
+    "search": ["lexical", "exact", "ann", "hybrid", "named-vectors", "filter", "facet", "metric"],
+    "transactions": ["commit-status", "atomic-batch"],
+    "administration": ["status", "telemetry", "doctor"],
+    "proofs": ["generate", "origin-independent-verify"],
+    "backup": ["create", "verify", "restore", "doctor-after-restore"],
+    "failures": ["syntax", "not-found", "limit", "deadline", "cancellation", "authorization"],
+    "transport-failures": ["malformed-input", "backpressure", "missing-completion", "disconnect-unknown-commit"]
+  },
+  "applicability": {
+    "backup/verify": ["embedded-rust", "cli"],
+    "proofs/generate": ["embedded-rust", "cli", "http", "rust-sdk-http", "python-sdk-http", "typescript-sdk-http"],
+    "proofs/origin-independent-verify": ["embedded-rust", "cli", "local-daemon", "http", "rust-sdk-local", "rust-sdk-http"],
+    "failures/limit": ["embedded-rust", "local-daemon", "http", "rust-sdk-local", "rust-sdk-http", "python-sdk-local", "python-sdk-http", "typescript-sdk-local", "typescript-sdk-http"],
+    "failures/deadline": ["embedded-rust", "local-daemon", "http", "rust-sdk-local", "rust-sdk-http", "python-sdk-local", "python-sdk-http", "typescript-sdk-local", "typescript-sdk-http"],
+    "failures/cancellation": ["embedded-rust", "local-daemon", "http", "rust-sdk-local", "rust-sdk-http", "python-sdk-local", "python-sdk-http", "typescript-sdk-local", "typescript-sdk-http"],
+    "failures/authorization": ["embedded-rust", "local-daemon", "http", "rust-sdk-local", "rust-sdk-http", "python-sdk-local", "python-sdk-http", "typescript-sdk-local", "typescript-sdk-http"],
+    "transport-failures/malformed-input": ["local-daemon", "http"],
+    "transport-failures/backpressure": ["local-daemon"],
+    "transport-failures/missing-completion": ["local-daemon", "http"],
+    "transport-failures/disconnect-unknown-commit": ["local-daemon"]
+  }
+}

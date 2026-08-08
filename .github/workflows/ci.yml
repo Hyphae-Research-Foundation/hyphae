@@ -37,7 +37,7 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
-      - name: Verify open G6 contract foundation
+      - name: Verify G6 manifests
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
           python tools/check_native_g6_foundation.py \

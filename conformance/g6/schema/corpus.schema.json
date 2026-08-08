@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/schema/native-g6-corpus-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "lanes", "families", "applicability"],
+  "properties": {
+    "schema": {"const": "hyphae-native-g6-corpus-v1"},
+    "lanes": {"type": "array", "minItems": 10, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "families": {"type": "object", "minProperties": 11, "additionalProperties": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}},
+    "applicability": {"type": "object", "minProperties": 4, "additionalProperties": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}}
+  }
+}

@@ -80,3 +80,12 @@ is outside the SDK's control.
 See [public client semantics](../../docs/clients/v1.md),
 [data model](../../docs/concepts/data-model.md), and
 [error codes](../../docs/api/error-codes-v1.md).
+
+## Native v2
+
+The `@celiums/hyphae/v2` export provides one high-level API over
+`HyphaeClient.local(endpoint)` and `HyphaeClient.http(origin)`. The Node local
+connector uses AF_UNIX paths on Unix and `\\.\pipe\...` named-pipe paths on
+Windows and carries exact `HYPHLCL1` frames without a wrapper protocol. HTTP
+uses canonical product envelopes at `/v2/execute`. Both expose typed product
+errors, request deadlines, `AbortSignal` cancellation, and transaction state.

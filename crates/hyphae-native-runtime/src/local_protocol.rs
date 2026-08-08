@@ -64,6 +64,8 @@ pub enum FrameKind {
     RowSchema = 22,
     /// Bounded typed row batch.
     RowBatch = 23,
+    /// Absolute request deadline control.
+    Deadline = 24,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -94,6 +96,7 @@ impl TryFrom<u8> for FrameKind {
             21 => Ok(Self::WindowUpdate),
             22 => Ok(Self::RowSchema),
             23 => Ok(Self::RowBatch),
+            24 => Ok(Self::Deadline),
             _ => Err(LocalProtocolError::UnknownKind(value)),
         }
     }

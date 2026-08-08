@@ -1,6 +1,7 @@
 {
   "schema": "hyphae-native-g6-workload-manifest-v1",
   "gate": "G6",
+  "required_platforms": ["linux", "macos", "windows"],
   "workloads": [
     {"id": "surface-error-parity", "requirement": "shared-contracts-and-errors", "oracle": "same stable code, retry class and transaction state on every surface", "acceptance": ["stable-code-registry", "unknown-commit", "redaction", "local-http-sdk-parity"]},
     {"id": "catalog-identity", "requirement": "catalog-and-collection-model", "oracle": "same stable IDs, definitions and dependencies on one snapshot", "acceptance": ["bounded-enumeration", "catalogued-keyspaces", "fielded-collections", "named-vectors", "dependency-integrity"]},

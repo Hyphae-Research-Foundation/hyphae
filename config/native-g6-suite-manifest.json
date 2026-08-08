@@ -2,20 +2,147 @@
   "schema": "hyphae-native-g6-suite-manifest-v1",
   "gate": "G6",
   "requirements": [
-    {"id": "shared-contracts-and-errors", "workloads": ["surface-error-parity"], "status": "partial-unhosted", "suites": [{"name": "product-error-contracts", "command": ["cargo", "test", "-p", "hyphae-native-product", "directory_lock_and_sql_errors_have_stable_mappings", "--locked"]}, {"name": "product-error-code-registry", "command": ["cargo", "test", "-p", "hyphae-native-product", "stable_error_registry_matches_accepted_contract", "--locked"]}, {"name": "product-nested-errors", "command": ["cargo", "test", "-p", "hyphae-native-product", "nested_runtime_io_and_corruption_have_honest_categories", "--locked"]}, {"name": "product-sql-not-found", "command": ["cargo", "test", "-p", "hyphae-native-product", "missing_relation_is_not_an_internal_product_failure", "--locked"]}, {"name": "product-sql-wrong-kind", "command": ["cargo", "test", "-p", "hyphae-native-product", "non_relation_name_is_not_reported_as_corruption", "--locked"]}]},
-    {"id": "catalog-and-collection-model", "workloads": ["catalog-identity"], "status": "planned", "suites": []},
-    {"id": "embedded-product-facade", "workloads": ["embedded-product"], "status": "partial-unhosted", "suites": [{"name": "embedded-catalog-not-found", "command": ["cargo", "test", "-p", "hyphae-native-product", "facade_creates_empty_directory_and_reports_safe_not_found", "--locked"]}, {"name": "prepared-lineage", "command": ["cargo", "test", "-p", "hyphae-native-product", "prepared_statement_cannot_cross_directory_lineage", "--locked"]}, {"name": "snapshot-prepared-lineage", "command": ["cargo", "test", "-p", "hyphae-native-product", "prepared_statement_snapshot_cannot_cross_directory_lineage", "--locked"]}, {"name": "prepared-sql-product-limits", "command": ["cargo", "test", "-p", "hyphae-native-product", "prepared_sql_enforces_product_row_and_statement_limits", "--locked"]}]},
-    {"id": "competitive-search-surface", "workloads": ["integrated-search"], "status": "planned", "suites": []},
-    {"id": "incremental-ann-lifecycle", "workloads": ["incremental-ann"], "status": "planned", "suites": []},
-    {"id": "native-offline-proofs", "workloads": ["offline-proof"], "status": "planned", "suites": []},
-    {"id": "native-local-daemon", "workloads": ["local-daemon"], "status": "planned", "suites": []},
-    {"id": "native-http-v2", "workloads": ["http-v2"], "status": "planned", "suites": []},
-    {"id": "single-binary-cli", "workloads": ["one-binary"], "status": "planned", "suites": []},
-    {"id": "rust-python-typescript-sdks", "workloads": ["sdk-parity"], "status": "planned", "suites": []},
-    {"id": "administration-and-explain", "workloads": ["admin-explain"], "status": "planned", "suites": []},
-    {"id": "telemetry-and-doctor", "workloads": ["telemetry-doctor"], "status": "planned", "suites": []},
-    {"id": "backup-restore-product-surface", "workloads": ["product-restore"], "status": "planned", "suites": []},
-    {"id": "cross-surface-conformance", "workloads": ["all-surface-conformance"], "status": "planned", "suites": []}
+    {
+      "id": "shared-contracts-and-errors",
+      "workloads": ["surface-error-parity"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "product-error-contracts", "acceptance": ["stable-code-registry", "unknown-commit", "redaction"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--lib"]},
+        {"name": "g6-error-parity", "acceptance": ["local-http-sdk-parity"], "coverage": {"sdks": ["rust", "python", "typescript"], "transports": ["embedded", "native-local", "http-v2"]}, "command": ["python", "-m", "unittest", "tools.test_check_native_g6_conformance", "-v"]}
+      ]
+    },
+    {
+      "id": "catalog-and-collection-model",
+      "workloads": ["catalog-identity"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "catalog-model-codec", "acceptance": ["catalogued-keyspaces", "fielded-collections", "named-vectors", "dependency-integrity"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-catalog", "--lib"]},
+        {"name": "bounded-product-catalog", "acceptance": ["bounded-enumeration"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "catalog_v2"]}
+      ]
+    },
+    {
+      "id": "embedded-product-facade",
+      "workloads": ["embedded-product"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "product-operation-dispatch", "acceptance": ["direct-engine-calls", "limits-deadlines-cancellation", "durability-policy"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "operation_dispatcher"]},
+        {"name": "product-structures-transactions", "acceptance": ["curated-api"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "product_structures_transactions"]}
+      ]
+    },
+    {
+      "id": "competitive-search-surface",
+      "workloads": ["integrated-search"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "integrated-search", "acceptance": ["persistent-doc-values", "filter-aware-ann", "exact-filtered-oracle", "adaptive-exact-ann", "multi-target-vectors", "streaming-ingest-backpressure", "no-partial-mutation"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "integrated_search"]}
+      ]
+    },
+    {
+      "id": "incremental-ann-lifecycle",
+      "workloads": ["incremental-ann"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "ann-foreground-delta", "acceptance": ["incremental-upsert", "incremental-delete", "durable-delta", "no-per-mutation-full-rebuild"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-runtime", "--test", "ann_incremental_lifecycle_g6"]},
+        {"name": "ann-consolidation", "acceptance": ["interrupted-consolidation", "atomic-generation-switch", "snapshot-safe-reclamation"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-runtime", "--test", "ann_consolidation_g6"]}
+      ]
+    },
+    {
+      "id": "native-offline-proofs",
+      "workloads": ["offline-proof"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "native-proof-and-witness", "acceptance": ["point-sql-search-proofs", "ann-approximation-binding", "hybrid-branch-binding", "origin-unavailable", "tamper-matrix"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "native_proof_g6"]}
+      ]
+    },
+    {
+      "id": "native-local-daemon",
+      "workloads": ["local-daemon"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "native-protocol", "acceptance": ["handshake-capabilities"], "coverage": {"sdks": [], "transports": ["native-local"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-protocol", "--test", "golden_vectors"]},
+        {"name": "native-daemon", "acceptance": ["uds", "multi-client", "prepared-handles", "provisional-read-completion", "flow-control", "cancel-deadline", "disconnect-transaction-outcome"], "coverage": {"sdks": [], "transports": ["native-local"]}, "platforms": ["linux", "macos"], "command": ["cargo", "test", "--locked", "-p", "hyphae-native-daemon", "--test", "daemon_uds"]},
+        {"name": "native-daemon-windows", "acceptance": ["windows-named-pipe", "peer-identity"], "coverage": {"sdks": [], "transports": ["native-local"]}, "platforms": ["windows"], "command": ["cargo", "test", "--locked", "-p", "hyphae-native-daemon", "--test", "daemon_windows"]},
+        {"name": "product-graceful-shutdown", "acceptance": ["graceful-shutdown"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "operation_dispatcher", "graceful_shutdown_drains_admitted_mutation_and_stops_new_admission"]}
+      ]
+    },
+    {
+      "id": "native-http-v2",
+      "workloads": ["http-v2"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "http-v2-contracts", "acceptance": ["openapi-json-schema"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-contracts", "--lib", "native_v2_assets_are_versioned_and_match_canonical_contracts"]},
+        {"name": "http-v2-server", "acceptance": ["authentication", "bounded-streaming", "provisional-read-completion", "request-id", "v1-compatibility-policy"], "coverage": {"sdks": [], "transports": ["http-v2"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-server", "--lib", "native_v2::tests"]}
+      ]
+    },
+    {
+      "id": "single-binary-cli",
+      "workloads": ["one-binary"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "native-cli", "acceptance": ["native-default-authority", "no-native-switch", "no-implicit-listener", "stable-exit-classes", "full-admitted-operation-corpus"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-cli", "--test", "native_cli"]}
+      ]
+    },
+    {
+      "id": "rust-python-typescript-sdks",
+      "workloads": ["sdk-parity"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "rust-sdk", "acceptance": ["rust"], "coverage": {"sdks": ["rust"], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-client", "--test", "v2_protocol"]},
+        {"name": "python-sdk", "acceptance": ["python"], "coverage": {"sdks": ["python"], "transports": []}, "command": ["python", "-m", "unittest", "sdks.python.tests.test_v2", "-v"]},
+        {"name": "typescript-sdk", "acceptance": ["typescript"], "coverage": {"sdks": ["typescript"], "transports": []}, "command": ["npm", "test", "--prefix", "sdks/typescript"]},
+        {"name": "all-sdk-real-transports", "acceptance": ["native-local", "http-v2", "typed-errors-proofs"], "coverage": {"sdks": ["rust", "python", "typescript"], "transports": ["native-local", "http-v2"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-server", "--test", "sdk_v2_real"]}
+      ]
+    },
+    {
+      "id": "administration-and-explain",
+      "workloads": ["admin-explain"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "administration-surfaces", "acceptance": ["typed-explain", "progress-cancellation"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "administration_surfaces"]},
+        {"name": "administration-authorization", "acceptance": ["authorization"], "coverage": {"sdks": [], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "operation_dispatcher", "cancellation_deadline_and_authorization_fail_before_mutation"]},
+        {"name": "maintenance-foreground", "acceptance": ["foreground-interference"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-runtime", "--test", "maintenance_foreground_g6"]}
+      ]
+    },
+    {
+      "id": "telemetry-and-doctor",
+      "workloads": ["telemetry-doctor"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "telemetry-and-doctor", "acceptance": ["bounded-cardinality", "redaction", "whole-product-corruption", "lock-contention"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "administration_surfaces"]},
+        {"name": "telemetry-separate-clocks", "acceptance": ["separate-clocks"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "operation_dispatcher", "dispatcher_records_admission_execution_planning_and_durability_clocks"]}
+      ]
+    },
+    {
+      "id": "backup-restore-product-surface",
+      "workloads": ["product-restore"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "embedded-backup-restore", "acceptance": ["offline-verification", "doctor-after-restore", "complete-state-equivalence"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-native-product", "--test", "administration_surfaces", "backup_restore_has_safe_cancellation_and_doctor_after_restore"]},
+        {"name": "cli-backup-restore", "acceptance": ["facade-cli-surface"], "coverage": {"sdks": [], "transports": ["embedded"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-cli", "--test", "native_cli", "native_backup_restore_and_proof_verification_are_offline"]}
+      ]
+    },
+    {
+      "id": "cross-surface-conformance",
+      "workloads": ["all-surface-conformance"],
+      "status": "implemented-unhosted",
+      "uncovered_acceptance": [],
+      "suites": [
+        {"name": "all-surface-corpus", "acceptance": ["linux-macos-windows", "embedded-local-cli-http", "rust-python-typescript", "identity-csn-result-error-explain-proof", "failure-paths"], "coverage": {"sdks": ["rust", "python", "typescript"], "transports": ["embedded", "native-local", "http-v2"]}, "command": ["python", "-m", "unittest", "tools.test_check_native_g6_conformance", "tools.test_run_native_g6_conformance", "-v"]}
+      ]
+    }
   ],
   "claims": [],
   "closure_declared": false

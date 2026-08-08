@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
     sync::Arc,
 };
 
@@ -21,6 +22,10 @@ pub const MAX_CATALOG_NAME_BYTES: usize = 1_024;
 pub const MAX_CATALOG_DEFINITION_ITEMS: usize = 100_000;
 /// Maximum canonical byte length of one catalog object definition.
 pub const MAX_CATALOG_DEFINITION_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum object-keyed mutations admitted by one incremental vector delta.
+pub const MAX_INCREMENTAL_VECTOR_DELTA_ENTRIES: u32 = 4_096;
+/// Maximum obsolete ANN generations retained by one vector definition.
+pub const MAX_INCREMENTAL_VECTOR_RETAINED_GENERATIONS: u16 = 64;
 
 /// Catalog construction or lookup failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -115,6 +120,33 @@ pub enum CatalogError {
     /// Catalog version space is exhausted.
     #[error("catalog version space is exhausted")]
     VersionExhausted,
+    /// A V2 definition version is zero.
+    #[error("catalog definition version must be nonzero")]
+    InvalidDefinitionVersion,
+    /// A V2 parent is absent, self-referential, or has the wrong object kind.
+    #[error("catalog object hierarchy is invalid")]
+    InvalidObjectHierarchy,
+    /// An analyzer repeats one token-filter policy.
+    #[error("analyzer token-filter policy is duplicated")]
+    DuplicateAnalyzerFilter,
+    /// A search field has a contradictory or empty materialization policy.
+    #[error("search field policy is invalid")]
+    InvalidSearchFieldPolicy,
+    /// A named vector field ID is duplicated.
+    #[error("named vector field ID {0} is duplicated")]
+    DuplicateVectorId(FieldId),
+    /// A normalized named vector or search-field name is duplicated.
+    #[error("named vector or search-field name is duplicated: {0}")]
+    DuplicateVectorName(Box<CatalogName>),
+    /// A named vector policy or lifecycle is invalid.
+    #[error("named vector policy or lifecycle is invalid")]
+    InvalidVectorPolicy,
+    /// A keyspace TTL, memory, or eviction policy is contradictory.
+    #[error("keyspace policy is invalid")]
+    InvalidKeyspacePolicy,
+    /// A derived dependency names an object absent from the supplied set.
+    #[error("catalog dependency target {0} does not exist")]
+    MissingDependencyTarget(ObjectId),
 }
 
 /// Display and normalized representation of one catalog name component.
@@ -232,6 +264,86 @@ impl std::fmt::Display for QualifiedName {
             self.object.display()
         )
     }
+}
+
+/// Nonzero logical definition revision embedded in `HYCOBJ02`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DefinitionVersion(NonZeroU64);
+
+impl DefinitionVersion {
+    /// First logical definition revision.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    /// Constructs a nonzero logical definition revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero.
+    pub fn new(value: u64) -> Result<Self, CatalogError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(CatalogError::InvalidDefinitionVersion)
+    }
+
+    /// Returns the encoded revision number.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Stable SHA-256 digest of one complete canonical logical definition.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DefinitionDigest([u8; 32]);
+
+impl DefinitionDigest {
+    /// Constructs a digest from its canonical bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the canonical 32-byte digest.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Stable logical catalog object family used by V2 views and dependency edges.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum CatalogObjectKind {
+    /// Top-level database namespace.
+    Database = 1,
+    /// Schema namespace owned by one database.
+    Schema = 2,
+    /// Relational relation.
+    Relation = 3,
+    /// Relational secondary index.
+    SecondaryIndex = 4,
+    /// First-class structure keyspace.
+    Keyspace = 5,
+    /// V1-compatible structure object.
+    Structure = 6,
+    /// Search collection.
+    SearchCollection = 7,
+    /// Reusable lexical analyzer.
+    Analyzer = 8,
+    /// Explicit cross-engine link.
+    CrossEngineLink = 9,
+}
+
+/// Shared metadata for native V2-only catalog definitions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectHeaderV2 {
+    /// Stable object identity.
+    pub id: ObjectId,
+    /// Owning engine.
+    pub owner: EngineKind,
+    /// Qualified display and lookup name.
+    pub name: QualifiedName,
+    /// Stable parent identity, absent only for a database.
+    pub parent: Option<ObjectId>,
+    /// Monotonic logical definition revision for this stable object ID.
+    pub definition_version: DefinitionVersion,
 }
 
 /// Shared immutable object metadata.
@@ -537,6 +649,92 @@ pub enum StructureOwnership {
     Cache = 2,
 }
 
+/// Keyspace expiry policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum KeyspaceTtlPolicy {
+    /// Values cannot carry expiry timestamps.
+    Disabled = 1,
+    /// Values may carry an explicit per-value expiry.
+    PerValue = 2,
+    /// Values use the keyspace default when no explicit expiry is supplied.
+    Default = 3,
+}
+
+/// Keyspace memory-accounting class.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum KeyspaceMemoryClass {
+    /// Durable canonical data receives protected memory treatment.
+    Durable = 1,
+    /// Normal managed memory treatment.
+    Standard = 2,
+    /// Reconstructible cache data eligible for eviction.
+    Cache = 3,
+}
+
+/// Keyspace eviction behavior.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum KeyspaceEvictionPolicy {
+    /// Never evict live values implicitly.
+    None = 1,
+    /// Evict least-recently-used values under memory pressure.
+    LeastRecentlyUsed = 2,
+    /// Evict values nearest expiry under memory pressure.
+    NearestExpiry = 3,
+}
+
+/// First-class V2 keyspace definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyspaceDefinition {
+    /// Shared V2 metadata.
+    pub header: ObjectHeaderV2,
+    /// Native structure family admitted in this keyspace.
+    pub kind: StructureKind,
+    /// Canonical key type.
+    pub key_type: LogicalType,
+    /// Canonical value or member type.
+    pub value_type: LogicalType,
+    /// Source or cache ownership.
+    pub ownership: StructureOwnership,
+    /// Expiry policy.
+    pub ttl_policy: KeyspaceTtlPolicy,
+    /// Default expiry in milliseconds, required only by `Default`.
+    pub default_ttl_millis: Option<u64>,
+    /// Memory-accounting class.
+    pub memory_class: KeyspaceMemoryClass,
+    /// Eviction policy.
+    pub eviction: KeyspaceEvictionPolicy,
+    /// Optional stable relation exposing the value schema.
+    pub relation_schema: Option<ObjectId>,
+}
+
+impl KeyspaceDefinition {
+    /// Validates ownership and policy combinations independent of dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid owner or contradictory policy.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.header.owner != EngineKind::Structure {
+            return Err(CatalogError::WrongObjectOwner);
+        }
+        if self.default_ttl_millis.is_some() != (self.ttl_policy == KeyspaceTtlPolicy::Default)
+            || self.default_ttl_millis == Some(0)
+            || (self.ownership == StructureOwnership::Canonical
+                && self.eviction != KeyspaceEvictionPolicy::None)
+            || (self.memory_class == KeyspaceMemoryClass::Durable
+                && self.ownership != StructureOwnership::Canonical)
+            || (self.memory_class == KeyspaceMemoryClass::Cache
+                && self.ownership != StructureOwnership::Cache)
+        {
+            return Err(CatalogError::InvalidKeyspacePolicy);
+        }
+        Ok(())
+    }
+}
+
 /// Native keyspace/structure object definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureDefinition {
@@ -567,6 +765,190 @@ pub struct SearchFieldDefinition {
     pub analyzer: Option<ObjectId>,
     /// Whether typed doc values are materialized.
     pub doc_values: bool,
+}
+
+/// Reusable analyzer tokenization strategy.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum AnalyzerTokenizer {
+    /// Unicode word-boundary tokenizer.
+    UnicodeWord = 1,
+    /// Whitespace-delimited tokenizer.
+    Whitespace = 2,
+    /// Treat the complete input as one keyword.
+    Keyword = 3,
+}
+
+/// One analyzer token-filter stage.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum AnalyzerFilter {
+    /// Unicode lowercase normalization.
+    Lowercase = 1,
+    /// ASCII-compatible accent folding.
+    AsciiFolding = 2,
+    /// English stop-word removal, version one.
+    EnglishStopV1 = 3,
+    /// English stemming, version one.
+    EnglishStemV1 = 4,
+}
+
+/// First-class reusable V2 lexical analyzer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyzerDefinition {
+    /// Shared V2 metadata.
+    pub header: ObjectHeaderV2,
+    /// Tokenization strategy.
+    pub tokenizer: AnalyzerTokenizer,
+    /// Ordered token-filter pipeline.
+    pub filters: Vec<AnalyzerFilter>,
+}
+
+impl AnalyzerDefinition {
+    /// Validates a bounded filter pipeline with no repeated stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate or excessive filters.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.header.owner != EngineKind::Search {
+            return Err(CatalogError::WrongObjectOwner);
+        }
+        if self.filters.len() > MAX_CATALOG_DEFINITION_ITEMS {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        let mut filters = BTreeSet::new();
+        if self.filters.iter().any(|filter| !filters.insert(*filter)) {
+            return Err(CatalogError::DuplicateAnalyzerFilter);
+        }
+        Ok(())
+    }
+}
+
+/// Search field source retention policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum FieldSourcePolicy {
+    /// Exclude this field from retained source.
+    Excluded = 1,
+    /// Retain the canonical source representation.
+    Retained = 2,
+}
+
+/// Lexical indexing policy for one field.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum LexicalIndexPolicy {
+    /// Do not build a lexical index for this field.
+    None = 1,
+    /// Index analyzed terms and frequencies.
+    Frequencies = 2,
+    /// Index terms, frequencies, and positions.
+    Positions = 3,
+}
+
+/// Complete V2 field storage and indexing options.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SearchFieldOptions {
+    /// Whether the original field value is independently retrievable.
+    pub stored: bool,
+    /// Whether typed filtering, sorting, facets, and metrics are materialized.
+    pub doc_values: bool,
+    /// Whether canonical source retains this field.
+    pub source: FieldSourcePolicy,
+    /// Lexical index detail.
+    pub lexical: LexicalIndexPolicy,
+}
+
+/// One V2 search field mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchFieldDefinitionV2 {
+    /// Stable field identity.
+    pub id: FieldId,
+    /// Display and lookup name.
+    pub name: CatalogName,
+    /// Source logical type.
+    pub logical_type: LogicalType,
+    /// Analyzer dependency for lexical indexing.
+    pub analyzer: Option<ObjectId>,
+    /// Storage and index options.
+    pub options: SearchFieldOptions,
+}
+
+/// Selection policy for exact and approximate vector execution.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VectorSearchPolicy {
+    /// Always evaluate exact distance over admitted candidates.
+    Exact,
+    /// Always use the named ANN definition.
+    Ann(AnnIndexDefinition),
+    /// Select exact below the candidate threshold and ANN otherwise.
+    Adaptive {
+        /// Maximum admitted exact candidate count.
+        exact_candidate_threshold: u32,
+        /// ANN definition used above the threshold.
+        ann: AnnIndexDefinition,
+    },
+}
+
+/// Incremental ANN lifecycle configuration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct IncrementalVectorLifecycle {
+    /// Maximum pending mutations before consolidation is required.
+    pub delta_max_entries: u32,
+    /// Number of immutable deltas that triggers consolidation.
+    pub consolidate_after_deltas: u16,
+    /// Maximum obsolete generations retained before reclamation.
+    pub retain_generations: u16,
+}
+
+impl IncrementalVectorLifecycle {
+    /// Validates bounded lifecycle controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero, inverted, or above-format bounds.
+    pub fn validate(self) -> Result<(), CatalogError> {
+        if self.delta_max_entries == 0
+            || self.delta_max_entries > MAX_INCREMENTAL_VECTOR_DELTA_ENTRIES
+            || self.consolidate_after_deltas == 0
+            || u32::from(self.consolidate_after_deltas) > self.delta_max_entries
+            || self.retain_generations == 0
+            || self.retain_generations > MAX_INCREMENTAL_VECTOR_RETAINED_GENERATIONS
+        {
+            Err(CatalogError::InvalidVectorPolicy)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// One named vector field owned by a V2 search collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedVectorDefinition {
+    /// Stable field identity for vector mutation and binding.
+    pub id: FieldId,
+    /// Display and lookup name.
+    pub name: CatalogName,
+    /// Fixed element and dimension.
+    pub vector_type: VectorType,
+    /// Fixed distance metric.
+    pub metric: VectorMetric,
+    /// Exact, ANN, or adaptive execution policy.
+    pub policy: VectorSearchPolicy,
+    /// Incremental delta/consolidation/reclamation policy.
+    pub lifecycle: IncrementalVectorLifecycle,
+}
+
+/// Native V2 search collection with complete field policy and named vectors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchCollectionDefinitionV2 {
+    /// Shared V2 metadata.
+    pub header: ObjectHeaderV2,
+    /// Fields ordered by stable identity.
+    pub fields: Vec<SearchFieldDefinitionV2>,
+    /// Named vectors ordered by stable identity.
+    pub vectors: Vec<NamedVectorDefinition>,
 }
 
 /// Vector distance fixed by one catalog search definition.
@@ -790,6 +1172,96 @@ impl SearchCollectionDefinition {
     }
 }
 
+impl SearchCollectionDefinitionV2 {
+    /// Validates canonical field/vector order, names, and policy combinations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for wrong ownership, duplicates, noncanonical order,
+    /// invalid analyzers, or invalid vector lifecycle settings.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.header.owner != EngineKind::Search {
+            return Err(CatalogError::WrongObjectOwner);
+        }
+        if self.fields.len() > MAX_CATALOG_DEFINITION_ITEMS
+            || self.vectors.len() > MAX_CATALOG_DEFINITION_ITEMS
+        {
+            return Err(CatalogError::TooManyDefinitionItems);
+        }
+        let mut ids = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        let mut previous_id = None;
+        for field in &self.fields {
+            if previous_id == Some(field.id) {
+                return Err(CatalogError::DuplicateFieldId(field.id));
+            }
+            if previous_id.is_some_and(|previous| previous > field.id) {
+                return Err(CatalogError::NoncanonicalFieldOrder);
+            }
+            previous_id = Some(field.id);
+            if !ids.insert(field.id) {
+                return Err(CatalogError::DuplicateFieldId(field.id));
+            }
+            if !names.insert(field.name.lookup()) {
+                return Err(CatalogError::DuplicateFieldName(Box::new(
+                    field.name.clone(),
+                )));
+            }
+            if field.options.lexical == LexicalIndexPolicy::None && field.analyzer.is_some() {
+                return Err(CatalogError::InvalidSearchFieldPolicy);
+            }
+            if field.options.lexical != LexicalIndexPolicy::None && field.analyzer.is_none() {
+                return Err(CatalogError::InvalidSearchFieldPolicy);
+            }
+            if !field.options.stored
+                && !field.options.doc_values
+                && field.options.source == FieldSourcePolicy::Excluded
+                && field.options.lexical == LexicalIndexPolicy::None
+            {
+                return Err(CatalogError::InvalidSearchFieldPolicy);
+            }
+        }
+
+        previous_id = None;
+        for vector in &self.vectors {
+            if previous_id == Some(vector.id) || ids.contains(&vector.id) {
+                return Err(CatalogError::DuplicateVectorId(vector.id));
+            }
+            if previous_id.is_some_and(|previous| previous > vector.id) {
+                return Err(CatalogError::NoncanonicalFieldOrder);
+            }
+            previous_id = Some(vector.id);
+            ids.insert(vector.id);
+            if !names.insert(vector.name.lookup()) {
+                return Err(CatalogError::DuplicateVectorName(Box::new(
+                    vector.name.clone(),
+                )));
+            }
+            let policy_metric = match vector.policy {
+                VectorSearchPolicy::Exact => None,
+                VectorSearchPolicy::Ann(ann) => Some(ann.metric()),
+                VectorSearchPolicy::Adaptive {
+                    exact_candidate_threshold,
+                    ann,
+                } => {
+                    if exact_candidate_threshold == 0 {
+                        return Err(CatalogError::InvalidVectorPolicy);
+                    }
+                    Some(ann.metric())
+                }
+            };
+            if policy_metric.is_some_and(|metric| metric != vector.metric)
+                || vector.lifecycle.delta_max_entries == 0
+                || vector.lifecycle.consolidate_after_deltas == 0
+                || vector.lifecycle.retain_generations == 0
+            {
+                return Err(CatalogError::InvalidVectorPolicy);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One native catalog object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogObject {
@@ -815,6 +1287,73 @@ impl CatalogObject {
             Self::Search(definition) => &definition.header,
             Self::CrossEngineLink(definition) => &definition.header,
         }
+    }
+
+    /// Returns the stable logical object family.
+    pub const fn kind(&self) -> CatalogObjectKind {
+        match self {
+            Self::Relation(_) => CatalogObjectKind::Relation,
+            Self::SecondaryIndex(_) => CatalogObjectKind::SecondaryIndex,
+            Self::Structure(_) => CatalogObjectKind::Structure,
+            Self::Search(_) => CatalogObjectKind::SearchCollection,
+            Self::CrossEngineLink(_) => CatalogObjectKind::CrossEngineLink,
+        }
+    }
+
+    /// Derives stable object dependencies declared by this V1-compatible object.
+    pub fn dependencies(&self) -> Vec<DependencyEdge> {
+        let dependent = self.header().id;
+        let mut edges = BTreeSet::new();
+        match self {
+            Self::Relation(definition) => {
+                for foreign_key in &definition.foreign_keys {
+                    if foreign_key.referenced_relation != dependent {
+                        edges.insert(DependencyEdge::new(
+                            dependent,
+                            foreign_key.referenced_relation,
+                            DependencyKind::ForeignKey,
+                        ));
+                    }
+                    if let Some(index) = foreign_key.referenced_index {
+                        edges.insert(DependencyEdge::new(
+                            dependent,
+                            index,
+                            DependencyKind::ForeignKey,
+                        ));
+                    }
+                }
+            }
+            Self::SecondaryIndex(definition) => {
+                edges.insert(DependencyEdge::new(
+                    dependent,
+                    definition.relation,
+                    DependencyKind::SecondaryIndexRelation,
+                ));
+            }
+            Self::Search(definition) => {
+                for analyzer in definition.fields.iter().filter_map(|field| field.analyzer) {
+                    edges.insert(DependencyEdge::new(
+                        dependent,
+                        analyzer,
+                        DependencyKind::Analyzer,
+                    ));
+                }
+            }
+            Self::CrossEngineLink(definition) => {
+                edges.insert(DependencyEdge::new(
+                    dependent,
+                    definition.source,
+                    DependencyKind::LinkEndpoint,
+                ));
+                edges.insert(DependencyEdge::new(
+                    dependent,
+                    definition.target,
+                    DependencyKind::LinkEndpoint,
+                ));
+            }
+            Self::Structure(_) => {}
+        }
+        edges.into_iter().collect()
     }
 
     /// Validates the object kind, owner, names, identities, and definition.
@@ -857,6 +1396,393 @@ impl CatalogObject {
             }
         }
     }
+}
+
+/// V2-only logical catalog object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogObjectV2 {
+    /// Top-level database namespace.
+    Database(ObjectHeaderV2),
+    /// Schema namespace owned by a database.
+    Schema(ObjectHeaderV2),
+    /// First-class structure keyspace.
+    Keyspace(KeyspaceDefinition),
+    /// Reusable lexical analyzer.
+    Analyzer(AnalyzerDefinition),
+    /// Search collection with complete field and vector policy.
+    SearchCollection(SearchCollectionDefinitionV2),
+}
+
+/// V1-compatible object promoted into the logical V2 hierarchy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompatibleCatalogObjectV2 {
+    /// Existing object definition, preserving all V1 constructors and fields.
+    pub object: CatalogObject,
+    /// Stable hierarchy parent.
+    pub parent: ObjectId,
+    /// Monotonic logical definition revision.
+    pub definition_version: DefinitionVersion,
+}
+
+/// Complete logical object admitted by the `HYCOBJ02` codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LogicalCatalogObject {
+    /// Existing relation/index/structure/search/link represented without loss.
+    Compatible(CompatibleCatalogObjectV2),
+    /// V2-native namespace, keyspace, analyzer, or search definition.
+    V2(CatalogObjectV2),
+}
+
+impl LogicalCatalogObject {
+    /// Promotes one legacy object into the logical V2 view.
+    ///
+    /// Legacy definitions do not carry an explicit hierarchy parent. Their
+    /// stable object identity is used as the compatibility parent marker and
+    /// is never emitted by the canonical `HYCOBJ02` encoder.
+    pub fn from_legacy(object: CatalogObject) -> Self {
+        let parent = object.header().id;
+        Self::Compatible(CompatibleCatalogObjectV2 {
+            object,
+            parent,
+            definition_version: DefinitionVersion::FIRST,
+        })
+    }
+
+    /// Returns the stable object identity.
+    pub const fn id(&self) -> ObjectId {
+        match self {
+            Self::Compatible(definition) => definition.object.header().id,
+            Self::V2(definition) => definition.header().id,
+        }
+    }
+
+    /// Returns the owning engine.
+    pub const fn owner(&self) -> EngineKind {
+        match self {
+            Self::Compatible(definition) => definition.object.header().owner,
+            Self::V2(definition) => definition.header().owner,
+        }
+    }
+
+    /// Returns the qualified display and lookup name.
+    pub const fn name(&self) -> &QualifiedName {
+        match self {
+            Self::Compatible(definition) => &definition.object.header().name,
+            Self::V2(definition) => &definition.header().name,
+        }
+    }
+
+    /// Returns the stable logical object family.
+    pub const fn kind(&self) -> CatalogObjectKind {
+        match self {
+            Self::Compatible(definition) => definition.object.kind(),
+            Self::V2(definition) => definition.kind(),
+        }
+    }
+
+    /// Returns the hierarchy parent, absent only for a database.
+    pub const fn parent(&self) -> Option<ObjectId> {
+        match self {
+            Self::Compatible(definition) => {
+                if definition.parent.get() == definition.object.header().id.get() {
+                    None
+                } else {
+                    Some(definition.parent)
+                }
+            }
+            Self::V2(definition) => definition.header().parent,
+        }
+    }
+
+    /// Returns the stable logical definition revision.
+    pub const fn definition_version(&self) -> DefinitionVersion {
+        match self {
+            Self::Compatible(definition) => definition.definition_version,
+            Self::V2(definition) => definition.header().definition_version,
+        }
+    }
+
+    /// Validates the complete logical object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a self-parent or invalid contained definition.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        match self {
+            Self::Compatible(definition) => definition.object.validate(),
+            Self::V2(definition) => definition.validate(),
+        }
+    }
+
+    /// Derives parent and definition-declared dependency edges.
+    pub fn dependencies(&self) -> Vec<DependencyEdge> {
+        let mut edges = BTreeSet::new();
+        if let Some(parent) = self.parent() {
+            edges.insert(DependencyEdge::new(
+                self.id(),
+                parent,
+                DependencyKind::Parent,
+            ));
+        }
+        match self {
+            Self::Compatible(definition) => edges.extend(definition.object.dependencies()),
+            Self::V2(definition) => edges.extend(definition.dependencies()),
+        }
+        edges.into_iter().collect()
+    }
+}
+
+impl CatalogObjectV2 {
+    /// Returns common V2 metadata.
+    pub const fn header(&self) -> &ObjectHeaderV2 {
+        match self {
+            Self::Database(header) | Self::Schema(header) => header,
+            Self::Keyspace(definition) => &definition.header,
+            Self::Analyzer(definition) => &definition.header,
+            Self::SearchCollection(definition) => &definition.header,
+        }
+    }
+
+    /// Returns the stable logical object family.
+    pub const fn kind(&self) -> CatalogObjectKind {
+        match self {
+            Self::Database(_) => CatalogObjectKind::Database,
+            Self::Schema(_) => CatalogObjectKind::Schema,
+            Self::Keyspace(_) => CatalogObjectKind::Keyspace,
+            Self::Analyzer(_) => CatalogObjectKind::Analyzer,
+            Self::SearchCollection(_) => CatalogObjectKind::SearchCollection,
+        }
+    }
+
+    /// Validates owner, hierarchy shape, and definition-local policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the logical definition is noncanonical.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        let header = self.header();
+        match self {
+            Self::Database(_) => {
+                if header.owner != EngineKind::Kernel {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                if header.parent.is_some() {
+                    return Err(CatalogError::InvalidObjectHierarchy);
+                }
+                Ok(())
+            }
+            Self::Schema(_) => {
+                if header.owner != EngineKind::Kernel {
+                    return Err(CatalogError::WrongObjectOwner);
+                }
+                validate_parent(header)
+            }
+            Self::Keyspace(definition) => {
+                validate_parent(header)?;
+                definition.validate()
+            }
+            Self::Analyzer(definition) => {
+                validate_parent(header)?;
+                definition.validate()
+            }
+            Self::SearchCollection(definition) => {
+                validate_parent(header)?;
+                definition.validate()
+            }
+        }
+    }
+
+    /// Derives parent and referenced-object dependency edges.
+    pub fn dependencies(&self) -> Vec<DependencyEdge> {
+        let dependent = self.header().id;
+        let mut edges = BTreeSet::new();
+        if let Some(parent) = self.header().parent {
+            edges.insert(DependencyEdge::new(
+                dependent,
+                parent,
+                DependencyKind::Parent,
+            ));
+        }
+        match self {
+            Self::Keyspace(definition) => {
+                if let Some(relation) = definition.relation_schema {
+                    edges.insert(DependencyEdge::new(
+                        dependent,
+                        relation,
+                        DependencyKind::RelationSchema,
+                    ));
+                }
+            }
+            Self::SearchCollection(definition) => {
+                for analyzer in definition.fields.iter().filter_map(|field| field.analyzer) {
+                    edges.insert(DependencyEdge::new(
+                        dependent,
+                        analyzer,
+                        DependencyKind::Analyzer,
+                    ));
+                }
+            }
+            Self::Database(_) | Self::Schema(_) | Self::Analyzer(_) => {}
+        }
+        edges.into_iter().collect()
+    }
+}
+
+fn validate_parent(header: &ObjectHeaderV2) -> Result<(), CatalogError> {
+    match header.parent {
+        Some(parent) if parent != header.id => Ok(()),
+        Some(_) | None => Err(CatalogError::InvalidObjectHierarchy),
+    }
+}
+
+/// Semantic reason for one derived catalog dependency.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum DependencyKind {
+    /// Namespace parent.
+    Parent = 1,
+    /// Secondary index owning relation.
+    SecondaryIndexRelation = 2,
+    /// Foreign-key target relation or unique index.
+    ForeignKey = 3,
+    /// Search field analyzer.
+    Analyzer = 4,
+    /// Cross-engine link endpoint.
+    LinkEndpoint = 5,
+    /// Keyspace relation-valued schema.
+    RelationSchema = 6,
+}
+
+/// Canonical directed edge from a dependent to its prerequisite.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DependencyEdge {
+    /// Object that declares the dependency.
+    pub dependent: ObjectId,
+    /// Object required by the dependent.
+    pub prerequisite: ObjectId,
+    /// Semantic edge class.
+    pub kind: DependencyKind,
+}
+
+impl DependencyEdge {
+    /// Constructs one directed dependency edge.
+    pub const fn new(dependent: ObjectId, prerequisite: ObjectId, kind: DependencyKind) -> Self {
+        Self {
+            dependent,
+            prerequisite,
+            kind,
+        }
+    }
+}
+
+/// Direction used to query derived dependency edges.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DependencyDirection {
+    /// Edges declared by the object.
+    Outgoing,
+    /// Edges whose dependents require the object.
+    Incoming,
+}
+
+/// Canonically derives and validates dependency edges for one complete object set.
+///
+/// # Errors
+///
+/// Returns an error when an edge is self-referential or names an absent target.
+pub fn derive_dependency_edges<'a>(
+    objects: impl IntoIterator<Item = &'a CatalogObject>,
+) -> Result<Vec<DependencyEdge>, CatalogError> {
+    let objects: Vec<_> = objects.into_iter().collect();
+    let ids: BTreeSet<_> = objects.iter().map(|object| object.header().id).collect();
+    let mut edges = BTreeSet::new();
+    for edge in objects.iter().flat_map(|object| object.dependencies()) {
+        if edge.dependent == edge.prerequisite {
+            return Err(CatalogError::InvalidObjectHierarchy);
+        }
+        if !ids.contains(&edge.prerequisite) {
+            return Err(CatalogError::MissingDependencyTarget(edge.prerequisite));
+        }
+        edges.insert(edge);
+    }
+    Ok(edges.into_iter().collect())
+}
+
+/// Returns all edges touching one object in a requested direction.
+pub fn dependency_edges_for(
+    edges: &[DependencyEdge],
+    object: ObjectId,
+    direction: DependencyDirection,
+) -> Vec<DependencyEdge> {
+    edges
+        .iter()
+        .copied()
+        .filter(|edge| match direction {
+            DependencyDirection::Outgoing => edge.dependent == object,
+            DependencyDirection::Incoming => edge.prerequisite == object,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Canonically derives and validates dependencies for logical V2 objects.
+///
+/// This validates database/schema hierarchy kinds in addition to requiring
+/// every referenced target to exist.
+///
+/// # Errors
+///
+/// Returns an error for absent targets, self-edges, or invalid parent kinds.
+pub fn derive_logical_dependency_edges<'a>(
+    objects: impl IntoIterator<Item = &'a LogicalCatalogObject>,
+) -> Result<Vec<DependencyEdge>, CatalogError> {
+    let objects: Vec<_> = objects.into_iter().collect();
+    let kinds: BTreeMap<_, _> = objects
+        .iter()
+        .map(|object| (object.id(), object.kind()))
+        .collect();
+    if kinds.len() != objects.len() {
+        return Err(CatalogError::InvalidObjectHierarchy);
+    }
+    let mut edges = BTreeSet::new();
+    for object in objects {
+        object.validate()?;
+        for edge in object.dependencies() {
+            if edge.dependent == edge.prerequisite {
+                return Err(CatalogError::InvalidObjectHierarchy);
+            }
+            let target_kind = kinds
+                .get(&edge.prerequisite)
+                .copied()
+                .ok_or(CatalogError::MissingDependencyTarget(edge.prerequisite))?;
+            let valid_target = match edge.kind {
+                DependencyKind::Parent => match object.kind() {
+                    CatalogObjectKind::Database => false,
+                    CatalogObjectKind::Schema => target_kind == CatalogObjectKind::Database,
+                    _ => target_kind == CatalogObjectKind::Schema,
+                },
+                DependencyKind::SecondaryIndexRelation | DependencyKind::RelationSchema => {
+                    target_kind == CatalogObjectKind::Relation
+                }
+                DependencyKind::ForeignKey => matches!(
+                    target_kind,
+                    CatalogObjectKind::Relation | CatalogObjectKind::SecondaryIndex
+                ),
+                DependencyKind::Analyzer => target_kind == CatalogObjectKind::Analyzer,
+                DependencyKind::LinkEndpoint => !matches!(
+                    target_kind,
+                    CatalogObjectKind::Database
+                        | CatalogObjectKind::Schema
+                        | CatalogObjectKind::CrossEngineLink
+                ),
+            };
+            if !valid_target {
+                return Err(CatalogError::InvalidObjectHierarchy);
+            }
+            edges.insert(edge);
+        }
+    }
+    Ok(edges.into_iter().collect())
 }
 
 /// Immutable catalog snapshot.
@@ -1076,13 +2002,17 @@ mod tests {
     use std::sync::Arc;
 
     use hyphae_native_types::{
-        CatalogVersion, ColumnId, EngineKind, IntegerWidth, LogicalType, ObjectId,
+        CatalogVersion, ColumnId, EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId,
     };
 
     use super::{
-        CatalogError, CatalogName, CatalogObject, CatalogSnapshot, CatalogTransaction,
-        ColumnDefinition, ObjectHeader, QualifiedName, RelationDefinition,
-        SecondaryIndexDefinition,
+        AnalyzerDefinition, AnalyzerTokenizer, CatalogError, CatalogName, CatalogObject,
+        CatalogObjectV2, CatalogSnapshot, CatalogTransaction, ColumnDefinition,
+        CompatibleCatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind,
+        FieldSourcePolicy, LexicalIndexPolicy, LogicalCatalogObject, ObjectHeader, ObjectHeaderV2,
+        QualifiedName, RelationDefinition, SearchCollectionDefinitionV2, SearchFieldDefinitionV2,
+        SearchFieldOptions, SecondaryIndexDefinition, dependency_edges_for,
+        derive_logical_dependency_edges,
     };
 
     fn relation(id: u128, name: &str) -> Result<CatalogObject, Box<dyn std::error::Error>> {
@@ -1213,6 +2143,122 @@ mod tests {
         transaction.create(secondary_index(2, 1, 1)?)?;
         let committed = transaction.commit()?;
         assert_eq!(committed.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn logical_dependencies_are_derived_in_both_directions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = LogicalCatalogObject::V2(CatalogObjectV2::Database(ObjectHeaderV2 {
+            id: ObjectId::new(10)?,
+            owner: EngineKind::Kernel,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted("database")?,
+            ),
+            parent: None,
+            definition_version: DefinitionVersion::FIRST,
+        }));
+        let schema = LogicalCatalogObject::V2(CatalogObjectV2::Schema(ObjectHeaderV2 {
+            id: ObjectId::new(11)?,
+            owner: EngineKind::Kernel,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted("schema")?,
+            ),
+            parent: Some(ObjectId::new(10)?),
+            definition_version: DefinitionVersion::FIRST,
+        }));
+        let analyzer = LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
+            header: ObjectHeaderV2 {
+                id: ObjectId::new(12)?,
+                owner: EngineKind::Search,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted("plain")?,
+                ),
+                parent: Some(ObjectId::new(11)?),
+                definition_version: DefinitionVersion::FIRST,
+            },
+            tokenizer: AnalyzerTokenizer::Whitespace,
+            filters: Vec::new(),
+        }));
+        let search = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+            SearchCollectionDefinitionV2 {
+                header: ObjectHeaderV2 {
+                    id: ObjectId::new(13)?,
+                    owner: EngineKind::Search,
+                    name: QualifiedName::new(
+                        CatalogName::unquoted("main")?,
+                        CatalogName::unquoted("public")?,
+                        CatalogName::unquoted("documents")?,
+                    ),
+                    parent: Some(ObjectId::new(11)?),
+                    definition_version: DefinitionVersion::FIRST,
+                },
+                fields: vec![SearchFieldDefinitionV2 {
+                    id: FieldId::new(1)?,
+                    name: CatalogName::unquoted("body")?,
+                    logical_type: LogicalType::Text,
+                    analyzer: Some(ObjectId::new(12)?),
+                    options: SearchFieldOptions {
+                        stored: true,
+                        doc_values: false,
+                        source: FieldSourcePolicy::Retained,
+                        lexical: LexicalIndexPolicy::Positions,
+                    },
+                }],
+                vectors: Vec::new(),
+            },
+        ));
+        let objects = [&database, &schema, &analyzer, &search];
+        let edges = derive_logical_dependency_edges(objects)?;
+        let outgoing =
+            dependency_edges_for(&edges, ObjectId::new(13)?, DependencyDirection::Outgoing);
+        let incoming =
+            dependency_edges_for(&edges, ObjectId::new(12)?, DependencyDirection::Incoming);
+        assert_eq!(outgoing.len(), 2);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].kind, DependencyKind::Analyzer);
+        Ok(())
+    }
+
+    #[test]
+    fn logical_dependency_derivation_rejects_missing_and_wrong_parents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let relation = LogicalCatalogObject::Compatible(CompatibleCatalogObjectV2 {
+            object: relation(1, "accounts")?,
+            parent: ObjectId::new(99)?,
+            definition_version: DefinitionVersion::FIRST,
+        });
+        assert_eq!(
+            derive_logical_dependency_edges([&relation]),
+            Err(CatalogError::MissingDependencyTarget(ObjectId::new(99)?))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_promotion_is_deterministic_for_full_width_object_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = u128::MAX - 1;
+        let legacy = relation(id, "high_id_relation")?;
+        let promoted = LogicalCatalogObject::from_legacy(legacy.clone());
+        assert_eq!(promoted.id(), ObjectId::new(id)?);
+        assert_eq!(promoted.parent(), None);
+        assert_eq!(promoted.definition_version(), DefinitionVersion::FIRST);
+        let encoded = promoted.encode_definition_v2()?;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&encoded)?,
+            promoted
+        );
+        let LogicalCatalogObject::Compatible(compatible) = promoted else {
+            return Err("legacy definition was not compatibly promoted".into());
+        };
+        assert_eq!(compatible.object, legacy);
         Ok(())
     }
 }

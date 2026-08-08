@@ -30,6 +30,7 @@ fn all_v1_frame_kind_codes_are_frozen_and_decodeable() -> Result<(), Box<dyn std
         (FrameKind::WindowUpdate, 21),
         (FrameKind::RowSchema, 22),
         (FrameKind::RowBatch, 23),
+        (FrameKind::Deadline, 24),
     ];
 
     for (kind, code) in registry {
@@ -39,8 +40,8 @@ fn all_v1_frame_kind_codes_are_frozen_and_decodeable() -> Result<(), Box<dyn std
         assert_eq!(decode_frame(&frame, 0)?.kind, kind);
     }
     assert_eq!(
-        FrameKind::try_from(24),
-        Err(LocalProtocolError::UnknownKind(24))
+        FrameKind::try_from(25),
+        Err(LocalProtocolError::UnknownKind(25))
     );
     Ok(())
 }

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/native-v2.schema.json",
+  "title": "NativeRequestV2",
+  "description": "One transport-independent Hyphae Native v2 operation and execution context.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "logical_time_micros", "durability", "limits", "operation"],
+  "properties": {
+    "request_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+    "logical_time_micros": { "type": "integer" },
+    "deadline_micros": { "type": ["integer", "null"], "minimum": 1 },
+    "durability": { "enum": ["strict", "group", "memory"] },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_count", "max_request_bytes", "max_response_bytes", "max_work_units", "max_memory_bytes"],
+      "properties": {
+        "max_count": { "type": "integer", "minimum": 1 },
+        "max_request_bytes": { "type": "integer", "minimum": 1 },
+        "max_response_bytes": { "type": "integer", "minimum": 1 },
+        "max_work_units": { "type": "integer", "minimum": 1 },
+        "max_memory_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "description": "Closed operation encoded canonically as HYPREQ01 on HTTP.",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["capabilities", "catalog", "sql", "structure", "search", "search_collection", "search_ingest", "admin", "telemetry", "doctor", "backup", "proof_verify", "transaction_status"]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/schema/native-g6-receipt-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source_commit", "platform", "status", "corpus_digest", "schema_digest", "transcript_digest", "lanes"],
+  "properties": {
+    "schema": {"const": "hyphae-native-g6-conformance-receipt-v1"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "platform": {"enum": ["linux", "macos", "windows"]},
+    "status": {"const": "passed"},
+    "corpus_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schema_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "transcript_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "lanes": {"type": "array", "minItems": 10, "items": {"$ref": "transcript.schema.json"}}
+  }
+}

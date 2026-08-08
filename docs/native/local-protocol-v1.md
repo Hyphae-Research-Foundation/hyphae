@@ -1,12 +1,11 @@
 # Native local protocol v1
 
-Status: normative target contract; the allocation-free borrowed frame decoder,
-encoder, version/kind validation, bounds, CRC32C, and filesystem-backed
-Unix-domain-socket framed transport are implemented experimentally. Canonical
-structure `GET`, `SET`, and TTL operations, lexical `SEARCH MATCH`, and
-prepared SQL `SELECT` execute through that transport. Windows named pipes, the
-complete handshake, explicit transactions, session flow control, and
-multiplexing remain pending.
+Status: normative target contract; the portable frame and product codecs,
+complete capability handshake, canonical errors, provisional completion,
+flow-control, cancellation/deadline controls, multi-client UDS daemon, and safe
+Windows named-pipe implementation compile path are present. The broader G6
+product operation matrix and cross-platform functional receipts remain
+incomplete.
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.
@@ -81,10 +80,11 @@ The v1 kind registry is append-only:
 | 21 | `WINDOW_UPDATE` | flow |
 | 22 | `ROW_SCHEMA` | result |
 | 23 | `ROW_BATCH` | result |
+| 24 | `DEADLINE` | flow |
 
-Codes 24 through 255 are unassigned in v1 and fail as unknown kinds. Adding a
+Codes 25 through 255 are unassigned in v1 and fail as unknown kinds. Adding a
 kind uses a previously unassigned code; existing assignments never change.
-Registry recognition does not imply that the corresponding session operation
+Registry recognition does not imply that every corresponding product operation
 is implemented.
 
 ## Message families
@@ -94,7 +94,7 @@ is implemented.
 - transaction: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`;
 - structure: typed point and structure operations;
 - search: typed lexical, vector, hybrid and aggregation requests;
-- flow: `DATA`, `END`, `WINDOW_UPDATE`, `CANCEL`;
+- flow: `DATA`, `END`, `WINDOW_UPDATE`, `CANCEL`, `DEADLINE`;
 - result: `ROW_SCHEMA`, `ROW_BATCH`, `VALUE`, `RECEIPT`;
 - failure: `ERROR`.
 
@@ -120,8 +120,9 @@ session-local plans and executes canonical typed parameters directly against
 the physical current-root relational paths. Results preserve logical schema,
 typed rows, and the visible all-engine CSN.
 
-The serial handle is `LocalDataSession`; DDL/DML over the protocol, explicit
-transaction state, complete flow control, and multiplexing remain pending.
+The prior serial handle remains available for G1 evidence. The G6
+`hyphae-native-daemon` adapter dispatches admitted operations through the sole
+`NativeProductService` owner; no engine behavior is implemented in the daemon.
 
 ## Multiplexing and flow control
 

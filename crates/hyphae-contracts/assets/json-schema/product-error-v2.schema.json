@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/product-error-v2.schema.json",
+  "title": "ProductErrorV2",
+  "description": "JSON representation with exact field parity to the Native ProductError contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "category", "retry", "message", "request_id", "trace_id", "object_id", "transaction_state", "transaction_id", "limit", "source_span", "details"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+    "category": { "enum": ["invalid-request", "not-found", "conflict", "limit", "deadline", "cancelled", "authorization", "corruption", "unavailable", "io", "internal"] },
+    "retry": { "enum": ["never", "same-request", "new-snapshot", "after-backoff", "after-recovery", "unknown-commit"] },
+    "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "request_id": { "type": ["string", "null"], "pattern": "^[1-9][0-9]{0,38}$" },
+    "trace_id": { "type": ["string", "null"], "pattern": "^[1-9][0-9]{0,38}$" },
+    "object_id": { "type": ["string", "null"], "pattern": "^[1-9][0-9]{0,38}$" },
+    "transaction_state": { "enum": ["none", "active", "rolled-back", "committed", "outcome-unknown"] },
+    "transaction_id": { "type": ["string", "null"], "pattern": "^[1-9][0-9]{0,38}$" },
+    "limit": { "anyOf": [{ "$ref": "#/$defs/ProductErrorLimitV2" }, { "type": "null" }] },
+    "source_span": { "anyOf": [{ "$ref": "#/$defs/ProductErrorSourceSpanV2" }, { "type": "null" }] },
+    "details": { "$ref": "#/$defs/ProductErrorDetailsV2" }
+  },
+  "$defs": {
+    "ProductErrorLimitV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "configured", "observed"],
+      "properties": {
+        "kind": { "type": "string" },
+        "configured": { "type": "integer", "minimum": 0 },
+        "observed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ProductErrorSourceSpanV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ProductErrorDetailsV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sql_subcode", "unknown"],
+      "properties": {
+        "sql_subcode": { "type": ["string", "null"] },
+        "unknown": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/ProductErrorUnknownDetailV2" } }
+      }
+    },
+    "ProductErrorUnknownDetailV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "value_hex"],
+      "properties": {
+        "tag": { "type": "integer", "minimum": 3, "maximum": 65535 },
+        "value_hex": { "type": "string", "pattern": "^[0-9a-f]{0,512}$" }
+      }
+    }
+  }
+}

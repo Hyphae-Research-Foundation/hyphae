@@ -74,6 +74,23 @@ def run_json(binary: Path, arguments: list[str], environment: dict[str, str]) ->
     return json.loads(result.stdout)
 
 
+def require_command_failure(
+    binary: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        (str(binary), *arguments),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        raise RuntimeError("installed verifier accepted the tampered proof")
+
+
 def workspace_version() -> str:
     manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     return manifest["workspace"]["package"]["version"]
@@ -112,6 +129,7 @@ def exercise_retrieval(
     phase: str,
     initialize: bool,
     expected_outcomes: dict[str, Any] | None = None,
+    remove_origin_before_verification: bool = False,
 ) -> dict[str, Any]:
     phase_root = root / phase
     phase_root.mkdir()
@@ -238,11 +256,14 @@ def exercise_retrieval(
             process.kill()
             process.wait(timeout=10)
 
-    # Verification happens only after the serving process is gone. This proves
-    # the installed verifier needs neither the live data directory handle nor
-    # a reachable server.
+    # Verification happens only after the serving process is gone. The install
+    # smoke also removes the origin so only the downloaded witnesses remain.
+    if remove_origin_before_verification:
+        shutil.rmtree(live)
+        if live.exists():
+            raise RuntimeError("retrieval origin still exists before offline verification")
     for kind, proof_file, witness, anchor_digest in verification_inputs:
-        run_json(
+        verified = run_json(
             binary,
             [
                 "verify-retrieval",
@@ -257,6 +278,8 @@ def exercise_retrieval(
             ],
             environment,
         )
+        if verified.get("status") != "verified" or verified.get("operation") != kind:
+            raise RuntimeError(f"installed {kind} retrieval verifier did not verify the proof")
     return outcomes
 
 
@@ -284,7 +307,7 @@ def verify_install(directory: Path) -> dict[str, Any]:
         binary = binaries[0]
         environment = os.environ.copy()
         live = root / "hyphae-data"
-        environment["HYPHAE_DATA_DIR"] = str(live)
+        environment.pop("HYPHAE_DATA_DIR", None)
 
         version = run_json(binary, ["version", "--json"], environment)
         expected_version = workspace_version()
@@ -292,11 +315,87 @@ def verify_install(directory: Path) -> dict[str, Any]:
             "api_version": "v1",
             "disk_format_version": 2,
             "engine_version": expected_version,
+            "native_directory_format": 1,
             "product": "hyphae",
+            "product_api_version": 1,
         }
         if version != expected:
             raise RuntimeError(f"installed version mismatch: {version!r}")
 
+        initialized = run_json(binary, ["init", "--data-dir", str(live)], environment)
+        if initialized.get("status") != "initialized":
+            raise RuntimeError("installed binary did not initialize native state")
+        run_json(
+            binary,
+            [
+                "structure",
+                "--data-dir",
+                str(live),
+                "set",
+                "--key",
+                "alpha",
+                "--value",
+                "durable",
+            ],
+            environment,
+        )
+        read = run_json(
+            binary,
+            ["structure", "--data-dir", str(live), "get", "--key", "alpha"],
+            environment,
+        )
+        if read.get("value") != "durable":
+            raise RuntimeError("installed binary returned the wrong native structure value")
+        run_json(
+            binary,
+            [
+                "sql",
+                "--data-dir",
+                str(live),
+                "execute",
+                "--statement",
+                "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+            ],
+            environment,
+        )
+        run_json(
+            binary,
+            [
+                "sql",
+                "--data-dir",
+                str(live),
+                "execute",
+                "--statement",
+                "INSERT INTO items (id, name) VALUES (?, ?)",
+                "--parameter",
+                "1",
+                "--parameter",
+                '"alpha"',
+            ],
+            environment,
+        )
+        selected = run_json(
+            binary,
+            [
+                "sql",
+                "--data-dir",
+                str(live),
+                "execute",
+                "--statement",
+                "SELECT id, name FROM items WHERE id = ?",
+                "--parameter",
+                "1",
+            ],
+            environment,
+        )
+        if selected.get("result", {}).get("rows") != [[1, "alpha"]]:
+            raise RuntimeError("installed binary returned the wrong native SQL row")
+        if run_json(binary, ["status", "--data-dir", str(live)], environment).get("status") != "ready":
+            raise RuntimeError("installed native status is not ready")
+        run_json(binary, ["checkpoint", "--data-dir", str(live)], environment)
+        run_json(binary, ["compact", "--data-dir", str(live)], environment)
+
+        compatibility_origin = root / "format-2-origin"
         alpha = {
             "body": "offline agent memory",
             "group": "x",
@@ -309,64 +408,109 @@ def verify_install(directory: Path) -> dict[str, Any]:
             "score": 20,
             "title": "Fast search",
         }
-        run_json(binary, ["put", "--key", "alpha", "--json", json.dumps(alpha)], environment)
-        run_json(binary, ["put", "--key", "beta", "--json", json.dumps(beta)], environment)
-        read = run_json(binary, ["get", "--key", "alpha"], environment)
-        if read.get("record", {}).get("value") != alpha:
-            raise RuntimeError("installed binary returned the wrong durable value")
-        query = run_json(
-            binary,
-            ["query", "--field", "group", "--equals", '"x"', "--sort", "score"],
-            environment,
-        )
-        if [row["key_hex"] for row in query.get("rows", [])] != ["616c706861", "62657461"]:
-            raise RuntimeError("installed binary returned the wrong global query order")
-
-        baseline_retrieval = exercise_retrieval(
-            binary,
-            live,
-            root,
-            environment,
-            phase="baseline-retrieval",
-            initialize=True,
-        )
-        run_json(binary, ["snapshot"], environment)
-        run_json(binary, ["compact"], environment)
-        exercise_retrieval(
-            binary,
-            live,
-            root,
-            environment,
-            phase="compacted-retrieval",
-            initialize=False,
-            expected_outcomes=baseline_retrieval,
-        )
+        for key, value in (("alpha", alpha), ("beta", beta)):
+            run_json(
+                binary,
+                [
+                    "put",
+                    "--data-dir",
+                    str(compatibility_origin),
+                    "--key",
+                    key,
+                    "--json",
+                    json.dumps(value),
+                ],
+                environment,
+            )
 
         proof = root / "result.hyproof"
         proven = run_json(
             binary,
-            ["query", "--sort", "score", "--descending", "--limit", "2", "--proof-out", str(proof)],
+            [
+                "query",
+                "--data-dir",
+                str(compatibility_origin),
+                "--sort",
+                "score",
+                "--descending",
+                "--limit",
+                "2",
+                "--proof-out",
+                str(proof),
+            ],
             environment,
         )
-        proof_metadata = proven["proof"]
-        run_json(
+        proof_metadata = proven.get("proof")
+        if not isinstance(proof_metadata, dict):
+            raise RuntimeError("installed compatibility query omitted its proof")
+        anchor_digest = proof_metadata.get("anchor_digest")
+        snapshot_path = proof_metadata.get("snapshot_path")
+        if not isinstance(anchor_digest, str) or not isinstance(snapshot_path, str):
+            raise RuntimeError("installed compatibility query returned incomplete proof metadata")
+        snapshot = root / "result.hysnap"
+        shutil.copyfile(snapshot_path, snapshot)
+
+        exercise_retrieval(
+            binary,
+            compatibility_origin,
+            root,
+            environment,
+            phase="compatibility-retrieval",
+            initialize=True,
+            remove_origin_before_verification=True,
+        )
+        if compatibility_origin.exists():
+            raise RuntimeError("compatibility origin exists during offline verification")
+
+        verified_query = run_json(
             binary,
             [
                 "verify",
                 "--proof",
                 str(proof),
                 "--snapshot",
-                proof_metadata["snapshot_path"],
+                str(snapshot),
                 "--anchor",
-                proof_metadata["anchor_digest"],
+                anchor_digest,
+            ],
+            environment,
+        )
+        verified_rows = (
+            verified_query.get("result", {}).get("result", {}).get("rows", [])
+        )
+        if verified_query.get("status") != "verified" or [
+            row.get("key_hex") for row in verified_rows
+        ] != ["62657461", "616c706861"]:
+            raise RuntimeError("installed compatibility query proof was not verified")
+
+        tampered = root / "tampered.hyproof"
+        tampered_bytes = bytearray(proof.read_bytes())
+        if not tampered_bytes:
+            raise RuntimeError("installed compatibility query wrote an empty proof")
+        tampered_bytes[-1] ^= 1
+        tampered.write_bytes(tampered_bytes)
+        require_command_failure(
+            binary,
+            [
+                "verify",
+                "--proof",
+                str(tampered),
+                "--snapshot",
+                str(snapshot),
+                "--anchor",
+                anchor_digest,
             ],
             environment,
         )
 
         backup = root / "hyphae-backup"
         restored = root / "hyphae-restored"
-        run_json(binary, ["backup", "--data-dir", str(live), "--out", str(backup)], environment)
-        run_json(binary, ["backup-verify", "--backup", str(backup)], environment)
+        run_json(
+            binary,
+            ["backup", "create", "--data-dir", str(live), "--out", str(backup)],
+            environment,
+        )
+        run_json(binary, ["backup", "verify", "--backup", str(backup)], environment)
         run_json(
             binary,
             ["restore", "--backup", str(backup), "--data-dir", str(restored)],
@@ -374,22 +518,17 @@ def verify_install(directory: Path) -> dict[str, Any]:
         )
         run_json(binary, ["doctor", "--data-dir", str(restored)], environment)
         restored_value = run_json(
-            binary, ["get", "--data-dir", str(restored), "--key", "alpha"], environment
-        )
-        if restored_value.get("record", {}).get("value") != alpha:
-            raise RuntimeError("installed restore did not preserve the durable value")
-        exercise_retrieval(
             binary,
-            restored,
-            root,
+            ["structure", "--data-dir", str(restored), "get", "--key", "alpha"],
             environment,
-            phase="restored-retrieval",
-            initialize=False,
-            expected_outcomes=baseline_retrieval,
         )
+        if restored_value.get("value") != "durable":
+            raise RuntimeError("installed restore did not preserve the durable value")
         return {
             "archive": archive.name,
             "engine_version": expected_version,
+            "negative_control": "rejected",
+            "proofs_verified": 4,
             "status": "ok",
         }
 

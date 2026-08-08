@@ -15,6 +15,8 @@ const COMMIT_V1_SIZE: usize = 124;
 const COMMIT_V2_SIZE: usize = 140;
 const ABORT_MAGIC: &[u8; 8] = b"HYABT001";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"HYCHK001";
+const OUTCOME_MAGIC: &[u8; 8] = b"HYOUT001";
+const OUTCOME_BODY_SIZE: usize = 120;
 const ROOT_COUNT: usize = 4;
 const MUTATION_HAS_EXPIRY: u8 = 1;
 
@@ -85,6 +87,8 @@ pub(crate) enum Opcode {
     ExpireStream = 47,
     DeleteSortedSet = 48,
     ExpireSortedSet = 49,
+    ConsolidateAnn = 50,
+    CreateCatalogObjectV2 = 51,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,6 +223,7 @@ impl CommitManifest {
 pub(crate) struct RecoveredCommit {
     pub(crate) transaction_id: TransactionId,
     pub(crate) commit_lsn: Lsn,
+    pub(crate) durability: DurabilityClass,
     pub(crate) manifest: CommitManifest,
     pub(crate) mutations: Vec<Mutation>,
 }
@@ -233,10 +238,21 @@ pub(crate) struct RecoveredCheckpoint {
     pub(crate) previous_checkpoint_lsn: Option<Lsn>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredOutcome {
+    pub(crate) resolution_id: TransactionId,
+    pub(crate) runtime_transaction_id: TransactionId,
+    pub(crate) principal_hash: [u8; 32],
+    pub(crate) idempotency_token: [u8; 32],
+    pub(crate) state: u8,
+    pub(crate) commit_csn: Option<Csn>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RecoveredWal {
     pub(crate) commits: Vec<RecoveredCommit>,
     pub(crate) checkpoints: Vec<RecoveredCheckpoint>,
+    pub(crate) outcomes: Vec<RecoveredOutcome>,
     pub(crate) dangling_transaction: Option<TransactionId>,
 }
 
@@ -385,6 +401,35 @@ pub(crate) fn encode_abort(
     )?)
 }
 
+pub(crate) fn encode_outcome(
+    resolution_id: TransactionId,
+    runtime_transaction_id: TransactionId,
+    principal_hash: [u8; 32],
+    idempotency_token: [u8; 32],
+    state: u8,
+    commit_csn: Option<Csn>,
+) -> Result<PendingRecord, WalSemanticError> {
+    if !(1..=3).contains(&state) || (state == 1) != commit_csn.is_some() {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    let mut body = Vec::with_capacity(OUTCOME_BODY_SIZE);
+    body.extend_from_slice(OUTCOME_MAGIC);
+    body.push(state);
+    body.extend_from_slice(&[0; 7]);
+    body.extend_from_slice(&resolution_id.get().to_le_bytes());
+    body.extend_from_slice(&runtime_transaction_id.get().to_le_bytes());
+    body.extend_from_slice(&principal_hash);
+    body.extend_from_slice(&idempotency_token);
+    body.extend_from_slice(&commit_csn.map_or(0, Csn::get).to_le_bytes());
+    Ok(PendingRecord::new(
+        RecordKind::Catalog,
+        EngineKind::Kernel,
+        0,
+        runtime_transaction_id,
+        body,
+    )?)
+}
+
 #[cfg(test)]
 pub(crate) fn recover_wal(records: &[WalRecord]) -> Result<RecoveredWal, WalSemanticError> {
     recover_wal_after(records, None)
@@ -439,6 +484,7 @@ pub(crate) fn recover_wal_after(
                 recovered.commits.push(RecoveredCommit {
                     transaction_id: record.transaction_id(),
                     commit_lsn: record.lsn(),
+                    durability: transaction.begin.durability,
                     manifest,
                     mutations: transaction
                         .mutations
@@ -460,12 +506,93 @@ pub(crate) fn recover_wal_after(
                 recover_checkpoint(record, active.is_some(), &mut recovered, base)?;
             }
             RecordKind::Catalog => {
-                return Err(WalSemanticError::InvalidSequence);
+                recover_outcome(record, active.is_some(), &mut recovered)?;
             }
         }
     }
     recovered.dangling_transaction = active.map(|transaction| transaction.transaction_id);
     Ok(recovered)
+}
+
+fn recover_outcome(
+    record: &WalRecord,
+    transaction_active: bool,
+    recovered: &mut RecoveredWal,
+) -> Result<(), WalSemanticError> {
+    if transaction_active || record.engine() != EngineKind::Kernel || record.flags() != 0 {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    let outcome = decode_outcome(record)?;
+    let prior = recovered.outcomes.iter().rev().find(|prior| {
+        prior.resolution_id == outcome.resolution_id
+            || (prior.principal_hash == outcome.principal_hash
+                && prior.idempotency_token == outcome.idempotency_token)
+    });
+    if prior.is_some_and(|prior| {
+        prior.resolution_id != outcome.resolution_id
+            || prior.runtime_transaction_id != outcome.runtime_transaction_id
+            || prior.principal_hash != outcome.principal_hash
+            || prior.idempotency_token != outcome.idempotency_token
+            || prior.state != 3
+    }) {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    if outcome.runtime_transaction_id != record.transaction_id()
+        || (outcome.state == 1
+            && !recovered.commits.iter().any(|commit| {
+                commit.transaction_id == outcome.runtime_transaction_id
+                    && Some(commit.manifest.commit_csn) == outcome.commit_csn
+            }))
+    {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    if let Some(position) = recovered
+        .outcomes
+        .iter()
+        .position(|prior| prior.resolution_id == outcome.resolution_id)
+    {
+        recovered.outcomes[position] = outcome;
+    } else {
+        recovered.outcomes.push(outcome);
+    }
+    Ok(())
+}
+
+fn decode_outcome(record: &WalRecord) -> Result<RecoveredOutcome, WalSemanticError> {
+    let body = record.body();
+    if body.len() != OUTCOME_BODY_SIZE
+        || body.get(..8) != Some(OUTCOME_MAGIC.as_slice())
+        || body[9..16].iter().any(|byte| *byte != 0)
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    let state = body[8];
+    if !(1..=3).contains(&state) {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    let resolution_id = TransactionId::new(read_u128(&body[16..32]))
+        .map_err(|_| WalSemanticError::InvalidIdentity)?;
+    let runtime_transaction_id = TransactionId::new(read_u128(&body[32..48]))
+        .map_err(|_| WalSemanticError::InvalidIdentity)?;
+    let mut principal_hash = [0; 32];
+    principal_hash.copy_from_slice(&body[48..80]);
+    let mut idempotency_token = [0; 32];
+    idempotency_token.copy_from_slice(&body[80..112]);
+    if principal_hash == [0; 32] || idempotency_token == [0; 32] {
+        return Err(WalSemanticError::InvalidIdentity);
+    }
+    let commit_csn = optional_csn(read_u64(&body[112..120]))?;
+    if (state == 1) != commit_csn.is_some() {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    Ok(RecoveredOutcome {
+        resolution_id,
+        runtime_transaction_id,
+        principal_hash,
+        idempotency_token,
+        state,
+        commit_csn,
+    })
 }
 
 fn recover_checkpoint(
@@ -728,6 +855,12 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         }
         value if value == Opcode::UpsertVector as u8 => (Opcode::UpsertVector, EngineKind::Search),
         value if value == Opcode::DeleteVector as u8 => (Opcode::DeleteVector, EngineKind::Search),
+        value if value == Opcode::ConsolidateAnn as u8 => {
+            (Opcode::ConsolidateAnn, EngineKind::Search)
+        }
+        value if value == Opcode::CreateCatalogObjectV2 as u8 => {
+            (Opcode::CreateCatalogObjectV2, EngineKind::Kernel)
+        }
         _ => return Err(WalSemanticError::InvalidBody),
     })
 }
@@ -778,12 +911,16 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         expires_at_micros,
         key,
     )?;
+    let value = &body[value_start..expected];
+    if opcode == Opcode::ConsolidateAnn && !valid_ann_consolidation(value) {
+        return Err(WalSemanticError::InvalidBody);
+    }
     Ok(Mutation {
         engine,
         opcode,
         target,
         key: key.to_vec(),
-        value: body[value_start..expected].to_vec(),
+        value: value.to_vec(),
         expires_at_micros,
     })
 }
@@ -795,6 +932,18 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
+    if opcode == Opcode::ConsolidateAnn {
+        if !has_target || !key.is_empty() || value_length != 112 || expires_at_micros.is_some() {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        return Ok(());
+    }
+    if opcode == Opcode::CreateCatalogObjectV2 {
+        if !has_target || key.is_empty() || value_length == 0 || expires_at_micros.is_some() {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        return Ok(());
+    }
     if matches!(
         opcode,
         Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch
@@ -875,6 +1024,15 @@ fn validate_mutation_shape(
     validate_mutation_identity(opcode, value_length, key)
 }
 
+fn valid_ann_consolidation(value: &[u8]) -> bool {
+    value.len() == 112
+        && value.get(..8) == Some(b"HYANNC01")
+        && value[8..40].iter().any(|byte| *byte != 0)
+        && value[40..72].iter().any(|byte| *byte != 0)
+        && value[72..104].iter().any(|byte| *byte != 0)
+        && (1..=4_096).contains(&read_u64(&value[104..112]))
+}
+
 fn validate_mutation_target_shape(
     opcode: Opcode,
     has_target: bool,
@@ -927,6 +1085,8 @@ fn validate_mutation_target_shape(
             | Opcode::CreateAnnIndex
             | Opcode::UpsertVector
             | Opcode::DeleteVector
+            | Opcode::ConsolidateAnn
+            | Opcode::CreateCatalogObjectV2
             | Opcode::UpdateRow
             | Opcode::DeleteRow
     );
@@ -962,6 +1122,9 @@ fn validate_mutation_identity(
         return Err(WalSemanticError::InvalidBody);
     }
     if opcode == Opcode::UpsertSortedSetMember && value_length != 8 {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    if opcode == Opcode::CreateAnnIndex && value_length < 20 {
         return Err(WalSemanticError::InvalidBody);
     }
     Ok(())
@@ -1180,8 +1343,8 @@ mod tests {
                 EngineKind::Search,
                 Opcode::CreateAnnIndex,
                 Some(ObjectId::new(3)?),
-                b"",
-                b"catalog-definition",
+                b"vectors",
+                b"HYANNIDX00000000000000",
                 None,
             ),
             mutation(
@@ -1584,6 +1747,84 @@ mod tests {
             ]
         );
         assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, compaction);
+        Ok(())
+    }
+
+    #[test]
+    fn ann_consolidation_opcode_is_append_only_and_strict() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(Opcode::ConsolidateAnn as u8, 50);
+        assert_eq!(
+            decode_opcode(50)?,
+            (Opcode::ConsolidateAnn, EngineKind::Search)
+        );
+        let mut value = Vec::with_capacity(112);
+        value.extend_from_slice(b"HYANNC01");
+        value.extend_from_slice(&[1; 32]);
+        value.extend_from_slice(&[2; 32]);
+        value.extend_from_slice(&[3; 32]);
+        value.extend_from_slice(&1_u64.to_le_bytes());
+        let mutation = mutation(
+            EngineKind::Search,
+            Opcode::ConsolidateAnn,
+            Some(ObjectId::new(3)?),
+            b"",
+            &value,
+            None,
+        );
+        let encoded = mutation.encode()?;
+        assert_eq!(encoded[8], 50);
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, mutation);
+
+        for invalid in [
+            validate_mutation_shape(Opcode::ConsolidateAnn, false, 112, None, b""),
+            validate_mutation_shape(Opcode::ConsolidateAnn, true, 111, None, b""),
+            validate_mutation_shape(Opcode::ConsolidateAnn, true, 112, None, b"key"),
+            validate_mutation_shape(Opcode::ConsolidateAnn, true, 112, Some(1), b""),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        let mut bad_magic = encoded.clone();
+        bad_magic[44] ^= 1;
+        assert!(matches!(
+            decode_mutation(EngineKind::Search, &bad_magic),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn logical_catalog_create_uses_the_next_append_only_opcode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::CreateCatalogObjectV2 as u8, 51);
+        assert_eq!(
+            decode_opcode(51)?,
+            (Opcode::CreateCatalogObjectV2, EngineKind::Kernel)
+        );
+        let mutation = mutation(
+            EngineKind::Kernel,
+            Opcode::CreateCatalogObjectV2,
+            Some(ObjectId::new(7)?),
+            b"qualified-name",
+            b"HYCOBJ02definition",
+            None,
+        );
+        let encoded = mutation.encode()?;
+        assert_eq!(encoded[8], 51);
+        assert_eq!(decode_mutation(EngineKind::Kernel, &encoded)?, mutation);
+        assert!(
+            validate_mutation_shape(Opcode::CreateCatalogObjectV2, false, 1, None, b"").is_err()
+        );
+        assert!(
+            validate_mutation_shape(
+                Opcode::CreateCatalogObjectV2,
+                true,
+                0,
+                None,
+                b"qualified-name"
+            )
+            .is_err()
+        );
         Ok(())
     }
 

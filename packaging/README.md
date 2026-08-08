@@ -17,9 +17,14 @@ and Windows x64. It emits a SHA-256 checksum file, SPDX JSON and
 CycloneDX JSON SBOMs, Sigstore bundles for every release asset, and GitHub
 Actions SLSA v1 provenance plus SBOM attestations for every native archive
 before creating a release. Every package job also extracts its own archive and
-executes the documented offline version, KV, query, compaction, result proof,
-durable vector/lexical/hybrid retrieval, retrieval-proof verification,
-backup/restore, and doctor flow from the installed binary.
+uses only its installed binary to execute native initialization, structures,
+SQL, checkpoint, compaction, backup/restore, and doctor. The same installed
+binary exercises the retained format-2 compatibility proof path: it generates
+a result proof plus exact, lexical, and hybrid retrieval proofs, downloads the
+complete witnesses, stops the server, deletes the originating data directory,
+and verifies all four proofs offline. A tampered result-proof negative control
+must fail; the smoke cannot report success unless every positive verification
+succeeds and the negative control is rejected.
 
 A manual workflow run, including one dispatched from a tag ref, executes native
 build, provenance, SBOM, signing, and verification, then uploads a candidate

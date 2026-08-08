@@ -1,0 +1,1561 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Exact dependency-free HYPHLCL1 and product-envelope codecs."""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+from typing import Any
+
+from .models import ClientError, ProductErrorFields, RequestOptions, Response
+
+
+MAX_PAYLOAD = 16 * 1024 * 1024
+FRAME_HEADER_SIZE = 32
+FRAME_KINDS = {
+    "hello": 1,
+    "welcome": 2,
+    "prepare": 4,
+    "execute": 5,
+    "failure": 13,
+    "cancel": 14,
+    "deallocate": 16,
+    "data": 19,
+    "end": 20,
+    "window_update": 21,
+}
+REQUEST_KINDS = {
+    "capabilities": 1,
+    "sql_prepare": 2,
+    "sql_execute_prepared": 3,
+    "sql_execute": 4,
+    "structure_get": 5,
+    "structure_set": 6,
+    "structure_ttl": 7,
+    "transaction_status": 8,
+    "search": 9,
+    "admin_status": 10,
+    "admin_checkpoint": 11,
+    "sql_deallocate": 12,
+    "catalog_object": 13,
+    "catalog_object_named": 14,
+    "catalog_list": 15,
+    "catalog_dependencies": 16,
+    "catalog_describe": 17,
+    "catalog_resolve": 18,
+    "admin_explain_sql": 20,
+    "doctor": 21,
+    "backup": 22,
+    "telemetry": 23,
+    "proof_verify": 24,
+    "search_collection": 25,
+    "search_ingest": 29,
+    "search_document_update": 30,
+    "search_document_delete": 31,
+    "structure_mutate": 26,
+    "structure_read": 27,
+    "restore": 28,
+    "transaction_begin": 32,
+    "transaction_stage_sql": 33,
+    "transaction_commit": 37,
+    "transaction_rollback": 38,
+    "proof_generate": 41,
+}
+
+DEFAULT_PROOF_LIMITS = {
+    "result_items": 10_000,
+    "candidate_items": 100_000,
+    "evidence_bytes": 32 * 1024 * 1024,
+    "max_proof_bytes": 64 * 1024 * 1024,
+    "max_section_bytes": 32 * 1024 * 1024,
+    "max_decoded_bytes": 48 * 1024 * 1024,
+    "max_objects": 4_096,
+    "max_hybrid_branches": 64,
+    "max_witness_bytes": 4 * 1024 * 1024 * 1024,
+    "max_entries": 65_536,
+    "max_files": 32_768,
+    "max_directories": 32_768,
+    "max_path_bytes": 4_096,
+    "max_file_bytes": 1024 * 1024 * 1024,
+    "max_total_file_bytes": 3 * 1024 * 1024 * 1024,
+    "max_witness_decoded_bytes": 3 * 1024 * 1024 * 1024,
+}
+
+
+@dataclass(frozen=True)
+class Frame:
+    kind: int
+    stream_id: int
+    request_id: int
+    payload: bytes
+
+
+def crc32c(data: bytes, crc: int = 0) -> int:
+    """Portable Castagnoli CRC matching Rust crc32c."""
+
+    crc ^= 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+
+def encode_frame(kind: int, stream_id: int, request_id: int, payload: bytes) -> bytes:
+    if len(payload) > MAX_PAYLOAD:
+        raise ClientError("native frame payload exceeds the configured maximum")
+    frame = bytearray(FRAME_HEADER_SIZE + len(payload))
+    struct.pack_into("<8sHBBIQI", frame, 0, b"HYPHLCL1", 1, kind, 0, stream_id, request_id, len(payload))
+    frame[FRAME_HEADER_SIZE:] = payload
+    struct.pack_into("<I", frame, 28, crc32c(frame))
+    return bytes(frame)
+
+
+def decode_frame(encoded: bytes) -> Frame:
+    if len(encoded) < FRAME_HEADER_SIZE:
+        raise ClientError("native frame is truncated")
+    magic, major, kind, flags, stream_id, request_id, length, checksum = struct.unpack_from(
+        "<8sHBBIQII", encoded
+    )
+    if magic != b"HYPHLCL1" or major != 1 or flags != 0 or kind not in FRAME_KINDS.values():
+        raise ClientError("native frame preamble is invalid")
+    if length > MAX_PAYLOAD or len(encoded) != FRAME_HEADER_SIZE + length:
+        raise ClientError("native frame length is invalid")
+    checked = bytearray(encoded)
+    checked[28:32] = b"\0" * 4
+    if crc32c(checked) != checksum:
+        raise ClientError("native frame CRC32C mismatch")
+    return Frame(kind, stream_id, request_id, encoded[FRAME_HEADER_SIZE:])
+
+
+def encode_hello(client_identity: str = "hyphae-python-sdk-v2") -> bytes:
+    names = [client_identity.encode(), b"main", b"public"]
+    total = 58 + sum(map(len, names))
+    return struct.pack(
+        "<8sIHHHHQQIII B3x HHH",
+        b"HYPHEL01",
+        total,
+        1,
+        1,
+        0,
+        0,
+        0x7F,
+        0x7F,
+        MAX_PAYLOAD,
+        64,
+        64 * 1024,
+        1,
+        *(len(name) for name in names),
+    ) + b"".join(names)
+
+
+def decode_welcome(encoded: bytes) -> dict[str, int]:
+    if len(encoded) != 94 or encoded[:8] != b"HYPWEL01" or struct.unpack_from("<I", encoded, 8)[0] != 94:
+        raise ClientError("native welcome is malformed")
+    major, minor, capabilities = struct.unpack_from("<HHQ", encoded, 12)
+    session_id = int.from_bytes(encoded[24:40], "little")
+    maximum_frame_payload, maximum_in_flight, initial_window = struct.unpack_from("<III", encoded, 40)
+    if major != 1 or session_id == 0 or not all((maximum_frame_payload, maximum_in_flight, initial_window)):
+        raise ClientError("native welcome values are invalid")
+    return {
+        "major": major,
+        "minor": minor,
+        "capabilities": capabilities,
+        "session_id": session_id,
+        "maximum_frame_payload": maximum_frame_payload,
+        "maximum_in_flight": maximum_in_flight,
+        "initial_window": initial_window,
+    }
+
+
+def encode_product_request(operation: str, arguments: dict[str, Any], options: RequestOptions) -> bytes:
+    kind = REQUEST_KINDS.get(operation)
+    if kind is None:
+        raise ClientError(f"unsupported native operation: {operation}")
+    limits = options.limits
+    if options.deadline_micros is not None and options.deadline_micros <= 0:
+        raise ClientError("deadline_micros must be positive")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in limits.values()
+    ):
+        raise ClientError("product limits must be positive integers")
+    try:
+        token = options.idempotency_token
+        if token is not None and (isinstance(token, bool) or not isinstance(token, int) or not 0 < token < 1 << 128):
+            raise ClientError("idempotency_token must be an unsigned 128-bit integer")
+        values = (
+            options.logical_time_micros,
+            options.deadline_micros or 0,
+            limits["max_count"],
+            limits["max_request_bytes"],
+            limits["max_response_bytes"],
+            limits["max_work_units"],
+            limits["max_memory_bytes"],
+            {"strict": 0, "group": 1, "memory": 2}[options.durability],
+        )
+        context = struct.pack("<qqQQQQQ B7x", *values) if token is None else struct.pack(
+            "<qq16sQQQQQ B7s",
+            values[0], values[1], token.to_bytes(16, "little"), *values[2:], b"\1\0\0\0\0\0\0",
+        )
+    except (KeyError, struct.error) as error:
+        raise ClientError("invalid request options") from error
+    body = _encode_operation(operation, arguments)
+    total = 16 + len(context) + len(body)
+    if total > MAX_PAYLOAD:
+        raise ClientError("product request exceeds the protocol maximum")
+    return struct.pack("<8sIHH", b"HYPREQ01", total, kind, 0) + context + body
+
+
+def decode_product_request(encoded: bytes) -> tuple[str, dict[str, Any], RequestOptions]:
+    kind, payload = _envelope(encoded, b"HYPREQ01")
+    if len(payload) >= 80 and payload[73:80] == b"\1\0\0\0\0\0\0":
+        values = struct.unpack_from("<qq16sQQQQQB", payload)
+        token, limits, durability, offset = int.from_bytes(values[2], "little") or None, values[3:8], values[8], 80
+    elif len(payload) >= 64 and payload[57:64] == b"\0" * 7:
+        values = struct.unpack_from("<qqQQQQQB", payload)
+        token, limits, durability, offset = None, values[2:7], values[7], 64
+    else:
+        raise ClientError("product request context is malformed")
+    options = RequestOptions(
+        logical_time_micros=values[0],
+        deadline_micros=values[1] or None,
+        idempotency_token=token,
+        limits=dict(zip(("max_count", "max_request_bytes", "max_response_bytes", "max_work_units", "max_memory_bytes"), limits)),
+        durability=("strict", "group", "memory")[durability],
+    )
+    operation = next((name for name, value in REQUEST_KINDS.items() if value == kind), None)
+    if operation is None:
+        raise ClientError("unsupported product request kind")
+    return operation, _decode_operation(operation, payload[offset:]), options
+
+
+def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
+    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"}:
+        return b""
+    if operation in {"structure_get", "structure_ttl"}:
+        return _bytes(arguments["key"])
+    if operation == "structure_set":
+        expiry = arguments.get("expires_at_micros")
+        return _bytes(arguments["key"]) + _bytes(arguments["value"]) + struct.pack("<B7x", expiry is not None) + (struct.pack("<q", expiry) if expiry is not None else b"")
+    if operation in {"sql_prepare", "admin_explain_sql"}:
+        return _text(arguments["statement"])
+    if operation == "sql_deallocate":
+        return struct.pack("<Q", arguments["handle"])
+    if operation == "sql_execute_prepared":
+        return struct.pack("<Q", arguments["handle"]) + _encode_values(arguments.get("parameters", []))
+    if operation == "sql_execute":
+        return _text(arguments["statement"]) + _encode_values(arguments.get("parameters", []))
+    if operation == "transaction_status":
+        return int(arguments["transaction_id"]).to_bytes(16, "little")
+    if operation == "transaction_stage_sql":
+        return struct.pack("<Q", arguments["handle"]) + _text(arguments["statement"]) + _encode_values(arguments.get("parameters", []))
+    if operation in {"transaction_commit", "transaction_rollback"}:
+        return struct.pack("<Q", arguments["handle"])
+    if operation == "doctor":
+        return b""
+    if operation == "backup":
+        limits = arguments["limits"]
+        return _text(arguments["destination"]) + struct.pack(
+            "<QQQQQ",
+            limits["max_files"],
+            limits["max_directories"],
+            limits["max_total_bytes"],
+            limits["max_path_bytes"],
+            limits["max_manifest_bytes"],
+        )
+    if operation == "search":
+        return int(arguments["index"]).to_bytes(16, "little") + struct.pack("<Q", arguments["limit"]) + _encode_query(arguments["query"])
+    if operation in {"catalog_object", "catalog_describe"}:
+        return int(arguments["id"]).to_bytes(16, "little")
+    if operation in {"catalog_object_named", "catalog_resolve"}:
+        return _encode_qualified_name(arguments["name"])
+    if operation == "catalog_list":
+        parent = arguments.get("parent")
+        kind = arguments.get("kind")
+        kind_tag = 0 if kind is None else _catalog_kind_tag(kind)
+        return struct.pack("<BB6x", parent is not None, kind_tag) + (
+            int(parent).to_bytes(16, "little") if parent is not None else b""
+        ) + _encode_cursor(arguments.get("cursor")) + struct.pack(
+            "<QQQ",
+            arguments["item_limit"],
+            arguments["visit_limit"],
+            arguments["byte_limit"],
+        )
+    if operation == "catalog_dependencies":
+        return int(arguments["object"]).to_bytes(16, "little") + struct.pack(
+            "<B7x", 0 if arguments["direction"] == "outgoing" else 1
+        ) + _encode_cursor(arguments.get("cursor")) + struct.pack(
+            "<QQQ",
+            arguments["item_limit"],
+            arguments["visit_limit"],
+            arguments["byte_limit"],
+        )
+    if operation == "proof_verify":
+        anchor = arguments["trusted_anchor"]
+        if not isinstance(anchor, bytes) or len(anchor) != 32:
+            raise ClientError("trusted_anchor must contain 32 bytes")
+        return _bytes(arguments["proof"]) + _bytes(arguments["witness"]) + anchor
+    if operation == "search_collection":
+        return _encode_search_collection(arguments)
+    if operation == "search_ingest":
+        return int(arguments["collection"]).to_bytes(16, "little") + _encode_search_batch(arguments["batch"])
+    if operation == "search_document_update":
+        return int(arguments["collection"]).to_bytes(16, "little") + int(arguments["idempotency_id"]).to_bytes(16, "little") + _encode_search_document(arguments["document"])
+    if operation == "search_document_delete":
+        return int(arguments["collection"]).to_bytes(16, "little") + int(arguments["idempotency_id"]).to_bytes(16, "little") + int(arguments["object_id"]).to_bytes(16, "little")
+    if operation == "structure_mutate":
+        mutations = arguments.get("mutations")
+        if not isinstance(mutations, list) or not 0 < len(mutations) <= 4096:
+            raise ClientError("structure mutations must be a nonempty bounded list")
+        return struct.pack("<I", len(mutations)) + b"".join(_encode_structure_mutation(value) for value in mutations)
+    if operation == "structure_read":
+        return _encode_structure_read(arguments)
+    if operation == "restore":
+        limits = arguments["limits"]
+        return _text(arguments["backup"]) + _text(arguments["destination"]) + struct.pack(
+            "<QQQQQq",
+            limits["max_files"],
+            limits["max_directories"],
+            limits["max_total_bytes"],
+            limits["max_path_bytes"],
+            limits["max_manifest_bytes"],
+            arguments.get("doctor_logical_time_micros", 0),
+        )
+    if operation == "proof_generate":
+        nested_operation = arguments["operation"]
+        nested_arguments = arguments.get("arguments", {})
+        if nested_operation == "proof_generate" or nested_operation not in REQUEST_KINDS:
+            raise ClientError("nested proof operation is invalid")
+        nested_body = _encode_operation(nested_operation, nested_arguments)
+        limits = {**DEFAULT_PROOF_LIMITS, **arguments.get("limits", {})}
+        names = tuple(DEFAULT_PROOF_LIMITS)
+        try:
+            encoded_limits = struct.pack("<" + "Q" * len(names), *(limits[name] for name in names))
+        except (KeyError, struct.error, TypeError) as error:
+            raise ClientError("proof generation limits are invalid") from error
+        return struct.pack("<HH", REQUEST_KINDS[nested_operation], 0) + _bytes(nested_body) + encoded_limits
+    raise ClientError(f"binary operation encoder is not implemented for {operation}")
+
+
+def _catalog_kind_tag(kind: Any) -> int:
+    kinds = (
+        "database",
+        "schema",
+        "relation",
+        "secondary_index",
+        "keyspace",
+        "structure",
+        "search_collection",
+        "analyzer",
+        "cross_engine_link",
+    )
+    try:
+        return kinds.index(kind) + 1
+    except ValueError as error:
+        raise ClientError("catalog object kind is invalid") from error
+
+
+def _encode_qualified_name(name: Any) -> bytes:
+    if not isinstance(name, dict):
+        raise ClientError("qualified catalog name is invalid")
+    output = bytearray()
+    for component in ("database", "schema", "object"):
+        value = name[component]
+        if not isinstance(value, dict):
+            raise ClientError("qualified catalog name component is invalid")
+        output.extend(_text(value["display"]))
+        output.extend(_text(value["lookup"]))
+    return bytes(output)
+
+
+def _encode_cursor(cursor: Any) -> bytes:
+    if cursor is None:
+        return struct.pack("<B7x", 0)
+    if not isinstance(cursor, dict):
+        raise ClientError("catalog cursor is invalid")
+    return struct.pack("<B7x", 1) + _encode_snapshot(cursor["snapshot"]) + int(
+        cursor["after"]
+    ).to_bytes(16, "little")
+
+
+def _encode_snapshot(snapshot: Any) -> bytes:
+    if not isinstance(snapshot, dict):
+        raise ClientError("snapshot identity is invalid")
+    lineage, root = snapshot["directory_lineage"], snapshot["root_digest"]
+    if not isinstance(lineage, bytes) or len(lineage) != 24 or not isinstance(root, bytes) or len(root) != 32:
+        raise ClientError("snapshot digest widths are invalid")
+    return lineage + struct.pack(
+        "<QQ", snapshot.get("visible_csn") or 0, snapshot["catalog_version"]
+    ) + root + struct.pack("<q", snapshot["logical_time_micros"])
+
+
+def _encode_values(values: Any) -> bytes:
+    if not isinstance(values, list) or len(values) > 4096:
+        raise ClientError("SQL parameters must be a bounded list")
+    return struct.pack("<I", len(values)) + b"".join(_encode_value(value, 0) for value in values)
+
+
+def _encode_value(value: Any, depth: int) -> bytes:
+    if depth > 8:
+        raise ClientError("SQL parameter nesting is too deep")
+    if value is None:
+        return b"\0"
+    if isinstance(value, bool):
+        return bytes((1, int(value)))
+    if isinstance(value, int):
+        if -(1 << 63) <= value < 1 << 63:
+            return b"\x02" + struct.pack("<q", value)
+        if 0 <= value < 1 << 64:
+            return b"\x03" + struct.pack("<Q", value)
+        raise ClientError("SQL integer is outside the signed/unsigned 64-bit domain")
+    if isinstance(value, str):
+        return b"\x07" + _text(value)
+    if isinstance(value, bytes):
+        return b"\x08" + _bytes(value)
+    if isinstance(value, list):
+        return b"\x0e" + _encode_values(value)
+    if isinstance(value, dict):
+        entries = list(value.items())
+        return b"\x0f" + struct.pack("<I", len(entries)) + b"".join(
+            _encode_value(key, depth + 1) + _encode_value(child, depth + 1)
+            for key, child in entries
+        )
+    raise ClientError("unsupported SQL parameter type")
+
+
+def _encode_query(query: Any, depth: int = 0) -> bytes:
+    if depth > 8 or not isinstance(query, dict):
+        raise ClientError("search query is invalid")
+    kind = query.get("kind")
+    if kind in {"term", "phrase", "prefix"}:
+        return bytes(({"term": 0, "phrase": 1, "prefix": 2}[kind],)) + _text(query["value"])
+    if kind == "fuzzy":
+        return b"\x03" + bytes((query["max_distance"],)) + _text(query["term"])
+    if kind == "boolean":
+        groups = [query.get("must", []), query.get("should", []), query.get("must_not", [])]
+        return b"\x04" + struct.pack("<III", *(len(group) for group in groups)) + b"".join(
+            _encode_query(child, depth + 1) for group in groups for child in group
+        )
+    raise ClientError("unsupported search query kind")
+
+
+def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
+    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry"}:
+        if encoded:
+            raise ClientError("parameterless request has trailing bytes")
+        return {}
+    if operation in {"structure_get", "structure_ttl"}:
+        value, offset = _take_bytes(encoded, 0)
+        if offset != len(encoded):
+            raise ClientError("structure request has trailing bytes")
+        return {"key": value}
+    raise ClientError(f"binary operation decoder is not implemented for {operation}")
+
+
+def decode_product_response(encoded: bytes, request_id: int) -> Response:
+    kind, payload = _envelope(encoded, b"HYPRSP01")
+    reader = _Reader(payload)
+    if kind == 1:
+        value = {
+            "product_api_version": reader.u16(),
+            "native_directory_format": reader.u16(),
+            "logical_catalog_codec_version": reader.u16(),
+            "catalog_tree_format_version": reader.u16(),
+            "max_catalog_items": reader.u64(),
+            "max_catalog_visits": reader.u64(),
+            "max_catalog_bytes": reader.u64(),
+            "max_sql_statement_bytes": reader.u64(),
+            "max_sql_parameters": reader.u64(),
+            "max_sql_rows": reader.u64(),
+        }
+        reader.finish()
+        return Response("capabilities", value, request_id)
+    if kind == 2:
+        value = {
+            "handle": reader.u64(),
+            "catalog_version": reader.u64(),
+            "parameter_count": reader.u64(),
+            "maximum_result_rows": reader.u64(),
+        }
+        reader.finish()
+        return Response("prepared_sql", value, request_id)
+    if kind == 3:
+        flags = reader.u8()
+        reader.zeroes(7)
+        snapshot = _decode_snapshot(reader) if flags & 1 else None
+        commit = _decode_commit_outcome(reader) if flags & 2 else None
+        value = {"result": _decode_sql_result(reader), "snapshot": snapshot, "commit": commit}
+        reader.finish()
+        return Response("sql", value, request_id)
+    if kind == 4:
+        present = reader.u8()
+        reader.zeroes(3)
+        value = reader.bytes() if present == 1 else None
+        if present not in (0, 1):
+            raise ClientError("structure response is malformed")
+        reader.finish()
+        return Response("structure_value", value, request_id)
+    if kind == 5:
+        value = _decode_commit_outcome(reader)
+        reader.finish()
+        return Response("structure_set", value, request_id)
+    if kind == 6:
+        tag = reader.u8()
+        value = {0: {"state": "missing"}, 1: {"state": "persistent"}}.get(tag)
+        if tag == 2:
+            value = {"state": "remaining", "remaining_micros": reader.i64()}
+        if value is None:
+            raise ClientError("structure TTL response is malformed")
+        reader.finish()
+        return Response("structure_ttl", value, request_id)
+    if kind == 7:
+        value = _decode_transaction_status(reader)
+        reader.finish()
+        return Response("transaction_status", value, request_id)
+    if kind == 8:
+        count = reader.u32()
+        reader.zeroes(4)
+        documents_examined = reader.u64()
+        source_bytes = reader.u64()
+        token_visits = reader.u64()
+        token_comparisons = reader.u64()
+        fuzzy_steps = reader.u64()
+        value = {
+            "documents_examined": documents_examined,
+            "source_bytes": source_bytes,
+            "token_visits": token_visits,
+            "token_comparisons": token_comparisons,
+            "fuzzy_steps": fuzzy_steps,
+            "hits": [
+                {"document_id": reader.bytes(), "score": reader.f64()}
+                for _ in range(count)
+            ],
+        }
+        reader.finish()
+        return Response("search", value, request_id)
+    if kind == 9:
+        snapshot = _decode_snapshot(reader)
+        fields = [reader.u64() for _ in range(10)]
+        value = {
+            "snapshot": snapshot,
+            "snapshot_pin_count": fields[0],
+            "physical": {
+                "page_count": fields[1],
+                "physical_page_reads": fields[2],
+                "wal_bytes": fields[3],
+                "process_full_state_loads": fields[4],
+                "process_full_catalog_loads": fields[5],
+            },
+            "retained_wal_bytes": fields[6],
+            "replayed_transactions": fields[7],
+            "manifest_count": fields[8],
+            "blob_count": fields[9],
+        }
+        reader.finish()
+        return Response("admin_status", value, request_id)
+    if kind == 10:
+        value = {
+            "transaction_id": reader.u128(),
+            "visible_csn": reader.u64(),
+            "manifest_generation": reader.u64(),
+            "manifest_digest": reader.take(32),
+            "checkpoint_lsn": reader.u64(),
+            "parent_directory_sync_supported": reader.boolean(),
+        }
+        reader.finish()
+        return Response("admin_checkpoint", value, request_id)
+    if kind == 11:
+        reader.finish()
+        return Response("deallocated", None, request_id)
+    if kind == 12:
+        value = {"snapshot": _decode_snapshot(reader), "definition": reader.bytes()}
+        reader.finish()
+        return Response("catalog_object", value, request_id)
+    if kind == 13:
+        value = _decode_catalog_page(reader, dependencies=False)
+        reader.finish()
+        return Response("catalog_page", value, request_id)
+    if kind == 14:
+        value = _decode_catalog_page(reader, dependencies=True)
+        reader.finish()
+        return Response("catalog_dependency_page", value, request_id)
+    if kind == 15:
+        present = reader.u8()
+        reader.zeroes(3)
+        value = reader.bytes() if present == 1 else None
+        if present not in (0, 1):
+            raise ClientError("catalog definition response is malformed")
+        reader.finish()
+        return Response("catalog_definition", value, request_id)
+    if kind == 16:
+        value = _decode_commit_outcome(reader)
+        reader.finish()
+        return Response("catalog_created", value, request_id)
+    if kind == 17:
+        if reader.u8() != 0:
+            raise ClientError("explain response is not an SQL plan")
+        reader.zeroes(3)
+        value = {"version": reader.u16()}
+        if reader.u16() != 0:
+            raise ClientError("explain response is malformed")
+        value["visible_csn"] = reader.u64() or None
+        value["catalog_version"] = reader.u64()
+        value["executed"] = reader.boolean()
+        reader.zeroes(7)
+        value["text"] = reader.text()
+        reader.finish()
+        return Response("explain", value, request_id)
+    if kind == 18:
+        value = _decode_doctor(reader)
+        reader.finish()
+        return Response("doctor", value, request_id)
+    if kind == 19:
+        value = {
+            "path": reader.text(),
+            "visible_csn": reader.u64(),
+            "checkpoint_digest": reader.take(32),
+            "file_count": reader.u64(),
+            "total_bytes": reader.u64(),
+        }
+        reader.finish()
+        return Response("backup", value, request_id)
+    if kind == 20:
+        value = _decode_telemetry(reader)
+        reader.finish()
+        return Response("telemetry", value, request_id)
+    if kind == 21:
+        proof_kinds = ("point", "sql", "lexical", "exact_vector", "ann", "hybrid", "catalog")
+        proof_kind = reader.u8()
+        semantic = reader.boolean()
+        reader.zeroes(6)
+        if not 1 <= proof_kind <= len(proof_kinds):
+            raise ClientError("proof verification kind is invalid")
+        value = {
+            "scope": "artifact_integrity",
+            "kind": proof_kinds[proof_kind - 1],
+            "semantic_reexecution_performed": semantic,
+            "anchor_digest": reader.take(32),
+            "proof_digest": reader.take(32),
+            "witness_digest": reader.take(32),
+            "request_digest": reader.take(32),
+            "result_digest": reader.take(32),
+            "evidence_digest": reader.take(32),
+            "file_count": reader.u64(),
+            "directory_count": reader.u64(),
+            "total_file_bytes": reader.u64(),
+        }
+        reader.finish()
+        return Response("proof_verification", value, request_id)
+    if kind == 22:
+        value = _decode_integrated_search(reader)
+        reader.finish()
+        return Response("integrated_search", value, request_id)
+    if kind == 23:
+        value = _decode_commit_outcome(reader)
+        reader.finish()
+        return Response("structure_mutated", value, request_id)
+    if kind == 24:
+        value = {"snapshot": _decode_snapshot(reader), "result": _decode_structure_read(reader)}
+        reader.finish()
+        return Response("structure_read", value, request_id)
+    if kind == 25:
+        value = {
+            "data_path": reader.text(),
+            "backup": {
+                "path": reader.text(),
+                "visible_csn": reader.u64(),
+                "checkpoint_digest": reader.take(32),
+                "file_count": reader.u64(),
+                "total_bytes": reader.u64(),
+            },
+            "doctor": _decode_doctor(reader),
+        }
+        phase_count = reader.u32()
+        value["phases"] = [reader.u8() for _ in range(phase_count)]
+        reader.finish()
+        return Response("restore", value, request_id)
+    if kind == 27:
+        value = _decode_explicit_transaction_status(reader)
+        reader.finish()
+        return Response("explicit_transaction_status", value, request_id)
+    if kind == 28:
+        value = {"handle": reader.u64(), "operation_ordinal": reader.u64(), "changed": reader.boolean()}
+        raise ClientError("typed transaction stage decoding is not implemented")
+    if kind == 29:
+        value = {"handle": reader.u64(), "staged_operations": reader.u64(), "commit": _decode_commit_receipt(reader)}
+        reader.finish()
+        return Response("transaction_committed", value, request_id)
+    if kind == 30:
+        value = {"handle": reader.u64(), "discarded_operations": reader.u64()}
+        reader.finish()
+        return Response("transaction_rolled_back", value, request_id)
+    if kind == 26:
+        snapshot = _decode_snapshot(reader)
+        has_commit, replay = reader.boolean(), reader.boolean()
+        reader.zeroes(6)
+        value = {
+            "snapshot": snapshot,
+            "documents": reader.u64(),
+            "idempotent_replay": replay,
+            "commit": _decode_commit_receipt(reader) if has_commit else None,
+        }
+        reader.finish()
+        return Response("search_ingested", value, request_id)
+    if kind == 31:
+        nested = decode_product_response(reader.bytes(), request_id)
+        value = {
+            "response": nested,
+            "proof": reader.bytes(),
+            "witness": reader.bytes(),
+            "trusted_anchor": reader.take(32),
+        }
+        reader.finish()
+        return Response("proven", value, request_id)
+    raise ClientError(f"unsupported product response kind: {kind}")
+
+
+def _decode_snapshot(reader: _Reader) -> dict[str, Any]:
+    lineage = reader.take(24)
+    visible = reader.u64()
+    return {
+        "directory_lineage": lineage,
+        "visible_csn": visible or None,
+        "catalog_version": reader.u64(),
+        "root_digest": reader.take(32),
+        "logical_time_micros": reader.i64(),
+    }
+
+
+def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
+    request = arguments["request"]
+    output = bytearray()
+    output.extend(int(arguments["collection"]).to_bytes(16, "little"))
+    lexical = request.get("lexical")
+    output.extend(struct.pack("<B7x", lexical is not None))
+    if lexical is not None:
+        output.extend(_text(lexical["query"]))
+        output.extend(struct.pack("<QI", lexical["candidate_limit"], lexical["weight"]))
+    vectors = request.get("vectors", [])
+    output.extend(struct.pack("<I", len(vectors)))
+    for vector in vectors:
+        values = vector["query"]
+        output.extend(_text(vector["target"]))
+        output.extend(struct.pack("<I", len(values)))
+        output.extend(struct.pack(f"<{len(values)}f", *values))
+        output.extend(struct.pack("<QI", vector["candidate_limit"], vector["weight"]))
+        execution = vector.get("execution")
+        kind = execution["kind"] if execution is not None else "catalog"
+        if kind == "catalog":
+            output.extend(struct.pack("<B7x", 0))
+        elif kind == "exact":
+            output.extend(struct.pack("<B7x", 1))
+        elif kind == "ann":
+            rerank = execution.get("exact_rerank")
+            output.extend(struct.pack("<BB6xQQ", 2, rerank is not None, execution["ef_search"], rerank or 0))
+        elif kind == "adaptive":
+            rerank = execution.get("exact_rerank")
+            output.extend(struct.pack("<BB6xQQQ", 3, rerank is not None, execution["exact_candidate_threshold"], execution["ef_search"], rerank or 0))
+        else:
+            raise ClientError("integrated vector execution is invalid")
+    output.extend(_encode_search_filter(request.get("filter", {"kind": "match_all"})))
+    sorts = request.get("sort", [])
+    output.extend(struct.pack("<I", len(sorts)))
+    for sort in sorts:
+        source = sort["source"]
+        if source["kind"] == "score":
+            output.append(0)
+        elif source["kind"] == "field":
+            output.append(1)
+            output.extend(_text(source["field"]))
+        else:
+            raise ClientError("integrated sort source is invalid")
+        output.extend(bytes((("ascending", "descending").index(sort["direction"]), ("first", "last").index(sort["missing"]))))
+    facets = request.get("facets", [])
+    output.extend(struct.pack("<I", len(facets)))
+    for facet in facets:
+        output.extend(_text(facet["field"]))
+        output.extend(struct.pack("<Q", facet["limit"]))
+    aggregations = request.get("aggregations", [])
+    output.extend(struct.pack("<I", len(aggregations)))
+    for aggregation in aggregations:
+        output.extend(_text(aggregation["name"]))
+        kind = aggregation["kind"]
+        if kind == "count":
+            output.append(0)
+        elif kind in {"sum", "min", "max"}:
+            output.append({"sum": 1, "min": 2, "max": 3}[kind])
+            output.extend(_text(aggregation["field"]))
+        else:
+            raise ClientError("integrated aggregation is invalid")
+    output.extend(struct.pack("<Q", request["limit"]))
+    return bytes(output)
+
+
+def _encode_search_batch(batch: Any) -> bytes:
+    documents = batch["documents"]
+    return int(batch["idempotency_id"]).to_bytes(16, "little") + struct.pack("<I", len(documents)) + b"".join(_encode_search_document(document) for document in documents)
+
+
+def _encode_search_document(document: Any) -> bytes:
+    output = bytearray(int(document["object_id"]).to_bytes(16, "little"))
+    output.extend(_text(document["text"]))
+    values = document.get("doc_values", {})
+    output.extend(struct.pack("<I", len(values)))
+    for name in sorted(values):
+        output.extend(_text(name))
+        output.extend(_encode_doc_value(values[name]))
+    vectors = document.get("vectors", {})
+    output.extend(struct.pack("<I", len(vectors)))
+    for name in sorted(vectors):
+        vector = vectors[name]
+        output.extend(_text(name))
+        output.extend(struct.pack("<I", len(vector)))
+        output.extend(struct.pack(f"<{len(vector)}f", *vector))
+    return bytes(output)
+
+
+def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
+    snapshot = _decode_snapshot(reader)
+    hits = []
+    for _ in range(reader.u32()):
+        object_id, score = reader.u128(), reader.f64()
+        values = {}
+        for _ in range(reader.u32()):
+            name, tag = reader.text(), reader.u8()
+            if tag == 0:
+                value = reader.boolean()
+            elif tag == 1:
+                value = reader.i64()
+            elif tag == 2:
+                value = reader.text()
+            elif tag == 3:
+                value = reader.bytes()
+            else:
+                raise ClientError("integrated doc value is invalid")
+            values[name] = value
+        hits.append({"object_id": object_id, "score": score, "doc_values": values})
+    facets = []
+    for _ in range(reader.u32()):
+        field = reader.text()
+        buckets = [
+            {"value": _decode_doc_value(reader), "count": reader.u64()}
+            for _ in range(reader.u32())
+        ]
+        facets.append({"field": field, "buckets": buckets})
+    aggregations = []
+    for _ in range(reader.u32()):
+        aggregations.append({"name": reader.text(), "value": _decode_aggregation_value(reader)})
+    strategies = ("exact_filtered", "adaptive_exact_filtered", "filter_aware_ann", "adaptive_filter_aware_ann")
+    branches = []
+    for _ in range(reader.u32()):
+        target, strategy = reader.text(), reader.u8()
+        if strategy >= len(strategies):
+            raise ClientError("integrated vector strategy is invalid")
+        approximate, reranked = reader.boolean(), reader.boolean()
+        reader.zeroes(5)
+        branches.append({
+            "target": target,
+            "strategy": strategies[strategy],
+            "approximate": approximate,
+            "exact_reranked": reranked,
+            "eligible_documents": reader.u64(),
+            "candidate_count": reader.u64(),
+            "visited_nodes": reader.u64(),
+        })
+    approximate = reader.boolean()
+    reader.zeroes(7)
+    counts = [reader.u64() for _ in range(5)]
+    return {
+        "snapshot": snapshot,
+        "hits": hits,
+        "facets": facets,
+        "aggregations": aggregations,
+        "vector_branches": branches,
+        "approximate": approximate,
+        "total_documents": counts[0],
+        "eligible_documents": counts[1],
+        "lexical_candidates": counts[2],
+        "retrieval_candidates": counts[3],
+        "matched_candidates": counts[4],
+    }
+
+
+def _encode_search_filter(value: Any, depth: int = 0) -> bytes:
+    if depth > 32 or not isinstance(value, dict):
+        raise ClientError("integrated filter is invalid")
+    kind = value.get("kind")
+    if kind == "match_all":
+        return b"\0"
+    if kind == "exists":
+        return b"\x01" + _text(value["field"])
+    if kind == "compare":
+        operators = ("equal", "not_equal", "less", "less_or_equal", "greater", "greater_or_equal")
+        try:
+            operator = operators.index(value["operator"])
+        except ValueError as error:
+            raise ClientError("integrated comparison operator is invalid") from error
+        return b"\x02" + _text(value["field"]) + bytes((operator,)) + _encode_doc_value(value["value"])
+    if kind in {"all", "any"}:
+        children = value.get("filters", [])
+        return bytes((3 if kind == "all" else 4,)) + struct.pack("<I", len(children)) + b"".join(
+            _encode_search_filter(child, depth + 1) for child in children
+        )
+    if kind == "not":
+        return b"\x05" + _encode_search_filter(value["filter"], depth + 1)
+    raise ClientError("integrated filter kind is invalid")
+
+
+def _encode_doc_value(value: Any) -> bytes:
+    if isinstance(value, bool):
+        return bytes((0, int(value)))
+    if isinstance(value, int) and not isinstance(value, bool) and -(1 << 63) <= value < 1 << 63:
+        return b"\x01" + struct.pack("<q", value)
+    if isinstance(value, str):
+        return b"\x02" + _text(value)
+    if isinstance(value, bytes):
+        return b"\x03" + _bytes(value)
+    raise ClientError("integrated doc value is invalid")
+
+
+def _decode_doc_value(reader: _Reader) -> Any:
+    tag = reader.u8()
+    if tag == 0:
+        return reader.boolean()
+    if tag == 1:
+        return reader.i64()
+    if tag == 2:
+        return reader.text()
+    if tag == 3:
+        return reader.bytes()
+    raise ClientError("integrated doc value is invalid")
+
+
+def _decode_aggregation_value(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"kind": "count", "value": reader.u64()}
+    if tag == 1:
+        return {"kind": "integer", "value": reader.i128() if reader.boolean() else None}
+    if tag == 2:
+        return {"kind": "value", "value": _decode_doc_value(reader) if reader.boolean() else None}
+    raise ClientError("integrated aggregation value is invalid")
+
+
+def _encode_structure_mutation(value: Any) -> bytes:
+    if not isinstance(value, dict):
+        raise ClientError("structure mutation is invalid")
+    kind = value.get("kind")
+    tags = {
+        "create_hash": 0,
+        "hash_set": 1,
+        "create_set": 2,
+        "set_add": 3,
+        "create_list": 4,
+        "list_push_tail": 5,
+        "create_sorted_set": 6,
+        "sorted_set_add": 7,
+        "create_stream": 8,
+        "stream_append": 9,
+    }
+    if kind not in tags:
+        raise ClientError("structure mutation kind is invalid")
+    output = bytearray((tags[kind],))
+    output.extend(_encode_structure_key(value["key"]))
+    if kind == "hash_set":
+        output.extend(_bytes(value["field"]))
+        output.extend(_bytes(value["value"]))
+    elif kind == "set_add":
+        output.extend(_bytes(value["member"]))
+    elif kind == "list_push_tail":
+        output.extend(_bytes(value["value"]))
+    elif kind == "sorted_set_add":
+        output.extend(struct.pack("<d", value["score"]))
+        output.extend(_bytes(value["member"]))
+    elif kind == "stream_append":
+        fields = value["fields"]
+        output.extend(struct.pack("<I", len(fields)))
+        for field, field_value in fields:
+            output.extend(_bytes(field))
+            output.extend(_bytes(field_value))
+    return bytes(output)
+
+
+def _encode_structure_read(value: dict[str, Any]) -> bytes:
+    kind = value.get("kind")
+    tags = {"hash_get": 3, "set_members": 10, "list_range": 7, "sorted_set_range": 15, "stream_range": 17}
+    if kind not in tags:
+        raise ClientError("structure read kind is invalid")
+    output = bytearray((tags[kind],))
+    output.extend(_encode_structure_key(value["key"]))
+    if kind == "hash_get":
+        output.extend(_bytes(value["field"]))
+    elif kind == "set_members":
+        cursor = value.get("start_after")
+        output.append(cursor is not None)
+        if cursor is not None:
+            output.extend(_bytes(cursor))
+        output.extend(struct.pack("<Q", value["limit"]))
+    elif kind in {"list_range", "sorted_set_range"}:
+        output.extend(struct.pack("<qq", value["start"], value["stop"]))
+        if kind == "sorted_set_range":
+            output.append(0)
+    else:
+        output.extend(struct.pack("<QQQ", value["start"], value["end"], value["limit"]))
+    return bytes(output)
+
+
+def _encode_structure_key(value: Any) -> bytes:
+    if not isinstance(value, dict):
+        raise ClientError("structure key is invalid")
+    return int(value["keyspace"]).to_bytes(16, "little") + _bytes(value["key"])
+
+
+def _decode_structure_read(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"kind": "hash_value", "value": reader.bytes() if reader.boolean() else None}
+    if tag == 1:
+        values = [reader.bytes() for _ in range(reader.u32())]
+        return {"kind": "values", "values": values}
+    if tag == 10:
+        return {"kind": "sorted_set_entries", "entries": [
+            {"member": reader.bytes(), "score": reader.f64()} for _ in range(reader.u32())
+        ]}
+    if tag == 11:
+        entries = []
+        for _ in range(reader.u32()):
+            entry_id = reader.u64()
+            fields = [(reader.bytes(), reader.bytes()) for _ in range(reader.u32())]
+            entries.append({"id": entry_id, "fields": fields})
+        return {"kind": "stream_entries", "entries": entries}
+    raise ClientError("structure read response is invalid")
+
+
+def _decode_commit_receipt(reader: _Reader) -> dict[str, Any]:
+    value = {
+        "transaction_id": reader.u128(),
+        "commit_csn": reader.u64(),
+        "catalog_version": reader.u64(),
+        "commit_lsn": reader.u64(),
+        "wal_block_digest": reader.take(32),
+    }
+    tag = reader.u8()
+    reader.zeroes(7)
+    if tag not in (0, 1, 2):
+        raise ClientError("commit durability is invalid")
+    value["durability"] = ("strict", "group", "memory")[tag]
+    value["durability_cohort_size"] = reader.u64()
+    value["durability_cohort_position"] = reader.u64()
+    return value
+
+
+def _decode_commit_outcome(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    reader.zeroes(7)
+    if tag == 0:
+        return {"state": "committed", "receipt": _decode_commit_receipt(reader)}
+    if tag == 1:
+        return {"state": "outcome_unknown", "transaction_id": reader.u128()}
+    raise ClientError("commit outcome is malformed")
+
+
+def _decode_transaction_status(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"state": "unknown"}
+    if tag == 1:
+        return {"state": "committed", "receipt": _decode_commit_receipt(reader)}
+    if tag in (2, 3):
+        return {
+            "state": "rolled_back" if tag == 2 else "outcome_unknown",
+            "transaction_id": reader.u128(),
+        }
+    raise ClientError("transaction status is malformed")
+
+
+def _decode_explicit_transaction_status(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"state": "unknown"}
+    if tag == 1:
+        return {"state": "active", "handle": reader.u64(), "read_csn": reader.u64() or None, "staged_operations": reader.u64(), "durability": ("strict", "group", "memory")[reader.u8()]}
+    if tag == 2:
+        return {"state": "committed", "handle": reader.u64(), "staged_operations": reader.u64(), "receipt": _decode_commit_receipt(reader)}
+    if tag in (3, 4):
+        return {"state": "rolled_back" if tag == 3 else "outcome_unknown", "handle": reader.u64(), "operations": reader.u64(), "transaction_id": reader.u128() if tag == 4 else None}
+    raise ClientError("explicit transaction status is malformed")
+
+
+def _decode_sql_result(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        has_object = reader.boolean()
+        reader.zeroes(6)
+        return {
+            "kind": "command",
+            "rows_affected": reader.u64(),
+            "object_id": reader.u128() if has_object else None,
+        }
+    if tag == 1:
+        reader.zeroes(7)
+        column_count, row_count = reader.u32(), reader.u32()
+        columns = [reader.text() for _ in range(column_count)]
+        rows = [[_decode_value(reader, 0) for _ in columns] for _ in range(row_count)]
+        return {"kind": "rows", "columns": columns, "rows": rows}
+    raise ClientError("SQL result is malformed")
+
+
+def _decode_value(reader: _Reader, depth: int) -> Any:
+    if depth > 8:
+        raise ClientError("SQL value nesting is too deep")
+    tag = reader.u8()
+    if tag == 0:
+        return None
+    if tag == 1:
+        return reader.boolean()
+    if tag == 2:
+        return reader.i64()
+    if tag == 3:
+        return reader.u64()
+    if tag == 4:
+        return reader.i128()
+    if tag == 5:
+        return reader.f32()
+    if tag == 6:
+        return reader.f64()
+    if tag == 7:
+        return reader.text()
+    if tag == 8:
+        return reader.bytes()
+    if tag == 9:
+        return {"date_days": reader.i32()}
+    if tag == 10:
+        return {"time_nanos": reader.u64()}
+    if tag == 11:
+        return {"timestamp_micros": reader.i64()}
+    if tag == 12:
+        return {"interval": {"months": reader.i32(), "days": reader.i32(), "nanoseconds": reader.i64()}}
+    if tag == 13:
+        return {"uuid": reader.take(16)}
+    if tag == 14:
+        return [_decode_value(reader, depth + 1) for _ in range(reader.u32())]
+    if tag == 15:
+        return {"map": [[_decode_value(reader, depth + 1), _decode_value(reader, depth + 1)] for _ in range(reader.u32())]}
+    if tag == 16:
+        return {"vector": [reader.f32() for _ in range(reader.u32())]}
+    if tag == 17:
+        return {"json": reader.text()}
+    raise ClientError("SQL value kind is unsupported")
+
+
+def _decode_catalog_page(reader: _Reader, *, dependencies: bool) -> dict[str, Any]:
+    snapshot = _decode_snapshot(reader)
+    cursor = _decode_cursor(reader)
+    stop_tag = reader.u8()
+    reader.zeroes(7)
+    stops = ("exhausted", "item_limit", "visit_limit", "byte_limit")
+    if stop_tag >= len(stops):
+        raise ClientError("catalog page stop is invalid")
+    page = {
+        "snapshot": snapshot,
+        "cursor": cursor,
+        "stop": stops[stop_tag],
+        "visited": reader.u64(),
+        "returned_bytes": reader.u64(),
+        "items": [],
+    }
+    count = reader.u32()
+    if dependencies:
+        kinds = ("parent", "secondary_index_relation", "foreign_key", "analyzer", "link_endpoint", "relation_schema")
+        for _ in range(count):
+            dependent, prerequisite, tag = reader.u128(), reader.u128(), reader.u8()
+            if not 1 <= tag <= len(kinds):
+                raise ClientError("catalog dependency kind is invalid")
+            page["items"].append({"dependent": dependent, "prerequisite": prerequisite, "kind": kinds[tag - 1]})
+    else:
+        kinds = ("database", "schema", "relation", "secondary_index", "keyspace", "structure", "search_collection", "analyzer", "cross_engine_link")
+        for _ in range(count):
+            object_id, tag, has_parent = reader.u128(), reader.u8(), reader.boolean()
+            reader.zeroes(6)
+            if not 1 <= tag <= len(kinds):
+                raise ClientError("catalog object kind is invalid")
+            page["items"].append({
+                "id": object_id,
+                "kind": kinds[tag - 1],
+                "parent": reader.u128() if has_parent else None,
+                "name": _decode_qualified_name(reader),
+            })
+    return page
+
+
+def _decode_cursor(reader: _Reader) -> dict[str, Any] | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    return {"snapshot": _decode_snapshot(reader), "after": reader.u128()} if present else None
+
+
+def _decode_qualified_name(reader: _Reader) -> dict[str, dict[str, str]]:
+    return {
+        component: {"display": reader.text(), "lookup": reader.text()}
+        for component in ("database", "schema", "object")
+    }
+
+
+def _decode_doctor(reader: _Reader) -> dict[str, Any]:
+    status = reader.u8()
+    statuses = ("healthy", "busy", "corrupt", "io")
+    if status >= len(statuses):
+        raise ClientError("doctor status is invalid")
+    verified_open, snapshot_verified = reader.boolean(), reader.boolean()
+    has_lineage, has_recovery = reader.boolean(), reader.boolean()
+    reader.zeroes(3)
+    telemetry_registry_version = reader.u16()
+    reader.zeroes(2)
+    process_start_identity = reader.u128()
+    session_start_identity = reader.u128()
+    value = {
+        "status": statuses[status],
+        "verified_open": verified_open,
+        "snapshot_verified": snapshot_verified,
+        "telemetry_registry_version": telemetry_registry_version,
+        "process_start_identity": process_start_identity,
+        "session_start_identity": session_start_identity,
+        "directory_lineage": reader.take(24) if has_lineage else None,
+        "recovery": None,
+    }
+    if has_recovery:
+        value["recovery"] = {
+            "visible_csn": reader.u64() or None,
+            "replayed_transactions": reader.u64(),
+            "page_tail_bytes_removed": reader.u64(),
+            "wal_tail_bytes_removed": reader.u64(),
+            "retained_wal_bytes": reader.u64(),
+            "manifest_count": reader.u64(),
+            "blob_count": reader.u64(),
+            "open_time_micros": reader.u64(),
+        }
+    return value
+
+
+def _decode_telemetry(reader: _Reader) -> dict[str, Any]:
+    registry_version = reader.u16()
+    if reader.u16() != 0:
+        raise ClientError("telemetry response is malformed")
+    value = {
+        "registry_version": registry_version,
+        "process_start_identity": reader.u128(),
+        "session_start_identity": reader.u128(),
+        "captured_at_micros": reader.i64(),
+        "catalog_version": reader.u64() or None,
+        "dropped_events": reader.u64(),
+        "metrics": [],
+        "events": [],
+    }
+    metric_count, event_count = reader.u32(), reader.u32()
+    for _ in range(metric_count):
+        name, kind = reader.text(), reader.u8()
+        if kind in (0, 1):
+            metric = {"name": name, "kind": "counter" if kind == 0 else "gauge", "value": reader.u64()}
+        elif kind == 2:
+            metric = {"name": name, "kind": "histogram", "count": reader.u64(), "sum_micros": reader.u64(), "buckets": [reader.u64() for _ in range(11)]}
+        else:
+            raise ClientError("telemetry metric kind is invalid")
+        value["metrics"].append(metric)
+    event_names = ("backup", "restore", "doctor", "cancelled", "deadline", "error")
+    categories = ("invalid-request", "not-found", "conflict", "limit", "deadline", "cancelled", "authorization", "corruption", "unavailable", "io", "internal")
+    for _ in range(event_count):
+        captured, kind, category = reader.i64(), reader.u8(), reader.u8()
+        reader.zeroes(6)
+        if kind >= len(event_names) or (kind == 5 and category >= len(categories)):
+            raise ClientError("telemetry event is invalid")
+        value["events"].append({"captured_at_micros": captured, "kind": event_names[kind], "category": categories[category] if kind == 5 else None})
+    return value
+
+
+class _Reader:
+    def __init__(self, encoded: bytes) -> None:
+        self.encoded = encoded
+        self.offset = 0
+
+    def take(self, length: int) -> bytes:
+        if length < 0 or self.offset + length > len(self.encoded):
+            raise ClientError("product response is truncated")
+        value = self.encoded[self.offset:self.offset + length]
+        self.offset += length
+        return value
+
+    def zeroes(self, length: int) -> None:
+        if self.take(length) != b"\0" * length:
+            raise ClientError("product response reserved bytes are nonzero")
+
+    def boolean(self) -> bool:
+        value = self.u8()
+        if value not in (0, 1):
+            raise ClientError("product response boolean is invalid")
+        return bool(value)
+
+    def bytes(self) -> bytes:
+        length = self.u32()
+        if length > MAX_PAYLOAD:
+            raise ClientError("product response bytes exceed the protocol maximum")
+        return self.take(length)
+
+    def text(self) -> str:
+        try:
+            return self.bytes().decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ClientError("product response text is not valid UTF-8") from error
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self.take(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self.take(4))[0]
+
+    def i32(self) -> int:
+        return struct.unpack("<i", self.take(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self.take(8))[0]
+
+    def i64(self) -> int:
+        return struct.unpack("<q", self.take(8))[0]
+
+    def u128(self) -> int:
+        return int.from_bytes(self.take(16), "little")
+
+    def i128(self) -> int:
+        return int.from_bytes(self.take(16), "little", signed=True)
+
+    def f32(self) -> float:
+        return struct.unpack("<f", self.take(4))[0]
+
+    def f64(self) -> float:
+        return struct.unpack("<d", self.take(8))[0]
+
+    def finish(self) -> None:
+        if self.offset != len(self.encoded):
+            raise ClientError("product response has trailing bytes")
+
+
+def decode_product_error(encoded: bytes) -> ProductErrorFields:
+    if len(encoded) < 20 or encoded[:8] != b"HYPERR01" or struct.unpack_from("<I", encoded, 8)[0] != len(encoded):
+        raise ClientError("HYPERR01 envelope is malformed")
+    category, retry, transaction_state, flags, code_length, message_length, detail_count = struct.unpack_from("<BBBBBHB", encoded, 12)
+    offset = 20
+    code, offset = _take_text(encoded, offset, code_length)
+    message, offset = _take_text(encoded, offset, message_length)
+    identities: list[int | None] = []
+    for bit in range(3):
+        identities.append(int.from_bytes(encoded[offset:offset + 16], "little") if flags & 1 << bit else None)
+        if flags & 1 << bit:
+            offset += 16
+    limit = None
+    if flags & 8:
+        size = encoded[offset]
+        offset += 1
+        name, offset = _take_text(encoded, offset, size)
+        configured, observed = struct.unpack_from("<QQ", encoded, offset)
+        offset += 16
+        limit = {"kind": name, "configured": configured, "observed": observed}
+    source_span = None
+    if flags & 16:
+        start, end = struct.unpack_from("<II", encoded, offset)
+        offset += 8
+        source_span = {"start": start, "end": end}
+    details: dict[str, Any] = {}
+    transaction_id = None
+    previous = 0
+    for _ in range(detail_count):
+        tag, length = struct.unpack_from("<HH", encoded, offset)
+        offset += 4
+        if tag <= previous or offset + length > len(encoded):
+            raise ClientError("HYPERR01 details are noncanonical")
+        value = encoded[offset:offset + length]
+        offset += length
+        previous = tag
+        if tag == 1:
+            details["sql_subcode"] = value.decode("ascii")
+        elif tag == 2:
+            transaction_id = int.from_bytes(value, "little")
+        else:
+            details[f"unknown_{tag}"] = value.hex()
+    if offset != len(encoded):
+        raise ClientError("HYPERR01 envelope has trailing bytes")
+    return ProductErrorFields(
+        code=code,
+        category=("invalid-request", "not-found", "conflict", "limit", "deadline", "cancelled", "authorization", "corruption", "unavailable", "io", "internal")[category],
+        retry=("never", "same-request", "new-snapshot", "after-backoff", "after-recovery", "unknown-commit")[retry],
+        message=message,
+        request_id=identities[0],
+        trace_id=identities[1],
+        object_id=identities[2],
+        transaction_state=("none", "active", "rolled-back", "committed", "outcome-unknown")[transaction_state],
+        transaction_id=transaction_id,
+        limit=limit,
+        source_span=source_span,
+        details=details,
+    )
+
+
+def decode_end(encoded: bytes) -> tuple[int, bytes]:
+    if len(encoded) != 56 or encoded[:8] != b"HYPEND01" or encoded[12] != 1 or encoded[13:16] != b"\0" * 3:
+        raise ClientError("native completion frame is malformed")
+    return struct.unpack_from("<Q", encoded, 16)[0], encoded[24:56]
+
+
+def blake3(data: bytes) -> bytes:
+    """Dependency-free one-shot BLAKE3 needed by mandatory END validation."""
+
+    iv = (0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19)
+    permutation = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+
+    def rotate(value: int, count: int) -> int:
+        return ((value >> count) | (value << (32 - count))) & 0xFFFFFFFF
+
+    def compress(cv: tuple[int, ...], words: tuple[int, ...], counter: int, length: int, flags: int) -> tuple[int, ...]:
+        state = list(cv + iv[:4] + (counter & 0xFFFFFFFF, counter >> 32, length, flags))
+        message = list(words)
+
+        def mix(a: int, b: int, c: int, d: int, x: int, y: int) -> None:
+            state[a] = (state[a] + state[b] + x) & 0xFFFFFFFF
+            state[d] = rotate(state[d] ^ state[a], 16)
+            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+            state[b] = rotate(state[b] ^ state[c], 12)
+            state[a] = (state[a] + state[b] + y) & 0xFFFFFFFF
+            state[d] = rotate(state[d] ^ state[a], 8)
+            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+            state[b] = rotate(state[b] ^ state[c], 7)
+
+        for round_index in range(7):
+            mix(0, 4, 8, 12, message[0], message[1])
+            mix(1, 5, 9, 13, message[2], message[3])
+            mix(2, 6, 10, 14, message[4], message[5])
+            mix(3, 7, 11, 15, message[6], message[7])
+            mix(0, 5, 10, 15, message[8], message[9])
+            mix(1, 6, 11, 12, message[10], message[11])
+            mix(2, 7, 8, 13, message[12], message[13])
+            mix(3, 4, 9, 14, message[14], message[15])
+            if round_index != 6:
+                message = [message[index] for index in permutation]
+        return tuple((state[index] ^ state[index + 8]) & 0xFFFFFFFF for index in range(8)) + tuple(
+            (state[index + 8] ^ cv[index]) & 0xFFFFFFFF for index in range(8)
+        )
+
+    @dataclass(frozen=True)
+    class Output:
+        cv: tuple[int, ...]
+        words: tuple[int, ...]
+        counter: int
+        length: int
+        flags: int
+
+        def chaining_value(self) -> tuple[int, ...]:
+            return compress(self.cv, self.words, self.counter, self.length, self.flags)[:8]
+
+        def root(self) -> bytes:
+            words = compress(self.cv, self.words, 0, self.length, self.flags | 8)
+            return b"".join(word.to_bytes(4, "little") for word in words)[:32]
+
+    def block_words(block: bytes) -> tuple[int, ...]:
+        return struct.unpack("<16I", block.ljust(64, b"\0"))
+
+    def chunk_output(chunk: bytes, counter: int) -> Output:
+        cv = iv
+        blocks = [chunk[offset:offset + 64] for offset in range(0, len(chunk), 64)] or [b""]
+        for index, block in enumerate(blocks[:-1]):
+            flags = 1 if index == 0 else 0
+            cv = compress(cv, block_words(block), counter, len(block), flags)[:8]
+        final = blocks[-1]
+        flags = 2 | (1 if len(blocks) == 1 else 0)
+        return Output(cv, block_words(final), counter, len(final), flags)
+
+    def parent_output(left: tuple[int, ...], right: tuple[int, ...]) -> Output:
+        return Output(iv, left + right, 0, 64, 4)
+
+    chunks = [data[offset:offset + 1024] for offset in range(0, len(data), 1024)] or [b""]
+    stack: list[tuple[int, ...]] = []
+    for index, chunk in enumerate(chunks[:-1]):
+        value = chunk_output(chunk, index).chaining_value()
+        total = index + 1
+        while total & 1 == 0:
+            value = parent_output(stack.pop(), value).chaining_value()
+            total >>= 1
+        stack.append(value)
+    output = chunk_output(chunks[-1], len(chunks) - 1)
+    while stack:
+        output = parent_output(stack.pop(), output.chaining_value())
+    return output.root()
+
+
+def encode_cancel(reason: int = 1) -> bytes:
+    return struct.pack("<8sI4x", b"HYPCAN01", reason)
+
+
+def encode_window_update(increment: int) -> bytes:
+    if increment <= 0:
+        raise ClientError("window update must be positive")
+    return struct.pack("<8sQ", b"HYPWIN01", increment)
+
+
+def _envelope(encoded: bytes, magic: bytes) -> tuple[int, bytes]:
+    if len(encoded) < 16:
+        raise ClientError("product envelope is truncated")
+    found_magic, length, kind, reserved = struct.unpack_from("<8sIHH", encoded)
+    if found_magic != magic or length != len(encoded) or reserved != 0 or len(encoded) > MAX_PAYLOAD:
+        raise ClientError("product envelope is malformed")
+    return kind, encoded[16:]
+
+
+def _bytes(value: bytes) -> bytes:
+    if not isinstance(value, bytes) or len(value) > MAX_PAYLOAD:
+        raise ClientError("binary value is invalid or too large")
+    return struct.pack("<I", len(value)) + value
+
+
+def _text(value: str) -> bytes:
+    return _bytes(value.encode("utf-8"))
+
+
+def _take_bytes(encoded: bytes, offset: int) -> tuple[bytes, int]:
+    if offset + 4 > len(encoded):
+        raise ClientError("length-prefixed bytes are truncated")
+    length = struct.unpack_from("<I", encoded, offset)[0]
+    offset += 4
+    if length > MAX_PAYLOAD or offset + length > len(encoded):
+        raise ClientError("length-prefixed bytes are invalid")
+    return encoded[offset:offset + length], offset + length
+
+
+def _take_text(encoded: bytes, offset: int, length: int) -> tuple[str, int]:
+    if offset + length > len(encoded):
+        raise ClientError("text is truncated")
+    try:
+        return encoded[offset:offset + length].decode("utf-8"), offset + length
+    except UnicodeDecodeError as error:
+        raise ClientError("text is not valid UTF-8") from error
+
+
+__all__ = [
+    "FRAME_HEADER_SIZE",
+    "FRAME_KINDS",
+    "Frame",
+    "MAX_PAYLOAD",
+    "crc32c",
+    "blake3",
+    "decode_end",
+    "decode_frame",
+    "decode_product_error",
+    "decode_product_request",
+    "decode_product_response",
+    "decode_welcome",
+    "encode_cancel",
+    "encode_frame",
+    "encode_hello",
+    "encode_product_request",
+    "encode_window_update",
+]

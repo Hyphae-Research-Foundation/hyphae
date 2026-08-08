@@ -68,3 +68,13 @@ proof.
 See [public client semantics](../../docs/clients/v1.md),
 [data model](../../docs/concepts/data-model.md), and
 [error codes](../../docs/api/error-codes-v1.md).
+
+## Native v2
+
+`hyphae_sdk.v2.HyphaeClient` exposes one capabilities, catalog, SQL,
+structure, search, administration, telemetry, doctor, backup, transaction
+status, and proof-verification API over either `HyphaeClient.local(endpoint)`
+or `HyphaeClient.http(origin)`. Local uses exact `HYPHLCL1` bytes over AF_UNIX
+or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
+`/v2/execute`. Both reconstruct `ProductError` typed fields and accept
+`RequestOptions` deadlines and cancellation.

@@ -56,7 +56,7 @@ from required_checks import (
     validate_report,
     write_report,
 )
-from verify_install import extract_archive
+from verify_install import extract_archive, require_command_failure
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1582,6 +1582,17 @@ class PackageTests(unittest.TestCase):
                 bundle.writestr("../escape", b"forbidden")
             with self.assertRaisesRegex(RuntimeError, "unsafe archive member"):
                 extract_archive(archive, root / "installed")
+
+    def test_install_verifier_negative_control_must_fail(self) -> None:
+        failed = subprocess.CompletedProcess(("hyphae", "verify"), 1, "", "corrupt")
+        with patch("verify_install.subprocess.run", return_value=failed) as invoked:
+            require_command_failure(Path("hyphae"), ["verify"], {})
+        invoked.assert_called_once()
+
+        accepted = subprocess.CompletedProcess(("hyphae", "verify"), 0, "{}", "")
+        with patch("verify_install.subprocess.run", return_value=accepted):
+            with self.assertRaisesRegex(RuntimeError, "accepted the tampered proof"):
+                require_command_failure(Path("hyphae"), ["verify"], {})
 
 
 if __name__ == "__main__":

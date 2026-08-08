@@ -1296,9 +1296,9 @@ fn execute_single_request(
                     commit: report.commit,
                     admission_wait: enqueued_at.saturating_duration_since(submitted_at),
                     queue_wait: execution_started.saturating_duration_since(enqueued_at),
-                    cohort_execution: report.execution_time,
-                    page_synchronization: report.page_synchronization_time,
-                    wal_synchronization: report.wal_synchronization_time,
+                    cohort_execution: report.commit.execution_time,
+                    page_synchronization: report.commit.page_synchronization_time,
+                    wal_synchronization: report.commit.wal_synchronization_time,
                     end_to_end: Duration::ZERO,
                 }),
             );

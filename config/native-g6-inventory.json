@@ -4,87 +4,87 @@
   "requirements": [
     {
       "id": "shared-contracts-and-errors",
-      "status": "partial",
-      "present": ["canonical native values and stable IDs", "typed runtime, catalog, SQL, protocol and backup errors", "transport-independent native product crate", "initial stable error code/category/retry mappings with stable string identities"],
-      "gaps": ["exhaustive runtime, catalog, protocol, backup and search mappings", "request IDs, typed limit details and transaction state", "cross-surface mappings and uncertain-commit semantics"]
+      "status": "implemented-unhosted",
+      "present": ["append-only stable product error registry", "request and trace IDs, typed limit details and transaction state", "publication-unknown transaction semantics", "canonical HYPERR01 codec", "redacted Rust, local-protocol, HTTP v2, CLI and SDK mappings"],
+      "gaps": []
     },
     {
       "id": "catalog-and-collection-model",
-      "status": "partial",
-      "present": ["versioned catalog definitions", "stable IDs, relations, secondary indexes, search collections and cross-engine links", "bounded point lookup"],
-      "gaps": ["bounded public list/describe/dependency API", "catalogued keyspace authority", "integrated fielded collection and multiple named vectors", "complete evolution and plan invalidation"]
+      "status": "implemented-unhosted",
+      "present": ["versioned logical catalog and canonical codec", "bounded snapshot-bound list, describe, resolve and dependency APIs", "catalogued keyspaces", "fielded search collections and multiple named vectors", "dependency validation, stable IDs and prepared-plan invalidation"],
+      "gaps": []
     },
     {
       "id": "embedded-product-facade",
-      "status": "partial",
-      "present": ["NativeDatabase, NativeSnapshot and NativeWriteBatch", "closed G2-G5 execution paths", "curated read facade for directory lifecycle, snapshots, catalog point lookup, prepared SQL and scalar structure reads", "product-owned prepared-plan, SQL result, TTL and snapshot wrappers"],
-      "gaps": ["remaining SQL, structure, search, transaction, proof and administration families", "central limits, deadlines, cancellation, durability and authorization policy", "public embedding examples"]
+      "status": "implemented-unhosted",
+      "present": ["NativeProduct, ProductSnapshot and one-owner ProductService", "direct typed SQL, every admitted structure family, catalog, integrated search, proof verification and administration paths", "explicit all-engine transaction begin, stage, commit, rollback and unknown-outcome resolution", "central limits, deadlines, cancellation, authorization and durability policy", "typed responses and commit outcomes"],
+      "gaps": []
     },
     {
       "id": "competitive-search-surface",
-      "status": "partial",
-      "present": ["BM25, boolean, phrase, prefix and fuzzy execution", "typed doc-value filtering, sort, facets and metrics", "exact, ANN and hybrid components"],
-      "gaps": ["one persistent fielded collection query surface", "persistent multi-field doc values", "filter-aware ANN planning", "named and multi-target vector queries", "bounded streaming ingestion"]
+      "status": "implemented-unhosted",
+      "present": ["persistent catalog-bound documents, doc values and named vectors", "BM25, exact, filter-aware ANN, adaptive exact/ANN and multi-target hybrid execution", "filters, sort, facets and metrics on one snapshot", "bounded idempotent streaming ingestion with backpressure and atomic failure"],
+      "gaps": []
     },
     {
       "id": "incremental-ann-lifecycle",
-      "status": "open",
-      "present": ["deterministic HNSW build, exact oracle, WAL-backed vector lifecycle and snapshot generations"],
-      "gaps": ["incremental graph upsert and delete", "durable deltas and interruption-safe consolidation", "snapshot-safe generation reclamation", "no full rebuild per mutation"]
+      "status": "implemented-unhosted",
+      "present": ["object-keyed durable upsert and tombstone deltas", "foreground writes preserve the immutable base", "bounded interruption-safe consolidation and atomic generation switch", "later-delta preservation, stale-plan rejection and current-root generation cleanup", "historical-root and snapshot-pin reclamation safety"],
+      "gaps": []
     },
     {
       "id": "native-offline-proofs",
-      "status": "open",
-      "present": ["published format-2 proof discipline", "native lineage, root-set, catalog and receipt identities"],
-      "gaps": ["native proof codec and witness", "point, SQL, search, ANN, hybrid and catalog proof generation", "offline verifier and tamper matrix", "explicit approximate-proof semantics"]
+      "status": "implemented-unhosted",
+      "present": ["canonical HYNPRF02 proof and HYNWIT02 witness codecs", "operation-integrated point, SQL, lexical, exact-vector, ANN, hybrid and catalog proof generation", "offline semantic reexecution against complete retained native authority", "approximation and hybrid branch bindings", "origin-independent verification and tamper/limit/path-safety matrix"],
+      "gaps": []
     },
     {
       "id": "native-local-daemon",
-      "status": "partial",
-      "present": ["HYPHLCL1 frame codec", "engine-bearing serial UDS session", "bounded SQL, scalar structure, lexical and all-engine transaction slices"],
-      "gaps": ["multi-client daemon", "Windows named pipes", "complete handshake and peer identity", "flow control, streaming, deadlines and cancellation", "complete admitted product operation matrix"]
+      "status": "implemented-unhosted",
+      "present": ["portable HYPHLCL1 frame, handshake, control and complete product codecs", "multi-client UDS daemon over one product owner", "peer identity, prepared handles, flow control, provisional completion, cancellation, deadlines and disconnect outcome resolution", "functional protected Windows named-pipe listener/client, ACL, isolation and bounded-control tests", "real local-protocol integrated search and ingestion tests"],
+      "gaps": []
     },
     {
       "id": "native-http-v2",
-      "status": "open",
-      "present": ["loopback-first format-2 HTTP v1 patterns", "OpenAPI and JSON Schema tooling"],
-      "gaps": ["native HTTP v2 contracts and server adapter", "native streaming and error parity", "exact v1 compatibility decision over one native authority"]
+      "status": "implemented-unhosted",
+      "present": ["OpenAPI 3.1 and JSON Schema contracts", "loopback-first direct product-service adapter", "authentication, request IDs and bounded binary requests/responses", "provisional NDJSON read completion", "canonical binary and JSON error parity", "explicit fail-closed v1 compatibility policy"],
+      "gaps": []
     },
     {
       "id": "single-binary-cli",
-      "status": "open",
-      "present": ["one packaged hyphae executable with format-2 operations"],
-      "gaps": ["native runtime in the product binary", "native SQL, structures, search, transactions and explain", "native daemon, admin, doctor, backup, restore and proof commands", "stable exit classes"]
+      "status": "implemented-unhosted",
+      "present": ["one hyphae executable with native authority by default and no native switch", "listener opt-in only through serve", "complete admitted catalog, SQL and prepared-plan, structure-family, integrated-search and explicit-transaction command corpus", "service, administration, telemetry, doctor, backup, restore, native proof generation and offline semantic verification", "canonical machine-readable results and stable exit classes", "one service owner shared by local and HTTP listeners", "focused black-box full-corpus execution through the built binary"],
+      "gaps": []
     },
     {
       "id": "rust-python-typescript-sdks",
-      "status": "open",
-      "present": ["bounded format-2 HTTP Rust, Python and TypeScript clients", "shared generated-model and conformance patterns"],
-      "gaps": ["native high-level local-protocol clients", "native HTTP v2 clients", "complete capability parity and cross-language binary goldens", "transaction, explain and proof APIs"]
+      "status": "implemented-unhosted",
+      "present": ["Rust, Python and TypeScript high-level Native v2 clients", "real native-local and HTTP v2 execution for all three SDKs", "shared canonical binary fixture", "cross-transport syntax, not-found, limit, deadline, cancellation, authorization and unknown-commit ProductError field parity", "native HYNPRF02 and HYNWIT02 generation, receipt and origin-independent offline verification over both transports", "generated OpenAPI/JSON Schema models"],
+      "gaps": []
     },
     {
       "id": "administration-and-explain",
-      "status": "partial",
-      "present": ["checkpoint, compaction, vacuum, retention, collection and expiry primitives", "bounded SQL and convergence explanations"],
-      "gaps": ["typed administration facade and authorization", "progress and cancellation boundaries", "stable cross-engine explain schema", "foreground/background resource-policy integration"]
+      "status": "implemented-unhosted",
+      "present": ["typed checkpoint, expiry, compaction, vacuum, retention, blob collection and ANN consolidation facade", "authorization and cooperative cancellation boundaries", "versioned SQL, convergence, ANN and hybrid explanation goldens", "bounded progress callbacks for backup and restore", "concurrent foreground progress and snapshot-correctness acceptance for every maintenance family"],
+      "gaps": []
     },
     {
       "id": "telemetry-and-doctor",
-      "status": "partial",
-      "present": ["recovery reports, physical counters, scheduler timings, ANN and convergence receipts", "fail-closed native open validation"],
-      "gaps": ["bounded telemetry registry and redaction rules", "cross-surface telemetry snapshots", "native doctor schema and CLI", "whole-product corruption and lock-contention matrix"]
+      "status": "implemented-unhosted",
+      "present": ["fixed bounded counter, histogram and event registry", "measured separate admission, planning, execution, WAL, page synchronization and durability timing classes", "redacted zero-arbitrary-label snapshots", "stable process and changing session restart identities shared with doctor", "typed whole-directory doctor with healthy, busy, corrupt and I/O outcomes"],
+      "gaps": []
     },
     {
       "id": "backup-restore-product-surface",
-      "status": "partial",
-      "present": ["G5 native offline backup, verification and atomic restore", "failure-path tests"],
-      "gaps": ["facade and single-binary exposure", "common errors, telemetry, progress and safe cancellation", "doctor-after-restore and cross-surface equivalence"]
+      "status": "implemented-unhosted",
+      "present": ["typed embedded backup, verification and atomic restore", "safe cancellation and progress phases", "single-binary backup, verify and restore commands", "doctor-after-restore and complete native-state reopen equivalence"],
+      "gaps": []
     },
     {
       "id": "cross-surface-conformance",
-      "status": "open",
-      "present": ["individual embedded and UDS verticals", "format-2 public-client conformance patterns"],
-      "gaps": ["one G6 corpus across embedded, UDS, named pipes, CLI, HTTP and six SDK transport lanes", "identity, CSN, result, error, explain and proof equality", "complete security and failure-path matrix"]
+      "status": "implemented-unhosted",
+      "present": ["exact ordered G6 fixture corpus on embedded, built-binary CLI, local daemon, HTTP and all Rust, Python and TypeScript transport lanes", "explicit per-case lane applicability with exact-execution enforcement", "cross-lane stable IDs, CSN, ordered results, explain, proof-result and stable error comparison", "real proof generation and origin-independent verification plus backup, verify, restore and doctor rows", "malformed input, limit, deadline, cancellation, authorization, backpressure, missing-completion and disconnect/unknown-commit rows", "clean-built TypeScript distribution and Linux, macOS and Windows receipt aggregation"],
+      "gaps": []
     }
   ],
   "claims": [],

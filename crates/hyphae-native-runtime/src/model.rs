@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 
 use hyphae_native_catalog::{
-    CatalogError, CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, QualifiedName,
-    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
+    CatalogError, CatalogName, CatalogObject, CatalogObjectKind, ColumnDefinition, DependencyEdge,
+    DependencyKind, LogicalCatalogObject, ObjectHeader, QualifiedName, RelationDefinition,
+    SearchCollectionDefinition, SearchFieldDefinition,
 };
 use hyphae_native_types::{ColumnId, EngineKind, FieldId, LogicalType, ObjectId};
 use thiserror::Error;
@@ -14,6 +15,7 @@ use thiserror::Error;
 const CATALOG_MAGIC_V1: [u8; 8] = *b"HYCAT001";
 const CATALOG_MAGIC_V2: [u8; 8] = *b"HYCAT002";
 const CATALOG_MAGIC_V3: [u8; 8] = *b"HYCAT005";
+const CATALOG_MAGIC_V4: [u8; 8] = *b"HYCAT006";
 const STRUCTURE_MAGIC: [u8; 8] = *b"HYSTR001";
 const SEARCH_MAGIC: [u8; 8] = *b"HYSEA001";
 
@@ -72,6 +74,7 @@ pub(crate) enum ModelError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogState {
     pub(crate) objects: BTreeMap<ObjectId, CatalogObject>,
+    pub(crate) logical_objects: BTreeMap<ObjectId, LogicalCatalogObject>,
     next_object_id: Option<u128>,
 }
 
@@ -79,6 +82,7 @@ impl Default for CatalogState {
     fn default() -> Self {
         Self {
             objects: BTreeMap::new(),
+            logical_objects: BTreeMap::new(),
             next_object_id: Some(1),
         }
     }
@@ -89,13 +93,12 @@ impl CatalogState {
         object.validate()?;
         let header = object.header();
         let id = header.id;
-        if self.objects.contains_key(&id) {
+        if self.contains_id(id) {
             return Err(ModelError::DuplicateObjectId);
         }
         if self
-            .objects
-            .values()
-            .any(|entry| same_catalog_lookup(&entry.header().name, &header.name))
+            .names()
+            .any(|name| same_catalog_lookup(name, &header.name))
         {
             return Err(ModelError::DuplicateObjectName);
         }
@@ -132,12 +135,101 @@ impl CatalogState {
                 return Err(ModelError::Catalog(CatalogError::InvalidCrossEngineLink));
             }
         }
+        self.advance_next_object_id(id);
+        self.objects.insert(id, object);
+        Ok(())
+    }
+
+    pub(crate) fn create_logical(
+        &mut self,
+        object: LogicalCatalogObject,
+    ) -> Result<(), ModelError> {
+        self.insert_logical(object, true)
+    }
+
+    pub(crate) fn insert_logical_unchecked(
+        &mut self,
+        object: LogicalCatalogObject,
+    ) -> Result<(), ModelError> {
+        self.insert_logical(object, false)
+    }
+
+    fn insert_logical(
+        &mut self,
+        object: LogicalCatalogObject,
+        validate_dependencies: bool,
+    ) -> Result<(), ModelError> {
+        object.validate()?;
+        let id = object.id();
+        if self.contains_id(id) {
+            return Err(ModelError::DuplicateObjectId);
+        }
+        if self
+            .names()
+            .any(|name| same_catalog_lookup(name, object.name()))
+        {
+            return Err(ModelError::DuplicateObjectName);
+        }
+        if validate_dependencies {
+            self.validate_logical_dependencies(&object)?;
+        }
+        self.advance_next_object_id(id);
+        self.logical_objects.insert(id, object);
+        Ok(())
+    }
+
+    fn validate_logical_dependencies(
+        &self,
+        object: &LogicalCatalogObject,
+    ) -> Result<(), ModelError> {
+        for edge in object.dependencies() {
+            let target_kind = self
+                .kind(edge.prerequisite)
+                .ok_or(CatalogError::MissingDependencyTarget(edge.prerequisite))?;
+            if edge.dependent == edge.prerequisite
+                || !logical_dependency_target_is_valid(object.kind(), edge, target_kind)
+            {
+                return Err(CatalogError::InvalidObjectHierarchy.into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_all_logical_dependencies(&self) -> Result<(), ModelError> {
+        for object in self.logical_objects.values() {
+            self.validate_logical_dependencies(object)?;
+        }
+        Ok(())
+    }
+
+    fn contains_id(&self, id: ObjectId) -> bool {
+        self.objects.contains_key(&id) || self.logical_objects.contains_key(&id)
+    }
+
+    fn names(&self) -> impl Iterator<Item = &QualifiedName> {
+        self.objects
+            .values()
+            .map(|object| &object.header().name)
+            .chain(
+                self.logical_objects
+                    .values()
+                    .map(LogicalCatalogObject::name),
+            )
+    }
+
+    pub(crate) fn kind(&self, id: ObjectId) -> Option<CatalogObjectKind> {
+        self.objects.get(&id).map(CatalogObject::kind).or_else(|| {
+            self.logical_objects
+                .get(&id)
+                .map(LogicalCatalogObject::kind)
+        })
+    }
+
+    fn advance_next_object_id(&mut self, id: ObjectId) {
         self.next_object_id = match (self.next_object_id, id.get().checked_add(1)) {
             (Some(current), Some(next)) => Some(current.max(next)),
             (_, None) | (None, _) => None,
         };
-        self.objects.insert(id, object);
-        Ok(())
     }
 
     pub(crate) fn replace(&mut self, object: CatalogObject) -> Result<CatalogObject, ModelError> {
@@ -147,10 +239,18 @@ impl CatalogState {
         if old.header().owner != object.header().owner {
             return Err(ModelError::WrongEngine);
         }
-        if self.objects.values().any(|candidate| {
-            candidate.header().id != id
-                && same_catalog_lookup(&candidate.header().name, &object.header().name)
-        }) {
+        if self
+            .objects
+            .values()
+            .filter(|candidate| candidate.header().id != id)
+            .map(|candidate| &candidate.header().name)
+            .chain(
+                self.logical_objects
+                    .values()
+                    .map(LogicalCatalogObject::name),
+            )
+            .any(|name| same_catalog_lookup(name, &object.header().name))
+        {
             return Err(ModelError::DuplicateObjectName);
         }
         self.objects
@@ -178,6 +278,10 @@ impl CatalogState {
 
     pub(crate) fn object(&self, id: ObjectId) -> Option<&CatalogObject> {
         self.objects.get(&id)
+    }
+
+    pub(crate) fn logical_object(&self, id: ObjectId) -> Option<&LogicalCatalogObject> {
+        self.logical_objects.get(&id)
     }
 
     pub(crate) fn object_qualified(&self, name: &QualifiedName) -> Option<&CatalogObject> {
@@ -233,11 +337,27 @@ impl CatalogState {
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CATALOG_MAGIC_V3);
+        bytes.extend_from_slice(&CATALOG_MAGIC_V4);
         bytes.extend_from_slice(&self.next_object_id.unwrap_or(0).to_le_bytes());
-        put_len(&mut bytes, self.objects.len())?;
-        for object in self.objects.values() {
-            put_bytes(&mut bytes, &object.encode_definition()?)?;
+        put_len(
+            &mut bytes,
+            self.objects
+                .len()
+                .checked_add(self.logical_objects.len())
+                .ok_or(ModelError::LengthOverflow)?,
+        )?;
+        for id in self
+            .objects
+            .keys()
+            .chain(self.logical_objects.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            if let Some(object) = self.objects.get(&id) {
+                put_bytes(&mut bytes, &object.encode_definition()?)?;
+            } else if let Some(object) = self.logical_objects.get(&id) {
+                put_bytes(&mut bytes, &object.encode_definition_v2()?)?;
+            }
         }
         Ok(bytes)
     }
@@ -249,6 +369,38 @@ impl CatalogState {
         if bytes.get(..8) == Some(CATALOG_MAGIC_V2.as_slice()) {
             return Self::decode_v2(bytes);
         }
+        if bytes.get(..8) == Some(CATALOG_MAGIC_V3.as_slice()) {
+            return Self::decode_v3(bytes);
+        }
+        let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V4)?;
+        let persisted_next = u128::from_le_bytes(
+            decoder
+                .take(16)?
+                .try_into()
+                .map_err(|_| ModelError::Truncated)?,
+        );
+        let count = decoder.len()?;
+        let mut state = Self::default();
+        for _ in 0..count {
+            let definition = decoder.bytes()?;
+            match definition.get(..8) {
+                Some(b"HYCOBJ01") => {
+                    state.create(CatalogObject::decode_definition(&definition)?)?;
+                }
+                Some(b"HYCOBJ02") => state.insert_logical(
+                    LogicalCatalogObject::decode_definition_v2(&definition)?,
+                    false,
+                )?,
+                _ => return Err(ModelError::InvalidMagic),
+            }
+        }
+        decoder.finish()?;
+        state.finish_decode(persisted_next)?;
+        state.validate_all_logical_dependencies()?;
+        Ok(state)
+    }
+
+    fn decode_v3(bytes: &[u8]) -> Result<Self, ModelError> {
         let mut decoder = Decoder::new(bytes, CATALOG_MAGIC_V3)?;
         let persisted_next = u128::from_le_bytes(
             decoder
@@ -262,8 +414,13 @@ impl CatalogState {
             state.create(CatalogObject::decode_definition(&decoder.bytes()?)?)?;
         }
         decoder.finish()?;
+        state.finish_decode(persisted_next)?;
+        Ok(state)
+    }
+
+    fn finish_decode(&mut self, persisted_next: u128) -> Result<(), ModelError> {
         let persisted_next = (persisted_next != 0).then_some(persisted_next);
-        let valid_authority = match (state.next_object_id, persisted_next) {
+        let valid_authority = match (self.next_object_id, persisted_next) {
             (None, None) => true,
             (Some(required), Some(found)) => required <= found,
             _ => false,
@@ -271,8 +428,8 @@ impl CatalogState {
         if !valid_authority {
             return Err(ModelError::DuplicateObjectId);
         }
-        state.next_object_id = persisted_next;
-        Ok(state)
+        self.next_object_id = persisted_next;
+        Ok(())
     }
 
     fn decode_v2(bytes: &[u8]) -> Result<Self, ModelError> {
@@ -298,6 +455,34 @@ impl CatalogState {
         }
         decoder.finish()?;
         Ok(state)
+    }
+}
+
+fn logical_dependency_target_is_valid(
+    dependent_kind: CatalogObjectKind,
+    edge: DependencyEdge,
+    target_kind: CatalogObjectKind,
+) -> bool {
+    match edge.kind {
+        DependencyKind::Parent => match dependent_kind {
+            CatalogObjectKind::Database => false,
+            CatalogObjectKind::Schema => target_kind == CatalogObjectKind::Database,
+            _ => target_kind == CatalogObjectKind::Schema,
+        },
+        DependencyKind::SecondaryIndexRelation | DependencyKind::RelationSchema => {
+            target_kind == CatalogObjectKind::Relation
+        }
+        DependencyKind::ForeignKey => matches!(
+            target_kind,
+            CatalogObjectKind::Relation | CatalogObjectKind::SecondaryIndex
+        ),
+        DependencyKind::Analyzer => target_kind == CatalogObjectKind::Analyzer,
+        DependencyKind::LinkEndpoint => !matches!(
+            target_kind,
+            CatalogObjectKind::Database
+                | CatalogObjectKind::Schema
+                | CatalogObjectKind::CrossEngineLink
+        ),
     }
 }
 
@@ -638,6 +823,7 @@ pub(crate) struct StructureState {
     pub(crate) lists: BTreeMap<Vec<u8>, VecDeque<Vec<u8>>>,
     pub(crate) list_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) sorted_sets: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, SortedSetScore>>,
+    pub(crate) sorted_set_expiries: BTreeMap<Vec<u8>, i64>,
     pub(crate) streams: BTreeMap<Vec<u8>, StreamEntries>,
     pub(crate) stream_expiries: BTreeMap<Vec<u8>, i64>,
 }
@@ -1614,6 +1800,7 @@ impl StructureState {
         &mut self,
         key: &[u8],
     ) -> Option<BTreeMap<Vec<u8>, SortedSetScore>> {
+        self.sorted_set_expiries.remove(key);
         self.sorted_sets.remove(key)
     }
 
@@ -1899,6 +2086,7 @@ impl StructureState {
             lists: BTreeMap::new(),
             list_expiries: BTreeMap::new(),
             sorted_sets: BTreeMap::new(),
+            sorted_set_expiries: BTreeMap::new(),
             streams: BTreeMap::new(),
             stream_expiries: BTreeMap::new(),
         })
@@ -2261,13 +2449,14 @@ impl<'bytes> Decoder<'bytes> {
 #[cfg(test)]
 mod tests {
     use hyphae_native_catalog::{
-        CatalogName, CatalogObject, CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior,
-        CrossEngineLinkMaintenance, CrossEngineLinkMapping, ObjectHeader, QualifiedName,
+        CatalogName, CatalogObject, CatalogObjectV2, CrossEngineLinkDefinition,
+        CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
+        DefinitionVersion, LogicalCatalogObject, ObjectHeader, ObjectHeaderV2, QualifiedName,
     };
     use hyphae_native_types::{EngineKind, ObjectId};
 
     use super::{
-        CATALOG_MAGIC_V1, CATALOG_MAGIC_V3, CatalogState, HashPatternModelRequest,
+        CATALOG_MAGIC_V1, CATALOG_MAGIC_V4, CatalogState, HashPatternModelRequest,
         HashPatternModelStop, ModelError, RelationState, SearchState, SortedSetMemberState,
         SortedSetScore, StructureState, TtlValue, legacy_catalog_object, put_bytes, put_len,
     };
@@ -2285,7 +2474,7 @@ mod tests {
         )?)?;
         catalog.create(legacy_catalog_object(index, EngineKind::Search, "Notes")?)?;
         assert_eq!(CatalogState::decode(&catalog.encode()?)?, catalog);
-        assert!(catalog.encode()?.starts_with(&CATALOG_MAGIC_V3));
+        assert!(catalog.encode()?.starts_with(&CATALOG_MAGIC_V4));
 
         let mut relational = RelationState::default();
         relational.create_table(table)?;
@@ -2331,7 +2520,7 @@ mod tests {
         };
         assert_eq!(search.fields.len(), 1);
         assert_eq!(search.header.name.object.lookup(), "notes");
-        assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V3));
+        assert!(decoded.encode()?.starts_with(&CATALOG_MAGIC_V4));
         Ok(())
     }
 
@@ -2453,6 +2642,40 @@ mod tests {
             )?),
             Err(ModelError::DuplicateObjectName)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_v2_state_round_trips_hierarchy_and_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = LogicalCatalogObject::V2(CatalogObjectV2::Database(ObjectHeaderV2 {
+            id: ObjectId::new(10)?,
+            owner: EngineKind::Kernel,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted("database")?,
+            ),
+            parent: None,
+            definition_version: DefinitionVersion::FIRST,
+        }));
+        let schema = LogicalCatalogObject::V2(CatalogObjectV2::Schema(ObjectHeaderV2 {
+            id: ObjectId::new(11)?,
+            owner: EngineKind::Kernel,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted("schema")?,
+            ),
+            parent: Some(ObjectId::new(10)?),
+            definition_version: DefinitionVersion::FIRST,
+        }));
+        let mut catalog = CatalogState::default();
+        catalog.create_logical(database)?;
+        catalog.create_logical(schema)?;
+        let encoded = catalog.encode()?;
+        assert!(encoded.starts_with(&CATALOG_MAGIC_V4));
+        assert_eq!(CatalogState::decode(&encoded)?, catalog);
         Ok(())
     }
 
