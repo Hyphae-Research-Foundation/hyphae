@@ -23,9 +23,17 @@ on:
         options:
           - targeted
           - final
+      scope:
+        description: Windows SDK smoke test or complete candidate suite
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - candidate
 
 concurrency:
-  group: native-g6-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.mode || 'final' }}
+  group: native-g6-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.mode || 'final' }}-${{ inputs.scope || 'candidate' }}
   cancel-in-progress: true
 
 permissions:
@@ -120,52 +128,25 @@ jobs:
     name: G6 suites (${{ matrix.platform }})
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux
-            python: python3
-          - os: macos-15
-            platform: macos
-            python: python3
-          - os: windows-2025
-            platform: windows
-            python: python
+      matrix: ${{ fromJSON(inputs.platform == 'windows' && '{"include":[{"os":"windows-2025","platform":"windows","python":"python"}]}' || inputs.platform == 'linux' && '{"include":[{"os":"ubuntu-24.04","platform":"linux","python":"python3"}]}' || inputs.platform == 'macos' && '{"include":[{"os":"macos-15","platform":"macos","python":"python3"}]}' || '{"include":[{"os":"ubuntu-24.04","platform":"linux","python":"python3"},{"os":"macos-15","platform":"macos","python":"python3"},{"os":"windows-2025","platform":"windows","python":"python"}]}') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Select requested platform
-        id: selected
-        shell: bash
-        env:
-          REQUESTED_PLATFORM: ${{ inputs.platform }}
-          MATRIX_PLATFORM: ${{ matrix.platform }}
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == push || "$REQUESTED_PLATFORM" == all || "$REQUESTED_PLATFORM" == "$MATRIX_PLATFORM" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Check out exact commit
-        if: steps.selected.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install pinned Rust
-        if: steps.selected.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
 
       - name: Install pinned Python
-        if: steps.selected.outputs.run == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.13.7
 
       - name: Install pinned Node
-        if: steps.selected.outputs.run == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.10.0
@@ -173,12 +154,10 @@ jobs:
           cache-dependency-path: sdks/typescript/package-lock.json
 
       - name: Install TypeScript dependencies
-        if: steps.selected.outputs.run == 'true'
         shell: bash
         run: npm ci --ignore-scripts --prefix sdks/typescript
 
       - name: Build TypeScript dist from clean
-        if: steps.selected.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -186,8 +165,15 @@ jobs:
           npm run build --prefix sdks/typescript
           test -f sdks/typescript/dist/v2/index.js
 
+      - name: Execute Windows SDK smoke test
+        if: inputs.scope == 'smoke'
+        shell: bash
+        env:
+          PYTHONPATH: sdks/python/src
+        run: cargo test --locked -p hyphae-server --test sdk_v2_real -- --ignored
+
       - name: Execute every authorized suite and produce one receipt per requirement
-        if: steps.selected.outputs.run == 'true'
+        if: github.event_name == 'push' || inputs.scope == 'candidate'
         shell: bash
         env:
           G6_PLATFORM: ${{ matrix.platform }}
@@ -204,7 +190,7 @@ jobs:
             --output-dir g6-candidate
 
       - name: Upload platform receipts
-        if: steps.selected.outputs.run == 'true'
+        if: github.event_name == 'push' || inputs.scope == 'candidate'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-g6-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
@@ -215,7 +201,7 @@ jobs:
   readiness:
     name: G6 exact-SHA candidate readiness
     needs: [manifests, suites]
-    if: always() && (github.event_name == 'push' || inputs.mode == 'final') && needs.manifests.result == 'success' && needs.suites.result == 'success'
+    if: always() && (github.event_name == 'push' || (inputs.mode == 'final' && inputs.scope == 'candidate')) && needs.manifests.result == 'success' && needs.suites.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out exact commit

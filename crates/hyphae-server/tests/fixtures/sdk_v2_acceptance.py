@@ -84,12 +84,14 @@ proven = http.prove_sql(
 assert proven.kind == "proven"
 assert proven.value["proof"].startswith(b"HYNPRF02")
 assert proven.value["witness"].startswith(b"HYNWIT02")
-verified = local.verify_proof(
+proof_local = HyphaeClient.local(os.environ["HYPHAE_SOCKET"])
+verified = proof_local.verify_proof(
     proven.value["proof"], proven.value["witness"], proven.value["trusted_anchor"],
     options=RequestOptions(request_id=20_121),
 )
 assert verified.kind == "proof_verification"
 assert verified.value["semantic_reexecution_performed"]
+proof_local.close()
 
 with open(os.environ["HYPHAE_PYTHON_ARTIFACT"], "wb") as artifact:
     for value in (proven.value["proof"], proven.value["witness"], proven.value["trusted_anchor"]):
