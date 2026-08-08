@@ -6,14 +6,22 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.aggregate_native_g6_candidate import validate_platform_artifacts
 from tools.check_native_g6_foundation import PLATFORMS, REQUIREMENTS
+from tools.run_native_g6_candidate import host_command
 from tools.test_check_native_g6_conformance import receipt as conformance_receipt
 from tools.test_native_g6_evidence_support import checked_raw, digests
 
 
 class NativeG6CandidateWorkflowTests(unittest.TestCase):
+    def test_windows_command_shims_are_executable(self) -> None:
+        with mock.patch("tools.run_native_g6_candidate.os.name", "nt"):
+            self.assertEqual(host_command(["npm", "test"]), ["npm.cmd", "test"])
+            self.assertEqual(host_command(["node", "--test"]), ["node.exe", "--test"])
+            self.assertEqual(host_command(["cargo", "test"]), ["cargo", "test"])
+
     def fixture(self, root: Path) -> dict[str, str]:
         manifest_sha256 = digests(checked_raw())
         for platform in PLATFORMS:

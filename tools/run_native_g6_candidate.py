@@ -29,13 +29,17 @@ FILES = {
 }
 
 
-def version(command: list[str]) -> str:
+def host_command(command: list[str]) -> list[str]:
     if os.name == "nt" and command[0] == "npm":
-        command = ["npm.cmd", *command[1:]]
-    elif os.name == "nt" and command[0] == "node":
-        command = ["node.exe", *command[1:]]
+        return ["npm.cmd", *command[1:]]
+    if os.name == "nt" and command[0] == "node":
+        return ["node.exe", *command[1:]]
+    return command
+
+
+def version(command: list[str]) -> str:
     completed = subprocess.run(
-        command,
+        host_command(command),
         check=True,
         capture_output=True,
         text=True,
@@ -76,7 +80,7 @@ def main() -> int:
     if typescript_dist.exists():
         import shutil
         shutil.rmtree(typescript_dist)
-    subprocess.run(["npm", "run", "build", "--prefix", "sdks/typescript"], cwd=ROOT, env=environment, check=True)
+    subprocess.run(host_command(["npm", "run", "build", "--prefix", "sdks/typescript"]), cwd=ROOT, env=environment, check=True)
     if not (typescript_dist / "v2" / "index.js").is_file():
         raise RuntimeError("TypeScript clean build did not produce dist/v2/index.js")
 
@@ -105,7 +109,7 @@ def main() -> int:
             with log.open("w", encoding="utf-8") as stream:
                 stream.write("G6_COMMAND: " + json.dumps(authorized, separators=(",", ":")) + "\n")
                 stream.flush()
-                completed = subprocess.run(command, cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
+                completed = subprocess.run(host_command(command), cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
                 stream.write(f"G6_EXIT_CODE: {completed.returncode}\n")
             if completed.returncode != 0:
                 return completed.returncode
