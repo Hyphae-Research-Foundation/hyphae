@@ -23,6 +23,7 @@ on:
         options:
           - targeted
           - final
+          - aggregate
       scope:
         description: Windows SDK smoke test or complete candidate suite
         required: true
@@ -31,12 +32,21 @@ on:
         options:
           - smoke
           - candidate
+      evidence_run_id:
+        description: Producer run ID for aggregate mode
+        required: false
+        type: string
+      evidence_sha:
+        description: Exact producer SHA for aggregate mode
+        required: false
+        type: string
 
 concurrency:
   group: native-g6-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.mode || 'final' }}-${{ inputs.scope || 'candidate' }}
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -131,6 +141,7 @@ jobs:
 
   suites:
     name: G6 suites (${{ matrix.platform }})
+    if: inputs.mode != 'aggregate'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'windows' && '{"include":[{"os":"windows-2025","platform":"windows","python":"python"}]}' || inputs.platform == 'linux' && '{"include":[{"os":"ubuntu-24.04","platform":"linux","python":"python3"}]}' || inputs.platform == 'macos' && '{"include":[{"os":"macos-15","platform":"macos","python":"python3"}]}' || '{"include":[{"os":"ubuntu-24.04","platform":"linux","python":"python3"},{"os":"macos-15","platform":"macos","python":"python3"},{"os":"windows-2025","platform":"windows","python":"python"}]}') }}
@@ -267,6 +278,95 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-g6-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            g6-readiness/
+            manifest-artifact/
+            platform-artifacts/
+
+  aggregate-existing:
+    name: G6 exact-SHA candidate readiness
+    if: inputs.mode == 'aggregate'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate aggregate inputs
+        shell: bash
+        env:
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          EVIDENCE_SHA: ${{ inputs.evidence_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVIDENCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out evidence tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+
+      - name: Download exact-SHA manifest authority
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.evidence_run_id }}
+          name: native-g6-manifests-${{ inputs.evidence_sha }}
+          path: manifest-artifact
+
+      - name: Download exact-SHA platform receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.evidence_run_id }}
+          pattern: native-g6-*-${{ inputs.evidence_sha }}
+          path: downloaded-platforms
+
+      - name: Arrange platform receipts
+        shell: bash
+        env:
+          EVIDENCE_SHA: ${{ inputs.evidence_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p platform-artifacts
+          mv "downloaded-platforms/native-g6-linux-${EVIDENCE_SHA}" platform-artifacts/linux
+          mv "downloaded-platforms/native-g6-macos-${EVIDENCE_SHA}" platform-artifacts/macos
+          mv "downloaded-platforms/native-g6-windows-${EVIDENCE_SHA}" platform-artifacts/windows
+
+      - name: Aggregate exact-SHA candidate evidence
+        shell: bash
+        env:
+          EVIDENCE_SHA: ${{ inputs.evidence_sha }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python tools/aggregate_native_g6_candidate.py \
+            --source-commit "$EVIDENCE_SHA" \
+            --manifest-audit manifest-artifact/native-g6-manifest-audit.json \
+            --manifest-digests manifest-artifact/g6-manifest-sha256.json \
+            --platform-root platform-artifacts \
+            --output-dir g6-readiness
+          PYTHONPATH=. python tools/check_native_g6_conformance.py aggregate \
+            --receipt platform-artifacts/linux/native-g6-conformance-receipt.json \
+            --receipt platform-artifacts/macos/native-g6-conformance-receipt.json \
+            --receipt platform-artifacts/windows/native-g6-conformance-receipt.json \
+            --output g6-readiness/native-g6-conformance-aggregate.json
+          python - <<'PY'
+          import json
+          result = json.load(open("g6-readiness/native-g6-readiness.json"))
+          assert result["status"] == "candidate-evidence-complete"
+          assert result["passed"] == result["required"] == 14
+          assert result["matrix_cells_passed"] == 42
+          assert result["platforms_passed"] == ["linux", "macos", "windows"]
+          assert result["closure_status"] == "open"
+          assert result["claims"] == [] and result["closure_declared"] is False
+          PY
+
+      - name: Upload exact-SHA open candidate evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g6-candidate-${{ inputs.evidence_sha }}
           retention-days: 90
           if-no-files-found: error
           path: |
