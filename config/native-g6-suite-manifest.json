@@ -100,7 +100,7 @@
         {"name": "rust-sdk", "acceptance": ["rust"], "coverage": {"sdks": ["rust"], "transports": []}, "command": ["cargo", "test", "--locked", "-p", "hyphae-client", "--test", "v2_protocol"]},
         {"name": "python-sdk", "acceptance": ["python"], "coverage": {"sdks": ["python"], "transports": []}, "command": ["python", "-m", "unittest", "sdks.python.tests.test_v2", "-v"]},
         {"name": "typescript-sdk", "acceptance": ["typescript"], "coverage": {"sdks": ["typescript"], "transports": []}, "command": ["npm", "test", "--prefix", "sdks/typescript"]},
-        {"name": "all-sdk-real-transports", "acceptance": ["native-local", "http-v2", "typed-errors-proofs"], "coverage": {"sdks": ["rust", "python", "typescript"], "transports": ["native-local", "http-v2"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-server", "--test", "sdk_v2_real"]}
+        {"name": "all-sdk-real-transports", "acceptance": ["native-local", "http-v2", "typed-errors-proofs"], "coverage": {"sdks": ["rust", "python", "typescript"], "transports": ["native-local", "http-v2"]}, "command": ["cargo", "test", "--locked", "-p", "hyphae-server", "--test", "sdk_v2_real", "--", "--ignored"]}
       ]
     },
     {

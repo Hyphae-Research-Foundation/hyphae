@@ -28,7 +28,7 @@ use hyphae_native_protocol::{
     encode_failure, encode_product_response, encode_welcome, negotiate,
 };
 use interprocess::local_socket::traits::StreamCommon as _;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, PeerCreds};
+use interprocess::local_socket::{ListenerOptions, PeerCreds};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, broadcast},
@@ -42,7 +42,7 @@ use interprocess::{
 };
 #[cfg(unix)]
 use {
-    interprocess::local_socket::ToFsName as _,
+    interprocess::local_socket::{GenericFilePath, ToFsName as _},
     std::{fs, os::unix::fs::PermissionsExt as _},
 };
 

@@ -1342,6 +1342,12 @@ impl ExtractedWitness {
                 }
             }
         }
+        let lock = extraction.path.join("LOCK");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|source| super::model::io_error(&lock, source))?;
         Ok(extraction)
     }
 

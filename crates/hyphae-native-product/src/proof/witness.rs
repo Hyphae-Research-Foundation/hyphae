@@ -356,6 +356,11 @@ fn collect_directory(
         let item = item.map_err(|source| io_error(&directory, source))?;
         let child_relative = relative.join(item.file_name());
         let path = relative_path_string(&child_relative, limits.max_path_bytes)?;
+        // LOCK is ephemeral process ownership rather than durable database authority. Windows
+        // denies reopening it while the product owns the directory, so verification recreates it.
+        if relative.as_os_str().is_empty() && path == "LOCK" {
+            continue;
+        }
         account_path(accounting, path.len(), limits)?;
         let source_path = item.path();
         let metadata =

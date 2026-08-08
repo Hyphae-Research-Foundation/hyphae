@@ -8,8 +8,11 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(unix)]
+use std::time::Instant;
 
 use hyphae_native_product::proof::{
     AdmittedProofLimits, CanonicalBytes, CompletionStatus, NativeProof, NativeProofAnchor,
@@ -163,9 +166,9 @@ fn doctor_reports_busy_corrupt_and_io_without_preopening() -> Result<(), Box<dyn
     let corrupt = run(&["doctor", "--data-dir", &path(&corrupt)])?;
     assert_eq!(corrupt["status"], "corrupt");
 
-    let not_a_directory = temporary.0.join("not-a-directory");
-    fs::write(&not_a_directory, b"file")?;
-    let io_path = not_a_directory.join("child");
+    let io_path = temporary.0.join("io-error");
+    fs::create_dir(&io_path)?;
+    fs::create_dir(io_path.join("LOCK"))?;
     let io = run(&["doctor", "--data-dir", &path(&io_path)])?;
     assert_eq!(io["status"], "io");
     assert_eq!(io["verified_open"], false);

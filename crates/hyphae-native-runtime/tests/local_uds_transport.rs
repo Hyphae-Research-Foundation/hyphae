@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(unix)]
-
 //! Direct Unix-domain transport integration coverage.
+
+#![cfg(unix)]
 
 use std::{
     fs::{self, File},

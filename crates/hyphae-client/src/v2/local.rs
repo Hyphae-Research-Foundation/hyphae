@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
-use interprocess::local_socket::{GenericNamespaced, ToNsName as _};
+use interprocess::local_socket::GenericNamespaced;
 
 use super::{ClientError, RequestOptions, ResponseFuture, Transport};
 

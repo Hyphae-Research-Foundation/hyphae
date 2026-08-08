@@ -108,16 +108,25 @@ class DependencyReviewTests(unittest.TestCase):
             "crates/hyphae-native-blobs/Cargo.toml",
             "crates/hyphae-native-btree/Cargo.toml",
             "crates/hyphae-native-catalog/Cargo.toml",
+            "crates/hyphae-native-daemon/Cargo.toml",
             "crates/hyphae-native-manifest/Cargo.toml",
             "crates/hyphae-native-mvcc/Cargo.toml",
             "crates/hyphae-native-pages/Cargo.toml",
             "crates/hyphae-native-product/Cargo.toml",
+            "crates/hyphae-native-protocol/Cargo.toml",
             "crates/hyphae-native-records/Cargo.toml",
             "crates/hyphae-native-runtime/Cargo.toml",
             "crates/hyphae-native-types/Cargo.toml",
             "crates/hyphae-native-wal/Cargo.toml",
         }
         self.assertLessEqual(native_manifests, set(CARGO_MANIFESTS))
+
+    def test_g6_runner_manifest_and_lock_are_registered(self) -> None:
+        self.assertIn("conformance/g6/runners/rust/Cargo.toml", CARGO_MANIFESTS)
+        self.assertIn(
+            "conformance/g6/runners/rust/Cargo.lock",
+            REGISTERED_DEPENDENCY_FILES,
+        )
 
     def test_unregistered_dependency_families_are_rejected(self) -> None:
         paths = (
@@ -234,6 +243,7 @@ class DependencyReviewTests(unittest.TestCase):
         expected_reads = []
         for path in (
             "Cargo.lock",
+            "conformance/g6/runners/rust/Cargo.lock",
             "fuzz/Cargo.lock",
             "sdks/typescript/package-lock.json",
             "integrations/javascript/package-lock.json",

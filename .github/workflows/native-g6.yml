@@ -69,7 +69,7 @@ jobs:
           paths = {name: pathlib.Path("config") / files[name] for name in names}
           digests = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
           pathlib.Path("g6-manifest-sha256.json").write_text(json.dumps(digests, indent=2, sort_keys=True) + "\n")
-          command = [sys.executable, "tools/check_native_g6_manifests.py", "--expected-commit", "${{ github.event.pull_request.head.sha || github.sha }}"]
+          command = [sys.executable, "-m", "tools.check_native_g6_manifests", "--expected-commit", "${{ github.event.pull_request.head.sha || github.sha }}"]
           for name in names:
               command += [f"--{name}", str(paths[name]), f"--{name}-sha256", digests[name]]
           command += ["--output", "native-g6-manifest-audit.json"]

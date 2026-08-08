@@ -45,7 +45,7 @@ for (const client of [local, http]) {
       "SELECT label FROM proof_items WHERE id = ?",
       [7n],
       {},
-      { requestId: 30_110n, deadlineMicros: BigInt(Date.now()) * 1000n + 100n },
+      { requestId: 30_110n, deadlineMicros: BigInt(Date.now()) * 1000n - 1n },
     );
     throw new Error("expired request accepted");
   } catch (error) {

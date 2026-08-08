@@ -4,14 +4,16 @@
 
 use std::{error::Error, num::NonZeroU64};
 
+#[cfg(unix)]
+use hyphae_native_runtime::MAX_LOCAL_PREPARED_STATEMENTS;
 use hyphae_native_runtime::{
     LOCAL_SQL_EXECUTE_HEADER_SIZE, LOCAL_SQL_PREPARE_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE,
     LocalFailureCode, LocalSqlCodecError, LocalSqlColumn, LocalSqlPreparedReceipt, LocalSqlRows,
-    MAX_LOCAL_PREPARED_STATEMENTS, MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS,
-    MAX_LOCAL_SQL_ROWS, MAX_LOCAL_SQL_STATEMENT_BYTES, decode_local_failure,
-    decode_local_sql_execute, decode_local_sql_prepare, decode_local_sql_prepared_receipt,
-    decode_local_sql_rows, encode_local_failure, encode_local_sql_execute,
-    encode_local_sql_prepare, encode_local_sql_prepared_receipt, encode_local_sql_rows,
+    MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS, MAX_LOCAL_SQL_ROWS,
+    MAX_LOCAL_SQL_STATEMENT_BYTES, decode_local_failure, decode_local_sql_execute,
+    decode_local_sql_prepare, decode_local_sql_prepared_receipt, decode_local_sql_rows,
+    encode_local_failure, encode_local_sql_execute, encode_local_sql_prepare,
+    encode_local_sql_prepared_receipt, encode_local_sql_rows,
 };
 use hyphae_native_types::{
     CanonicalF32, CanonicalF64, CatalogVersion, Csn, DecimalType, IntegerWidth, LogicalType,

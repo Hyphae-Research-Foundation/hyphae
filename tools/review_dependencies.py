@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 CARGO_MANIFESTS = (
     "Cargo.toml",
+    "conformance/g6/runners/rust/Cargo.toml",
     "conformance/rust/Cargo.toml",
     "crates/hyphae-cli/Cargo.toml",
     "crates/hyphae-client/Cargo.toml",
@@ -31,10 +32,12 @@ CARGO_MANIFESTS = (
     "crates/hyphae-native-blobs/Cargo.toml",
     "crates/hyphae-native-btree/Cargo.toml",
     "crates/hyphae-native-catalog/Cargo.toml",
+    "crates/hyphae-native-daemon/Cargo.toml",
     "crates/hyphae-native-manifest/Cargo.toml",
     "crates/hyphae-native-mvcc/Cargo.toml",
     "crates/hyphae-native-pages/Cargo.toml",
     "crates/hyphae-native-product/Cargo.toml",
+    "crates/hyphae-native-protocol/Cargo.toml",
     "crates/hyphae-native-records/Cargo.toml",
     "crates/hyphae-native-runtime/Cargo.toml",
     "crates/hyphae-native-types/Cargo.toml",
@@ -46,7 +49,11 @@ CARGO_MANIFESTS = (
     "fuzz/Cargo.toml",
     "integrations/pliegors/Cargo.toml",
 )
-CARGO_LOCKS = ("Cargo.lock", "fuzz/Cargo.lock")
+CARGO_LOCKS = (
+    "Cargo.lock",
+    "conformance/g6/runners/rust/Cargo.lock",
+    "fuzz/Cargo.lock",
+)
 NPM_PROJECTS = {
     "sdks/typescript/package.json": "sdks/typescript/package-lock.json",
     "integrations/javascript/package.json": "integrations/javascript/package-lock.json",
@@ -353,6 +360,10 @@ def validate_manifest_lock_pairs(changed: set[str], head: str) -> None:
         validate_cargo_lock(head)
     if "fuzz/Cargo.toml" in changed and "fuzz/Cargo.lock" not in changed:
         validate_cargo_lock(head, "fuzz/Cargo.toml")
+    g6_runner = "conformance/g6/runners/rust/Cargo.toml"
+    g6_lock = "conformance/g6/runners/rust/Cargo.lock"
+    if g6_runner in changed and g6_lock not in changed:
+        validate_cargo_lock(head, g6_runner)
     for manifest in (path for path in changed if path in NPM_PROJECTS):
         lock = NPM_PROJECTS[manifest]
         if lock not in changed:

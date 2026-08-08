@@ -317,6 +317,7 @@ async fn rust_transport_acceptance(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "G6 hosted suite installs the TypeScript toolchain before running this test"]
 async fn all_sdks_match_typed_errors_and_verify_origin_free_native_proofs()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TestDirectory::new()?;
