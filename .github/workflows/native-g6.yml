@@ -25,7 +25,7 @@ on:
           - final
 
 concurrency:
-  group: native-g6-${{ github.ref }}
+  group: native-g6-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.mode || 'final' }}
   cancel-in-progress: true
 
 permissions:
@@ -38,6 +38,7 @@ env:
 jobs:
   manifests:
     name: G6 exact-SHA manifests
+    if: github.event_name == 'push' || inputs.mode == 'final'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out exact commit
@@ -117,7 +118,6 @@ jobs:
 
   suites:
     name: G6 suites (${{ matrix.platform }})
-    needs: manifests
     strategy:
       fail-fast: false
       matrix:
@@ -195,7 +195,7 @@ jobs:
   readiness:
     name: G6 exact-SHA candidate readiness
     needs: [manifests, suites]
-    if: github.event_name == 'push' || inputs.mode == 'final'
+    if: always() && (github.event_name == 'push' || inputs.mode == 'final') && needs.manifests.result == 'success' && needs.suites.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out exact commit

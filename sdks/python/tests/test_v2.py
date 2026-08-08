@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from typing import BinaryIO, cast
 from unittest.mock import patch
 
 from hyphae_sdk.v2 import HyphaeClient, RequestOptions, Response
 from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
-from hyphae_sdk.v2.local import LocalTransport, _windows_pipe_namespace
+from hyphae_sdk.v2.local import _windows_pipe_namespace, _write_all
 from hyphae_sdk.v2.protocol import (
     FRAME_KINDS,
     decode_frame,
@@ -133,11 +134,9 @@ class V2Tests(unittest.TestCase):
             _windows_pipe_namespace("\\\\server\\pipe\\hyphae-test")
 
     def test_local_pipe_write_completes_short_writes(self) -> None:
-        transport = LocalTransport("hyphae-test")
         stream = ShortWriteStream()
-        transport._stream = stream  # type: ignore[assignment]
         encoded = encode_frame(FRAME_KINDS["hello"], 0, 17, b"")
-        transport._write(encoded)
+        _write_all(cast(BinaryIO, stream), encoded)
         self.assertEqual(stream.encoded, encoded)
         self.assertEqual(stream.flushes, 1)
 

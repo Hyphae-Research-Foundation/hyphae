@@ -170,13 +170,7 @@ class LocalTransport:
             if isinstance(self._stream, socket.socket):
                 self._stream.sendall(encoded)
             else:
-                remaining = memoryview(encoded)
-                while remaining:
-                    written = self._stream.write(remaining)
-                    if written is None or written <= 0:
-                        raise OSError("native-local stream accepted no bytes")
-                    remaining = remaining[written:]
-                self._stream.flush()
+                _write_all(self._stream, encoded)
         except OSError as error:
             self.close()
             raise ClientError("native-local transport failed") from error
@@ -193,6 +187,16 @@ def _windows_pipe_namespace(endpoint: str) -> str:
     if not endpoint or endpoint.startswith("\\\\"):
         raise ClientError("Windows local endpoint must be a local named-pipe namespace")
     return endpoint
+
+
+def _write_all(stream: BinaryIO, encoded: bytes) -> None:
+    remaining = memoryview(encoded)
+    while remaining:
+        written = stream.write(remaining)
+        if written is None or written <= 0:
+            raise OSError("native-local stream accepted no bytes")
+        remaining = remaining[written:]
+    stream.flush()
 
 
 __all__ = ["LocalTransport"]
