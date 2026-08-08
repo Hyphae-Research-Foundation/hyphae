@@ -1,8 +1,6 @@
 name: Native G3 Structure Evidence
 
 on:
-  push:
-    branches: [dev, main]
   workflow_dispatch:
 
 concurrency:

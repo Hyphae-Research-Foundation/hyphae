@@ -1,8 +1,6 @@
 name: Native G5 Convergence Closure Evidence
 
 on:
-  push:
-    branches: [dev, main]
   workflow_dispatch:
 
 concurrency:

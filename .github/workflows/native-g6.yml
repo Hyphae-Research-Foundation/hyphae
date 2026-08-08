@@ -1,8 +1,6 @@
 name: Native G6 Candidate Evidence
 
 on:
-  push:
-    branches: [dev, main]
   workflow_dispatch:
     inputs:
       platform:

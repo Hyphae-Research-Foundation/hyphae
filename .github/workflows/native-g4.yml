@@ -1,8 +1,6 @@
 name: Native G4 Search Closure Evidence
 
 on:
-  push:
-    branches: [dev, main]
   workflow_dispatch:
 
 concurrency:
