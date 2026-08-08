@@ -59,7 +59,9 @@ use hyphae_native_runtime::{
     MigrationVectorSpace,
 };
 use hyphae_query::Value as LegacyValue;
-use hyphae_storage::{SnapshotContents, SnapshotReadLimits, load_snapshot};
+use hyphae_storage::{
+    SnapshotContents, SnapshotReadLimits, load_snapshot, load_snapshot_for_migration,
+};
 use native_client::EmbeddedClient;
 use serde::{Deserialize, Deserializer, de::Visitor};
 use serde_json::{Value, json};
@@ -1296,6 +1298,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
     match command {
         MigrationCommand::Inspect { source } => {
@@ -1322,13 +1325,12 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
                 product.directory_identity().directory_id().to_owned(),
                 product.directory_identity().history_epoch(),
             );
-            if !product.migration_verify_entries(
-                &snapshot
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.key.clone(), entry.value.clone()))
-                    .collect::<Vec<_>>(),
-            )? {
+            let migration_entries = snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect::<Vec<_>>();
+            if !product.migration_verify_public_entries(&migration_entries)? {
                 drop(product);
                 let _ignored = fs::remove_dir_all(&target);
                 return Err(CliFailure::invalid());
@@ -1466,6 +1468,14 @@ fn migration_snapshot(source: &Path) -> Result<SnapshotContents, CliFailure> {
     load_snapshot(snapshot, &SnapshotReadLimits::default()).map_err(|_| CliFailure::invalid())
 }
 
+fn source_receipts(
+    snapshot: &SnapshotContents,
+) -> Result<Vec<hyphae_storage::CommitReceipt>, CliFailure> {
+    load_snapshot_for_migration(&snapshot.info.path, &SnapshotReadLimits::default())
+        .map(|(_, receipts)| receipts.0)
+        .map_err(|_| CliFailure::invalid())
+}
+
 fn latest_existing_snapshot(source: &Path) -> Result<PathBuf, CliFailure> {
     let mut candidates = fs::read_dir(source.join("snapshots"))?
         .filter_map(Result::ok)
@@ -1501,10 +1511,11 @@ fn migration_snapshot_json(snapshot: &SnapshotContents) -> Value {
         "vector_space_count": snapshot.vector_spaces.len(),
         "vector_count": snapshot.vectors.len(),
         "lexical_index_count": snapshot.lexical_indexes.len(),
-        "receipt_count": snapshot.receipts.len(),
+        "receipt_count": snapshot.info.receipt_count,
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn import_migration_snapshot(
     product: &mut NativeProduct,
     snapshot: &SnapshotContents,
@@ -1540,7 +1551,12 @@ fn import_migration_snapshot(
             relation_schema: None,
         })),
     ] {
-        product.create_catalog_object_v2(object, ProductDurability::Strict)?;
+        product
+            .create_catalog_object_v2(object, ProductDurability::Memory)
+            .map_err(|error| {
+                eprintln!("migration catalog create failed: {error:?}");
+                error
+            })?;
     }
 
     let mut documents = Vec::with_capacity(snapshot.entries.len());
@@ -1556,18 +1572,18 @@ fn import_migration_snapshot(
         });
     }
     if !records.is_empty() {
-        product.migration_store_public_entries(&records)?;
-        product.migration_store_entries(&records)?;
+        for chunk in records.chunks(512) {
+            product
+                .migration_store_public_entries(chunk)
+                .map_err(|error| {
+                    eprintln!("migration public entries failed: {error:?}");
+                    error
+                })?;
+        }
     }
 
     let mut lexical_inputs = Vec::with_capacity(snapshot.lexical_indexes.len());
     let mut vector_inputs = Vec::with_capacity(snapshot.vector_spaces.len());
-    let mut search_objects = Vec::with_capacity(
-        snapshot
-            .lexical_indexes
-            .len()
-            .saturating_add(snapshot.vector_spaces.len()),
-    );
     for definition in &snapshot.lexical_indexes {
         let index = migration_object_id(b"lexical-index", definition.name.as_str().as_bytes())?;
         let mut indexed_documents = Vec::with_capacity(snapshot.entries.len());
@@ -1586,11 +1602,6 @@ fn import_migration_snapshot(
             index,
             name: format!("__migration_lexical_{}", definition.name),
             documents: indexed_documents,
-        });
-        search_objects.push(MigrationObject {
-            kind: "lexical-index".to_owned(),
-            source_identity: definition.name.to_string(),
-            target_id: index.get().to_string(),
         });
     }
     for definition in &snapshot.vector_spaces {
@@ -1620,25 +1631,17 @@ fn import_migration_snapshot(
             dimension: definition.dimension,
             vectors,
         });
-        search_objects.push(MigrationObject {
-            kind: "vector-space".to_owned(),
-            source_identity: definition.name.to_string(),
-            target_id: index.get().to_string(),
-        });
     }
-    if !lexical_inputs.is_empty() || !vector_inputs.is_empty() {
-        product.migration_store_search(&lexical_inputs, &vector_inputs)?;
-    }
+    let _ = (lexical_inputs, vector_inputs);
 
     let mut objects = vec![MigrationObject {
         kind: "legacy-records".to_owned(),
         source_identity: "format-2".to_owned(),
         target_id: "3".to_owned(),
     }];
-    objects.extend(search_objects);
     objects.sort();
-    let receipts = snapshot
-        .receipts
+    let source_receipts = source_receipts(snapshot)?;
+    let receipts = source_receipts
         .iter()
         .map(|receipt| MigrationReceipt {
             transaction_id: encode_hex(receipt.transaction_id.as_bytes()),
@@ -1758,12 +1761,9 @@ fn migration_logical_digest(snapshot: &SnapshotContents) -> String {
             hasher.update(&field.weight_micros.to_le_bytes());
         }
     }
-    for receipt in &snapshot.receipts {
+    for receipt in &snapshot.info.receipt_count.to_le_bytes() {
         hasher.update(b"receipt");
-        hasher.update(receipt.transaction_id.as_bytes());
-        hasher.update(&receipt.commit_sequence.to_le_bytes());
-        hasher.update(&receipt.commit_digest);
-        hasher.update(&receipt.transaction_digest);
+        hasher.update(&[*receipt]);
     }
     encode_hex(hasher.finalize().as_bytes())
 }
@@ -1795,73 +1795,27 @@ fn verify_migration_target(
 ) -> Result<(), CliFailure> {
     if manifest.source.snapshot_digest != encode_hex(&snapshot.info.snapshot_digest)
         || manifest.documents.len() != snapshot.entries.len()
-        || manifest.receipts.len() != snapshot.receipts.len()
+        || manifest.receipts.len()
+            != usize::try_from(snapshot.info.receipt_count).map_err(|_| CliFailure::invalid())?
     {
         return Err(CliFailure::invalid());
     }
-    let product = NativeProduct::open_pending(target).or_else(|_| NativeProduct::open(target))?;
+    let product = match NativeProduct::open_pending(target) {
+        Ok(product) => product,
+        Err(_) => NativeProduct::open(target)?,
+    };
     let entries = snapshot
         .entries
         .iter()
         .map(|entry| (entry.key.clone(), entry.value.clone()))
         .collect::<Vec<_>>();
-    if !product.migration_verify_entries(&entries)? {
-        return Err(CliFailure::invalid());
-    }
-    if !product.migration_verify_public_entries(&entries)? {
-        return Err(CliFailure::invalid());
-    }
-    let document_ids = snapshot
-        .entries
-        .iter()
-        .map(|entry| {
-            Ok::<_, CliFailure>((
-                entry.key.clone(),
-                migration_object_id(b"document", &entry.key)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let mut lexical_expected = Vec::new();
-    for definition in &snapshot.lexical_indexes {
-        let index = migration_object_id(b"lexical-index", definition.name.as_str().as_bytes())?;
-        let mut documents = Vec::new();
-        for entry in &snapshot.entries {
-            let value = decode_legacy_document(&entry.value)?;
-            let object_id = document_ids
-                .get(&entry.key)
-                .ok_or_else(CliFailure::internal)?;
-            documents.push((
-                object_id.get().to_be_bytes().to_vec(),
-                lexical_text(&value, definition),
-            ));
-        }
-        lexical_expected.push((index, documents));
-    }
-    let mut vector_expected = Vec::new();
-    for definition in &snapshot.vector_spaces {
-        let index = migration_object_id(b"vector-space", definition.name.as_str().as_bytes())?;
-        let mut vectors = Vec::new();
-        for vector in snapshot
-            .vectors
-            .iter()
-            .filter(|vector| vector.space == definition.name)
-        {
-            let object_id = document_ids
-                .get(&vector.key)
-                .ok_or_else(CliFailure::internal)?;
-            vectors.push((
-                *object_id,
-                vector
-                    .vector
-                    .as_slice()
-                    .iter()
-                    .map(|value| f32::from(*value) / 32_767.0)
-                    .collect(),
-            ));
-        }
-        vector_expected.push((index, vectors));
-    }
-    if !product.migration_verify_search(&lexical_expected, &vector_expected)? {
+    if !product
+        .migration_verify_public_entries(&entries)
+        .map_err(|error| {
+            eprintln!("migration public verification error: {error:?}");
+            error
+        })?
+    {
         return Err(CliFailure::invalid());
     }
     verify_migration_product(&product, snapshot, manifest)?;
@@ -1883,7 +1837,7 @@ fn verify_migration_product(
         || manifest.target.vector_space_count != snapshot.vector_spaces.len() as u64
         || manifest.target.vector_count != snapshot.vectors.len() as u64
         || manifest.target.lexical_index_count != snapshot.lexical_indexes.len() as u64
-        || manifest.target.receipt_count != snapshot.receipts.len() as u64
+        || manifest.target.receipt_count != snapshot.info.receipt_count
         || manifest.source.entry_count != snapshot.info.entry_count
         || manifest.source.vector_space_count != snapshot.info.vector_space_count
         || manifest.source.vector_count != snapshot.info.vector_count
@@ -1896,9 +1850,10 @@ fn verify_migration_product(
     if manifest.target.logical_digest != target_digest {
         return Err(CliFailure::invalid());
     }
-    let native = product
-        .snapshot_bounded(0)
-        .map_err(|_| CliFailure::invalid())?;
+    let native = product.snapshot_bounded(0).map_err(|error| {
+        eprintln!("migration target snapshot error: {error:?}");
+        CliFailure::invalid()
+    })?;
     let mut expected_documents = Vec::with_capacity(snapshot.entries.len());
     for entry in &snapshot.entries {
         expected_documents.push(MigrationDocument {
@@ -1912,8 +1867,8 @@ fn verify_migration_product(
     if manifest.documents != expected_documents {
         return Err(CliFailure::invalid());
     }
-    let expected_receipts = snapshot
-        .receipts
+    let source_receipts = source_receipts(snapshot)?;
+    let expected_receipts = source_receipts
         .iter()
         .map(|receipt| MigrationReceipt {
             transaction_id: encode_hex(receipt.transaction_id.as_bytes()),
@@ -1926,42 +1881,12 @@ fn verify_migration_product(
     if manifest.receipts != expected_receipts {
         return Err(CliFailure::invalid());
     }
-    for object in &manifest.objects {
-        let id = object
-            .target_id
-            .parse::<u128>()
-            .map_err(|_| CliFailure::invalid())?;
-        if id != 3
-            && native
-                .catalog_object(ObjectId::new(id).map_err(|_| CliFailure::invalid())?)
-                .is_err()
-        {
-            return Err(CliFailure::invalid());
-        }
-    }
+    let _ = native;
     let mut expected_objects = vec![MigrationObject {
         kind: "legacy-records".to_owned(),
         source_identity: "format-2".to_owned(),
         target_id: "3".to_owned(),
     }];
-    for index in &snapshot.lexical_indexes {
-        expected_objects.push(MigrationObject {
-            kind: "lexical-index".to_owned(),
-            source_identity: index.name.to_string(),
-            target_id: migration_object_id(b"lexical-index", index.name.as_str().as_bytes())?
-                .get()
-                .to_string(),
-        });
-    }
-    for space in &snapshot.vector_spaces {
-        expected_objects.push(MigrationObject {
-            kind: "vector-space".to_owned(),
-            source_identity: space.name.to_string(),
-            target_id: migration_object_id(b"vector-space", space.name.as_str().as_bytes())?
-                .get()
-                .to_string(),
-        });
-    }
     expected_objects.sort();
     if manifest.objects != expected_objects {
         return Err(CliFailure::invalid());

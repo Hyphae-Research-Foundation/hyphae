@@ -245,10 +245,11 @@ fn format2_migration_runs_verifies_promotes_and_keeps_source_unchanged()
         let expected = expected_values
             .get(key.as_bytes())
             .ok_or("missing expected migrated record")?;
-        let expected_hex = expected
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let expected_hex = expected.iter().fold(String::new(), |mut encoded, byte| {
+            use std::fmt::Write;
+            let _ = write!(encoded, "{byte:02x}");
+            encoded
+        });
         assert_eq!(read["result"]["value_hex"], expected_hex);
     }
 

@@ -2966,6 +2966,10 @@ impl NativeSnapshot {
     }
 
     /// Returns the exact current vector records for one physical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index does not exist or is corrupt.
     pub fn vector_records(&self, index: ObjectId) -> Result<Vec<VectorRecord>, NativeRuntimeError> {
         self.state.ann.vector_records(index)
     }
@@ -3208,6 +3212,10 @@ impl NativeDatabase {
     }
 
     /// Opens an importer-owned pending migration target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not an unpromoted migration target.
     pub fn open_pending(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
         Self::open_with_marker(path.as_ref(), true)
     }

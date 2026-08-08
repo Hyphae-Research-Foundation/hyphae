@@ -12,6 +12,7 @@ pub const NATIVE_MIGRATION_MANIFEST_KIND: &str = "hyphae-native-migration-manife
 
 /// Bounded manifest decoder policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)]
 pub struct MigrationManifestLimits {
     /// Maximum encoded manifest bytes.
     pub max_bytes: usize,
@@ -117,7 +118,7 @@ pub struct MigrationLexicalIndex {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationTarget {
-    /// Native directory UUIDv7 string.
+    /// Native directory `UUIDv7` string.
     pub directory_id: String,
     /// Native history epoch.
     pub history_epoch: u64,
@@ -217,6 +218,10 @@ fn valid_hex(value: &str, bytes: usize) -> bool {
 
 impl MigrationManifest {
     /// Encodes the canonical compact JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or canonical encoding fails.
     pub fn encode(&self) -> Result<Vec<u8>, MigrationManifestError> {
         self.validate(&MigrationManifestLimits::default())?;
         let encoded = serde_json::to_vec(self)?;
@@ -230,6 +235,10 @@ impl MigrationManifest {
     }
 
     /// Decodes and validates one bounded manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is malformed, oversized, or invalid.
     pub fn decode(
         encoded: &[u8],
         limits: &MigrationManifestLimits,
@@ -246,6 +255,10 @@ impl MigrationManifest {
     }
 
     /// Validates format, bounds, canonical ordering, and identity continuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a manifest field violates the migration contract.
     pub fn validate(&self, limits: &MigrationManifestLimits) -> Result<(), MigrationManifestError> {
         if self.version != NATIVE_MIGRATION_MANIFEST_VERSION {
             return Err(MigrationManifestError::Invalid(
@@ -335,7 +348,8 @@ mod tests {
     use super::{MigrationManifest, MigrationManifestLimits};
 
     #[test]
-    fn manifest_rejects_wrong_source_and_receipt_identity() {
+    fn manifest_rejects_wrong_source_and_receipt_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
         let value = serde_json::json!({
             "version": 1,
             "kind": "hyphae-native-migration-manifest",
@@ -366,8 +380,9 @@ mod tests {
             "documents": [],
             "receipts": []
         });
-        let encoded = serde_json::to_vec(&value).expect("encode test manifest");
+        let encoded = serde_json::to_vec(&value)?;
         assert!(MigrationManifest::decode(&encoded, &MigrationManifestLimits::default()).is_err());
+        Ok(())
     }
 
     #[test]
