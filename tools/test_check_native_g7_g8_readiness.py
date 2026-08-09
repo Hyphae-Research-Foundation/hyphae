@@ -25,14 +25,54 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config").mkdir()
+            (root / ".github/workflows").mkdir(parents=True)
             for name in ("native-g7-readiness-profile.json", "native-g8-readiness-profile.json", "native-g8-suite-manifest.json"):
                 source = ROOT / "config" / name
                 (root / "config" / name).write_bytes(source.read_bytes())
+            (root / ".github/workflows/native-g8-closure.yml").write_bytes(
+                (ROOT / ".github/workflows/native-g8-closure.yml").read_bytes()
+            )
             path = root / "config/native-g8-suite-manifest.json"
             payload = json.loads(path.read_text())
             payload["requirements"][0]["status"] = "passed"
             path.write_text(json.dumps(payload))
-            with self.assertRaisesRegex(GateFailure, "closed requirement"):
+            with self.assertRaisesRegex(GateFailure, "not completely implemented"):
+                validate(root, "a" * 40)
+
+    def test_g8_closure_must_enforce_g7_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / ".github/workflows").mkdir(parents=True)
+            for name in (
+                "native-g7-readiness-profile.json",
+                "native-g8-readiness-profile.json",
+                "native-g8-suite-manifest.json",
+            ):
+                (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
+            workflow = (ROOT / ".github/workflows/native-g8-closure.yml").read_text()
+            (root / ".github/workflows/native-g8-closure.yml").write_text(
+                workflow.replace("native-g7-aggregate.json", "missing-g7.json")
+            )
+            with self.assertRaisesRegex(GateFailure, "G7 predecessor"):
+                validate(root, "a" * 40)
+
+    def test_g8_closure_must_revalidate_raw_g7_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / ".github/workflows").mkdir(parents=True)
+            for name in (
+                "native-g7-readiness-profile.json",
+                "native-g8-readiness-profile.json",
+                "native-g8-suite-manifest.json",
+            ):
+                (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
+            workflow = (ROOT / ".github/workflows/native-g8-closure.yml").read_text()
+            (root / ".github/workflows/native-g8-closure.yml").write_text(
+                workflow.replace("--receipts", "--unchecked-receipts")
+            )
+            with self.assertRaisesRegex(GateFailure, "G7 predecessor"):
                 validate(root, "a" * 40)
 
 

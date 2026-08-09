@@ -1,6 +1,6 @@
 {
   "name": "@celiums/hyphae-integrations",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "description": "Optional Astro, Next, and Vite adapters for Hyphae v1",
   "license": "Apache-2.0",
   "type": "module",
@@ -35,7 +35,7 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "peerDependencies": {
-    "@celiums/hyphae": "0.2.1",
+    "@celiums/hyphae": "1.0.0",
     "astro": ">=5 <8",
     "next": ">=15 <17",
     "vite": ">=6 <9"

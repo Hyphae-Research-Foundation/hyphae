@@ -1,0 +1,117 @@
+name: Native G8 Exact SHA Closure
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact 40-character commit shared by both evidence runs
+        required: true
+        type: string
+      readiness_run_id:
+        description: Successful readiness run containing both G7 benchmark and G8 matrix evidence
+        required: true
+        type: string
+      release_run_id:
+        description: Successful Release run ID for the same commit
+        required: true
+        type: string
+
+concurrency:
+  group: native-g8-closure-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  close:
+    name: Validate all exact-SHA G8 receipts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject malformed closure inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.source_commit }}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${{ inputs.readiness_run_id }}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${{ inputs.release_run_id }}" =~ ^[1-9][0-9]*$ ]]
+          test "${{ inputs.readiness_run_id }}" != "${{ inputs.release_run_id }}"
+          test "${{ github.sha }}" = "${{ inputs.source_commit }}"
+      - name: Check out the exact evidence commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+      - name: Verify source and workflow run identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          READINESS_RUN: ${{ inputs.readiness_run_id }}
+          RELEASE_RUN: ${{ inputs.release_run_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          verify_run() {
+            local run_id="$1"
+            local expected_path="$2"
+            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .head_sha)" = "$SOURCE_COMMIT"
+            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .conclusion)" = success
+            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .path)" = "$expected_path"
+          }
+          verify_run "$READINESS_RUN" ".github/workflows/native-g7-g8-readiness.yml"
+          verify_run "$RELEASE_RUN" ".github/workflows/release.yml"
+      - name: Download both bounded evidence sets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.readiness_run_id }}" \
+            --repo "$REPOSITORY" --dir evidence/readiness
+          gh run download "${{ inputs.release_run_id }}" \
+            --repo "$REPOSITORY" --dir evidence/release
+      - name: Enforce the exact-SHA G7 predecessor closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t aggregates < <(
+            find evidence/readiness -type f -name native-g7-aggregate.json -print
+          )
+          test "${#aggregates[@]}" -eq 1
+          PYTHONPATH=. python tools/check_native_g7_matrix.py \
+            --matrix "${aggregates[0]}" \
+            --expected-commit "${{ inputs.source_commit }}" \
+            --output native-g7-prerequisite-audit.json \
+            --closure \
+            --receipts evidence/readiness
+      - name: Validate and aggregate all nine G8 requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_g8_receipts \
+            tools.test_produce_native_g8_receipt \
+            -v
+          PYTHONPATH=. python tools/check_native_g8_receipts.py \
+            --expected-commit "${{ inputs.source_commit }}" \
+            --receipts evidence \
+            --output native-g8-aggregate.json
+      - name: Upload exact-SHA G8 closure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g8-aggregate-${{ inputs.source_commit }}
+          path: |
+            native-g7-prerequisite-audit.json
+            native-g8-aggregate.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+          overwrite: true

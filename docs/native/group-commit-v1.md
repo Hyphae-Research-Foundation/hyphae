@@ -127,7 +127,7 @@ Required executable evidence covers:
   queue time, execution time, page synchronization, WAL synchronization, and
   end-to-end acknowledgement.
 
-This vertical advances G1 and G7. It does not close either gate, bounded WAL
-replay, WAL retention, background expiry, or the complete scheduler/resource
-policy. The remaining shared resource policy is narrowed by
+This vertical is retained by the closed G1 substrate gate. It contributes to
+G7 but does not close the controlled performance matrix. The shared resource
+policy is specified by
 [Native mixed-durability scheduler v1](mixed-durability-scheduler-v1.md).

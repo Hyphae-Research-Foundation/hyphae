@@ -1,7 +1,9 @@
 # Public contracts
 
-`openapi/hyphae-v1.yaml` is the canonical HTTP surface and the JSON Schema
-2020-12 documents are the canonical payload definitions for `/v1`. The data
+`openapi/hyphae-v1.yaml` remains the canonical published format-2 HTTP surface,
+and its JSON Schema 2020-12 documents define `/v1`. Native `dev` uses
+`openapi/hyphae-v2.yaml` plus `json-schema/native-v2.schema.json` as the
+versioned `/v2` edge and canonical binary-envelope authority. The `/v1` data
 operations cover KV put/get/delete, deterministic structured query, durable
 vector and lexical definitions/mutations, exact/lexical/hybrid retrieval, and
 result/retrieval proof witness download. Health and capabilities disclose no

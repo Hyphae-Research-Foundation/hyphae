@@ -1,6 +1,6 @@
 # Native whole-set lifecycle v1
 
-Status: implemented and directly verified on Linux; hosted checks pending.
+Status: implemented and retained by the closed G3 structure gate.
 
 Evidence:
 [Native whole-set lifecycle evidence on Linux — 2026-08-03](../gates/evidence/native-set-lifecycle-linux-2026-08-03.md).

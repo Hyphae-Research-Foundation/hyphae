@@ -126,5 +126,29 @@ const localVerified = await proofLocal.verifyProof(
 assert.equal(localVerified.value.semanticReexecutionPerformed, true);
 await proofLocal.close();
 
+for (const [offset, client] of [local, http].entries()) {
+  const rowId = 30_200n + BigInt(offset);
+  const begun = await client.transactionBegin({ requestId: 30_200n + BigInt(offset * 10) });
+  assert.equal(begun.kind, "explicit_transaction_status");
+  assert.equal(begun.value.state, "active");
+  const handle = begun.value.handle;
+  const staged = await client.transactionStageSql(
+    handle,
+    "INSERT INTO proof_items (id, label) VALUES (?, ?)",
+    [rowId, `typescript-${offset}`],
+    { requestId: 30_201n + BigInt(offset * 10) },
+  );
+  assert.equal(staged.kind, "transaction_staged");
+  assert.equal(staged.value.result.kind, "sql");
+  const rolledBack = await client.transactionRollback(handle, { requestId: 30_202n + BigInt(offset * 10) });
+  assert.equal(rolledBack.kind, "transaction_rolled_back");
+  const selected = await client.sql(
+    "SELECT label FROM proof_items WHERE id = ?",
+    [rowId],
+    { requestId: 30_203n + BigInt(offset * 10) },
+  );
+  assert.deepEqual(selected.value.result.rows, []);
+}
+
 await local.close();
 await deniedLocal.close();

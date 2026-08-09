@@ -1,7 +1,7 @@
 # Native HTTP API v2
 
-Status: implemented bounded Native HTTP v2 adapter and versioned contract;
-broader G6 cross-platform and hosted receipts remain incomplete
+Status: implemented bounded Native HTTP v2 adapter and versioned contract; G6
+cross-platform and hosted receipts are closed for the bounded product profile
 
 HTTP `/v2` is an optional edge adapter over the native product facade. The
 embedded API and native local protocol remain the primary performance

@@ -71,7 +71,7 @@ pub use convergence::{
     HybridSource, MAX_CONVERGENCE_AGGREGATES, MAX_CONVERGENCE_ROWS, MAX_CONVERGENCE_SOURCES,
     StructureSource,
 };
-pub use directory::{NativeDirectoryError, NativeDirectoryIdentity};
+pub use directory::{NativeDirectoryError, NativeDirectoryIdentity, PromotionBoundary};
 pub use group_commit::{
     ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
     CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
@@ -3211,6 +3211,24 @@ impl NativeDatabase {
             .map_err(Into::into)
     }
 
+    /// Publishes a pending target with one deterministic crash interruption.
+    ///
+    /// After an injected interruption the caller must drop this handle and
+    /// reopen either the pending or authoritative directory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a directory error at the selected promotion boundary, or when
+    /// marker promotion or parent synchronization fails.
+    pub fn promote_pending_with_interruption(
+        &mut self,
+        boundary: PromotionBoundary,
+    ) -> Result<(), NativeRuntimeError> {
+        self.directory_guard
+            .promote_pending_with_interruption(&self.data_directory, boundary)
+            .map_err(Into::into)
+    }
+
     /// Opens an importer-owned pending migration target.
     ///
     /// # Errors
@@ -3504,8 +3522,31 @@ impl NativeDatabase {
         object: LogicalCatalogObject,
         durability: DurabilityClass,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.create_catalog_objects_v2(vec![object], durability)
+    }
+
+    /// Creates multiple generic logical catalog V2 objects under one commit.
+    ///
+    /// Objects are admitted in input order so parent definitions may precede
+    /// their dependents. Any invalid object aborts the private transaction and
+    /// publishes none of the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty batch, invalid catalog semantics, or
+    /// commit persistence.
+    pub fn create_catalog_objects_v2(
+        &mut self,
+        objects: Vec<LogicalCatalogObject>,
+        durability: DurabilityClass,
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        if objects.is_empty() {
+            return Err(WalSemanticError::InvalidSequence.into());
+        }
         let mut transaction = self.begin(0, durability)?;
-        transaction.create_catalog_object_v2(object)?;
+        for object in objects {
+            transaction.create_catalog_object_v2(object)?;
+        }
         transaction.commit()
     }
 
@@ -24431,11 +24472,11 @@ mod tests {
         HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError, Mutation,
         NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
         NativeRuntimeError, NativeSchedulerClock, NativeTransaction, NativeWriteBatch,
-        ObjectHeader, Opcode, PAGE_FILE, PageStore, QualifiedName, RelationDefinition,
-        RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition, SetOutcome,
-        SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult,
-        SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError, WalRetentionAnchor,
-        WalRetentionBoundary, ZAddOutcome, append_catalog_object_entries,
+        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
+        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
+        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
+        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, append_catalog_object_entries,
         binary_relation_definition, catalog_definition_storage_value, catalog_dependency_prefix,
         catalog_name_identity, catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
@@ -24605,6 +24646,36 @@ mod tests {
         drop(database);
         let reopened = NativeDatabase::open(directory.path())?;
         assert_eq!(reopened.directory_identity().history_epoch(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_pending_promotion_boundaries_reopen_to_one_marker_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            PromotionBoundary::BeforeRename,
+            PromotionBoundary::MarkerRenamed,
+            PromotionBoundary::ParentSynchronized,
+        ] {
+            let directory = TestDirectory::new();
+            let mut database = NativeDatabase::create_pending(directory.path())?;
+            let result = database.promote_pending_with_interruption(boundary);
+            assert!(matches!(
+                result,
+                Err(NativeRuntimeError::Directory(
+                    NativeDirectoryError::InjectedPromotionCrash(found)
+                )) if found == boundary
+            ));
+            drop(database);
+            let has_pending = directory.path().join("FORMAT.pending").exists();
+            let has_authority = directory.path().join("FORMAT").exists();
+            assert_ne!(has_pending, has_authority);
+            if boundary == PromotionBoundary::BeforeRename {
+                drop(NativeDatabase::open_pending(directory.path())?);
+            } else {
+                drop(NativeDatabase::open(directory.path())?);
+            }
+        }
         Ok(())
     }
 

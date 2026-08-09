@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-client"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-contracts",
  "hyphae-native-product",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -374,11 +374,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "0.2.1"
+version = "1.0.0"
 
 [[package]]
 name = "hyphae-native-ann"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-pages",
  "hyphae-native-types",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-daemon"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-product",
  "hyphae-native-protocol",
@@ -438,12 +438,13 @@ dependencies = [
  "hyphae-native-runtime",
  "hyphae-native-types",
  "serde_json",
+ "stats_alloc",
  "tokio",
 ]
 
 [[package]]
 name = "hyphae-native-manifest"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -454,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -463,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -473,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-product"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -483,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-protocol"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -495,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-records"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -503,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -527,14 +528,14 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-types"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "hyphae-native-wal"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -544,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1154,6 +1155,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "subtle"

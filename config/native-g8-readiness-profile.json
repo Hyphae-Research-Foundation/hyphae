@@ -1,5 +1,5 @@
 {
-  "schema": "hyphae-native-g8-readiness-profile-v1",
+  "schema": "hyphae-native-g8-readiness-profile-v2",
   "gate": "G8",
   "scope": "exact-commit-release-evidence",
   "status": "open",
@@ -15,6 +15,14 @@
     "independent-restore-verification"
   ],
   "required_platforms": ["linux", "macos", "windows"],
+  "required_release_targets": [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+  ],
+  "receipt_schema": "hyphae-native-g8-receipt-v1",
+  "artifact_digest": "sha256",
   "claims": [],
   "closure_declared": false
 }

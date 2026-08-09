@@ -1,9 +1,9 @@
 # Native local SQL SELECT v1
 
-Status: implemented for the experimental serial UDS session; the
-compiler-reaching red gate and [direct-Linux evidence][sql-linux-evidence]
-were recorded on 2026-08-03. DDL, DML, explicit transactions, streaming, and
-the complete G2/G6/G7 evidence remain pending.
+Status: implemented and retained by the closed G2 and G6 gates. DDL, DML,
+explicit transactions, and bounded read streaming are available through the
+Native product surfaces. Controlled performance evidence remains open under
+G7.
 
 This contract exposes the existing catalog-bound, physical current-root SQL
 `SELECT` executor through the serial `HYPHLCL1` local session. A client

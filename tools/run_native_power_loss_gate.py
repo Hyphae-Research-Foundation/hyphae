@@ -45,6 +45,9 @@ BOUNDARIES = (
     ("checkpoint", "manifest-published"),
     ("checkpoint", "wal-appended"),
     ("checkpoint", "wal-synchronized"),
+    ("promotion", "before-rename"),
+    ("promotion", "marker-renamed"),
+    ("promotion", "parent-synchronized"),
 )
 
 REQUIRED_COMMANDS = (

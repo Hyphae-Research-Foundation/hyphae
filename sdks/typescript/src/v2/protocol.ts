@@ -36,6 +36,7 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   catalog_dependencies: 16,
   catalog_describe: 17,
   catalog_resolve: 18,
+  catalog_create: 19,
   admin_explain_sql: 20,
   doctor: 21,
   backup: 22,
@@ -50,8 +51,13 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   restore: 28,
   transaction_begin: 32,
   transaction_stage_sql: 33,
+  transaction_stage_structure: 34,
+  transaction_stage_search: 35,
+  transaction_stage_vector: 36,
   transaction_commit: 37,
   transaction_rollback: 38,
+  transaction_status_by_idempotency: 39,
+  explicit_transaction_status: 40,
   proof_generate: 41,
 };
 
@@ -461,6 +467,31 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): R
     reader.finish();
     return { kind: "restore", value, requestId };
   }
+  if (kind === 27) {
+    const value = decodeExplicitTransactionStatus(reader);
+    reader.finish();
+    return { kind: "explicit_transaction_status", value, requestId };
+  }
+  if (kind === 28) {
+    const value = {
+      handle: reader.u64(),
+      operationOrdinal: reader.u64(),
+      changed: reader.boolean(),
+      result: decodeTransactionStageResult(reader),
+    };
+    reader.finish();
+    return { kind: "transaction_staged", value, requestId };
+  }
+  if (kind === 29) {
+    const value = { handle: reader.u64(), stagedOperations: reader.u64(), commit: decodeCommitReceipt(reader) };
+    reader.finish();
+    return { kind: "transaction_committed", value, requestId };
+  }
+  if (kind === 30) {
+    const value = { handle: reader.u64(), discardedOperations: reader.u64() };
+    reader.finish();
+    return { kind: "transaction_rolled_back", value, requestId };
+  }
   return { kind: `response_${kind}`, value: payload.slice(), requestId };
 }
 
@@ -587,6 +618,50 @@ function decodeTransactionStatus(reader: Reader): Readonly<Record<string, unknow
   if (tag === 1) return { state: "committed", receipt: decodeCommitReceipt(reader) };
   if (tag === 2 || tag === 3) return { state: tag === 2 ? "rolled_back" : "outcome_unknown", transactionId: reader.u128() };
   throw new ClientError("transaction status is malformed");
+}
+
+function decodeExplicitTransactionStatus(reader: Reader): Readonly<Record<string, unknown>> {
+  const tag = reader.u8();
+  if (tag === 0) return { state: "unknown" };
+  if (tag === 1) {
+    const handle = reader.u64();
+    const readCsn = reader.u64();
+    const stagedOperations = reader.u64();
+    const durabilityTag = reader.u8();
+    const durability = ["strict", "group", "memory"][durabilityTag];
+    if (durability === undefined) throw new ClientError("explicit transaction durability is invalid");
+    return { handle, state: "active", readCsn: readCsn === 0n ? undefined : readCsn, stagedOperations, durability };
+  }
+  if (tag === 2) {
+    return { state: "committed", handle: reader.u64(), stagedOperations: reader.u64(), receipt: decodeCommitReceipt(reader) };
+  }
+  if (tag === 3) {
+    return { state: "rolled_back", handle: reader.u64(), discardedOperations: reader.u64() };
+  }
+  if (tag === 4) {
+    return { state: "outcome_unknown", handle: reader.u64(), transactionId: reader.u128(), stagedOperations: reader.u64() };
+  }
+  throw new ClientError("explicit transaction status is malformed");
+}
+
+function decodeTransactionStageResult(reader: Reader): Readonly<Record<string, unknown>> {
+  const tag = reader.u8();
+  if (tag === 0) return { kind: "sql", result: decodeSqlResult(reader) };
+  if (tag === 1) return { kind: "structure", result: decodeStructureMutationResult(reader) };
+  if (tag === 2) return { kind: "search" };
+  if (tag === 3) return { kind: "vector", changed: reader.boolean() };
+  throw new ClientError("transaction stage result is malformed");
+}
+
+function decodeStructureMutationResult(reader: Reader): Readonly<Record<string, unknown>> {
+  const tag = reader.u8();
+  if (tag === 0) return { kind: "unit" };
+  if (tag === 1) return { kind: "integer", value: reader.i64() };
+  if (tag === 2) return { kind: "boolean", value: reader.boolean() };
+  if (tag === 3) return { kind: "count", value: reader.u64() };
+  if (tag === 4) return { kind: "value", value: reader.boolean() ? reader.bytes() : undefined };
+  if (tag === 5) return { kind: "stream_id", value: reader.u64() };
+  throw new ClientError("structure mutation result is malformed");
 }
 
 function decodeSqlResult(reader: Reader): Readonly<Record<string, unknown>> {
@@ -824,7 +899,11 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
   if (operation === "sql_execute") return join(bytes(new TextEncoder().encode(String(args.statement))), encodeValues(args.parameters ?? []));
   if (operation === "transaction_status") return u128(BigInt(args.transaction_id as bigint | number));
   if (operation === "transaction_stage_sql") return join(u64(BigInt(args.handle as bigint | number)), bytes(new TextEncoder().encode(String(args.statement))), encodeValues(args.parameters ?? []));
-  if (operation === "transaction_commit" || operation === "transaction_rollback") return u64(BigInt(args.handle as bigint | number));
+  if (operation === "transaction_stage_structure") return join(u64(BigInt(args.handle as bigint | number)), encodeStructureMutation(args.mutation));
+  if (operation === "transaction_stage_search") return join(u64(BigInt(args.handle as bigint | number)), encodeTransactionSearchMutation(args.mutation));
+  if (operation === "transaction_stage_vector") return join(u64(BigInt(args.handle as bigint | number)), encodeTransactionVectorMutation(args.mutation));
+  if (operation === "transaction_commit" || operation === "transaction_rollback" || operation === "explicit_transaction_status") return u64(BigInt(args.handle as bigint | number));
+  if (operation === "transaction_status_by_idempotency") return u128(BigInt(args.idempotency_token as bigint | number));
   if (operation === "doctor") return new Uint8Array();
   if (operation === "backup") {
     const limits = args.limits as Readonly<Record<string, number>>;
@@ -866,6 +945,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
       u64(BigInt(args.byte_limit as number)),
     );
   }
+  if (operation === "catalog_create") return bytes(requireBytes(args.definition));
   if (operation === "proof_verify") {
     const anchor = requireBytes(args.trusted_anchor);
     if (anchor.byteLength !== 32) throw new ClientError("trusted anchor must contain 32 bytes");
@@ -1065,18 +1145,58 @@ function decodeAggregationValue(reader: Reader): Readonly<Record<string, unknown
 function encodeStructureMutation(raw: unknown): Uint8Array {
   if (typeof raw !== "object" || raw === null) throw new ClientError("structure mutation is invalid");
   const value = raw as Readonly<Record<string, unknown>>;
-  const kinds = ["create_hash", "hash_set", "create_set", "set_add", "create_list", "list_push_tail", "create_sorted_set", "sorted_set_add", "create_stream", "stream_append"];
-  const kind = String(value.kind);
-  const tag = kinds.indexOf(kind);
-  if (tag < 0) throw new ClientError("structure mutation kind is invalid");
+  const aliases: Readonly<Record<string, readonly [string, string | undefined]>> = {
+    create_hash: ["create", "hash"],
+    create_set: ["create", "set"],
+    create_list: ["create", "list"],
+    create_sorted_set: ["create", "sorted_set"],
+    create_stream: ["create", "stream"],
+    list_push_tail: ["list_push", "right"],
+    stream_append: ["stream_add", undefined],
+  };
+  const tags: Readonly<Record<string, number>> = {
+    string_set: 0,
+    string_delete: 1,
+    counter_add: 2,
+    create: 3,
+    delete: 4,
+    expire: 5,
+    hash_set: 6,
+    hash_delete: 7,
+    hash_counter_add: 8,
+    hash_expire_field: 9,
+    list_push: 10,
+    list_pop: 11,
+    set_add: 12,
+    set_remove: 13,
+    sorted_set_add: 14,
+    sorted_set_remove: 15,
+    stream_add: 16,
+  };
+  const originalKind = String(value.kind);
+  const [kind, implied] = aliases[originalKind] ?? [originalKind, undefined];
+  const tag = tags[kind];
+  if (tag === undefined) throw new ClientError("structure mutation kind is invalid");
   const parts = [Uint8Array.of(tag), encodeStructureKey(value.key)];
-  if (kind === "hash_set") parts.push(bytes(requireBytes(value.field)), bytes(requireBytes(value.value)));
-  else if (kind === "set_add") parts.push(bytes(requireBytes(value.member)));
-  else if (kind === "list_push_tail") parts.push(bytes(requireBytes(value.value)));
+  if (kind === "string_set") {
+    const expiry = value.expires_at_micros;
+    parts.push(bytes(requireBytes(value.value)), Uint8Array.of(expiry === undefined || expiry === null ? 0 : 1));
+    if (expiry !== undefined && expiry !== null) parts.push(i64(BigInt(expiry as bigint | number)));
+  }
+  else if (kind === "counter_add") parts.push(i64(BigInt(value.delta as bigint | number)));
+  else if (kind === "create" || kind === "delete") parts.push(Uint8Array.of(structureFamilyTag(implied ?? value.family)));
+  else if (kind === "expire") parts.push(Uint8Array.of(structureFamilyTag(value.family)), i64(BigInt(value.expires_at_micros as bigint | number)));
+  else if (kind === "hash_set") parts.push(bytes(requireBytes(value.field)), bytes(requireBytes(value.value)));
+  else if (kind === "hash_delete") parts.push(bytes(requireBytes(value.field)));
+  else if (kind === "hash_counter_add") parts.push(bytes(requireBytes(value.field)), i64(BigInt(value.delta as bigint | number)));
+  else if (kind === "hash_expire_field") parts.push(bytes(requireBytes(value.field)), i64(BigInt(value.expires_at_micros as bigint | number)));
+  else if (kind === "list_push") parts.push(Uint8Array.of(listSideTag(implied ?? value.side)), bytes(requireBytes(value.value)));
+  else if (kind === "list_pop") parts.push(Uint8Array.of(listSideTag(value.side)));
+  else if (kind === "set_add" || kind === "set_remove" || kind === "sorted_set_remove") parts.push(bytes(requireBytes(value.member)));
   else if (kind === "sorted_set_add") parts.push(f64(Number(value.score)), bytes(requireBytes(value.member)));
-  else if (kind === "stream_append") {
+  else if (kind === "stream_add") {
     const fields = value.fields;
-    if (!Array.isArray(fields)) throw new ClientError("stream fields must be an array");
+    if (!Array.isArray(fields) || fields.length === 0 || fields.length > 4096) throw new ClientError("stream fields must be a nonempty bounded array");
     parts.push(u32(fields.length), ...fields.flatMap((entry) => {
       if (!Array.isArray(entry) || entry.length !== 2) throw new ClientError("stream field entry is invalid");
       return [bytes(requireBytes(entry[0])), bytes(requireBytes(entry[1]))];
@@ -1085,23 +1205,92 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
   return join(...parts);
 }
 
+function structureFamilyTag(raw: unknown): number {
+  const families: Readonly<Record<string, number>> = { string: 1, counter: 2, hash: 3, list: 4, set: 5, sorted_set: 6, stream: 7 };
+  const tag = families[String(raw)];
+  if (tag === undefined) throw new ClientError("structure family is invalid");
+  return tag;
+}
+
+function listSideTag(raw: unknown): number {
+  if (raw === "left") return 0;
+  if (raw === "right") return 1;
+  throw new ClientError("list side is invalid");
+}
+
+function encodeTransactionSearchMutation(raw: unknown): Uint8Array {
+  if (typeof raw !== "object" || raw === null) throw new ClientError("transaction search mutation is invalid");
+  const value = raw as Readonly<Record<string, unknown>>;
+  const tags: Readonly<Record<string, number>> = { index: 0, replace: 1, delete: 2 };
+  const kind = String(value.kind);
+  const tag = tags[kind];
+  if (tag === undefined) throw new ClientError("transaction search mutation kind is invalid");
+  return join(
+    Uint8Array.of(tag),
+    u128(BigInt(value.index as bigint | number)),
+    bytes(requireBytes(value.document_id)),
+    ...(kind === "delete" ? [] : [bytes(new TextEncoder().encode(String(value.text)))]),
+  );
+}
+
+function encodeTransactionVectorMutation(raw: unknown): Uint8Array {
+  if (typeof raw !== "object" || raw === null) throw new ClientError("transaction vector mutation is invalid");
+  const value = raw as Readonly<Record<string, unknown>>;
+  const kind = String(value.kind);
+  if (kind !== "upsert" && kind !== "delete") throw new ClientError("transaction vector mutation kind is invalid");
+  const prefix = [
+    Uint8Array.of(kind === "upsert" ? 0 : 1),
+    u128(BigInt(value.index as bigint | number)),
+    u128(BigInt(value.object_id as bigint | number)),
+  ];
+  if (kind === "delete") return join(...prefix);
+  const vector = value.vector;
+  if (!Array.isArray(vector) || vector.length === 0) throw new ClientError("transaction vector must be a nonempty array");
+  return join(...prefix, u32(vector.length), ...vector.map((item) => f32(Number(item))));
+}
+
 function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Array {
-  const tags: Readonly<Record<string, number>> = { hash_get: 3, set_members: 10, list_range: 7, sorted_set_range: 15, stream_range: 17 };
-  const tag = tags[String(value.kind)];
+  const tags: Readonly<Record<string, number>> = {
+    string_get: 0, counter_get: 1, ttl: 2, hash_get: 3, hash_field_ttl: 4,
+    hash_scan: 5, hash_length: 6, list_range: 7, list_length: 8, set_contains: 9,
+    set_members: 10, set_cardinality: 11, set_algebra: 12, sorted_set_score: 13,
+    sorted_set_rank: 14, sorted_set_range: 15, sorted_set_cardinality: 16, stream_range: 17,
+  };
+  const kind = String(value.kind);
+  const tag = tags[kind];
   if (tag === undefined) throw new ClientError("structure read kind is invalid");
+  if (kind === "set_algebra") {
+    const operations: Readonly<Record<string, number>> = { union: 0, intersection: 1, difference: 2 };
+    const operation = operations[String(value.operation)];
+    const keys = value.keys;
+    if (operation === undefined) throw new ClientError("set algebra operation is invalid");
+    if (!Array.isArray(keys) || keys.length === 0) throw new ClientError("set algebra keys must be a nonempty array");
+    return join(Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), Uint8Array.of(operation),
+      u32(keys.length), ...keys.map((key) => bytes(requireBytes(key))),
+      u64(BigInt(value.output_member_limit as number)), u64(BigInt(value.visit_limit as number)));
+  }
   const parts = [Uint8Array.of(tag), encodeStructureKey(value.key)];
-  if (tag === 3) parts.push(bytes(requireBytes(value.field)));
-  else if (tag === 10) {
+  if (kind === "ttl") parts.push(Uint8Array.of(structureFamilyTag(value.family)));
+  else if (kind === "hash_get" || kind === "hash_field_ttl") parts.push(bytes(requireBytes(value.field)));
+  else if (kind === "hash_scan" || kind === "set_members") {
     const cursor = value.start_after;
     parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
     if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
     parts.push(u64(BigInt(value.limit as number)));
-  } else if (tag === 7 || tag === 15) {
+  } else if (kind === "set_contains" || kind === "sorted_set_score") parts.push(bytes(requireBytes(value.member)));
+  else if (kind === "sorted_set_rank") parts.push(bytes(requireBytes(value.member)), Uint8Array.of(sortedOrderTag(value.order ?? "ascending")));
+  else if (kind === "list_range" || kind === "sorted_set_range") {
     parts.push(i64(BigInt(value.start as bigint | number)), i64(BigInt(value.stop as bigint | number)));
-    if (tag === 15) parts.push(Uint8Array.of(0));
+    if (kind === "sorted_set_range") parts.push(Uint8Array.of(sortedOrderTag(value.order ?? "ascending")));
   }
-  else parts.push(u64(BigInt(value.start as bigint | number)), u64(BigInt(value.end as bigint | number)), u64(BigInt(value.limit as number)));
+  else if (kind === "stream_range") parts.push(u64(BigInt(value.start as bigint | number)), u64(BigInt(value.end as bigint | number)), u64(BigInt(value.limit as number)));
   return join(...parts);
+}
+
+function sortedOrderTag(raw: unknown): number {
+  if (raw === "ascending") return 0;
+  if (raw === "descending") return 1;
+  throw new ClientError("sorted-set order is invalid");
 }
 
 function encodeStructureKey(raw: unknown): Uint8Array {
@@ -1112,8 +1301,20 @@ function encodeStructureKey(raw: unknown): Uint8Array {
 
 function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> {
   const tag = reader.u8();
-  if (tag === 0) return { kind: "hash_value", value: reader.boolean() ? reader.bytes() : undefined };
+  if (tag === 0) return { kind: "value", value: reader.boolean() ? reader.bytes() : undefined };
   if (tag === 1) return { kind: "values", values: Array.from({ length: reader.u32() }, () => reader.bytes()) };
+  if (tag === 2) return { kind: "counter", value: reader.boolean() ? reader.i64() : undefined };
+  if (tag === 3) {
+    const state = ["missing", "persistent", "remaining"][reader.u8()];
+    if (state === undefined) throw new ClientError("structure TTL response is invalid");
+    return { kind: "ttl", value: { state, ...(state === "remaining" ? { remainingMicros: reader.i64() } : {}) } };
+  }
+  if (tag === 4) return { kind: "hash_entries", entries: Array.from({ length: reader.u32() }, () => ({ field: reader.bytes(), value: reader.bytes() })) };
+  if (tag === 5) return { kind: "count", value: reader.u64() };
+  if (tag === 6) return { kind: "boolean", value: reader.boolean() };
+  if (tag === 7) return { kind: "set_algebra", members: Array.from({ length: reader.u32() }, () => reader.bytes()), visited: reader.u64() };
+  if (tag === 8) return { kind: "sorted_set_score", value: reader.boolean() ? reader.f64() : undefined };
+  if (tag === 9) return { kind: "sorted_set_rank", value: reader.boolean() ? reader.u64() : undefined };
   if (tag === 10) return { kind: "sorted_set_entries", entries: Array.from({ length: reader.u32() }, () => ({ member: reader.bytes(), score: reader.f64() })) };
   if (tag === 11) return { kind: "stream_entries", entries: Array.from({ length: reader.u32() }, () => ({ id: reader.u64(), fields: Array.from({ length: reader.u32() }, () => [reader.bytes(), reader.bytes()]) })) };
   throw new ClientError("structure read response is invalid");
@@ -1242,7 +1443,7 @@ function encodeQuery(raw: unknown, depth = 0): Uint8Array {
 }
 
 function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Record<string, unknown>> {
-  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry"].includes(operation)) {
+  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"].includes(operation)) {
     if (encoded.byteLength !== 0) throw new ClientError("parameterless request has trailing bytes");
     return {};
   }
@@ -1251,7 +1452,128 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
     if (offset !== encoded.byteLength) throw new ClientError("structure request has trailing bytes");
     return { key };
   }
-  throw new ClientError(`binary operation decoder is not implemented for ${operation}`);
+  const reader = new Reader(encoded);
+  let args: Readonly<Record<string, unknown>>;
+  if (operation === "catalog_create") args = { definition: reader.bytes() };
+  else if (operation === "transaction_stage_sql") {
+    const handle = reader.u64();
+    const statement = reader.text();
+    const parameters = Array.from({ length: reader.u32() }, () => decodeValue(reader, 0));
+    args = { handle, statement, parameters };
+  }
+  else if (operation === "transaction_stage_structure") args = { handle: reader.u64(), mutation: decodeStructureMutation(reader) };
+  else if (operation === "transaction_stage_search") args = { handle: reader.u64(), mutation: decodeTransactionSearchMutation(reader) };
+  else if (operation === "transaction_stage_vector") args = { handle: reader.u64(), mutation: decodeTransactionVectorMutation(reader) };
+  else if (["transaction_commit", "transaction_rollback", "explicit_transaction_status"].includes(operation)) args = { handle: reader.u64() };
+  else if (operation === "transaction_status_by_idempotency") args = { idempotency_token: reader.u128() };
+  else if (operation === "structure_read") args = decodeStructureReadRequest(reader);
+  else throw new ClientError(`binary operation decoder is not implemented for ${operation}`);
+  reader.finish();
+  return args;
+}
+
+function decodeStructureKey(reader: Reader): Readonly<Record<string, unknown>> {
+  return { keyspace: reader.u128(), key: reader.bytes() };
+}
+
+function decodeStructureReadRequest(reader: Reader): Readonly<Record<string, unknown>> {
+  const kinds = ["string_get", "counter_get", "ttl", "hash_get", "hash_field_ttl", "hash_scan", "hash_length", "list_range", "list_length", "set_contains", "set_members", "set_cardinality", "set_algebra", "sorted_set_score", "sorted_set_rank", "sorted_set_range", "sorted_set_cardinality", "stream_range"];
+  const kind = kinds[reader.u8()];
+  if (kind === undefined) throw new ClientError("structure read kind is invalid");
+  if (kind === "set_algebra") {
+    const keyspace = reader.u128();
+    const operation = ["union", "intersection", "difference"][reader.u8()];
+    if (operation === undefined) throw new ClientError("set algebra operation is invalid");
+    return { kind, keyspace, operation, keys: Array.from({ length: reader.u32() }, () => reader.bytes()), output_member_limit: reader.u64(), visit_limit: reader.u64() };
+  }
+  const result: Record<string, unknown> = { kind, key: decodeStructureKey(reader) };
+  if (kind === "ttl") {
+    const family = [undefined, "string", "counter", "hash", "list", "set", "sorted_set", "stream"][reader.u8()];
+    if (family === undefined) throw new ClientError("structure family is invalid");
+    result.family = family;
+  }
+  else if (kind === "hash_get" || kind === "hash_field_ttl") result.field = reader.bytes();
+  else if (kind === "hash_scan" || kind === "set_members") {
+    result.start_after = reader.boolean() ? reader.bytes() : undefined;
+    result.limit = reader.u64();
+  }
+  else if (kind === "set_contains" || kind === "sorted_set_score") result.member = reader.bytes();
+  else if (kind === "sorted_set_rank") {
+    result.member = reader.bytes();
+    const order = ["ascending", "descending"][reader.u8()];
+    if (order === undefined) throw new ClientError("sorted-set order is invalid");
+    result.order = order;
+  }
+  else if (kind === "list_range" || kind === "sorted_set_range") {
+    result.start = reader.i64();
+    result.stop = reader.i64();
+    if (kind === "sorted_set_range") {
+      const order = ["ascending", "descending"][reader.u8()];
+      if (order === undefined) throw new ClientError("sorted-set order is invalid");
+      result.order = order;
+    }
+  }
+  else if (kind === "stream_range") {
+    result.start = reader.u64();
+    result.end = reader.u64();
+    result.limit = reader.u64();
+  }
+  return result;
+}
+
+function decodeStructureMutation(reader: Reader): Readonly<Record<string, unknown>> {
+  const kinds = ["string_set", "string_delete", "counter_add", "create", "delete", "expire", "hash_set", "hash_delete", "hash_counter_add", "hash_expire_field", "list_push", "list_pop", "set_add", "set_remove", "sorted_set_add", "sorted_set_remove", "stream_add"];
+  const kind = kinds[reader.u8()];
+  if (kind === undefined) throw new ClientError("structure mutation kind is invalid");
+  const result: Record<string, unknown> = { kind, key: decodeStructureKey(reader) };
+  const families = [undefined, "string", "counter", "hash", "list", "set", "sorted_set", "stream"];
+  if (kind === "string_set") {
+    result.value = reader.bytes();
+    result.expires_at_micros = reader.boolean() ? reader.i64() : null;
+  }
+  else if (kind === "counter_add") result.delta = reader.i64();
+  else if (kind === "create" || kind === "delete") {
+    const family = families[reader.u8()];
+    if (family === undefined) throw new ClientError("structure family is invalid");
+    result.family = family;
+  }
+  else if (kind === "expire") {
+    const family = families[reader.u8()];
+    if (family === undefined) throw new ClientError("structure family is invalid");
+    result.family = family;
+    result.expires_at_micros = reader.i64();
+  }
+  else if (["hash_set", "hash_delete", "hash_counter_add", "hash_expire_field"].includes(kind)) {
+    result.field = reader.bytes();
+    if (kind === "hash_set") result.value = reader.bytes();
+    else if (kind === "hash_counter_add") result.delta = reader.i64();
+    else if (kind === "hash_expire_field") result.expires_at_micros = reader.i64();
+  }
+  else if (kind === "list_push" || kind === "list_pop") {
+    const side = ["left", "right"][reader.u8()];
+    if (side === undefined) throw new ClientError("list side is invalid");
+    result.side = side;
+    if (kind === "list_push") result.value = reader.bytes();
+  }
+  else if (kind === "set_add" || kind === "set_remove" || kind === "sorted_set_remove") result.member = reader.bytes();
+  else if (kind === "sorted_set_add") {
+    result.score = reader.f64();
+    result.member = reader.bytes();
+  }
+  else if (kind === "stream_add") result.fields = Array.from({ length: reader.u32() }, () => [reader.bytes(), reader.bytes()]);
+  return result;
+}
+
+function decodeTransactionSearchMutation(reader: Reader): Readonly<Record<string, unknown>> {
+  const kind = ["index", "replace", "delete"][reader.u8()];
+  if (kind === undefined) throw new ClientError("transaction search mutation kind is invalid");
+  return { kind, index: reader.u128(), document_id: reader.bytes(), ...(kind === "delete" ? {} : { text: reader.text() }) };
+}
+
+function decodeTransactionVectorMutation(reader: Reader): Readonly<Record<string, unknown>> {
+  const kind = ["upsert", "delete"][reader.u8()];
+  if (kind === undefined) throw new ClientError("transaction vector mutation kind is invalid");
+  return { kind, index: reader.u128(), object_id: reader.u128(), ...(kind === "delete" ? {} : { vector: Array.from({ length: reader.u32() }, () => reader.f32()) }) };
 }
 
 function envelope(encoded: Uint8Array, expectedMagic: string): readonly [number, Uint8Array] {
@@ -1375,6 +1697,12 @@ function u64(value: bigint): Uint8Array {
 function f64(value: number): Uint8Array {
   const encoded = new Uint8Array(8);
   new DataView(encoded.buffer).setFloat64(0, value, true);
+  return encoded;
+}
+
+function f32(value: number): Uint8Array {
+  const encoded = new Uint8Array(4);
+  new DataView(encoded.buffer).setFloat32(0, value, true);
   return encoded;
 }
 

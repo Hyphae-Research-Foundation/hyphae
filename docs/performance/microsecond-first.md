@@ -82,13 +82,19 @@ An accepted receipt records:
   virtualization status;
 - dataset generator and digest, row/document/vector counts, dimensions,
   payload sizes, selectivity, result size and index state;
-- durability class, warm/cold state and whether proofs are included;
+- durability class, warm state and whether proofs are included;
 - concurrency 1, 8 and 32 plus a saturation sweep;
 - at least 1,000,000 hot-path observations in an HDR-style histogram;
 - p50, p95, p99 and p99.9, throughput, allocations, RSS, CPU cycles, cache
   misses, page faults and bytes read/written; and
 - correctness, recall, crash-recovery, and cross-engine visibility results for
   the same build.
+
+Cold first-touch observations are reported separately as diagnostics. They do
+not enter the million-observation hot-path histogram or a G7 closure threshold:
+repeating one access a million times silently turns a purported cold benchmark
+into a warm-cache benchmark, while evicting the host cache between every access
+measures an artificial privileged maintenance loop rather than product latency.
 
 Shared or virtualized machines may publish observations but cannot establish a
 hard regression threshold. Linux and Windows both require functional lanes;

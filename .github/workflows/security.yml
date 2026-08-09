@@ -17,7 +17,6 @@ permissions:
 jobs:
   policy:
     name: Dependency and license policy
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

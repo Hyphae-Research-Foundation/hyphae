@@ -19,15 +19,25 @@ x-hyphae-provisional-streams: >-
 servers:
   - url: http://127.0.0.1:8788
     description: Default loopback-only listener
+tags:
+  - name: discovery
+  - name: catalog
+  - name: sql
+  - name: structures
+  - name: search
+  - name: administration
+  - name: proofs
 paths:
   /v2/capabilities:
     get:
+      tags: [discovery]
       operationId: nativeCapabilitiesV2
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/execute:
     post:
+      tags: [administration]
       operationId: executeNativeOperationV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -36,6 +46,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/catalog:
     post:
+      tags: [catalog]
       operationId: executeCatalogV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -44,6 +55,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/sql:
     post:
+      tags: [sql]
       operationId: executeSqlV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -52,6 +64,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/structures:
     post:
+      tags: [structures]
       operationId: executeStructureV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -60,6 +73,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/search:
     post:
+      tags: [search]
       operationId: executeSearchV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -82,8 +96,18 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
         default: { $ref: "#/components/responses/ProductError" }
+  /v2/search/document:
+    post:
+      tags: [search]
+      operationId: mutateNativeSearchDocumentV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
   /v2/admin:
     post:
+      tags: [administration]
       operationId: executeAdminV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -92,6 +116,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/telemetry:
     post:
+      tags: [administration]
       operationId: telemetryV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -100,6 +125,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/doctor:
     post:
+      tags: [administration]
       operationId: doctorV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -108,6 +134,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/backup:
     post:
+      tags: [administration]
       operationId: backupV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -116,13 +143,16 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/restore:
     post:
+      tags: [administration]
       operationId: restoreNativeBackupV2
-      description: Explicitly unsupported until ProductOperation exposes restore.
       security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
-        "501": { $ref: "#/components/responses/ProductError" }
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
   /v2/proofs/verify:
     post:
+      tags: [proofs]
       operationId: verifyNativeProofV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -131,6 +161,7 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/transactions/status:
     post:
+      tags: [administration]
       operationId: transactionStatusV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
@@ -139,12 +170,17 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/read-stream:
     post:
+      tags: [sql, catalog, structures, search]
       operationId: streamNativeReadV2
       security: [{ BearerAuth: [] }, {}]
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200":
           description: Provisional records followed by mandatory completion
+          headers:
+            X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
+            X-Hyphae-Stream-Completion:
+              schema: { const: required }
           content:
             application/x-ndjson:
               schema:
@@ -155,27 +191,42 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
+  headers:
+    RequestId:
+      required: true
+      schema:
+        type: string
+        pattern: "^[1-9][0-9]{0,38}$"
   requestBodies:
     ProductRequest:
       required: true
       content:
         application/vnd.hyphae.product-v1:
-          schema: { type: string, format: binary }
+          schema:
+            type: string
+            format: binary
   responses:
     ProductResponse:
       description: Canonical HYPRSP01 Product response
       headers:
+        X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
         X-Hyphae-Session-Id:
           description: Opaque principal-bound HTTP session identity when state is retained
           schema: { type: string, pattern: "^[0-9a-f]{32}$" }
       content:
         application/vnd.hyphae.product-v1:
-          schema: { type: string, format: binary }
+          schema:
+            type: string
+            format: binary
     ProductError:
-      description: ProductError field parity; HYPERR01 is available by Accept negotiation
+      description: ProductError field parity; binary HYPERR01 is available by Accept negotiation
+      headers:
+        X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
       content:
         application/json:
           schema:
             $ref: "../json-schema/product-error-v2.schema.json"
         application/vnd.hyphae.error-v1:
-          schema: { type: string, format: binary }
+          schema:
+            type: string
+            format: binary

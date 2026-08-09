@@ -21,7 +21,7 @@ use std::{
 
 use hyphae_native_runtime::{
     CheckpointBoundary, CommitBoundary, NativeDatabase, NativeRuntimeError, NativeTransaction,
-    SnapshotPinBoundary, SnapshotPinId, Ttl,
+    PromotionBoundary, SnapshotPinBoundary, SnapshotPinId, Ttl,
 };
 use hyphae_native_types::{Csn, DurabilityClass, ObjectId};
 
@@ -32,6 +32,7 @@ const READY_PREFIX: &str = "hyphae-native-crash-ready:";
 const COMMIT_FAMILY: &str = "commit";
 const CHECKPOINT_FAMILY: &str = "checkpoint";
 const SNAPSHOT_PIN_FAMILY: &str = "snapshot-pin";
+const PROMOTION_FAMILY: &str = "promotion";
 const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
 const TABLE_ID: u128 = 1;
@@ -62,6 +63,11 @@ const SNAPSHOT_PIN_BOUNDARIES: [(&str, SnapshotPinBoundary); 2] = [
     ("record-published", SnapshotPinBoundary::RecordPublished),
 ];
 const SNAPSHOT_PIN_ID: u128 = 1;
+const PROMOTION_BOUNDARIES: [(&str, PromotionBoundary); 3] = [
+    ("before-rename", PromotionBoundary::BeforeRename),
+    ("marker-renamed", PromotionBoundary::MarkerRenamed),
+    ("parent-synchronized", PromotionBoundary::ParentSynchronized),
+];
 
 struct TemporaryDirectory(PathBuf);
 
@@ -108,6 +114,12 @@ struct SnapshotPinObservation {
     recovered_pin_count: usize,
     pin_directory_files: usize,
     retained_page_generations: usize,
+    termination: String,
+}
+
+struct PromotionObservation {
+    name: &'static str,
+    expected_marker: &'static str,
     termination: String,
 }
 
@@ -187,6 +199,7 @@ fn run_child(family: &str, directory: &Path, boundary_name: &str) -> Result<(), 
         COMMIT_FAMILY => run_commit_child(directory, boundary_name)?,
         CHECKPOINT_FAMILY => run_checkpoint_child(directory, boundary_name)?,
         SNAPSHOT_PIN_FAMILY => run_snapshot_pin_child(directory, boundary_name)?,
+        PROMOTION_FAMILY => run_promotion_child(directory, boundary_name)?,
         other => return Err(failure(format!("unknown boundary family: {other}"))),
     }
 
@@ -245,6 +258,23 @@ fn run_snapshot_pin_child(directory: &Path, boundary_name: &str) -> Result<(), B
     Ok(())
 }
 
+fn run_promotion_child(directory: &Path, boundary_name: &str) -> Result<(), Box<dyn Error>> {
+    let boundary = parse_promotion_boundary(boundary_name)
+        .ok_or_else(|| failure(format!("unknown promotion boundary: {boundary_name}")))?;
+    let mut database = NativeDatabase::create_pending(directory)?;
+    match database.promote_pending_with_interruption(boundary) {
+        Err(NativeRuntimeError::Directory(
+            hyphae_native_runtime::NativeDirectoryError::InjectedPromotionCrash(found),
+        )) if found == boundary => {}
+        other => {
+            return Err(failure(format!(
+                "promotion boundary {boundary_name} returned an unexpected result: {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run_parent(source_commit: &str, environment: &str) -> Result<(), Box<dyn Error>> {
     let executable = std::env::current_exe()?;
     let temporary = TemporaryDirectory::create()?;
@@ -252,12 +282,14 @@ fn run_parent(source_commit: &str, environment: &str) -> Result<(), Box<dyn Erro
     let commit_observations = run_commit_matrix(&executable, temporary.path())?;
     let checkpoint_observations = run_checkpoint_matrix(&executable, temporary.path())?;
     let snapshot_pin_observations = run_snapshot_pin_matrix(&executable, temporary.path())?;
+    let promotion_observations = run_promotion_matrix(&executable, temporary.path())?;
     print_receipt(
         source_commit,
         environment,
         &commit_observations,
         &checkpoint_observations,
         &snapshot_pin_observations,
+        &promotion_observations,
     );
     Ok(())
 }
@@ -357,6 +389,29 @@ fn run_snapshot_pin_matrix(
             recovered_pin_count: database.snapshot_pin_count(),
             pin_directory_files,
             retained_page_generations,
+            termination,
+        });
+    }
+    Ok(observations)
+}
+
+fn run_promotion_matrix(
+    executable: &Path,
+    root: &Path,
+) -> Result<Vec<PromotionObservation>, Box<dyn Error>> {
+    let mut observations = Vec::with_capacity(PROMOTION_BOUNDARIES.len());
+    for (name, boundary) in PROMOTION_BOUNDARIES {
+        let directory = root.join(format!("{PROMOTION_FAMILY}-{name}"));
+        let termination = kill_child_at_boundary(executable, PROMOTION_FAMILY, &directory, name)?;
+        let expects_pending = boundary == PromotionBoundary::BeforeRename;
+        validate_promotion_state(&directory, Some(expects_pending))?;
+        observations.push(PromotionObservation {
+            name,
+            expected_marker: if expects_pending {
+                "pending"
+            } else {
+                "authority"
+            },
             termination,
         });
     }
@@ -536,9 +591,9 @@ fn verify_power_loss_recovery(
     directory: &Path,
     boundary_name: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let database = NativeDatabase::open(directory)?;
     match family {
         COMMIT_FAMILY => {
+            let database = NativeDatabase::open(directory)?;
             let boundary = parse_commit_boundary(boundary_name)
                 .ok_or_else(|| failure(format!("unknown commit boundary: {boundary_name}")))?;
             let expected_complete = expects_power_loss_complete_state(boundary);
@@ -564,6 +619,7 @@ fn verify_power_loss_recovery(
             println!("}}");
         }
         CHECKPOINT_FAMILY => {
+            let database = NativeDatabase::open(directory)?;
             let boundary = parse_checkpoint_boundary(boundary_name)
                 .ok_or_else(|| failure(format!("unknown checkpoint boundary: {boundary_name}")))?;
             validate_recovered_state(&database, true)?;
@@ -586,9 +642,51 @@ fn verify_power_loss_recovery(
             );
             println!("}}");
         }
+        PROMOTION_FAMILY => {
+            let boundary = parse_promotion_boundary(boundary_name)
+                .ok_or_else(|| failure(format!("unknown promotion boundary: {boundary_name}")))?;
+            let expected_pending = match boundary {
+                PromotionBoundary::BeforeRename => Some(true),
+                PromotionBoundary::MarkerRenamed => None,
+                PromotionBoundary::ParentSynchronized => Some(false),
+            };
+            let marker = validate_promotion_state(directory, expected_pending)?;
+            println!("{{");
+            println!("  \"family\": \"{PROMOTION_FAMILY}\",");
+            println!("  \"boundary\": \"{boundary_name}\",");
+            println!("  \"recovered_marker\": \"{marker}\"");
+            println!("}}");
+        }
         other => return Err(failure(format!("unknown boundary family: {other}"))),
     }
     Ok(())
+}
+
+fn validate_promotion_state(
+    directory: &Path,
+    expected_pending: Option<bool>,
+) -> Result<&'static str, Box<dyn Error>> {
+    let has_pending = directory.join("FORMAT.pending").try_exists()?;
+    let has_authority = directory.join("FORMAT").try_exists()?;
+    if has_pending == has_authority {
+        return Err(failure(
+            "promotion recovery must expose exactly one FORMAT marker",
+        ));
+    }
+    if let Some(expected) = expected_pending
+        && has_pending != expected
+    {
+        return Err(failure(format!(
+            "promotion recovery marker differs: pending={has_pending}, expected={expected}"
+        )));
+    }
+    if has_pending {
+        drop(NativeDatabase::open_pending(directory)?);
+        Ok("pending")
+    } else {
+        drop(NativeDatabase::open(directory)?);
+        Ok("authority")
+    }
 }
 
 fn validate_power_loss_checkpoint_recovery(
@@ -700,9 +798,10 @@ fn print_receipt(
     commit_observations: &[CommitObservation],
     checkpoint_observations: &[CheckpointObservation],
     snapshot_pin_observations: &[SnapshotPinObservation],
+    promotion_observations: &[PromotionObservation],
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v3\",");
+    println!("  \"schema\": \"hyphae.native.process-crash-matrix.v4\",");
     println!("  \"status\": \"process-crash-not-power-loss\",");
     println!("  \"source_commit\": \"{source_commit}\",");
     println!("  \"environment\": \"{environment}\",");
@@ -713,9 +812,17 @@ fn print_receipt(
     );
     println!("  \"durability\": \"strict\",");
     println!("  \"all_engine_csn\": 1,");
+    print_commit_observations(commit_observations);
+    print_checkpoint_observations(checkpoint_observations);
+    print_snapshot_pin_observations(snapshot_pin_observations);
+    print_promotion_observations(promotion_observations);
+    println!("}}");
+}
+
+fn print_commit_observations(observations: &[CommitObservation]) {
     println!("  \"commit_boundaries\": [");
-    for (index, observation) in commit_observations.iter().enumerate() {
-        let suffix = if index + 1 == commit_observations.len() {
+    for (index, observation) in observations.iter().enumerate() {
+        let suffix = if index + 1 == observations.len() {
             ""
         } else {
             ","
@@ -738,9 +845,12 @@ fn print_receipt(
         println!("    }}{suffix}");
     }
     println!("  ],");
+}
+
+fn print_checkpoint_observations(observations: &[CheckpointObservation]) {
     println!("  \"checkpoint_boundaries\": [");
-    for (index, observation) in checkpoint_observations.iter().enumerate() {
-        let suffix = if index + 1 == checkpoint_observations.len() {
+    for (index, observation) in observations.iter().enumerate() {
+        let suffix = if index + 1 == observations.len() {
             ""
         } else {
             ","
@@ -764,9 +874,12 @@ fn print_receipt(
         println!("    }}{suffix}");
     }
     println!("  ],");
+}
+
+fn print_snapshot_pin_observations(observations: &[SnapshotPinObservation]) {
     println!("  \"snapshot_pin_boundaries\": [");
-    for (index, observation) in snapshot_pin_observations.iter().enumerate() {
-        let suffix = if index + 1 == snapshot_pin_observations.len() {
+    for (index, observation) in observations.iter().enumerate() {
+        let suffix = if index + 1 == observations.len() {
             ""
         } else {
             ","
@@ -789,8 +902,27 @@ fn print_receipt(
         println!("      \"termination\": \"{}\"", observation.termination);
         println!("    }}{suffix}");
     }
+    println!("  ],");
+}
+
+fn print_promotion_observations(observations: &[PromotionObservation]) {
+    println!("  \"promotion_boundaries\": [");
+    for (index, observation) in observations.iter().enumerate() {
+        let suffix = if index + 1 == observations.len() {
+            ""
+        } else {
+            ","
+        };
+        println!("    {{");
+        println!("      \"boundary\": \"{}\",", observation.name);
+        println!(
+            "      \"expected_marker\": \"{}\",",
+            observation.expected_marker
+        );
+        println!("      \"termination\": \"{}\"", observation.termination);
+        println!("    }}{suffix}");
+    }
     println!("  ]");
-    println!("}}");
 }
 
 fn parse_commit_boundary(name: &str) -> Option<CommitBoundary> {
@@ -807,6 +939,12 @@ fn parse_checkpoint_boundary(name: &str) -> Option<CheckpointBoundary> {
 
 fn parse_snapshot_pin_boundary(name: &str) -> Option<SnapshotPinBoundary> {
     SNAPSHOT_PIN_BOUNDARIES
+        .iter()
+        .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
+}
+
+fn parse_promotion_boundary(name: &str) -> Option<PromotionBoundary> {
+    PROMOTION_BOUNDARIES
         .iter()
         .find_map(|(candidate, boundary)| (*candidate == name).then_some(*boundary))
 }

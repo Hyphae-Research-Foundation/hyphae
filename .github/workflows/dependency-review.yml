@@ -13,7 +13,6 @@ permissions:
 jobs:
   review:
     name: Review dependency changes
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out candidate history

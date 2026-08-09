@@ -50,6 +50,36 @@ mod tests {
 
     struct TestDirectory(PathBuf);
 
+    #[test]
+    fn openapi_contract_lists_every_native_http_v2_route() {
+        let contract = include_str!("../../../../contracts/openapi/hyphae-v2.yaml");
+        for route in [
+            "/v2/capabilities",
+            "/v2/execute",
+            "/v2/catalog",
+            "/v2/sql",
+            "/v2/structures",
+            "/v2/search",
+            "/v2/search/collection",
+            "/v2/search/ingest",
+            "/v2/search/document",
+            "/v2/admin",
+            "/v2/telemetry",
+            "/v2/doctor",
+            "/v2/backup",
+            "/v2/restore",
+            "/v2/proofs/verify",
+            "/v2/transactions/status",
+            "/v2/read-stream",
+        ] {
+            assert!(contract.contains(&format!("  {route}:")), "missing {route}");
+        }
+        assert!(
+            !contract.contains("Explicitly unsupported until ProductOperation exposes restore")
+        );
+        assert!(!contract.contains("\"501\""));
+    }
+
     impl TestDirectory {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
@@ -338,6 +368,178 @@ mod tests {
         assert_eq!(completion["status"], "complete");
         assert_eq!(completion["request_id"], "81");
         drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_stream_rejects_state_changes_before_execution() -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("stream-read-only")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+
+        for (request_id, operation) in [
+            (
+                "82",
+                ProductOperation::StructureSet {
+                    key: b"must-not-change".to_vec(),
+                    value: b"value".to_vec(),
+                    expires_at_micros: None,
+                },
+            ),
+            ("83", ProductOperation::TransactionBegin),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "/v2/read-stream",
+                    request(operation)?,
+                    Some(request_id),
+                    None,
+                    None,
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let response = app
+            .oneshot(http_request(
+                "/v2/structures",
+                request(ProductOperation::StructureGet {
+                    key: b"must-not-change".to_vec(),
+                })?,
+                Some("84"),
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(response).await?)?,
+            hyphae_native_product::ProductResponse::StructureValue(None)
+        ));
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_transactions_create_and_reuse_http_sessions() -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("explicit-transaction-session")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+
+        let created = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement:
+                        "CREATE TABLE http_tx_items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)"
+                            .to_owned(),
+                    parameters: Vec::new(),
+                })?,
+                "85",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let _ = response_bytes(created).await?;
+
+        let begun = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionBegin)?,
+                "86",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(begun.status(), StatusCode::OK);
+        let session_id = begun
+            .headers()
+            .get(hyphae_contracts::v2::SESSION_ID_HEADER_V2)
+            .ok_or("transaction begin omitted the HTTP session")?
+            .to_str()?
+            .to_owned();
+        let response = decode_product_response(&response_bytes(begun).await?)?;
+        let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
+            hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+        ) = response
+        else {
+            return Err("transaction begin returned the wrong response".into());
+        };
+
+        let staged = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionStageSql {
+                    handle,
+                    mutation: hyphae_native_product::ProductTransactionSqlMutation {
+                        statement: "INSERT INTO http_tx_items (id, label) VALUES (?, ?)".to_owned(),
+                        parameters: vec![
+                            hyphae_native_product::ProductValue::Signed(7),
+                            hyphae_native_product::ProductValue::Text("committed".to_owned()),
+                        ],
+                    },
+                })?,
+                "87",
+                None,
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(staged.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(staged).await?)?,
+            hyphae_native_product::ProductResponse::TransactionStaged(_)
+        ));
+
+        let committed = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionCommit { handle })?,
+                "88",
+                None,
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(committed.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(committed).await?)?,
+            hyphae_native_product::ProductResponse::TransactionCommitted(_)
+        ));
+
+        assert_committed_http_row(app, &session_id).await?;
+        drop(service);
+        Ok(())
+    }
+
+    async fn assert_committed_http_row(
+        app: axum::Router,
+        session_id: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let selected = app
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement: "SELECT label FROM http_tx_items WHERE id = ?".to_owned(),
+                    parameters: vec![hyphae_native_product::ProductValue::Signed(7)],
+                })?,
+                "89",
+                None,
+                Some(session_id),
+            )?)
+            .await?;
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(selected).await?)?,
+            hyphae_native_product::ProductResponse::Sql {
+                result: hyphae_native_product::ProductSqlResult::Rows { rows, .. },
+                ..
+            } if rows == vec![vec![hyphae_native_product::ProductValue::Text("committed".to_owned())]]
+        ));
         Ok(())
     }
 

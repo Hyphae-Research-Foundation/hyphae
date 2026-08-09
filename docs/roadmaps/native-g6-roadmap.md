@@ -1,13 +1,13 @@
 # Native G6 local-product roadmap
 
-Status: accepted execution plan; implementation in progress
+Status: closed; retained implementation and exit-evidence roadmap
 
-This roadmap turns the closed G2-G5 engine profiles into one competitive local
-product. [ADR-0023](../adr/0023-native-local-product-and-competitive-scope.md)
+This roadmap records how the closed G2-G5 engine profiles became one
+competitive local product. [ADR-0023](../adr/0023-native-local-product-and-competitive-scope.md)
 fixes the positioning and public-surface decisions. The current gate state is
 maintained in [native gate status](../gates/native-gate-status.md).
 
-The complete retained G0-G5 prefix is a required predecessor. G2-G5 supply the
+The complete retained G0-G6 prefix is now closed. G2-G5 supply the
 engine behavior reused by G6; G0-G1 remain binding constitutional and substrate
 authority.
 
@@ -123,10 +123,9 @@ The machine-readable profile contains these fourteen ordered requirements:
 13. `backup-restore-product-surface`; and
 14. `cross-surface-conformance`.
 
-All fourteen need hosted exact-SHA receipts. The G0-G5 retained closure files
-are digest-bound predecessors. Candidate workflow artifacts remain supporting
-evidence and cannot declare closure. A later reviewed commit retains the
-aggregate and moves G6 to `closed`.
+All fourteen have hosted exact-SHA receipts. The G0-G5 retained closure files
+are digest-bound predecessors, and the reviewed G6 closure aggregate is the
+authority linked by the native gate status.
 
 ## After G8
 

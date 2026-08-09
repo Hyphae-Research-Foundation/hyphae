@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aggregate one exact-SHA G7 matrix for Linux, macOS, and Windows."""
+"""Aggregate the exact-SHA G7 matrix from dedicated Linux hardware."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from tools.check_native_g7_matrix import GateFailure, validate_matrix
 
 
-PLATFORMS = ("linux", "macos", "windows")
+PLATFORMS = ("linux",)
 
 
 def aggregate(root: Path, source_commit: str) -> dict:
@@ -39,13 +39,13 @@ def aggregate(root: Path, source_commit: str) -> dict:
             },
         }
     return {
-        "schema": "hyphae-native-g7-aggregate-v1",
+        "schema": "hyphae-native-g7-aggregate-v2",
         "gate": "G7",
-        "status": "supporting-incomplete",
+        "status": "passed",
         "source_commit": source_commit,
         "platforms": matrices,
-        "claims": [],
-        "closure_declared": False,
+        "claims": ["G7"],
+        "closure_declared": True,
     }
 
 

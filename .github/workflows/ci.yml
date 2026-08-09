@@ -126,21 +126,9 @@ jobs:
           retention-days: 14
           overwrite: true
 
-  # Pull requests use Linux lanes only; platform lanes run on protected branch pushes.
-  test-platform-pr:
-    name: Test (${{ matrix.name }})
-    if: github.event_name == 'pull_request'
-    strategy:
-      matrix:
-        name: [macOS stable, Windows stable]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Defer platform execution to protected branch push
-        run: echo "Platform tests run on dev/main pushes to conserve hosted-runner minutes."
-
   test-platform-push:
-    name: Platform test (${{ matrix.name }})
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    name: Test (${{ matrix.name }})
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'))
     strategy:
       fail-fast: false
       matrix:
@@ -158,7 +146,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -173,13 +161,13 @@ jobs:
           python tools/check_native_conformance.py \
             --profile config/native-conformance-profile.json \
             --platform "${{ matrix.native-platform }}" \
-            --source-commit "${{ github.sha }}" \
+            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
             --run \
             --output "native-conformance-${{ matrix.native-platform }}.json"
       - name: Upload native conformance receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-conformance-${{ matrix.native-platform }}-${{ github.sha }}
+          name: native-conformance-${{ matrix.native-platform }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: native-conformance-${{ matrix.native-platform }}.json
           if-no-files-found: error
           retention-days: 14
@@ -228,7 +216,6 @@ jobs:
 
   optional-integrations:
     name: Optional framework integrations
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -298,19 +285,19 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP"
           chmod 0755 "$RUNNER_TEMP/cargo-semver-checks"
           test "$("$RUNNER_TEMP/cargo-semver-checks" --version)" = "cargo 0.48.0"
-      - name: Verify patch public API against v0.2.0
+      - name: Verify major public API against v0.2.1
         shell: bash
         env:
-          BASELINE_COMMIT: 170380453a2ca6322a4c8bc50417318daee1c011
+          BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=1 origin \
-            "refs/tags/v0.2.0:refs/tags/v0.2.0"
-          test "$(git rev-parse 'v0.2.0^{commit}')" = "$BASELINE_COMMIT"
+            "refs/tags/v0.2.1:refs/tags/v0.2.1"
+          test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
           "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
             --workspace \
             --baseline-rev "$BASELINE_COMMIT" \
-            --release-type patch \
+            --release-type major \
             --all-features \
             --color never
       - name: Install pinned Python

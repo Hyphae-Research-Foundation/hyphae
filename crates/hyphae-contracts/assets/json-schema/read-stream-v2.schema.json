@@ -22,7 +22,7 @@
       "properties": {
         "type": { "const": "completion" },
         "status": { "const": "complete" },
-        "request_id": { "type": "string" },
+        "request_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
         "chunks": { "type": "integer", "minimum": 0 },
         "response_bytes": { "type": "integer", "minimum": 0 },
         "digest_hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }

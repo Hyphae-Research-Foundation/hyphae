@@ -1,6 +1,8 @@
 # SDKs
 
-Hyphae ships three bounded clients for the public `/v1` API:
+Hyphae ships three bounded clients. All expose the published `/v1` API; the
+Rust, TypeScript, and Python clients also expose the Native `/v2` product API
+on the `1.0.0` development line:
 
 | Client | Location | Runtime floor | Runtime dependencies |
 |---|---|---:|---|
@@ -23,11 +25,11 @@ documentation does not claim an npm or PyPI publication without a separate
 registry release and receipt.
 
 TypeScript and Python preserve the signed 64-bit integer domain and reject
-invalid JSON, but their generated success models provide static typing only.
+invalid JSON on `/v1`, but their generated success models provide static typing only.
 They cast a syntactically valid successful payload without validating its
 complete shape at runtime. Applications that require runtime success validation
-must add it at their trust boundary; full validators are outside this `0.2.1`
-source-only patch.
+must add it at their trust boundary. Native `/v2` additionally validates its
+typed binary and product-envelope contracts at the SDK boundary.
 
 TypeScript/Python models are generated from canonical JSON Schema and checked
 in. Regenerate after contract changes and verify no drift:

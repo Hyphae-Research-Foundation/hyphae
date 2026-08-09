@@ -54,7 +54,10 @@ def _hard_killed(row: dict[str, Any]) -> bool:
 
 
 def validate_receipt(receipt: dict[str, Any], expected_commit: str) -> dict[str, Any]:
-    if receipt.get("schema") != "hyphae.native.process-crash-matrix.v3":
+    if receipt.get("schema") not in {
+        "hyphae.native.process-crash-matrix.v3",
+        "hyphae.native.process-crash-matrix.v4",
+    }:
         raise GateFailure("unsupported crash receipt schema")
     if receipt.get("status") != "process-crash-not-power-loss":
         raise GateFailure("receipt scope is not process crash")

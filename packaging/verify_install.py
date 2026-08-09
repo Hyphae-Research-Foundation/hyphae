@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -65,12 +66,16 @@ def extract_archive(archive: Path, destination: Path) -> None:
 def run_json(binary: Path, arguments: list[str], environment: dict[str, str]) -> Any:
     result = subprocess.run(
         (str(binary), *arguments),
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         env=environment,
         timeout=60,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"installed command failed ({' '.join(arguments)}): {result.stderr.strip()}"
+        )
     return json.loads(result.stdout)
 
 
@@ -390,6 +395,47 @@ def verify_install(directory: Path) -> dict[str, Any]:
         )
         if selected.get("result", {}).get("rows") != [[1, "alpha"]]:
             raise RuntimeError("installed binary returned the wrong native SQL row")
+        run_json(
+            binary,
+            [
+                "catalog", "--data-dir", str(live), "create-search-collection",
+                "--database", "10", "--schema", "11", "--collection", "13",
+                "--analyzer", "12", "--name", "main.public.installed",
+            ],
+            environment,
+        )
+        run_json(
+            binary,
+            ["search", "--data-dir", str(live), "provision", "--collection", "13"],
+            environment,
+        )
+        run_json(
+            binary,
+            [
+                "search", "--data-dir", str(live), "ingest", "--collection", "13",
+                "--idempotency-id", "1", "--documents-json",
+                json.dumps([
+                    {
+                        "id": 101,
+                        "text": "installed native lexical vector search",
+                        "doc_values": {"category": "smoke", "price": 1},
+                        "vectors": {"exact": [0.0, 0.0], "ann": [0.0, 0.0]},
+                    }
+                ], separators=(",", ":")),
+            ],
+            environment,
+        )
+        searched = run_json(
+            binary,
+            [
+                "search", "--data-dir", str(live), "integrated", "--collection", "13",
+                "--lexical", "installed", "--vector-target", "exact",
+                "--vector", "0", "--vector", "0",
+            ],
+            environment,
+        )
+        if not searched.get("hits"):
+            raise RuntimeError("installed binary returned no Native search hit")
         if run_json(binary, ["status", "--data-dir", str(live)], environment).get("status") != "ready":
             raise RuntimeError("installed native status is not ready")
         run_json(binary, ["checkpoint", "--data-dir", str(live)], environment)
@@ -528,6 +574,7 @@ def verify_install(directory: Path) -> dict[str, Any]:
             "archive": archive.name,
             "engine_version": expected_version,
             "negative_control": "rejected",
+            "native_engines": ["sql", "structures", "search"],
             "proofs_verified": 4,
             "status": "ok",
         }
@@ -536,8 +583,48 @@ def verify_install(directory: Path) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--platform")
+    parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
-    print(json.dumps(verify_install(arguments.directory), sort_keys=True))
+    result = verify_install(arguments.directory)
+    if (arguments.source_commit is None) != (arguments.platform is None):
+        raise ValueError("source-commit and platform must be supplied together")
+    if arguments.source_commit is not None:
+        if len(arguments.source_commit) != 40 or any(
+            character not in "0123456789abcdef" for character in arguments.source_commit
+        ):
+            raise ValueError("source commit must be a canonical lowercase SHA-1")
+        head = subprocess.run(
+            ("git", "rev-parse", "HEAD"), cwd=ROOT, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if head != arguments.source_commit:
+            raise RuntimeError("source commit differs from checked-out HEAD")
+        dirty = subprocess.run(
+            ("git", "status", "--porcelain", "--untracked-files=no"), cwd=ROOT,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if dirty:
+            raise RuntimeError("tracked source worktree must be clean")
+        source_tree = subprocess.run(
+            ("git", "rev-parse", "HEAD^{tree}"), cwd=ROOT, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        archive = arguments.directory / result["archive"]
+        result.update({
+            "schema": "hyphae-native-installed-package-v1",
+            "source_commit": arguments.source_commit,
+            "source_tree": source_tree,
+            "platform": arguments.platform,
+            "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "installed_smoke": "passed",
+        })
+    encoded = json.dumps(result, indent=2 if arguments.output else None, sort_keys=True) + "\n"
+    if arguments.output:
+        arguments.output.write_text(encoded, encoding="utf-8")
+    else:
+        print(encoded, end="")
 
 
 if __name__ == "__main__":

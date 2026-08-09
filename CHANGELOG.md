@@ -3,9 +3,20 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [Unreleased]
+## [1.0.0] - Unreleased
 
-No changes after the `0.2.1` release entry below.
+The `dev` line is versioned as the `1.0.0` Native release candidate. G0
+through G6 are closed; G7 performance and G8 exact-commit release evidence
+remain open, so none of the following is a published `1.0.0` claim.
+
+### Added
+
+- Added the Hyphae-owned Native SQL, structure, lexical, exact-vector, ANN, and
+  hybrid engines over shared catalog, WAL, MVCC, recovery, backup, and proofs.
+- Added the Native embedded facade, local protocol/daemon, HTTP `/v2`, CLI, and
+  Rust, Python, and TypeScript SDK surfaces.
+- Added format-2-to-Native offline migration, Native backup/restore, and G7/G8
+  fail-closed evidence authorities.
 
 ## [0.2.1] - 2026-07-30
 

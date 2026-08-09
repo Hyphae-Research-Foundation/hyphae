@@ -6,6 +6,7 @@ use hyphae_native_product::{
     NativeProduct, ProductAuthorization, ProductDurability, ProductError, ProductOperation,
     ProductPrincipal, ProductResponse, ProductSession, ProductSessionId,
 };
+use uuid::Uuid;
 
 use crate::native::logical_time_micros;
 
@@ -18,7 +19,7 @@ pub(crate) struct EmbeddedClient {
 
 impl EmbeddedClient {
     pub(crate) fn new(product: NativeProduct) -> Result<Self, Box<ProductError>> {
-        let session_id = ProductSessionId::new(1).ok_or_else(|| {
+        let session_id = ProductSessionId::new(Uuid::now_v7().as_u128()).ok_or_else(|| {
             Box::new(ProductError::from_code(
                 hyphae_native_product::ProductErrorCode::Internal,
             ))

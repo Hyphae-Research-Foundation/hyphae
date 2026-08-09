@@ -36,11 +36,12 @@ that commit to remain reachable from `main`, and re-fetches both immediately
 before publication. A tag may be pushed only after the complete gate is green
 and publication is explicitly authorized.
 
-A tagged `push` publication also records exactly 17 required checks. Each check
+A tagged `push` publication also records exactly 18 required checks. Each check
 is bound to the expected canonical workflow path and to successful workflow-run
 metadata for the same commit; a same-named job from another workflow is
-rejected. All selected runs must be `pull_request` runs for the same head
-branch, every workflow path must resolve to one run, and the commit must belong
+rejected. Seventeen selected runs must be `pull_request` runs; the exact-SHA
+G7/G8 closure is the sole `workflow_dispatch` run. All use the same head branch,
+every workflow path must resolve to one run, and the commit must belong
 to exactly one merged in-repository PR targeting `main`; the complete PR
 history for that head branch must contain no second PR, and the PR's complete
 issue-event history must contain no base-ref change or successful automatic

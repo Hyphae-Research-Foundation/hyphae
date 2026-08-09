@@ -461,11 +461,11 @@ async fn execute_operation(
         .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, &metadata))?;
     let mut operation = wire.operation;
     let mut new_session = None;
-    let session = if operation_uses_session(&operation) {
+    let session = if operation_requires_existing_session(&operation) {
         let session_id = requested_session
             .ok_or_else(|| NativeApiError::code(ProductErrorCode::SqlInvalidValue, &metadata))?;
         Some(lookup_session(&state, session_id, &principal, &metadata)?)
-    } else if matches!(operation, ProductOperation::PrepareSql { .. }) {
+    } else if operation_starts_session(&operation) {
         if let Some(session_id) = requested_session {
             Some(lookup_session(&state, session_id, &principal, &metadata)?)
         } else {
@@ -959,32 +959,28 @@ pub(super) fn family_accepts(family: OperationFamily, operation: &ProductOperati
 }
 
 fn is_read_operation(operation: &ProductOperation) -> bool {
-    match operation {
-        ProductOperation::CatalogCreate { .. }
-        | ProductOperation::StructureSet { .. }
-        | ProductOperation::SearchIngest { .. }
-        | ProductOperation::SearchDocumentUpdate { .. }
-        | ProductOperation::SearchDocumentDelete { .. }
-        | ProductOperation::AdminCheckpoint
-        | ProductOperation::Backup(_)
-        | ProductOperation::Restore(_) => false,
-        ProductOperation::ExecuteSql { statement, .. } => {
-            let first = statement
-                .split_ascii_whitespace()
-                .next()
-                .unwrap_or_default();
-            first.eq_ignore_ascii_case("select")
-                || first.eq_ignore_ascii_case("with")
-                || first.eq_ignore_ascii_case("explain")
-        }
-        _ => true,
-    }
+    operation.is_read_only()
 }
 
-fn operation_uses_session(operation: &ProductOperation) -> bool {
+fn operation_requires_existing_session(operation: &ProductOperation) -> bool {
     matches!(
         operation,
-        ProductOperation::ExecutePrepared { .. } | ProductOperation::DeallocatePrepared { .. }
+        ProductOperation::ExecutePrepared { .. }
+            | ProductOperation::DeallocatePrepared { .. }
+            | ProductOperation::TransactionStageSql { .. }
+            | ProductOperation::TransactionStageStructure { .. }
+            | ProductOperation::TransactionStageSearch { .. }
+            | ProductOperation::TransactionStageVector { .. }
+            | ProductOperation::TransactionCommit { .. }
+            | ProductOperation::TransactionRollback { .. }
+            | ProductOperation::ExplicitTransactionStatus { .. }
+    )
+}
+
+fn operation_starts_session(operation: &ProductOperation) -> bool {
+    matches!(
+        operation,
+        ProductOperation::PrepareSql { .. } | ProductOperation::TransactionBegin
     )
 }
 

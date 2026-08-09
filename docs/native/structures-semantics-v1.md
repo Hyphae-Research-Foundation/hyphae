@@ -1,6 +1,7 @@
 # Native structure-engine semantics v1
 
-Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
+Status: implemented structure contract retained by the closed G3 and G6
+gates. Binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
 hashes, bounded native set member batches and scans, chunked-deque lists,
 absolute complete-set and complete-list TTL,
@@ -9,8 +10,9 @@ dual-index sorted sets, bounded sorted-set score ranges, bidirectional
 sorted-set member ranks, and reverse sorted-set rank/score ranges are
 implemented in the convergence slice; the ordered durable scalar-expiry index
 and bounded cleanup are
-implemented; an engine-owned background timer, version-bearing responses, and
-the remaining structure commands and complete G3 gates remain pending.
+implemented, together with engine-owned expiry scheduling, version-bearing
+responses, and the complete bounded Native command inventory. Controlled
+performance evidence remains open under G7.
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by

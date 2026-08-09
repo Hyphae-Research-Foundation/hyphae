@@ -43,6 +43,7 @@ REQUEST_KINDS = {
     "catalog_dependencies": 16,
     "catalog_describe": 17,
     "catalog_resolve": 18,
+    "catalog_create": 19,
     "admin_explain_sql": 20,
     "doctor": 21,
     "backup": 22,
@@ -57,8 +58,13 @@ REQUEST_KINDS = {
     "restore": 28,
     "transaction_begin": 32,
     "transaction_stage_sql": 33,
+    "transaction_stage_structure": 34,
+    "transaction_stage_search": 35,
+    "transaction_stage_vector": 36,
     "transaction_commit": 37,
     "transaction_rollback": 38,
+    "transaction_status_by_idempotency": 39,
+    "explicit_transaction_status": 40,
     "proof_generate": 41,
 }
 
@@ -250,8 +256,16 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         return int(arguments["transaction_id"]).to_bytes(16, "little")
     if operation == "transaction_stage_sql":
         return struct.pack("<Q", arguments["handle"]) + _text(arguments["statement"]) + _encode_values(arguments.get("parameters", []))
-    if operation in {"transaction_commit", "transaction_rollback"}:
+    if operation == "transaction_stage_structure":
+        return struct.pack("<Q", arguments["handle"]) + _encode_structure_mutation(arguments["mutation"])
+    if operation == "transaction_stage_search":
+        return struct.pack("<Q", arguments["handle"]) + _encode_transaction_search_mutation(arguments["mutation"])
+    if operation == "transaction_stage_vector":
+        return struct.pack("<Q", arguments["handle"]) + _encode_transaction_vector_mutation(arguments["mutation"])
+    if operation in {"transaction_commit", "transaction_rollback", "explicit_transaction_status"}:
         return struct.pack("<Q", arguments["handle"])
+    if operation == "transaction_status_by_idempotency":
+        return int(arguments["idempotency_token"]).to_bytes(16, "little")
     if operation == "doctor":
         return b""
     if operation == "backup":
@@ -291,6 +305,8 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
             arguments["visit_limit"],
             arguments["byte_limit"],
         )
+    if operation == "catalog_create":
+        return _bytes(arguments["definition"])
     if operation == "proof_verify":
         anchor = arguments["trusted_anchor"]
         if not isinstance(anchor, bytes) or len(anchor) != 32:
@@ -441,7 +457,7 @@ def _encode_query(query: Any, depth: int = 0) -> bytes:
 
 
 def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
-    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry"}:
+    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"}:
         if encoded:
             raise ClientError("parameterless request has trailing bytes")
         return {}
@@ -450,7 +466,106 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         if offset != len(encoded):
             raise ClientError("structure request has trailing bytes")
         return {"key": value}
-    raise ClientError(f"binary operation decoder is not implemented for {operation}")
+    reader = _Reader(encoded)
+    if operation == "catalog_create":
+        result = {"definition": reader.bytes()}
+    elif operation == "transaction_stage_sql":
+        result = {
+            "handle": reader.u64(),
+            "statement": reader.text(),
+            "parameters": [_decode_value(reader, 0) for _ in range(reader.u32())],
+        }
+    elif operation == "transaction_stage_structure":
+        result = {"handle": reader.u64(), "mutation": _decode_structure_mutation(reader)}
+    elif operation == "transaction_stage_search":
+        result = {"handle": reader.u64(), "mutation": _decode_transaction_search_mutation(reader)}
+    elif operation == "transaction_stage_vector":
+        result = {"handle": reader.u64(), "mutation": _decode_transaction_vector_mutation(reader)}
+    elif operation in {"transaction_commit", "transaction_rollback", "explicit_transaction_status"}:
+        result = {"handle": reader.u64()}
+    elif operation == "transaction_status_by_idempotency":
+        result = {"idempotency_token": reader.u128()}
+    elif operation == "structure_read":
+        result = _decode_structure_read_request(reader)
+    else:
+        raise ClientError(f"binary operation decoder is not implemented for {operation}")
+    reader.finish()
+    return result
+
+
+def _decode_structure_key(reader: _Reader) -> dict[str, Any]:
+    return {"keyspace": reader.u128(), "key": reader.bytes()}
+
+
+def _decode_structure_mutation(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    kinds = (
+        "string_set", "string_delete", "counter_add", "create", "delete", "expire",
+        "hash_set", "hash_delete", "hash_counter_add", "hash_expire_field", "list_push",
+        "list_pop", "set_add", "set_remove", "sorted_set_add", "sorted_set_remove", "stream_add",
+    )
+    if tag >= len(kinds):
+        raise ClientError("structure mutation kind is invalid")
+    kind = kinds[tag]
+    result: dict[str, Any] = {"kind": kind, "key": _decode_structure_key(reader)}
+    families = (None, "string", "counter", "hash", "list", "set", "sorted_set", "stream")
+    if kind == "string_set":
+        result["value"] = reader.bytes()
+        result["expires_at_micros"] = reader.i64() if reader.boolean() else None
+    elif kind == "counter_add":
+        result["delta"] = reader.i64()
+    elif kind in {"create", "delete"}:
+        family = reader.u8()
+        if family == 0 or family >= len(families):
+            raise ClientError("structure family is invalid")
+        result["family"] = families[family]
+    elif kind == "expire":
+        family = reader.u8()
+        if family == 0 or family >= len(families):
+            raise ClientError("structure family is invalid")
+        result.update(family=families[family], expires_at_micros=reader.i64())
+    elif kind in {"hash_set", "hash_delete", "hash_counter_add", "hash_expire_field"}:
+        result["field"] = reader.bytes()
+        if kind == "hash_set":
+            result["value"] = reader.bytes()
+        elif kind == "hash_counter_add":
+            result["delta"] = reader.i64()
+        elif kind == "hash_expire_field":
+            result["expires_at_micros"] = reader.i64()
+    elif kind in {"list_push", "list_pop"}:
+        side = reader.u8()
+        if side > 1:
+            raise ClientError("list side is invalid")
+        result["side"] = ("left", "right")[side]
+        if kind == "list_push":
+            result["value"] = reader.bytes()
+    elif kind in {"set_add", "set_remove", "sorted_set_remove"}:
+        result["member"] = reader.bytes()
+    elif kind == "sorted_set_add":
+        result.update(score=reader.f64(), member=reader.bytes())
+    elif kind == "stream_add":
+        result["fields"] = [(reader.bytes(), reader.bytes()) for _ in range(reader.u32())]
+    return result
+
+
+def _decode_transaction_search_mutation(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag > 2:
+        raise ClientError("transaction search mutation kind is invalid")
+    result = {"kind": ("index", "replace", "delete")[tag], "index": reader.u128(), "document_id": reader.bytes()}
+    if tag != 2:
+        result["text"] = reader.text()
+    return result
+
+
+def _decode_transaction_vector_mutation(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag > 1:
+        raise ClientError("transaction vector mutation kind is invalid")
+    result = {"kind": ("upsert", "delete")[tag], "index": reader.u128(), "object_id": reader.u128()}
+    if tag == 0:
+        result["vector"] = [reader.f32() for _ in range(reader.u32())]
+    return result
 
 
 def decode_product_response(encoded: bytes, request_id: int) -> Response:
@@ -680,8 +795,14 @@ def decode_product_response(encoded: bytes, request_id: int) -> Response:
         reader.finish()
         return Response("explicit_transaction_status", value, request_id)
     if kind == 28:
-        value = {"handle": reader.u64(), "operation_ordinal": reader.u64(), "changed": reader.boolean()}
-        raise ClientError("typed transaction stage decoding is not implemented")
+        value = {
+            "handle": reader.u64(),
+            "operation_ordinal": reader.u64(),
+            "changed": reader.boolean(),
+            "result": _decode_transaction_stage_result(reader),
+        }
+        reader.finish()
+        return Response("transaction_staged", value, request_id)
     if kind == 29:
         value = {"handle": reader.u64(), "staged_operations": reader.u64(), "commit": _decode_commit_receipt(reader)}
         reader.finish()
@@ -945,35 +1066,82 @@ def _decode_aggregation_value(reader: _Reader) -> dict[str, Any]:
 def _encode_structure_mutation(value: Any) -> bytes:
     if not isinstance(value, dict):
         raise ClientError("structure mutation is invalid")
+    aliases = {
+        "create_hash": ("create", "hash"),
+        "create_set": ("create", "set"),
+        "create_list": ("create", "list"),
+        "create_sorted_set": ("create", "sorted_set"),
+        "create_stream": ("create", "stream"),
+        "list_push_tail": ("list_push", "right"),
+        "stream_append": ("stream_add", None),
+    }
     kind = value.get("kind")
+    alias = aliases.get(kind)
+    if alias is not None:
+        kind, implied = alias
+    else:
+        implied = None
     tags = {
-        "create_hash": 0,
-        "hash_set": 1,
-        "create_set": 2,
-        "set_add": 3,
-        "create_list": 4,
-        "list_push_tail": 5,
-        "create_sorted_set": 6,
-        "sorted_set_add": 7,
-        "create_stream": 8,
-        "stream_append": 9,
+        "string_set": 0,
+        "string_delete": 1,
+        "counter_add": 2,
+        "create": 3,
+        "delete": 4,
+        "expire": 5,
+        "hash_set": 6,
+        "hash_delete": 7,
+        "hash_counter_add": 8,
+        "hash_expire_field": 9,
+        "list_push": 10,
+        "list_pop": 11,
+        "set_add": 12,
+        "set_remove": 13,
+        "sorted_set_add": 14,
+        "sorted_set_remove": 15,
+        "stream_add": 16,
     }
     if kind not in tags:
         raise ClientError("structure mutation kind is invalid")
     output = bytearray((tags[kind],))
     output.extend(_encode_structure_key(value["key"]))
-    if kind == "hash_set":
+    if kind == "string_set":
+        output.extend(_bytes(value["value"]))
+        expiry = value.get("expires_at_micros")
+        output.append(expiry is not None)
+        if expiry is not None:
+            output.extend(struct.pack("<q", expiry))
+    elif kind == "counter_add":
+        output.extend(struct.pack("<q", value["delta"]))
+    elif kind in {"create", "delete"}:
+        output.append(_structure_family_tag(implied or value["family"]))
+    elif kind == "expire":
+        output.append(_structure_family_tag(value["family"]))
+        output.extend(struct.pack("<q", value["expires_at_micros"]))
+    elif kind == "hash_set":
         output.extend(_bytes(value["field"]))
         output.extend(_bytes(value["value"]))
-    elif kind == "set_add":
-        output.extend(_bytes(value["member"]))
-    elif kind == "list_push_tail":
+    elif kind == "hash_delete":
+        output.extend(_bytes(value["field"]))
+    elif kind == "hash_counter_add":
+        output.extend(_bytes(value["field"]))
+        output.extend(struct.pack("<q", value["delta"]))
+    elif kind == "hash_expire_field":
+        output.extend(_bytes(value["field"]))
+        output.extend(struct.pack("<q", value["expires_at_micros"]))
+    elif kind == "list_push":
+        output.append(_list_side_tag(implied or value["side"]))
         output.extend(_bytes(value["value"]))
+    elif kind == "list_pop":
+        output.append(_list_side_tag(value["side"]))
+    elif kind in {"set_add", "set_remove", "sorted_set_remove"}:
+        output.extend(_bytes(value["member"]))
     elif kind == "sorted_set_add":
         output.extend(struct.pack("<d", value["score"]))
         output.extend(_bytes(value["member"]))
-    elif kind == "stream_append":
+    elif kind == "stream_add":
         fields = value["fields"]
+        if not isinstance(fields, list) or not 0 < len(fields) <= 4096:
+            raise ClientError("stream fields must be a nonempty bounded list")
         output.extend(struct.pack("<I", len(fields)))
         for field, field_value in fields:
             output.extend(_bytes(field))
@@ -981,28 +1149,120 @@ def _encode_structure_mutation(value: Any) -> bytes:
     return bytes(output)
 
 
+def _structure_family_tag(value: Any) -> int:
+    families = {
+        "string": 1,
+        "counter": 2,
+        "hash": 3,
+        "list": 4,
+        "set": 5,
+        "sorted_set": 6,
+        "stream": 7,
+    }
+    try:
+        return families[value]
+    except (KeyError, TypeError) as error:
+        raise ClientError("structure family is invalid") from error
+
+
+def _list_side_tag(value: Any) -> int:
+    if value == "left":
+        return 0
+    if value == "right":
+        return 1
+    raise ClientError("list side is invalid")
+
+
+def _encode_transaction_search_mutation(value: Any) -> bytes:
+    if not isinstance(value, dict):
+        raise ClientError("transaction search mutation is invalid")
+    kind = value.get("kind")
+    tags = {"index": 0, "replace": 1, "delete": 2}
+    if kind not in tags:
+        raise ClientError("transaction search mutation kind is invalid")
+    output = bytearray((tags[kind],))
+    output.extend(int(value["index"]).to_bytes(16, "little"))
+    output.extend(_bytes(value["document_id"]))
+    if kind != "delete":
+        output.extend(_text(value["text"]))
+    return bytes(output)
+
+
+def _encode_transaction_vector_mutation(value: Any) -> bytes:
+    if not isinstance(value, dict):
+        raise ClientError("transaction vector mutation is invalid")
+    kind = value.get("kind")
+    if kind not in {"upsert", "delete"}:
+        raise ClientError("transaction vector mutation kind is invalid")
+    output = bytearray((0 if kind == "upsert" else 1,))
+    output.extend(int(value["index"]).to_bytes(16, "little"))
+    output.extend(int(value["object_id"]).to_bytes(16, "little"))
+    if kind == "upsert":
+        vector = value.get("vector")
+        if not isinstance(vector, list) or not vector:
+            raise ClientError("transaction vector must be a nonempty list")
+        output.extend(struct.pack("<I", len(vector)))
+        output.extend(struct.pack("<" + "f" * len(vector), *vector))
+    return bytes(output)
+
+
 def _encode_structure_read(value: dict[str, Any]) -> bytes:
     kind = value.get("kind")
-    tags = {"hash_get": 3, "set_members": 10, "list_range": 7, "sorted_set_range": 15, "stream_range": 17}
+    tags = {
+        "string_get": 0, "counter_get": 1, "ttl": 2, "hash_get": 3,
+        "hash_field_ttl": 4, "hash_scan": 5, "hash_length": 6, "list_range": 7,
+        "list_length": 8, "set_contains": 9, "set_members": 10, "set_cardinality": 11,
+        "set_algebra": 12, "sorted_set_score": 13, "sorted_set_rank": 14,
+        "sorted_set_range": 15, "sorted_set_cardinality": 16, "stream_range": 17,
+    }
     if kind not in tags:
         raise ClientError("structure read kind is invalid")
-    output = bytearray((tags[kind],))
+    tag = tags[kind]
+    output = bytearray((tag,))
+    if kind == "set_algebra":
+        operations = {"union": 0, "intersection": 1, "difference": 2}
+        if value.get("operation") not in operations:
+            raise ClientError("set algebra operation is invalid")
+        keys = value.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise ClientError("set algebra keys must be a nonempty list")
+        output.extend(int(value["keyspace"]).to_bytes(16, "little"))
+        output.append(operations[value["operation"]])
+        output.extend(struct.pack("<I", len(keys)))
+        output.extend(b"".join(_bytes(key) for key in keys))
+        output.extend(struct.pack("<QQ", value["output_member_limit"], value["visit_limit"]))
+        return bytes(output)
     output.extend(_encode_structure_key(value["key"]))
-    if kind == "hash_get":
+    if kind == "ttl":
+        output.append(_structure_family_tag(value["family"]))
+    elif kind in {"hash_get", "hash_field_ttl"}:
         output.extend(_bytes(value["field"]))
-    elif kind == "set_members":
+    elif kind in {"hash_scan", "set_members"}:
         cursor = value.get("start_after")
         output.append(cursor is not None)
         if cursor is not None:
             output.extend(_bytes(cursor))
         output.extend(struct.pack("<Q", value["limit"]))
+    elif kind in {"set_contains", "sorted_set_score"}:
+        output.extend(_bytes(value["member"]))
+    elif kind == "sorted_set_rank":
+        output.extend(_bytes(value["member"]))
+        output.append(_sorted_order_tag(value.get("order", "ascending")))
     elif kind in {"list_range", "sorted_set_range"}:
         output.extend(struct.pack("<qq", value["start"], value["stop"]))
         if kind == "sorted_set_range":
-            output.append(0)
-    else:
+            output.append(_sorted_order_tag(value.get("order", "ascending")))
+    elif kind == "stream_range":
         output.extend(struct.pack("<QQQ", value["start"], value["end"], value["limit"]))
     return bytes(output)
+
+
+def _sorted_order_tag(value: Any) -> int:
+    if value == "ascending":
+        return 0
+    if value == "descending":
+        return 1
+    raise ClientError("sorted-set order is invalid")
 
 
 def _encode_structure_key(value: Any) -> bytes:
@@ -1014,10 +1274,31 @@ def _encode_structure_key(value: Any) -> bytes:
 def _decode_structure_read(reader: _Reader) -> dict[str, Any]:
     tag = reader.u8()
     if tag == 0:
-        return {"kind": "hash_value", "value": reader.bytes() if reader.boolean() else None}
+        return {"kind": "value", "value": reader.bytes() if reader.boolean() else None}
     if tag == 1:
         values = [reader.bytes() for _ in range(reader.u32())]
         return {"kind": "values", "values": values}
+    if tag == 2:
+        return {"kind": "counter", "value": reader.i64() if reader.boolean() else None}
+    if tag == 3:
+        state = reader.u8()
+        if state > 2:
+            raise ClientError("structure TTL response is invalid")
+        return {"kind": "ttl", "value": {"state": ("missing", "persistent", "remaining")[state], **({"remaining_micros": reader.i64()} if state == 2 else {})}}
+    if tag == 4:
+        return {"kind": "hash_entries", "entries": [
+            {"field": reader.bytes(), "value": reader.bytes()} for _ in range(reader.u32())
+        ]}
+    if tag == 5:
+        return {"kind": "count", "value": reader.u64()}
+    if tag == 6:
+        return {"kind": "boolean", "value": reader.boolean()}
+    if tag == 7:
+        return {"kind": "set_algebra", "members": [reader.bytes() for _ in range(reader.u32())], "visited": reader.u64()}
+    if tag == 8:
+        return {"kind": "sorted_set_score", "value": reader.f64() if reader.boolean() else None}
+    if tag == 9:
+        return {"kind": "sorted_set_rank", "value": reader.u64() if reader.boolean() else None}
     if tag == 10:
         return {"kind": "sorted_set_entries", "entries": [
             {"member": reader.bytes(), "score": reader.f64()} for _ in range(reader.u32())
@@ -1030,6 +1311,61 @@ def _decode_structure_read(reader: _Reader) -> dict[str, Any]:
             entries.append({"id": entry_id, "fields": fields})
         return {"kind": "stream_entries", "entries": entries}
     raise ClientError("structure read response is invalid")
+
+
+def _decode_structure_read_request(reader: _Reader) -> dict[str, Any]:
+    kinds = (
+        "string_get", "counter_get", "ttl", "hash_get", "hash_field_ttl", "hash_scan",
+        "hash_length", "list_range", "list_length", "set_contains", "set_members",
+        "set_cardinality", "set_algebra", "sorted_set_score", "sorted_set_rank",
+        "sorted_set_range", "sorted_set_cardinality", "stream_range",
+    )
+    tag = reader.u8()
+    if tag >= len(kinds):
+        raise ClientError("structure read kind is invalid")
+    kind = kinds[tag]
+    if kind == "set_algebra":
+        operation_tag = reader.u8() if False else None
+        keyspace = reader.u128()
+        operation_tag = reader.u8()
+        if operation_tag > 2:
+            raise ClientError("set algebra operation is invalid")
+        return {
+            "kind": kind, "keyspace": keyspace,
+            "operation": ("union", "intersection", "difference")[operation_tag],
+            "keys": [reader.bytes() for _ in range(reader.u32())],
+            "output_member_limit": reader.u64(), "visit_limit": reader.u64(),
+        }
+    result: dict[str, Any] = {"kind": kind, "key": _decode_structure_key(reader)}
+    if kind == "ttl":
+        families = (None, "string", "counter", "hash", "list", "set", "sorted_set", "stream")
+        family = reader.u8()
+        if family == 0 or family >= len(families):
+            raise ClientError("structure family is invalid")
+        result["family"] = families[family]
+    elif kind in {"hash_get", "hash_field_ttl"}:
+        result["field"] = reader.bytes()
+    elif kind in {"hash_scan", "set_members"}:
+        result["start_after"] = reader.bytes() if reader.boolean() else None
+        result["limit"] = reader.u64()
+    elif kind in {"set_contains", "sorted_set_score"}:
+        result["member"] = reader.bytes()
+    elif kind == "sorted_set_rank":
+        result["member"] = reader.bytes()
+        order = reader.u8()
+        if order > 1:
+            raise ClientError("sorted-set order is invalid")
+        result["order"] = ("ascending", "descending")[order]
+    elif kind in {"list_range", "sorted_set_range"}:
+        result.update(start=reader.i64(), stop=reader.i64())
+        if kind == "sorted_set_range":
+            order = reader.u8()
+            if order > 1:
+                raise ClientError("sorted-set order is invalid")
+            result["order"] = ("ascending", "descending")[order]
+    elif kind == "stream_range":
+        result.update(start=reader.u64(), end=reader.u64(), limit=reader.u64())
+    return result
 
 
 def _decode_commit_receipt(reader: _Reader) -> dict[str, Any]:
@@ -1079,12 +1415,65 @@ def _decode_explicit_transaction_status(reader: _Reader) -> dict[str, Any]:
     if tag == 0:
         return {"state": "unknown"}
     if tag == 1:
-        return {"state": "active", "handle": reader.u64(), "read_csn": reader.u64() or None, "staged_operations": reader.u64(), "durability": ("strict", "group", "memory")[reader.u8()]}
+        handle = reader.u64()
+        read_csn = reader.u64() or None
+        staged_operations = reader.u64()
+        durability_tag = reader.u8()
+        if durability_tag > 2:
+            raise ClientError("explicit transaction durability is invalid")
+        return {
+            "state": "active",
+            "handle": handle,
+            "read_csn": read_csn,
+            "staged_operations": staged_operations,
+            "durability": ("strict", "group", "memory")[durability_tag],
+        }
     if tag == 2:
         return {"state": "committed", "handle": reader.u64(), "staged_operations": reader.u64(), "receipt": _decode_commit_receipt(reader)}
-    if tag in (3, 4):
-        return {"state": "rolled_back" if tag == 3 else "outcome_unknown", "handle": reader.u64(), "operations": reader.u64(), "transaction_id": reader.u128() if tag == 4 else None}
+    if tag == 3:
+        return {
+            "state": "rolled_back",
+            "handle": reader.u64(),
+            "discarded_operations": reader.u64(),
+        }
+    if tag == 4:
+        return {
+            "state": "outcome_unknown",
+            "handle": reader.u64(),
+            "transaction_id": reader.u128(),
+            "staged_operations": reader.u64(),
+        }
     raise ClientError("explicit transaction status is malformed")
+
+
+def _decode_transaction_stage_result(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"kind": "sql", "result": _decode_sql_result(reader)}
+    if tag == 1:
+        return {"kind": "structure", "result": _decode_structure_mutation_result(reader)}
+    if tag == 2:
+        return {"kind": "search"}
+    if tag == 3:
+        return {"kind": "vector", "changed": reader.boolean()}
+    raise ClientError("transaction stage result is malformed")
+
+
+def _decode_structure_mutation_result(reader: _Reader) -> dict[str, Any]:
+    tag = reader.u8()
+    if tag == 0:
+        return {"kind": "unit"}
+    if tag == 1:
+        return {"kind": "integer", "value": reader.i64()}
+    if tag == 2:
+        return {"kind": "boolean", "value": reader.boolean()}
+    if tag == 3:
+        return {"kind": "count", "value": reader.u64()}
+    if tag == 4:
+        return {"kind": "value", "value": reader.bytes() if reader.boolean() else None}
+    if tag == 5:
+        return {"kind": "stream_id", "value": reader.u64()}
+    raise ClientError("structure mutation result is malformed")
 
 
 def _decode_sql_result(reader: _Reader) -> dict[str, Any]:
@@ -1550,7 +1939,6 @@ __all__ = [
     "decode_end",
     "decode_frame",
     "decode_product_error",
-    "decode_product_request",
     "decode_product_response",
     "decode_welcome",
     "encode_cancel",

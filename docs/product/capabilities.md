@@ -1,5 +1,9 @@
 # Product capabilities and limits
 
+This page describes the published format-2 `0.2.1` compatibility product. The
+current Native `dev` capability matrix is maintained separately in
+[`native-capabilities.md`](native-capabilities.md).
+
 Hyphae `0.2.1` is a published local-first Rust data engine. The base
 deployment is one native `hyphae` executable and one exclusively owned data
 directory. It starts no listener unless `serve` is selected and requires no

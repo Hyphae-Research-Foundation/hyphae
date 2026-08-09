@@ -1,16 +1,70 @@
 {
-  "schema": "hyphae-native-g8-suite-manifest-v1",
+  "schema": "hyphae-native-g8-suite-manifest-v2",
   "gate": "G8",
   "requirements": [
-    {"id": "native-soak", "status": "supporting-incomplete", "acceptance": ["kill-restart", "backup-restore", "doctor-after-restore"]},
-    {"id": "process-crash-recovery", "status": "supporting-incomplete", "acceptance": ["commit-boundaries", "checkpoint-boundaries", "snapshot-pins"]},
-    {"id": "power-loss-replay", "status": "supporting-incomplete", "acceptance": ["bounded-replay", "recovery-equivalence", "safety-checks"]},
-    {"id": "corruption-matrix", "status": "planned", "acceptance": ["pages", "wal", "manifest", "blobs", "indexes", "proofs"]},
-    {"id": "resource-exhaustion", "status": "planned", "acceptance": ["disk-full", "read-only", "memory", "descriptors", "bounded-input"]},
-    {"id": "format2-to-native-migration", "status": "planned", "acceptance": ["read-only-source", "identity-mapping", "semantic-equivalence", "promotion", "rollback"]},
-    {"id": "multiplatform-packaging", "status": "supporting-incomplete", "acceptance": ["linux", "macos", "windows", "installed-smoke"]},
-    {"id": "sbom-signatures-provenance", "status": "supporting-incomplete", "acceptance": ["spdx", "cyclonedx", "checksums", "cosign", "provenance"]},
-    {"id": "independent-restore-verification", "status": "planned", "acceptance": ["independent-tool", "offline", "state-equivalence"]}
+    {
+      "id": "native-soak",
+      "status": "implemented-unhosted",
+      "platforms": ["linux"],
+      "runner": "python tools/run_native_g8_soak.py",
+      "acceptance": ["kill-restart", "backup-restore", "doctor-after-restore"]
+    },
+    {
+      "id": "process-crash-recovery",
+      "status": "implemented-unhosted",
+      "platforms": ["linux"],
+      "runner": "cargo run -p hyphae-native-runtime --example process_crash_matrix",
+      "acceptance": ["commit-boundaries", "checkpoint-boundaries", "snapshot-pins", "migration-promotion-boundaries"]
+    },
+    {
+      "id": "power-loss-replay",
+      "status": "implemented-unhosted",
+      "platforms": ["linux"],
+      "runner": "python tools/run_native_power_loss_gate.py",
+      "acceptance": ["bounded-replay", "recovery-equivalence", "safety-checks"]
+    },
+    {
+      "id": "corruption-matrix",
+      "status": "implemented-unhosted",
+      "platforms": ["linux"],
+      "runner": "cargo test --workspace --all-features corruption",
+      "acceptance": ["pages", "wal", "manifest", "blobs", "indexes", "proofs"]
+    },
+    {
+      "id": "resource-exhaustion",
+      "status": "implemented-unhosted",
+      "platforms": ["linux"],
+      "runner": "python tools/run_native_resource_exhaustion_gate.py",
+      "acceptance": ["disk-full", "read-only", "memory", "descriptors", "bounded-input"]
+    },
+    {
+      "id": "format2-to-native-migration",
+      "status": "implemented-unhosted",
+      "platforms": ["linux", "macos", "windows"],
+      "runner": "cargo test -p hyphae-cli migration_",
+      "acceptance": ["read-only-source", "identity-mapping", "semantic-equivalence", "promotion", "rollback"]
+    },
+    {
+      "id": "multiplatform-packaging",
+      "status": "implemented-unhosted",
+      "platforms": ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
+      "runner": "python packaging/package.py && python packaging/verify_install.py",
+      "acceptance": ["archive-layout", "installed-native-smoke"]
+    },
+    {
+      "id": "sbom-signatures-provenance",
+      "status": "implemented-unhosted",
+      "platforms": ["release"],
+      "runner": "python packaging/release_evidence.py verify",
+      "acceptance": ["spdx", "cyclonedx", "checksums", "cosign", "provenance"]
+    },
+    {
+      "id": "independent-restore-verification",
+      "status": "implemented-unhosted",
+      "platforms": ["linux", "macos", "windows"],
+      "runner": "cargo run -p hyphae-independent-backup-verifier -- <backup-directory>",
+      "acceptance": ["independent-tool", "offline", "state-equivalence"]
+    }
   ],
   "claims": [],
   "closure_declared": false
