@@ -20,9 +20,11 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 `bounded-readiness-only` records useful hosted evidence without promoting a
 deliberately restricted vertical into the broader normative gate outcome.
 
-A later gate may be implemented and measured early. It cannot be declared
-closed until every earlier gate has a retained exact-SHA closure aggregate.
-Temporary workflow artifacts are inputs to that aggregate, not durable closure
+G0 through G6 form the ordered product-readiness prefix. G8 closes independently
+on the exact release commit. G7 is a separate performance certification and may
+remain open without blocking a stable release; while it is open, no certified
+latency, saturation, or production-scale performance claim is permitted.
+Temporary workflow artifacts are inputs to an aggregate, not durable closure
 authority by themselves.
 
 ## G3 local validation record

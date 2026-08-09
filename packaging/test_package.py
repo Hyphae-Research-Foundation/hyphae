@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -340,7 +341,10 @@ class PackageTests(unittest.TestCase):
             integrations["peerDependencies"]["@celiums/hyphae"], version
         )
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn(f"## [{version}] - Unreleased", changelog)
+        self.assertRegex(
+            changelog,
+            rf"(?m)^## \[{re.escape(version)}\] - (?:Unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
+        )
 
     def test_release_workflow_separates_native_and_candidate_artifacts(
         self,

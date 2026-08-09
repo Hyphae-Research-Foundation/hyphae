@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fail-closed validation for the open G7/G8 evidence authority spine."""
+"""Fail-closed validation for the independent G7/G8 evidence authorities."""
 
 from __future__ import annotations
 
@@ -101,16 +101,12 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
     closure_workflow = (root / ".github/workflows/native-g8-closure.yml").read_text(
         encoding="utf-8"
     )
-    for required in (
-        "native-g7-aggregate.json",
-        "check_native_g7_matrix.py",
-        "--closure",
-        "--receipts",
-        "check_native_g8_receipts.py",
-        '"${{ inputs.source_commit }}"',
-    ):
+    for required in ("check_native_g8_receipts.py", '"${{ inputs.source_commit }}"'):
         if required not in closure_workflow:
-            raise GateFailure("G8 closure workflow does not enforce its G7 predecessor")
+            raise GateFailure("G8 closure workflow does not enforce exact-SHA receipts")
+    for forbidden in ("native-g7-aggregate.json", "check_native_g7_matrix.py"):
+        if forbidden in closure_workflow:
+            raise GateFailure("G8 closure workflow must remain independent from G7")
     return {
         "schema": "hyphae-native-g7-g8-readiness-audit-v1",
         "status": "passed",

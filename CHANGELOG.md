@@ -3,11 +3,12 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-08-09
 
-The `dev` line is versioned as the `1.0.0` Native release candidate. G0
-through G6 are closed; G7 performance and G8 exact-commit release evidence
-remain open, so none of the following is a published `1.0.0` claim.
+Hyphae 1.0.0 introduces the Native local data ecosystem. G0 through G6 are
+closed, and publication is bound to the exact-commit G8 release evidence. G7
+performance certification remains open, so this release makes no certified
+latency, saturation, or production-scale performance claim.
 
 ### Added
 

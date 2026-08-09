@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       readiness_run_id:
-        description: Successful readiness run containing both G7 benchmark and G8 matrix evidence
+        description: Successful readiness run containing the G8 matrix evidence
         required: true
         type: string
       release_run_id:
@@ -78,20 +78,6 @@ jobs:
             --repo "$REPOSITORY" --dir evidence/readiness
           gh run download "${{ inputs.release_run_id }}" \
             --repo "$REPOSITORY" --dir evidence/release
-      - name: Enforce the exact-SHA G7 predecessor closure
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t aggregates < <(
-            find evidence/readiness -type f -name native-g7-aggregate.json -print
-          )
-          test "${#aggregates[@]}" -eq 1
-          PYTHONPATH=. python tools/check_native_g7_matrix.py \
-            --matrix "${aggregates[0]}" \
-            --expected-commit "${{ inputs.source_commit }}" \
-            --output native-g7-prerequisite-audit.json \
-            --closure \
-            --receipts evidence/readiness
       - name: Validate and aggregate all nine G8 requirements
         shell: bash
         run: |
@@ -108,9 +94,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g8-aggregate-${{ inputs.source_commit }}
-          path: |
-            native-g7-prerequisite-audit.json
-            native-g8-aggregate.json
+          path: native-g8-aggregate.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 90

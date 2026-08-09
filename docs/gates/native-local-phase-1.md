@@ -1,15 +1,18 @@
 # Native local ecosystem phase-1 gate
 
-Status: in progress. The current closure/revalidation state is maintained in
+Status: release candidate. The current closure/revalidation state is maintained in
 [`native-gate-status.md`](native-gate-status.md); this document remains the
 normative definition of gate outcomes.
 
-This is the ordered implementation gate for the Hyphae-owned relational,
+This is the implementation gate for the Hyphae-owned relational,
 structure, and search ecosystem. It describes future work, not shipped
 `0.2.1` behavior.
 
-A later gate may be prototyped early but cannot be declared complete while an
-earlier gate is red.
+G0 through G6 are ordered product-readiness gates. G8 is the independent
+release-safety gate and must close on the exact release commit. G7 is an
+independent performance certification: it may close after a stable release,
+and while open the project must publish no certified latency, saturation, or
+production-scale performance claim.
 
 | Gate | Required outcome | Exit evidence |
 |---|---|---|

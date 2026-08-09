@@ -40,7 +40,7 @@ A tagged `push` publication also records exactly 18 required checks. Each check
 is bound to the expected canonical workflow path and to successful workflow-run
 metadata for the same commit; a same-named job from another workflow is
 rejected. Seventeen selected runs must be `pull_request` runs; the exact-SHA
-G7/G8 closure is the sole `workflow_dispatch` run. All use the same head branch,
+G8 closure is the sole `workflow_dispatch` run. All use the same head branch,
 every workflow path must resolve to one run, and the commit must belong
 to exactly one merged in-repository PR targeting `main`; the complete PR
 history for that head branch must contain no second PR, and the PR's complete

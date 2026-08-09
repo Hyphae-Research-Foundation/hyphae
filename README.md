@@ -26,21 +26,23 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Development line:** Hyphae Native is the active architecture on `dev`. G0
-through G6 are closed for their versioned, bounded profiles; G7 and G8 remain
-open. The
+**Stable Native release:** Hyphae Native is the active architecture. G0
+through G6 are closed for their versioned, bounded profiles. G7 performance
+certification remains open; the exact-commit G8 release evidence is produced
+by the release workflow. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 
-**Published stable release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1)
-is still the version available from crates.io and GitHub Releases. It is the
-compatibility baseline, not a description of the current `dev` architecture.
-Its publication receipt remains available at
+**Published release:** [`v1.0.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0)
+is distributed as signed native archives from GitHub Releases. The prior
+`0.2.1` crates.io line remains the format-2 compatibility baseline; its
+publication receipt is retained at
 [`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
 
-The target release for the native line is `1.0.0`. The remaining G7 performance
-and G8 release gates must close before `main` receives the native line and
-replaces `0.2.1`.
+The Native line releases as `1.0.0` after G8 closes on the exact release
+commit. G7 does not block publication, but Hyphae makes no certified latency,
+saturation, or production-scale performance claim until G7 closes on dedicated
+hardware.
 
 ## What Hyphae does
 
@@ -65,22 +67,21 @@ The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 
 ## Install
 
-Install the latest published compatibility binary:
+Download the archive for your platform from the
+[`v1.0.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0),
+then verify its checksum and Sigstore bundle before installing the `hyphae`
+binary. Native 1.0 crates are not published to crates.io.
+
+Build and embed the exact release from source with:
 
 ```bash
-cargo install hyphae-cli --version 0.2.1 --locked
-hyphae version --json
+git checkout v1.0.0
+cargo build --release --locked -p hyphae-cli
+./target/release/hyphae version --json
 ```
 
-Embed the latest published engine with an exact product-version requirement:
-
-```bash
-cargo add hyphae-engine@=0.2.1
-```
-
-Native archives, checksums, SBOMs, provenance, signatures, and attestations
-for `0.2.1` are attached to its
-[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
+The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
+checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
 
 ## Published 0.2.1 compatibility flow
 
@@ -174,7 +175,7 @@ The following crates are the published format-2 compatibility libraries at
 Start at the [documentation index](docs/README.md). Key guides:
 
 - [Native capabilities and limits](docs/product/native-capabilities.md)
-- [Native development quickstart](docs/quickstart-native.md)
+- [Native 1.0 quickstart](docs/quickstart-native.md)
 - [Published 0.2.1 compatibility guide](docs/quickstart.md)
 - [CLI reference](docs/cli/reference.md)
 - [Configuration](docs/configuration.md)
@@ -193,13 +194,13 @@ Start at the [documentation index](docs/README.md). Key guides:
 
 Hyphae Native is a local, single-node data ecosystem with Hyphae-owned SQL,
 structures, lexical search, and ANN under one durable authority. G0 through G6
-are closed for their bounded contracts; G7 and G8 still prevent a `1.0.0`
-release claim.
+are closed for their bounded contracts. G8 protects the exact release commit;
+G7 remains a post-release performance certification and is not a release claim.
 
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
-runtime, a hosted SaaS, or a framework-specific data layer. The published
-`0.2.1` release does not include the native SQL/structures/search architecture
-now present on `dev`. Replication, clustering, built-in TLS, at-rest encryption,
+runtime, a hosted SaaS, or a framework-specific data layer. The retained
+`0.2.1` compatibility line does not include the Native SQL/structures/search
+architecture. Replication, clustering, built-in TLS, at-rest encryption,
 multitenancy, billing, a control plane, an embedding model, and an LLM are also
 outside Native 1.0.
 

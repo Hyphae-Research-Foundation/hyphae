@@ -1,6 +1,6 @@
 # Hyphae roadmap
 
-`0.2.1` is the latest published release. Its annotated `v0.2.1` tag peels to
+`0.2.1` is the retained compatibility release. Its annotated `v0.2.1` tag peels to
 `08028e8dac077846c638f067ce74fbcf6fb75501`, its
 [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1) is
 published, and all ten publishable Rust workspace crates are available on
@@ -18,9 +18,10 @@ format.
 
 ## Next program: native local data ecosystem
 
-The next product program targets `1.0.0`. G0 through G6 have retained exact-SHA
-closure for their versioned, bounded profiles; G7 and G8 remain open with
-machine-readable authority now defined. See
+The Native product program ships as `1.0.0`. G0 through G6 have retained
+exact-SHA closure for their versioned, bounded profiles. G8 supplies
+exact-release safety evidence; G7 remains an independent post-release
+performance certification with machine-readable authority. See
 the [native gate status](gates/native-gate-status.md). Hyphae will build its own
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory

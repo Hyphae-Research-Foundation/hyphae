@@ -39,7 +39,7 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(GateFailure, "not completely implemented"):
                 validate(root, "a" * 40)
 
-    def test_g8_closure_must_enforce_g7_predecessor(self) -> None:
+    def test_g8_closure_must_validate_exact_sha_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config").mkdir()
@@ -52,12 +52,12 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
                 (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
             workflow = (ROOT / ".github/workflows/native-g8-closure.yml").read_text()
             (root / ".github/workflows/native-g8-closure.yml").write_text(
-                workflow.replace("native-g7-aggregate.json", "missing-g7.json")
+                workflow.replace("check_native_g8_receipts.py", "unchecked-g8.py")
             )
-            with self.assertRaisesRegex(GateFailure, "G7 predecessor"):
+            with self.assertRaisesRegex(GateFailure, "exact-SHA receipts"):
                 validate(root, "a" * 40)
 
-    def test_g8_closure_must_revalidate_raw_g7_receipts(self) -> None:
+    def test_g8_closure_must_not_depend_on_g7(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config").mkdir()
@@ -70,9 +70,9 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
                 (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
             workflow = (ROOT / ".github/workflows/native-g8-closure.yml").read_text()
             (root / ".github/workflows/native-g8-closure.yml").write_text(
-                workflow.replace("--receipts", "--unchecked-receipts")
+                workflow + "\n# check_native_g7_matrix.py\n"
             )
-            with self.assertRaisesRegex(GateFailure, "G7 predecessor"):
+            with self.assertRaisesRegex(GateFailure, "independent from G7"):
                 validate(root, "a" * 40)
 
 

@@ -14,7 +14,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 ## Start here
 
 - [Native 1.0 capabilities and limits](product/native-capabilities.md)
-- [Native 1.0 development quickstart](quickstart-native.md)
+- [Native 1.0 quickstart](quickstart-native.md)
 - [Published 0.2.1 capabilities and limits](product/capabilities.md)
 - [Published 0.2.1 compatibility quickstart](quickstart.md)
 - [CLI reference](cli/reference.md)

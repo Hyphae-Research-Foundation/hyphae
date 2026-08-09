@@ -7,7 +7,7 @@ an uploaded version cannot be overwritten or deleted. Run this procedure only
 from an exact, newly versioned release commit after its complete hosted gate is
 green.
 
-The native crates remain unpublished on crates.io. The `1.0.0` candidate
+The native crates remain unpublished on crates.io. The `1.0.0` release
 `hyphae-client`, `hyphae-server`, and `hyphae-cli` source packages use those
 native internals and are therefore also marked `publish = false`.
 `hyphae-pliegors` is likewise unpublished because its normal dependency on

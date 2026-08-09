@@ -94,7 +94,7 @@ return that same PR and no other, and its complete issue-event history must
 contain no base-ref change or successful automatic base change. The producer
 verifies each referenced workflow run's exact ID, path, commit, branch, event,
 repository, attempt, state, and conclusion. Seventeen checks require
-`event=pull_request`; the exact-SHA G7/G8 closure requires
+`event=pull_request`; the exact-SHA G8 closure requires
 `event=workflow_dispatch` and the same candidate commit. It fetches the Jobs API record for
 every selected check and requires the job's exact ID, workflow-run ID, name,
 commit, state, conclusion, and `run_attempt` to agree with the check and the

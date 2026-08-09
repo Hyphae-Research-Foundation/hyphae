@@ -1,7 +1,7 @@
-# Native 1.0 development quickstart
+# Native 1.0 quickstart
 
-Status: implemented on `dev`; not a published `1.0.0` release until G7 and G8
-close on one exact commit.
+Status: implemented for `1.0.0`; publication requires G8 evidence on the exact
+release commit. G7 performance certification is tracked separately.
 
 This guide exercises the Native SQL, structure, and integrated search engines
 through one binary and one owned data directory. It starts no listener and
