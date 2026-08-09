@@ -112,6 +112,7 @@ pub const MAX_PRODUCT_SQL_PARAMETERS: usize = 1_024;
 pub const MAX_PRODUCT_SQL_ROWS: usize = 1_024;
 
 const MIGRATION_STORAGE_PREFIX: &[u8] = b"\0hyphae.migration.v1\0";
+const MIGRATION_SEARCH_BATCH_SIZE: usize = 512;
 
 /// One source lexical index prepared for offline migration.
 #[derive(Clone, Debug)]
@@ -450,58 +451,59 @@ impl NativeProduct {
         if lexical_indexes.is_empty() && vector_indexes.is_empty() {
             return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
         }
-        let total_documents = lexical_indexes
-            .iter()
-            .map(|index| index.documents.len())
-            .sum::<usize>();
-        let total_vectors = vector_indexes
-            .iter()
-            .map(|index| index.vectors.len())
-            .sum::<usize>();
         let mut last_receipt = None;
-        let mut lexical_offset = 0;
-        let mut vector_offset = 0;
-        while lexical_offset < lexical_indexes.len() || vector_offset < vector_indexes.len() {
-            let lexical_end = (lexical_offset + 1).min(lexical_indexes.len());
-            let vector_end = (vector_offset + 1).min(vector_indexes.len());
-            let mut transaction = self.database.begin(0, ProductDurability::Memory.into())?;
-            for index in &lexical_indexes[lexical_offset..lexical_end] {
-                transaction
-                    .create_search_index(index.index, &index.name)
-                    .map_err(|error| {
-                        eprintln!("migration create search runtime error: {error:?}");
-                        error
-                    })?;
-                for (document_id, text) in index.documents.iter().take(8) {
+        for index in lexical_indexes {
+            let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+            transaction
+                .create_search_index(index.index, &index.name)
+                .map_err(|error| {
+                    eprintln!("migration create search runtime error: {error:?}");
+                    error
+                })?;
+            let receipt = transaction.commit().map_err(|error| {
+                eprintln!("migration search commit error: {error:?}");
+                error
+            })?;
+            self.observe_commit(&receipt);
+            last_receipt = Some(receipt.into());
+            for documents in index.documents.chunks(MIGRATION_SEARCH_BATCH_SIZE) {
+                let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+                for (document_id, text) in documents {
                     transaction.index_document(index.index, document_id.clone(), text.clone())?;
                 }
+                let receipt = transaction.commit().map_err(|error| {
+                    eprintln!("migration search commit error: {error:?}");
+                    error
+                })?;
+                self.observe_commit(&receipt);
+                last_receipt = Some(receipt.into());
             }
-            for index in &vector_indexes[vector_offset..vector_end] {
-                let config = HnswConfig::new(
-                    8,
-                    32,
-                    16,
-                    4_096,
-                    u64::try_from(index.index.get())
-                        .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?,
-                )
+        }
+        for index in vector_indexes {
+            let config = HnswConfig::new(8, 32, 16, 4_096, migration_hnsw_seed(index.index))
                 .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
-                transaction
-                    .create_vector_index(
-                        index.index,
-                        &index.name,
-                        index.dimension,
-                        RuntimeVectorMetric::Cosine,
-                        config,
-                    )
-                    .map_err(|error| {
-                        eprintln!("migration create vector runtime error: {error:?}");
-                        error
-                    })?;
-                let vectors = index
-                    .vectors
+            let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+            transaction
+                .create_vector_index(
+                    index.index,
+                    &index.name,
+                    index.dimension,
+                    RuntimeVectorMetric::Cosine,
+                    config,
+                )
+                .map_err(|error| {
+                    eprintln!("migration create vector runtime error: {error:?}");
+                    error
+                })?;
+            let receipt = transaction.commit().map_err(|error| {
+                eprintln!("migration search commit error: {error:?}");
+                error
+            })?;
+            self.observe_commit(&receipt);
+            last_receipt = Some(receipt.into());
+            for records in index.vectors.chunks(MIGRATION_SEARCH_BATCH_SIZE) {
+                let vectors = records
                     .iter()
-                    .take(8)
                     .map(|(document_id, values)| {
                         Ok((
                             *document_id,
@@ -511,23 +513,21 @@ impl NativeProduct {
                         ))
                     })
                     .collect::<Result<Vec<_>, ProductError>>()?;
+                let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
                 transaction
                     .upsert_vectors(index.index, vectors)
                     .map_err(|error| {
                         eprintln!("migration upsert vector batch error: {error:?}");
                         error
                     })?;
+                let receipt = transaction.commit().map_err(|error| {
+                    eprintln!("migration search commit error: {error:?}");
+                    error
+                })?;
+                self.observe_commit(&receipt);
+                last_receipt = Some(receipt.into());
             }
-            let receipt = transaction.commit().map_err(|error| {
-                eprintln!("migration search commit error: {error:?}");
-                error
-            })?;
-            self.observe_commit(&receipt);
-            last_receipt = Some(receipt.into());
-            lexical_offset = lexical_end;
-            vector_offset = vector_end;
         }
-        let _ = (total_documents, total_vectors);
         last_receipt.ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))
     }
 
@@ -562,6 +562,7 @@ impl NativeProduct {
             if actual.len() != expected.len()
                 || actual.iter().zip(expected).any(|(actual, expected)| {
                     actual.object_id != expected.0
+                        || actual.vector.values().len() != expected.1.len()
                         || actual
                             .vector
                             .values()
@@ -825,6 +826,17 @@ impl NativeProduct {
     }
 }
 
+const fn migration_hnsw_seed(index: ObjectId) -> u64 {
+    let bytes = index.get().to_le_bytes();
+    let lower = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let upper = u64::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]);
+    lower ^ upper
+}
+
 fn foreign_prepared_error() -> ProductError {
     ProductError::foreign_prepared()
 }
@@ -834,9 +846,9 @@ mod tests {
     use std::{fs, io, path::PathBuf};
 
     use super::{
-        MAX_PRODUCT_SQL_STATEMENT_BYTES, NativeDatabase, NativeProduct, ObjectId, ProductError,
-        ProductErrorCategory, ProductErrorCode, ProductRetry, ProductTransactionState,
-        ProductValue,
+        MAX_PRODUCT_SQL_STATEMENT_BYTES, MigrationLexicalIndexInput, MigrationVectorIndexInput,
+        NativeDatabase, NativeProduct, ObjectId, ProductError, ProductErrorCategory,
+        ProductErrorCode, ProductRetry, ProductTransactionState, ProductValue,
     };
     use hyphae_native_blobs::BlobError;
     use hyphae_native_btree::BTreeError;
@@ -868,6 +880,53 @@ mod tests {
         assert_eq!(error.code(), ProductErrorCode::CatalogObjectNotFound);
         assert_eq!(error.category(), ProductErrorCategory::NotFound);
         drop(product);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_search_imports_every_record_and_survives_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary("migration-search-complete");
+        let _ = fs::remove_dir_all(&path);
+        let lexical_index = ObjectId::new(101)?;
+        let vector_index = ObjectId::new(102)?;
+        let documents = (0_u8..17)
+            .map(|value| (vec![value], format!("document {value}")))
+            .collect::<Vec<_>>();
+        let vectors = (0_u8..17)
+            .map(|value| -> Result<_, Box<dyn std::error::Error>> {
+                Ok((
+                    ObjectId::new(u128::from(value) + 1)?,
+                    vec![f32::from(value), f32::from(value) + 0.5],
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let lexical = vec![MigrationLexicalIndexInput {
+            index: lexical_index,
+            name: "migration_lexical".to_owned(),
+            documents: documents.clone(),
+        }];
+        let vector = vec![MigrationVectorIndexInput {
+            index: vector_index,
+            name: "migration_vector".to_owned(),
+            dimension: 2,
+            vectors: vectors.clone(),
+        }];
+        let expected_lexical = vec![(lexical_index, documents)];
+        let expected_vectors = vec![(vector_index, vectors)];
+
+        let mut product = NativeProduct::create(&path)?;
+        product.migration_store_search(&lexical, &vector)?;
+        assert!(product.migration_verify_search(&expected_lexical, &expected_vectors)?);
+        drop(product);
+
+        let reopened = NativeProduct::open(&path)?;
+        assert!(reopened.migration_verify_search(&expected_lexical, &expected_vectors)?);
+        let mut incomplete = expected_vectors.clone();
+        incomplete[0].1.pop();
+        assert!(!reopened.migration_verify_search(&expected_lexical, &incomplete)?);
+        drop(reopened);
         fs::remove_dir_all(path)?;
         Ok(())
     }

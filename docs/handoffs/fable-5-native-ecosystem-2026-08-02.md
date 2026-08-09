@@ -1,12 +1,14 @@
 # Fable 5 native-ecosystem handoff
 
-Status: active engineering handoff; PR 47 remains draft
+Status: superseded historical handoff. Do not use its gate table or next-step
+instructions as current authority. G0-G6 are closed and only G7-G8 remain
+open; see [`native-gate-status.md`](../gates/native-gate-status.md).
 
 Prepared: 2026-08-02 11:25:54 -05:00
 
 Audience: Fable 5 and the next Hyphae maintainer
 
-## Read this first
+## Historical context
 
 The immediate work is not a general migration or product cutover. It is the
 ordered secondary-index range milestone in draft

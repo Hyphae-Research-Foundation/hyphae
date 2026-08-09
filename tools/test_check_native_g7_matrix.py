@@ -5,25 +5,27 @@ import copy
 import unittest
 
 from tools.check_native_g7_matrix import GateFailure, validate_matrix
-from tools.test_check_native_g7_receipt import receipt
+from tools.test_check_native_g7_receipt import interference_receipt, receipt
 
 
 def matrix() -> dict:
     receipts = []
-    for state in ("warm", "cold"):
-        for concurrency in (1, 8, 32):
-            value = receipt()
-            value["state"] = state
-            value["concurrency"] = concurrency
-            receipts.append(value)
+    for state in ("warm",):
+        for background in ("control", "interference"):
+            for concurrency in (1, 8, 32):
+                value = interference_receipt() if background == "interference" else receipt()
+                value["state"] = state
+                value["concurrency"] = concurrency
+                receipts.append(value)
     return {
-        "schema": "hyphae-native-g7-matrix-v1",
+        "schema": "hyphae-native-g7-matrix-v2",
         "gate": "G7",
-        "status": "supporting-incomplete",
+        "status": "closure-candidate",
         "source_commit": "a" * 40,
         "platform": "linux",
-        "states": ["warm", "cold"],
+        "states": ["warm"],
         "concurrency": [1, 8, 32],
+        "background_modes": ["control", "interference"],
         "receipts": receipts,
         "claims": [],
         "closure_declared": False,
@@ -39,6 +41,12 @@ class G7MatrixTests(unittest.TestCase):
         payload = matrix()
         payload["receipts"][0] = copy.deepcopy(payload["receipts"][0])
         payload["receipts"][0]["cells"].pop("hybrid-top10")
+        with self.assertRaises(GateFailure):
+            validate_matrix(payload, "a" * 40)
+
+    def test_mixed_build_identity_fails(self) -> None:
+        payload = matrix()
+        payload["receipts"][0]["build"]["binary_sha256"] = "d" * 64
         with self.assertRaises(GateFailure):
             validate_matrix(payload, "a" * 40)
 

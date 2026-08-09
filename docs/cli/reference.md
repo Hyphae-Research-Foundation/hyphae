@@ -47,13 +47,17 @@ All commands also accept `--help`; the executable accepts `--version`.
 
 ## Common data-directory behavior
 
-`put`, `get`, `delete`, `query`, `snapshot`, `compact`, `backup`, `restore`,
-`doctor`, and `serve` require `--data-dir <PATH>` or `HYPHAE_DATA_DIR`.
-Opening the path initializes it if absent, verifies durable state, rebuilds a
-stale disposable index, and takes an exclusive operating-system lock.
+Commands that operate on live state accept `--data-dir <PATH>` or
+`HYPHAE_DATA_DIR`. Format-2 compatibility commands initialize an absent path;
+Native commands require an existing directory created by `init`. Opening live
+state verifies recovery authority and takes an exclusive operating-system lock.
 
 Every path supplied to `--out` or restore destination must be new. Hyphae
 refuses to replace an existing proof, witness, backup, or data directory.
+
+Commands in the Native `dev` surface never initialize a missing directory on
+open: use `init` first. The format-2 compatibility commands retain their
+published `0.2.1` initialization behavior.
 
 ## `version`
 
@@ -136,26 +140,143 @@ Creates or reuses the canonical logical snapshot for the current checkpoint.
 Output includes path, checkpoint identity, snapshot digest, entry/receipt
 counts, and file length.
 
+## `migrate`
+
+```text
+hyphae migrate inspect --source <FORMAT2_DIRECTORY>
+hyphae migrate run --source <FORMAT2_DIRECTORY> --target <NEW_NATIVE_DIRECTORY> --manifest <NEW_FILE>
+hyphae migrate verify --source <FORMAT2_DIRECTORY> --target <NATIVE_DIRECTORY> --manifest <FILE>
+hyphae migrate promote --source <FORMAT2_DIRECTORY> --target <PENDING_NATIVE_DIRECTORY> --manifest <FILE>
+hyphae migrate rollback --target <PENDING_NATIVE_DIRECTORY> [--manifest <FILE>]
+```
+
+The importer reads the format-2 source without mutating it, creates a separate
+pending Native directory, verifies identity and logical SQL/structure/search
+equivalence, and requires explicit promotion. Rollback only removes an
+unpromoted target owned by the migration manifest.
+
+## `init` and `capabilities`
+
+```text
+hyphae init --data-dir <NEW_NATIVE_DIRECTORY>
+hyphae capabilities --data-dir <NATIVE_DIRECTORY>
+```
+
+`init` fails if the destination exists. `capabilities` reports the Native
+product API, directory format, operations, limits, and durability classes
+without starting a listener.
+
+## `catalog`
+
+```text
+hyphae catalog --data-dir <NATIVE_DIRECTORY> <list|describe|resolve|dependencies|create-keyspace|create-search-collection> ...
+```
+
+Catalog pages are bounded and stable-ID ordered. Creation commands atomically
+publish catalog-owned keyspaces or an integrated search collection; inspect
+each subcommand's help for typed IDs, families, limits, and durability.
+
+## `sql`
+
+```text
+hyphae sql --data-dir <NATIVE_DIRECTORY> execute --statement <SQL> [--parameter <JSON>]... [--durability <CLASS>]
+hyphae sql --data-dir <NATIVE_DIRECTORY> prepared --statement <SQL> [--parameter <JSON>]...
+```
+
+Parameters are canonical JSON scalars in statement order. `prepared` prepares,
+executes, and deallocates in one retained session; both commands return typed
+commit or bounded row results.
+
+## `structure`
+
+```text
+hyphae structure --data-dir <NATIVE_DIRECTORY> <get|set|ttl|batch|read> ...
+```
+
+`get`, `set`, and `ttl` address the scalar Native keyspace. `batch` applies a
+typed JSON mutation array atomically across catalogued strings, counters,
+hashes, lists, sets, sorted sets, and streams. `read` accepts the corresponding
+bounded typed read request.
+
+## `search`
+
+```text
+hyphae search --data-dir <NATIVE_DIRECTORY> <provision|query|integrated|ingest|update|delete> ...
+```
+
+`provision` creates catalog-owned physical indexes. Ingest/update/delete are
+idempotent all-branch mutations. Query surfaces cover lexical term/phrase/
+prefix/fuzzy matching and integrated lexical, exact-vector, ANN, hybrid,
+filter, sort, facet, and metric execution.
+
+## `transaction`
+
+```text
+hyphae transaction --data-dir <NATIVE_DIRECTORY> execute --steps-json <ARRAY> [--durability <CLASS>]
+hyphae transaction --data-dir <NATIVE_DIRECTORY> status --id <U128>
+```
+
+The script retains one explicit transaction session for SQL, structure,
+search, and vector stages followed by commit or rollback. `status` resolves
+durable outcome evidence after disconnect or an uncertain commit response.
+
+## `explain`, `status`, and `telemetry`
+
+```text
+hyphae explain --data-dir <NATIVE_DIRECTORY> sql --statement <SQL>
+hyphae status --data-dir <NATIVE_DIRECTORY>
+hyphae telemetry --data-dir <NATIVE_DIRECTORY>
+```
+
+`explain` returns bounded physical plan text without execution. `status`
+reports the all-engine catalog/root/CSN state. `telemetry` returns a bounded,
+redacted process-local snapshot and does not enable a background exporter.
+
+## `checkpoint` and `vacuum`
+
+```text
+hyphae checkpoint --data-dir <NATIVE_DIRECTORY>
+hyphae vacuum --data-dir <NATIVE_DIRECTORY>
+```
+
+`checkpoint` synchronizes and publishes one all-engine recovery boundary.
+`vacuum` rebuilds live roots into a smaller page generation and publishes it
+atomically; neither command is an online compaction latency promise.
+
+## `proof`
+
+```text
+hyphae proof generate --data-dir <NATIVE_DIRECTORY> --operation-json <JSON> --proof-out <NEW_FILE> --witness-out <NEW_FILE>
+hyphae proof verify --proof <FILE> --witness <FILE> --anchor <64_HEX_CHARS>
+```
+
+Native proof generation covers admitted catalog, SQL, and product reads. The
+offline verifier checks the proof, complete witness, canonical request/result,
+and independently supplied anchor without opening live state.
+
 ## `compact`
 
 ```text
 hyphae compact --data-dir <PATH>
 ```
 
-Creates/reuses a verified snapshot, selects a new log generation through an
-immutable manifest, and only then retires the old segment. Output is either a
-compaction report or an already-compacted outcome. Logical records and commit
-receipts remain unchanged.
+For Native directories this compacts the selected root family (`structures` by
+default) and atomically publishes the result. For format-2 compatibility state
+it creates/reuses a verified snapshot, selects a new log generation through an
+immutable manifest, and only then retires the old segment.
 
 ## `backup`
 
 ```text
 hyphae backup --data-dir <PATH> --out <NEW_DIRECTORY>
+hyphae backup create --data-dir <NATIVE_DIRECTORY> --out <NEW_DIRECTORY>
+hyphae backup verify --backup <NATIVE_BACKUP_DIRECTORY>
 ```
 
-Creates one portable backup at a locked logical checkpoint. The destination
-contains exactly `BACKUP.json` and `snapshot.hysnap`; it must not exist and
-must be outside the live data directory.
+The first form creates a published format-2 portable backup. The Native form
+creates a synchronized physical backup containing `NATIVE_BACKUP.json` and an
+exact data inventory, then verifies it before promotion. Destinations must be
+new and outside the source.
 
 ## `backup-verify`
 
@@ -163,8 +284,9 @@ must be outside the live data directory.
 hyphae backup-verify --backup <DIRECTORY>
 ```
 
-Verifies backup layout, manifest metadata, snapshot framing/checksums/digest,
-and checkpoint identity without creating or opening a live data directory.
+Verifies the published format-2 backup layout, manifest metadata, snapshot
+framing/checksums/digest, and checkpoint identity without opening live state.
+Use `backup verify` for a Native backup.
 
 ## `restore`
 
@@ -172,9 +294,9 @@ and checkpoint identity without creating or opening a live data directory.
 hyphae restore --backup <DIRECTORY> --data-dir <NEW_DIRECTORY>
 ```
 
-Verifies the source, reconstructs and reopens storage in a sibling staging
-directory, then atomically activates the new destination. It never merges or
-overwrites data and does not modify the backup.
+Verifies a Native backup, reconstructs and reopens storage in a sibling staging
+directory, runs mandatory doctor validation, then atomically activates the new
+destination. It never merges or overwrites data and does not modify the backup.
 
 ## `doctor`
 
@@ -182,10 +304,10 @@ overwrites data and does not modify the backup.
 hyphae doctor --data-dir <PATH>
 ```
 
-Opens and verifies the format, manifest, snapshot, log chain, recovery state,
-and materialized index, then creates/reuses a logical snapshot. Success prints
-`status: healthy` plus recovery and checkpoint evidence. It is not an
-in-place corruption repair tool.
+Auto-detects Native versus format-2 state and runs the matching bounded offline
+diagnosis. Native diagnosis verifies format, pages, WAL, manifests, blobs,
+indexes, catalog/root authority, and recovery state. It is not an in-place
+corruption repair tool.
 
 ## `verify`
 
@@ -225,13 +347,14 @@ candidate-count policy.
 ```text
 hyphae serve --data-dir <PATH> [--bind <IP:PORT>]
              [--bearer-token-file <PATH>]
+hyphae serve --data-dir <NATIVE_DIRECTORY> [--endpoint <LOCAL_ENDPOINT>]
+             [--http-bind <IP:PORT>]
 ```
 
-Starts API v1 and owns the data directory until Ctrl+C. The default bind is
-`127.0.0.1:8787`. A non-loopback bind is rejected before socket creation
-unless a valid bearer token file or `HYPHAE_BEARER_TOKEN` is present. The
-binary uses the audited default resource policy; inspect it with
-`/v1/capabilities`.
+Native state starts the local UDS/named-pipe daemon and, only when requested,
+the HTTP `/v2` edge. `--bind` selects the separate format-2 `/v1` compatibility
+server. The process owns the directory until shutdown and refuses mixed Native
+and format-2 listener options.
 
 ## `remote`
 

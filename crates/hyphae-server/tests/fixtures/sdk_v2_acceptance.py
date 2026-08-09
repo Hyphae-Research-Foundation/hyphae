@@ -112,5 +112,30 @@ assert verified.kind == "proof_verification"
 assert verified.value["semantic_reexecution_performed"]
 proof_local.close()
 
+for offset, client in enumerate((local, http)):
+    row_id = 20_200 + offset
+    begun = client.transaction_begin(options=RequestOptions(request_id=20_200 + offset * 10))
+    assert begun.kind == "explicit_transaction_status"
+    assert begun.value["state"] == "active"
+    handle = begun.value["handle"]
+    staged = client.transaction_stage_sql(
+        handle,
+        "INSERT INTO proof_items (id, label) VALUES (?, ?)",
+        [row_id, f"python-{offset}"],
+        options=RequestOptions(request_id=20_201 + offset * 10),
+    )
+    assert staged.kind == "transaction_staged"
+    assert staged.value["result"]["kind"] == "sql"
+    rolled_back = client.transaction_rollback(
+        handle, options=RequestOptions(request_id=20_202 + offset * 10)
+    )
+    assert rolled_back.kind == "transaction_rolled_back"
+    selected = client.sql(
+        "SELECT label FROM proof_items WHERE id = ?",
+        [row_id],
+        options=RequestOptions(request_id=20_203 + offset * 10),
+    )
+    assert selected.value["result"]["rows"] == []
+
 local.close()
 denied_local.close()

@@ -2036,6 +2036,59 @@ impl ProductOperation {
         }
     }
 
+    /// Returns whether this operation is a side-effect-free read eligible for
+    /// provisional read streaming.
+    ///
+    /// Session mutations such as preparing SQL or staging and rolling back an
+    /// explicit transaction are deliberately excluded even when they do not
+    /// publish durable product state.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Capabilities
+            | Self::CatalogObject { .. }
+            | Self::CatalogObjectNamed { .. }
+            | Self::CatalogList(_)
+            | Self::CatalogDependencies(_)
+            | Self::CatalogDescribe { .. }
+            | Self::CatalogResolve { .. }
+            | Self::ExecutePrepared { .. }
+            | Self::StructureGet { .. }
+            | Self::StructureTtl { .. }
+            | Self::StructureRead(_)
+            | Self::ExplicitTransactionStatus { .. }
+            | Self::TransactionStatus { .. }
+            | Self::TransactionStatusByIdempotency { .. }
+            | Self::Search { .. }
+            | Self::SearchCollection { .. }
+            | Self::AdminStatus
+            | Self::AdminExplainSql { .. }
+            | Self::Doctor(_)
+            | Self::Telemetry
+            | Self::VerifyProof { .. } => true,
+            Self::ExecuteSql { statement, .. } => sql_is_read(statement),
+            Self::Prove { operation, .. } => operation.is_read_only(),
+            Self::CatalogCreate { .. }
+            | Self::PrepareSql { .. }
+            | Self::DeallocatePrepared { .. }
+            | Self::StructureSet { .. }
+            | Self::StructureMutate { .. }
+            | Self::TransactionBegin
+            | Self::TransactionStageSql { .. }
+            | Self::TransactionStageStructure { .. }
+            | Self::TransactionStageSearch { .. }
+            | Self::TransactionStageVector { .. }
+            | Self::TransactionCommit { .. }
+            | Self::TransactionRollback { .. }
+            | Self::SearchIngest { .. }
+            | Self::SearchDocumentUpdate { .. }
+            | Self::SearchDocumentDelete { .. }
+            | Self::AdminCheckpoint
+            | Self::Backup(_)
+            | Self::Restore(_) => false,
+        }
+    }
+
     fn is_mutating(&self) -> bool {
         matches!(
             self,

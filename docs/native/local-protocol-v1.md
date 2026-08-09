@@ -1,11 +1,7 @@
 # Native local protocol v1
 
-Status: normative target contract; the portable frame and product codecs,
-complete capability handshake, canonical errors, provisional completion,
-flow-control, cancellation/deadline controls, multi-client UDS daemon, and safe
-Windows named-pipe implementation compile path are present. The broader G6
-product operation matrix and cross-platform functional receipts remain
-incomplete.
+Status: implemented normative contract; G6 cross-surface and cross-platform
+receipts are closed for the bounded product profile
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.

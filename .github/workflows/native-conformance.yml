@@ -1,6 +1,7 @@
 name: Native Conformance Aggregate
 
 on:
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -31,7 +32,7 @@ jobs:
           script: |
             const sha = context.payload.pull_request?.head.sha || context.sha;
             let run;
-            for (let attempt = 1; attempt <= 40; attempt++) {
+            for (let attempt = 1; attempt <= 80; attempt++) {
               const response = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -43,7 +44,7 @@ jobs:
                 .filter(item => item.head_sha === sha && item.conclusion === 'success')
                 .sort((a, b) => b.run_number - a.run_number)[0];
               if (run) break;
-              core.info(`waiting for successful CI run for ${sha} (${attempt}/40)`);
+              core.info(`waiting for successful CI run for ${sha} (${attempt}/80)`);
               await new Promise(resolve => setTimeout(resolve, 30000));
             }
             if (!run) {

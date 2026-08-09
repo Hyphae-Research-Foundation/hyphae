@@ -7,15 +7,16 @@ an uploaded version cannot be overwritten or deleted. Run this procedure only
 from an exact, newly versioned release commit after its complete hosted gate is
 green.
 
-The native crates remain unpublished at `0.2.1`. The current
+The native crates remain unpublished on crates.io. The `1.0.0` candidate
 `hyphae-client`, `hyphae-server`, and `hyphae-cli` source packages use those
 native internals and are therefore also marked `publish = false`.
 `hyphae-pliegors` is likewise unpublished because its normal dependency on
 `hyphae-client` would not resolve from crates.io. These packages remain in the
 workspace for local builds and packaging, but are not publication candidates.
-A future release must first assign a new version and establish a complete
-publishable dependency closure; it must not add publication commands for these
-packages while that closure is unpublished.
+is intentionally distributed by the signed multiplatform archive workflow;
+the Rust registry publication boundary remains the six-crate compatibility
+closure below. Expanding crates.io publication to the Native crates requires a
+separate accepted dependency-closure and registry receipt.
 
 ## Preconditions
 
@@ -42,7 +43,7 @@ packages while that closure is unpublished.
 The current publishable package audit covers these packages in dependency
 order. The commands show the current publishable closure but must not be run
 at `0.2.1`, which already exists. A future release procedure must first update
-the workspace version:
+the workspace release version:
 
 ```bash
 cargo publish --locked -p hyphae-core

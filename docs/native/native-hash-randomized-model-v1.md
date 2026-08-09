@@ -1,6 +1,6 @@
 # Native hash randomized-model gate v1
 
-Status: implemented and evidenced on direct Linux; hosted CI pending.
+Status: implemented and retained by the closed G3 structure gate.
 
 Evidence:
 [native hash randomized-model Linux receipt](../gates/evidence/native-hash-randomized-model-linux-2026-08-03.md).

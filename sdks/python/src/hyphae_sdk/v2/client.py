@@ -117,5 +117,52 @@ class HyphaeClient:
     def transaction_status(self, transaction_id: int, *, options: RequestOptions | None = None) -> Response:
         return self.execute("transaction_status", {"transaction_id": transaction_id}, options=options)
 
+    def transaction_begin(self, *, options: RequestOptions | None = None) -> Response:
+        return self.execute("transaction_begin", options=options)
+
+    def transaction_stage_sql(self, handle: int, statement: str, parameters: list[object] | None = None, *, options: RequestOptions | None = None) -> Response:
+        return self.execute(
+            "transaction_stage_sql",
+            {"handle": handle, "statement": statement, "parameters": parameters or []},
+            options=options,
+        )
+
+    def transaction_stage_structure(self, handle: int, mutation: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+        return self.execute(
+            "transaction_stage_structure",
+            {"handle": handle, "mutation": mutation},
+            options=options,
+        )
+
+    def transaction_stage_search(self, handle: int, mutation: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+        return self.execute(
+            "transaction_stage_search",
+            {"handle": handle, "mutation": mutation},
+            options=options,
+        )
+
+    def transaction_stage_vector(self, handle: int, mutation: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+        return self.execute(
+            "transaction_stage_vector",
+            {"handle": handle, "mutation": mutation},
+            options=options,
+        )
+
+    def transaction_commit(self, handle: int, *, options: RequestOptions | None = None) -> Response:
+        return self.execute("transaction_commit", {"handle": handle}, options=options)
+
+    def transaction_rollback(self, handle: int, *, options: RequestOptions | None = None) -> Response:
+        return self.execute("transaction_rollback", {"handle": handle}, options=options)
+
+    def explicit_transaction_status(self, handle: int, *, options: RequestOptions | None = None) -> Response:
+        return self.execute("explicit_transaction_status", {"handle": handle}, options=options)
+
+    def transaction_status_by_idempotency(self, idempotency_token: int, *, options: RequestOptions | None = None) -> Response:
+        return self.execute(
+            "transaction_status_by_idempotency",
+            {"idempotency_token": idempotency_token},
+            options=options,
+        )
+
 
 __all__ = ["HyphaeClient", "Transport"]

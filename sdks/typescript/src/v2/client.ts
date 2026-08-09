@@ -146,4 +146,40 @@ export class HyphaeClient {
     return this.execute("transaction_status", { transaction_id: transactionId }, options);
   }
 
+  transactionBegin(options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_begin", {}, options);
+  }
+
+  transactionStageSql(handle: bigint, statement: string, parameters: readonly unknown[] = [], options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_stage_sql", { handle, statement, parameters }, options);
+  }
+
+  transactionStageStructure(handle: bigint, mutation: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_stage_structure", { handle, mutation }, options);
+  }
+
+  transactionStageSearch(handle: bigint, mutation: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_stage_search", { handle, mutation }, options);
+  }
+
+  transactionStageVector(handle: bigint, mutation: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_stage_vector", { handle, mutation }, options);
+  }
+
+  transactionCommit(handle: bigint, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_commit", { handle }, options);
+  }
+
+  transactionRollback(handle: bigint, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_rollback", { handle }, options);
+  }
+
+  explicitTransactionStatus(handle: bigint, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("explicit_transaction_status", { handle }, options);
+  }
+
+  transactionStatusByIdempotency(idempotencyToken: bigint, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("transaction_status_by_idempotency", { idempotency_token: idempotencyToken }, options);
+  }
+
 }

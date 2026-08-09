@@ -121,12 +121,24 @@ class DependencyReviewTests(unittest.TestCase):
         }
         self.assertLessEqual(native_manifests, set(CARGO_MANIFESTS))
 
-    def test_g6_runner_manifest_and_lock_are_registered(self) -> None:
-        self.assertIn("conformance/g6/runners/rust/Cargo.toml", CARGO_MANIFESTS)
-        self.assertIn(
+    def test_conformance_manifests_and_isolated_locks_are_registered(self) -> None:
+        for manifest in (
+            "conformance/g6/runners/rust/Cargo.toml",
+            "conformance/g7/runners/rust/Cargo.toml",
+            "conformance/g8/independent-backup-verifier/Cargo.toml",
+        ):
+            self.assertIn(manifest, CARGO_MANIFESTS)
+        for lock in (
             "conformance/g6/runners/rust/Cargo.lock",
-            REGISTERED_DEPENDENCY_FILES,
-        )
+            "conformance/g7/runners/rust/Cargo.lock",
+        ):
+            self.assertIn(lock, REGISTERED_DEPENDENCY_FILES)
+
+    @patch("tools.review_dependencies.validate_cargo_lock")
+    def test_g7_runner_manifest_checks_its_isolated_lock(self, check_lock) -> None:
+        manifest = "conformance/g7/runners/rust/Cargo.toml"
+        validate_manifest_lock_pairs({manifest}, HEAD)
+        check_lock.assert_called_once_with(HEAD, manifest)
 
     def test_unregistered_dependency_families_are_rejected(self) -> None:
         paths = (
@@ -244,6 +256,7 @@ class DependencyReviewTests(unittest.TestCase):
         for path in (
             "Cargo.lock",
             "conformance/g6/runners/rust/Cargo.lock",
+            "conformance/g7/runners/rust/Cargo.lock",
             "fuzz/Cargo.lock",
             "sdks/typescript/package-lock.json",
             "integrations/javascript/package-lock.json",

@@ -161,6 +161,102 @@ fn init_is_explicit_and_read_only_commands_never_create() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn search_collection_helper_is_one_atomic_catalog_commit() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "CREATE TABLE occupied (id BIGINT PRIMARY KEY)",
+    ])?;
+    let failed = output(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.occupied",
+    ])?;
+    assert!(!failed.status.success());
+    let catalog = run(&["catalog", "--data-dir", &data_text, "list"])?;
+    let items = catalog["items"].as_array().ok_or("catalog items absent")?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "main.public.occupied");
+    Ok(())
+}
+
+#[test]
+fn separate_cli_transactions_use_distinct_default_idempotency() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.search",
+    ])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-keyspace",
+        "--id",
+        "20",
+        "--parent",
+        "11",
+        "--name",
+        "main.public.values",
+        "--family",
+        "string",
+    ])?;
+    for key in ["first", "second"] {
+        let steps = serde_json::json!([
+            {"operation":"stage_structure","mutation":{
+                "operation":"string_set","keyspace":20,"key":key,
+                "value":"committed","expires_at_micros":null
+            }},
+            {"operation":"commit"}
+        ])
+        .to_string();
+        let result = run(&[
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--steps-json",
+            &steps,
+        ])?;
+        assert_eq!(result["steps"][2]["status"], "committed");
+    }
+    Ok(())
+}
+
+#[test]
 fn format2_migration_runs_verifies_promotes_and_keeps_source_unchanged()
 -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new()?;

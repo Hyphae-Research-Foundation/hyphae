@@ -1520,7 +1520,7 @@ fn import_migration_snapshot(
     product: &mut NativeProduct,
     snapshot: &SnapshotContents,
 ) -> Result<MigrationManifest, CliFailure> {
-    for object in [
+    let catalog_objects = vec![
         LogicalCatalogObject::V2(CatalogObjectV2::Database(catalog_header(
             1,
             EngineKind::Kernel,
@@ -1550,14 +1550,13 @@ fn import_migration_snapshot(
             eviction: KeyspaceEvictionPolicy::None,
             relation_schema: None,
         })),
-    ] {
-        product
-            .create_catalog_object_v2(object, ProductDurability::Memory)
-            .map_err(|error| {
-                eprintln!("migration catalog create failed: {error:?}");
-                error
-            })?;
-    }
+    ];
+    product
+        .create_catalog_objects_v2(catalog_objects, ProductDurability::Memory)
+        .map_err(|error| {
+            eprintln!("migration catalog create failed: {error:?}");
+            error
+        })?;
 
     let mut documents = Vec::with_capacity(snapshot.entries.len());
     let mut records = Vec::with_capacity(snapshot.entries.len());
@@ -1582,57 +1581,15 @@ fn import_migration_snapshot(
         }
     }
 
-    let mut lexical_inputs = Vec::with_capacity(snapshot.lexical_indexes.len());
-    let mut vector_inputs = Vec::with_capacity(snapshot.vector_spaces.len());
-    for definition in &snapshot.lexical_indexes {
-        let index = migration_object_id(b"lexical-index", definition.name.as_str().as_bytes())?;
-        let mut indexed_documents = Vec::with_capacity(snapshot.entries.len());
-        for entry in &snapshot.entries {
-            let value = decode_legacy_document(&entry.value)?;
-            let text = lexical_text(&value, definition);
-            let document_id = document_ids
-                .get(&entry.key)
-                .ok_or_else(CliFailure::internal)?
-                .get()
-                .to_be_bytes()
-                .to_vec();
-            indexed_documents.push((document_id, text));
-        }
-        lexical_inputs.push(MigrationLexicalIndexInput {
-            index,
-            name: format!("__migration_lexical_{}", definition.name),
-            documents: indexed_documents,
-        });
+    let (lexical_inputs, vector_inputs) = migration_search_inputs(snapshot, &document_ids)?;
+    if !lexical_inputs.is_empty() || !vector_inputs.is_empty() {
+        product
+            .migration_store_search(&lexical_inputs, &vector_inputs)
+            .map_err(|error| {
+                eprintln!("migration search import failed: {error:?}");
+                error
+            })?;
     }
-    for definition in &snapshot.vector_spaces {
-        let index = migration_object_id(b"vector-space", definition.name.as_str().as_bytes())?;
-        let mut vectors = Vec::new();
-        for vector in snapshot
-            .vectors
-            .iter()
-            .filter(|vector| vector.space == definition.name)
-        {
-            let object_id = document_ids
-                .get(&vector.key)
-                .ok_or_else(CliFailure::internal)?;
-            vectors.push((
-                *object_id,
-                vector
-                    .vector
-                    .as_slice()
-                    .iter()
-                    .map(|value| f32::from(*value) / 32_767.0)
-                    .collect(),
-            ));
-        }
-        vector_inputs.push(MigrationVectorIndexInput {
-            index,
-            name: format!("__migration_vector_{}", definition.name),
-            dimension: definition.dimension,
-            vectors,
-        });
-    }
-    let _ = (lexical_inputs, vector_inputs);
 
     let mut objects = vec![MigrationObject {
         kind: "legacy-records".to_owned(),
@@ -1772,6 +1729,68 @@ fn decode_legacy_document(encoded: &[u8]) -> Result<LegacyValue, CliFailure> {
     decode_document(encoded).map_err(|_| CliFailure::invalid())
 }
 
+fn migration_search_inputs(
+    snapshot: &SnapshotContents,
+    document_ids: &BTreeMap<Vec<u8>, ObjectId>,
+) -> Result<
+    (
+        Vec<MigrationLexicalIndexInput>,
+        Vec<MigrationVectorIndexInput>,
+    ),
+    CliFailure,
+> {
+    let mut lexical_inputs = Vec::with_capacity(snapshot.lexical_indexes.len());
+    for definition in &snapshot.lexical_indexes {
+        let index = migration_object_id(b"lexical-index", definition.name.as_str().as_bytes())?;
+        let mut documents = Vec::with_capacity(snapshot.entries.len());
+        for entry in &snapshot.entries {
+            let value = decode_legacy_document(&entry.value)?;
+            let document_id = document_ids
+                .get(&entry.key)
+                .ok_or_else(CliFailure::internal)?
+                .get()
+                .to_be_bytes()
+                .to_vec();
+            documents.push((document_id, lexical_text(&value, definition)));
+        }
+        lexical_inputs.push(MigrationLexicalIndexInput {
+            index,
+            name: format!("__migration_lexical_{}", definition.name),
+            documents,
+        });
+    }
+    let mut vector_inputs = Vec::with_capacity(snapshot.vector_spaces.len());
+    for definition in &snapshot.vector_spaces {
+        let index = migration_object_id(b"vector-space", definition.name.as_str().as_bytes())?;
+        let mut vectors = Vec::new();
+        for vector in snapshot
+            .vectors
+            .iter()
+            .filter(|vector| vector.space == definition.name)
+        {
+            let object_id = document_ids
+                .get(&vector.key)
+                .ok_or_else(CliFailure::internal)?;
+            vectors.push((
+                *object_id,
+                vector
+                    .vector
+                    .as_slice()
+                    .iter()
+                    .map(|value| f32::from(*value) / 32_767.0)
+                    .collect(),
+            ));
+        }
+        vector_inputs.push(MigrationVectorIndexInput {
+            index,
+            name: format!("__migration_vector_{}", definition.name),
+            dimension: definition.dimension,
+            vectors,
+        });
+    }
+    Ok((lexical_inputs, vector_inputs))
+}
+
 fn lexical_text(
     value: &LegacyValue,
     definition: &hyphae_retrieval::LexicalIndexDefinition,
@@ -1850,17 +1869,14 @@ fn verify_migration_product(
     if manifest.target.logical_digest != target_digest {
         return Err(CliFailure::invalid());
     }
-    let native = product.snapshot_bounded(0).map_err(|error| {
-        eprintln!("migration target snapshot error: {error:?}");
-        CliFailure::invalid()
-    })?;
     let mut expected_documents = Vec::with_capacity(snapshot.entries.len());
+    let mut document_ids = BTreeMap::new();
     for entry in &snapshot.entries {
+        let object_id = migration_object_id(b"document", &entry.key)?;
+        document_ids.insert(entry.key.clone(), object_id);
         expected_documents.push(MigrationDocument {
             source_key: encode_hex(&entry.key),
-            object_id: migration_object_id(b"document", &entry.key)?
-                .get()
-                .to_string(),
+            object_id: object_id.get().to_string(),
         });
     }
     expected_documents.sort();
@@ -1881,7 +1897,24 @@ fn verify_migration_product(
     if manifest.receipts != expected_receipts {
         return Err(CliFailure::invalid());
     }
-    let _ = native;
+    let (lexical_inputs, vector_inputs) = migration_search_inputs(snapshot, &document_ids)?;
+    let lexical_expected = lexical_inputs
+        .into_iter()
+        .map(|input| (input.index, input.documents))
+        .collect::<Vec<_>>();
+    let vector_expected = vector_inputs
+        .into_iter()
+        .map(|input| (input.index, input.vectors))
+        .collect::<Vec<_>>();
+    if !product
+        .migration_verify_search(&lexical_expected, &vector_expected)
+        .map_err(|error| {
+            eprintln!("migration search verification error: {error:?}");
+            error
+        })?
+    {
+        return Err(CliFailure::invalid());
+    }
     let mut expected_objects = vec![MigrationObject {
         kind: "legacy-records".to_owned(),
         source_identity: "format-2".to_owned(),
@@ -1983,8 +2016,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             dimension,
             durability,
         } => {
-            let mut client = open_client(local)?;
-            for object in [
+            let mut objects = vec![
                 LogicalCatalogObject::V2(CatalogObjectV2::Database(catalog_header(
                     database,
                     EngineKind::Kernel,
@@ -1997,12 +2029,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                     "main.public.schema",
                     Some(database),
                 )?)),
-            ] {
-                client.dispatch_with_durability(
-                    ProductOperation::CatalogCreate { object },
-                    durability.into(),
-                )?;
-            }
+            ];
             let analyzer_name = format!("{name}_analyzer");
             let analyzer_object =
                 LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
@@ -2015,12 +2042,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                     tokenizer: AnalyzerTokenizer::UnicodeWord,
                     filters: vec![AnalyzerFilter::Lowercase],
                 }));
-            client.dispatch_with_durability(
-                ProductOperation::CatalogCreate {
-                    object: analyzer_object,
-                },
-                durability.into(),
-            )?;
+            objects.push(analyzer_object);
             let ann = AnnIndexDefinition::new(VectorMetric::SquaredL2, 8, 32, 16, 256, 7)
                 .map_err(|_| CliFailure::invalid())?;
             let lifecycle = IncrementalVectorLifecycle {
@@ -2079,11 +2101,12 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                     ],
                 },
             ));
-            let created = client.dispatch_with_durability(
-                ProductOperation::CatalogCreate { object },
-                durability.into(),
-            )?;
-            return print_json(&response_json(created));
+            objects.push(object);
+            let mut product = NativeProduct::open(&local.data_dir)?;
+            let receipt = product.create_catalog_objects_v2(objects, durability.into())?;
+            return print_json(&response_json(ProductResponse::CatalogCreated(
+                ProductCommitOutcome::Committed(receipt),
+            )));
         }
     };
     dispatch(local, operation)

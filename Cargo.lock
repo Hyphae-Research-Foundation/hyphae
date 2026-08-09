@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-cli"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "clap",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-client"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-contracts",
  "hyphae-native-daemon",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-conformance-rust"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-client",
  "hyphae-contracts",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -642,11 +642,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "0.2.1"
+version = "1.0.0"
 
 [[package]]
 name = "hyphae-engine"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -660,8 +660,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-independent-backup-verifier"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hyphae-native-ann"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -670,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -681,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-pages",
@@ -691,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -699,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-daemon"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-product",
  "hyphae-native-protocol",
@@ -711,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-manifest"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -722,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -731,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -741,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-product"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-blobs",
@@ -757,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-protocol"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -769,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-records"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -778,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -802,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-types"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -810,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-wal"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -820,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-pliegors"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-client",
  "thiserror",
@@ -828,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -839,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-retrieval"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-core",
  "hyphae-query",
@@ -852,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-server"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "axum",
  "base64 0.23.0",
@@ -882,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-storage"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",

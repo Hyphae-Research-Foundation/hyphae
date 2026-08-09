@@ -1,4 +1,8 @@
-# Local quickstart
+# Published 0.2.1 compatibility quickstart
+
+This guide is retained for the published format-2 `0.2.1` product. For the
+current Native `dev` architecture and 1.0 candidate commands, use the
+[Native development quickstart](quickstart-native.md).
 
 This quickstart exercises Hyphae as one executable and one owned data
 directory. It does not start or contact a database, cache, cloud service,

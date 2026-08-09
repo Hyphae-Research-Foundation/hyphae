@@ -154,9 +154,31 @@ impl NativeProduct {
         object: LogicalCatalogObject,
         durability: crate::ProductDurability,
     ) -> Result<crate::ProductCommitReceipt, ProductError> {
+        self.create_catalog_objects_v2(vec![object], durability)
+    }
+
+    /// Durably creates one ordered batch of generic logical catalog V2 objects.
+    ///
+    /// The batch is one atomic catalog commit. Parent objects must precede
+    /// their dependents; an invalid object publishes none of the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable request, limit, conflict, I/O, or corruption error.
+    pub fn create_catalog_objects_v2(
+        &mut self,
+        objects: Vec<LogicalCatalogObject>,
+        durability: crate::ProductDurability,
+    ) -> Result<crate::ProductCommitReceipt, ProductError> {
+        if objects.is_empty() {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        if objects.len() > crate::MAX_PRODUCT_TRANSACTION_OPERATIONS {
+            return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+        }
         let receipt = self
             .database
-            .create_catalog_object_v2(object, durability.into())
+            .create_catalog_objects_v2(objects, durability.into())
             .map_err(map_catalog_mutation_error)?;
         self.observe_commit(&receipt);
         Ok(receipt.into())

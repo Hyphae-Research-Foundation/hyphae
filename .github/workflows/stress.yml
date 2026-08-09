@@ -16,7 +16,6 @@ permissions:
 jobs:
   stress:
     name: Load and kill/restart soak
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

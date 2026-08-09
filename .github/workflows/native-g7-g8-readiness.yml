@@ -28,6 +28,14 @@ on:
           - "1"
           - "8"
           - "32"
+      g8_mode:
+        description: G8 authority-only validation or supporting execution matrix
+        required: true
+        default: authority
+        type: choice
+        options:
+          - authority
+          - matrix
 
 concurrency:
   group: native-g7-g8-${{ github.ref }}
@@ -51,7 +59,10 @@ jobs:
           python-version: 3.13.7
       - name: Validate open authority
         run: |
-          PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_g7_g8_readiness \
+            tools.test_check_native_g8_receipts \
+            -v
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "${{ github.sha }}" \
             --output native-g7-g8-readiness-audit.json
@@ -64,19 +75,14 @@ jobs:
           retention-days: 14
 
   g7-matrix:
-    name: G7 complete Linux matrix
+    name: G7 complete dedicated Linux matrix
     if: inputs.g7_mode == 'benchmark'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            platform: linux
-          - os: macos-15
-            platform: macos
-          - os: windows-2025
-            platform: windows
-    runs-on: ${{ matrix.os }}
+          - platform: linux
+    runs-on: [self-hosted, hyphae-g7, dedicated, "${{ matrix.platform }}"]
     steps:
       - name: Check out exact commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +100,8 @@ jobs:
         shell: bash
         env:
           HYPHAE_G7_BACKGROUND: "1"
+          HYPHAE_G7_PERF: "1"
+          HYPHAE_G7_HARDWARE_FILE: /etc/hyphae/g7-hardware.json
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
@@ -102,8 +110,9 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --output native-g7-matrix.json \
             --background \
-            --observations 100000 \
-            --warmup 10000
+            --hardware-file "$HYPHAE_G7_HARDWARE_FILE" \
+            --observations 1000000 \
+            --warmup 100000
           PYTHONPATH=. python tools/check_native_g7_matrix.py \
             --matrix native-g7-matrix.json \
             --expected-commit "$SHA" \
@@ -143,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
-          for platform in linux macos windows; do
+          for platform in linux; do
             mkdir -p "g7-normalized/$platform"
             cp "g7-platforms/native-g7-matrix-$platform-$SHA/native-g7-matrix.json" "g7-normalized/$platform/native-g7-matrix.json"
           done
@@ -151,10 +160,224 @@ jobs:
             --source-commit "$SHA" \
             --platform-root g7-normalized \
             --output native-g7-aggregate.json
+          PYTHONPATH=. python tools/check_native_g7_matrix.py \
+            --matrix native-g7-aggregate.json \
+            --expected-commit "$SHA" \
+            --output native-g7-closure-audit.json \
+            --closure \
+            --receipts g7-normalized
       - name: Upload exact-SHA aggregate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g7-aggregate-${{ github.sha }}
-          path: native-g7-aggregate.json
+          path: |
+            native-g7-aggregate.json
+            native-g7-closure-audit.json
           if-no-files-found: error
           retention-days: 90
+
+  g8-functional:
+    name: G8 Native functional (${{ matrix.platform }})
+    if: inputs.g8_mode == 'matrix'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+            suffix: ""
+          - platform: macos
+            runner: macos-15
+            suffix: ""
+          - platform: windows
+            runner: windows-2025
+            suffix: .exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+      - name: Build Native product and independent verifier
+        shell: bash
+        run: cargo build --workspace --all-features --locked
+      - name: Run exact-SHA Native soak and independent restore verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_native_g8_soak.py \
+            --source-commit "${{ github.sha }}" \
+            --platform "${{ matrix.platform }}" \
+            --cycles 4 \
+            --writes-per-cycle 32 \
+            --binary "target/debug/hyphae${{ matrix.suffix }}" \
+            --independent-verifier "target/debug/hyphae-independent-backup-verifier${{ matrix.suffix }}" \
+            --output native-g8-soak.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement independent-restore-verification \
+            --platform "${{ matrix.platform }}" \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-soak.json \
+            --output native-g8-independent-restore-receipt.json
+          if [[ "${{ matrix.platform }}" == linux ]]; then
+            PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+              --requirement native-soak \
+              --platform linux \
+              --expected-commit "${{ github.sha }}" \
+              --artifact native-g8-soak.json \
+              --output native-g8-soak-receipt.json
+          fi
+      - name: Run format-2 to Native migration gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python tools/run_native_g8_test_gate.py \
+            --requirement format2-to-native-migration \
+            --platform "${{ matrix.platform }}" \
+            --source-commit "${{ github.sha }}" \
+            --output native-g8-migration.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement format2-to-native-migration \
+            --platform "${{ matrix.platform }}" \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-migration.json \
+            --output native-g8-migration-receipt.json
+      - name: Upload Native functional evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g8-functional-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            native-g8-soak.json
+            native-g8-migration.json
+            native-g8-*-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  g8-linux-integrity:
+    name: G8 Native crash and corruption
+    if: inputs.g8_mode == 'matrix'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Run process-crash and corruption matrices
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p hyphae-native-runtime \
+            --example process_crash_matrix -- \
+            "${{ github.sha }}" \
+            "g8-github-actions-ubuntu-24.04" \
+            | tee native-g8-process-crash.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement process-crash-recovery \
+            --platform linux \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-process-crash.json \
+            --output native-g8-process-crash-receipt.json
+          PYTHONPATH=. python tools/run_native_g8_test_gate.py \
+            --requirement corruption-matrix \
+            --platform linux \
+            --source-commit "${{ github.sha }}" \
+            --output native-g8-corruption.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement corruption-matrix \
+            --platform linux \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-corruption.json \
+            --output native-g8-corruption-receipt.json
+      - name: Upload crash evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g8-integrity-linux-${{ github.sha }}
+          path: |
+            native-g8-process-crash.json
+            native-g8-process-crash-receipt.json
+            native-g8-corruption.json
+            native-g8-corruption-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  g8-linux-privileged:
+    name: G8 Native media and resource faults
+    if: inputs.g8_mode == 'matrix'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+      - name: Prepare isolated block replay infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes dmsetup e2fsprogs util-linux
+          sudo modprobe loop
+          sudo modprobe dm-log-writes
+          sudo dmsetup targets | grep -Eq '^log-writes[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+$'
+          git clone https://github.com/josefbacik/log-writes "${{ runner.temp }}/dm-log-writes"
+          git -C "${{ runner.temp }}/dm-log-writes" checkout --detach 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
+          test "$(git -C "${{ runner.temp }}/dm-log-writes" rev-parse HEAD)" = 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
+      - name: Run isolated resource-exhaustion matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_native_resource_exhaustion_gate.py \
+            --source-commit "${{ github.sha }}" \
+            --environment "g8-github-hosted-linux" \
+            --output native-g8-resource-exhaustion.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement resource-exhaustion \
+            --platform linux \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-resource-exhaustion.json \
+            --output native-g8-resource-exhaustion-receipt.json
+      - name: Run block power-loss replay matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_native_power_loss_gate.py \
+            --source-commit "${{ github.sha }}" \
+            --environment "g8-github-hosted-linux" \
+            --replay-tool-source "${{ runner.temp }}/dm-log-writes" \
+            --output native-g8-power-loss.json
+          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+            --requirement power-loss-replay \
+            --platform linux \
+            --expected-commit "${{ github.sha }}" \
+            --artifact native-g8-power-loss.json \
+            --output native-g8-power-loss-receipt.json
+      - name: Upload privileged fault evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g8-privileged-linux-${{ github.sha }}
+          path: |
+            native-g8-resource-exhaustion.json
+            native-g8-resource-exhaustion-receipt.json
+            native-g8-power-loss.json
+            native-g8-power-loss-receipt.json
+          if-no-files-found: error
+          retention-days: 30

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform as platform_module
@@ -18,8 +19,56 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-STATES = ("warm", "cold")
+STATES = ("warm",)
 CONCURRENCIES = (1, 8, 32)
+BACKGROUND_MODES = ("control", "interference")
+
+
+def verify_source(expected_commit: str) -> str:
+    if len(expected_commit) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_commit
+    ):
+        raise ValueError("source commit must be a canonical lowercase SHA-1")
+    head = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=ROOT, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if head != expected_commit:
+        raise RuntimeError("source commit differs from checked-out HEAD")
+    dirty = subprocess.run(
+        ("git", "status", "--porcelain", "--untracked-files=no"), cwd=ROOT,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if dirty:
+        raise RuntimeError("tracked source worktree must be clean")
+    return subprocess.run(
+        ("git", "rev-parse", "HEAD^{tree}"), cwd=ROOT, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def build_metadata(binary: Path, source_tree: str) -> dict[str, str]:
+    rustc = subprocess.run(
+        ("rustc", "-vV"), check=True, capture_output=True, text=True, timeout=30
+    ).stdout.strip()
+    cargo = subprocess.run(
+        ("cargo", "-V"), check=True, capture_output=True, text=True, timeout=30
+    ).stdout.strip()
+    host = next(
+        (line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: ")),
+        "",
+    )
+    if not host:
+        raise RuntimeError("rustc did not disclose its host target")
+    return {
+        "rustc": rustc,
+        "cargo": cargo,
+        "profile": "release",
+        "target": host,
+        "os": platform_module.platform(),
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "source_tree": source_tree,
+    }
 
 
 def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: int, environment: dict[str, str] | None = None) -> dict:
@@ -86,7 +135,8 @@ def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: 
                 f"G7 cell failed ({state}/{concurrency}): {completed.stderr.strip()}"
             )
     payload = json.loads(completed.stdout)
-    metrics.inject(payload)
+    if perf_output is None:
+        metrics.inject(payload)
     if perf_output is not None:
         augment_perf_counters(payload, perf_output)
         perf_output.unlink(missing_ok=True)
@@ -178,11 +228,11 @@ class ProcessMetrics:
                 "provider": "linux-proc-stat",
             }
         if self.initial_io is not None and self.final_io is not None:
-            for name in ("read_bytes", "write_bytes"):
-                if name in self.initial_io and name in self.final_io:
-                    counters[name] = {
+            for source, target in (("read_bytes", "bytes_read"), ("write_bytes", "bytes_written")):
+                if source in self.initial_io and source in self.final_io:
+                    counters[target] = {
                         "status": "measured",
-                        "value": max(0, self.final_io[name] - self.initial_io[name]),
+                        "value": max(0, self.final_io[source] - self.initial_io[source]),
                         "unit": "bytes",
                         "provider": "linux-proc-io",
                     }
@@ -269,7 +319,31 @@ def main() -> int:
     parser.add_argument("--observations", type=int, default=1_000_000)
     parser.add_argument("--warmup", type=int, default=100_000)
     parser.add_argument("--background", action="store_true")
+    parser.add_argument("--hardware-file", type=Path)
     arguments = parser.parse_args()
+    source_tree = verify_source(arguments.source_commit)
+    hardware_path = arguments.hardware_file or (
+        Path(os.environ["HYPHAE_G7_HARDWARE_FILE"])
+        if "HYPHAE_G7_HARDWARE_FILE" in os.environ else None
+    )
+    if arguments.background and hardware_path is None:
+        raise RuntimeError("complete G7 matrix requires --hardware-file")
+    hardware = (
+        json.loads(hardware_path.read_text(encoding="utf-8"))
+        if hardware_path is not None else {
+            "dedicated": False,
+            "cpu": platform_module.processor() or "undisclosed",
+            "topology": "undisclosed",
+            "ram_bytes": 0,
+            "storage": "undisclosed",
+            "filesystem": "undisclosed",
+            "governor": "undisclosed",
+            "affinity": "uncontrolled",
+            "priority": "normal",
+            "background_services": "uncontrolled",
+            "virtualization": "unknown",
+        }
+    )
     binary = ROOT / "conformance" / "g7" / "runners" / "rust" / "target" / "release" / "hyphae-native-g7-runner"
     if os.name == "nt":
         binary = binary.with_suffix(".exe")
@@ -288,33 +362,81 @@ def main() -> int:
         )
     if not binary.is_file():
         raise RuntimeError(f"G7 runner not found: {binary}")
+    build = build_metadata(binary, source_tree)
     environment = os.environ.copy()
     environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
     environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
-    if arguments.background:
-        environment["HYPHAE_G7_BACKGROUND"] = "1"
     receipts = []
     for state in STATES:
-        for concurrency in CONCURRENCIES:
-            receipt = run_cell(
-                binary,
-                arguments.source_commit,
-                arguments.platform,
-                state,
-                concurrency,
-                environment,
+        for background_mode in (BACKGROUND_MODES if arguments.background else ("control",)):
+            for concurrency in CONCURRENCIES:
+                cell_environment = environment.copy()
+                if background_mode == "interference":
+                    cell_environment["HYPHAE_G7_BACKGROUND"] = "1"
+                else:
+                    cell_environment.pop("HYPHAE_G7_BACKGROUND", None)
+                receipt = run_cell(
+                    binary,
+                    arguments.source_commit,
+                    arguments.platform,
+                    state,
+                    concurrency,
+                    cell_environment,
+                )
+                receipt["background_mode"] = background_mode
+                receipt["hardware"] = hardware
+                receipt["build"] = build
+                receipts.append(receipt)
+    for state in STATES:
+        for background_mode in ({value["background_mode"] for value in receipts}):
+            sweep = {
+                str(concurrency): next(
+                    value for value in receipts
+                    if value["state"] == state
+                    and value["background_mode"] == background_mode
+                    and value["concurrency"] == concurrency
+                )
+                for concurrency in CONCURRENCIES
+            }
+            throughput = {
+                name: {
+                    level: receipt["cells"][name]["throughput_per_second"]
+                    for level, receipt in sweep.items()
+                }
+                for name in sweep["1"]["cells"]
+            }
+            for receipt in sweep.values():
+                receipt["saturation"] = {
+                    "status": "measured",
+                    "levels": list(CONCURRENCIES),
+                    "method": "executed-concurrency-sweep",
+                    "throughput_per_second": throughput,
+                }
+    if arguments.background:
+        for receipt in receipts:
+            if receipt["background_mode"] != "interference":
+                continue
+            control = next(
+                value for value in receipts
+                if value["state"] == receipt["state"]
+                and value["concurrency"] == receipt["concurrency"]
+                and value["background_mode"] == "control"
             )
-            receipts.append(receipt)
+            receipt["background_interference"]["p99_ratio_by_cell"] = {
+                name: receipt["cells"][name]["p99"] / control["cells"][name]["p99"]
+                for name in receipt["cells"]
+            }
     for receipt in receipts:
         receipt.pop("controller", None)
     result = {
-        "schema": "hyphae-native-g7-matrix-v1",
+        "schema": "hyphae-native-g7-matrix-v2",
         "gate": "G7",
-        "status": "supporting-incomplete",
+        "status": "closure-candidate",
         "source_commit": arguments.source_commit,
         "platform": arguments.platform,
         "states": list(STATES),
         "concurrency": list(CONCURRENCIES),
+        "background_modes": list(BACKGROUND_MODES if arguments.background else ("control",)),
         "receipts": receipts,
         "claims": [],
         "closure_declared": False,

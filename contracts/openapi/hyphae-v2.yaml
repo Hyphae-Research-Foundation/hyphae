@@ -96,6 +96,15 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
         default: { $ref: "#/components/responses/ProductError" }
+  /v2/search/document:
+    post:
+      tags: [search]
+      operationId: mutateNativeSearchDocumentV2
+      security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
   /v2/admin:
     post:
       tags: [administration]
@@ -134,11 +143,13 @@ paths:
         default: { $ref: "#/components/responses/ProductError" }
   /v2/restore:
     post:
+      tags: [administration]
       operationId: restoreNativeBackupV2
-      description: Explicitly unsupported until ProductOperation exposes restore.
       security: [{ BearerAuth: [] }, {}]
+      requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
-        "501": { $ref: "#/components/responses/ProductError" }
+        "200": { $ref: "#/components/responses/ProductResponse" }
+        default: { $ref: "#/components/responses/ProductError" }
   /v2/proofs/verify:
     post:
       tags: [proofs]

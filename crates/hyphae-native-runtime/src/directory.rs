@@ -27,6 +27,17 @@ const FORMAT2_ONLY_ENTRIES: [&str; 2] = ["indexes", "log"];
 static NEXT_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(1);
 const MAX_UUID_V7_MILLISECONDS: u64 = 0x0000_ffff_ffff_ffff;
 
+/// Deterministic pending-marker promotion boundary used by crash matrices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromotionBoundary {
+    /// The pending marker is validated but has not been renamed.
+    BeforeRename,
+    /// The marker has its authoritative name but the parent is not synchronized.
+    MarkerRenamed,
+    /// The marker rename and parent-directory synchronization are complete.
+    ParentSynchronized,
+}
+
 /// Stable identity of one native data-directory history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDirectoryIdentity {
@@ -113,6 +124,9 @@ pub enum NativeDirectoryError {
         #[source]
         source: io::Error,
     },
+    /// A deterministic migration-promotion interruption was requested.
+    #[error("native migration promotion interrupted at {0:?}; reopen the data directory")]
+    InjectedPromotionCrash(PromotionBoundary),
 }
 
 #[derive(Debug)]
@@ -166,6 +180,22 @@ impl NativeDirectoryGuard {
     }
 
     pub(crate) fn promote_pending(&mut self, path: &Path) -> Result<(), NativeDirectoryError> {
+        self.promote_pending_at(path, None)
+    }
+
+    pub(crate) fn promote_pending_with_interruption(
+        &mut self,
+        path: &Path,
+        boundary: PromotionBoundary,
+    ) -> Result<(), NativeDirectoryError> {
+        self.promote_pending_at(path, Some(boundary))
+    }
+
+    fn promote_pending_at(
+        &mut self,
+        path: &Path,
+        interruption: Option<PromotionBoundary>,
+    ) -> Result<(), NativeDirectoryError> {
         if !self.pending {
             return Ok(());
         }
@@ -179,14 +209,28 @@ impl NativeDirectoryGuard {
                 path.to_path_buf(),
             ));
         }
+        interrupt_promotion(interruption, PromotionBoundary::BeforeRename)?;
         fs::rename(&pending_path, &format_path)
             .map_err(|source| io_error(&pending_path, source))?;
         self.pending = false;
-        sync_parent_directory(path)
+        interrupt_promotion(interruption, PromotionBoundary::MarkerRenamed)?;
+        sync_parent_directory(path)?;
+        interrupt_promotion(interruption, PromotionBoundary::ParentSynchronized)
     }
 
     pub(crate) const fn identity(&self) -> &NativeDirectoryIdentity {
         &self.identity
+    }
+}
+
+fn interrupt_promotion(
+    requested: Option<PromotionBoundary>,
+    current: PromotionBoundary,
+) -> Result<(), NativeDirectoryError> {
+    if requested == Some(current) {
+        Err(NativeDirectoryError::InjectedPromotionCrash(current))
+    } else {
+        Ok(())
     }
 }
 

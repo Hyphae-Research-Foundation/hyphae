@@ -1,8 +1,8 @@
 # Native durable snapshot pins v1
 
-Status: implemented candidate on `codex/native-snapshot-pins`; the frozen
-acceptance criteria have executable red/green coverage, direct Linux/ext4
-receipts, and real process-kill coverage; hosted CI and review remain pending
+Status: implemented and retained by the closed G1 substrate gate. The frozen
+acceptance criteria have executable coverage, hosted receipts, direct
+Linux/ext4 evidence, and real process-kill coverage.
 
 This protocol turns a current all-engine root set into a durable, named
 historical snapshot that remains reopenable after process restart and later

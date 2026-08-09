@@ -8,44 +8,46 @@ use std::{
     fs,
     hint::black_box,
     path::{Path, PathBuf},
-    sync::{Arc, Barrier},
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Barrier, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-
-use hyphae_client::v2::{HyphaeClient, RequestOptions};
 use futures_util::future::join_all;
-use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
+use hyphae_client::v2::{HyphaeClient, RequestOptions};
 use hyphae_native_catalog::{
-    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, CatalogObjectV2, CatalogName,
+    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, CatalogName, CatalogObjectV2,
     DefinitionVersion, FieldSourcePolicy, IncrementalVectorLifecycle, LexicalIndexPolicy,
     NamedVectorDefinition, ObjectHeaderV2, QualifiedName, SearchCollectionDefinitionV2,
     SearchFieldDefinitionV2, SearchFieldOptions, VectorMetric as CatalogVectorMetric,
     VectorSearchPolicy,
 };
+use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
-    LogicalCatalogObject, NativeProduct, ProductAuthorization, ProductDurability, ProductDurabilityPolicy,
-    ProductDocument, ProductDocValue, ProductLexicalBranch, ProductOperation, ProductPrincipal,
-    ProductRequestContext, ProductSearchFilter, ProductSearchIngestBatch, ProductSearchRequest,
-    ProductSession, ProductSessionId, ProductVector, ProductVectorBranch,
+    LogicalCatalogObject, NativeProduct, ProductAuthorization, ProductDocValue, ProductDocument,
+    ProductDurability, ProductDurabilityPolicy, ProductLexicalBranch, ProductOperation,
+    ProductPrincipal, ProductRequestContext, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchRequest, ProductSession, ProductSessionId, ProductVector, ProductVectorBranch,
     ProductVectorExecution,
 };
 use hyphae_native_runtime::{
-    AnnSearchOptions, HnswConfig, NativeCommitScheduler, NativeDatabase,
-    Vector, VectorMetric,
+    AnnSearchOptions, HnswConfig, NativeCommitScheduler, NativeDatabase, Vector, VectorMetric,
 };
 use hyphae_native_types::{EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType};
 use serde_json::json;
+use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
-const VERSION: &str = "hyphae-native-g7-receipt-v1";
+#[global_allocator]
+static GLOBAL_ALLOCATOR: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
+
+const VERSION: &str = "hyphae-native-g7-receipt-v2";
 const DEFAULT_OBSERVATIONS: usize = 1_000_000;
 const DEFAULT_WARMUP: usize = 100_000;
 const STRUCTURE_KEYS: usize = 2_048;
 const SQL_KEYS: usize = 128;
-const SEARCH_DOCUMENTS: usize = 512;
-const VECTOR_DIMENSION: u16 = 16;
+const CLOSURE_SEARCH_DOCUMENTS: usize = 1_000_000;
+const CLOSURE_VECTOR_DIMENSION: u16 = 384;
 const K: usize = 10;
 
 #[derive(Clone, Copy, Debug)]
@@ -69,8 +71,13 @@ struct CounterValue {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let source_commit = std::env::args().nth(1).ok_or("missing exact source commit")?;
-    let platform = std::env::args().nth(2).unwrap_or_else(|| std::env::consts::OS.to_owned());
+    let allocation_start = GLOBAL_ALLOCATOR.stats();
+    let source_commit = std::env::args()
+        .nth(1)
+        .ok_or("missing exact source commit")?;
+    let platform = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| std::env::consts::OS.to_owned());
     let state = std::env::args().nth(3).unwrap_or_else(|| "warm".to_owned());
     let concurrency = std::env::args()
         .nth(4)
@@ -90,34 +97,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("state must be warm/cold and concurrency must be 1, 8, or 32".into());
     }
     let root = temporary_root(&state, concurrency)?;
-    let background_enabled = std::env::var("HYPHAE_G7_BACKGROUND")
-        .is_ok_and(|value| value == "1" || value == "true");
+    let background_enabled =
+        std::env::var("HYPHAE_G7_BACKGROUND").is_ok_and(|value| value == "1" || value == "true");
     let background_stop = Arc::new(AtomicBool::new(false));
     let background_thread = background_enabled.then(|| {
         let stop = Arc::clone(&background_stop);
-        thread::spawn(move || {
-            let mut value = 0_u64;
+        let path = root.join("background-maintenance");
+        thread::spawn(move || -> Result<u64, String> {
+            let mut database = NativeDatabase::create(path).map_err(|error| error.to_string())?;
+            let mut operations = 0_u64;
             while !stop.load(Ordering::Relaxed) {
-                value = value.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                black_box(value);
+                let mut transaction = database
+                    .begin(0, hyphae_native_types::DurabilityClass::Memory)
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .set(operations.to_be_bytes().to_vec(), vec![0x7b; 4_096], None)
+                    .map_err(|error| error.to_string())?;
+                transaction.commit().map_err(|error| error.to_string())?;
+                operations = operations.saturating_add(1);
+                if operations.is_multiple_of(64) {
+                    black_box(database.checkpoint().map_err(|error| error.to_string())?);
+                }
             }
+            Ok(operations)
         })
     });
     let mut receipt = json!({
         "schema": VERSION,
         "gate": "G7",
         "status": "passed",
-        "evidence_class": "supporting-not-closure",
+        "evidence_class": "closure-candidate",
         "source_commit": source_commit,
         "platform": platform,
         "state": state,
         "concurrency": concurrency,
-        "dataset": dataset_metadata(observations, warmup),
+        "dataset": dataset_metadata(&source_commit, observations, warmup),
+        "workload": workload_metadata(),
+        "durability": {
+            "read_seed": "memory-committed",
+            "product_search_seed": "strict-committed",
+            "commit_cell": "group-physical-sync",
+        },
+        "proofs_included": false,
+        "correctness": {
+            "cell_assertions": "passed",
+            "ann_recall_floor": 0.95,
+            "cross_engine_visibility": "integrated-product-search",
+        },
         "cells": {},
         "counters": counters_process(&root)?,
         "saturation": {"status": "measured", "levels": [1, 8, 32], "method": "requested-concurrency"},
         "background_interference": if background_enabled {
-            json!({"status": "measured", "method": "cpu-busy-background-worker", "workload": "single-deterministic-spinner"})
+            json!({"status": "measured", "method": "concurrent-native-wal-checkpoint", "workload": "4KiB memory commits plus periodic checkpoints"})
         } else {
             json!({"status": "control", "method": "no-background-worker", "workload": "none"})
         },
@@ -158,6 +189,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|error| format!("indexed sql: {error}"))?,
     );
     cells.insert(
+        "two-index-join-bounded-read",
+        run_join_sql(&root, state == "warm", concurrency, observations, warmup)
+            .map_err(|error| format!("two-index join: {error}"))?,
+    );
+    cells.insert(
         "bm25-top10",
         run_bm25(&root, state == "warm", concurrency, observations, warmup)
             .map_err(|error| format!("bm25: {error}"))?,
@@ -183,10 +219,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     receipt["cells"] = serde_json::to_value(cells)?;
     receipt["physical_observation"] = physical_observation(&root)?;
+    receipt["counters"] = counters_process(&root)?;
+    let allocation_change = GLOBAL_ALLOCATOR.stats() - allocation_start;
+    receipt["counters"]["allocations"] = counter_json(CounterValue {
+        status: "measured",
+        value: Some(
+            u64::try_from(
+                allocation_change
+                    .allocations
+                    .saturating_add(allocation_change.reallocations),
+            )
+            .unwrap_or(u64::MAX),
+        ),
+        unit: "count",
+        provider: "stats-alloc-system-wrapper",
+        reason: None,
+    });
     background_stop.store(true, Ordering::Relaxed);
     if let Some(thread) = background_thread {
-        thread.join().map_err(|_| "background worker panicked")?;
+        let operations = thread
+            .join()
+            .map_err(|_| "background worker panicked")?
+            .map_err(|error| format!("background maintenance failed: {error}"))?;
+        receipt["background_interference"]["operations"] = json!(operations);
     }
+    fs::remove_dir_all(&root)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
 }
@@ -199,7 +256,11 @@ fn temporary_root(state: &str, concurrency: usize) -> Result<PathBuf, Box<dyn Er
 }
 
 fn short_endpoint(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("h-g7-{label}-{}-{}", std::process::id(), unique_nonce()))
+    std::env::temp_dir().join(format!(
+        "h-g7-{label}-{}-{}",
+        std::process::id(),
+        unique_nonce()
+    ))
 }
 
 fn unique_nonce() -> u128 {
@@ -208,15 +269,66 @@ fn unique_nonce() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
-fn dataset_metadata(observations: usize, warmup: usize) -> serde_json::Value {
+fn dataset_metadata(source_commit: &str, observations: usize, warmup: usize) -> serde_json::Value {
+    let documents = search_documents();
+    let dimension = vector_dimension();
+    let generator = "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
+    let digest = blake3::hash(
+        format!(
+            "{generator}:source={source_commit}:documents={documents}:vectors={documents}:dimension={dimension}"
+        )
+            .as_bytes(),
+    );
     json!({
         "structure_keys": STRUCTURE_KEYS,
-        "search_documents": SEARCH_DOCUMENTS,
-        "vector_dimension": VECTOR_DIMENSION,
+        "search_documents": documents,
+        "vector_count": documents,
+        "vector_dimension": dimension,
         "observations": observations,
         "warmup": warmup,
-        "digest": blake3::hash(b"hyphae-native-g7-corpus-v1").to_hex().to_string(),
+        "generator": generator,
+        "digest": digest.to_hex().to_string(),
     })
+}
+
+fn workload_metadata() -> serde_json::Value {
+    let documents = search_documents();
+    json!({
+        "structure_keys": STRUCTURE_KEYS,
+        "sql_rows": SQL_KEYS,
+        "point_value_bytes": 64,
+        "search_documents": documents,
+        "vector_count": documents,
+        "vector_dimension": vector_dimension(),
+        "lexical_rare_documents": 1,
+        "filtered_documents": documents.div_ceil(2),
+        "result_limit": K,
+        "lexical_index_state": "committed-hot",
+        "vector_index_state": "committed-hot",
+    })
+}
+
+fn search_documents() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| smoke_override("HYPHAE_G7_SEARCH_DOCUMENTS", CLOSURE_SEARCH_DOCUMENTS))
+}
+
+fn vector_dimension() -> u16 {
+    static VALUE: OnceLock<u16> = OnceLock::new();
+    *VALUE.get_or_init(|| smoke_override("HYPHAE_G7_VECTOR_DIMENSION", CLOSURE_VECTOR_DIMENSION))
+}
+
+fn smoke_override<T>(name: &str, closure_value: T) -> T
+where
+    T: std::str::FromStr + Copy,
+{
+    if std::env::var("HYPHAE_G7_SMOKE").as_deref() != Ok("1") {
+        return closure_value;
+    }
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(closure_value)
 }
 
 fn counters_unavailable() -> serde_json::Value {
@@ -253,13 +365,20 @@ fn counters_process(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
             });
         }
         let io = fs::read_to_string(format!("/proc/{}/io", std::process::id()))?;
-        for (name, provider) in [("read_bytes", "linux-proc-read-bytes"), ("write_bytes", "linux-proc-write-bytes")] {
-            let field = if name == "read_bytes" { "read_bytes:" } else { "write_bytes:" };
+        for (source, target, provider) in [
+            ("read_bytes", "bytes_read", "linux-proc-read-bytes"),
+            ("write_bytes", "bytes_written", "linux-proc-write-bytes"),
+        ] {
+            let field = if source == "read_bytes" {
+                "read_bytes:"
+            } else {
+                "write_bytes:"
+            };
             if let Some(value) = io.lines().find_map(|line| {
                 line.strip_prefix(field)
                     .and_then(|value| value.trim().parse::<u64>().ok())
             }) {
-                counters[name] = counter_json(CounterValue {
+                counters[target] = counter_json(CounterValue {
                     status: "measured",
                     value: Some(value),
                     unit: "bytes",
@@ -271,7 +390,9 @@ fn counters_process(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
         let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id()))?;
         let fields = stat.split_whitespace().collect::<Vec<_>>();
         if fields.len() > 14 {
-            let faults = fields[9].parse::<u64>()?.saturating_add(fields[11].parse::<u64>()?);
+            let faults = fields[9]
+                .parse::<u64>()?
+                .saturating_add(fields[11].parse::<u64>()?);
             counters["page_faults"] = counter_json(CounterValue {
                 status: "measured",
                 value: Some(faults),
@@ -298,10 +419,17 @@ fn counter_json(counter: CounterValue) -> serde_json::Value {
     value
 }
 
-fn run_embedded_structure(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_embedded_structure(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("structure");
-    let mut database = NativeDatabase::create(&path).map_err(|error| format!("structure seed: {error}"))?;
+    let mut database =
+        NativeDatabase::create(&path).map_err(|error| format!("structure seed: {error}"))?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     for index in 0..STRUCTURE_KEYS {
         seed.set(index.to_be_bytes().to_vec(), vec![0xa5; 64], None)?;
@@ -314,72 +442,55 @@ fn run_embedded_structure(root: &Path, warm: bool, concurrency: usize, observati
         }
     }
     let target_value = [0xa5; 64];
-    let stats = if concurrency == 1 {
-        measure(observations, || {
-            let value = database.get_latest_structure(&target, 0)?;
-            if value.as_deref() != Some(target_value.as_slice()) {
-                return Err("structure result mismatch".into());
-            }
-            Ok::<(), Box<dyn Error>>(())
-        })?
-    } else {
-        let database = Arc::new(database);
-        let barrier = Arc::new(Barrier::new(concurrency));
-        let mut handles = Vec::new();
-        for _ in 0..concurrency {
-            let database = Arc::clone(&database);
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || -> Result<Vec<u64>, String> {
-                barrier.wait();
-                let started = Instant::now();
-                for _ in 0..(observations / concurrency) {
-                    let value = database
-                        .get_latest_structure(&target, 0)
-                        .map_err(|error| error.to_string())?;
-                    if value.as_deref() != Some(target_value.as_slice()) {
-                        return Err("structure result mismatch".to_owned());
-                    }
-                }
-                Ok(vec![started.elapsed().as_nanos() as u64])
-            }));
+    let stats = measure_concurrent(concurrency, observations, &|| {
+        let value = database.get_latest_structure(&target, 0)?;
+        if value.as_deref() != Some(target_value.as_slice()) {
+            return Err("structure result mismatch".into());
         }
-        let samples = handles
-            .into_iter()
-            .map(|handle| handle.join().map_err(|_| "worker panicked".to_owned())?)
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|error| -> Box<dyn Error> { error.into() })?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        stats_from_samples(samples)
-    };
+        Ok::<(), Box<dyn Error>>(())
+    })?;
     Ok(stats_json(stats))
 }
 
-fn run_embedded_sql(root: &Path, warm: bool, _concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_embedded_sql(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("sql");
     let mut database = NativeDatabase::create(&path)
         .map_err(|error| format!("sql seed {}: {error}", path.display()))?;
     let mut seed = database.begin_sql(0, hyphae_native_types::DurabilityClass::Memory)?;
-    seed.execute_sql("CREATE TABLE g7_items (id BIGINT PRIMARY KEY, payload BINARY NOT NULL)", &[])?;
+    seed.execute_sql(
+        "CREATE TABLE g7_items (id BIGINT PRIMARY KEY, payload BINARY NOT NULL)",
+        &[],
+    )?;
     for id in 0..SQL_KEYS {
         seed.execute_sql(
             "INSERT INTO g7_items (id, payload) VALUES (?, ?)",
-            &[hyphae_native_runtime::SqlValue::Signed(id as i64), hyphae_native_runtime::SqlValue::Binary(vec![0x5a; 64])],
+            &[
+                hyphae_native_runtime::SqlValue::Signed(id as i64),
+                hyphae_native_runtime::SqlValue::Binary(vec![0x5a; 64]),
+            ],
         )?;
     }
     seed.commit()?;
     let prepared = database.prepare_sql_latest("SELECT id, payload FROM g7_items WHERE id = ?")?;
-    let parameters = [hyphae_native_runtime::SqlValue::Signed((SQL_KEYS / 2) as i64)];
+    let parameters = [hyphae_native_runtime::SqlValue::Signed(
+        (SQL_KEYS / 2) as i64,
+    )];
     if warm {
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
         }
     }
-    let stats = measure(observations, || {
+    let stats = measure_concurrent(concurrency, observations, &|| {
         let result = database.execute_prepared_latest(&prepared, &parameters)?;
-        if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1) {
+        if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
+        {
             return Err("prepared SQL result mismatch".into());
         }
         Ok::<(), Box<dyn Error>>(())
@@ -387,10 +498,17 @@ fn run_embedded_sql(root: &Path, warm: bool, _concurrency: usize, observations: 
     Ok(stats_json(stats))
 }
 
-async fn run_local_structure(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn run_local_structure(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("local-structure");
-    let mut product = NativeProduct::create(&path).map_err(|error| format!("local structure seed: {error}"))?;
+    let mut product =
+        NativeProduct::create(&path).map_err(|error| format!("local structure seed: {error}"))?;
     let mut session = product_session();
     let mut context = product_context(&session, 1);
     context.durability = ProductDurabilityPolicy::MEMORY;
@@ -412,8 +530,7 @@ async fn run_local_structure(root: &Path, warm: bool, concurrency: usize, observ
     )?;
     let result = async {
         let client = HyphaeClient::local(endpoint.to_string_lossy().into_owned())?;
-        let mut options = RequestOptions::default();
-        options.logical_time_micros = 0;
+        let options = RequestOptions::default();
         if warm {
             for _ in 0..warmup {
                 require_structure_response(
@@ -437,16 +554,24 @@ async fn run_local_structure(root: &Path, warm: bool, concurrency: usize, observ
         })
         .await?;
         Ok::<_, Box<dyn Error>>(stats_json(stats))
-    }.await;
+    }
+    .await;
     let shutdown = daemon.shutdown().await?;
     drop(shutdown);
     result
 }
 
-async fn run_local_sql(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn run_local_sql(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("local-sql");
-    let mut product = NativeProduct::create(&path).map_err(|error| format!("local sql seed: {error}"))?;
+    let mut product =
+        NativeProduct::create(&path).map_err(|error| format!("local sql seed: {error}"))?;
     seed_product_sql(&mut product)?;
     let endpoint = short_endpoint("sql");
     let daemon = NativeDaemon::start(
@@ -459,7 +584,7 @@ async fn run_local_sql(root: &Path, warm: bool, concurrency: usize, observations
         let options = RequestOptions::default();
         let prepared = client
             .prepare_sql(
-                        "SELECT id, payload FROM g7_items WHERE id = ?",
+                "SELECT id, payload FROM g7_items WHERE id = ?",
                 options.clone(),
             )
             .await?;
@@ -501,13 +626,20 @@ async fn run_local_sql(root: &Path, warm: bool, concurrency: usize, observations
         })
         .await?;
         Ok::<_, Box<dyn Error>>(stats_json(stats))
-    }.await;
+    }
+    .await;
     let shutdown = daemon.shutdown().await?;
     drop(shutdown);
     result
 }
 
-fn run_indexed_sql(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_indexed_sql(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("indexed");
     let mut database = NativeDatabase::create(&path)?;
@@ -526,25 +658,26 @@ fn run_indexed_sql(root: &Path, warm: bool, concurrency: usize, observations: us
             ],
         )?;
     }
-    seed.execute_sql("CREATE UNIQUE INDEX g7_indexed_email ON g7_indexed (email)", &[])?;
-    seed.commit()?;
-    let prepared = database.prepare_sql_latest(
-        "SELECT id, payload FROM g7_indexed WHERE email = ?",
+    seed.execute_sql(
+        "CREATE UNIQUE INDEX g7_indexed_email ON g7_indexed (email)",
+        &[],
     )?;
+    seed.commit()?;
+    let prepared =
+        database.prepare_sql_latest("SELECT id, payload FROM g7_indexed WHERE email = ?")?;
     let parameters = [hyphae_native_runtime::SqlValue::Text(format!(
         "g7-email-{}",
         SQL_KEYS / 2
     ))];
-    if !warm {
-        let _ = database.execute_prepared_latest(&prepared, &parameters)?;
-    } else {
+    if warm {
         for _ in 0..warmup {
-            let _ = database.execute_prepared_latest(&prepared, &parameters)?;
+            black_box(database.execute_prepared_latest(&prepared, &parameters)?);
         }
     }
-    let stats = measure(observations, || {
+    let stats = measure_concurrent(concurrency, observations, &|| {
         let result = database.execute_prepared_latest(&prepared, &parameters)?;
-        if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1) {
+        if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
+        {
             return Err("indexed SQL result mismatch".into());
         }
         Ok::<(), Box<dyn Error>>(())
@@ -555,12 +688,81 @@ fn run_indexed_sql(root: &Path, warm: bool, concurrency: usize, observations: us
     Ok(value)
 }
 
-fn run_filtered_bm25(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_join_sql(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let path = root.join("join");
+    let mut database = NativeDatabase::create(&path)?;
+    let mut seed = database.begin_sql(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.execute_sql(
+        "CREATE TABLE g7_profiles (id BIGINT PRIMARY KEY, city TEXT NOT NULL)",
+        &[],
+    )?;
+    seed.execute_sql(
+        "CREATE TABLE g7_users (id BIGINT PRIMARY KEY, profile_id BIGINT NOT NULL, email TEXT NOT NULL)",
+        &[],
+    )?;
+    for id in 0..SQL_KEYS {
+        seed.execute_sql(
+            "INSERT INTO g7_profiles (id, city) VALUES (?, ?)",
+            &[
+                hyphae_native_runtime::SqlValue::Signed(id as i64),
+                hyphae_native_runtime::SqlValue::Text(format!("city-{id}")),
+            ],
+        )?;
+        seed.execute_sql(
+            "INSERT INTO g7_users (id, profile_id, email) VALUES (?, ?, ?)",
+            &[
+                hyphae_native_runtime::SqlValue::Signed(id as i64),
+                hyphae_native_runtime::SqlValue::Signed(id as i64),
+                hyphae_native_runtime::SqlValue::Text(format!("join-email-{id}")),
+            ],
+        )?;
+    }
+    seed.execute_sql(
+        "CREATE UNIQUE INDEX g7_users_email ON g7_users (email)",
+        &[],
+    )?;
+    seed.commit()?;
+    let prepared = database.prepare_sql_latest(
+        "SELECT g7_users.id, g7_profiles.city FROM g7_users INNER JOIN g7_profiles ON g7_users.profile_id = g7_profiles.id WHERE email = ?",
+    )?;
+    let parameters = [hyphae_native_runtime::SqlValue::Text(format!(
+        "join-email-{}",
+        SQL_KEYS / 2
+    ))];
+    if warm {
+        for _ in 0..warmup {
+            black_box(database.execute_prepared_latest(&prepared, &parameters)?);
+        }
+    }
+    let stats = measure_concurrent(concurrency, observations, &|| {
+        let result = database.execute_prepared_latest(&prepared, &parameters)?;
+        if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
+        {
+            return Err("two-index join result mismatch".into());
+        }
+        Ok(())
+    })?;
+    Ok(stats_json(stats))
+}
+
+fn run_filtered_bm25(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let (product, collection) = seed_product_search(&root.join("filtered"))?;
     let request = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
             query: "rare".to_owned(),
-            candidate_limit: SEARCH_DOCUMENTS,
+            candidate_limit: search_documents(),
             weight: 1,
         }),
         vectors: Vec::new(),
@@ -574,7 +776,15 @@ fn run_filtered_bm25(root: &Path, warm: bool, concurrency: usize, observations: 
         aggregations: Vec::new(),
         limit: K,
     };
-    let stats = measure_product_search(&product, collection, &request, warm, concurrency, observations, warmup)?;
+    let stats = measure_product_search(
+        &product,
+        collection,
+        &request,
+        warm,
+        concurrency,
+        observations,
+        warmup,
+    )?;
     let mut value = stats_json(stats);
     value["route"] = json!("native-product-filtered-bm25");
     value["filter_selectivity"] = json!(0.5);
@@ -583,18 +793,24 @@ fn run_filtered_bm25(root: &Path, warm: bool, concurrency: usize, observations: 
     Ok(value)
 }
 
-fn run_hybrid(root: &Path, warm: bool, concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_hybrid(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let (product, collection) = seed_product_search(&root.join("hybrid"))?;
     let request = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
             query: "rare".to_owned(),
-            candidate_limit: SEARCH_DOCUMENTS,
+            candidate_limit: search_documents(),
             weight: 1,
         }),
         vectors: vec![ProductVectorBranch {
             target: "exact".to_owned(),
             query: ProductVector::new({
-                let mut values = vec![0.0; VECTOR_DIMENSION as usize];
+                let mut values = vec![0.0; vector_dimension() as usize];
                 values[0] = 1.0;
                 values
             })?,
@@ -608,7 +824,15 @@ fn run_hybrid(root: &Path, warm: bool, concurrency: usize, observations: usize, 
         aggregations: Vec::new(),
         limit: K,
     };
-    let stats = measure_product_search(&product, collection, &request, warm, concurrency, observations, warmup)?;
+    let stats = measure_product_search(
+        &product,
+        collection,
+        &request,
+        warm,
+        concurrency,
+        observations,
+        warmup,
+    )?;
     let mut value = stats_json(stats);
     value["route"] = json!("native-product-hybrid");
     value["lexical_branch"] = json!(true);
@@ -650,7 +874,12 @@ fn seed_product_search(path: &Path) -> Result<(NativeProduct, ObjectId), Box<dyn
         ProductDurability::Strict,
     )?;
     let collection_definition = SearchCollectionDefinitionV2 {
-        header: search_header(collection, "g7_collection", Some(schema), EngineKind::Search)?,
+        header: search_header(
+            collection,
+            "g7_collection",
+            Some(schema),
+            EngineKind::Search,
+        )?,
         fields: vec![
             SearchFieldDefinitionV2 {
                 id: FieldId::new(1)?,
@@ -680,7 +909,7 @@ fn seed_product_search(path: &Path) -> Result<(NativeProduct, ObjectId), Box<dyn
         vectors: vec![NamedVectorDefinition {
             id: FieldId::new(3)?,
             name: CatalogName::unquoted("exact")?,
-            vector_type: VectorType::new(VectorElement::Float32, VECTOR_DIMENSION)?,
+            vector_type: VectorType::new(VectorElement::Float32, vector_dimension())?,
             metric: CatalogVectorMetric::Cosine,
             policy: VectorSearchPolicy::Exact,
             lifecycle: IncrementalVectorLifecycle {
@@ -695,31 +924,36 @@ fn seed_product_search(path: &Path) -> Result<(NativeProduct, ObjectId), Box<dyn
         ProductDurability::Strict,
     )?;
     product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
-    let mut documents = Vec::with_capacity(SEARCH_DOCUMENTS);
-    for id in 0..SEARCH_DOCUMENTS {
-        let mut vector = vec![0.0; VECTOR_DIMENSION as usize];
-        vector[0] = 1.0;
-        vector[1] = id as f32 / SEARCH_DOCUMENTS as f32;
-        documents.push(ProductDocument {
-            object_id: ObjectId::new(id as u128 + 1)?,
-            text: if id == SEARCH_DOCUMENTS / 2 {
-                "rare g7 native benchmark term".to_owned()
-            } else {
-                "common g7 native benchmark".to_owned()
-            },
-            doc_values: BTreeMap::from([(
-                "category".to_owned(),
-                ProductDocValue::String(if id % 2 == 0 { "keep" } else { "drop" }.to_owned()),
-            )]),
-            vectors: BTreeMap::from([("exact".to_owned(), ProductVector::new(vector)?)]),
-        });
-    }
-    for (batch_id, batch) in documents.chunks(256).enumerate() {
+    let document_count = search_documents();
+    for (batch_id, batch_start) in (0..document_count).step_by(256).enumerate() {
+        let batch_end = (batch_start + 256).min(document_count);
+        let batch = (batch_start..batch_end)
+            .map(|id| {
+                let mut vector = vec![0.0; vector_dimension() as usize];
+                vector[0] = 1.0;
+                vector[1] = id as f32 / document_count as f32;
+                Ok(ProductDocument {
+                    object_id: ObjectId::new(id as u128 + 1)?,
+                    text: if id == document_count / 2 {
+                        "rare g7 native benchmark term".to_owned()
+                    } else {
+                        "common g7 native benchmark".to_owned()
+                    },
+                    doc_values: BTreeMap::from([(
+                        "category".to_owned(),
+                        ProductDocValue::String(
+                            if id % 2 == 0 { "keep" } else { "drop" }.to_owned(),
+                        ),
+                    )]),
+                    vectors: BTreeMap::from([("exact".to_owned(), ProductVector::new(vector)?)]),
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
         product.ingest_search_batch(
             collection,
             &ProductSearchIngestBatch {
                 idempotency_id: batch_id as u128 + 1,
-                documents: batch.to_vec(),
+                documents: batch,
             },
             0,
             ProductDurability::Strict,
@@ -758,19 +992,18 @@ fn measure_product_search(
 ) -> Result<Stats, Box<dyn Error>> {
     if warm {
         for _ in 0..warmup {
-            black_box(product.search_collection(collection, &request, 0)?);
+            black_box(product.search_collection(collection, request, 0)?);
         }
     } else {
-        black_box(product.search_collection(collection, &request, 0)?);
+        black_box(product.search_collection(collection, request, 0)?);
     }
-    let mut stats = measure(observations, || {
-        let result = product.search_collection(collection, &request, 0)?;
+    let stats = measure_concurrent(concurrency, observations, &|| {
+        let result = product.search_collection(collection, request, 0)?;
         if result.hits.is_empty() {
             return Err("product search result mismatch".into());
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    stats.throughput *= concurrency as f64;
     Ok(stats)
 }
 
@@ -782,7 +1015,8 @@ fn seed_product_sql(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
         &mut session,
         &context,
         ProductOperation::ExecuteSql {
-            statement: "CREATE TABLE g7_items (id BIGINT PRIMARY KEY, payload BINARY NOT NULL)".into(),
+            statement: "CREATE TABLE g7_items (id BIGINT PRIMARY KEY, payload BINARY NOT NULL)"
+                .into(),
             parameters: Vec::new(),
         },
     )?;
@@ -825,20 +1059,28 @@ fn product_context(session: &ProductSession, request_id: u128) -> ProductRequest
 fn require_structure_response(
     response: hyphae_native_product::ProductResponse,
 ) -> Result<(), Box<dyn Error>> {
-    if !matches!(response, hyphae_native_product::ProductResponse::StructureValue(Some(value)) if value == vec![0x3c; 64]) {
+    if !matches!(response, hyphae_native_product::ProductResponse::StructureValue(Some(value)) if value == vec![0x3c; 64])
+    {
         return Err("local structure response mismatch".into());
     }
     Ok(())
 }
 
-fn require_sql_response(response: hyphae_native_product::ProductResponse) -> Result<(), Box<dyn Error>> {
-    if !matches!(response, hyphae_native_product::ProductResponse::Sql { result: hyphae_native_product::ProductSqlResult::Rows { rows, .. }, .. } if rows.len() == 1) {
+fn require_sql_response(
+    response: hyphae_native_product::ProductResponse,
+) -> Result<(), Box<dyn Error>> {
+    if !matches!(response, hyphae_native_product::ProductResponse::Sql { result: hyphae_native_product::ProductSqlResult::Rows { rows, .. }, .. } if rows.len() == 1)
+    {
         return Err("local SQL response mismatch".into());
     }
     Ok(())
 }
 
-async fn measure_async<F, Fut>(concurrency: usize, observations: usize, mut operation: F) -> Result<Stats, Box<dyn Error>>
+async fn measure_async<F, Fut>(
+    concurrency: usize,
+    observations: usize,
+    mut operation: F,
+) -> Result<Stats, Box<dyn Error>>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), Box<dyn Error>>>,
@@ -866,33 +1108,45 @@ where
         p99: percentile(&samples, 990),
         p999: percentile(&samples, 999),
         maximum: *samples.last().ok_or("empty async benchmark")?,
-        throughput: samples.len() as f64 * concurrency as f64 / elapsed,
+        throughput: samples.len() as f64 / elapsed,
     })
 }
 
-fn run_bm25(root: &Path, warm: bool, _concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_bm25(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("bm25");
-    let mut database = NativeDatabase::create(&path).map_err(|error| format!("bm25 seed: {error}"))?;
+    let mut database =
+        NativeDatabase::create(&path).map_err(|error| format!("bm25 seed: {error}"))?;
     let index = ObjectId::new(7)?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.create_search_index(index, "g7_bm25")?;
-    for id in 0..SEARCH_DOCUMENTS {
-        let text = if id == SEARCH_DOCUMENTS / 2 {
-            "rare g7 native benchmark term"
-        } else {
-            "common g7 native benchmark"
-        };
-        seed.index_document(index, (id as u128 + 1).to_be_bytes().to_vec(), text)?;
-    }
     seed.commit()?;
+    let document_count = search_documents();
+    for batch_start in (0..document_count).step_by(512) {
+        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        for id in batch_start..(batch_start + 512).min(document_count) {
+            let text = if id == document_count / 2 {
+                "rare g7 native benchmark term"
+            } else {
+                "common g7 native benchmark"
+            };
+            batch.index_document(index, (id as u128 + 1).to_be_bytes().to_vec(), text)?;
+        }
+        batch.commit()?;
+    }
     let snapshot = database.snapshot(0)?;
     if warm {
         for _ in 0..warmup {
             black_box(snapshot.match_text(index, "rare", K)?);
         }
     }
-    let stats = measure(observations, || {
+    let stats = measure_concurrent(concurrency, observations, &|| {
         let hits = snapshot.match_text(index, "rare", K)?;
         if hits.is_empty() {
             return Err("BM25 result mismatch".into());
@@ -902,34 +1156,60 @@ fn run_bm25(root: &Path, warm: bool, _concurrency: usize, observations: usize, w
     Ok(stats_json(stats))
 }
 
-fn run_ann(root: &Path, warm: bool, _concurrency: usize, observations: usize, warmup: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_ann(
+    root: &Path,
+    warm: bool,
+    concurrency: usize,
+    observations: usize,
+    warmup: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("ann");
-    let mut database = NativeDatabase::create(&path).map_err(|error| format!("ann seed: {error}"))?;
+    let mut database =
+        NativeDatabase::create(&path).map_err(|error| format!("ann seed: {error}"))?;
     let index = ObjectId::new(8)?;
     let config = HnswConfig::new(8, 32, 16, 512, 7)?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-    seed.create_vector_index(index, "g7_ann", VECTOR_DIMENSION, VectorMetric::Cosine, config)?;
-    let mut vectors = Vec::new();
-    for id in 0..SEARCH_DOCUMENTS {
-        let mut values = vec![0.0; VECTOR_DIMENSION as usize];
-        values[0] = 1.0;
-        values[1] = id as f32 / SEARCH_DOCUMENTS as f32;
-        vectors.push((ObjectId::new(id as u128 + 1)?, Vector::new(values)?));
-    }
-    seed.upsert_vectors(index, vectors)?;
+    seed.create_vector_index(
+        index,
+        "g7_ann",
+        vector_dimension(),
+        VectorMetric::Cosine,
+        config,
+    )?;
     seed.commit()?;
+    let document_count = search_documents();
+    for batch_start in (0..document_count).step_by(256) {
+        let vectors = (batch_start..(batch_start + 256).min(document_count))
+            .map(|id| {
+                let mut values = vec![0.0; vector_dimension() as usize];
+                values[0] = 1.0;
+                values[1] = id as f32 / document_count as f32;
+                Ok((ObjectId::new(id as u128 + 1)?, Vector::new(values)?))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        batch.upsert_vectors(index, vectors)?;
+        batch.commit()?;
+    }
     let snapshot = database.snapshot(0)?;
     let query = Vector::new({
-        let mut values = vec![0.0; VECTOR_DIMENSION as usize];
+        let mut values = vec![0.0; vector_dimension() as usize];
         values[0] = 1.0;
         values
     })?;
     let options = AnnSearchOptions::new(K, 512, Some(K))?;
     let exact = snapshot.search_vector_exact(index, &query, K)?;
     let approximate = snapshot.search_ann(index, &query, options)?;
-    let exact_ids = exact.iter().map(|hit| hit.object_id).collect::<std::collections::BTreeSet<_>>();
-    let recalled = approximate.hits.iter().filter(|hit| exact_ids.contains(&hit.object_id)).count();
+    let exact_ids = exact
+        .iter()
+        .map(|hit| hit.object_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let recalled = approximate
+        .hits
+        .iter()
+        .filter(|hit| exact_ids.contains(&hit.object_id))
+        .count();
     if recalled * 20 < K * 19 {
         return Err("ANN recall below G7 floor".into());
     }
@@ -938,7 +1218,7 @@ fn run_ann(root: &Path, warm: bool, _concurrency: usize, observations: usize, wa
             black_box(snapshot.search_ann(index, &query, options)?);
         }
     }
-    let stats = measure(observations, || {
+    let stats = measure_concurrent(concurrency, observations, &|| {
         black_box(snapshot.search_ann(index, &query, options)?);
         Ok::<(), Box<dyn Error>>(())
     })?;
@@ -947,70 +1227,124 @@ fn run_ann(root: &Path, warm: bool, _concurrency: usize, observations: usize, wa
     Ok(output)
 }
 
-fn run_commit(root: &Path, concurrency: usize, observations: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+fn run_commit(
+    root: &Path,
+    concurrency: usize,
+    observations: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
-    let strict_path = root.join("strict");
-    let mut database = NativeDatabase::create(&strict_path).map_err(|error| format!("strict seed: {error}"))?;
-    let stats = measure(observations, || {
-        let sequence = Instant::now().elapsed().as_nanos();
-        let mut batch = database.begin_optimistic(0, hyphae_native_types::DurabilityClass::Strict)?;
-        batch.set(format!("g7-{sequence}").into_bytes(), b"v".to_vec(), None)?;
-        database.commit_optimistic(batch)?;
-        Ok::<(), Box<dyn Error>>(())
-    })?;
     let group_path = root.join("group");
-    let database = NativeDatabase::create(&group_path).map_err(|error| format!("group seed: {error}"))?;
-    let scheduler = NativeCommitScheduler::start(database, hyphae_native_runtime::GroupCommitConfig::new(concurrency, Duration::from_millis(2), 64)?)?;
-    let clients = (0..concurrency).map(|_| scheduler.client()).collect::<Vec<_>>();
-    let barrier = Arc::new(Barrier::new(concurrency));
-    thread::scope(|scope| {
+    let database =
+        NativeDatabase::create(&group_path).map_err(|error| format!("group seed: {error}"))?;
+    let scheduler = NativeCommitScheduler::start(
+        database,
+        hyphae_native_runtime::GroupCommitConfig::new(concurrency, Duration::from_millis(2), 64)?,
+    )?;
+    let clients = (0..concurrency)
+        .map(|_| scheduler.client())
+        .collect::<Vec<_>>();
+    let barrier = Barrier::new(concurrency);
+    let started = Instant::now();
+    let samples = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
         for (producer, client) in clients.into_iter().enumerate() {
-            let barrier = Arc::clone(&barrier);
-            scope.spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let count =
+                observations / concurrency + usize::from(producer < observations % concurrency);
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || -> Result<Vec<u64>, String> {
+                let mut samples = Vec::with_capacity(count);
                 barrier.wait();
-                let mut batch = client.begin_optimistic(0, hyphae_native_types::DurabilityClass::Group)?;
-                batch.set(format!("g7-group-{producer}").into_bytes(), b"v".to_vec(), None)?;
-                client.submit(batch)?;
-                Ok(())
-            });
+                for sequence in 0..count {
+                    let sample = Instant::now();
+                    let mut batch = client
+                        .begin_optimistic(0, hyphae_native_types::DurabilityClass::Group)
+                        .map_err(|error| error.to_string())?;
+                    batch
+                        .set(
+                            format!("g7-group-{producer}-{sequence}").into_bytes(),
+                            b"v".to_vec(),
+                            None,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    client.submit(batch).map_err(|error| error.to_string())?;
+                    samples.push(sample.elapsed().as_nanos() as u64);
+                }
+                Ok(samples)
+            }));
         }
-    });
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "group commit worker panicked".to_owned())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .map_err(|error| -> Box<dyn Error> { error.into() })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let stats = stats_from_samples(samples, started.elapsed().as_secs_f64());
     scheduler.shutdown()?;
     let mut output = stats_json(stats);
     output["group_concurrency"] = json!(concurrency);
+    output["durability"] = json!("group-physical-sync");
     Ok(output)
 }
 
-fn measure(observations: usize, mut operation: impl FnMut() -> Result<(), Box<dyn Error>>) -> Result<Stats, Box<dyn Error>> {
-    let started = Instant::now();
-    let mut samples = Vec::with_capacity(observations);
-    for _ in 0..observations {
-        let sample = Instant::now();
-        operation()?;
-        samples.push(sample.elapsed().as_nanos() as u64);
+fn measure_concurrent(
+    concurrency: usize,
+    observations: usize,
+    operation: &(impl Fn() -> Result<(), Box<dyn Error>> + Sync),
+) -> Result<Stats, Box<dyn Error>> {
+    if concurrency == 0 || observations < concurrency {
+        return Err("concurrent benchmark requires at least one observation per worker".into());
     }
-    samples.sort_unstable();
-    let elapsed = started.elapsed().as_secs_f64();
-    Ok(Stats {
-        p50: percentile(&samples, 500),
-        p95: percentile(&samples, 950),
-        p99: percentile(&samples, 990),
-        p999: percentile(&samples, 999),
-        maximum: *samples.last().ok_or("empty benchmark")?,
-        throughput: samples.len() as f64 / elapsed,
+    let barrier = Barrier::new(concurrency);
+    let started = Instant::now();
+    let samples = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker in 0..concurrency {
+            let count =
+                observations / concurrency + usize::from(worker < observations % concurrency);
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || -> Result<Vec<u64>, String> {
+                let mut samples = Vec::with_capacity(count);
+                barrier.wait();
+                for _ in 0..count {
+                    let sample = Instant::now();
+                    operation().map_err(|error| error.to_string())?;
+                    samples.push(sample.elapsed().as_nanos() as u64);
+                }
+                Ok(samples)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "benchmark worker panicked".to_owned())?
+            })
+            .collect::<Result<Vec<_>, String>>()
     })
+    .map_err(|error| -> Box<dyn Error> { error.into() })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    Ok(stats_from_samples(samples, started.elapsed().as_secs_f64()))
 }
 
-fn stats_from_samples(mut samples: Vec<u64>) -> Stats {
+fn stats_from_samples(mut samples: Vec<u64>, elapsed_seconds: f64) -> Stats {
     samples.sort_unstable();
-    let total = samples.iter().sum::<u64>().max(1);
     Stats {
         p50: percentile(&samples, 500),
         p95: percentile(&samples, 950),
         p99: percentile(&samples, 990),
         p999: percentile(&samples, 999),
         maximum: *samples.last().unwrap_or(&0),
-        throughput: samples.len() as f64 / (total as f64 / 1_000_000_000.0),
+        throughput: samples.len() as f64 / elapsed_seconds,
     }
 }
 

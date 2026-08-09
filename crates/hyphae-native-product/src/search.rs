@@ -897,6 +897,104 @@ impl NativeProduct {
         })
     }
 
+    /// Executes one integrated search against a caller-owned immutable product
+    /// snapshot. This entry point keeps snapshot capture outside a benchmarked
+    /// hot path and preserves the exact same search semantics as
+    /// [`Self::search_collection`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid binding/request, missing durable side
+    /// record, exhausted bound, or native lexical/vector execution failure.
+    pub fn search_collection_at_snapshot(
+        _product: &Self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        request: &ProductSearchRequest,
+    ) -> Result<ProductSearchResult, ProductError> {
+        let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
+        let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
+        validate_search_request(&definition, &binding, request)?;
+        let documents = load_documents(snapshot, collection)?;
+        let total_documents = documents.len();
+        let eligible = filter_documents(&documents, &request.filter)?;
+        let eligible_ids = eligible
+            .iter()
+            .map(|candidate| decode_object_id(&candidate.document_id))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
+        let lexical_candidates = execute_lexical_branch(
+            snapshot,
+            binding.lexical_index,
+            request.lexical.as_ref(),
+            &eligible_ids,
+            &mut fused,
+        )?;
+        let vector_receipts = execute_vector_branches(
+            snapshot,
+            &binding,
+            &definition,
+            &request.vectors,
+            &eligible_ids,
+            &mut fused,
+        )?;
+        if request.lexical.is_none() && request.vectors.is_empty() {
+            for candidate in &eligible {
+                fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
+            }
+        }
+        let by_id = documents
+            .into_iter()
+            .map(|candidate| Ok((decode_object_id(&candidate.document_id)?, candidate)))
+            .collect::<Result<BTreeMap<_, _>, ProductError>>()?;
+        let candidates = fused
+            .into_iter()
+            .map(|(object_id, score)| {
+                let source = by_id.get(&object_id).ok_or_else(corruption)?;
+                Ok(hyphae_native_runtime::DocValueCandidate {
+                    document_id: object_id.get().to_be_bytes().to_vec(),
+                    score,
+                    values: source.values.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ProductError>>()?;
+        let result = execute_doc_values(
+            &candidates,
+            &hyphae_native_runtime::DocValueRequest {
+                filter: request.filter.clone(),
+                sort: request.sort.clone(),
+                limit: request.limit,
+                facets: request.facets.clone(),
+                aggregations: request.aggregations.clone(),
+            },
+            &doc_value_limits(),
+        )
+        .map_err(|error| map_doc_value_error(&error))?;
+        Ok(ProductSearchResult {
+            snapshot: snapshot.identity(),
+            hits: result
+                .hits
+                .into_iter()
+                .map(|hit| {
+                    Ok(ProductIntegratedSearchHit {
+                        object_id: decode_object_id(&hit.document_id)?,
+                        score: hit.score,
+                        doc_values: hit.values,
+                    })
+                })
+                .collect::<Result<_, ProductError>>()?,
+            facets: result.facets,
+            aggregations: result.aggregations,
+            vector_branches: vector_receipts,
+            approximate: false,
+            total_documents,
+            eligible_documents: eligible_ids.len(),
+            lexical_candidates,
+            retrieval_candidates: candidates.len(),
+            matched_candidates: result.matched_candidates,
+        })
+    }
+
     fn search_definition(
         &self,
         collection: crate::ObjectId,
@@ -911,6 +1009,30 @@ impl NativeProduct {
             return Err(invalid_request());
         };
         Ok(definition)
+    }
+
+    fn search_definition_at_snapshot(
+        product_snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+    ) -> Result<SearchCollectionDefinitionV2, ProductError> {
+        let object = product_snapshot
+            .inner
+            .logical_catalog_object(collection)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition)) = object else {
+            return Err(invalid_request());
+        };
+        Ok(definition.clone())
+    }
+
+    fn search_collection_binding_at_snapshot(
+        product_snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+    ) -> Result<ProductSearchCollectionBinding, ProductError> {
+        let encoded = product_snapshot
+            .structure_get(&binding_key(collection))
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        decode_binding(encoded)
     }
 
     /// Resolves a durable catalog-owned physical search binding.

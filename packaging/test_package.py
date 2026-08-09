@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 import zipfile
 from pathlib import Path
@@ -41,6 +42,7 @@ from required_checks import (
     INTEGRATION_GUARD_CHECKS,
     INTEGRATION_GUARD_STEP,
     REPORT_SCHEMA_PATH,
+    REQUIRED_CHECK_EVENTS,
     REQUIRED_CHECK_NAMES,
     REQUIRED_CHECK_WORKFLOWS,
     REPOSITORY_SLUG,
@@ -123,7 +125,7 @@ def fixture_workflow_runs(
             "path": REQUIRED_CHECK_WORKFLOWS[str(check_run["name"])],
             "head_sha": commit,
             "head_branch": "codex/release-candidate",
-            "event": "pull_request",
+            "event": REQUIRED_CHECK_EVENTS[str(check_run["name"])],
             "run_attempt": 1,
             "repository": {"full_name": REPOSITORY_SLUG},
             "head_repository": {"full_name": REPOSITORY_SLUG},
@@ -302,6 +304,44 @@ def add_final_signature_bundles(directory: Path) -> None:
 
 
 class PackageTests(unittest.TestCase):
+    def test_release_candidate_versions_are_aligned(self) -> None:
+        cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        version = cargo["workspace"]["package"]["version"]
+        python = tomllib.loads(
+            (ROOT / "sdks/python/pyproject.toml").read_text(encoding="utf-8")
+        )
+        typescript = json.loads(
+            (ROOT / "sdks/typescript/package.json").read_text(encoding="utf-8")
+        )
+        integrations = json.loads(
+            (ROOT / "integrations/javascript/package.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        typescript_lock = json.loads(
+            (ROOT / "sdks/typescript/package-lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        integrations_lock = json.loads(
+            (ROOT / "integrations/javascript/package-lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version, "1.0.0")
+        self.assertEqual(python["project"]["version"], version)
+        self.assertEqual(typescript["version"], version)
+        self.assertEqual(typescript_lock["version"], version)
+        self.assertEqual(typescript_lock["packages"][""]["version"], version)
+        self.assertEqual(integrations["version"], version)
+        self.assertEqual(integrations_lock["version"], version)
+        self.assertEqual(integrations_lock["packages"][""]["version"], version)
+        self.assertEqual(
+            integrations["peerDependencies"]["@celiums/hyphae"], version
+        )
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{version}] - Unreleased", changelog)
+
     def test_release_workflow_separates_native_and_candidate_artifacts(
         self,
     ) -> None:
@@ -321,11 +361,17 @@ class PackageTests(unittest.TestCase):
         self.assertIn("git merge-base --is-ancestor", workflow)
         self.assertIn("--tag-object", workflow)
         self.assertIn("--tag-target", workflow)
+        self.assertNotIn("if: github.event_name != 'pull_request'", workflow)
         self.assertEqual(workflow.count("pull-requests: read"), 2)
         self.assertEqual(workflow.count('${merge_commit}^{tree}'), 2)
         self.assertEqual(workflow.count('${merge_commit}^1'), 2)
         self.assertEqual(workflow.count('${merge_commit}^2'), 2)
-        for workflow_path in set(REQUIRED_CHECK_WORKFLOWS.values()):
+        pull_request_workflows = {
+            REQUIRED_CHECK_WORKFLOWS[name]
+            for name, event in REQUIRED_CHECK_EVENTS.items()
+            if event == "pull_request"
+        }
+        for workflow_path in pull_request_workflows:
             workflow_source = (ROOT / workflow_path).read_text(encoding="utf-8")
             self.assertIn(
                 "name: Verify the pull-request integration tree",
@@ -333,7 +379,7 @@ class PackageTests(unittest.TestCase):
             )
             self.assertIn("'FETCH_HEAD^{tree}'", workflow_source)
 
-    def test_ci_binds_patch_semver_check_to_release_baseline(self) -> None:
+    def test_ci_binds_major_semver_check_to_latest_release_baseline(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -347,12 +393,18 @@ class PackageTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            "BASELINE_COMMIT: 170380453a2ca6322a4c8bc50417318daee1c011",
+            "BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501",
             workflow,
         )
-        self.assertIn("refs/tags/v0.2.0:refs/tags/v0.2.0", workflow)
-        self.assertIn("--release-type patch", workflow)
+        self.assertIn("refs/tags/v0.2.1:refs/tags/v0.2.1", workflow)
+        self.assertIn("--release-type major", workflow)
         self.assertIn("--all-features", workflow)
+        self.assertNotIn("Defer platform execution", workflow)
+        self.assertIn("runs-on: ${{ matrix.os }}", workflow)
+        self.assertNotIn(
+            "name: Optional framework integrations\n    if:",
+            workflow,
+        )
 
     def test_archives_are_reproducible_and_rooted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hyphae-package-") as temporary:
@@ -812,7 +864,15 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(report["pull_request"]["base_ref"], "main")
         self.assertEqual(
             {check["workflow_event"] for check in report["checks"]},
-            {"pull_request"},
+            {"pull_request", "workflow_dispatch"},
+        )
+        self.assertEqual(
+            [
+                check["name"]
+                for check in report["checks"]
+                if check["workflow_event"] == "workflow_dispatch"
+            ],
+            ["Validate all exact-SHA G8 receipts"],
         )
         self.assertEqual(
             {check["head_branch"] for check in report["checks"]},

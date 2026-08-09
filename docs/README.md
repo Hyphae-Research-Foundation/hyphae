@@ -13,8 +13,10 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Start here
 
-- [Product capabilities and limits](product/capabilities.md)
-- [Local quickstart](quickstart.md)
+- [Native 1.0 capabilities and limits](product/native-capabilities.md)
+- [Native 1.0 development quickstart](quickstart-native.md)
+- [Published 0.2.1 capabilities and limits](product/capabilities.md)
+- [Published 0.2.1 compatibility quickstart](quickstart.md)
 - [CLI reference](cli/reference.md)
 - [Configuration reference](configuration.md)
 - [Data model](concepts/data-model.md)
@@ -137,7 +139,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Decisions and governance
 
-- [Fable 5 native-ecosystem handoff — 2026-08-02](handoffs/fable-5-native-ecosystem-2026-08-02.md)
+- [Superseded Fable 5 native-ecosystem handoff — 2026-08-02](handoffs/fable-5-native-ecosystem-2026-08-02.md)
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)
 - [Porting ledger](porting/ledger.md)

@@ -5,5 +5,6 @@ native Hyphae transaction substrate.
 
 The normative target contract is
 [`docs/native/wal-format-v1.md`](../../docs/native/wal-format-v1.md). This
-crate proves framing, integrity, tail repair, and record ordering only; it does
-not yet close cross-engine commit or G1.
+crate supplies framing, integrity, tail repair, record ordering, and the WAL
+side of the cross-engine commit protocol retained by the closed G1 and G5
+gates.

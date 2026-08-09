@@ -1,12 +1,12 @@
 # Native directory format v1
 
-Status: partially implemented by the experimental native runtime. Canonical
+Status: implemented by the Native runtime. Canonical
 `FORMAT` creation and validation, lifetime-held `LOCK` ownership, and lineage
 threading through `HYROOT03` manifests and `HYWAR002` retention anchors are
-implemented. Offline promotion remains unimplemented. ADR-0021 and ADR-0022
-govern this contract. The complete offline promotion contract remains work for
-the later product and release gates; it is not part of the closed bounded G1
-substrate profile.
+implemented. Explicit offline format-2 import, verification, promotion, and
+rollback are implemented. ADR-0021 and ADR-0022 govern this contract. Hosted
+migration and release evidence remains open under G8; it is not part of the
+closed bounded G1 substrate profile.
 
 This contract fixes the root-level identity of one native data directory:
 the `FORMAT` marker required by
@@ -169,9 +169,12 @@ Implementation of this contract requires:
 - a double-writer test proving that a second open fails with the explicit
   already-locked error while the first handle lives.
 
-The 2026-08-02 Linux implementation slice covers the golden marker, UUIDv7
-shape, stable reopen identity, missing/malformed/unknown/format-2/pending/
-conflicting marker failures, mixed-family rejection, and live double-writer
-exclusion. The promotion crash boundaries and the ADR-0022 lineage divergence
-round-trip remain open. This partial evidence does not close G1 or authorize
-format-2 migration.
+The retained G1 evidence covers the golden marker, UUIDv7 shape, stable reopen
+identity, missing/malformed/unknown/format-2/pending/conflicting marker
+failures, mixed-family rejection, live double-writer exclusion, and lineage
+round-trips. The implemented G8 process and block-replay harnesses additionally
+exercise interruption before the promotion rename, after rename, and after
+parent synchronization; every recovery must expose exactly one valid marker.
+The G8 suite also adds format-2 import, equivalence, explicit promotion,
+rollback, and source-retention checks. Those G8 checks authorize no release
+claim until their exact-SHA hosted receipts aggregate successfully.

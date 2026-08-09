@@ -22,6 +22,8 @@ HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 CARGO_MANIFESTS = (
     "Cargo.toml",
     "conformance/g6/runners/rust/Cargo.toml",
+    "conformance/g7/runners/rust/Cargo.toml",
+    "conformance/g8/independent-backup-verifier/Cargo.toml",
     "conformance/rust/Cargo.toml",
     "crates/hyphae-cli/Cargo.toml",
     "crates/hyphae-client/Cargo.toml",
@@ -52,7 +54,12 @@ CARGO_MANIFESTS = (
 CARGO_LOCKS = (
     "Cargo.lock",
     "conformance/g6/runners/rust/Cargo.lock",
+    "conformance/g7/runners/rust/Cargo.lock",
     "fuzz/Cargo.lock",
+)
+ISOLATED_CARGO_MANIFESTS = (
+    "conformance/g6/runners/rust/Cargo.toml",
+    "conformance/g7/runners/rust/Cargo.toml",
 )
 NPM_PROJECTS = {
     "sdks/typescript/package.json": "sdks/typescript/package-lock.json",
@@ -356,14 +363,15 @@ def validate_registered_dependency_files(changed: set[str]) -> None:
 def validate_manifest_lock_pairs(changed: set[str], head: str) -> None:
     validate_registered_dependency_files(changed)
     rust_manifests = {path for path in changed if path.endswith("Cargo.toml")}
-    if any(not path.startswith("fuzz/") for path in rust_manifests) and "Cargo.lock" not in changed:
+    root_manifests = rust_manifests.difference(ISOLATED_CARGO_MANIFESTS, {"fuzz/Cargo.toml"})
+    if root_manifests and "Cargo.lock" not in changed:
         validate_cargo_lock(head)
     if "fuzz/Cargo.toml" in changed and "fuzz/Cargo.lock" not in changed:
         validate_cargo_lock(head, "fuzz/Cargo.toml")
-    g6_runner = "conformance/g6/runners/rust/Cargo.toml"
-    g6_lock = "conformance/g6/runners/rust/Cargo.lock"
-    if g6_runner in changed and g6_lock not in changed:
-        validate_cargo_lock(head, g6_runner)
+    for runner in ISOLATED_CARGO_MANIFESTS:
+        lock = str(PurePosixPath(runner).with_name("Cargo.lock"))
+        if runner in changed and lock not in changed:
+            validate_cargo_lock(head, runner)
     for manifest in (path for path in changed if path in NPM_PROJECTS):
         lock = NPM_PROJECTS[manifest]
         if lock not in changed:

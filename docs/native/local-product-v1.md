@@ -1,9 +1,10 @@
 # Native local product contract v1
 
-Status: accepted G6 planning contract; implementation incomplete
+Status: implemented; G6 closed for this bounded contract
 
-This contract defines the bounded Native 1.0 product that G6 must expose. It
-does not describe shipped `0.2.1` behavior and does not declare G6 closed.
+This contract defines the bounded Native 1.0 product exposed by G6. It does not
+describe shipped `0.2.1` behavior. G6 closure is recorded by the native gate
+status and its retained exact-SHA evidence.
 
 ## One authority
 
