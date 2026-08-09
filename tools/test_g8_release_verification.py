@@ -37,17 +37,37 @@ class G8ReleaseVerificationTests(unittest.TestCase):
                 (directory / name).write_text(name, encoding="ascii")
 
             with (
-                patch("g8_release_verification.run"),
+                patch("g8_release_verification.run") as run,
                 patch("g8_release_verification.verify_blob") as blob,
                 patch("g8_release_verification.verify_attestation") as attestation,
             ):
-                result = verify(directory, COMMIT, TAG, "workflow-identity")
+                result = verify(
+                    directory,
+                    COMMIT,
+                    TAG,
+                    "workflow-identity",
+                    "b" * 40,
+                    COMMIT,
+                )
 
             self.assertEqual(result["archive_count"], 4)
             self.assertEqual(result["signature_verifications"], 8)
             self.assertEqual(result["attestation_verifications"], 12)
             self.assertEqual(blob.call_count, 8)
             self.assertEqual(attestation.call_count, 12)
+            self.assertIn("--tag-object", run.call_args_list[0].args)
+            self.assertIn("--tag-target", run.call_args_list[0].args)
+
+    def test_verify_rejects_partial_tag_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "provided together"):
+                verify(
+                    Path(temporary),
+                    COMMIT,
+                    TAG,
+                    "workflow-identity",
+                    tag_object="b" * 40,
+                )
 
     def test_verify_rejects_incomplete_target_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -58,16 +58,28 @@ def verify_attestation(
 
 
 def verify(
-    directory: Path, commit: str, tag: str, certificate_identity: str
+    directory: Path,
+    commit: str,
+    tag: str,
+    certificate_identity: str,
+    tag_object: str | None = None,
+    tag_target: str | None = None,
 ) -> dict:
     directory = directory.resolve(strict=True)
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise ValueError("release commit must be canonical lowercase SHA-1")
+    if (tag_object is None) != (tag_target is None):
+        raise ValueError("release tag object and target must be provided together")
     manifest = directory / f"hyphae-{tag}.release-evidence.json"
-    run(
+    evidence_arguments: list[str | Path] = [
         sys.executable, "packaging/release_evidence.py", "verify",
         "--directory", directory, "--manifest", manifest, "--commit", commit,
-    )
+    ]
+    if tag_object is not None and tag_target is not None:
+        evidence_arguments.extend(
+            ("--tag-object", tag_object, "--tag-target", tag_target)
+        )
+    run(*evidence_arguments)
     run(
         sys.executable, "packaging/finalize_release.py",
         "--directory", directory, "--tag", tag, "--verify",
@@ -122,12 +134,14 @@ def main() -> int:
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag-object")
+    parser.add_argument("--tag-target")
     parser.add_argument("--certificate-identity", required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     result = verify(
         arguments.directory, arguments.commit, arguments.tag,
-        arguments.certificate_identity,
+        arguments.certificate_identity, arguments.tag_object, arguments.tag_target,
     )
     arguments.output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
