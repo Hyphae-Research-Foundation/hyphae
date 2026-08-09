@@ -105,6 +105,10 @@ def validate_process_crash(payload: dict[str, Any], commit: str) -> dict[str, st
         or payload.get("source_commit") != commit
         or payload.get("durability") != "strict"
         or payload.get("all_engine_csn") != 1
+        or not isinstance(payload.get("environment"), str)
+        or not payload["environment"].strip()
+        or not isinstance(payload.get("target"), str)
+        or not payload["target"].endswith("-linux")
     ):
         raise GateFailure("process-crash artifact identity is invalid")
     commits = require_exact_names(payload.get("commit_boundaries"), COMMIT_BOUNDARIES, "commit")
@@ -120,8 +124,57 @@ def validate_process_crash(payload: dict[str, Any], commit: str) -> dict[str, st
     for row in [*commits, *checkpoints, *pins, *promotions]:
         if row.get("termination") != "signal-9":
             raise GateFailure("Linux process-crash child was not terminated by SIGKILL")
-    if any(row.get("recovered_temporary_manifests") != 0 for row in checkpoints):
-        raise GateFailure("process crash left a temporary manifest")
+    expected_commits = {
+        "blob-staged": ("prior-empty", None, 0),
+        "blob-promoted": ("prior-empty", None, 1),
+        "page-appended": ("prior-empty", None, 1),
+        "page-synchronized": ("prior-empty", None, 1),
+        "wal-appended": ("complete-csn-1", 1, 1),
+        "wal-synchronized": ("complete-csn-1", 1, 1),
+        "root-published": ("complete-csn-1", 1, 1),
+    }
+    if any(
+        (
+            row.get("expected_state"),
+            row.get("recovered_csn"),
+            row.get("recovered_blob_count"),
+        )
+        != expected_commits[row["boundary"]]
+        for row in commits
+    ):
+        raise GateFailure("process-crash commit recovery differs")
+    expected_checkpoints = {
+        "manifest-staged": (0, 0, 0, 1),
+        "manifest-published": (1, 0, 1, 0),
+        "wal-appended": (1, 1, 0, 0),
+        "wal-synchronized": (1, 1, 0, 0),
+    }
+    if any(
+        (
+            row.get("manifest_count"),
+            row.get("checkpoint_count"),
+            row.get("unanchored_manifest_suffix"),
+            row.get("recovered_temporary_manifests"),
+        )
+        != expected_checkpoints[row["boundary"]]
+        for row in checkpoints
+    ):
+        raise GateFailure("process-crash checkpoint recovery differs")
+    expected_pins = {
+        "record-synchronized": ("absent", 0, 0, 1),
+        "record-published": ("complete", 1, 1, 1),
+    }
+    if any(
+        (
+            row.get("expected_pin"),
+            row.get("recovered_pin_count"),
+            row.get("pin_directory_files"),
+            row.get("retained_page_generations"),
+        )
+        != expected_pins[row["boundary"]]
+        for row in pins
+    ):
+        raise GateFailure("process-crash snapshot-pin recovery differs")
     expected_markers = {
         "before-rename": "pending",
         "marker-renamed": "authority",

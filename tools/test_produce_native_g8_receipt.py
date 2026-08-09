@@ -86,18 +86,48 @@ class G8ProducerTests(unittest.TestCase):
             "schema": "hyphae.native.process-crash-matrix.v4",
             "status": "process-crash-not-power-loss",
             "source_commit": COMMIT,
+            "environment": "g8-github-actions-ubuntu-24.04",
+            "target": "x86_64-linux",
             "durability": "strict",
             "all_engine_csn": 1,
             "commit_boundaries": [
-                {"boundary": name, "termination": "signal-9"}
+                {
+                    "boundary": name,
+                    "termination": "signal-9",
+                    "expected_state": (
+                        "complete-csn-1"
+                        if name in {"wal-appended", "wal-synchronized", "root-published"}
+                        else "prior-empty"
+                    ),
+                    "recovered_csn": (
+                        1
+                        if name in {"wal-appended", "wal-synchronized", "root-published"}
+                        else None
+                    ),
+                    "recovered_blob_count": 0 if name == "blob-staged" else 1,
+                }
                 for name in sorted(COMMIT_BOUNDARIES)
             ],
             "checkpoint_boundaries": [
-                {"boundary": name, "termination": "signal-9", "recovered_temporary_manifests": 0}
+                {
+                    "boundary": name,
+                    "termination": "signal-9",
+                    "manifest_count": 0 if name == "manifest-staged" else 1,
+                    "checkpoint_count": int(name.startswith("wal-")),
+                    "unanchored_manifest_suffix": int(name == "manifest-published"),
+                    "recovered_temporary_manifests": int(name == "manifest-staged"),
+                }
                 for name in sorted(CHECKPOINT_BOUNDARIES)
             ],
             "snapshot_pin_boundaries": [
-                {"boundary": name, "termination": "signal-9"}
+                {
+                    "boundary": name,
+                    "termination": "signal-9",
+                    "expected_pin": "complete" if name == "record-published" else "absent",
+                    "recovered_pin_count": int(name == "record-published"),
+                    "pin_directory_files": int(name == "record-published"),
+                    "retained_page_generations": 1,
+                }
                 for name in sorted(SNAPSHOT_PIN_BOUNDARIES)
             ],
             "promotion_boundaries": [
@@ -112,6 +142,15 @@ class G8ProducerTests(unittest.TestCase):
             ],
         }
         self.assert_valid("process-crash-recovery", payload)
+        staged = next(
+            row
+            for row in payload["checkpoint_boundaries"]
+            if row["boundary"] == "manifest-staged"
+        )
+        staged["recovered_temporary_manifests"] = 0
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(GateFailure):
+            produce(ROOT, "process-crash-recovery", "linux", COMMIT, write(directory, payload))
+        staged["recovered_temporary_manifests"] = 1
         payload["commit_boundaries"][0]["termination"] = "exit-code-1"
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(GateFailure):
             produce(ROOT, "process-crash-recovery", "linux", COMMIT, write(directory, payload))
