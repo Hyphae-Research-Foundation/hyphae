@@ -302,12 +302,21 @@ jobs:
           CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
         run: |
           set -euo pipefail
-          PYTHONPATH=. python packaging/g8_release_verification.py \
-            --directory dist \
-            --commit "$RELEASE_COMMIT" \
-            --tag "$RELEASE_TAG" \
-            --certificate-identity "$CERTIFICATE_IDENTITY" \
+          arguments=(
+            --directory dist
+            --commit "$RELEASE_COMMIT"
+            --tag "$RELEASE_TAG"
+            --certificate-identity "$CERTIFICATE_IDENTITY"
             --output native-g8-signed-release.json
+          )
+          if [[ -n "${RELEASE_TAG_OBJECT:-}" ]]; then
+            arguments+=(
+              --tag-object "$RELEASE_TAG_OBJECT"
+              --tag-target "$RELEASE_TAG_TARGET"
+            )
+          fi
+          PYTHONPATH=. python packaging/g8_release_verification.py \
+            "${arguments[@]}"
           PYTHONPATH=. python tools/produce_native_g8_receipt.py \
             --requirement sbom-signatures-provenance \
             --platform release \
