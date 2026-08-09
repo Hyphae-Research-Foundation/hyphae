@@ -432,6 +432,7 @@ struct Candidate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HnswIndex {
     definition: VectorIndexDefinition,
+    definition_digest: [u8; 32],
     entries: BTreeMap<ObjectId, Entry>,
     nodes: BTreeMap<ObjectId, GraphNode>,
     entry_point: Option<ObjectId>,
@@ -449,6 +450,7 @@ impl HnswIndex {
     pub fn new(definition: VectorIndexDefinition) -> Result<Self, AnnError> {
         let mut index = Self {
             definition,
+            definition_digest: definition.digest(),
             entries: BTreeMap::new(),
             nodes: BTreeMap::new(),
             entry_point: None,
@@ -490,31 +492,104 @@ impl HnswIndex {
         Self::from_entries(definition, entries)
     }
 
-    /// Restores only if every record equals the deterministic canonical
-    /// rebuild for the supplied vectors.
+    /// Restores one persisted generation after validating its canonical
+    /// ordering, structural bounds, deterministic levels, and complete build
+    /// identity.
     ///
     /// # Errors
     ///
-    /// Returns an error for duplicate/missing identities, malformed vectors,
-    /// invalid graph edges, or any build-identity mismatch.
+    /// Returns an error for duplicate, missing, or out-of-order identities,
+    /// malformed vectors, invalid graph edges, or any build-identity mismatch.
     pub fn restore(snapshot: &IndexSnapshot) -> Result<Self, AnnError> {
+        Self::restore_owned(snapshot.clone())
+    }
+
+    /// Restores one owned persisted generation without cloning its vectors or
+    /// graph records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::restore`].
+    pub fn restore_owned(snapshot: IndexSnapshot) -> Result<Self, AnnError> {
         let mut entries = BTreeMap::new();
-        for record in &snapshot.vectors {
+        let mut previous_object_id = None;
+        for record in snapshot.vectors {
+            if previous_object_id.is_some_and(|previous| previous >= record.object_id) {
+                return Err(AnnError::CorruptGraph);
+            }
             validate_vector(snapshot.definition, &record.vector)?;
             if entries
                 .insert(
                     record.object_id,
                     Entry {
                         creating_csn: record.creating_csn,
-                        vector: record.vector.clone(),
+                        vector: record.vector,
                     },
                 )
                 .is_some()
             {
                 return Err(AnnError::CorruptGraph);
             }
+            previous_object_id = Some(record.object_id);
         }
-        let expected = Self::from_entries(snapshot.definition, entries)?;
+
+        let mut nodes = BTreeMap::new();
+        previous_object_id = None;
+        for record in snapshot.nodes {
+            if previous_object_id.is_some_and(|previous| previous >= record.object_id)
+                || record.neighbors.len() != usize::from(record.level) + 1
+            {
+                return Err(AnnError::CorruptGraph);
+            }
+            let neighbors = record
+                .neighbors
+                .into_iter()
+                .map(|layer| {
+                    if layer.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(AnnError::CorruptGraph);
+                    }
+                    Ok(layer.into_iter().collect())
+                })
+                .collect::<Result<Vec<BTreeSet<_>>, AnnError>>()?;
+            if nodes
+                .insert(
+                    record.object_id,
+                    GraphNode {
+                        level: record.level,
+                        neighbors,
+                    },
+                )
+                .is_some()
+            {
+                return Err(AnnError::CorruptGraph);
+            }
+            previous_object_id = Some(record.object_id);
+        }
+
+        let restored = Self {
+            definition: snapshot.definition,
+            definition_digest: snapshot.definition.digest(),
+            entries,
+            nodes,
+            entry_point: snapshot.entry_point,
+            max_level: snapshot.max_level,
+            build_identity: snapshot.build_identity,
+        };
+        restored.validate()?;
+        Ok(restored)
+    }
+
+    /// Rebuilds a restored generation and proves byte-for-byte canonical graph
+    /// equivalence. This intentionally expensive path is for offline proofs;
+    /// ordinary recovery uses [`Self::restore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ordinary restore fails or the deterministic
+    /// rebuild differs from the persisted generation.
+    pub fn restore_canonical(snapshot: &IndexSnapshot) -> Result<Self, AnnError> {
+        let restored = Self::restore(snapshot)?;
+        let expected = Self::from_entries(snapshot.definition, restored.entries)?;
         if expected.export_snapshot() != *snapshot {
             return Err(AnnError::CorruptGraph);
         }
@@ -850,7 +925,11 @@ impl HnswIndex {
             return Err(AnnError::CorruptGraph);
         }
         for (object_id, node) in &self.nodes {
-            if node.level > MAX_LEVEL || node.neighbors.len() != usize::from(node.level) + 1 {
+            if node.level > MAX_LEVEL
+                || node.level > self.max_level
+                || node.level != self.level_for(*object_id)
+                || node.neighbors.len() != usize::from(node.level) + 1
+            {
                 return Err(AnnError::CorruptGraph);
             }
             for (layer, neighbors) in node.neighbors.iter().enumerate() {
@@ -1213,7 +1292,7 @@ impl HnswIndex {
     fn level_for(&self, object_id: ObjectId) -> u16 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"hyphae-hnsw-level-v1");
-        hasher.update(&self.definition.digest());
+        hasher.update(&self.definition_digest);
         hasher.update(&object_id.get().to_be_bytes());
         let digest = hasher.finalize();
         let mut random_bytes = [0_u8; 8];
@@ -1290,28 +1369,38 @@ fn distance(metric: Metric, left: &Vector, right: &Vector) -> Result<f64, AnnErr
     if left.dimension() != right.dimension() {
         return Err(AnnError::DimensionMismatch);
     }
-    let mut dot = 0.0_f64;
-    let mut left_norm = 0.0_f64;
-    let mut right_norm = 0.0_f64;
-    let mut squared_l2 = 0.0_f64;
-    for (left, right) in left.values().iter().zip(right.values()) {
-        let left = f64::from(*left);
-        let right = f64::from(*right);
-        dot += left * right;
-        left_norm += left * left;
-        right_norm += right * right;
-        let difference = left - right;
-        squared_l2 += difference * difference;
-    }
     match metric {
         Metric::Cosine => {
+            let mut dot = 0.0_f64;
+            let mut left_norm = 0.0_f64;
+            let mut right_norm = 0.0_f64;
+            for (left, right) in left.values().iter().zip(right.values()) {
+                let left = f64::from(*left);
+                let right = f64::from(*right);
+                dot += left * right;
+                left_norm += left * left;
+                right_norm += right * right;
+            }
             if left_norm == 0.0 || right_norm == 0.0 {
                 return Err(AnnError::ZeroCosineVector);
             }
             Ok(1.0 - dot / (left_norm.sqrt() * right_norm.sqrt()))
         }
-        Metric::NegativeDot => Ok(-dot),
-        Metric::SquaredL2 => Ok(squared_l2),
+        Metric::NegativeDot => Ok(-left
+            .values()
+            .iter()
+            .zip(right.values())
+            .map(|(left, right)| f64::from(*left) * f64::from(*right))
+            .sum::<f64>()),
+        Metric::SquaredL2 => Ok(left
+            .values()
+            .iter()
+            .zip(right.values())
+            .map(|(left, right)| {
+                let difference = f64::from(*left) - f64::from(*right);
+                difference * difference
+            })
+            .sum()),
     }
 }
 
@@ -1393,6 +1482,18 @@ mod tests {
         Ok(Vector::new(values)?)
     }
 
+    fn restore_fixture() -> Result<HnswIndex, Box<dyn std::error::Error>> {
+        let mut index = HnswIndex::new(definition(Metric::Cosine)?)?;
+        for value in 1..=32_u16 {
+            index.upsert(
+                object(u128::from(value))?,
+                csn(u64::from(value))?,
+                deterministic_vector(value, 2)?,
+            )?;
+        }
+        Ok(index)
+    }
+
     #[test]
     fn every_metric_matches_the_exact_oracle_for_axis_vectors()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1433,6 +1534,18 @@ mod tests {
 
         assert_eq!(forward.build_identity(), reverse.build_identity());
         assert_eq!(forward.export_graph(), reverse.export_graph());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_build_identity_is_frozen() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            restore_fixture()?.build_identity(),
+            [
+                167, 22, 41, 248, 199, 113, 23, 225, 118, 147, 152, 216, 175, 136, 150, 106, 67,
+                221, 74, 124, 123, 13, 145, 10, 59, 203, 190, 237, 196, 46, 220, 30,
+            ]
+        );
         Ok(())
     }
 
@@ -1487,14 +1600,7 @@ mod tests {
 
     #[test]
     fn restore_rejects_any_noncanonical_graph_record() -> Result<(), Box<dyn std::error::Error>> {
-        let mut index = HnswIndex::new(definition(Metric::Cosine)?)?;
-        for value in 1..=16_u16 {
-            index.upsert(
-                object(u128::from(value))?,
-                csn(u64::from(value))?,
-                Vector::new([f32::from(value), 1.0])?,
-            )?;
-        }
+        let index = restore_fixture()?;
         let mut snapshot = index.export_snapshot();
         snapshot.build_identity[0] ^= 0xff;
         assert_eq!(HnswIndex::restore(&snapshot), Err(AnnError::CorruptGraph));
@@ -1511,6 +1617,51 @@ mod tests {
             HnswIndex::restore(&graph_corruption),
             Err(AnnError::CorruptGraph)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_preserves_canonical_generation_and_search_results()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = restore_fixture()?;
+        let snapshot = index.export_snapshot();
+        let restored = HnswIndex::restore(&snapshot)?;
+        let restored_owned = HnswIndex::restore_owned(snapshot.clone())?;
+        let canonical = HnswIndex::restore_canonical(&snapshot)?;
+        let query = deterministic_vector(91, 2)?;
+        let options = SearchOptions::new(10, 32, Some(10))?;
+
+        assert_eq!(restored.export_snapshot(), snapshot);
+        assert_eq!(restored_owned.export_snapshot(), snapshot);
+        assert_eq!(canonical.export_snapshot(), snapshot);
+        assert_eq!(
+            restored.search(&query, options)?,
+            index.search(&query, options)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_noncanonical_record_order() -> Result<(), Box<dyn std::error::Error>> {
+        let index = restore_fixture()?;
+
+        let mut vectors = index.export_snapshot();
+        vectors.vectors.swap(0, 1);
+        assert_eq!(HnswIndex::restore(&vectors), Err(AnnError::CorruptGraph));
+
+        let mut nodes = index.export_snapshot();
+        nodes.nodes.swap(0, 1);
+        assert_eq!(HnswIndex::restore(&nodes), Err(AnnError::CorruptGraph));
+
+        let mut neighbors = index.export_snapshot();
+        let layer = neighbors
+            .nodes
+            .iter_mut()
+            .flat_map(|node| node.neighbors.iter_mut())
+            .find(|layer| layer.len() >= 2)
+            .ok_or("quality fixture did not produce two graph neighbors")?;
+        layer.swap(0, 1);
+        assert_eq!(HnswIndex::restore(&neighbors), Err(AnnError::CorruptGraph));
         Ok(())
     }
 

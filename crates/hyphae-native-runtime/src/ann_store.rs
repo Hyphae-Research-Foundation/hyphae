@@ -931,7 +931,8 @@ fn restore_index(
         max_level: metadata.max_level,
         build_identity: metadata.build_identity,
     };
-    let base = HnswIndex::restore(&snapshot).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let base =
+        HnswIndex::restore_owned(snapshot).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
     let mut restored = AnnIndexState {
         base,
         deltas,
