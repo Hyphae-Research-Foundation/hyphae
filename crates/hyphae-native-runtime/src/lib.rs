@@ -13556,9 +13556,20 @@ impl NativeWriteBatch {
         {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        self.state
-            .ann
-            .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)?;
+        let initializes_index = self.mutations.iter().any(|mutation| {
+            mutation.opcode == Opcode::CreateAnnIndex && mutation.target == Some(index)
+        });
+        if initializes_index {
+            self.state.ann.upsert_initial_many(
+                index,
+                ann_store::private_mutation_csn()?,
+                &vectors,
+            )?;
+        } else {
+            self.state
+                .ann
+                .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)?;
+        }
         let count = vectors.len();
         self.mutations
             .extend(vectors.into_iter().map(|(object_id, vector)| Mutation {
@@ -14407,6 +14418,7 @@ fn apply_mutations_to_state(
     state: &mut MaterializedState,
     mutations: &[Mutation],
 ) -> Result<(), NativeRuntimeError> {
+    let mut initial_ann_vectors = BTreeMap::<ObjectId, BTreeMap<ObjectId, Vector>>::new();
     for mutation in mutations {
         match mutation.opcode {
             Opcode::CreateCatalogObjectV2 => apply_catalog_v2_creation(state, mutation)?,
@@ -14461,11 +14473,57 @@ fn apply_mutations_to_state(
             Opcode::CreateIndex
             | Opcode::IndexDocument
             | Opcode::ReplaceDocument
-            | Opcode::DeleteDocument
-            | Opcode::CreateAnnIndex
-            | Opcode::UpsertVector
-            | Opcode::DeleteVector => apply_search_mutation_to_state(state, mutation)?,
+            | Opcode::DeleteDocument => apply_search_mutation_to_state(state, mutation)?,
+            Opcode::CreateAnnIndex => {
+                apply_search_mutation_to_state(state, mutation)?;
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                if initial_ann_vectors.insert(index, BTreeMap::new()).is_some() {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+            }
+            Opcode::UpsertVector => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                if let Some(vectors) = initial_ann_vectors.get_mut(&index) {
+                    vectors.insert(
+                        ann_store::decode_object_identity(&mutation.key)?,
+                        ann_store::decode_vector_mutation(&mutation.value)?,
+                    );
+                } else {
+                    apply_search_mutation_to_state(state, mutation)?;
+                }
+            }
+            Opcode::DeleteVector => {
+                let index = mutation
+                    .target
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                if let Some(vectors) = initial_ann_vectors.get_mut(&index) {
+                    let object_id = ann_store::decode_object_identity(&mutation.key)?;
+                    if !mutation.value.is_empty() || vectors.remove(&object_id).is_none() {
+                        return Err(NativeRuntimeError::InvalidPreparedMutation);
+                    }
+                } else {
+                    apply_search_mutation_to_state(state, mutation)?;
+                }
+            }
         }
+    }
+    apply_initial_ann_vectors(state, initial_ann_vectors)
+}
+
+fn apply_initial_ann_vectors(
+    state: &mut MaterializedState,
+    initial_ann_vectors: BTreeMap<ObjectId, BTreeMap<ObjectId, Vector>>,
+) -> Result<(), NativeRuntimeError> {
+    for (index, vectors) in initial_ann_vectors {
+        state.ann.upsert_initial_many(
+            index,
+            ann_store::private_mutation_csn()?,
+            &vectors.into_iter().collect::<Vec<_>>(),
+        )?;
     }
     Ok(())
 }
@@ -40947,6 +41005,46 @@ mod tests {
                 .map(|hit| hit.object_id)
                 .collect::<Vec<_>>(),
             vec![luciana, mario]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_base_admits_more_vectors_than_the_delta_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(3)?;
+        let vector_count = u16::try_from(crate::MAX_ANN_DELTA_RECORDS + 1)?;
+        let vectors = (0..vector_count)
+            .map(|offset| -> Result<_, Box<dyn std::error::Error>> {
+                Ok((
+                    ObjectId::new(u128::from(offset) + 1)?,
+                    Vector::new([1.0, f32::from(offset) / f32::from(vector_count)])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let vector_count = usize::from(vector_count);
+        let mut create = database.begin(10, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "initial-bulk",
+            2,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+        assert_eq!(create.upsert_vectors(index, vectors)?, vector_count);
+        create.commit()?;
+        let observed = database.observe_ann_index(index)?;
+        assert_eq!(observed.base_vector_count, vector_count);
+        assert_eq!(observed.effective_vector_count, vector_count);
+        assert_eq!(observed.delta_records, 0);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.observe_ann_index(index)?.base_vector_count,
+            vector_count
         );
         Ok(())
     }

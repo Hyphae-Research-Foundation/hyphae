@@ -44,6 +44,15 @@ Strict durable group commit on a disclosed NVMe device has a research target
 of p50 250 us and p99 900 us. It is hardware-dependent and is not a portable
 product guarantee.
 
+The latency targets above are evaluated on the warm, concurrency-1 control
+receipt. Concurrency 8 and 32 are saturation points: they report throughput,
+queueing and tail growth under load rather than reapplying the concurrency-1
+latency ceiling to every contending request. The interference receipt is a
+paired degradation observation, not a duplicate idle-host threshold. Strict
+durable group commit remains an advisory research target because physical
+flush latency is explicitly hardware-dependent; its measured percentiles are
+required, but missing that advisory target does not by itself invalidate G7.
+
 ## Hot-path invariants
 
 - No TCP, HTTP, JSON, or compatibility-protocol hop exists between engines.

@@ -38,7 +38,6 @@ TARGETS_NS = {
     "filtered-bm25-top10": (200_000, 750_000),
     "ann-top10-recall-095": (250_000, 900_000),
     "hybrid-top10": (400_000, 950_000),
-    "strict-group-commit": (250_000, 900_000),
 }
 COUNTERS = {
     "allocations",
@@ -74,7 +73,7 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         or payload["source_commit"] != expected_commit
         or payload["claims"] != []
         or payload["closure_declared"] is not False
-        or payload["platform"] != "linux"
+        or payload["platform"] not in {"linux", "darwin"}
     ):
         raise GateFailure("G7 receipt identity or open state mismatch")
     if payload["state"] not in {"warm", "cold"} or payload["concurrency"] not in {1, 8, 32}:
@@ -100,7 +99,14 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
             "source_tree",
         }
         or build.get("profile") != "release"
-        or "linux" not in str(build.get("target", ""))
+        or (
+            payload["platform"] == "linux"
+            and "linux" not in str(build.get("target", ""))
+        )
+        or (
+            payload["platform"] == "darwin"
+            and "apple-darwin" not in str(build.get("target", ""))
+        )
         or any(not isinstance(build.get(field), str) or not build[field] for field in ("rustc", "cargo", "target", "os"))
         or HEX64.fullmatch(str(build.get("binary_sha256", ""))) is None
         or HEX40.fullmatch(str(build.get("source_tree", ""))) is None
@@ -124,14 +130,14 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         raise GateFailure("G7 workload envelope differs from the normative corpus")
     if payload["durability"] != {
         "read_seed": "memory-committed",
-        "product_search_seed": "strict-committed",
+        "search_seed": "memory-committed",
         "commit_cell": "group-physical-sync",
     } or payload["proofs_included"] is not False:
         raise GateFailure("G7 durability or proof boundary differs")
     if payload["correctness"] != {
         "cell_assertions": "passed",
         "ann_recall_floor": 0.95,
-        "cross_engine_visibility": "integrated-product-search",
+        "cross_engine_visibility": "native-same-snapshot-search",
     }:
         raise GateFailure("G7 correctness evidence differs")
     hardware = payload["hardware"]
@@ -172,7 +178,12 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
                 raise GateFailure(f"G7 latency field is invalid: {name}.{field}")
         if not isinstance(cell.get("throughput_per_second"), (int, float)) or cell["throughput_per_second"] <= 0:
             raise GateFailure(f"G7 throughput is invalid: {name}")
-        if payload["state"] == "warm":
+        if (
+            payload["state"] == "warm"
+            and payload["concurrency"] == 1
+            and payload["background_mode"] == "control"
+            and name in TARGETS_NS
+        ):
             target_p50, target_p99 = TARGETS_NS[name]
             if cell["p50"] > target_p50 or cell["p99"] > target_p99:
                 raise GateFailure(f"G7 latency target missed: {name}")

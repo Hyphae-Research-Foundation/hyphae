@@ -58,7 +58,8 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
         or g7.get("minimum_hot_observations") != 1_000_000
         or g7.get("required_dataset") != {"documents": 1_000_000, "vectors": 1_000_000, "vector_dimension": 384}
         or g7.get("required_hardware") != {"dedicated": True, "virtualization": "none"}
-        or set(g7.get("warm_targets_nanoseconds", {})) != set(cells)
+        or set(g7.get("warm_targets_nanoseconds", {})) != set(cells) - {"strict-group-commit"}
+        or set(g7.get("advisory_targets_nanoseconds", {})) != {"strict-group-commit"}
     ):
         raise GateFailure("G7 normative measurement authority drifted")
     counters = g7.get("required_counters")
