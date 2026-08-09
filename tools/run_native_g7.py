@@ -26,7 +26,11 @@ def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: 
     base_command = [str(binary), commit, platform, state, str(concurrency)]
     command = base_command
     perf_output: Path | None = None
-    if sys.platform.startswith("linux") and shutil.which("perf"):
+    if (
+        sys.platform.startswith("linux")
+        and os.environ.get("HYPHAE_G7_PERF") == "1"
+        and shutil.which("perf")
+    ):
         descriptor = tempfile.NamedTemporaryFile(prefix="hyphae-g7-perf-", suffix=".csv", delete=False)
         descriptor.close()
         perf_output = Path(descriptor.name)
@@ -60,7 +64,12 @@ def run_cell(binary: Path, commit: str, platform: str, state: str, concurrency: 
     metrics.sample()
     completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if completed.returncode != 0:
-        if "No permission to enable" in completed.stderr or "Permission denied" in completed.stderr:
+        if (
+            "No permission to enable" in completed.stderr
+            or "Permission denied" in completed.stderr
+            or "perf_event_paranoid" in completed.stderr
+            or "performance monitoring" in completed.stderr
+        ):
             command = base_command
             completed = subprocess.run(
                 command,
