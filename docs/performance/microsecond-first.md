@@ -99,6 +99,13 @@ An accepted receipt records:
 - correctness, recall, crash-recovery, and cross-engine visibility results for
   the same build.
 
+Corpus construction is preparation, not a timed hot path. A matrix may publish
+one immutable search seed and reopen it for independent receipt and profiler
+processes only when its directory identity binds the exact source commit,
+generator, document/vector counts, and vector dimension. Every process must
+still reopen native durable state and revalidate exact-versus-ANN recall before
+measurement; a seed from another identity must never be reused.
+
 Cold first-touch observations are reported separately as diagnostics. They do
 not enter the million-observation hot-path histogram or a G7 closure threshold:
 repeating one access a million times silently turns a purported cold benchmark

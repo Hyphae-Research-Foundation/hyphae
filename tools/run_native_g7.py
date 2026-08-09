@@ -602,6 +602,17 @@ def main() -> int:
     environment = os.environ.copy()
     environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
     environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
+    transient_seed_workspace: Path | None = None
+    if "HYPHAE_G7_SEARCH_SEED_ROOT" not in environment:
+        data_root = environment.get("HYPHAE_G7_DATA_ROOT")
+        if data_root is None:
+            transient_seed_workspace = Path(
+                tempfile.mkdtemp(prefix="hyphae-g7-search-seeds-")
+            )
+            seed_root = transient_seed_workspace
+        else:
+            seed_root = Path(data_root) / "shared-search-seeds"
+        environment["HYPHAE_G7_SEARCH_SEED_ROOT"] = str(seed_root)
     receipts = []
     for state in STATES:
         for background_mode in (BACKGROUND_MODES if arguments.background else ("control",)):
@@ -682,6 +693,8 @@ def main() -> int:
     arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     if macos_counter_workspace is not None:
         shutil.rmtree(macos_counter_workspace)
+    if transient_seed_workspace is not None:
+        shutil.rmtree(transient_seed_workspace)
     print(json.dumps({"status": "ok", "output": str(arguments.output), "cells": len(receipts)}))
     return 0
 

@@ -45,6 +45,8 @@ const ANN_QUERY_BREADTH: usize = 64;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
 const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
+const CORPUS_GENERATOR: &str =
+    "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
 
 #[derive(Clone, Copy, Debug)]
 struct Stats {
@@ -67,52 +69,23 @@ struct SearchFixture {
 }
 
 impl SearchFixture {
-    fn create(root: &Path) -> Result<Self, Box<dyn Error>> {
-        let path = root.join("search");
-        let mut database =
-            NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
+    fn open_or_create(root: &Path, source_commit: &str) -> Result<Self, Box<dyn Error>> {
+        let path = search_seed_path(root, source_commit)?;
+        if !path.is_dir() {
+            publish_search_seed(&path)?;
+        }
+        let database =
+            NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
         let lexical_index = ObjectId::new(7)?;
         let vector_index = ObjectId::new(8)?;
-        let document_count = search_documents();
-        let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-        seed.create_search_index(lexical_index, "g7_search")?;
-        seed.create_vector_index_with_lifecycle(
-            vector_index,
-            "g7_ann",
-            vector_dimension(),
-            VectorMetric::Cosine,
-            HnswConfig::new(8, 32, 16, 512, 7)?,
-            ann_lifecycle(),
-        )?;
-        seed.upsert_vectors(
-            vector_index,
-            (0..document_count)
-                .map(|id| vector_fixture(id, document_count))
-                .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
-        )?;
-        seed.commit()?;
-        for batch_start in (0..document_count).step_by(512) {
-            let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-            for id in batch_start..(batch_start + 512).min(document_count) {
-                let document_id = (id as u128 + 1).to_be_bytes();
-                let text = if id == document_count / 2 {
-                    "rare g7 native benchmark term"
-                } else {
-                    "common g7 native benchmark"
-                };
-                batch.index_document(lexical_index, document_id.to_vec(), text)?;
-                batch.set(
-                    filter_key(&document_id),
-                    if id % 2 == 0 {
-                        b"keep".to_vec()
-                    } else {
-                        b"drop".to_vec()
-                    },
-                    None,
-                )?;
-            }
-            batch.commit()?;
-        }
+        Self::from_database(database, lexical_index, vector_index)
+    }
+
+    fn from_database(
+        database: NativeDatabase,
+        lexical_index: ObjectId,
+        vector_index: ObjectId,
+    ) -> Result<Self, Box<dyn Error>> {
         let snapshot = database.snapshot(0)?;
         let query = Vector::new({
             let mut values = vec![0.0; vector_dimension() as usize];
@@ -144,6 +117,87 @@ impl SearchFixture {
             recall_at_10: recalled as f64 / K as f64,
         })
     }
+}
+
+fn publish_search_seed(path: &Path) -> Result<(), Box<dyn Error>> {
+    let parent = path.parent().ok_or("search seed path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".search-staging-{}-{}",
+        std::process::id(),
+        unique_nonce()
+    ));
+    seed_search_database(&staging)?;
+    fs::rename(&staging, path)?;
+    Ok(())
+}
+
+fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut database =
+        NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
+    let lexical_index = ObjectId::new(7)?;
+    let vector_index = ObjectId::new(8)?;
+    let document_count = search_documents();
+    let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_search_index(lexical_index, "g7_search")?;
+    seed.create_vector_index_with_lifecycle(
+        vector_index,
+        "g7_ann",
+        vector_dimension(),
+        VectorMetric::Cosine,
+        HnswConfig::new(8, 32, 16, 512, 7)?,
+        ann_lifecycle(),
+    )?;
+    seed.upsert_vectors(
+        vector_index,
+        (0..document_count)
+            .map(|id| vector_fixture(id, document_count))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+    )?;
+    seed.commit()?;
+    for batch_start in (0..document_count).step_by(512) {
+        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        for id in batch_start..(batch_start + 512).min(document_count) {
+            let document_id = (id as u128 + 1).to_be_bytes();
+            let text = if id == document_count / 2 {
+                "rare g7 native benchmark term"
+            } else {
+                "common g7 native benchmark"
+            };
+            batch.index_document(lexical_index, document_id.to_vec(), text)?;
+            batch.set(
+                filter_key(&document_id),
+                if id % 2 == 0 {
+                    b"keep".to_vec()
+                } else {
+                    b"drop".to_vec()
+                },
+                None,
+            )?;
+        }
+        batch.commit()?;
+    }
+    drop(database);
+    Ok(())
+}
+
+fn search_seed_path(root: &Path, source_commit: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let parent = std::env::var_os("HYPHAE_G7_SEARCH_SEED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("search-seeds"));
+    let digest = dataset_digest(source_commit);
+    Ok(parent.join(format!("search-{}", digest.to_hex())))
+}
+
+fn dataset_digest(source_commit: &str) -> blake3::Hash {
+    let documents = search_documents();
+    let dimension = vector_dimension();
+    blake3::hash(
+        format!(
+            "{CORPUS_GENERATOR}:source={source_commit}:documents={documents}:vectors={documents}:dimension={dimension}"
+        )
+        .as_bytes(),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -183,7 +237,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("state must be warm/cold and concurrency must be 1, 8, or 32".into());
     }
     let root = temporary_root(&state, concurrency)?;
-    let search = SearchFixture::create(&root)?;
+    let search = SearchFixture::open_or_create(&root, &source_commit)?;
     let background_enabled =
         std::env::var("HYPHAE_G7_BACKGROUND").is_ok_and(|value| value == "1" || value == "true");
     let background_stop = Arc::new(AtomicBool::new(false));
@@ -384,13 +438,7 @@ fn unique_nonce() -> u128 {
 fn dataset_metadata(source_commit: &str, observations: usize, warmup: usize) -> serde_json::Value {
     let documents = search_documents();
     let dimension = vector_dimension();
-    let generator = "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
-    let digest = blake3::hash(
-        format!(
-            "{generator}:source={source_commit}:documents={documents}:vectors={documents}:dimension={dimension}"
-        )
-            .as_bytes(),
-    );
+    let digest = dataset_digest(source_commit);
     json!({
         "structure_keys": STRUCTURE_KEYS,
         "search_documents": documents,
@@ -398,7 +446,7 @@ fn dataset_metadata(source_commit: &str, observations: usize, warmup: usize) -> 
         "vector_dimension": dimension,
         "observations": observations,
         "warmup": warmup,
-        "generator": generator,
+        "generator": CORPUS_GENERATOR,
         "digest": digest.to_hex().to_string(),
     })
 }
