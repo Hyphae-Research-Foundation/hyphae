@@ -1,0 +1,222 @@
+{
+  "schema": "hyphae.native.local-search-match-evidence.v1",
+  "status": "observation-not-regression-gate",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-search-match",
+  "contract_commit": "d467de7188e49d0ce2395067c1d73c047798fb6c",
+  "implementation_commit": "9b69318cf0928680dd7e71c1257c28eaeebdba55",
+  "source_commit": "2c40f8ccdd9430e06502a9699c93255dcf34b96a",
+  "source_tree": "dbe98da459727a3cd666580f6dce1e07c80dbe36",
+  "harness_commit": "2c40f8ccdd9430e06502a9699c93255dcf34b96a",
+  "harness": "crates/hyphae-native-runtime/examples/uds_search_match_smoke.rs",
+  "harness_sha256": "3d721a7e405794a327d42970f01d579e8305832ca985d855859a6282f6027f6f",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_search_match --no-run --locked",
+    "expected_result": "E0432 unresolved imports for the frozen SEARCH MATCH codecs and LocalDataSession",
+    "log_sha256": "f68fd480a3987b4a6ae18a5fc3a7143e7d8d4269701db4f5620dc0c228a0dfe5"
+  },
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "physical_cores_visible": 4,
+    "memory_gib": 30,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [
+      2,
+      3
+    ],
+    "cpu_governor": "unavailable",
+    "wsl_in_execution_path": false
+  },
+  "workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "maximum_payload_bytes": 128,
+    "search_documents": 2048,
+    "search_tree_height": 2,
+    "query": "needle",
+    "query_bytes": 6,
+    "result_limit": 10,
+    "result_count": 1,
+    "result_bytes": 32,
+    "ping_bytes": 32,
+    "warm_state": true,
+    "warmup_per_operation": 10000,
+    "observations_per_operation": 100000,
+    "dataset_digest_blake3": "d30066a3472d4c76c4b0aae03c6b36a4c459d566f59a10427a6883d5e7f097cd"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "254c09e1e7e6e999dab74b1b6ace12356113cbd465b2ef850843fc06302bedc8",
+      "embedded_physical_search_match_one_hit": {
+        "p50_nanos": 23407,
+        "p95_nanos": 24038,
+        "p99_nanos": 32704,
+        "p999_nanos": 39979,
+        "maximum_nanos": 131202,
+        "throughput_per_second": 42139.094
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23358,
+        "p95_nanos": 23765,
+        "p99_nanos": 33728,
+        "p999_nanos": 36700,
+        "maximum_nanos": 146892,
+        "throughput_per_second": 43319.441
+      },
+      "persistent_search_match_round_trip_one_hit": {
+        "p50_nanos": 56150,
+        "p95_nanos": 64973,
+        "p99_nanos": 68327,
+        "p999_nanos": 81589,
+        "maximum_nanos": 158616,
+        "throughput_per_second": 17618.058
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "ee79510f0d8b8d2d63708ff4c17901a491ea367b28c185d53d40fb9f77c8d950",
+      "embedded_physical_search_match_one_hit": {
+        "p50_nanos": 23339,
+        "p95_nanos": 23981,
+        "p99_nanos": 32674,
+        "p999_nanos": 41687,
+        "maximum_nanos": 132958,
+        "throughput_per_second": 42234.559
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23422,
+        "p95_nanos": 23857,
+        "p99_nanos": 34321,
+        "p999_nanos": 36800,
+        "maximum_nanos": 122486,
+        "throughput_per_second": 43096.730
+      },
+      "persistent_search_match_round_trip_one_hit": {
+        "p50_nanos": 56168,
+        "p95_nanos": 64943,
+        "p99_nanos": 68348,
+        "p999_nanos": 74709,
+        "maximum_nanos": 224120,
+        "throughput_per_second": 17642.846
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "b9074a217803df209169afb3774cdd15e547d27a0e39dbbd5e461427529bcde5",
+      "embedded_physical_search_match_one_hit": {
+        "p50_nanos": 23346,
+        "p95_nanos": 24080,
+        "p99_nanos": 34878,
+        "p999_nanos": 57523,
+        "maximum_nanos": 134718,
+        "throughput_per_second": 41939.573
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23246,
+        "p95_nanos": 23663,
+        "p99_nanos": 32944,
+        "p999_nanos": 36534,
+        "maximum_nanos": 117784,
+        "throughput_per_second": 43854.607
+      },
+      "persistent_search_match_round_trip_one_hit": {
+        "p50_nanos": 56032,
+        "p95_nanos": 64637,
+        "p99_nanos": 68186,
+        "p999_nanos": 80429,
+        "maximum_nanos": 153903,
+        "throughput_per_second": 17659.204
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "embedded_physical_search_match_one_hit": {
+      "p50_nanos": 23346,
+      "p95_nanos": 24038,
+      "p99_nanos": 32704,
+      "p999_nanos": 41687,
+      "maximum_nanos": 132958,
+      "throughput_per_second": 42139.094
+    },
+    "persistent_ping_round_trip_32b": {
+      "p50_nanos": 23358,
+      "p95_nanos": 23765,
+      "p99_nanos": 33728,
+      "p999_nanos": 36700,
+      "maximum_nanos": 122486,
+      "throughput_per_second": 43319.441
+    },
+    "persistent_search_match_round_trip_one_hit": {
+      "p50_nanos": 56150,
+      "p95_nanos": 64943,
+      "p99_nanos": 68327,
+      "p999_nanos": 80429,
+      "maximum_nanos": 158616,
+      "throughput_per_second": 17642.846
+    }
+  },
+  "performance_observation": {
+    "physical_match_microsecond_domain": true,
+    "local_match_microsecond_domain": true,
+    "independent_percentiles_subtracted": false,
+    "regression_threshold_established": false,
+    "g7_gate_passed": false
+  },
+  "verification": {
+    "status": "passed-direct-linux",
+    "workspace_tests_passed": 654,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_unit_tests_passed": 332,
+    "structure_get_integration_tests_passed": 5,
+    "structure_set_ttl_integration_tests_passed": 6,
+    "search_match_integration_tests_passed": 6,
+    "documentation_markdown_files": 239,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "25cd290ffcd158903b6fcc6b3954e81687c26811a5a8ffc050050eb8dcde4710",
+    "targeted_test_log_sha256": "40cfe16265ada3661294b156facd2eef99c1bfd87639b4fa464f3ab42f23868c",
+    "clippy_log_sha256": "db4d9b529406219198b4d5a351356849ea8392b959bb4dacaf83471a0290bc52",
+    "rustdoc_log_sha256": "1419bd75c89fdccd5995ce0e636ed262bd7f0a817b6f03103b3ac5fb66f6ffc3",
+    "release_check_log_sha256": "92434e198f27984c035c376ec77a7cf9e6ebdde782f8ccb1336ae3329b66ddb7",
+    "documentation_log_sha256": "33a86b2a8cca22894ea8698500beaf6866446f4d55ce5823eef9b0cf710db4d7",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diff_check_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "physical_search_operation": true,
+    "visible_csn": true,
+    "document_mutation": false,
+    "fielded_or_boolean_search": false,
+    "ann_or_hybrid_search": false,
+    "pagination_or_streaming": false,
+    "sql_operation": false,
+    "explicit_transaction_state": false,
+    "cold_state": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "windows_named_pipe": false,
+    "complete_handshake": false,
+    "multiplexing": false,
+    "g0_closed": false,
+    "g1_closed": false,
+    "g4_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "regression_threshold": false
+  }
+}

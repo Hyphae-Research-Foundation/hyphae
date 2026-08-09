@@ -1,0 +1,226 @@
+{
+  "schema": "hyphae.native.hash-field-ttl-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-hash-field-ttl",
+  "stacked_base_commit": "6fe6467ea3096eb37776e99dcd90129145dbf61a",
+  "contract_commit": "7b1cf552aa9e8847b1ce538e1cea104b8f39dd6d",
+  "runtime_commit": "1d6a2dc99c7576789efc74ffc526cd10ca3a682a",
+  "failure_boundary_commit": "97603a02c66c624d847f613004c0364b7a7917d7",
+  "equivalence_commit": "d0ca02f80daeec59a8c0c33cae54d188f183c3a6",
+  "benchmark_introduction_commit": "fbbd6a999d20e1cd2fe5a9ff2a287c14dfe6504a",
+  "persistent_layout_commit": "5c02dc7c29be3dc86c3dd99f92a746f2d1cd94ac",
+  "runtime_benchmark_commit": "ee18ec821775f4f27fd07fac0e0123495a952a45",
+  "runtime_benchmark_tree": "202b7d8f8581faa7a3e87098d3e8872de1356d92",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "hash_field_ttl_smoke": {
+    "schema": "hyphae.native.hash-field-ttl-smoke.v1",
+    "status": "observation-not-universal-slo",
+    "harness_sha256": "a42534940d47c7454be748103c1d3592edc939d5a963d49156aaac2256353220",
+    "raw_output_sha256": "2cbae1131d6510d23d08e906a4b9e48e4d6ad7dc4e1a1aa15fedc328519b5dd6",
+    "hash_fields": 2048,
+    "read_observations": 200000,
+    "read_operations_per_observation": 32,
+    "read_warmup": 20000,
+    "hlen_observations": 10000,
+    "hlen_warmup": 1000,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "cleanup_hashes": 16,
+    "cleanup_fields_per_hash": 64,
+    "operations": {
+      "persistent_hash_field_hget_physical": {
+        "p50_nanos": 1500,
+        "p95_nanos": 1767,
+        "p99_nanos": 1795,
+        "p999_nanos": 2871,
+        "maximum_nanos": 4974,
+        "throughput_per_second": 657447.804
+      },
+      "persistent_hash_hlen_no_due_physical": {
+        "p50_nanos": 228047,
+        "p95_nanos": 238659,
+        "p99_nanos": 241940,
+        "p999_nanos": 331551,
+        "maximum_nanos": 464247,
+        "throughput_per_second": 4350.5
+      },
+      "persistent_hash_field_ttl_materialized_snapshot": {
+        "p50_nanos": 110,
+        "p95_nanos": 113,
+        "p99_nanos": 115,
+        "p999_nanos": 393,
+        "maximum_nanos": 668,
+        "throughput_per_second": 8882173.509
+      },
+      "expiring_hash_field_ttl_private_batch": {
+        "p50_nanos": 118,
+        "p95_nanos": 122,
+        "p99_nanos": 124,
+        "p999_nanos": 402,
+        "maximum_nanos": 3643,
+        "throughput_per_second": 8249059.619
+      },
+      "expiring_hash_field_ttl_materialized_snapshot": {
+        "p50_nanos": 119,
+        "p95_nanos": 122,
+        "p99_nanos": 125,
+        "p999_nanos": 404,
+        "maximum_nanos": 4326,
+        "throughput_per_second": 8208388.282
+      },
+      "expiring_hash_field_ttl_physical": {
+        "p50_nanos": 1484,
+        "p95_nanos": 1653,
+        "p99_nanos": 1780,
+        "p999_nanos": 2512,
+        "maximum_nanos": 5723,
+        "throughput_per_second": 665148.049
+      },
+      "expiring_hash_field_hget_physical": {
+        "p50_nanos": 1501,
+        "p95_nanos": 1766,
+        "p99_nanos": 1802,
+        "p999_nanos": 2568,
+        "maximum_nanos": 4889,
+        "throughput_per_second": 657292.739
+      },
+      "expiring_hash_hlen_one_due_physical": {
+        "p50_nanos": 226646,
+        "p95_nanos": 237628,
+        "p99_nanos": 242202,
+        "p999_nanos": 312472,
+        "maximum_nanos": 462173,
+        "throughput_per_second": 4379.969
+      },
+      "expire_hash_field_memory_commit": {
+        "p50_nanos": 1368261,
+        "p95_nanos": 1396004,
+        "p99_nanos": 1407819,
+        "p999_nanos": 1407819,
+        "maximum_nanos": 1580712,
+        "throughput_per_second": 726.753
+      },
+      "expire_hash_field_strict_commit": {
+        "p50_nanos": 8274896,
+        "p95_nanos": 10973958,
+        "p99_nanos": 10973958,
+        "p999_nanos": 10973958,
+        "maximum_nanos": 14899004,
+        "throughput_per_second": 109.963
+      },
+      "expire_hash_field_cleanup_64_fields_memory": {
+        "p50_nanos": 5371546,
+        "p95_nanos": 5613604,
+        "p99_nanos": 5613604,
+        "p999_nanos": 5613604,
+        "maximum_nanos": 5640035,
+        "throughput_per_second": 185.255
+      }
+    }
+  },
+  "matched_persistent_hget_control": {
+    "harness_commit": "fbbd6a999d20e1cd2fe5a9ff2a287c14dfe6504a",
+    "harness_sha256": "8d03592813a5607be4ff1f63c7fced8c059a59a37ebd524c4098f1b9ed05b0eb",
+    "hash_fields": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "parent": {
+      "commit": "6fe6467ea3096eb37776e99dcd90129145dbf61a",
+      "rounds": [
+        {
+          "p50_nanos": 1346,
+          "p95_nanos": 1495,
+          "p99_nanos": 1643,
+          "p999_nanos": 2719,
+          "maximum_nanos": 4795,
+          "throughput_per_second": 732294.514,
+          "raw_output_sha256": "8ba9b5ba069f26e758927229f366dd5268866e73a4f9551dfb0d8ad85338f1c5"
+        },
+        {
+          "p50_nanos": 1345,
+          "p95_nanos": 1489,
+          "p99_nanos": 1644,
+          "p999_nanos": 2523,
+          "maximum_nanos": 5331,
+          "throughput_per_second": 732996.818,
+          "raw_output_sha256": "461dd0c5fc3050cf5d4a59ffc7ad4c3e3b563dd14c213aa4c0d17d61ae8485f4"
+        }
+      ],
+      "median": {
+        "p50_nanos": 1345.5,
+        "p95_nanos": 1492,
+        "p99_nanos": 1643.5,
+        "p999_nanos": 2621,
+        "throughput_per_second": 732645.666
+      }
+    },
+    "current": {
+      "commit": "ee18ec821775f4f27fd07fac0e0123495a952a45",
+      "rounds": [
+        {
+          "p50_nanos": 1369,
+          "p95_nanos": 1515,
+          "p99_nanos": 1661,
+          "p999_nanos": 2608,
+          "maximum_nanos": 7871,
+          "throughput_per_second": 721348.675,
+          "raw_output_sha256": "8717e7049ad96dc014b661ff743650810fbe01f720e0ee7b357851ccd894bcbb"
+        },
+        {
+          "p50_nanos": 1389,
+          "p95_nanos": 1537,
+          "p99_nanos": 1685,
+          "p999_nanos": 2691,
+          "maximum_nanos": 5288,
+          "throughput_per_second": 710748.713,
+          "raw_output_sha256": "b8ed9b0c72bbaa8fb821c2782c9266c3e46aec95de369d901a12d069ee781e37"
+        }
+      ],
+      "median": {
+        "p50_nanos": 1379,
+        "p95_nanos": 1526,
+        "p99_nanos": 1673,
+        "p999_nanos": 2649.5,
+        "throughput_per_second": 716048.694
+      }
+    },
+    "change_percent": {
+      "p50": 2.49,
+      "p95": 2.279,
+      "p99": 1.795,
+      "p999": 1.087,
+      "throughput": -2.265
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "excluded_observations": [
+    "An initial apparent no-regression result was invalid because parent and current worktrees shared one Cargo target and the current invocation reused the parent binary.",
+    "Two current-control files labeled the rustc version as the harness commit and were repeated with the correct harness commit.",
+    "A pre-fix current control and smoke run measured a batch-upsert layout regression that was corrected by 5c02dc7 and superseded by the exact ee18ec8 observations."
+  ],
+  "boundaries": [
+    "Warm embedded/current-root observations are not a universal latency SLO.",
+    "HLEN is cardinality-sensitive because independent due fields require visibility filtering over the field prefix.",
+    "Memory expiry publication and 64-field active cleanup are millisecond paths.",
+    "Strict commit includes ext4/EBS page and WAL synchronization.",
+    "The observations do not close relative TTL, conditional expiry, field PERSIST, batch field expiry, reverse-pattern scans, collection-family TTL, randomized model equivalence, complete G3, or G7."
+  ]
+}

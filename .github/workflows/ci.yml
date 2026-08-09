@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -32,6 +38,28 @@ jobs:
           git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/merge"
           test "$(git rev-parse FETCH_HEAD)" = "$PR_MERGE_COMMIT"
           test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')"
+      - name: Verify retained native gate closures
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
+          python tools/check_native_gate_closures.py
+      - name: Verify open G7 and G8 authority
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
+          PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --output native-g7-g8-readiness-audit.json
+      - name: Verify G6 manifests
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
+          python tools/check_native_g6_foundation.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --profile config/native-g6-readiness-profile.json \
+            --evidence config/native-g6-readiness-evidence.json \
+            --inventory config/native-g6-inventory.json \
+            --authority config/native-g6-authority-manifest.json \
+            --workload config/native-g6-workload-manifest.json \
+            --suite config/native-g6-suite-manifest.json \
+            --predecessor config/native-g6-predecessor-manifest.json
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -57,15 +85,13 @@ jobs:
           - name: Linux stable
             os: ubuntu-latest
             toolchain: 1.96.0
+            native-platform: linux
+            run-native-conformance: true
           - name: Linux MSRV
             os: ubuntu-latest
             toolchain: 1.89.0
-          - name: macOS stable
-            os: macos-latest
-            toolchain: 1.96.0
-          - name: Windows stable
-            os: windows-latest
-            toolchain: 1.96.0
+            native-platform: linux
+            run-native-conformance: false
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -80,6 +106,72 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Run native conformance profile
+        if: matrix.run-native-conformance
+        shell: bash
+        run: |
+          python tools/check_native_conformance.py \
+            --profile config/native-conformance-profile.json \
+            --platform "${{ matrix.native-platform }}" \
+            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --run \
+            --output "native-conformance-${{ matrix.native-platform }}.json"
+      - name: Upload native conformance receipt
+        if: matrix.run-native-conformance && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-conformance-${{ matrix.native-platform }}
+          path: native-conformance-${{ matrix.native-platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  test-platform-push:
+    name: Test (${{ matrix.name }})
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS stable
+            os: macos-latest
+            toolchain: 1.96.0
+            native-platform: macos
+          - name: Windows stable
+            os: windows-latest
+            toolchain: 1.96.0
+            native-platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run platform tests
+        run: cargo test --workspace --all-features --locked
+      - name: Run native conformance profile
+        shell: bash
+        run: |
+          python tools/check_native_conformance.py \
+            --profile config/native-conformance-profile.json \
+            --platform "${{ matrix.native-platform }}" \
+            --source-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --run \
+            --output "native-conformance-${{ matrix.native-platform }}.json"
+      - name: Upload native conformance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-conformance-${{ matrix.native-platform }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: native-conformance-${{ matrix.native-platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
   public-clients:
     name: Public client conformance
@@ -193,19 +285,19 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP"
           chmod 0755 "$RUNNER_TEMP/cargo-semver-checks"
           test "$("$RUNNER_TEMP/cargo-semver-checks" --version)" = "cargo 0.48.0"
-      - name: Verify patch public API against v0.2.0
+      - name: Verify major public API against v0.2.1
         shell: bash
         env:
-          BASELINE_COMMIT: 170380453a2ca6322a4c8bc50417318daee1c011
+          BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=1 origin \
-            "refs/tags/v0.2.0:refs/tags/v0.2.0"
-          test "$(git rev-parse 'v0.2.0^{commit}')" = "$BASELINE_COMMIT"
+            "refs/tags/v0.2.1:refs/tags/v0.2.1"
+          test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
           "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
             --workspace \
             --baseline-rev "$BASELINE_COMMIT" \
-            --release-type patch \
+            --release-type major \
             --all-features \
             --color never
       - name: Install pinned Python

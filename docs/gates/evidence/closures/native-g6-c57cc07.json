@@ -1,0 +1,40 @@
+{
+  "schema": "hyphae-native-g6-closure-v1",
+  "gate": "G6",
+  "status": "passed",
+  "source_commit": "c57cc07c17ba56efc2ea40d61fb62a2cc6befc8f",
+  "workflow_run": 31246198130,
+  "retention_workflow_run": 31246695476,
+  "scope": "competitive-local-product",
+  "production_scale": false,
+  "performance_gate_claimed": false,
+  "required": 14,
+  "passed": 14,
+  "matrix_cells_required": 42,
+  "matrix_cells_passed": 42,
+  "platforms": ["linux", "macos", "windows"],
+  "requirements": [
+    "shared-contracts-and-errors",
+    "catalog-and-collection-model",
+    "embedded-product-facade",
+    "competitive-search-surface",
+    "incremental-ann-lifecycle",
+    "native-offline-proofs",
+    "native-local-daemon",
+    "native-http-v2",
+    "single-binary-cli",
+    "rust-python-typescript-sdks",
+    "administration-and-explain",
+    "telemetry-and-doctor",
+    "backup-restore-product-surface",
+    "cross-surface-conformance"
+  ],
+  "artifact": "native-g6-candidate-c57cc07c17ba56efc2ea40d61fb62a2cc6befc8f",
+  "artifact_sha256": "72595144c352088657de5817ddc7cc19b09bd35ea5842c08c15eccef8de92a8c",
+  "non_claims": [
+    "production-scale performance",
+    "universal sub-millisecond durability",
+    "distributed operation",
+    "G7 or G8 closure"
+  ]
+}

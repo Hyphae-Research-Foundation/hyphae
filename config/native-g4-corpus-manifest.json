@@ -1,0 +1,9 @@
+{
+  "schema": "hyphae-native-g4-corpus-manifest-v1",
+  "gate": "G4",
+  "corpora": [
+    {"id": "search-quality-v1", "source": "config/native-g4-quality-corpus-v1.json", "sha256": "11027caf4260337bd6730977794f0a715e10a658038cdb6b815732281a2c8d9d", "requirements": ["analyzers", "postings-and-segments", "bm25-and-scoring-goldens", "phrase-search", "prefix-and-fuzzy-search", "doc-values-and-filtering", "facets-and-aggregations", "exact-vector-search", "ann-search", "hybrid-search", "ndcg-and-recall-quality", "rebuild-and-corruption"]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

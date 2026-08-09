@@ -1,0 +1,182 @@
+{
+  "schema": "hyphae.native.set-ttl-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-set-ttl",
+  "stacked_base_commit": "ba3f67e3898ce1a7b79c3ed0caf8fd8397fa656d",
+  "contract_commit": "f0cf410663a89c5df1f0356b70347429cd969bfc",
+  "runtime_implementation_commit": "fc6fe8e18a19f82e432f5d95ab0a1261a1040f4f",
+  "benchmark_introduction_commit": "5f72511edbf3cd60e9f54db9e579420c48d2ca2e",
+  "runtime_benchmark_commit": "5f72511edbf3cd60e9f54db9e579420c48d2ca2e",
+  "control_harness_commit": "d4fbc5ade73f7c80b2d770f0a3ce759e66818bb2",
+  "final_verified_source_commit": "d4fbc5ade73f7c80b2d770f0a3ce759e66818bb2",
+  "final_verified_source_tree": "41f74cb2d15f6f622ec41b017c620a09849abc8e",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "set_ttl_smoke": {
+    "schema": "hyphae.native.set-ttl-smoke.v1",
+    "status": "observation-not-universal-slo",
+    "raw_sha256": "9d64f17e7d80ac9a068669186645abc4908a9a13accf1a7e267dfbadf8447fcc",
+    "commit": "5f72511edbf3cd60e9f54db9e579420c48d2ca2e",
+    "set_members": 2048,
+    "read_observations": 200000,
+    "read_operations_per_observation": 32,
+    "read_warmup": 20000,
+    "memory_commit_observations": 32,
+    "strict_commit_observations": 16,
+    "cleanup_sets_per_cardinality": 16,
+    "small_cleanup_members": 1,
+    "large_cleanup_members": 256,
+    "operations": {
+      "persistent_set_sismember_physical": {
+        "p50_nanos": 1904,
+        "p95_nanos": 2182,
+        "p99_nanos": 2213,
+        "p999_nanos": 2757,
+        "maximum_nanos": 9417,
+        "throughput_per_second": 518110.999
+      },
+      "persistent_set_ttl_materialized_snapshot": {
+        "p50_nanos": 7,
+        "p95_nanos": 8,
+        "p99_nanos": 8,
+        "p999_nanos": 12,
+        "maximum_nanos": 626,
+        "throughput_per_second": 111803121.969
+      },
+      "expiring_set_ttl_private_batch": {
+        "p50_nanos": 12,
+        "p95_nanos": 13,
+        "p99_nanos": 14,
+        "p999_nanos": 42,
+        "maximum_nanos": 543,
+        "throughput_per_second": 73250402.128
+      },
+      "expiring_set_ttl_materialized_snapshot": {
+        "p50_nanos": 12,
+        "p95_nanos": 13,
+        "p99_nanos": 13,
+        "p999_nanos": 14,
+        "maximum_nanos": 456,
+        "throughput_per_second": 73594508.746
+      },
+      "expiring_set_ttl_physical": {
+        "p50_nanos": 873,
+        "p95_nanos": 880,
+        "p99_nanos": 1155,
+        "p999_nanos": 1296,
+        "maximum_nanos": 5952,
+        "throughput_per_second": 1131532.894
+      },
+      "expiring_set_sismember_physical": {
+        "p50_nanos": 1902,
+        "p95_nanos": 2176,
+        "p99_nanos": 2203,
+        "p999_nanos": 2568,
+        "maximum_nanos": 5292,
+        "throughput_per_second": 519420.962
+      },
+      "expire_set_memory_commit": {
+        "p50_nanos": 1046562,
+        "p95_nanos": 1070480,
+        "p99_nanos": 1086930,
+        "p999_nanos": 1086930,
+        "maximum_nanos": 1234677,
+        "throughput_per_second": 947.735
+      },
+      "expire_set_strict_commit": {
+        "p50_nanos": 8272273,
+        "p95_nanos": 10317042,
+        "p99_nanos": 10317042,
+        "p999_nanos": 10317042,
+        "maximum_nanos": 55597168,
+        "throughput_per_second": 87.496
+      },
+      "expire_set_cleanup_1_member_memory": {
+        "p50_nanos": 403275,
+        "p95_nanos": 443881,
+        "p99_nanos": 443881,
+        "p999_nanos": 443881,
+        "maximum_nanos": 449001,
+        "throughput_per_second": 2461.143
+      },
+      "expire_set_cleanup_256_members_memory": {
+        "p50_nanos": 602216,
+        "p95_nanos": 665651,
+        "p99_nanos": 665651,
+        "p999_nanos": 665651,
+        "maximum_nanos": 736416,
+        "throughput_per_second": 1635.696
+      }
+    }
+  },
+  "matched_persistent_sismember_control": {
+    "harness_sha256": "edf542fdf0ad1727bd379f0f19214d644d714ca5883b3479f09524732c7729da",
+    "set_members": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "parent": {
+      "raw_sha256": "2138ccb2c44aa7bb33b5847b9453c86292cec1a28c7f82720b3c78e6144766a5",
+      "commit": "ba3f67e3898ce1a7b79c3ed0caf8fd8397fa656d",
+      "p50_nanos": 1889,
+      "p95_nanos": 2159,
+      "p99_nanos": 2197,
+      "p999_nanos": 3376,
+      "maximum_nanos": 5318,
+      "throughput_per_second": 522190.425
+    },
+    "current": {
+      "raw_sha256": "1cf136fc8be7f1dcfbbca9de89a5f54d1f4aafc1b8bde15b7f41cbfe4ce33221",
+      "commit": "d4fbc5ade73f7c80b2d770f0a3ce759e66818bb2",
+      "p50_nanos": 1882,
+      "p95_nanos": 2157,
+      "p99_nanos": 2182,
+      "p999_nanos": 2770,
+      "maximum_nanos": 6540,
+      "throughput_per_second": 524593.706
+    },
+    "change_percent": {
+      "p50": -0.371,
+      "p95": -0.093,
+      "p99": -0.683,
+      "p999": -17.950,
+      "throughput": 0.460
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true
+    }
+  },
+  "verification": {
+    "runtime_tests_passed": 295,
+    "runtime_tests_failed": 0,
+    "set_ttl_tests_passed": 11,
+    "set_ttl_tests_failed": 0,
+    "singleton_cleanup_boundaries": 7,
+    "workspace_all_targets_all_features_locked": "passed",
+    "clippy_workspace_all_targets_all_features_locked_deny_warnings": "passed",
+    "documentation_check": "passed"
+  },
+  "boundaries": [
+    "Warm embedded and current-root observations are not a universal latency SLO.",
+    "Strict commit includes ext4/EBS page and WAL synchronization.",
+    "Cleanup cost is cardinality-sensitive and is reported separately for 1 and 256 live members.",
+    "The matched read control is concurrency-one and does not close saturation, cold-cache, allocation, RSS, hardware-counter, or G7 gates.",
+    "Injected commit boundaries are not physical power-loss evidence.",
+    "Complete G3, local-protocol exposure, relative or conditional expiry, persist, per-member TTL, destination-set algebra, sorted-set TTL or algebra, and streams remain open."
+  ]
+}

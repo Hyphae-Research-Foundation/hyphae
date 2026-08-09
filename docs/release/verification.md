@@ -5,12 +5,13 @@ verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
 ## Maintainer tag-target invariant
 
-The 17-check release report is bound to the exact pull-request head commit.
+The 18-check release report is bound to the exact pull-request head commit.
 Every required workflow checks out that head rather than GitHub's synthetic
 merge commit, and the Release assemble job separately requires the event's
 synthetic merge tree to equal the checked head tree. `Review dependency
-changes` is PR-only; the five Release jobs also run for manual candidates and
-tag pushes, but the tag run is excluded from its own required-check report.
+changes` is PR-only; the five Release jobs run on the candidate PR and also on
+manual candidates and tag pushes, but the tag run is excluded from its own
+required-check report.
 Merge a release PR with a merge commit, never squash or rebase it, and retain
 the reviewed candidate as a commit reachable from protected `main`:
 
@@ -26,7 +27,7 @@ push:
 test "$(git rev-parse vVERSION^{commit})" = "CANDIDATE"
 ```
 
-The tag workflow excludes every check from its own run and must find all 17
+The tag workflow excludes every check from its own run and must find all 18
 completed successful prior checks on that candidate SHA. It also fetches the
 remote tag, records both the ref object and its peeled commit, requires that
 commit to equal the candidate and remain reachable from `main`, and repeats
@@ -81,10 +82,10 @@ workflow, and GitHub Actions run. Its artifact inventory must contain every
 archive, provenance predicate, SPDX SBOM, CycloneDX SBOM, and the
 required-checks report exactly once. The checks
 report must identify `celiumsai/hyphae`, the same source commit, and exactly
-the 17 canonical checks in fixed order. Every record must have a unique
+the 18 canonical checks in fixed order. Every record must have a unique
 check-run ID, the matching workflow-run ID, canonical workflow path and
 GitHub job URL, GitHub Actions app ID/slug, the same `head_sha` and head branch,
-`event=pull_request`, run attempt, and
+run attempt and
 `status=completed`/`conclusion=success`. All jobs from one workflow path must
 come from one workflow run. The report also identifies the unique merged,
 in-repository PR to `main`, including its number, head/base commits, merge
@@ -92,7 +93,9 @@ commit, and merge time; querying all PRs for that in-repository head branch must
 return that same PR and no other, and its complete issue-event history must
 contain no base-ref change or successful automatic base change. The producer
 verifies each referenced workflow run's exact ID, path, commit, branch, event,
-repository, attempt, state, and conclusion. It fetches the Jobs API record for
+repository, attempt, state, and conclusion. Seventeen checks require
+`event=pull_request`; the exact-SHA G8 closure requires
+`event=workflow_dispatch` and the same candidate commit. It fetches the Jobs API record for
 every selected check and requires the job's exact ID, workflow-run ID, name,
 commit, state, conclusion, and `run_attempt` to agree with the check and the
 workflow run's current attempt. A partial rerun that mixes jobs from different
@@ -170,7 +173,7 @@ GitHub-hosted builder, and invocation URI. The invocation must use the same
 workflow run ID as the release-evidence manifest. Its attempt may be earlier
 than the assemble attempt when a successful package job was reused by a
 failed-job rerun, but it may never name another run or a later attempt.
-This provenance allowance is separate from the required-check report: all 17
+This provenance allowance is separate from the required-check report: all 18
 required-check jobs must match their workflow runs' current attempts.
 Require the native runner identity that matches the archive target:
 Linux/X64, macOS/X64, macOS/ARM64, or Windows/X64.

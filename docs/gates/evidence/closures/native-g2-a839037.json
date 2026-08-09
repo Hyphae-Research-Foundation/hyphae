@@ -1,0 +1,22 @@
+{
+  "schema": "hyphae-native-g2-readiness-v1",
+  "gate": "G2",
+  "status": "passed",
+  "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+  "workflow_run": 31029905102,
+  "scope": "bounded-correctness",
+  "production_scale": false,
+  "required": 8,
+  "passed": 8,
+  "requirements": [
+    "native-ddl-dml-and-constraints",
+    "transactions-and-isolation",
+    "indexes-joins-ctes-windows",
+    "prepared-plans-and-explain",
+    "sqllogictest-conformance",
+    "metamorphic-sql-equivalence",
+    "tpch-correctness",
+    "tpcc-acid"
+  ],
+  "artifact": "native-g2-bounded-closure-evidence"
+}

@@ -42,11 +42,13 @@ def dependency(package_id: str, kind: str | None) -> dict[str, object]:
 def metadata(
     packages: list[dict[str, object]],
     root_dependencies: list[dict[str, object]],
+    *,
+    root_name: str = "hyphae-native-runtime",
 ) -> dict[str, object]:
     nodes = [
         {
             "id": package_record["id"],
-            "deps": root_dependencies if package_record["name"] == "hyphae-native-runtime" else [],
+            "deps": root_dependencies if package_record["name"] == root_name else [],
         }
         for package_record in packages
     ]
@@ -69,10 +71,11 @@ def policy(
     external_packages: list[dict[str, object]],
     *,
     forbidden_packages: list[str] | None = None,
+    root_package: str = "hyphae-native-runtime",
 ) -> dict[str, object]:
     return {
         "schema": "hyphae-native-dependency-policy-v1",
-        "root_package": "hyphae-native-runtime",
+        "root_package": root_package,
         "workspace_packages": workspace_packages,
         "forbidden_packages": forbidden_packages or ["redb", "tantivy"],
         "external_packages": [
@@ -110,6 +113,26 @@ def geiger_package(
 
 
 class NativeDependencyGateTests(unittest.TestCase):
+    def test_product_root_includes_the_runtime_closure(self) -> None:
+        product = package("hyphae-native-product")
+        runtime = package("hyphae-native-runtime")
+        report = audit_metadata(
+            metadata(
+                [product, runtime],
+                [dependency(str(runtime["id"]), None)],
+                root_name="hyphae-native-product",
+            ),
+            policy(
+                ["hyphae-native-product", "hyphae-native-runtime"],
+                [],
+                root_package="hyphae-native-product",
+            ),
+        )
+        self.assertEqual(
+            [entry["name"] for entry in report["packages"]],
+            ["hyphae-native-product", "hyphae-native-runtime"],
+        )
+
     def test_metadata_closure_includes_build_and_excludes_dev_edges(self) -> None:
         root = package("hyphae-native-runtime")
         runtime = package("blake3", source=REGISTRY)
@@ -189,6 +212,38 @@ class NativeDependencyGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(GateFailure, field):
                     audit_metadata(graph, candidate)
 
+    def test_multiple_reviewed_external_versions_are_retained_exactly(self) -> None:
+        root = package("hyphae-native-runtime")
+        syn_v2 = package("syn", version="2.0.119", source=REGISTRY)
+        syn_v3 = package("syn", version="3.0.2", source=REGISTRY)
+        report = audit_metadata(
+            metadata(
+                [root, syn_v2, syn_v3],
+                [
+                    dependency(str(syn_v2["id"]), None),
+                    dependency(str(syn_v3["id"]), "build"),
+                ],
+            ),
+            policy(["hyphae-native-runtime"], [syn_v2, syn_v3]),
+        )
+
+        self.assertEqual(
+            [
+                (entry["name"], entry["version"])
+                for entry in report["packages"]
+                if not entry["workspace"]
+            ],
+            [("syn", "2.0.119"), ("syn", "3.0.2")],
+        )
+        self.assertEqual(
+            report["dependency_kinds"],
+            {
+                "hyphae-native-runtime": ["root"],
+                "syn@2.0.119": ["normal"],
+                "syn@3.0.2": ["build"],
+            },
+        )
+
     def test_workspace_lints_must_forbid_unsafe_and_be_inherited(self) -> None:
         workspace = {"workspace": {"lints": {"rust": {"unsafe_code": "forbid"}}}}
         manifests = {"hyphae-native-runtime": {"lints": {"workspace": True}}}
@@ -265,8 +320,8 @@ class NativeDependencyGateTests(unittest.TestCase):
         self.assertEqual(result["external_used_unsafe_count_on_host"], 7)
         self.assertEqual(result["out_of_closure_parse_failures"], ["unrelated@2.0.0"])
 
-    def test_parse_failure_inside_closure_fails(self) -> None:
-        closure = [{"name": "blake3", "version": "1.0.0", "workspace": False}]
+    def test_parse_failure_inside_workspace_closure_fails(self) -> None:
+        closure = [{"name": "blake3", "version": "1.0.0", "workspace": True}]
         report = {
             "packages": [geiger_package("blake3")],
             "packages_without_metrics": [],
@@ -279,6 +334,20 @@ class NativeDependencyGateTests(unittest.TestCase):
                 "Failed to parse file: /registry/blake3-1.0.0/src/lib.rs, Syn(Error)",
                 closure,
             )
+
+    def test_external_parse_failure_is_reported_without_weakening_workspace_gate(self) -> None:
+        closure = [{"name": "unicode-casefold", "version": "0.2.0", "workspace": False}]
+        report = {
+            "packages": [],
+            "packages_without_metrics": [],
+            "used_but_not_scanned_files": [],
+        }
+        result = audit_unsafe(
+            report,
+            "Failed to parse file: /registry/unicode-casefold-0.2.0/src/lib.rs, Syn(Error)",
+            closure,
+        )
+        self.assertEqual(result["packages"][0]["status"], "not-scanned-on-host")
 
     def test_receipt_paths_remove_repo_cargo_and_home_identity(self) -> None:
         sanitized = sanitize_receipt_paths(

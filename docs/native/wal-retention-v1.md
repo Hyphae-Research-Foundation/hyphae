@@ -2,17 +2,19 @@
 
 Status: normative contract; current-root anchors, identity-preserving prefix
 retirement, bounded suffix replay, interruption recovery, fail-closed
-validation, and local Windows/WSL2 observations are implemented
+validation, lineage-bearing `HYWAR002`, native-marker validation, and direct
+Linux tests are implemented
 
 This protocol bounds native restart work without renumbering the authoritative
 WAL or weakening its digest chain. It removes only a prefix made obsolete by a
 current-root retention checkpoint. Every retained block keeps its original
 block sequence, LSNs, bytes, and digest.
 
-V1 deliberately implements current-root retention. It does not promise that a
-snapshot older than the published retention floor can be reconstructed after
-restart. Multi-generation historical retention, replica pins, incremental
-backup pins, and remote WAL archiving require later contracts.
+V1 deliberately defaults to current-root retention. A snapshot older than the
+published retention floor is reconstructable after restart only when a
+verified [durable snapshot pin](snapshot-pins-v1.md) names its exact manifest
+and blocks an incompatible base selection. Replica pins, incremental-backup
+pins, and remote WAL archiving require later contracts.
 
 ## Pain points fixed
 
@@ -60,9 +62,9 @@ those identities.
 12. An acknowledgement is returned only after the new anchor, truncated WAL,
     and relevant directory entries are synchronized.
 
-## Retention anchor format
+## Legacy retention anchor format
 
-One `HYWAR001` anchor is exactly 256 bytes:
+One historical `HYWAR001` anchor is exactly 256 bytes:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -90,6 +92,31 @@ native CSNs are contiguous and every committed maintenance transaction also
 consumes one CSN. The duplicate field is retained as an explicit
 cross-validation and reporting boundary.
 
+### Lineage-bearing anchor v2
+
+Every retention anchor created under a native `FORMAT` marker uses
+`HYWAR002`. It extends the same fixed-field authority to 280 bytes:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYWAR002` |
+| 8 | 2 | format version `2` |
+| 10 | 2 | header length `280` |
+| 12 | 4 | CRC32C with checksum and final-digest fields zeroed |
+| 16 | 208 | all `HYWAR001` fields from anchor epoch through prior anchor digest |
+| 224 | 16 | directory UUIDv7 in network byte order |
+| 240 | 8 | nonzero history epoch, little-endian |
+| 248 | 32 | BLAKE3 digest after CRC publication, with this field zeroed |
+
+The checksum and digest cover the complete lineage identity. The referenced
+manifest must carry the same lineage, and every prior/current/candidate anchor
+in one chain must match it exactly. A mismatch fails before WAL prefix bytes
+can be ignored or reset.
+
+`HYWAR001` remains byte-identical and decodeable for historical compatibility
+and explicit import tooling. It carries no lineage and is rejected as an
+authority inside a native-marked directory.
+
 Canonical final names are
 `wal-anchor-NNNNNNNNNNNNNNNNNNNN.hywa`, where the decimal component is the
 anchor epoch. Create-new stages append `.tmp`; a synchronized destructive
@@ -115,7 +142,7 @@ request unless all of these are true:
 - the checkpoint block is the last complete WAL block;
 - no transaction, group cohort, checkpoint, vacuum, or background task is in
   progress;
-- no registered snapshot, backup, replica, or archive pin requires the
+- no durable snapshot pin, backup, replica, or archive authority requires the
   candidate prefix; and
 - the next transaction ID and all cumulative counters fit their fields.
 
@@ -253,7 +280,8 @@ universal microsecond restart.
 
 V1 does not:
 
-- retain restartable history below the current floor;
+- retain restartable history below the current floor without a verified
+  durable snapshot pin;
 - collect immutable blobs or old manifest generations;
 - archive WAL remotely;
 - define replica or incremental-backup pin registration;

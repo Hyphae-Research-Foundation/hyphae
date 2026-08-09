@@ -1,7 +1,7 @@
 {
   "name": "@celiums/hyphae",
-  "version": "0.2.1",
-  "description": "Bounded TypeScript client for the public Hyphae v1 API",
+  "version": "1.0.0",
+  "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -14,6 +14,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./v2": {
+      "types": "./dist/v2/index.d.ts",
+      "import": "./dist/v2/index.js"
     }
   },
   "scripts": {
@@ -23,6 +27,7 @@
     "conformance": "npm run build && node conformance/run.mjs"
   },
   "devDependencies": {
+    "@types/node": "^24.10.1",
     "typescript": "5.9.3"
   }
 }

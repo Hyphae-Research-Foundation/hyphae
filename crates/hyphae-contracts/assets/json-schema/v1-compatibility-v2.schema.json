@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/v1-compatibility-v2.schema.json",
+  "title": "NativeV1CompatibilityPolicyV2",
+  "description": "Explicit policy for any v1 route exposed by a Native product service.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["exact_mappings_only", "unmappable_fails_explicitly", "opens_format_2_state"],
+  "properties": {
+    "exact_mappings_only": { "const": true },
+    "unmappable_fails_explicitly": { "const": true },
+    "opens_format_2_state": { "const": false }
+  }
+}

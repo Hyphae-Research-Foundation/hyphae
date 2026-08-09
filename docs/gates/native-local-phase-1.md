@@ -1,25 +1,29 @@
 # Native local ecosystem phase-1 gate
 
-Status: in progress; G0 specifications are drafted but implementation and
-exit evidence remain incomplete
+Status: release candidate. The current closure/revalidation state is maintained in
+[`native-gate-status.md`](native-gate-status.md); this document remains the
+normative definition of gate outcomes.
 
-This is the ordered implementation gate for the Hyphae-owned relational,
+This is the implementation gate for the Hyphae-owned relational,
 structure, and search ecosystem. It describes future work, not shipped
 `0.2.1` behavior.
 
-A later gate may be prototyped early but cannot be declared complete while an
-earlier gate is red.
+G0 through G6 are ordered product-readiness gates. G8 is the independent
+release-safety gate and must close on the exact release commit. G7 is an
+independent performance certification: it may close after a stable release,
+and while open the project must publish no certified latency, saturation, or
+production-scale performance claim.
 
 | Gate | Required outcome | Exit evidence |
 |---|---|---|
 | G0 | Constitution and native specifications | Accepted architecture; versioned type, row, page, blob, WAL, MVCC, SQL, structure, search, ANN, local-protocol and benchmark contracts; clean-room/dependency inventory |
 | G1 | Native substrate | Hyphae page/blob store, WAL, catalog, CSN/MVCC, partitioned memory and scheduler; no Redb on the target path; crash injection at every commit/checkpoint boundary |
-| G2 | Relational engine | Native DDL/DML, constraints, transactions, indexes, joins, CTEs, windows, prepared plans and `EXPLAIN`; SQLLogicTest, metamorphic tests, isolation litmus, TPC-H correctness and TPC-C ACID evidence |
+| G2 | Bounded relational engine | The complete versioned Hyphae SQL G2 bounded profile: catalog-backed bounded DDL/DML and immediate constraints; snapshot transactions; primary, secondary and unique indexes; admitted bounded inner-join, nonrecursive CTE, window, prepared-plan and `EXPLAIN` shapes. Unsupported SQL fails closed. Exit evidence is hosted exact-SHA SQLLogicTest-format bounded conformance, metamorphic and isolation suites, plus canonical-derived bounded TPC-H correctness and TPC-C ACID fixtures. This does not claim universal SQL compatibility, official benchmark conformance, complete canonical benchmark execution or performance. |
 | G3 | Structure engine | Native strings, counters, hashes, lists, sets, sorted sets, streams, TTL and atomic batches; model-based randomized tests, expiry under controlled time, restart equivalence and memory-amplification evidence |
-| G4 | Search engine | Native analyzers, postings, BM25, phrase/prefix/fuzzy, doc values, facets, aggregations, exact vector, ANN and hybrid; scoring goldens, NDCG/recall, rebuild and corruption evidence |
-| G5 | Convergence | One transaction mutates all three engines; concurrent readers never observe a mixed CSN; SQL joins and aggregates native structure/search sources through stable IDs and native operators; one checkpoint, backup and restore preserves the complete state |
-| G6 | Local product | Embedded API, native binary local protocol, CLI, SDK, administration, `EXPLAIN`, telemetry, doctor, backup and restore share one catalog and error model |
-| G7 | Performance | The microsecond contract passes on stable hardware with warm/cold, concurrency, saturation, background interference, p99.9, allocation and hardware-counter receipts |
+| G4 | Bounded search engine | Canonical native analyzer and durable postings; bounded BM25, boolean/phrase/prefix/fuzzy execution; typed doc values, filters, sort, facets and metric aggregations; exact vector, filtered ANN and same-snapshot hybrid fusion. Exit evidence requires analyzer/scoring goldens, NDCG/recall thresholds, lifecycle/rebuild/compaction equivalence and fail-closed corruption matrices. Automatic segments, page-buffered ANN and production-scale performance remain explicit G7 non-claims. |
+| G5 | Bounded convergence | One transaction mutates relational, structure and search/ANN surfaces under one root set and CSN; concurrent readers observe no mixed generation; typed relation-valued structure/search/vector sources join and aggregate by stable `ObjectId` with bounded native execution; one checkpoint plus verified native backup/restore preserves the complete admitted state. Universal federated SQL, online incremental backup and production-scale performance remain non-claims. |
+| G6 | Competitive local product | One curated embedded facade, native UDS/named-pipe protocol, single-binary CLI/daemon, native HTTP `/v2`, and Rust/Python/TypeScript SDKs expose the same catalog, CSN, errors, explanations and offline-verifiable proofs. The bounded product includes catalogued SQL, structures, BM25, exact/ANN/hybrid search, persistent filters/facets/aggregations, named vectors, incremental ANN lifecycle, administration, telemetry, doctor and native backup/restore. Production-scale performance, format-2 migration, clustering, replication and shared-kernel multitenancy remain outside G6. |
+| G7 | Performance | The warm microsecond contract passes on stable hardware with concurrency, saturation, background interference, p99.9, allocation and hardware-counter receipts; cold first-touch behavior is reported separately without a universal threshold |
 | G8 | Release evidence | Soak, crash, corruption, resource exhaustion, migration v2-to-native, multiplatform packaging, SBOM, signatures and independent restore verification are green on one exact commit |
 
 ## G0 required decisions
@@ -38,12 +42,20 @@ G0 must close these decisions before production implementation:
 - strict, group and memory durability classes; and
 - the reproducible performance and quality corpus.
 
+G0 requires a reproducible hosted corpus and bounded quality receipts that
+freeze generators, identities, reference semantics, metrics, and replay. It
+does not require the final product-scale performance claim. Production-scale
+latency and saturation remain G7 evidence; search quality at the complete
+feature and target corpus remains G4 evidence. Those later gates may supply
+inputs to G0, but G0 cannot silently claim their closure.
+
 No disk format, public API, or crate boundary should be frozen before the
 relevant G0 contract is reviewable.
 
 The current reviewable drafts are:
 
 - [canonical types](../native/types-v1.md);
+- [directory format marker](../native/directory-format-v1.md);
 - [page, row, and blob format](../native/page-row-blob-format-v1.md);
 - [current-root page-generation vacuum](../native/page-vacuum-v1.md);
 - [B+tree format](../native/btree-format-v1.md);
@@ -66,13 +78,26 @@ benchmark corpus, and implementation-facing tests exist.
 
 ## Current experimental evidence
 
+The status language in dated evidence below records the state at each source
+commit. It does not override the current retained closure index in
+[`native-gate-status.md`](native-gate-status.md).
+
+The [native directory identity and writer exclusion
+evidence](evidence/native-directory-identity-linux-2026-08-02.md) binds
+canonical native `FORMAT`, UUIDv7 lineage identity, fail-closed marker-family
+validation, and operating-system single-writer ownership to one direct Linux
+commit. Offline promotion crash boundaries and manifest/anchor lineage
+threading remain open, so this evidence closes neither G0 nor G1.
+
 The [2026-08-01 kernel evidence](evidence/native-phase1-kernel-2026-08-01.md)
 implements the first reviewable vertical. Steps 1 through 4 and the
 reopen-equivalence portion of step 6 below execute in tests. Step 5 now covers
 five in-process commit boundaries and four manifest/checkpoint boundaries, but
 not blobs, group commit, filesystem reordering, or sector-level power loss.
-Step 7 has an embedded and frame-codec smoke only; no named-pipe/UDS transport
-receipt.
+Step 7 now has filesystem-backed UDS framing, persistent PING, structure
+`GET`/`SET`/TTL, lexical `SEARCH MATCH`, and prepared SQL `SELECT` receipts
+on direct Linux. Windows named-pipe transport, the complete session, explicit
+all-engine transactions, and the full performance matrix remain open.
 
 The follow-on [row, B+tree, and checkpoint
 evidence](evidence/native-row-tree-checkpoint-2026-08-01.md) binds canonical
@@ -117,6 +142,121 @@ compound family: explicit type creation, independent field storage,
 cardinality metadata, field tombstones, field-granular conflict/rebase,
 multilevel scale, corruption rejection, crash recovery, and direct `HGET`
 latency to one source commit.
+
+The [native bounded hash-scan
+evidence](evidence/native-hash-scan-linux-2026-08-02.md) adds exact binary
+field iteration across private, retained, current-root, and reopened
+execution. Its exclusive field cursor remains valid after deletion, zero
+limit validates type and existence, and the physical route maps the cursor
+into the hash-field B+tree prefix, skips tombstones, and stops at the requested
+live count.
+
+The [native whole-hash lifecycle
+evidence](evidence/native-hash-lifecycle-linux-2026-08-02.md) adds typed
+`DELETE_HASH`, same-transaction recreation, a non-publishing lifecycle
+dependency that preserves disjoint-field admission, metadata/field prefix
+tombstoning, fail-closed replay, compaction, all seven singleton commit crash
+boundaries, and latency separated into private, memory-publication, and strict
+durability surfaces.
+
+The [native whole-hash TTL
+evidence](evidence/native-hash-ttl-linux-2026-08-03.md) adds absolute
+whole-family expiry, persistent/expiring metadata compatibility, typed shared
+expiry indexing, logical absence, cross-family key reuse, lifecycle
+conflicts, mixed scalar/hash scheduler cleanup, crash boundaries, compaction,
+and matched direct-Linux latency.
+
+The [native hash field command
+evidence](evidence/native-hash-field-commands-linux-2026-08-03.md) adds
+bounded positional multi-read, canonical atomic multi-set/delete, signed field
+counters, failure atomicity, field/lifecycle conflicts, crash boundaries,
+reached-corruption checks, and separated direct-Linux latency.
+
+The [native reverse hash-scan
+evidence](evidence/native-hash-reverse-scan-linux-2026-08-03.md) adds
+descending exact-byte scans over private, retained, and physical state;
+exclusive live/dead cursors; whole-hash TTL; height-two reverse B+tree
+pruning; early stop; fail-closed reached corruption; and a direct-Linux
+comparison against full ascending materialization.
+
+The [native hash pattern-scan
+evidence](evidence/native-hash-pattern-scan-linux-2026-08-03.md) adds one
+bounded binary-glob grammar with independent output, visit, and matcher-step
+budgets; exact and leading-prefix physical routes; empty-page progress;
+TTL/reopen equivalence; and reached-corruption handling. Its receipt retains
+the negative leading-wildcard result as an optimization target.
+
+The [native hash field TTL
+evidence](evidence/native-hash-field-ttl-linux-2026-08-03.md) adds absolute
+per-field expiry, the accepted WAL opcode `EXPIRE_HASH_FIELD=32`, the ordered
+`0x0c` namespace, visibility across every hash read surface, expiry-clearing
+mutations, field/lifecycle conflicts, combined active cleanup, crash
+boundaries, compaction, and matched direct-Linux latency. Relative and
+conditional field expiry, field persist/batches, floating counters, other
+collection-family TTL, the complete G3 suite, and G7 remain open.
+
+The [native hash randomized-model
+evidence](evidence/native-hash-randomized-model-linux-2026-08-03.md) executes
+the frozen dependency-free state machine across 16 fixed seeds, 4,096 actions,
+4,524,373 comparisons, every hash read surface, and 128 reopen cycles. It also
+retains a perturbed-oracle negative control and the physical field-TTL
+contract correction exposed by the corpus. Other structure-family models,
+concurrent histories, memory amplification, complete G3, and G7 remain open.
+
+The [native set algebra
+evidence](evidence/native-set-algebra-linux-2026-08-03.md) implements the
+frozen bounded exact-byte `UNION`, `INTERSECTION`, and ordered `DIFFERENCE`
+contract over private, retained, and current-root physical set state. It binds
+logical-time expiry, restart equivalence, deterministic smallest-set
+intersection, reached-corruption failures, hard output/visit limits, and
+direct-Linux latency. Small embedded cases measured 1.838–6.013 microseconds
+at p50; current-root physical cases measured 61.645–93.838 microseconds at
+p50. Large union and difference remained cardinality-sensitive at 2.605 and
+6.784 milliseconds p50. Store variants, sorted-set algebra/TTL, streams,
+complete G3, and G7 remain open.
+
+The [native whole-set TTL
+evidence](evidence/native-set-ttl-linux-2026-08-03.md) implements the frozen
+absolute complete-set expiry contract across membership, cardinality, bounded
+algebra, snapshots, physical reads, restart, lifecycle conflicts, due-key
+reuse, and shared cleanup. It binds additive WAL opcodes `EXPIRE_SET=33` and
+internal `DELETE_SET=34`, backward-readable `HYSETM02` metadata, expiry marker
+`3`, group durability, seven cleanup crash boundaries, corruption rejection,
+compaction, page vacuum, and matched direct-Linux latency. Relative or
+conditional expiry, persist, per-member TTL, destination algebra, complete
+G3, and G7 remain open.
+
+The [native whole-set lifecycle
+evidence](evidence/native-set-lifecycle-linux-2026-08-03.md) promotes the
+existing internal `DELETE_SET=34` path to an explicit embedded operation.
+It proves complete retirement, retained history, same-transaction recreation
+as every implemented structure family, lifecycle conflicts, all seven
+singleton delete and replacement crash boundaries, fail-closed corruption,
+compaction, page vacuum, and direct-Linux cardinality-sensitive latency.
+Generic `DEL`, protocol compatibility, process-kill/block replay, complete
+G3, and G7 remain open.
+
+The [native whole-list lifecycle
+evidence](evidence/native-list-lifecycle-linux-2026-08-03.md) adds
+`DELETE_LIST=35` over the native chunked deque. It proves complete metadata
+and chunk retirement, retained history, all typed recreations, whole-list
+first-committer-wins conflicts, 14 singleton crash boundaries, multichunk
+blob retirement, fail-closed corruption, compaction, page vacuum, blob
+collection, reopen, and direct-Linux cardinality-sensitive latency.
+Process-kill/block replay, blocking operations, streams, complete G3, and G7
+remain open.
+
+The [native whole-list TTL
+evidence](evidence/native-list-ttl-linux-2026-08-03.md) implements absolute
+complete-list expiry across both-end mutation, length/range reads, snapshots,
+explicit-time physical reads, restart, lifecycle conflicts, due-key reuse,
+and shared cleanup. It binds additive WAL opcode `EXPIRE_LIST=36`, existing
+retirement opcode `DELETE_LIST=35`, backward-readable `HYLSTM02` metadata,
+expiry marker `4`, Group durability, seven cleanup crash boundaries,
+corruption rejection, compaction, page vacuum, blob collection, and repeated
+matched direct-Linux latency. Relative or conditional expiry, persist,
+per-element TTL, blocking/indexed/trim/move operations, complete G3, and G7
+remain open.
 
 The [native inverted-search
 evidence](evidence/native-inverted-search-2026-08-01.md) binds the replacement
@@ -291,9 +431,39 @@ membership and score/member order to one native structure B+tree. It proves
 canonical binary64 ordering, retained snapshots, member-granular optimistic
 rebase, strict reopen, fail-closed dual-index recovery, all seven commit crash
 boundaries, and clean physical microsecond observations over 2,048 members.
-Score ranges, reverse/rank acceleration, algebra, TTL, protocol exposure,
+Subtree-count order-statistic acceleration, algebra, TTL, protocol exposure,
 model testing, amplification evidence, the complete G3 suite, and G7 remain
 open.
+
+The [native sorted-set score-range
+evidence](evidence/native-sorted-set-score-ranges-linux-2026-08-02.md) adds
+inclusive, exclusive, unbounded, empty, and inverted score bounds with live
+offset/limit semantics across private, retained, current-root, and reopened
+execution. The current-root path maps canonical binary64 bounds directly onto
+the ordered B+tree namespace, prunes nonintersecting subtrees, ignores
+tombstones without charging offset, stops at the requested live result count,
+and fails closed on malformed ordered identities, scores, and markers. Its
+direct-Linux observation measures one warm, bounded physical range.
+
+The [native sorted-set member-rank
+evidence](evidence/native-sorted-set-ranks-linux-2026-08-02.md) adds zero-based
+`ZRANK` and `ZREVRANK` across private, retained, current-root, and reopened
+execution. The physical path resolves the member score through the membership
+index, walks the ordered B+tree toward the target in the requested direction,
+ignores tombstones, stops at the live target, and fails closed on forged
+metadata, scores, identities, or markers. Its direct-Linux observation
+characterizes head, middle, and tail costs over 2,048 members.
+
+The [native sorted-set reverse-range
+evidence](evidence/native-sorted-set-reverse-ranges-linux-2026-08-02.md) adds
+signed-rank `ZREVRANGE` and bounded-score `ZREVRANGE_BY_SCORE` across private,
+retained, current-root, and reopened execution. Both reverse the complete
+score/member order, count only live entries, and stop at the requested result
+boundary. The physical paths start at the ordered prefix tail or traverse only
+the bounded score interval in reverse, reject forged metadata/markers, and do
+not materialize the complete sorted set. Subtree live counts, algebra, TTL,
+protocol exposure, model testing, amplification evidence, the complete G3
+suite, and G7 remain open.
 
 The [native durable scalar-expiry
 evidence](evidence/native-expiry-2026-08-01.md) binds `HYSTRBT2`, its ordered
@@ -341,14 +511,14 @@ milliseconds, so neither is claimed as a microsecond maintenance path.
 Multi-generation retention, blob/WAL collection, background scheduling, and
 the complete G1/G7 matrices remain open.
 
-The [native dependency-closure
-evidence](evidence/native-dependency-closure-2026-08-02.md) makes the non-dev
-normal/build graph rooted at `hyphae-native-runtime` an exact fail-closed
-allowlist. Its clean WSL2 receipt contains 11 Hyphae-owned packages, 19
-reviewed external primitive/build packages, no forbidden engine, and zero
-native unsafe findings. Reported third-party unsafe syntax still requires
-semantic review, and the remaining golden/corpus/conformance requirements keep
-G0 open.
+The historical [native dependency-closure
+evidence](evidence/native-dependency-closure-2026-08-02.md) made the then-current
+non-dev graph rooted at `hyphae-native-runtime` an exact fail-closed allowlist.
+Its clean WSL2 receipt contains 11 Hyphae-owned packages, 19 reviewed external
+primitive/build packages, no forbidden engine, and zero native unsafe findings.
+G6 later moved the live dependency gate root to `hyphae-native-product`; current
+hosted receipts must report that expanded closure and do not rewrite the
+historical receipt.
 
 The [native group-commit
 evidence](evidence/native-group-commit-2026-08-02.md) adds a bounded
@@ -424,6 +594,179 @@ p50. This is an operator observation, not G2 or G7; composite
 equality-prefix secondary ranges, descending and streaming execution, and
 the complete correctness and performance matrices remain open.
 
+The [native composite secondary prefix-range
+evidence](evidence/native-secondary-index-prefix-ranges-linux-2026-08-02.md)
+binds a nonempty strict `HYRIDX02` equality prefix plus lower/upper bounds on
+the immediately following index column. It proves canonical bounds across
+remaining index suffixes and primary-key ties, residual-before-limit
+behavior, private/retained/current/reopened equivalence, legacy fallback,
+false-plan rejection, and fail-closed malformed identities and forged
+projections. Its schema-v16 Linux observation uses a second isolated native
+database so the inherited schema-v15 corpus and measurement order remain
+unchanged. After eliminating duplicate row decoding, it measured 46.535
+microseconds p50 and 98.370 microseconds p99, meeting both halves of the
+provisional bounded indexed-SQL target in this one warm scenario. This is an
+operator observation, not G2 or G7; overlapping-index cost selection,
+descending and streaming execution, and the complete correctness and
+performance matrices remain open.
+
+The [native ext4 Linux baseline
+evidence](evidence/native-ext4-linux-baseline-2026-08-02.md) executes the
+same schema-v15 smoke on native Linux for the first time, with the
+benchmark data directory on persistent ext4 rather than tmpfs. It opens
+the native-ext4 observation lane that the retention milestones name where
+"native-ext4/power-loss evidence remain open", but the run is warm,
+memory-durability, and concurrency one and does not fsync, so it covers
+neither power-loss nor physical-durability evidence. It closes no gate;
+its numbers are a new devbox baseline that is not run-to-run comparable
+with the WSL2 or Windows receipts.
+
+The [native lineage ext4 latency
+evidence](evidence/native-lineage-ext4-latency-2026-08-02.md) repeats the
+schema-v15 embedded/local-frame smoke directly on that Linux host for the
+exact lineage-bearing source tree merged by PR 53. All 20 hot or indexed
+routes remain below one millisecond through p99.9, and the local-frame route
+observes p50/p99 `0.104/0.121 us`. This satisfies the first latency
+observation for that source tree but does not time the one-CSN commit, strict
+durability, UDS/named-pipe transport, or power loss and closes neither G1 nor
+G7.
+
+The [native local UDS
+evidence](evidence/native-local-uds-linux-2026-08-03.md) adds the first real
+filesystem-backed transport below `HYPHLCL1`: bounded reusable frame buffers,
+fail-closed truncation and allocation checks, exact `0600` endpoint
+permissions, identity-safe cleanup, and an ordered persistent connection.
+Three direct-Linux release observations put the median persistent `PING`
+round trip at p50 `23.261 us`, p99 `35.290 us`, and p99.9 `44.631 us`. This
+removes the explicit no-UDS-receipt deficit from the minimal G1 vertical, but
+does not close Windows named-pipe or complete session semantics, establish a
+regression threshold, or close G1, G6, or G7.
+
+The [native local structure GET
+evidence](evidence/native-local-structure-get-linux-2026-08-03.md) adds the
+first engine-bearing UDS operation. Canonical binary payloads, stable
+request-local failures, server-authoritative TTL time, and direct physical
+B+tree reads retain stream/request identity on one persistent connection.
+Across three direct-Linux release runs, the median embedded physical read was
+p50/p99 `0.816/1.588 us`; the complete `STRUCTURE GET` round trip was
+`23.466/35.939 us`. This bounded observation is below the provisional
+`25/100 us` local-protocol target, but it is warm, virtualized, concurrency
+one, may allocate the returned value, and lacks the G7 cold/saturation/
+interference/allocation/hardware-counter matrix. `SET`, TTL commands, SQL,
+search, transactions, complete session semantics, and Windows named pipes
+remain open.
+
+The [native local structure SET and TTL
+evidence](evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
+extends that serial session with canonical binary mutation/TTL payloads,
+strict and memory durability receipts, exact transaction ID/CSN identity,
+controlled expiry, request-local recovery, and strict reopen equivalence.
+Across three direct-Linux runs, median physical TTL p50/p99 was
+`0.832/0.886 us`; persistent GET and TTL round trips were
+`23.546/34.286 us` and `23.487/34.489 us`. Memory `SET` was
+`377.113/401.059 us`, while strict `SET` was
+`6,738.743/6,928.074 us`. Those mutation results expose unfinished hot-path
+and physical-durability work rather than satisfying G7. Group durability,
+replay/idempotency, explicit transactions, SQL/search operations, complete
+session semantics, Windows named pipes, and the G7 matrix remain open.
+
+The [native local SEARCH MATCH
+evidence](evidence/native-local-search-match-linux-2026-08-03.md) adds the
+first search-engine operation to that UDS session. It binds a nonzero catalog
+identity, bounded UTF-8 query, visible all-engine CSN, positive finite BM25
+scores, and strict score/document ordering to the physical inverted index.
+Across three direct-Linux runs over 2,048 documents, median physical MATCH
+p50/p99 was `23.346/32.704 us`; the complete one-hit UDS round trip was
+`56.150/68.327 us`, with independent PING at `23.358/33.728 us`. The receipt
+does not subtract those distributions or close G4/G6/G7. SQL operations
+beyond bounded prepared SELECT, document mutation, ANN/hybrid search,
+streaming, Windows named pipes, concurrency, saturation, allocation, and
+hardware-counter lanes remain open.
+
+The [native local SQL SELECT
+evidence](evidence/native-local-sql-select-linux-2026-08-03.md) adds the first
+relational-engine operation to the same UDS session. It retains bounded
+prepared plans and canonical typed parameters, then returns the complete
+logical schema, typed rows, and visible all-engine CSN from direct physical
+primary, secondary, bounded-scan/range, and indexed-join access paths. Across
+three direct-Linux runs over 2,048 rows, median embedded prepared primary-key
+SELECT p50/p99 was `1.878/2.022 us`; the one-row UDS EXECUTE round trip was
+`21.924/32.976 us`, with independent PING at `23.365/33.780 us`. The UDS p50
+being lower than PING is not negative overhead: independent percentiles are
+not subtracted. DDL/DML over the protocol, explicit all-engine transactions,
+streaming, Windows named pipes, concurrency, saturation, allocation, hardware
+counters, and complete G2/G5/G6/G7 evidence remain open.
+
+The [native local all-engine transaction
+evidence](evidence/native-local-all-engine-transaction-linux-2026-08-03.md)
+adds one explicit serial transaction over the existing detached optimistic
+batch. SQL DML, scalar SET, and lexical document indexing stage under one
+fixed read CSN and server time, then publish through one WAL transaction and
+one commit CSN. Prior snapshots see none of the writes; strict reopen sees all
+three. Wrong handles/counts, empty commit, semantic failure, response
+preflight, rollback, close, peer loss, the 1,024-operation bound, optimistic
+conflict, and all seven commit interruptions fail closed. Across three
+direct-Linux runs, median SQL/structure/search stage p50 was
+`24.415/22.364/24.271 us`. Memory and strict commit p50 was
+`6.476/15.097 ms`, exposing unfinished publication and synchronization work.
+This completes the minimal transaction proof required by G1 step 4 and
+advances G5/G6, but it does not prove concurrent-reader mixing, cross-engine
+SQL operators, backup/restore, Windows named pipes, or the G7 matrix and
+closes no complete gate.
+
+The [native delta all-engine transaction
+evidence](evidence/native-delta-all-engine-transaction-linux-2026-08-03.md)
+replaces complete engine-state materialization on that local transaction hot
+path with one bounded physical delta. HYCAT004 point-resolves the named
+relation and its exact secondary-index dependencies; SQL, scalar structure,
+and immutable lexical overlays revalidate and publish through the existing
+WAL transaction and one CSN. Deterministic guards reject any hot-path complete
+engine or catalog load, latest and historical reads stop at the first visible
+row version, full verification still rejects corrupt older links, and all
+seven commit interruptions remain never-mixed. Across three CPU-0
+direct-Linux runs, median memory/strict commit p50 is `1.001241/9.388397 ms`;
+depth from 1 through 1,024 prior versions retains nine page reads, three page
+appends, one 65,536-byte WAL block, and zero complete state/catalog loads.
+This closes the bounded delta slice and removes the known materialization
+bottleneck. It does not close G1, G5, G6, or G7: memory commit remains outside
+the microsecond domain, and cold/concurrent/saturated performance,
+per-operation allocation bounds, cross-engine SQL operators, backup/restore,
+replication, and complete phase evidence remain open.
+
+The [native lexical document lifecycle
+evidence](evidence/native-search-document-lifecycle-linux-2026-08-03.md)
+adds exact replacement and deletion to the point-resolved lexical delta and
+local transaction surface. Search WAL opcodes `37` and `38`, the atomic
+`HYSEABT1` to `HYSEABT2` upgrade, exact document/term/posting tombstones,
+same-document conflict identity, historical BM25 equivalence, fourteen commit
+interruptions, large-blob reclamation, and fail-closed V1/malformed tombstones
+are implementation-gated. Across three CPU-0 direct-Linux runs, staging p50
+remained between `22.469 us` and `141.813 us`. At 4,096 unrelated documents,
+median memory commit p50 was `1.295983 ms` for replacement and `1.033210 ms`
+for deletion; strict commit p50 was `9.670471/8.966219 ms`. Every measured
+transaction appended one 65,536-byte WAL block and performed zero complete
+engine-state or catalog loads. This removes mutable lexical documents from
+the bounded-delta gap but closes no complete gate; hosted stack checks, search
+tombstone compaction, broad query semantics, cross-engine SQL, and complete
+phase evidence remain open.
+
+The [native lexical tombstone compaction
+evidence](evidence/native-search-tombstone-compaction-linux-2026-08-03.md)
+adds explicit current-root `HYSEABT2` reachability compaction under search WAL
+opcode `39`. Complete lexical and catalog-bound ANN validation precedes writer
+admission; exact document, term, and posting tombstones are omitted while
+every retained lexical and ANN byte, historical root, and non-search engine
+root remains unchanged. V1/no-tombstone roots advance no page, WAL identity,
+transaction ID, or CSN. Six focused equivalence tests, two public integration
+tests, all seven commit interruptions, corruption-before-append gates, and the
+compaction/vacuum/retention/blob sequence pass directly on Linux. Across three
+CPU-0 runs, validated-plan p50 was `9.925-29.915 ms`; applied memory/strict
+compaction p50 was `14.821-56.681/20.683-64.283 ms` across 256 and 4,096
+documents at 25% and 75% tombstones. Applied work wrote one 65,536-byte WAL
+block and appended 3-52 replacement pages. This closes explicit lexical
+tombstone compaction, not automatic policy, background merge, broad search,
+cross-engine SQL, or any complete phase gate.
+
 The [native bounded-WAL-replay
 evidence](evidence/native-wal-replay-2026-08-02.md) adds fixed-size
 `HYWAR001` retention anchors, absolute retained block/LSN identity, explicit
@@ -456,6 +799,63 @@ verification p50 improved by 26.467297 times on Windows/NTFS and 39.915948
 times under WSL2/tmpfs. Multi-root pins, native-ext4/power-loss evidence,
 automatic scheduling, and complete G1/G7 matrices remain open.
 
+The [native lineage-threading
+evidence](evidence/native-lineage-threading-linux-2026-08-02.md) makes the
+directory UUIDv7 plus history epoch part of `HYROOT03` manifests and
+`HYWAR002` retention anchors. Direct Linux tests preserve historical codec
+bytes while rejecting legacy, mixed, and marker-divergent recovery authority
+before retained WAL state can be selected or reset. A follow-up exhausts all
+truncated prefixes and single-byte corruptions in both lineage-bearing
+authority fixtures, for 1,088 deterministic corrupt inputs. Offline
+promotion, a sanctioned epoch transition, physical power-loss evidence, and
+the broader G1 matrix remain open.
+
+The [native process crash matrix
+evidence](evidence/native-process-crash-matrix-linux-2026-08-02.md) replaces
+the singleton commit's in-process-only interruption claim with seven
+`SIGKILL`/reopen cycles on direct Linux/ext4. A strict transaction mutates
+relational, structure/TTL, and lexical state under one CSN while also
+publishing a large immutable blob. The four pre-WAL boundaries reopen the
+prior empty state; complete WAL append, WAL synchronization, and root
+publication reopen the complete CSN 1. This is process-crash evidence, not
+physical power loss: the kernel page cache survives, and checkpoint,
+retention, maintenance, migration, resource-exhaustion, and storage-fault
+lanes remain open.
+
+The [native checkpoint process crash
+evidence](evidence/native-checkpoint-process-crash-linux-2026-08-02.md)
+extends that live-writer `SIGKILL` harness to all four checkpoint boundaries.
+Recovery removes the staged temporary manifest, preserves a published
+manifest as a non-authoritative suffix, and recognizes the complete
+checkpoint record after either WAL boundary. All four reopen the same
+complete all-engine CSN 1. Group commit, retention, maintenance, migration,
+resource-exhaustion, filesystem-reordering, and physical power-loss lanes
+remain open.
+
+The [native block-layer power-loss replay
+evidence](evidence/native-block-power-loss-replay-linux-2026-08-02.md)
+reconstructs the worst stable ext4 image recorded by Linux `dm-log-writes`
+through each of those seven commit and four checkpoint boundaries. Unlike
+the process-kill lane, an appended but unsynchronized user WAL transaction
+reopens the prior empty state, and an appended but unsynchronized checkpoint
+WAL record leaves the published manifest as an unanchored suffix. Authority
+begins only after WAL synchronization. All 11 replay images mount, recover the
+required all-engine state, pass read-only `e2fsck`, and clean their isolated
+loop/mapping resources. This closes the singleton/checkpoint block-ordering
+slice, not literal EBS power removal, group commit, retention, maintenance,
+migration, resource exhaustion, or the complete G1 matrix.
+
+The [native durable snapshot-pin
+evidence](evidence/native-snapshot-pins-linux-2026-08-02.md) adds an immutable
+`HYPIN001` registry and exact named retention across relational, structure/TTL,
+lexical, ANN, catalog, page, blob, manifest, and WAL authority. Three pinned
+page generations reopen beside a fourth active generation; middle and final
+unpin collections report exact removed/retained bytes. Schema-v3 process
+evidence extends the existing harness to 13 `SIGKILL` cycles and proves staged
+pin absence versus published pin completeness. The direct Linux workspace
+funnel is green, but hosted CI, mutation testing, physical power loss, offline
+promotion, and the broader G1 matrix remain open.
+
 This evidence advances G0/G1 but closes neither gate. Relational table/primary
 key storage now uses the native B+tree and canonical MVCC rows, and large row
 values use native immutable blobs. The current implementation also retains
@@ -471,8 +871,8 @@ retained suffix. Explicit single-root maintenance now collects blobs
 unreachable after page/WAL/manifest retirement. Mixed strict/group/memory
 policy now has bounded-load concurrency, saturation, active-expiry fairness,
 and terminal-failure evidence. Broader sustained fairness remains pending,
-along with multi-generation pin-aware retention,
-composite secondary equality-prefix ranges and streaming execution,
+along with automated pin lifecycle policy and quotas,
+cost-based overlapping secondary-index selection and streaming execution,
 zero-copy relational operator cursors, general relational expressions beyond
 the admitted residual slice, constraints/planning, remaining structure
 families, positional postings, segments, buffered/filtered ANN, and hybrid
@@ -481,14 +881,24 @@ Typed point inserts, exact-PK update/delete, and catalog-bound
 primary/secondary-key projection now use canonical tuples and
 primitive/composite keys, but do not close G2. The structure keyspace has a
 multilevel native B+tree, direct reads, tombstone/expiry mutations,
-conditional writes, signed counters, independent-field hashes, exact binary
-sets with member-granular conflicts, chunked-deque lists, and dual-index
-sorted sets. It still lacks whole-hash lifecycle/iteration, set and sorted-set
-algebra/TTL, score/reverse/rank sorted-set operations, streams, adaptive
-empty-expiry backoff, model tests, and configurable historical retention
-required to close G3. Ordered cleanup,
-current-root compaction, and page-generation vacuum provide exact first
-amplification measurements, not the complete memory-amplification gate.
+conditional writes, signed counters, independent-field hashes with bounded
+ascending, descending, and binary-glob iteration, exact binary sets with
+member-granular conflicts, chunked-deque lists, and dual-index sorted sets
+with bounded bidirectional score/rank ranges, member-rank lookup, whole-hash
+delete/recreate and TTL, bounded multi-field hash commands, signed hash-field
+counters, independent absolute field TTL, bounded set algebra, and complete-set
+TTL, plus complete-list delete/recreate and TTL. Subsequent G3 work added
+durable sorted-set lifecycle/TTL, append-ordered streams with stable entry IDs
+and TTL, active expiry for both families, crash matrices, seeded models for
+every required family, an all-family restart matrix, and all-family atomic
+conflict evidence. Floating counters, sorted-set algebra, relative/conditional
+expiry, persist semantics, broader model alphabets and negative controls,
+adaptive empty-expiry backoff, and a user-facing historical-retention policy
+remain open. One cleanup transaction now retires all six families under one
+CSN, and explicit sorted-set deletion retires its TTL index before reopen.
+Ordered cleanup, current-root compaction, page-generation vacuum, and the
+bounded physical-amplification test provide initial measurements, not a
+complete production-scale memory claim.
 
 ## G1 substrate exit
 

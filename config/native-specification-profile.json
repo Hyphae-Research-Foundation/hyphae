@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-specification-profile-v1",
+  "architecture": "docs/architecture/native-local-ecosystem.md",
+  "specifications": [
+    "docs/native/types-v1.md",
+    "docs/native/page-row-blob-format-v1.md",
+    "docs/native/wal-format-v1.md",
+    "docs/native/mvcc-commit-v1.md",
+    "docs/native/catalog-v1.md",
+    "docs/native/sql-semantics-v1.md",
+    "docs/native/structures-semantics-v1.md",
+    "docs/native/search-semantics-v1.md",
+    "docs/native/ann-semantics-v1.md",
+    "docs/native/local-protocol-v1.md"
+  ]
+}

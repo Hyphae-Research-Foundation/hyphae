@@ -1,0 +1,2208 @@
+{
+  "schema": "hyphae.native.search-document-lifecycle-evidence.v1",
+  "status": "direct-linux-gates-passed-hosted-gates-pending",
+  "source": {
+    "branch": "codex/native-search-document-lifecycle",
+    "contract_commit": "0200485600b8eea98f4290d371e80588881ae7d0",
+    "implementation_commit": "02888c099c354f1109efeec1eef2f01dbcabfa92",
+    "initial_harness_commit": "7b7c7c8d4a7465ab1011a0f70de0ed34edd3775d",
+    "contract_alignment_commit": "6dce9a2fc4d7779427c5feceea136cb33ea1df40",
+    "measured_harness_commit": "e5bac1a3c56f00edbffb2b3486f56936906e139f",
+    "blob_reclamation_gate_commit": "b095629a478d8b77e1c27c44a0cf9ce2821a1784"
+  },
+  "controls": {
+    "canonical_host": "mario@10.77.10.10",
+    "canonical_repository": "/home/mario/celiumsai/hyphae",
+    "wsl_in_path": false,
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "pinned_cpu": 0,
+    "concurrency": 1,
+    "observations_per_configuration": 32,
+    "discarded_warmup_observations": 0,
+    "populations": [
+      0,
+      256,
+      4096
+    ],
+    "operations": [
+      "replace",
+      "delete"
+    ],
+    "durability_classes": [
+      "memory",
+      "strict"
+    ],
+    "percentile_subtraction": false,
+    "profiler_latencies_excluded": true
+  },
+  "sha256": {
+    "cargo_lock": "61b99ddda1784bf45999c00c4a32becf2b3a43530940b9add30ee9e8efa14195",
+    "red_gate_log": "a6bb5e89bb7442b04b6cfccca483897a9586f7979a5cf5c17223307371cbe8ba",
+    "environment": "d5f27e20bfcc7f2a2d4e4eef452a66dfb6e429f62a34a3ebc147f050b4bb5f46",
+    "harness_source": "c4ea2bbe6660adb1894dc0fbffdb43fea371f3e7b47bc305e5ab5a7f93d898c0",
+    "release_binary": "6a0c7805c102de5e06e4a992ce5695978efe40501e059882975566c782ee9c6c",
+    "run_1": "6349289f2381ca8979d20fd0c87b17d0cb674de95b06e9380926bd5f5dc1f61b",
+    "run_2": "2113d2b87f004a594cee48a27da364369f85fe4e6ab33d5dc7f2a4d42d986f72",
+    "run_3": "ac76647e5cf9435a3d4de9093a6a44f2bfb730977dea19aad0d160ad7c662212",
+    "heaptrack_capture": "080dbcd0c5ced99001eb33a28e164e821e931c3d8d30e96568cb866cc8c5c315",
+    "heaptrack_summary": "c204a3e92e6dff75ebea4e61358053d82d6448fd037183769790f0cdc56b1e40",
+    "heaptrack_run": "00764960813b469eefca5f5ec34571b3014cd640da4c278df890a6e6b7c5e2b8",
+    "final_fmt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "final_workspace_tests": "3223a4dfd63a23040d06de3dbe67c1ca46cc2d5cc1a4bae37245b0f9dad3e4bd",
+    "final_clippy": "d2f92bdfa5c3d782c26079f0ac16eec333ce56045151f0b9349eb41b3f8fea8d",
+    "final_rustdoc": "357d9010f4b8260c055dc44e15b4a46e6c6de739f21774e4ad143d324b7f56ae",
+    "final_documentation": "e52b00e0bc66147d1628f56965e17c626db6e8cd51d266d95bd1069b20a15fc8",
+    "final_diff_check": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "environment": {
+    "instance": "AWS EC2 m6i.2xlarge",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.17.0-1019-aws",
+    "cpu": "Intel Xeon Platinum 8375C @ 2.90 GHz",
+    "logical_cpus": 8,
+    "memory_gib": 30,
+    "swap": false,
+    "filesystem": "ext4 on /dev/nvme0n1p1",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "perf": "6.17.13",
+    "heaptrack": "1.5.0"
+  },
+  "red_gate": {
+    "compiler_reached": true,
+    "missing_public_apis": [
+      "NativeWriteBatch::replace_document",
+      "NativeWriteBatch::delete_document",
+      "NativeDatabase::stage_delta_replace_document",
+      "NativeDatabase::stage_delta_delete_document"
+    ],
+    "discarded_setup_failure": "cargo was initially absent from the non-login SSH PATH; that run is not evidence"
+  },
+  "directed_gates": {
+    "lifecycle_integration_tests": 6,
+    "native_runtime_unit_tests": 343,
+    "local_all_engine_transaction_tests": 23,
+    "deterministic_commit_interruptions": 14,
+    "full_state_loads_in_hot_path": 0,
+    "full_catalog_loads_in_hot_path": 0,
+    "clippy_warnings_allowed": 0,
+    "malformed_tombstones_fail_closed": true,
+    "v1_tombstones_fail_closed": true,
+    "large_blob_reclamation_proved": true
+  },
+  "runs": [
+    {
+      "schema": "hyphae.native.search-document-lifecycle-scaling.v1",
+      "status": "observation-not-regression-gate",
+      "implementation_commit": "e5bac1a",
+      "profile": "release",
+      "rows": [
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 50860,
+              "p95": 52265,
+              "maximum": 53356
+            },
+            "commit_nanos": {
+              "p50": 661794,
+              "p95": 706094,
+              "maximum": 716593
+            },
+            "total_nanos": {
+              "p50": 715121,
+              "p95": 759416,
+              "maximum": 770738
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 99300,
+              "p95": 109035,
+              "maximum": 123815
+            },
+            "commit_nanos": {
+              "p50": 7593190,
+              "p95": 7801141,
+              "maximum": 9841921
+            },
+            "total_nanos": {
+              "p50": 7713631,
+              "p95": 7905151,
+              "maximum": 9884971
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 22472,
+              "p95": 24627,
+              "maximum": 42185
+            },
+            "commit_nanos": {
+              "p50": 293642,
+              "p95": 321131,
+              "maximum": 325987
+            },
+            "total_nanos": {
+              "p50": 320941,
+              "p95": 346814,
+              "maximum": 365187
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 55738,
+              "p95": 70878,
+              "maximum": 72119
+            },
+            "commit_nanos": {
+              "p50": 6739480,
+              "p95": 6985700,
+              "maximum": 9049089
+            },
+            "total_nanos": {
+              "p50": 6797049,
+              "p95": 7044689,
+              "maximum": 9091982
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 42261,
+              "p95": 46305,
+              "maximum": 92226
+            },
+            "commit_nanos": {
+              "p50": 973559,
+              "p95": 1021697,
+              "maximum": 1041830
+            },
+            "total_nanos": {
+              "p50": 1018248,
+              "p95": 1066429,
+              "maximum": 1137132
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 102273,
+              "p95": 107246,
+              "maximum": 111524
+            },
+            "commit_nanos": {
+              "p50": 9122578,
+              "p95": 9651582,
+              "maximum": 19853049
+            },
+            "total_nanos": {
+              "p50": 9229605,
+              "p95": 9749561,
+              "maximum": 19938300
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 43176,
+              "p95": 59664,
+              "maximum": 82767
+            },
+            "commit_nanos": {
+              "p50": 805871,
+              "p95": 847006,
+              "maximum": 915971
+            },
+            "total_nanos": {
+              "p50": 852064,
+              "p95": 892260,
+              "maximum": 1001575
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 97651,
+              "p95": 107089,
+              "maximum": 113892
+            },
+            "commit_nanos": {
+              "p50": 8697958,
+              "p95": 9343384,
+              "maximum": 19391832
+            },
+            "total_nanos": {
+              "p50": 8798772,
+              "p95": 9456008,
+              "maximum": 19476448
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 71547,
+              "p95": 85400,
+              "maximum": 112771
+            },
+            "commit_nanos": {
+              "p50": 1291912,
+              "p95": 1347874,
+              "maximum": 1428496
+            },
+            "total_nanos": {
+              "p50": 1365163,
+              "p95": 1429017,
+              "maximum": 1647419
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 139174,
+              "p95": 158135,
+              "maximum": 167338
+            },
+            "commit_nanos": {
+              "p50": 9632251,
+              "p95": 9880953,
+              "maximum": 4497033122
+            },
+            "total_nanos": {
+              "p50": 9785473,
+              "p95": 10023057,
+              "maximum": 4497149017
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 71416,
+              "p95": 85130,
+              "maximum": 105304
+            },
+            "commit_nanos": {
+              "p50": 1033210,
+              "p95": 1076072,
+              "maximum": 1104849
+            },
+            "total_nanos": {
+              "p50": 1111914,
+              "p95": 1150953,
+              "maximum": 1216835
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 141532,
+              "p95": 167056,
+              "maximum": 177993
+            },
+            "commit_nanos": {
+              "p50": 8993649,
+              "p95": 9148724,
+              "maximum": 4295498258
+            },
+            "total_nanos": {
+              "p50": 9133931,
+              "p95": 9290341,
+              "maximum": 4295613687
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "schema": "hyphae.native.search-document-lifecycle-scaling.v1",
+      "status": "observation-not-regression-gate",
+      "implementation_commit": "e5bac1a",
+      "profile": "release",
+      "rows": [
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 50748,
+              "p95": 52718,
+              "maximum": 66425
+            },
+            "commit_nanos": {
+              "p50": 664189,
+              "p95": 708635,
+              "maximum": 731827
+            },
+            "total_nanos": {
+              "p50": 717336,
+              "p95": 763401,
+              "maximum": 786719
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 99643,
+              "p95": 112268,
+              "maximum": 112803
+            },
+            "commit_nanos": {
+              "p50": 7558366,
+              "p95": 7712042,
+              "maximum": 9399629
+            },
+            "total_nanos": {
+              "p50": 7651444,
+              "p95": 7816949,
+              "maximum": 9443732
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 22469,
+              "p95": 24116,
+              "maximum": 40054
+            },
+            "commit_nanos": {
+              "p50": 296082,
+              "p95": 316813,
+              "maximum": 339857
+            },
+            "total_nanos": {
+              "p50": 319104,
+              "p95": 342369,
+              "maximum": 364492
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 54199,
+              "p95": 58556,
+              "maximum": 70324
+            },
+            "commit_nanos": {
+              "p50": 6814677,
+              "p95": 7099903,
+              "maximum": 9174532
+            },
+            "total_nanos": {
+              "p50": 6873365,
+              "p95": 7159354,
+              "maximum": 9219695
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 42704,
+              "p95": 57846,
+              "maximum": 80980
+            },
+            "commit_nanos": {
+              "p50": 981235,
+              "p95": 1004080,
+              "maximum": 1120717
+            },
+            "total_nanos": {
+              "p50": 1026926,
+              "p95": 1048315,
+              "maximum": 1164322
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 100634,
+              "p95": 115228,
+              "maximum": 117463
+            },
+            "commit_nanos": {
+              "p50": 9166215,
+              "p95": 9328140,
+              "maximum": 19653870
+            },
+            "total_nanos": {
+              "p50": 9263235,
+              "p95": 9429319,
+              "maximum": 19735925
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 42722,
+              "p95": 52452,
+              "maximum": 80369
+            },
+            "commit_nanos": {
+              "p50": 802344,
+              "p95": 827095,
+              "maximum": 904638
+            },
+            "total_nanos": {
+              "p50": 848435,
+              "p95": 872503,
+              "maximum": 988452
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 102948,
+              "p95": 114878,
+              "maximum": 122831
+            },
+            "commit_nanos": {
+              "p50": 8678214,
+              "p95": 8907212,
+              "maximum": 19490356
+            },
+            "total_nanos": {
+              "p50": 8787797,
+              "p95": 9006861,
+              "maximum": 19572279
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 71365,
+              "p95": 85876,
+              "maximum": 241270
+            },
+            "commit_nanos": {
+              "p50": 1295983,
+              "p95": 1341697,
+              "maximum": 1372122
+            },
+            "total_nanos": {
+              "p50": 1369099,
+              "p95": 1414191,
+              "maximum": 1619692
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 142939,
+              "p95": 155212,
+              "maximum": 164192
+            },
+            "commit_nanos": {
+              "p50": 9679755,
+              "p95": 9981484,
+              "maximum": 4521482576
+            },
+            "total_nanos": {
+              "p50": 9827844,
+              "p95": 10138897,
+              "maximum": 4521592782
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 70675,
+              "p95": 84439,
+              "maximum": 103931
+            },
+            "commit_nanos": {
+              "p50": 1032528,
+              "p95": 1064709,
+              "maximum": 1162027
+            },
+            "total_nanos": {
+              "p50": 1104698,
+              "p95": 1138641,
+              "maximum": 1271687
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 141175,
+              "p95": 162551,
+              "maximum": 172251
+            },
+            "commit_nanos": {
+              "p50": 8966219,
+              "p95": 9420802,
+              "maximum": 4309129626
+            },
+            "total_nanos": {
+              "p50": 9109533,
+              "p95": 9566771,
+              "maximum": 4309251595
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "schema": "hyphae.native.search-document-lifecycle-scaling.v1",
+      "status": "observation-not-regression-gate",
+      "implementation_commit": "e5bac1a",
+      "profile": "release",
+      "rows": [
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 50745,
+              "p95": 53150,
+              "maximum": 67958
+            },
+            "commit_nanos": {
+              "p50": 669008,
+              "p95": 698421,
+              "maximum": 706650
+            },
+            "total_nanos": {
+              "p50": 721291,
+              "p95": 756249,
+              "maximum": 761184
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 98163,
+              "p95": 103175,
+              "maximum": 115421
+            },
+            "commit_nanos": {
+              "p50": 7564222,
+              "p95": 7709071,
+              "maximum": 9536998
+            },
+            "total_nanos": {
+              "p50": 7653823,
+              "p95": 7809834,
+              "maximum": 9579941
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 4
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 42,
+              "maximum": 42
+            },
+            "page_appends": {
+              "p50": 4,
+              "p95": 5,
+              "maximum": 5
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 22312,
+              "p95": 25374,
+              "maximum": 40745
+            },
+            "commit_nanos": {
+              "p50": 292806,
+              "p95": 317290,
+              "maximum": 327851
+            },
+            "total_nanos": {
+              "p50": 316656,
+              "p95": 341481,
+              "maximum": 353145
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 0,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 54013,
+              "p95": 58172,
+              "maximum": 70909
+            },
+            "commit_nanos": {
+              "p50": 6754565,
+              "p95": 7066501,
+              "maximum": 9024202
+            },
+            "total_nanos": {
+              "p50": 6809480,
+              "p95": 7121308,
+              "maximum": 9067304
+            },
+            "stage_page_reads": {
+              "p50": 2,
+              "p95": 2,
+              "maximum": 3
+            },
+            "commit_page_reads": {
+              "p50": 17,
+              "p95": 17,
+              "maximum": 17
+            },
+            "page_appends": {
+              "p50": 1,
+              "p95": 1,
+              "maximum": 1
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 42702,
+              "p95": 44324,
+              "maximum": 82102
+            },
+            "commit_nanos": {
+              "p50": 970436,
+              "p95": 1016564,
+              "maximum": 1043991
+            },
+            "total_nanos": {
+              "p50": 1015273,
+              "p95": 1063166,
+              "maximum": 1129151
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 101265,
+              "p95": 111782,
+              "maximum": 120009
+            },
+            "commit_nanos": {
+              "p50": 9172431,
+              "p95": 9656667,
+              "maximum": 20140985
+            },
+            "total_nanos": {
+              "p50": 9282802,
+              "p95": 9767214,
+              "maximum": 20227618
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 51,
+              "p95": 51,
+              "maximum": 51
+            },
+            "page_appends": {
+              "p50": 13,
+              "p95": 13,
+              "maximum": 14
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 43500,
+              "p95": 58611,
+              "maximum": 67655
+            },
+            "commit_nanos": {
+              "p50": 805384,
+              "p95": 831650,
+              "maximum": 886613
+            },
+            "total_nanos": {
+              "p50": 851762,
+              "p95": 878220,
+              "maximum": 957188
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 256,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 99617,
+              "p95": 114525,
+              "maximum": 121516
+            },
+            "commit_nanos": {
+              "p50": 8647754,
+              "p95": 8894845,
+              "maximum": 18967748
+            },
+            "total_nanos": {
+              "p50": 8751457,
+              "p95": 8995094,
+              "maximum": 19051710
+            },
+            "stage_page_reads": {
+              "p50": 4,
+              "p95": 4,
+              "maximum": 5
+            },
+            "commit_page_reads": {
+              "p50": 41,
+              "p95": 41,
+              "maximum": 41
+            },
+            "page_appends": {
+              "p50": 11,
+              "p95": 11,
+              "maximum": 11
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 71515,
+              "p95": 90360,
+              "maximum": 116438
+            },
+            "commit_nanos": {
+              "p50": 1299959,
+              "p95": 1344598,
+              "maximum": 1378697
+            },
+            "total_nanos": {
+              "p50": 1376053,
+              "p95": 1419379,
+              "maximum": 1607687
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "replace",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 141813,
+              "p95": 155822,
+              "maximum": 161651
+            },
+            "commit_nanos": {
+              "p50": 9670471,
+              "p95": 9790756,
+              "maximum": 4494957837
+            },
+            "total_nanos": {
+              "p50": 9817983,
+              "p95": 9931696,
+              "maximum": 4495069067
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 71,
+              "p95": 71,
+              "maximum": 71
+            },
+            "page_appends": {
+              "p50": 15,
+              "p95": 15,
+              "maximum": 17
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "memory",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 70715,
+              "p95": 85148,
+              "maximum": 128898
+            },
+            "commit_nanos": {
+              "p50": 1036610,
+              "p95": 1067805,
+              "maximum": 1107095
+            },
+            "total_nanos": {
+              "p50": 1109708,
+              "p95": 1140267,
+              "maximum": 1243628
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        },
+        {
+          "unrelated_documents": 4096,
+          "operation": "delete",
+          "durability": "strict",
+          "observations": 32,
+          "distributions": {
+            "stage_nanos": {
+              "p50": 141148,
+              "p95": 157520,
+              "maximum": 161028
+            },
+            "commit_nanos": {
+              "p50": 8960267,
+              "p95": 9111490,
+              "maximum": 4300085660
+            },
+            "total_nanos": {
+              "p50": 9109864,
+              "p95": 9276310,
+              "maximum": 4300198999
+            },
+            "stage_page_reads": {
+              "p50": 6,
+              "p95": 6,
+              "maximum": 7
+            },
+            "commit_page_reads": {
+              "p50": 56,
+              "p95": 56,
+              "maximum": 56
+            },
+            "page_appends": {
+              "p50": 12,
+              "p95": 12,
+              "maximum": 12
+            },
+            "wal_bytes_appended": {
+              "p50": 65536,
+              "p95": 65536,
+              "maximum": 65536
+            },
+            "full_state_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            },
+            "full_catalog_loads": {
+              "p50": 0,
+              "p95": 0,
+              "maximum": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "median_p50_by_configuration": [
+    {
+      "unrelated_documents": 0,
+      "operation": "replace",
+      "durability": "memory",
+      "stage_nanos": 50748,
+      "commit_nanos": 664189,
+      "total_nanos": 717336,
+      "stage_page_reads": 4,
+      "commit_page_reads": 41,
+      "page_appends": 4,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 0,
+      "operation": "replace",
+      "durability": "strict",
+      "stage_nanos": 99300,
+      "commit_nanos": 7564222,
+      "total_nanos": 7653823,
+      "stage_page_reads": 4,
+      "commit_page_reads": 41,
+      "page_appends": 4,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 0,
+      "operation": "delete",
+      "durability": "memory",
+      "stage_nanos": 22469,
+      "commit_nanos": 293642,
+      "total_nanos": 319104,
+      "stage_page_reads": 2,
+      "commit_page_reads": 17,
+      "page_appends": 1,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 0,
+      "operation": "delete",
+      "durability": "strict",
+      "stage_nanos": 54199,
+      "commit_nanos": 6754565,
+      "total_nanos": 6809480,
+      "stage_page_reads": 2,
+      "commit_page_reads": 17,
+      "page_appends": 1,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 256,
+      "operation": "replace",
+      "durability": "memory",
+      "stage_nanos": 42702,
+      "commit_nanos": 973559,
+      "total_nanos": 1018248,
+      "stage_page_reads": 4,
+      "commit_page_reads": 51,
+      "page_appends": 13,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 256,
+      "operation": "replace",
+      "durability": "strict",
+      "stage_nanos": 101265,
+      "commit_nanos": 9166215,
+      "total_nanos": 9263235,
+      "stage_page_reads": 4,
+      "commit_page_reads": 51,
+      "page_appends": 13,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 256,
+      "operation": "delete",
+      "durability": "memory",
+      "stage_nanos": 43176,
+      "commit_nanos": 805384,
+      "total_nanos": 851762,
+      "stage_page_reads": 4,
+      "commit_page_reads": 41,
+      "page_appends": 11,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 256,
+      "operation": "delete",
+      "durability": "strict",
+      "stage_nanos": 99617,
+      "commit_nanos": 8678214,
+      "total_nanos": 8787797,
+      "stage_page_reads": 4,
+      "commit_page_reads": 41,
+      "page_appends": 11,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 4096,
+      "operation": "replace",
+      "durability": "memory",
+      "stage_nanos": 71515,
+      "commit_nanos": 1295983,
+      "total_nanos": 1369099,
+      "stage_page_reads": 6,
+      "commit_page_reads": 71,
+      "page_appends": 15,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 4096,
+      "operation": "replace",
+      "durability": "strict",
+      "stage_nanos": 141813,
+      "commit_nanos": 9670471,
+      "total_nanos": 9817983,
+      "stage_page_reads": 6,
+      "commit_page_reads": 71,
+      "page_appends": 15,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 4096,
+      "operation": "delete",
+      "durability": "memory",
+      "stage_nanos": 70715,
+      "commit_nanos": 1033210,
+      "total_nanos": 1109708,
+      "stage_page_reads": 6,
+      "commit_page_reads": 56,
+      "page_appends": 12,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    },
+    {
+      "unrelated_documents": 4096,
+      "operation": "delete",
+      "durability": "strict",
+      "stage_nanos": 141175,
+      "commit_nanos": 8966219,
+      "total_nanos": 9109864,
+      "stage_page_reads": 6,
+      "commit_page_reads": 56,
+      "page_appends": 12,
+      "wal_bytes_appended": 65536,
+      "maximum_full_state_loads": 0,
+      "maximum_full_catalog_loads": 0
+    }
+  ],
+  "allocation_observation": {
+    "scope": "whole process including corpus construction and every measured configuration",
+    "per_operation_claim": false,
+    "total_runtime_seconds": 27.16,
+    "allocation_function_calls": 14991574,
+    "temporary_allocations": 720506,
+    "peak_heap_mib": 7.35,
+    "peak_rss_mib_including_profiler": 16.18,
+    "leaked_bytes_at_exit": 544
+  }
+}

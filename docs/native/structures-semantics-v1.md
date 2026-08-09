@@ -1,13 +1,18 @@
 # Native structure-engine semantics v1
 
-Status: normative target contract; binary scalar `SET`/`GET`, `DELETE`,
+Status: implemented structure contract retained by the closed G3 and G6
+gates. Binary scalar `SET`/`GET`, `DELETE`,
 independent `EXPIRE`, `NX`/`XX`, signed `INCRBY`, snapshot-time TTL, native
-hashes, sets, chunked-deque lists, multilevel B+tree persistence, direct
-buffered reads, large immutable blobs, and dual-index sorted sets are
+hashes, bounded native set member batches and scans, chunked-deque lists,
+absolute complete-set and complete-list TTL,
+multilevel B+tree persistence, direct buffered reads, large immutable blobs,
+dual-index sorted sets, bounded sorted-set score ranges, bidirectional
+sorted-set member ranks, and reverse sorted-set rank/score ranges are
 implemented in the convergence slice; the ordered durable scalar-expiry index
-and bounded cleanup are implemented; an engine-owned background timer,
-version-bearing responses, and the remaining structure families remain
-pending
+and bounded cleanup are
+implemented, together with engine-owned expiry scheduling, version-bearing
+responses, and the complete bounded Native command inventory. Controlled
+performance evidence remains open under G7.
 
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
@@ -44,7 +49,8 @@ conversion.
 
 The implemented families are binary scalars, canonical signed-decimal
 counters, explicitly created binary hash/maps, exact binary sets, and
-chunked-deque lists. Sorted sets, streams, bitmaps, sketches, geo indexes, and
+chunked-deque lists, plus dual-index sorted sets with bidirectional member-rank
+lookup and bounded score ranges. Streams, bitmaps, sketches, geo indexes, and
 typed registers remain targets.
 
 ## First vertical operations
@@ -57,16 +63,29 @@ EXPIRE(key, expires_at)
 TTL(key)
 INCRBY(key, signed_delta)
 CREATE_HASH(key)
+DELETE_HASH(key)
+EXPIRE_HASH(key, expires_at)
+TTL_HASH(key)
 HSET(key, field, value)
 HGET(key, field)
 HDELETE(key, field)
 HLEN(key)
+HSCAN(key, start_after, limit)
 CREATE_SET(key)
+EXPIRE_SET(key, expires_at)
+TTL_SET(key)
 SADD(key, member)
+SADD_MANY(key, members)
 SISMEMBER(key, member)
+SMISMEMBER(key, members)
 SREM(key, member)
+SREM_MANY(key, members)
 SCARD(key)
+SSCAN(key, start_after, limit)
 CREATE_LIST(key)
+DELETE_LIST(key)
+EXPIRE_LIST(key, expires_at)
+TTL_LIST(key)
 LPUSH(key, value)
 RPUSH(key, value)
 LPOP(key)
@@ -79,6 +98,9 @@ ZSCORE(key, member)
 ZREM(key, member)
 ZCARD(key)
 ZRANGE(key, start, stop)
+ZRANGE_BY_SCORE(key, lower, upper, offset, limit)
+ZREVRANGE(key, start, stop)
+ZREVRANGE_BY_SCORE(key, lower, upper, offset, limit)
 EXPIRE_DUE(logical_time, max_keys)
 ```
 
@@ -103,27 +125,138 @@ whitespace, a leading plus, redundant leading zeroes, `-0`, non-UTF-8 bytes,
 and out-of-range input fail as non-integers. Arithmetic overflow is a separate
 error. Either failure adds no mutation.
 
-`CREATE_HASH` establishes the key's family before field mutation. `HSET`
-returns added versus updated, `HGET` reads one field, `HDELETE` publishes a
-field tombstone, and `HLEN` reads durable cardinality. An empty hash remains a
-typed hash after its last field is deleted; whole-hash delete/recreate is not
-implemented yet.
+`CREATE_HASH` establishes the key's family before field mutation.
+`DELETE_HASH` returns false without a mutation for a missing key, fails with a
+kind error for another live structure family, and otherwise retires the
+complete hash. `HSET` returns added versus updated, `HGET` reads one field,
+`HDELETE` publishes a field tombstone, and `HLEN` reads durable cardinality.
+`EXPIRE_HASH` applies one absolute expiry to the complete hash and
+`TTL_HASH` evaluates it against deterministic logical time. Missing or already
+expired hashes return false from `EXPIRE_HASH`; due hashes are absent to every
+hash operation before physical cleanup.
+
+`HGET_MANY` preserves caller positions and duplicate reads. `HSET_MANY` and
+`HDELETE_MANY` reject duplicate exact fields, sort accepted fields into
+canonical mutation order, and return added or deleted field counts.
+`HINCRBY` applies checked `i64` arithmetic to canonical signed-decimal field
+bytes and starts a missing field at zero. These bounded operations validate
+all inputs before changing private state, preserve whole-hash expiry, and use
+the existing field WAL mutations and conflict identities. Their complete
+contract is [Native hash field commands v1](native-hash-field-commands-v1.md).
+
+`HSCAN` returns at most `limit` live field/value pairs in ascending exact
+field-byte order. `start_after` is an optional exclusive field cursor, not an
+opaque server token: the caller resumes with the last returned field. `None`
+starts at the first field, while `Some(empty)` resumes after a real empty
+field. A cursor does not need to remain live; its bytes still define the
+exclusive lower bound. A zero limit validates the key kind and hash existence
+before returning an empty result.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+execution must return identical entries for the same visible state. The
+physical route maps `start_after` directly into the hash-field B+tree
+namespace, skips field tombstones without charging the limit, and stops after
+the requested number of live entries. It must not materialize the complete
+hash. A reached malformed identity, field envelope, expiry, or blob fails the
+complete call rather than returning a partial result. Pattern matching,
+reverse iteration, and whole-hash materialization are outside this first
+bounded scan contract.
+
+This bounded `HSCAN` contract is implemented across private, retained,
+current-root, and reopened execution. Its red/green and physical-pruning
+evidence are tracked separately from this normative file. Whole-hash
+lifecycle, conflict-fence, crash, compaction, and separated durability-latency
+evidence are bound in the
+[native hash-lifecycle receipt](../gates/evidence/native-hash-lifecycle-linux-2026-08-02.md).
+
+`HSCAN_REVERSE` is the descending counterpart. `start_before` is an optional
+exclusive exact-field cursor, `None` starts at the greatest field, and
+`Some(empty)` has no lower field to return. The physical route maps that cursor
+to an exclusive upper B+tree bound and uses the native reverse visitor; it
+cannot implement descending output by materializing and reversing an
+ascending scan. Its complete contract is
+[Native reverse hash scan v1](native-hash-reverse-scan-v1.md).
+
+`HSCAN_MATCH` adds binary-glob filtering with separate returned-match,
+physical-visit, and matcher-step bounds. Its continuation is the last visited
+field, including a nonmatch or tombstone when necessary, so an empty
+non-exhausted page still makes forward progress. The physical route derives a
+leading literal prefix for B+tree pruning and falls back to a bounded hash
+prefix scan only for leading-wildcard patterns. Its complete contract is
+[Native hash pattern scan v1](native-hash-pattern-scan-v1.md).
+
+Independent absolute field expiry is specified in
+[Native hash field TTL v1](native-hash-field-ttl-v1.md). It uses one
+collision-free field-expiry namespace, field-granular WAL/conflict semantics,
+logical visibility across every hash read surface, and combined active
+cleanup. Its implementation, failure-boundary, equivalence, and direct-Linux
+latency evidence are bound in the
+[native hash field TTL receipt](../gates/evidence/native-hash-field-ttl-linux-2026-08-03.md).
+
+An empty hash remains a typed hash after its last field is deleted.
+`DELETE_HASH` is the explicit family-lifecycle boundary: the deleted hash and
+all of its fields become absent at one CSN while retained snapshots preserve
+their earlier view. The same transaction may recreate the key as an empty
+hash or another structure kind after deletion. Recreating a hash never exposes
+fields from the retired incarnation.
+
+Whole-hash expiry is the automatic equivalent lifecycle boundary. A
+transaction may reuse a due hash key as a scalar or explicitly created
+collection; it first records logical whole-hash cleanup so metadata, all
+fields, and the old expiry entry retire in the same publication as the new
+family. Retained snapshots before the boundary preserve the older incarnation.
 
 Scalar mutation of a hash key fails with a kind error. Concurrent scalar
 creation and hash creation over the same absent key conflict. Once the hash
 exists, different field identities can prepare and commit independently;
-same-field writers retain first-committer-wins semantics.
+same-field writers retain first-committer-wins semantics. Every field mutation
+also validates, but does not publish, the hash lifecycle fence observed by its
+snapshot. Hash creation and whole-hash deletion publish that fence. Therefore
+a field writer prepared before an admitted deletion cannot resurrect the
+retired hash, while disjoint fields in one live incarnation remain
+independently committable. If a field mutation commits first, a later
+whole-hash deletion rebases over and retires that admitted field as part of the
+same logical hash.
 
 `CREATE_SET` establishes a binary set before member mutation. `SADD` returns
 true only when it adds a missing member, `SISMEMBER` reports exact membership,
 `SREM` returns true only when it removes a live member, and `SCARD` reads the
 durable exact cardinality. An empty set remains typed after its last member is
-removed; whole-set deletion and per-member TTL are outside this slice.
+removed; public manual whole-set deletion and per-member TTL are outside this
+slice.
 
 Scalar, hash, and set kinds are mutually exclusive for one user key.
 Concurrent creation of different kinds over the same absent key conflicts.
 Once a set exists, different member identities can prepare and commit
 independently; same-member writers retain first-committer-wins semantics.
+
+The read-only algebra extension is frozen separately in
+[Native set algebra v1](native-set-algebra-v1.md). It defines bounded
+exact-byte union, intersection, and ordered difference without a sidecar,
+serialized compatibility protocol, write opcode, or destination-set mutation.
+Its private-batch, retained-snapshot, current-root physical, restart,
+corruption, and direct-Linux latency evidence is recorded in the
+[native set algebra receipt](../gates/evidence/native-set-algebra-linux-2026-08-03.md).
+
+The [native whole-set TTL v1](native-set-ttl-v1.md) contract freezes absolute
+complete-set expiry, explicit logical-time reads, lifecycle conflicts,
+due-incarnation reuse, WAL opcodes `EXPIRE_SET=33` and internal
+`DELETE_SET=34`, `HYSETM02` metadata, the top-level expiry marker `3`, shared
+active cleanup, corruption boundaries, and evidence requirements. The
+[direct-Linux evidence](../gates/evidence/native-set-ttl-linux-2026-08-03.md)
+binds the implementation, group durability, all seven cleanup crash
+boundaries, compaction, page vacuum, and separated latency to exact source.
+
+Bounded multi-member additions, removals, positional membership reads, and
+ascending exact-byte scans are specified in
+[Native set member commands v1](native-set-commands-v1.md). Mutation batches
+reject duplicates and use canonical member order, reads retain duplicate
+caller positions, and scans map exclusive cursors directly into the native
+member B+tree namespace. The
+[direct-Linux evidence](../gates/evidence/native-set-commands-linux-2026-08-03.md)
+binds failure atomicity, TTL preservation, per-member conflicts, all seven
+singleton crash boundaries, a randomized ordered model, multilevel pruning,
+reached-corruption rejection, and separated latency to exact source.
 
 `CREATE_LIST` establishes a binary chunked deque before element mutation.
 `LPUSH` and `RPUSH` insert one exact binary value and return the new length.
@@ -136,8 +269,21 @@ empty or inverted normalized interval returns an empty result.
 An empty list remains typed. Scalar, hash, set, and list kinds are mutually
 exclusive for one user key. Every list mutation conflicts on the complete
 list identity in this version; concurrent end operations do not silently
-commute. Whole-list deletion, list TTL, blocking pop, insertion by index,
-trimming, moving between lists, and element mutation remain pending.
+commute.
+
+The [native whole-list lifecycle v1](native-list-lifecycle-v1.md) contract
+freezes complete deletion and typed same-transaction recreation with additive
+WAL opcode `DELETE_LIST=35`. The
+[native whole-list TTL v1](native-list-ttl-v1.md) contract freezes absolute
+complete-list expiry, explicit logical-time reads, due-incarnation reuse,
+additive WAL opcode `EXPIRE_LIST=36`, `HYLSTM02` metadata, top-level expiry
+marker `4`, shared cleanup, corruption boundaries, and direct-Linux evidence
+requirements. The
+[direct-Linux evidence](../gates/evidence/native-list-ttl-linux-2026-08-03.md)
+binds the implementation, Group durability, all seven cleanup crash
+boundaries, compaction, page vacuum, blob collection, and repeated matched
+latency controls to exact source. Blocking pop, insertion by index, trimming,
+moving between lists, and element mutation remain pending.
 
 `CREATE_SORTED_SET` establishes a typed binary sorted set before member
 mutation. `ZADD` adds a member or replaces its score and reports added,
@@ -146,6 +292,67 @@ updated, or unchanged. `ZSCORE` returns the exact canonical score for a member,
 cardinality. `ZRANGE` uses the same signed, inclusive rank interval as
 `LRANGE`; results are ascending by score with exact member bytes as the
 deterministic tie-breaker.
+
+`ZRANGE_BY_SCORE` accepts independently inclusive, exclusive, or unbounded
+minimum and maximum scores plus a nonnegative `offset` and `limit`. Results
+remain ascending by score and exact member bytes. Offset counts only live
+members inside the score interval, and execution returns at most `limit`
+members. A zero limit still validates the sorted-set kind, existence, and
+both score bounds before returning an empty result. Equal inclusive endpoints
+select that exact score; every other equal-endpoint combination, or a lower
+endpoint greater than the upper endpoint, returns an empty result.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+execution have identical results. Current-root execution maps the canonical
+score bounds directly onto the ordered `0x0a` B+tree namespace, prunes
+nonintersecting subtrees, ignores tombstones without charging offset, and
+stops after the requested live result count. It does not materialize the
+complete sorted set. Malformed ordered identities, scores, or live markers
+fail the complete call rather than returning a partial result.
+
+`ZREVRANGE` applies the same signed, inclusive `start` and `stop` rules to the
+descending score/member sequence. Negative indexes count back from the tail of
+that descending sequence. Reversing the result reverses the complete total
+order, including exact member-byte order between equal scores.
+
+`ZREVRANGE_BY_SCORE` accepts the same canonical lower and upper score bounds
+as `ZRANGE_BY_SCORE`; output direction never changes which argument is the
+lower or upper bound. It filters that interval, traverses matching live
+members in descending score/member order, applies `offset` in that descending
+order, and returns at most `limit` entries. Empty, inverted, equal-endpoint,
+zero-limit, infinity, and `NaN` behavior is identical to the ascending
+operation before output direction is considered.
+
+Private-transaction, retained-snapshot, current-root physical, and reopened
+reverse execution must be identical. The physical rank route starts at the
+ordered prefix tail and stops after the last requested descending live rank.
+The physical score route applies the canonical score bounds to the same
+ordered namespace and visits only that bounded interval in reverse. Both
+ignore tombstones without charging rank or offset and stop without
+materializing the complete sorted set. Malformed metadata, identities, scores,
+or live markers fail the complete call rather than returning a partial result.
+
+These two reverse-range operations are implemented across the private,
+snapshot, current-root, and reopened read surfaces. Their release evidence is
+tracked separately from this normative contract.
+
+`ZRANK` returns a live member's zero-based position in that exact ascending
+score/member order. `ZREVRANK` returns its zero-based position after reversing
+the complete total order, so equal-score members also reverse their bytewise
+order. A missing member returns no rank; a missing sorted set or another
+structure kind remains a typed error. Private transaction, retained snapshot,
+current-root physical, and reopened execution have identical results.
+
+Current-root rank lookup validates metadata and resolves the member's
+canonical score through the membership index before targeting its exact
+ordered identity. `ZRANK` walks the ordered `0x0a` namespace ascending through
+that target; `ZREVRANK` walks it descending through the target. Both ignore
+tombstones without charging rank, stop when the live target is found, and do
+not materialize the complete sorted set. A missing or non-live target ordered
+entry, visited live target under a conflicting score, malformed visited
+identity, score, or marker, or a live rank reaching the declared cardinality
+fails the complete call. This first lookup contract does not add subtree live
+counts; order-statistic acceleration remains open.
 
 Scores use finite or infinite IEEE 754 binary64 values except `NaN`, which is
 rejected before mutation. Negative zero is normalized to positive zero. These
@@ -164,7 +371,7 @@ B+tree:
 |---:|---|---|
 | `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + arbitrary binary user key | canonical `HYSTRV01` value |
-| `0x02` | prefix + binary hash key | canonical `HYHSHM01` metadata |
+| `0x02` | prefix + binary hash key | canonical `HYHSHM01` or `HYHSHM02` metadata |
 | `0x03` | prefix + hash-field identity | canonical persistent `HYSTRV01` value |
 | `0x04` | prefix + binary set key | canonical `HYSETM01` metadata |
 | `0x05` | prefix + set-member identity | canonical empty persistent `HYSTRV01` value |
@@ -173,7 +380,8 @@ B+tree:
 | `0x08` | prefix + binary sorted-set key | canonical `HYZSTM01` metadata |
 | `0x09` | prefix + sorted-set-member identity | canonical `HYZSCR01` score or structure tombstone |
 | `0x0a` | prefix + sorted-set key + sortable score + member | canonical empty persistent `HYSTRV01` value or structure tombstone |
-| `0x0b` | prefix + sortable expiry + binary scalar key | one-byte live marker or tombstone |
+| `0x0b` | prefix + sortable expiry + binary structure key | typed one-byte live marker or tombstone |
+| `0x0c` | prefix + sortable expiry + compound hash-field identity | one-byte live field-expiry marker or tombstone |
 
 The exact value envelope is:
 
@@ -195,7 +403,7 @@ The only canonical tombstone has flags exactly `0x02`, inline storage, zero
 reserved and expiry bytes, and an empty payload. Any flag combination or
 payload on a tombstone fails closed.
 
-Logical expiry is independent from physical cleanup. The optional
+Scalar and whole-hash logical expiry are independent from physical cleanup. The optional
 [native active-expiry scheduler](active-expiry-scheduler-v1.md) visits the
 ordered expiry namespace through the single native writer and commits bounded
 tombstone transactions without making the timer a visibility authority.
@@ -207,24 +415,50 @@ materializing the complete structure state, then decode only the selected
 envelope and blob. Recovery scans and validates the complete reachable
 namespace while omitting tombstones from materialized state.
 
-The exact hash metadata is 16 bytes:
+Persistent hash metadata remains the exact 16-byte `HYHSHM01` encoding:
 
 | Offset | Width | Field |
 |---:|---:|---|
 | 0 | 8 | ASCII magic `HYHSHM01` |
 | 8 | 8 | unsigned little-endian live field count |
 
+Expiring hashes use the exact 24-byte `HYHSHM02` encoding:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `HYHSHM02` |
+| 8 | 8 | unsigned little-endian live field count |
+| 16 | 8 | signed little-endian absolute expiry |
+
+The distinct magic is the expiry-presence bit, so every signed timestamp
+round-trips without a sentinel collision. The `0x0b` marker is `0x00` for a
+tombstone, `0x01` for a live scalar expiry, or `0x02` for a live whole-hash
+expiry. Recovery validates an exact one-to-one typed match.
+
 A hash-field identity is `u32` big-endian hash-key length, the hash-key bytes,
 and the remaining field bytes. The physical key prepends `0x03`. This encoding
 is unambiguous for empty or arbitrary binary keys and fields and keeps fields
 clustered by hash-key length/key/field order.
 
-Each field uses the same inline/blob `HYSTRV01` envelope but cannot carry an
-independent expiry in this version. A field delete stores the same canonical
+Each currently implemented field uses the same inline/blob `HYSTRV01` envelope
+without independent expiry; the family metadata carries the whole-hash
+expiry. The frozen field-TTL extension reuses the envelope's expiry flag but
+requires separate WAL, index, visibility, cleanup, and recovery evidence
+before it becomes available. A field delete stores the same canonical
 tombstone as a scalar delete. Recovery requires every field to have prior hash
 metadata and requires metadata cardinality to equal the exact number of live
 field envelopes. Orphan fields, malformed identities, expiry-bearing fields,
 and count mismatches fail closed.
+
+Whole-hash deletion writes canonical `HYSTRV01` tombstones over every live
+field path, the hash metadata path, and any live whole-hash expiry path through
+one copy-on-write B+tree batch.
+The WAL carries only the logical hash key; page construction enumerates the
+admitted current-root field prefix after conflict validation. Recovery accepts
+field tombstones under retired metadata, rejects live orphan fields, and
+omits the retired family from materialized state. Recreation upserts live
+metadata over the metadata tombstone while the retired field tombstones remain
+non-visible until individually replaced.
 
 The exact set metadata is 16 bytes: ASCII magic `HYSETM01` followed by the
 unsigned little-endian live member count. A set-member identity uses the same
@@ -324,6 +558,14 @@ different fields rebase onto the admitted current root without losing the
 metadata count, while same-field updates conflict. Physical `HSET`/`HDELETE`
 rewrite the field path and the 16-byte metadata path; they never serialize the
 complete hash as one value.
+
+`CREATE_HASH`, `DELETE_HASH`, and `EXPIRE_HASH` publish the scalar/collection ownership
+identity as the hash lifecycle fence. `HSET` and `HDELETE` validate that
+identity in addition to their field write key but publish only the field key.
+This separates incarnation safety from field-level write admission.
+`DELETE_HASH` physically scans and tombstones the admitted hash prefix, so its
+cost is linear in retained physical field paths even though its WAL body is
+bounded.
 
 Set member write keys use the canonical set-member identity. Therefore
 different members rebase onto the admitted current root without losing the
@@ -475,6 +717,13 @@ structure, restart equivalence, multi-key atomicity, write conflicts,
 controlled-clock TTL tests, expiry-index reconstruction, bounded cleanup,
 blocking cancellation, memory-amplification receipts, eviction safety, and
 cross-engine transactions.
+
+The G3 readiness profile closes only the structure-engine obligations in this
+list. Cross-engine transactions are G5 convergence evidence. Relation-valued
+iterators, blocking product surfaces, eviction telemetry, and cancellation are
+G6 product evidence unless a structure command introduced before G6 depends on
+them. G3 still requires fail-closed non-claims for those surfaces and may not
+represent their absence as implemented behavior.
 
 Current experimental tests cover a 2,048-key multilevel tree, historical roots,
 direct TTL and expiry reads, canonical tombstones, `NX`/`XX`, racing `NX`

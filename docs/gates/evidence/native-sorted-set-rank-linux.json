@@ -1,0 +1,29 @@
+{
+  "schema": "hyphae-native-sorted-set-rank-smoke-v1",
+  "status": "observation-not-gate",
+  "source_commit": "63290be966a17882d7cf5fa33c73621242c8cada",
+  "source_tree": "02c79247d167c4210de1a33f65cf2b2e26d54ab0",
+  "source_branch": "codex/native-sorted-set-ranks",
+  "environment": "aws-m6i.2xlarge-ubuntu-24.04.4-linux-6.17.0-1019-aws-ext4-ebs",
+  "profile": "release",
+  "durability": "strict-seed-and-reopen",
+  "cpu_affinity": "logical-cpu-2",
+  "warm_state": true,
+  "concurrency": 1,
+  "position_sensitive": true,
+  "mode": "release-warm-concurrency-1",
+  "observations": 10000,
+  "warmup": 1000,
+  "members": 2048,
+  "member_bytes": 64,
+  "dataset_blake3": "b9dd892604bceb9c03720bf0f0322a1b18148ae3cc6cbf4c8d988697da2b71ab",
+  "structure_tree_height": 2,
+  "metrics": {
+    "zrank_head_physical": {"p50_nanos": 15306, "p95_nanos": 15612, "p99_nanos": 25301, "p999_nanos": 30729, "max_nanos": 45740, "throughput_per_second": 64197.885},
+    "zrevrank_tail_physical": {"p50_nanos": 10606, "p95_nanos": 10891, "p99_nanos": 19749, "p999_nanos": 22434, "max_nanos": 27461, "throughput_per_second": 92623.733},
+    "zrank_middle_physical": {"p50_nanos": 155005, "p95_nanos": 165874, "p99_nanos": 168376, "p999_nanos": 187309, "max_nanos": 316489, "throughput_per_second": 6372.970},
+    "zrevrank_middle_physical": {"p50_nanos": 134728, "p95_nanos": 145532, "p99_nanos": 148821, "p999_nanos": 174851, "max_nanos": 270969, "throughput_per_second": 7323.389},
+    "zrank_tail_physical": {"p50_nanos": 287051, "p95_nanos": 302590, "p99_nanos": 316357, "p999_nanos": 571530, "max_nanos": 639976, "throughput_per_second": 3435.637},
+    "zrevrank_head_physical": {"p50_nanos": 273731, "p95_nanos": 287972, "p99_nanos": 296506, "p999_nanos": 415874, "max_nanos": 608279, "throughput_per_second": 3607.975}
+  }
+}

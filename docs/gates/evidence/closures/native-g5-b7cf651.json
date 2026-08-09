@@ -1,0 +1,32 @@
+{
+  "schema": "hyphae-native-g5-closure-v1",
+  "gate": "G5",
+  "status": "passed",
+  "source_commit": "b7cf651229802f35d39d61d61965f469c9200ac1",
+  "workflow_run": 31052566797,
+  "scope": "bounded-cross-engine-convergence",
+  "production_scale": false,
+  "performance_gate_claimed": false,
+  "predecessors_required": 3,
+  "predecessors_passed": 3,
+  "required": 8,
+  "passed": 8,
+  "requirements": [
+    "all-engine-atomicity",
+    "concurrent-readers",
+    "stable-ids-and-links",
+    "structure-source",
+    "search-source",
+    "joins-aggregates-pushdown",
+    "checkpoint-complete-state",
+    "backup-restore"
+  ],
+  "artifact": "native-g5-closure-b7cf651229802f35d39d61d61965f469c9200ac1",
+  "non_claims": [
+    "universal federated SQL",
+    "distributed transactions",
+    "online or incremental backup",
+    "production-scale performance",
+    "G6 through G8 closure"
+  ]
+}

@@ -364,6 +364,7 @@ pub struct PageStore {
     file: File,
     generation: PageGeneration,
     next_page_id: u64,
+    physical_reads: AtomicU64,
     poisoned: bool,
 }
 
@@ -395,6 +396,7 @@ impl PageStore {
             file,
             generation,
             next_page_id: 1,
+            physical_reads: AtomicU64::new(0),
             poisoned: false,
         })
     }
@@ -430,6 +432,7 @@ impl PageStore {
             file,
             generation,
             next_page_id,
+            physical_reads: AtomicU64::new(0),
             poisoned: false,
         })
     }
@@ -472,6 +475,7 @@ impl PageStore {
                 file,
                 generation,
                 next_page_id,
+                physical_reads: AtomicU64::new(0),
                 poisoned: false,
             },
             truncated_tail_bytes,
@@ -486,6 +490,11 @@ impl PageStore {
     /// Returns this immutable page-file generation.
     pub const fn generation(&self) -> PageGeneration {
         self.generation
+    }
+
+    /// Returns physical page reads issued by this open store handle.
+    pub fn physical_read_count(&self) -> u64 {
+        self.physical_reads.load(Ordering::Relaxed)
     }
 
     /// Appends one unpublished or committed copy-on-write page.
@@ -532,6 +541,7 @@ impl PageStore {
             .checked_sub(1)
             .and_then(|slot| slot.checked_mul(PAGE_SIZE_U64))
             .ok_or(PageStoreError::PageIdExhausted)?;
+        self.physical_reads.fetch_add(1, Ordering::Relaxed);
         let mut bytes = vec![0_u8; PAGE_SIZE];
         read_exact_at(&self.file, &mut bytes, offset)?;
         Ok(Page::decode(id, &bytes)?)

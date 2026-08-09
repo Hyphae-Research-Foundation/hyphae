@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-g5-workload-manifest-v1",
+  "gate": "G5",
+  "workloads": [
+    {"id": "three-engine-commit", "requirement": "all-engine-atomicity", "kind": "integration", "oracle": "one visible CSN and exact reopen"},
+    {"id": "reader-snapshots", "requirement": "concurrent-readers", "kind": "isolation", "oracle": "repeatable snapshots without dirty reads or phantoms"},
+    {"id": "identity-links", "requirement": "stable-ids-and-links", "kind": "identity", "oracle": "stable catalog and search identities"},
+    {"id": "structure-relation", "requirement": "structure-source", "kind": "source", "oracle": "native structure lifecycle and typed SQL binding"},
+    {"id": "search-relation", "requirement": "search-source", "kind": "source", "oracle": "same-snapshot stable-ID search and typed SQL binding"},
+    {"id": "cross-operator-plan", "requirement": "joins-aggregates-pushdown", "kind": "operator", "oracle": "reference joins and pre-limit aggregation"},
+    {"id": "complete-checkpoint", "requirement": "checkpoint-complete-state", "kind": "durability", "oracle": "immutable all-engine checkpoint and boundary recovery"},
+    {"id": "complete-restore", "requirement": "backup-restore", "kind": "durability", "oracle": "offline verified backup restore"}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

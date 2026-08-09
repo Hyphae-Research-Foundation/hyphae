@@ -1,0 +1,127 @@
+name: Native G2 Bounded Closure Evidence
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: native-g2-complete-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  complete:
+    name: G2 bounded relational closure evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.96.0"
+
+      - name: Execute G2 suites and build receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          mkdir -p g2-logs g2-receipts g2-audits
+          run_suite() {
+            name="$1"
+            shift
+            cargo test -p hyphae-native-runtime --locked "$@" 2>&1 | tee "g2-logs/$name.log"
+          }
+
+          run_suite ddl --test sql_check_constraints_g2 --test sql_foreign_keys_g2 --test sql_drop_index_g2 --test sql_drop_table_g2 --test sql_alter_table_g2
+          run_suite isolation --test sql_isolation_g2
+          run_suite relational --test sql_cte --test sql_window_functions
+          run_suite prepared --test local_sql_select
+          run_suite sqllogictest --test sqllogictest_g2
+          run_suite metamorphic --test sql_metamorphic_g2 --test sql_metamorphic_generated_g2
+          run_suite tpch --test tpch_correctness_g2 --test tpch_corpus_g2
+          run_suite tpcc --test tpcc_loader_g2 --test tpcc_acid_g2
+
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          paths = sorted(Path("crates/hyphae-native-runtime/tests").rglob("*"))
+          data = b"".join(p.as_posix().encode() + b"\0" + p.read_bytes() for p in paths if p.is_file())
+          Path("g2-corpus.sha256").write_text(hashlib.sha256(data).hexdigest() + "\n")
+          PY
+          DIGEST="$(cat g2-corpus.sha256)"
+
+          declare -A logs=(
+            [native-ddl-dml-and-constraints]=ddl
+            [transactions-and-isolation]=isolation
+            [indexes-joins-ctes-windows]=relational
+            [prepared-plans-and-explain]=prepared
+            [sqllogictest-conformance]=sqllogictest
+            [metamorphic-sql-equivalence]=metamorphic
+            [tpch-correctness]=tpch
+            [tpcc-acid]=tpcc
+          )
+          cp config/native-g2-readiness-evidence.json g2-evidence.json
+          for requirement in "${!logs[@]}"; do
+            name="${logs[$requirement]}"
+            PYTHONPATH=. python tools/produce_native_g2_receipt.py \
+              --source-commit "$SHA" --requirement "$requirement" \
+              --suite-log "$name" "g2-logs/$name.log" \
+              --corpus-sha256 "$DIGEST" \
+              --output "g2-receipts/$requirement.json"
+            PYTHONPATH=. python tools/check_native_g2_receipts.py \
+              --receipt "g2-receipts/$requirement.json" \
+              --expected-commit "$SHA" --expected-requirement "$requirement" \
+              --output "g2-audits/$requirement.json"
+            PYTHONPATH=. python tools/inject_native_g2_evidence.py \
+              --baseline g2-evidence.json --requirement "$requirement" \
+              --reference "g2-audits/$requirement.json" \
+              --expected-commit "$SHA" --output g2-evidence-next.json
+            mv g2-evidence-next.json g2-evidence.json
+          done
+          PYTHONPATH=. python tools/check_native_g2_readiness.py \
+            --profile config/native-g2-readiness-profile.json \
+            --evidence g2-evidence.json --output native-g2-readiness.json
+          python - <<'PY'
+          import json
+          r = json.load(open("native-g2-readiness.json"))
+          assert r["gate"] == "G2"
+          assert r["status"] == "passed"
+          assert r["required"] == 8
+          assert r["passed"] == 8
+          assert r["requirements"] == [
+              {"id": "native-ddl-dml-and-constraints", "required_evidence": "hosted", "status": "passed"},
+              {"id": "transactions-and-isolation", "required_evidence": "hosted", "status": "passed"},
+              {"id": "indexes-joins-ctes-windows", "required_evidence": "hosted", "status": "passed"},
+              {"id": "prepared-plans-and-explain", "required_evidence": "hosted", "status": "passed"},
+              {"id": "sqllogictest-conformance", "required_evidence": "hosted", "status": "passed"},
+              {"id": "metamorphic-sql-equivalence", "required_evidence": "hosted", "status": "passed"},
+              {"id": "tpch-correctness", "required_evidence": "hosted", "status": "passed"},
+              {"id": "tpcc-acid", "required_evidence": "hosted", "status": "passed"},
+          ]
+          PY
+
+      - name: Validate evidence tools
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_produce_native_g2_receipt \
+            tools.test_check_native_g2_receipts \
+            tools.test_inject_native_g2_evidence \
+            tools.test_check_native_g2_readiness -v
+
+      - name: Upload exact-SHA G2 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g2-bounded-closure-evidence
+          path: |
+            g2-receipts/
+            g2-audits/
+            g2-evidence.json
+            g2-corpus.sha256
+            native-g2-readiness.json
+          if-no-files-found: error

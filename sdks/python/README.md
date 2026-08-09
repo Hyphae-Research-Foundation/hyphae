@@ -1,9 +1,9 @@
 # Python SDK
 
-`hyphae-sdk` is the synchronous, bounded Python client for API v1. It requires
+`hyphae-sdk` is the synchronous, bounded Python client for APIs v1 and Native v2. It requires
 Python 3.11 or newer, uses only the standard library at runtime, and includes
-typed generated models plus a `py.typed` marker. The source package version is
-`0.2.1`; this guide does not claim PyPI publication without a separate
+typed generated models plus a `py.typed` marker. The development source package version is
+`1.0.0`; this guide does not claim PyPI publication without a separate
 registry release and receipt.
 
 ## Test from this repository
@@ -68,3 +68,13 @@ proof.
 See [public client semantics](../../docs/clients/v1.md),
 [data model](../../docs/concepts/data-model.md), and
 [error codes](../../docs/api/error-codes-v1.md).
+
+## Native v2
+
+`hyphae_sdk.v2.HyphaeClient` exposes one capabilities, catalog, SQL,
+structure, search, administration, telemetry, doctor, backup, transaction
+status, and proof-verification API over either `HyphaeClient.local(endpoint)`
+or `HyphaeClient.http(origin)`. Local uses exact `HYPHLCL1` bytes over AF_UNIX
+or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
+`/v2/execute`. Both reconstruct `ProductError` typed fields and accept
+`RequestOptions` deadlines and cancellation.

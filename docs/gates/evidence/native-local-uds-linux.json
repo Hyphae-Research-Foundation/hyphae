@@ -1,0 +1,157 @@
+{
+  "schema": "hyphae.native.local-uds-evidence.v1",
+  "status": "observation-not-gate",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-uds",
+  "contract_commit": "caf4ed34f976f8917426f3c1f5bd016110e339ea",
+  "implementation_commit": "6e799e569a3f8b12b82e9ec2a5dda92f81892a6d",
+  "source_commit": "ba8a2a554e7f34f2a091a80c4e481bd1afa12579",
+  "source_tree": "faab7aa72005a03494b33a4d3931ccdad52bebdd",
+  "verification_commit": "c042af5b028a77c448985a7dd8d49e266f809322",
+  "verification_tree": "7201f0fdfb7c1f4e590709bf9e02debe2a539968",
+  "harness": "crates/hyphae-native-runtime/examples/uds_ping_smoke.rs",
+  "harness_sha256": "1e75b6cb8e610eb3df79bd9f553b92becca98a1c96588f9826c1e95d1c226113",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_uds_transport --no-run",
+    "expected_result": "E0432 unresolved imports for the four frozen public transport types",
+    "log_sha256": "c1f565cd863033d021d7af4a0978ec627533731409000e97a9ee9a9368823213"
+  },
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "memory_gib": 30,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [2, 3],
+    "cpu_governor": "unavailable"
+  },
+  "workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "socket_mode": "0600",
+    "maximum_payload_bytes": 64,
+    "ping_payload_bytes": 32,
+    "handshake_observations": 256,
+    "ping_observations": 100000,
+    "ping_warmup": 10000
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "a96e1f35662a08dd2c9aa507f565327b5341846454226b46407ca9c229c6363b",
+      "connect_handshake_close": {
+        "p50_nanos": 35095,
+        "p95_nanos": 55460,
+        "p99_nanos": 60715,
+        "p999_nanos": 68755,
+        "maximum_nanos": 87702,
+        "throughput_per_second": 25904.895
+      },
+      "persistent_ping_round_trip": {
+        "p50_nanos": 23320,
+        "p95_nanos": 29060,
+        "p99_nanos": 35340,
+        "p999_nanos": 44631,
+        "maximum_nanos": 1069968,
+        "throughput_per_second": 42601.516
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "404f44ff3af89b08cbdc5e33b95e69868137afe23eb28749afff12f5099391ff",
+      "connect_handshake_close": {
+        "p50_nanos": 34816,
+        "p95_nanos": 44553,
+        "p99_nanos": 53586,
+        "p999_nanos": 64843,
+        "maximum_nanos": 86522,
+        "throughput_per_second": 27709.016
+      },
+      "persistent_ping_round_trip": {
+        "p50_nanos": 23171,
+        "p95_nanos": 29088,
+        "p99_nanos": 35237,
+        "p999_nanos": 44429,
+        "maximum_nanos": 132348,
+        "throughput_per_second": 43029.595
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "d636617d0ffd28367c5e82247165a57fa7d47c046dea54b332a4fba03cc194d5",
+      "connect_handshake_close": {
+        "p50_nanos": 35707,
+        "p95_nanos": 51723,
+        "p99_nanos": 83754,
+        "p999_nanos": 90804,
+        "maximum_nanos": 96896,
+        "throughput_per_second": 24738.638
+      },
+      "persistent_ping_round_trip": {
+        "p50_nanos": 23261,
+        "p95_nanos": 29001,
+        "p99_nanos": 35290,
+        "p999_nanos": 44817,
+        "maximum_nanos": 846969,
+        "throughput_per_second": 42771.042
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "connect_handshake_close": {
+      "p50_nanos": 35095,
+      "p95_nanos": 51723,
+      "p99_nanos": 60715,
+      "p999_nanos": 68755,
+      "maximum_nanos": 87702,
+      "throughput_per_second": 25904.895
+    },
+    "persistent_ping_round_trip": {
+      "p50_nanos": 23261,
+      "p95_nanos": 29060,
+      "p99_nanos": 35290,
+      "p999_nanos": 44631,
+      "maximum_nanos": 846969,
+      "throughput_per_second": 42771.042
+    }
+  },
+  "verification": {
+    "workspace_tests_passed": 637,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_unit_tests_passed": 332,
+    "uds_integration_tests_passed": 4,
+    "documentation_markdown_files": 233,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "1480066d39ec65d9fe0c744ecc63cd9115ab603c81f45725f3296a8e9d619eaa",
+    "clippy_log_sha256": "a415fde2923d5bf8ec1163c18f19850b4e9f3a3aa5201774fb0459b0a7e048f5",
+    "rustdoc_log_sha256": "af6664beb508e112d56c7fcfe072f2671d93d067c519fb03b111aff4cc0666dc",
+    "release_check_log_sha256": "92434e198f27984c035c376ec77a7cf9e6ebdde782f8ccb1336ae3329b66ddb7",
+    "documentation_log_sha256": "497e5c16ecc24493c799b372f00ec661307c015d594e3d93c69e6a300274a054",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "engine_operation": false,
+    "physical_durability": false,
+    "cold_state": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "windows_named_pipe": false,
+    "g1_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "regression_threshold": false
+  }
+}

@@ -46,9 +46,14 @@ REQUIRED_CHECKS = (
     ("Test (Linux stable)", ".github/workflows/ci.yml"),
     ("Test (Windows stable)", ".github/workflows/ci.yml"),
     ("Test (macOS stable)", ".github/workflows/ci.yml"),
+    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml"),
 )
 REQUIRED_CHECK_NAMES = tuple(name for name, _ in REQUIRED_CHECKS)
 REQUIRED_CHECK_WORKFLOWS = dict(REQUIRED_CHECKS)
+REQUIRED_CHECK_EVENTS = {
+    name: "workflow_dispatch" if name == "Validate all exact-SHA G8 receipts" else "pull_request"
+    for name in REQUIRED_CHECK_NAMES
+}
 INTEGRATION_GUARD_STEP = "Verify the pull-request integration tree"
 INTEGRATION_GUARD_CHECKS = frozenset(
     {
@@ -355,6 +360,7 @@ def canonical_workflow_run(
     commit: str,
     expected_head_branch: str,
     expected_path: str,
+    expected_event: str,
 ) -> dict[str, object]:
     source = require_object(workflow_run, f"workflow run {workflow_run_id}")
     source_repository = require_object(
@@ -384,7 +390,7 @@ def canonical_workflow_run(
     if source.get("status") != "completed" or source.get("conclusion") != "success":
         raise ValueError(f"workflow run {workflow_run_id} is not successful")
     if (
-        source.get("event") != "pull_request"
+        source.get("event") != expected_event
         or source.get("head_branch") != expected_head_branch
         or source_repository.get("full_name") != repository
         or head_repository.get("full_name") != repository
@@ -397,7 +403,7 @@ def canonical_workflow_run(
         )
     return {
         "path": expected_path,
-        "event": "pull_request",
+        "event": expected_event,
         "head_branch": expected_head_branch,
         "run_attempt": run_attempt,
     }
@@ -454,6 +460,7 @@ def canonical_check_run(
         commit=commit,
         expected_head_branch=expected_head_branch,
         expected_path=REQUIRED_CHECK_WORKFLOWS[expected_name],
+        expected_event=REQUIRED_CHECK_EVENTS[expected_name],
     )
     if check_run_id not in job_runs:
         raise ValueError(f"job metadata is missing for check run {expected_name}")
@@ -624,7 +631,7 @@ def validate_report(document: object, *, expected_commit: str) -> None:
         raise ValueError("required-check report pull request is invalid")
     checks = root["checks"]
     if not isinstance(checks, list) or len(checks) != len(REQUIRED_CHECK_NAMES):
-        raise ValueError("required-check report must contain exactly 17 checks")
+        raise ValueError("required-check report must contain exactly 18 checks")
     seen_ids: set[int] = set()
     seen_workflow_runs: dict[int, tuple[str, int]] = {}
     workflow_run_by_path: dict[str, int] = {}
@@ -699,7 +706,7 @@ def validate_report(document: object, *, expected_commit: str) -> None:
             or not isinstance(workflow_run_attempt, int)
             or workflow_run_attempt < 1
             or workflow_path != REQUIRED_CHECK_WORKFLOWS[expected_name]
-            or record["workflow_event"] != "pull_request"
+            or record["workflow_event"] != REQUIRED_CHECK_EVENTS[expected_name]
             or record["head_branch"] != head_ref
             or (
                 workflow_run_id in seen_workflow_runs

@@ -1,8 +1,8 @@
 # TypeScript SDK
 
-`@celiums/hyphae` is the bounded ESM client for API v1. It requires Node.js 20
+`@celiums/hyphae` is the bounded ESM client for APIs v1 and Native v2. It requires Node.js 20
 or newer, uses the runtime `fetch`, and has no runtime package dependencies.
-The source package version is `0.2.1`. It is maintained in this repository;
+The development source package version is `1.0.0`. It is maintained in this repository;
 this guide does not claim npm publication without a separate registry release
 and receipt.
 
@@ -80,3 +80,12 @@ is outside the SDK's control.
 See [public client semantics](../../docs/clients/v1.md),
 [data model](../../docs/concepts/data-model.md), and
 [error codes](../../docs/api/error-codes-v1.md).
+
+## Native v2
+
+The `@celiums/hyphae/v2` export provides one high-level API over
+`HyphaeClient.local(endpoint)` and `HyphaeClient.http(origin)`. The Node local
+connector uses AF_UNIX paths on Unix and `\\.\pipe\...` named-pipe paths on
+Windows and carries exact `HYPHLCL1` frames without a wrapper protocol. HTTP
+uses canonical product envelopes at `/v2/execute`. Both expose typed product
+errors, request deadlines, `AbortSignal` cancellation, and transaction state.

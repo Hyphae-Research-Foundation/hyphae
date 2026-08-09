@@ -10,16 +10,24 @@ homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
-description = "Bounded asynchronous Rust client for the Hyphae /v1 API."
+description = "Bounded Rust client for Hyphae HTTP and native-local APIs."
 documentation = "https://docs.rs/hyphae-client"
-publish.workspace = true
+publish = false
 
 [dependencies]
 hyphae-contracts.workspace = true
+hyphae-native-product.workspace = true
+hyphae-native-protocol.workspace = true
+interprocess.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+hyphae-native-daemon.workspace = true
+hyphae-server.workspace = true
 
 [lints]
 workspace = true

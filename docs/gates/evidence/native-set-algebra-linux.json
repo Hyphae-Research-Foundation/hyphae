@@ -1,0 +1,218 @@
+{
+  "schema": "hyphae.native.set-algebra-evidence.v1",
+  "status": "direct-linux-semantic-and-latency-observation",
+  "source_branch": "codex/native-set-algebra",
+  "stacked_base_commit": "72ff5f5828838df70e3be3681456492a5cae5629",
+  "contract_commit": "9a482490aefbc198d5740130827bac722269a43d",
+  "implementation_commit": "3543d5530f428e559fd30597602e7b6d3da912f2",
+  "logical_time_fix_commit": "503f09e3d01365c2a6b597f82e513cc5e3254e5e",
+  "hardening_commit": "7cf4e4f138147119fb3b3903153f34a12000a50b",
+  "benchmark_commit": "700e4ef4d4c3be224b59180b4314be7344acfcc4",
+  "source_tree": "2acbbe2331f51f426d0945e3860c520a6575a15b",
+  "rustc": "rustc-1.96.0-ac68faa20-2026-05-25",
+  "profile": "release",
+  "harness": {
+    "path": "crates/hyphae-native-runtime/examples/set_algebra_smoke.rs",
+    "sha256": "f7518611e17ed664f8e41adf7f3cf9d062e0d8f68d9b366a6c2c751525394c08",
+    "dataset_blake3": "7429a4f17b6ff8cc436ba0b50e0fa34dc7ca9759a8d1f07f27d7c10b7ebe6729",
+    "raw_observation_sha256": "e1f7d9bdb9c3351c42dc9c2ac76498096b36154d609e42fd4182308a8983820b"
+  },
+  "red_gate": {
+    "kind": "compile_failure",
+    "rust_error": "E0432",
+    "missing_imports": [
+      "SetAlgebraOperation",
+      "SetAlgebraRequest"
+    ]
+  },
+  "contract": {
+    "operations": [
+      "union",
+      "intersection",
+      "difference"
+    ],
+    "key_limit": 64,
+    "output_member_limit_max": 65536,
+    "visit_limit_max": 1048576,
+    "missing_key_semantics": "mathematical empty set",
+    "wrong_kind_semantics": "preflight StructureKindMismatch",
+    "ordering": "exact binary ascending",
+    "partial_results": false,
+    "physical_logical_time_explicit": true
+  },
+  "tests": {
+    "focused_cases": 7,
+    "deterministic_oracle_cases": 64,
+    "oracle": "independent BTreeMap and BTreeSet",
+    "covered_surfaces": [
+      "private batch",
+      "retained snapshot",
+      "current-root physical",
+      "reopen"
+    ],
+    "covered_failures": [
+      "output limit",
+      "visit limit",
+      "wrong-kind preflight",
+      "reached metadata count corruption",
+      "reached member envelope corruption"
+    ],
+    "multilevel_intersection": {
+      "large_set_members": 2048,
+      "other_set_members": 2048,
+      "small_set_members_before_delete": 4,
+      "result_members_after_delete": 3,
+      "model_visits_after_delete": 9,
+      "physical_visits_after_delete": 10,
+      "physical_extra_visit_reason": "reached tombstone"
+    }
+  },
+  "benchmark": {
+    "concurrency": 1,
+    "small_observations_per_route": 10000,
+    "small_warmup_per_route": 1000,
+    "large_observations_per_route": 200,
+    "large_warmup_per_route": 20,
+    "physical_tree_height": 2,
+    "routes": {
+      "small_union": {
+        "members": 56,
+        "visits": 96
+      },
+      "small_intersection": {
+        "members": 8,
+        "visits": 80
+      },
+      "small_difference": {
+        "members": 8,
+        "visits": 80
+      },
+      "large_union": {
+        "members": 6144,
+        "visits": 8192
+      },
+      "large_intersection": {
+        "members": 64,
+        "visits": 192
+      },
+      "large_difference": {
+        "members": 2048,
+        "visits": 8192
+      }
+    },
+    "latency": {
+      "small_private_union": {
+        "unit": "microseconds",
+        "p50": 5.962,
+        "p95": 6.056,
+        "p99": 6.153
+      },
+      "small_private_intersection": {
+        "unit": "microseconds",
+        "p50": 1.994,
+        "p95": 2.059,
+        "p99": 2.098
+      },
+      "small_private_difference": {
+        "unit": "microseconds",
+        "p50": 1.867,
+        "p95": 1.915,
+        "p99": 1.942
+      },
+      "small_snapshot_union": {
+        "unit": "microseconds",
+        "p50": 6.013,
+        "p95": 6.115,
+        "p99": 6.217
+      },
+      "small_snapshot_intersection": {
+        "unit": "microseconds",
+        "p50": 1.983,
+        "p95": 2.046,
+        "p99": 2.084
+      },
+      "small_snapshot_difference": {
+        "unit": "microseconds",
+        "p50": 1.838,
+        "p95": 1.885,
+        "p99": 1.913
+      },
+      "small_physical_union": {
+        "unit": "microseconds",
+        "p50": 61.645,
+        "p95": 71.002,
+        "p99": 88.188
+      },
+      "small_physical_intersection": {
+        "unit": "microseconds",
+        "p50": 93.814,
+        "p95": 102.591,
+        "p99": 104.897
+      },
+      "small_physical_difference": {
+        "unit": "microseconds",
+        "p50": 93.838,
+        "p95": 102.736,
+        "p99": 105.43
+      },
+      "large_physical_union": {
+        "unit": "milliseconds",
+        "p50": 2.604951,
+        "p95": 2.657982,
+        "p99": 2.877073
+      },
+      "large_physical_intersection": {
+        "unit": "microseconds",
+        "p50": 218.443,
+        "p95": 228.533,
+        "p99": 234.614
+      },
+      "large_physical_difference": {
+        "unit": "milliseconds",
+        "p50": 6.783755,
+        "p95": 6.831848,
+        "p99": 6.928138
+      }
+    }
+  },
+  "excluded_observations": [
+    {
+      "sha256": "09af3a811482778355dc0e05840544dd71131bdbd9fab9f93e1255d9d0fc92ad",
+      "reason": "The remote non-login shell expanded the Rust version command before Cargo PATH was available, leaving rustc empty. No latency value from this observation is used."
+    },
+    {
+      "sha256": "167ec40bc5d96603a7fb2c437948de84235708fe2cd639bb381898c58a3458ca",
+      "reason": "The supplied benchmark commit argument did not resolve to the actual Git commit. No latency value from this observation is used."
+    }
+  ],
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "execution": "direct SSH Linux; no WSL"
+  },
+  "gates": {
+    "native_runtime_tests": {
+      "passed": 282,
+      "failed": 0
+    },
+    "workspace_all_targets_all_features": "passed",
+    "clippy_all_targets_all_features_deny_warnings": "passed",
+    "documentation": {
+      "status": "passed",
+      "markdown_files": 221,
+      "json_examples": 12
+    }
+  },
+  "boundaries": [
+    "No destination-set store variants, set TTL, per-member TTL, streams, local-protocol exposure, or network compatibility are added.",
+    "Large union and difference remain cardinality-sensitive; this receipt does not claim a universal microsecond bound.",
+    "The deterministic cases and selected corruption paths are not exhaustive state-space, concurrency, strict-fsync, process-kill, physical-power-loss, complete G3, or G7 evidence.",
+    "Hosted CI is not claimed by this local receipt."
+  ]
+}

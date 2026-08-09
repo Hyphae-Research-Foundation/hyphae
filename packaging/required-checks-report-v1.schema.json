@@ -125,7 +125,8 @@
             "Test (Linux MSRV)",
             "Test (Linux stable)",
             "Test (Windows stable)",
-            "Test (macOS stable)"
+            "Test (macOS stable)",
+            "Validate all exact-SHA G8 receipts"
           ]
         },
         "check_run_id": {
@@ -145,13 +146,14 @@
             ".github/workflows/ci.yml",
             ".github/workflows/dependency-review.yml",
             ".github/workflows/fuzz.yml",
+            ".github/workflows/native-g8-closure.yml",
             ".github/workflows/release.yml",
             ".github/workflows/security.yml",
             ".github/workflows/stress.yml"
           ]
         },
         "workflow_event": {
-          "const": "pull_request"
+          "enum": ["pull_request", "workflow_dispatch"]
         },
         "check_run_url": {
           "type": "string",
@@ -337,6 +339,25 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "Validate all exact-SHA G8 receipts"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/native-g8-closure.yml"
+              },
+              "workflow_event": {
+                "const": "workflow_dispatch"
+              }
+            }
+          }
         }
       ]
     }
@@ -360,8 +381,8 @@
     },
     "checks": {
       "type": "array",
-      "minItems": 17,
-      "maxItems": 17,
+      "minItems": 18,
+      "maxItems": 18,
       "uniqueItems": true,
       "prefixItems": [
         {
@@ -597,6 +618,20 @@
               "properties": {
                 "name": {
                   "const": "Test (macOS stable)"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Validate all exact-SHA G8 receipts"
                 }
               }
             }

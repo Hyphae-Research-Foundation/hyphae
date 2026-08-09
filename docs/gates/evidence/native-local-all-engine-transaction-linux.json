@@ -1,0 +1,382 @@
+{
+  "schema": "hyphae.native.local-all-engine-transaction-evidence.v1",
+  "status": "minimal-explicit-transaction-slice-passed",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-all-engine-transaction",
+  "base_branch": "codex/native-local-sql-select",
+  "contract_commit": "bbcb69a48617e8bca4301b1ef6f1f7bcec68fabf",
+  "implementation_commit": "30d53da2e6e7ebf1ce790b9923c15d47dbf6603",
+  "benchmark_commit": "dd10289fea97ce160fbfd435bdbc819ebdcb7c50",
+  "hardening_commit": "2f8fcb946233d710fdeb7c42e680120ead154f9d",
+  "source_tree": "d236d47875060125dc690c8bd6069c682eb8c8f8",
+  "harness": "crates/hyphae-native-runtime/examples/uds_all_engine_transaction_smoke.rs",
+  "harness_sha256": "d6cacc86bacda87041b33e7118236fbdf20a7d6a7cc4b3c9162f0a9e9dd103d7",
+  "harness_binary_sha256": "3d3c7f3a62601c2193dac511b3219b1cebd5165f8f9153dcd2591093749062eb",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_all_engine_transaction --no-run --locked",
+    "expected_result": "E0432 unresolved imports for the frozen transaction codecs and session state",
+    "exit_code": 101,
+    "log_sha256": "141da2c951768c02a8d1497a40d38def0ea596c6c5c52aa319ee3212cc1fa1de"
+  },
+  "environment": {
+    "canonical_host": "mario@10.77.10.10",
+    "canonical_repository": "/home/mario/celiumsai/hyphae",
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "physical_cores_visible": 4,
+    "memory_gib": 30,
+    "swap_gib": 0,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "filesystem_mount_options": "rw,relatime,discard,errors=remount-ro,commit=30",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [
+      2,
+      3
+    ],
+    "cpu_governor": "unavailable",
+    "wsl_in_execution_path": false
+  },
+  "correctness": {
+    "transaction_integration_tests": 21,
+    "single_session_active_transactions": 1,
+    "maximum_staged_operations": 1024,
+    "durability_classes_supported": [
+      "memory",
+      "strict"
+    ],
+    "durability_classes_rejected": [
+      "group"
+    ],
+    "engines_in_committed_transaction": [
+      "relational_sql",
+      "structure",
+      "lexical_search"
+    ],
+    "clock_samples_per_transaction": 1,
+    "prior_snapshot_invisibility": true,
+    "single_commit_csn": true,
+    "exact_wal_transaction_identity": true,
+    "strict_reopen_equivalence": true,
+    "optimistic_conflict_has_no_partial_publication": true,
+    "rollback_discards_complete_batch": true,
+    "close_discards_complete_batch": true,
+    "peer_loss_discards_complete_batch": true,
+    "response_preflight_before_begin_and_commit": true,
+    "semantic_failure_preserves_active_batch": true,
+    "all_new_payloads_have_golden_bytes": true,
+    "boundary_and_noncanonical_payload_tests": true,
+    "crash_boundaries": [
+      "blob_staged",
+      "blob_promoted",
+      "page_appended",
+      "page_synchronized",
+      "wal_appended",
+      "wal_synchronized",
+      "root_published"
+    ],
+    "crash_recovery_outcomes": [
+      "complete_prior_root_set",
+      "complete_new_root_set"
+    ],
+    "mixed_root_set_observed": false
+  },
+  "benchmark_workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "maximum_payload_bytes": 512,
+    "ping_bytes": 32,
+    "ping_warmup": 10000,
+    "ping_observations": 100000,
+    "stage_warmup": 1000,
+    "stage_observations": 10000,
+    "memory_commit_warmup": 16,
+    "memory_commit_observations": 256,
+    "strict_commit_warmup": 16,
+    "strict_commit_observations": 256,
+    "staged_operations_per_transaction": 3,
+    "relational_operation": "UPDATE one stable primary key",
+    "structure_operation": "SET one stable key with a changing 32-byte value",
+    "lexical_operation": "append one immutable document identity",
+    "relational_identity_growth": false,
+    "structure_identity_growth": false,
+    "lexical_document_growth": true,
+    "warm_state": true
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "f9bba235d310ff9323af6e7e8f3d5d98379cf41f94eeff6155063c7fd588852e",
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23897,
+        "p95_nanos": 24968,
+        "p99_nanos": 36971,
+        "p999_nanos": 40595,
+        "maximum_nanos": 152368,
+        "throughput_per_second": 42700.491
+      },
+      "persistent_transaction_sql_stage_round_trip": {
+        "p50_nanos": 24508,
+        "p95_nanos": 26165,
+        "p99_nanos": 39321,
+        "p999_nanos": 46799,
+        "maximum_nanos": 52932,
+        "throughput_per_second": 41844.570
+      },
+      "persistent_transaction_structure_stage_round_trip": {
+        "p50_nanos": 22496,
+        "p95_nanos": 23718,
+        "p99_nanos": 36482,
+        "p999_nanos": 39969,
+        "maximum_nanos": 56501,
+        "throughput_per_second": 46094.700
+      },
+      "persistent_transaction_search_stage_round_trip": {
+        "p50_nanos": 24371,
+        "p95_nanos": 25416,
+        "p99_nanos": 38524,
+        "p999_nanos": 42074,
+        "maximum_nanos": 44399,
+        "throughput_per_second": 41031.842
+      },
+      "persistent_transaction_memory_commit_round_trip": {
+        "p50_nanos": 6475748,
+        "p95_nanos": 11241679,
+        "p99_nanos": 11656022,
+        "p999_nanos": 11785968,
+        "maximum_nanos": 11957334,
+        "throughput_per_second": 151.278
+      },
+      "persistent_transaction_strict_commit_round_trip": {
+        "p50_nanos": 15063698,
+        "p95_nanos": 19789583,
+        "p99_nanos": 20253914,
+        "p999_nanos": 20845285,
+        "maximum_nanos": 21158701,
+        "throughput_per_second": 66.066
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "9d8e6387e711978ae86b9effc49d7345cd05d325b1b80b3d27603c372261d578",
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23817,
+        "p95_nanos": 24819,
+        "p99_nanos": 36983,
+        "p999_nanos": 40367,
+        "maximum_nanos": 144417,
+        "throughput_per_second": 42147.082
+      },
+      "persistent_transaction_sql_stage_round_trip": {
+        "p50_nanos": 24415,
+        "p95_nanos": 26099,
+        "p99_nanos": 39215,
+        "p999_nanos": 45593,
+        "maximum_nanos": 49234,
+        "throughput_per_second": 42138.760
+      },
+      "persistent_transaction_structure_stage_round_trip": {
+        "p50_nanos": 22364,
+        "p95_nanos": 23549,
+        "p99_nanos": 36449,
+        "p999_nanos": 40862,
+        "maximum_nanos": 68888,
+        "throughput_per_second": 46685.786
+      },
+      "persistent_transaction_search_stage_round_trip": {
+        "p50_nanos": 24271,
+        "p95_nanos": 25330,
+        "p99_nanos": 38590,
+        "p999_nanos": 41940,
+        "maximum_nanos": 58475,
+        "throughput_per_second": 41487.502
+      },
+      "persistent_transaction_memory_commit_round_trip": {
+        "p50_nanos": 6488588,
+        "p95_nanos": 11168943,
+        "p99_nanos": 11644002,
+        "p999_nanos": 11827423,
+        "maximum_nanos": 11990495,
+        "throughput_per_second": 152.020
+      },
+      "persistent_transaction_strict_commit_round_trip": {
+        "p50_nanos": 15097443,
+        "p95_nanos": 19740474,
+        "p99_nanos": 20376586,
+        "p999_nanos": 20728135,
+        "maximum_nanos": 21180295,
+        "throughput_per_second": 66.280
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "93c9fb5c687037fe5201424c8b0ac8fbf4586ae0ff5ca1d6288688f1270762ad",
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23853,
+        "p95_nanos": 24904,
+        "p99_nanos": 37000,
+        "p999_nanos": 40278,
+        "maximum_nanos": 136528,
+        "throughput_per_second": 42182.341
+      },
+      "persistent_transaction_sql_stage_round_trip": {
+        "p50_nanos": 24322,
+        "p95_nanos": 25865,
+        "p99_nanos": 39872,
+        "p999_nanos": 46231,
+        "maximum_nanos": 49063,
+        "throughput_per_second": 42508.084
+      },
+      "persistent_transaction_structure_stage_round_trip": {
+        "p50_nanos": 22305,
+        "p95_nanos": 23462,
+        "p99_nanos": 36033,
+        "p999_nanos": 40034,
+        "maximum_nanos": 45226,
+        "throughput_per_second": 47068.466
+      },
+      "persistent_transaction_search_stage_round_trip": {
+        "p50_nanos": 24227,
+        "p95_nanos": 25264,
+        "p99_nanos": 38091,
+        "p999_nanos": 41489,
+        "maximum_nanos": 50997,
+        "throughput_per_second": 41748.953
+      },
+      "persistent_transaction_memory_commit_round_trip": {
+        "p50_nanos": 6454540,
+        "p95_nanos": 11310085,
+        "p99_nanos": 11734347,
+        "p999_nanos": 11878321,
+        "maximum_nanos": 11896304,
+        "throughput_per_second": 151.680
+      },
+      "persistent_transaction_strict_commit_round_trip": {
+        "p50_nanos": 15139513,
+        "p95_nanos": 19834148,
+        "p99_nanos": 20274626,
+        "p999_nanos": 20445894,
+        "maximum_nanos": 21180014,
+        "throughput_per_second": 66.261
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "persistent_ping_round_trip_32b": {
+      "p50_nanos": 23853,
+      "p95_nanos": 24904,
+      "p99_nanos": 36983,
+      "p999_nanos": 40367,
+      "maximum_nanos": 144417,
+      "throughput_per_second": 42182.341
+    },
+    "persistent_transaction_sql_stage_round_trip": {
+      "p50_nanos": 24415,
+      "p95_nanos": 26099,
+      "p99_nanos": 39321,
+      "p999_nanos": 46231,
+      "maximum_nanos": 49234,
+      "throughput_per_second": 42138.760
+    },
+    "persistent_transaction_structure_stage_round_trip": {
+      "p50_nanos": 22364,
+      "p95_nanos": 23549,
+      "p99_nanos": 36449,
+      "p999_nanos": 40034,
+      "maximum_nanos": 56501,
+      "throughput_per_second": 46685.786
+    },
+    "persistent_transaction_search_stage_round_trip": {
+      "p50_nanos": 24271,
+      "p95_nanos": 25330,
+      "p99_nanos": 38524,
+      "p999_nanos": 41940,
+      "maximum_nanos": 50997,
+      "throughput_per_second": 41487.502
+    },
+    "persistent_transaction_memory_commit_round_trip": {
+      "p50_nanos": 6475748,
+      "p95_nanos": 11241679,
+      "p99_nanos": 11656022,
+      "p999_nanos": 11827423,
+      "maximum_nanos": 11957334,
+      "throughput_per_second": 151.680
+    },
+    "persistent_transaction_strict_commit_round_trip": {
+      "p50_nanos": 15097443,
+      "p95_nanos": 19789583,
+      "p99_nanos": 20274626,
+      "p999_nanos": 20728135,
+      "maximum_nanos": 21180014,
+      "throughput_per_second": 66.261
+    }
+  },
+  "performance_observation": {
+    "stage_p50_microsecond_domain": true,
+    "memory_commit_p50_microsecond_domain": false,
+    "strict_commit_p50_microsecond_domain": false,
+    "memory_commit_includes_fsync": false,
+    "strict_commit_includes_page_and_wal_synchronization": true,
+    "independent_percentiles_subtracted": false,
+    "negative_overhead_claimed": false,
+    "regression_threshold_established": false,
+    "g7_gate_passed": false
+  },
+  "verification": {
+    "status": "passed-direct-linux",
+    "workspace_tests_passed": 685,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_transaction_tests_passed": 21,
+    "documentation_markdown_files": 243,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "72b32b03c97f1c6f68d44e6069fb8c2f4eb30b5f99df41bd694edb5b4f0c175c",
+    "targeted_test_log_sha256": "731adf3778d5b1f2f272f64247573a895b26dcd0e8162c7b3ea9b1d8a7cff94f",
+    "clippy_log_sha256": "c7eddbc8e451ff77a1882d929e7cbfdc5a7221c366ae1b7f69073560b7960ebb",
+    "rustdoc_log_sha256": "d6d1461a68927a50eeb3067ba696850ee710e95a63b6d9af3b668751cbe0b72a",
+    "release_check_log_sha256": "5aa7a40260e3ee8d766193100f4c34e6039d5e9cb4b282739300dfd1dd1295b5",
+    "documentation_log_sha256": "c83e176d1b9992e91a76791d778eebc67a27c3f60aa40e1da5448624643e0e76",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diff_check_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "explicit_local_transaction": true,
+    "one_batch_three_engines": true,
+    "one_wal_transaction_and_csn": true,
+    "optimistic_first_committer_wins": true,
+    "transaction_private_reads": false,
+    "prepared_dml": false,
+    "ddl_in_local_transaction": false,
+    "savepoints": false,
+    "isolation_level_selection": false,
+    "group_durability": false,
+    "retry_tokens": false,
+    "process_kill_specific_to_local_session": false,
+    "windows_named_pipe": false,
+    "cold_state": false,
+    "concurrency_8_or_32": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "g0_closed": false,
+    "g1_closed": false,
+    "g2_closed": false,
+    "g3_closed": false,
+    "g4_closed": false,
+    "g5_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "g8_closed": false
+  }
+}

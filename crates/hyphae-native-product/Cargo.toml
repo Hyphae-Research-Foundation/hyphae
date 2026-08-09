@@ -1,0 +1,29 @@
+[package]
+name = "hyphae-native-product"
+description = "Transport-independent product contracts and embedded facade for Hyphae Native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+blake3.workspace = true
+hyphae-native-catalog.workspace = true
+hyphae-native-runtime.workspace = true
+hyphae-native-types.workspace = true
+
+[dev-dependencies]
+hyphae-native-blobs.workspace = true
+hyphae-native-btree.workspace = true
+hyphae-native-manifest.workspace = true
+hyphae-native-pages.workspace = true
+hyphae-native-records.workspace = true
+hyphae-native-wal.workspace = true
+
+[lints]
+workspace = true

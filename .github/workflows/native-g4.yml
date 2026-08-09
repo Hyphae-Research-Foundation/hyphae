@@ -1,0 +1,127 @@
+name: Native G4 Search Closure Evidence
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: native-g4-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  closure:
+    name: G4 exact-SHA search closure evidence
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+
+      - name: Verify exact checkout and G4 authorities
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test -z "$(git status --porcelain)"
+          PYTHONPATH=. python -m unittest \
+            tools.test_produce_native_g4_receipt \
+            tools.test_check_native_g4_receipt \
+            tools.test_inject_native_g4_evidence \
+            tools.test_check_native_g4_readiness \
+            tools.test_native_g4_quality -v
+          test "$(shasum -a 256 config/native-g4-quality-corpus-v1.json | cut -d' ' -f1)" = \
+            "$(python -c 'import json; print(json.load(open("config/native-g4-corpus-manifest.json"))["corpora"][0]["sha256"])')"
+
+      - name: Execute authorized suites and assemble closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          SUITE_MANIFEST="config/native-g4-suite-manifest.json"
+          CORPUS_MANIFEST="config/native-g4-corpus-manifest.json"
+          SUITE_SHA="$(shasum -a 256 "$SUITE_MANIFEST" | cut -d' ' -f1)"
+          CORPUS_SHA="$(shasum -a 256 "$CORPUS_MANIFEST" | cut -d' ' -f1)"
+          PLATFORM="ubuntu-24.04-$(uname -m)"
+          mkdir -p g4-logs g4-receipts g4-audits
+          cp config/native-g4-readiness-evidence.json g4-evidence.json
+          python - "$SUITE_MANIFEST" "$CORPUS_MANIFEST" "$SHA" "$SUITE_SHA" "$CORPUS_SHA" "$PLATFORM" <<'PY'
+          import json, pathlib, subprocess, sys
+          suite_path, corpus_path, sha, suite_sha, corpus_sha, platform = sys.argv[1:]
+          manifest = json.load(open(suite_path))
+          for requirement in manifest["requirements"]:
+              receipt_args = []
+              for suite in requirement["suites"]:
+                  name = suite["name"]
+                  command = suite["command"]
+                  log = pathlib.Path("g4-logs") / f"{requirement['id']}--{name}.log"
+                  with log.open("w") as output:
+                      output.write("G4_COMMAND: " + json.dumps(command, separators=(",", ":")) + "\n")
+                      output.flush()
+                      subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, check=True)
+                  receipt_args.extend(["--suite-log", name, str(log)])
+              receipt = pathlib.Path("g4-receipts") / f"{requirement['id']}.json"
+              subprocess.run([
+                  sys.executable, "tools/produce_native_g4_receipt.py",
+                  "--requirement", requirement["id"], "--source-commit", sha,
+                  "--suite-manifest", suite_path, "--suite-manifest-sha256", suite_sha,
+                  "--corpus-manifest", corpus_path, "--corpus-manifest-sha256", corpus_sha,
+                  "--platform", platform, "--toolchain", "1.96.0", *receipt_args,
+                  "--output", str(receipt),
+              ], check=True)
+          PY
+          while IFS= read -r requirement; do
+            python tools/check_native_g4_receipt.py \
+              --receipt "g4-receipts/$requirement.json" \
+              --expected-commit "$SHA" --expected-requirement "$requirement" \
+              --suite-manifest-sha256 "$SUITE_SHA" \
+              --corpus-manifest-sha256 "$CORPUS_SHA" \
+              --output "g4-audits/$requirement.json"
+            python tools/inject_native_g4_evidence.py \
+              --baseline g4-evidence.json --requirement "$requirement" \
+              --reference "g4-audits/$requirement.json" \
+              --expected-commit "$SHA" --output g4-evidence-next.json
+            mv g4-evidence-next.json g4-evidence.json
+          done < <(python -c 'import json; print("\n".join(r["id"] for r in json.load(open("config/native-g4-suite-manifest.json"))["requirements"]))')
+          python tools/check_native_g4_readiness.py \
+            --profile config/native-g4-readiness-profile.json \
+            --evidence g4-evidence.json --expected-commit "$SHA" \
+            --suite-manifest-sha256 "$SUITE_SHA" \
+            --corpus-manifest-sha256 "$CORPUS_SHA" \
+            --output native-g4-readiness.json
+          python - <<'PY'
+          import json
+          result = json.load(open("native-g4-readiness.json"))
+          assert result["status"] == "ready"
+          assert result["passed"] == result["required"] == 12
+          PY
+
+      - name: Upload exact-SHA G4 closure evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g4-closure-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            g4-logs/
+            g4-receipts/
+            g4-audits/
+            g4-evidence.json
+            native-g4-readiness.json
+            config/native-g4-readiness-profile.json
+            config/native-g4-inventory.json
+            config/native-g4-corpus-manifest.json
+            config/native-g4-suite-manifest.json

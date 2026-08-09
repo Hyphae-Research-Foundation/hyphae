@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/native-v2.schema.json",
+  "title": "NativeRequestV2",
+  "description": "One transport-independent Hyphae Native v2 operation and execution context.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "logical_time_micros", "durability", "limits", "operation"],
+  "properties": {
+    "request_id": {
+      "description": "Nonzero unsigned 128-bit request identity as canonical decimal text.",
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,38}$"
+    },
+    "logical_time_micros": {
+      "description": "Logical time used by snapshots and TTL behavior.",
+      "type": "integer"
+    },
+    "deadline_micros": {
+      "description": "Optional positive absolute Unix-time deadline in microseconds.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "durability": { "$ref": "#/$defs/DurabilityV2" },
+    "limits": { "$ref": "#/$defs/ProductLimitsV2" },
+    "operation": { "$ref": "#/$defs/OperationV2" }
+  },
+  "$defs": {
+    "DurabilityV2": {
+      "description": "Mutation acknowledgement policy.",
+      "enum": ["strict", "group", "memory"]
+    },
+    "ProductLimitsV2": {
+      "description": "Central count, byte, work, and memory envelope.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_count", "max_request_bytes", "max_response_bytes", "max_work_units", "max_memory_bytes"],
+      "properties": {
+        "max_count": { "type": "integer", "minimum": 1 },
+        "max_request_bytes": { "type": "integer", "minimum": 1 },
+        "max_response_bytes": { "type": "integer", "minimum": 1 },
+        "max_work_units": { "type": "integer", "minimum": 1 },
+        "max_memory_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "OperationV2": {
+      "description": "Closed high-level operation family. Arguments are family-specific typed JSON models.",
+      "oneOf": [
+        { "$ref": "#/$defs/OperationV2Capabilities" },
+        { "$ref": "#/$defs/OperationV2Catalog" },
+        { "$ref": "#/$defs/OperationV2Sql" },
+        { "$ref": "#/$defs/OperationV2Structure" },
+        { "$ref": "#/$defs/OperationV2Search" },
+        { "$ref": "#/$defs/OperationV2SearchCollection" },
+        { "$ref": "#/$defs/OperationV2SearchIngest" },
+        { "$ref": "#/$defs/OperationV2Admin" },
+        { "$ref": "#/$defs/OperationV2Telemetry" },
+        { "$ref": "#/$defs/OperationV2Doctor" },
+        { "$ref": "#/$defs/OperationV2Backup" },
+        { "$ref": "#/$defs/OperationV2ProofVerify" },
+        { "$ref": "#/$defs/OperationV2TransactionStatus" }
+      ]
+    },
+    "OperationV2Capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "capabilities" } }
+    },
+    "OperationV2Catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "catalog" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Sql": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "sql" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Structure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "structure" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Search": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "search" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2SearchCollection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "search_collection" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2SearchIngest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "search_ingest" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Admin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "admin" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "telemetry" } }
+    },
+    "OperationV2Doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "doctor" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2Backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "arguments"],
+      "properties": {
+        "kind": { "const": "backup" },
+        "action": { "type": "string" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2ProofVerify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "proof_verify" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2TransactionStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "transaction_status" },
+        "arguments": { "type": "object" }
+      }
+    },
+    "NativeResponseV2": {
+      "description": "Definitive response after transport completion validation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "kind", "value"],
+      "properties": {
+        "request_id": { "type": "string" },
+        "kind": { "type": "string" },
+        "value": {}
+      }
+    },
+    "NativeOperationResultV2": {
+      "description": "Transport-independent operation result represented by its stable response kind and family-specific value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "type": "string" },
+        "value": {}
+      }
+    }
+  }
+}

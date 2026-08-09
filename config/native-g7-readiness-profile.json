@@ -1,0 +1,50 @@
+{
+  "schema": "hyphae-native-g7-readiness-profile-v3",
+  "gate": "G7",
+  "scope": "controlled-performance-matrix",
+  "status": "open",
+  "required_cells": [
+    "embedded-structure-point-get",
+    "embedded-prepared-sql-primary-key",
+    "local-structure-point-get",
+    "local-prepared-sql-primary-key",
+    "indexed-sql-bounded-read",
+    "two-index-join-bounded-read",
+    "bm25-top10",
+    "filtered-bm25-top10",
+    "ann-top10-recall-095",
+    "hybrid-top10",
+    "strict-group-commit"
+  ],
+  "required_states": ["warm"],
+  "cold_diagnostics": {
+    "closure_claim": false,
+    "method": "separate-first-touch-observations",
+    "reason": "cold I/O has no universal latency target and cannot be represented by a million repeated accesses"
+  },
+  "required_concurrency": [1, 8, 32],
+  "required_saturation": true,
+  "required_background_interference": true,
+  "required_background_modes": ["control", "interference"],
+  "minimum_hot_observations": 1000000,
+  "required_dataset": {"documents": 1000000, "vectors": 1000000, "vector_dimension": 384},
+  "required_hardware": {"dedicated": true, "virtualization": "none"},
+  "warm_targets_nanoseconds": {
+    "embedded-structure-point-get": {"p50": 2000, "p99": 10000},
+    "local-structure-point-get": {"p50": 25000, "p99": 100000},
+    "embedded-prepared-sql-primary-key": {"p50": 5000, "p99": 25000},
+    "local-prepared-sql-primary-key": {"p50": 35000, "p99": 150000},
+    "indexed-sql-bounded-read": {"p50": 50000, "p99": 250000},
+    "two-index-join-bounded-read": {"p50": 75000, "p99": 400000},
+    "bm25-top10": {"p50": 100000, "p99": 500000},
+    "filtered-bm25-top10": {"p50": 200000, "p99": 750000},
+    "ann-top10-recall-095": {"p50": 250000, "p99": 900000},
+    "hybrid-top10": {"p50": 400000, "p99": 950000}
+  },
+  "advisory_targets_nanoseconds": {
+    "strict-group-commit": {"p50": 250000, "p99": 900000}
+  },
+  "required_counters": ["allocations", "rss", "cpu_cycles", "cache_misses", "page_faults", "bytes_read", "bytes_written"],
+  "claims": [],
+  "closure_declared": false
+}

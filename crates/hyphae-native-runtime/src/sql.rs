@@ -7,8 +7,8 @@ use std::{
 };
 
 use hyphae_native_catalog::{
-    CatalogName, CatalogObject, ColumnDefinition, ObjectHeader, RelationDefinition,
-    SecondaryIndexDefinition,
+    CatalogName, CatalogObject, ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition,
+    ForeignKeyDefinition, ObjectHeader, RelationDefinition, SecondaryIndexDefinition,
 };
 use hyphae_native_mvcc::Snapshot;
 use hyphae_native_records::{ColumnValueRef, RowTuple, RowTupleView};
@@ -90,6 +90,15 @@ pub enum SqlError {
     /// Secondary-index range bounds are duplicated or malformed.
     #[error("HYSQL014 native SQL secondary-index range binding is invalid")]
     InvalidSecondaryIndexRange,
+    /// A native SQL CHECK predicate evaluated to false.
+    #[error("HYSQL015 native SQL CHECK constraint failed")]
+    CheckViolation,
+    /// An immediate native SQL foreign key has no visible parent.
+    #[error("HYSQL016 native SQL FOREIGN KEY constraint failed")]
+    ForeignKeyViolation,
+    /// A referenced relation does not exist in the bound catalog.
+    #[error("HYSQL017 native SQL relation does not exist")]
+    UnknownRelation,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -106,6 +115,20 @@ impl PreparedStatement {
     /// Returns the catalog version used by the binder.
     pub const fn catalog_version(&self) -> CatalogVersion {
         self.catalog_version
+    }
+
+    /// Returns the exact parameter count required by this plan.
+    pub fn parameter_count(&self) -> usize {
+        self.plan.parameter_count()
+    }
+
+    pub(crate) fn result_schema(&self) -> Result<Vec<(String, LogicalType)>, SqlError> {
+        self.plan.result_schema()
+    }
+
+    /// Returns the maximum materialized row count for this bounded plan.
+    pub fn maximum_result_rows(&self) -> Option<usize> {
+        self.plan.maximum_result_rows()
     }
 }
 
@@ -247,6 +270,167 @@ enum JoinSide {
     Right,
 }
 
+impl PreparedPlan {
+    fn parameter_count(&self) -> usize {
+        match self {
+            Self::PrimaryKeyLookup {
+                parameter_count, ..
+            }
+            | Self::SecondaryIndexLookup {
+                parameter_count, ..
+            }
+            | Self::SecondaryIndexRangeScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyPrefixScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyPrefixRangeScan {
+                parameter_count, ..
+            }
+            | Self::PrimaryKeyRangeScan {
+                parameter_count, ..
+            }
+            | Self::IndexedInnerJoin {
+                parameter_count, ..
+            } => *parameter_count,
+        }
+    }
+
+    fn maximum_result_rows(&self) -> Option<usize> {
+        match self {
+            Self::PrimaryKeyLookup { .. } => Some(1),
+            Self::SecondaryIndexLookup {
+                index_definition,
+                limit,
+                ..
+            } => {
+                if index_definition.unique {
+                    Some(1)
+                } else {
+                    *limit
+                }
+            }
+            Self::SecondaryIndexRangeScan { limit, .. }
+            | Self::PrimaryKeyScan { limit, .. }
+            | Self::PrimaryKeyPrefixScan { limit, .. }
+            | Self::PrimaryKeyPrefixRangeScan { limit, .. }
+            | Self::PrimaryKeyRangeScan { limit, .. } => Some(*limit),
+            Self::IndexedInnerJoin { left_access, .. } => match left_access {
+                JoinLeftAccess::PrimaryKey { .. } | JoinLeftAccess::UniqueSecondaryIndex { .. } => {
+                    Some(1)
+                }
+                JoinLeftAccess::BoundedSecondaryIndex { limit, .. }
+                | JoinLeftAccess::BoundedPrimaryKeyScan { limit, .. } => Some(*limit),
+            },
+        }
+    }
+
+    fn result_schema(&self) -> Result<Vec<(String, LogicalType)>, SqlError> {
+        match self {
+            Self::PrimaryKeyLookup {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::SecondaryIndexLookup {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::SecondaryIndexRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyPrefixScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyPrefixRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::PrimaryKeyRangeScan {
+                relation,
+                projection,
+                output_columns,
+                ..
+            } => projected_schema(relation, projection, output_columns),
+            Self::IndexedInnerJoin {
+                left_relation,
+                right_relation,
+                projection,
+                output_columns,
+                ..
+            } => join_projected_schema(left_relation, right_relation, projection, output_columns),
+        }
+    }
+}
+
+fn projected_schema(
+    relation: &RelationDefinition,
+    projection: &[usize],
+    output_columns: &[String],
+) -> Result<Vec<(String, LogicalType)>, SqlError> {
+    if projection.len() != output_columns.len() {
+        return Err(SqlError::InvalidCatalogObject);
+    }
+    projection
+        .iter()
+        .zip(output_columns)
+        .map(|(column, output)| {
+            let definition = relation
+                .columns
+                .get(*column)
+                .ok_or(SqlError::UnknownColumn)?;
+            Ok((output.clone(), definition.logical_type.clone()))
+        })
+        .collect()
+}
+
+fn join_projected_schema(
+    left_relation: &RelationDefinition,
+    right_relation: &RelationDefinition,
+    projection: &[JoinProjection],
+    output_columns: &[String],
+) -> Result<Vec<(String, LogicalType)>, SqlError> {
+    if projection.len() != output_columns.len() {
+        return Err(SqlError::InvalidCatalogObject);
+    }
+    projection
+        .iter()
+        .zip(output_columns)
+        .map(|(projected, output)| {
+            let relation = match projected.side {
+                JoinSide::Left => left_relation,
+                JoinSide::Right => right_relation,
+            };
+            let definition = relation
+                .columns
+                .get(projected.column)
+                .ok_or(SqlError::UnknownColumn)?;
+            Ok((output.clone(), definition.logical_type.clone()))
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JoinProjection {
     side: JoinSide,
@@ -259,12 +443,23 @@ enum Statement {
         name: String,
         columns: Vec<ParsedColumn>,
         primary_key: Vec<String>,
+        foreign_keys: Vec<ParsedForeignKey>,
     },
     CreateIndex {
         name: String,
         table: String,
         columns: Vec<String>,
         unique: bool,
+    },
+    AlterTableRename {
+        name: String,
+        new_name: String,
+    },
+    DropTable {
+        name: String,
+    },
+    DropIndex {
+        name: String,
     },
     Insert {
         name: String,
@@ -300,6 +495,33 @@ enum Statement {
     },
     SelectJoin(ParsedInnerJoin),
     ExplainSelectJoin(ParsedInnerJoin),
+    WithSelect(ParsedCteSelect),
+    SelectWindow(ParsedWindowSelect),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowFunction {
+    RowNumber,
+    Rank,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedWindowSelect {
+    name: String,
+    value_column: String,
+    function: WindowFunction,
+    partition_column: Option<String>,
+    order_column: String,
+    alias: String,
+    outer_order_by: Vec<String>,
+    limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedCteSelect {
+    name: String,
+    inner: Box<Statement>,
+    outer: Box<Statement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,11 +543,26 @@ struct ParsedJoinEquality {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedForeignKey {
+    columns: Vec<String>,
+    name: Option<String>,
+    referenced_table: String,
+    referenced_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedColumn {
     name: String,
     logical_type: LogicalType,
     nullable: bool,
     inline_primary_key: bool,
+    check: Option<ParsedColumnCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedColumnCheck {
+    operator: ComparisonOperator,
+    operand: ScalarOperand,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -428,9 +665,28 @@ struct SecondaryIndexRangeEndpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SecondaryIndexPrefixRangeEndpoint {
+    operand: BoundScalarOperand,
+    inclusive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecondaryIndexRangeKind {
+    Complete {
+        lower: Option<SecondaryIndexRangeEndpoint>,
+        upper: Option<SecondaryIndexRangeEndpoint>,
+    },
+    Prefix {
+        prefix: KeyBinding,
+        range_column: usize,
+        lower: Option<SecondaryIndexPrefixRangeEndpoint>,
+        upper: Option<SecondaryIndexPrefixRangeEndpoint>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SecondaryIndexRange {
-    lower: Option<SecondaryIndexRangeEndpoint>,
-    upper: Option<SecondaryIndexRangeEndpoint>,
+    kind: SecondaryIndexRangeKind,
     parameter_count: usize,
 }
 
@@ -747,6 +1003,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn execute_transaction(
     transaction: &mut NativeWriteBatch,
     statement: &str,
@@ -757,13 +1014,26 @@ pub(crate) fn execute_transaction(
             name,
             columns,
             primary_key,
-        } => execute_create(transaction, &name, columns, primary_key, parameters),
+            foreign_keys,
+        } => execute_create(
+            transaction,
+            &name,
+            &columns,
+            primary_key,
+            foreign_keys,
+            parameters,
+        ),
         Statement::CreateIndex {
             name,
             table,
             columns,
             unique,
         } => execute_create_index(transaction, &name, &table, &columns, unique, parameters),
+        Statement::AlterTableRename { name, new_name } => {
+            execute_alter_table_rename(transaction, &name, &new_name, parameters)
+        }
+        Statement::DropTable { name } => execute_drop_table(transaction, &name, parameters),
+        Statement::DropIndex { name } => execute_drop_index(transaction, &name, parameters),
         Statement::Insert {
             name,
             values,
@@ -837,7 +1107,392 @@ pub(crate) fn execute_transaction(
         Statement::ExplainSelectJoin(join) => {
             execute_indexed_join_explain(transaction, &join, parameters)
         }
+        Statement::WithSelect(cte) => execute_cte_select(transaction, &cte, parameters),
+        Statement::SelectWindow(window) => execute_window_select(transaction, &window, parameters),
     }
+}
+
+fn execute_window_select(
+    transaction: &mut NativeWriteBatch,
+    window: &ParsedWindowSelect,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let (_, definition) = relation_named(&transaction.state.catalog, &window.name)?;
+    let order_index = column_index(&definition.columns, &window.order_column)?;
+    let partition_index = window
+        .partition_column
+        .as_ref()
+        .map(|column| column_index(&definition.columns, column))
+        .transpose()?;
+    let expected_key = partition_index
+        .into_iter()
+        .chain(std::iter::once(order_index))
+        .map(|index| definition.columns[index].id)
+        .collect::<Vec<_>>();
+    if definition.primary_key != expected_key {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let order_columns = window
+        .partition_column
+        .iter()
+        .cloned()
+        .chain(std::iter::once(window.order_column.clone()))
+        .collect::<Vec<_>>();
+    let query = format!(
+        "SELECT {}, {} FROM {} ORDER BY {} LIMIT {}",
+        window.value_column,
+        order_columns.join(", "),
+        window.name,
+        window.outer_order_by.join(", "),
+        window.limit
+    );
+    let Statement::Select {
+        name,
+        projection,
+        filter,
+        parameter_count,
+        order_by,
+        limit,
+    } = parse(&query)?
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let SqlResult::Rows { columns: _, rows } = execute_select(
+        transaction,
+        SelectQuery {
+            name: &name,
+            projection: &projection,
+            filter: filter.as_ref(),
+            parameter_count,
+            order_by: &order_by,
+            limit,
+        },
+        &[],
+    )?
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let mut output = Vec::with_capacity(rows.len());
+    let mut previous_partition = None;
+    let mut ordinal = 0_u64;
+    for row in rows {
+        let value = row.first().cloned().ok_or(SqlError::InvalidStoredRow)?;
+        let partition = window
+            .partition_column
+            .as_ref()
+            .map(|_| row.get(1).cloned().ok_or(SqlError::InvalidStoredRow))
+            .transpose()?;
+        if partition != previous_partition {
+            ordinal = 0;
+            previous_partition = partition;
+        }
+        ordinal = ordinal.checked_add(1).ok_or(SqlError::InvalidSyntax)?;
+        let rank = match window.function {
+            WindowFunction::RowNumber | WindowFunction::Rank => ordinal,
+        };
+        output.push(vec![value, SqlValue::Unsigned(rank)]);
+    }
+    Ok(SqlResult::Rows {
+        columns: vec![window.value_column.clone(), window.alias.clone()],
+        rows: output,
+    })
+}
+
+fn execute_cte_select(
+    transaction: &mut NativeWriteBatch,
+    cte: &ParsedCteSelect,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let inner_parameter_count = statement_parameter_count(&cte.inner)?;
+    let outer_parameter_count = statement_parameter_count(&cte.outer)?;
+    if parameters.len() != inner_parameter_count + outer_parameter_count {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let (inner_parameters, outer_parameters) = parameters.split_at(inner_parameter_count);
+    let inner = execute_parsed_transaction(transaction, &cte.inner, inner_parameters)?;
+    let SqlResult::Rows { columns, rows } = inner else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    let Statement::Select {
+        name,
+        projection,
+        filter,
+        parameter_count,
+        order_by,
+        limit,
+    } = cte.outer.as_ref()
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if normalize_identifier(name) != normalize_identifier(&cte.name)
+        || filter.is_some()
+        || *parameter_count != outer_parameters.len()
+        || !order_by.is_empty()
+    {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let projection = match projection {
+        Projection::All => (0..columns.len()).collect::<Vec<_>>(),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| {
+                let lookup = normalize_identifier(name);
+                columns
+                    .iter()
+                    .position(|column| normalize_identifier(column) == lookup)
+                    .ok_or(SqlError::UnknownColumn)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let output_columns = projection
+        .iter()
+        .map(|index| columns.get(*index).cloned().ok_or(SqlError::UnknownColumn))
+        .collect::<Result<Vec<_>, _>>()?;
+    let limit = limit.unwrap_or(rows.len());
+    let rows = rows
+        .into_iter()
+        .take(limit)
+        .map(|row| {
+            projection
+                .iter()
+                .map(|index| row.get(*index).cloned().ok_or(SqlError::InvalidStoredRow))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SqlResult::Rows {
+        columns: output_columns,
+        rows,
+    })
+}
+
+fn statement_parameter_count(statement: &Statement) -> Result<usize, SqlError> {
+    match statement {
+        Statement::Select {
+            parameter_count, ..
+        } => Ok(*parameter_count),
+        _ => Err(SqlError::InvalidSyntax),
+    }
+}
+
+fn execute_parsed_transaction(
+    transaction: &mut NativeWriteBatch,
+    statement: &Statement,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    match statement {
+        Statement::Select {
+            name,
+            projection,
+            filter,
+            parameter_count,
+            order_by,
+            limit,
+        } => execute_select(
+            transaction,
+            SelectQuery {
+                name,
+                projection,
+                filter: filter.as_ref(),
+                parameter_count: *parameter_count,
+                order_by,
+                limit: *limit,
+            },
+            parameters,
+        ),
+        _ => Err(SqlError::InvalidSyntax),
+    }
+}
+
+pub(crate) struct TransactionDml {
+    statement: Statement,
+}
+
+impl TransactionDml {
+    pub(crate) fn parse(statement: &str) -> Result<Self, SqlError> {
+        let statement = parse(statement)?;
+        match statement {
+            Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+                Ok(Self { statement })
+            }
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn relation_name(&self) -> Result<&str, SqlError> {
+        match &self.statement {
+            Statement::Insert { name, .. }
+            | Statement::Update { name, .. }
+            | Statement::Delete { name, .. } => Ok(name),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn primary_key(
+        &self,
+        transaction: &NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<(ObjectId, Vec<u8>), SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => {
+                let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+                let resolved =
+                    resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
+                let values = bind_insert_values(definition, values, &resolved)?;
+                let primary_key = if is_legacy_binary_relation(definition) {
+                    legacy_binary_value(values[0], false)?
+                } else {
+                    encode_primary_key(definition, &values)?
+                };
+                Ok((table, primary_key))
+            }
+            Statement::Update {
+                name,
+                predicates,
+                parameter_count,
+                ..
+            }
+            | Statement::Delete {
+                name,
+                predicates,
+                parameter_count,
+            } => {
+                let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+                let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+                let predicate_values = resolve_mutation_operands(
+                    definition,
+                    predicates,
+                    *parameter_count,
+                    parameters,
+                )?;
+                let primary_key =
+                    bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+                Ok((table, primary_key))
+            }
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn candidate_row(
+        &self,
+        transaction: &NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<Option<Vec<u8>>, SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => {
+                let (_, definition) = relation_named(&transaction.state.catalog, name)?;
+                let resolved =
+                    resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
+                let values = bind_insert_values(definition, values, &resolved)?;
+                if is_legacy_binary_relation(definition) {
+                    Ok(Some(legacy_binary_value(values[1], false)?))
+                } else {
+                    Ok(Some(encode_tuple(definition, &values)?))
+                }
+            }
+            Statement::Update {
+                name,
+                assignments,
+                predicates,
+                parameter_count,
+            } => transaction_update_candidate(
+                transaction,
+                name,
+                assignments,
+                predicates,
+                *parameter_count,
+                parameters,
+            ),
+            Statement::Delete { .. } => Ok(None),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        transaction: &mut NativeWriteBatch,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        match &self.statement {
+            Statement::Insert {
+                name,
+                values,
+                parameter_count,
+            } => execute_insert(transaction, name, values, *parameter_count, parameters),
+            Statement::Update {
+                name,
+                assignments,
+                predicates,
+                parameter_count,
+            } => execute_update(
+                transaction,
+                name,
+                assignments,
+                predicates,
+                *parameter_count,
+                parameters,
+            ),
+            Statement::Delete {
+                name,
+                predicates,
+                parameter_count,
+            } => execute_delete(transaction, name, predicates, *parameter_count, parameters),
+            _ => Err(SqlError::InvalidSyntax),
+        }
+    }
+}
+
+fn transaction_update_candidate(
+    transaction: &NativeWriteBatch,
+    name: &str,
+    assignments: &[ColumnOperand],
+    predicates: &[ColumnOperand],
+    parameter_count: usize,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let (table, definition) = relation_named(&transaction.state.catalog, name)?;
+    let assignment_columns = bind_update_columns(definition, assignments)?;
+    let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+    let assignment_values =
+        resolve_mutation_operands(definition, assignments, parameter_count, parameters)?;
+    let predicate_values =
+        resolve_mutation_operands(definition, predicates, parameter_count, parameters)?;
+    let primary_key = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+    let Some(stored) = transaction.select(table, &primary_key) else {
+        return Ok(None);
+    };
+    if is_legacy_binary_relation(definition) {
+        if assignment_columns.as_slice() != [1] {
+            return Err(SqlError::InvalidSyntax);
+        }
+        Ok(Some(legacy_binary_value(assignment_values.first(), false)?))
+    } else {
+        let assignments =
+            bind_update_assignments(definition, &assignment_columns, &assignment_values)?;
+        Ok(Some(encode_updated_tuple(
+            definition,
+            &assignments,
+            stored,
+        )?))
+    }
+}
+
+pub(crate) fn execute_transaction_dml(
+    transaction: &mut NativeWriteBatch,
+    statement: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    TransactionDml::parse(statement)?.execute(transaction, parameters)
 }
 
 fn execute_bound_snapshot(
@@ -1117,6 +1772,7 @@ fn execute_secondary_index_range_snapshot(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         range,
         limit,
@@ -1143,28 +1799,19 @@ fn execute_secondary_index_range_snapshot(
     if index_state.layout != SecondaryIndexLayout::OrderedV2 || index_state.relation != *table {
         return Err(SqlError::InvalidCatalogObject);
     }
+    let index_columns = secondary_index_column_indices(relation, index_definition)?;
+    let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
     for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
         for primary_key in primary_keys {
             let stored = snapshot
                 .select(*table, primary_key)
                 .ok_or(SqlError::InvalidStoredRow)?;
-            validate_secondary_index_row(
-                relation,
-                index_definition,
-                index_key,
-                primary_key,
-                stored,
-            )?;
-            if let Some(row) = materialize_filtered_row(
-                relation,
-                projection,
-                false,
-                primary_key,
-                stored,
-                Some(filter),
-                parameters,
-            )? {
+            let values = decode_complete_row(relation, false, primary_key, stored)?;
+            validate_secondary_index_values(relation, &index_columns, index_key, &values)?;
+            if let Some(row) =
+                materialize_decoded_row(relation, projection, &values, row_filter, parameters)?
+            {
                 rows.push(row);
                 if rows.len() == *limit {
                     return Ok(rows_result(output_columns, rows));
@@ -1189,6 +1836,7 @@ fn execute_secondary_index_range_latest(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         range,
         limit,
@@ -1206,6 +1854,8 @@ fn execute_secondary_index_range_latest(
     if key_range_is_empty(&lower, &upper) || *limit == 0 {
         return Ok(empty_rows_result(output_columns));
     }
+    let index_columns = secondary_index_column_indices(relation, index_definition)?;
+    let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
     database
         .visit_secondary_index_range_at(
@@ -1217,22 +1867,11 @@ fn execute_secondary_index_range_latest(
                 if matched_table != *table {
                     return Err(SqlError::InvalidCatalogObject);
                 }
-                validate_secondary_index_row(
-                    relation,
-                    index_definition,
-                    index_key,
-                    primary_key,
-                    stored,
-                )?;
-                if let Some(row) = materialize_filtered_row(
-                    relation,
-                    projection,
-                    false,
-                    primary_key,
-                    stored,
-                    Some(filter),
-                    parameters,
-                )? {
+                let values = decode_complete_row(relation, false, primary_key, stored)?;
+                validate_secondary_index_values(relation, &index_columns, index_key, &values)?;
+                if let Some(row) =
+                    materialize_decoded_row(relation, projection, &values, row_filter, parameters)?
+                {
                     rows.push(row);
                     if rows.len() == *limit {
                         return Ok(ControlFlow::Break(()));
@@ -2880,13 +3519,14 @@ fn execute_explain(
             index,
             range,
             limit,
-        } => format!(
-            "SecondaryIndexRangeScan(table={},index={index},lower={},upper={},limit={limit}{}",
+        } => explain_secondary_index_range(
+            &transaction.state.catalog,
             bound.table,
-            secondary_range_bound_name(range.lower.as_ref()),
-            secondary_range_bound_name(range.upper.as_ref()),
-            explain_suffix(bound.residual),
-        ),
+            bound.residual,
+            index,
+            &range,
+            limit,
+        )?,
         SelectAccess::PrimaryKeyScan { limit, .. } => {
             format!(
                 "PrimaryKeyScan(table={},limit={limit}{}",
@@ -2929,6 +3569,49 @@ fn execute_explain(
     Ok(SqlResult::Rows {
         columns: vec!["plan".to_owned()],
         rows: vec![vec![SqlValue::Text(plan)]],
+    })
+}
+
+fn explain_secondary_index_range(
+    catalog: &crate::model::CatalogState,
+    table: ObjectId,
+    residual: bool,
+    index: ObjectId,
+    range: &SecondaryIndexRange,
+    limit: usize,
+) -> Result<String, SqlError> {
+    Ok(match &range.kind {
+        SecondaryIndexRangeKind::Complete { lower, upper } => format!(
+            "SecondaryIndexRangeScan(table={},index={index},lower={},upper={},limit={limit}{}",
+            table,
+            secondary_range_bound_name(lower.as_ref()),
+            secondary_range_bound_name(upper.as_ref()),
+            explain_suffix(residual),
+        ),
+        SecondaryIndexRangeKind::Prefix {
+            prefix,
+            range_column,
+            lower,
+            upper,
+        } => {
+            let relation = relation_by_id(catalog, table)?;
+            let range_column = relation
+                .columns
+                .get(*range_column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .id
+                .get();
+            format!(
+                "SecondaryIndexPrefixRangeScan(table={},index={index},\
+                 prefix_columns={},range_column={range_column},lower={},\
+                 upper={},limit={limit}{}",
+                table,
+                prefix.columns.len(),
+                secondary_prefix_range_bound_name(lower.as_ref()),
+                secondary_prefix_range_bound_name(upper.as_ref()),
+                explain_suffix(residual),
+            )
+        }
     })
 }
 
@@ -2994,11 +3677,13 @@ fn explain_suffix(residual: bool) -> &'static str {
     if residual { ",residual=true)" } else { ")" }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_create(
     transaction: &mut NativeWriteBatch,
     name: &str,
-    parsed_columns: Vec<ParsedColumn>,
+    parsed_columns: &[ParsedColumn],
     primary_key_names: Vec<String>,
+    parsed_foreign_keys: Vec<ParsedForeignKey>,
     parameters: &[SqlValue],
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
@@ -3010,15 +3695,15 @@ fn execute_create(
         .next_object_id()
         .map_err(NativeRuntimeError::from)?;
     let mut columns = Vec::with_capacity(parsed_columns.len());
-    for (index, parsed) in parsed_columns.into_iter().enumerate() {
+    for (index, parsed) in parsed_columns.iter().enumerate() {
         let raw_id = u32::try_from(index)
             .ok()
             .and_then(|value| value.checked_add(1))
             .ok_or(SqlError::InvalidSyntax)?;
         columns.push(ColumnDefinition {
             id: ColumnId::new(raw_id).map_err(|_| SqlError::InvalidSyntax)?,
-            name: CatalogName::unquoted(parsed.name).map_err(NativeRuntimeError::from)?,
-            logical_type: parsed.logical_type,
+            name: CatalogName::unquoted(parsed.name.clone()).map_err(NativeRuntimeError::from)?,
+            logical_type: parsed.logical_type.clone(),
             nullable: parsed.nullable,
         });
     }
@@ -3035,6 +3720,125 @@ fn execute_create(
     if primary_key.is_empty() {
         return Err(SqlError::InvalidPrimaryKey);
     }
+    let mut checks = Vec::new();
+    for parsed in parsed_columns {
+        let Some(check) = &parsed.check else {
+            continue;
+        };
+        let index = columns
+            .iter()
+            .position(|column| column.name.lookup() == normalize_identifier(&parsed.name))
+            .ok_or(SqlError::UnknownColumn)?;
+        let column = &columns[index];
+        let operand = match bind_scalar_operand(&column.logical_type, &check.operand)? {
+            BoundScalarOperand::Literal(value) if !matches!(value, SqlValue::Null) => value,
+            BoundScalarOperand::Literal(_) | BoundScalarOperand::Parameter(_) => {
+                return Err(SqlError::InvalidSyntax);
+            }
+        };
+        checks.push((
+            column.id,
+            ColumnCheckConstraint {
+                operator: catalog_check_operator(check.operator),
+                operand,
+            },
+        ));
+    }
+    let mut constraint_names = BTreeSet::new();
+    for foreign_key in &parsed_foreign_keys {
+        if let Some(name) = &foreign_key.name
+            && !constraint_names.insert(normalize_identifier(name))
+        {
+            return Err(SqlError::DuplicateColumn);
+        }
+    }
+    let mut foreign_keys = Vec::new();
+    for foreign_key in parsed_foreign_keys {
+        let child_columns = foreign_key
+            .columns
+            .iter()
+            .map(|name| column_index(&columns, name).map(|index| columns[index].id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let self_reference =
+            normalize_identifier(&foreign_key.referenced_table) == normalize_identifier(name);
+        let (parent_id, parent) = if self_reference {
+            (id, None)
+        } else {
+            let (parent_id, parent) =
+                relation_named(&transaction.state.catalog, &foreign_key.referenced_table)?;
+            (parent_id, Some(parent))
+        };
+        let parent_columns_source =
+            parent.map_or(columns.as_slice(), |parent| parent.columns.as_slice());
+        let parent_primary_key = parent.map_or(primary_key.as_slice(), |parent| {
+            parent.primary_key.as_slice()
+        });
+        let parent_columns = foreign_key
+            .referenced_columns
+            .iter()
+            .map(|name| {
+                column_index(parent_columns_source, name)
+                    .map(|index| parent_columns_source[index].id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let referenced_index = if parent_columns == parent_primary_key {
+            None
+        } else if self_reference {
+            return Err(SqlError::InvalidCatalogObject);
+        } else {
+            transaction
+                .state
+                .catalog
+                .objects
+                .values()
+                .find_map(|object| match object {
+                    CatalogObject::SecondaryIndex(index)
+                        if index.relation == parent_id
+                            && index.unique
+                            && index.columns == parent_columns
+                            && index.columns.iter().all(|column_id| {
+                                parent_columns_source
+                                    .iter()
+                                    .any(|column| column.id == *column_id && !column.nullable)
+                            }) =>
+                    {
+                        Some(index.header.id)
+                    }
+                    _ => None,
+                })
+        };
+        if child_columns.len() != parent_columns.len()
+            || (parent_columns != parent_primary_key && referenced_index.is_none())
+        {
+            return Err(SqlError::InvalidCatalogObject);
+        }
+        for (child, parent_column) in child_columns.iter().zip(&parent_columns) {
+            let child_type = &columns
+                .iter()
+                .find(|column| column.id == *child)
+                .ok_or(SqlError::UnknownColumn)?
+                .logical_type;
+            let parent_type = &parent_columns_source
+                .iter()
+                .find(|column| column.id == *parent_column)
+                .ok_or(SqlError::UnknownColumn)?
+                .logical_type;
+            if child_type != parent_type {
+                return Err(SqlError::TypeMismatch);
+            }
+        }
+        foreign_keys.push(ForeignKeyDefinition {
+            name: foreign_key
+                .name
+                .map(CatalogName::unquoted)
+                .transpose()
+                .map_err(NativeRuntimeError::from)?,
+            columns: child_columns,
+            referenced_relation: parent_id,
+            referenced_columns: parent_columns,
+            referenced_index,
+        });
+    }
     let mut definition = RelationDefinition {
         header: ObjectHeader {
             id,
@@ -3043,6 +3847,8 @@ fn execute_create(
         },
         columns,
         primary_key,
+        checks,
+        foreign_keys,
     };
     if is_legacy_binary_relation(&definition) {
         for column in &mut definition.columns {
@@ -3051,6 +3857,140 @@ fn execute_create(
     }
     definition.validate().map_err(NativeRuntimeError::from)?;
     transaction.create_relation_definition(definition)?;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_alter_table_rename(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    new_name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .id_named(name, EngineKind::Relational)
+        .map_err(NativeRuntimeError::from)?;
+    if transaction
+        .state
+        .catalog
+        .id_named(new_name, EngineKind::Relational)
+        .is_ok()
+    {
+        return Err(SqlError::InvalidCatalogObject);
+    }
+    let Some(CatalogObject::Relation(current)) = transaction.state.catalog.object(id) else {
+        return Err(SqlError::InvalidCatalogObject);
+    };
+    let mut renamed = current.clone();
+    renamed.header.name.object =
+        CatalogName::unquoted(new_name).map_err(NativeRuntimeError::from)?;
+    transaction
+        .state
+        .catalog
+        .replace(CatalogObject::Relation(renamed.clone()))
+        .map_err(NativeRuntimeError::from)?;
+    transaction.mutations.push(crate::wal_codec::Mutation {
+        engine: EngineKind::Relational,
+        opcode: crate::wal_codec::Opcode::RenameTable,
+        target: Some(id),
+        key: name.as_bytes().to_vec(),
+        value: CatalogObject::Relation(renamed)
+            .encode_definition()
+            .map_err(NativeRuntimeError::from)?,
+        expires_at_micros: None,
+    });
+    transaction.dirty[0] = true;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_drop_table(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .id_named(name, EngineKind::Relational)
+        .map_err(NativeRuntimeError::from)?;
+    let Some(CatalogObject::Relation(_)) = transaction.state.catalog.object(id) else {
+        return Err(SqlError::InvalidCatalogObject);
+    };
+    transaction
+        .state
+        .relational
+        .drop_table(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction
+        .state
+        .catalog
+        .remove(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction.mutations.push(crate::wal_codec::Mutation {
+        engine: EngineKind::Relational,
+        opcode: crate::wal_codec::Opcode::DropTable,
+        target: Some(id),
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_micros: None,
+    });
+    transaction.dirty[0] = true;
+    transaction.dirty[1] = true;
+    Ok(SqlResult::Command {
+        rows_affected: 0,
+        object_id: Some(id),
+    })
+}
+
+fn execute_drop_index(
+    transaction: &mut NativeWriteBatch,
+    name: &str,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let id = transaction
+        .state
+        .catalog
+        .id_named(name, EngineKind::Relational)
+        .map_err(NativeRuntimeError::from)?;
+    let Some(CatalogObject::SecondaryIndex(_)) = transaction.state.catalog.object(id) else {
+        return Err(SqlError::InvalidCatalogObject);
+    };
+    transaction
+        .state
+        .relational
+        .drop_secondary_index(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction
+        .state
+        .catalog
+        .remove(id)
+        .map_err(NativeRuntimeError::from)?;
+    transaction.mutations.push(crate::wal_codec::Mutation {
+        engine: EngineKind::Relational,
+        opcode: crate::wal_codec::Opcode::DropSecondaryIndex,
+        target: Some(id),
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_micros: None,
+    });
+    transaction.dirty[0] = true;
+    transaction.dirty[1] = true;
     Ok(SqlResult::Command {
         rows_affected: 0,
         object_id: Some(id),
@@ -3069,6 +4009,7 @@ fn execute_insert(
     let resolved =
         resolve_mutation_operands(&definition, supplied_values, parameter_count, parameters)?;
     let values = bind_insert_values(&definition, supplied_values, &resolved)?;
+    validate_foreign_keys(transaction, &definition, &values)?;
     if is_legacy_binary_relation(&definition) {
         let primary_key = legacy_binary_value(values[0], false)?;
         let row = legacy_binary_value(values[1], false)?;
@@ -3086,6 +4027,23 @@ fn execute_insert(
         rows_affected: 1,
         object_id: None,
     })
+}
+
+fn decode_stored_values(
+    definition: &RelationDefinition,
+    stored: &[u8],
+) -> Result<Vec<SqlValue>, SqlError> {
+    decode_complete_row(definition, false, &[], stored)
+}
+
+fn validate_updated_foreign_keys(
+    transaction: &NativeWriteBatch,
+    definition: &RelationDefinition,
+    stored: &[u8],
+) -> Result<(), SqlError> {
+    let values = decode_stored_values(definition, stored)?;
+    let references = values.iter().map(Some).collect::<Vec<_>>();
+    validate_foreign_keys(transaction, definition, &references)
 }
 
 fn execute_update(
@@ -3121,10 +4079,74 @@ fn execute_update(
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
+    if !is_legacy_binary_relation(&definition) {
+        validate_updated_foreign_keys(transaction, &definition, &update)?;
+    }
     transaction
         .update(table, primary_key, update)
         .map_err(map_runtime_error)?;
     Ok(command_result(1))
+}
+
+fn validate_parent_not_referenced(
+    transaction: &NativeWriteBatch,
+    parent: ObjectId,
+    parent_key: &[u8],
+) -> Result<(), SqlError> {
+    for object in transaction.state.catalog.objects.values() {
+        let CatalogObject::Relation(child) = object else {
+            continue;
+        };
+        for foreign_key in &child.foreign_keys {
+            if foreign_key.referenced_relation != parent {
+                continue;
+            }
+            let Some(rows) = transaction.state.relational.tables.get(&child.header.id) else {
+                continue;
+            };
+            for (child_key, stored) in rows {
+                let values = decode_complete_row(child, false, child_key, stored)?;
+                let mut key = Vec::new();
+                let mut contains_null = false;
+                for (child_column, parent_column) in foreign_key
+                    .columns
+                    .iter()
+                    .zip(&foreign_key.referenced_columns)
+                {
+                    let child_index = child
+                        .columns
+                        .iter()
+                        .position(|column| column.id == *child_column)
+                        .ok_or(SqlError::InvalidCatalogObject)?;
+                    let value = &values[child_index];
+                    if matches!(value, SqlValue::Null) {
+                        contains_null = true;
+                        break;
+                    }
+                    let Some(CatalogObject::Relation(parent_definition)) =
+                        transaction.state.catalog.object(parent)
+                    else {
+                        return Err(SqlError::InvalidCatalogObject);
+                    };
+                    let parent_type = &parent_definition
+                        .columns
+                        .iter()
+                        .find(|column| column.id == *parent_column)
+                        .ok_or(SqlError::InvalidCatalogObject)?
+                        .logical_type;
+                    key.extend_from_slice(
+                        &value
+                            .encode_ordered_component(parent_type)
+                            .map_err(|_| SqlError::TypeMismatch)?,
+                    );
+                }
+                if !contains_null && key == parent_key {
+                    return Err(SqlError::ForeignKeyViolation);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_delete(
@@ -3142,6 +4164,7 @@ fn execute_delete(
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
+    validate_parent_not_referenced(transaction, table, &primary_key)?;
     transaction
         .delete(table, primary_key)
         .map_err(map_runtime_error)?;
@@ -3171,9 +4194,9 @@ fn execute_select(
         projection,
         filter,
         parameter_count,
+        residual,
         output_columns,
         access,
-        ..
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -3183,6 +4206,7 @@ fn execute_select(
         definition,
         projection: &projection,
         filter: filter.as_ref(),
+        residual,
         parameters,
     };
     let rows = match access {
@@ -3243,6 +4267,7 @@ struct TransactionSelectContext<'context> {
     definition: &'context RelationDefinition,
     projection: &'context [usize],
     filter: Option<&'context BoundFilterExpression>,
+    residual: bool,
     parameters: &'context [SqlValue],
 }
 
@@ -3350,6 +4375,8 @@ impl TransactionSelectContext<'_> {
         {
             return Err(SqlError::InvalidCatalogObject);
         }
+        let index_columns = secondary_index_column_indices(self.definition, definition)?;
+        let row_filter = if self.residual { self.filter } else { None };
         let mut rows = Vec::with_capacity(limit.min(256));
         for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
             for primary_key in primary_keys {
@@ -3357,20 +4384,18 @@ impl TransactionSelectContext<'_> {
                     .transaction
                     .select(self.table, primary_key)
                     .ok_or(SqlError::InvalidStoredRow)?;
-                validate_secondary_index_row(
+                let values = decode_complete_row(self.definition, false, primary_key, stored)?;
+                validate_secondary_index_values(
                     self.definition,
-                    definition,
+                    &index_columns,
                     index_key,
-                    primary_key,
-                    stored,
+                    &values,
                 )?;
-                if let Some(row) = materialize_filtered_row(
+                if let Some(row) = materialize_decoded_row(
                     self.definition,
                     self.projection,
-                    false,
-                    primary_key,
-                    stored,
-                    self.filter,
+                    &values,
+                    row_filter,
                     self.parameters,
                 )? {
                     rows.push(row);
@@ -3598,7 +4623,7 @@ fn bind_select_access(
         query.limit,
     )? {
         access
-    } else if let Some(prefix) = find_primary_key_prefix(&comparisons, &expected_primary_key) {
+    } else if let Some(prefix) = find_key_prefix(&comparisons, &expected_primary_key) {
         let limit = query.limit.ok_or(SqlError::InvalidSyntax)?;
         validate_primary_key_order(definition, query.order_by, &expected_primary_key)?;
         let used_terms = prefix.columns.len();
@@ -4144,13 +5169,13 @@ fn find_equality_key(
     })
 }
 
-fn find_primary_key_prefix(
+fn find_key_prefix(
     comparisons: &[&BoundFilterExpression],
-    primary_key: &[usize],
+    key_columns: &[usize],
 ) -> Option<KeyBinding> {
-    let mut columns = Vec::with_capacity(primary_key.len().saturating_sub(1));
-    let mut operands = Vec::with_capacity(primary_key.len().saturating_sub(1));
-    for key_column in primary_key {
+    let mut columns = Vec::with_capacity(key_columns.len().saturating_sub(1));
+    let mut operands = Vec::with_capacity(key_columns.len().saturating_sub(1));
+    for key_column in key_columns {
         let matching = comparisons
             .iter()
             .filter_map(|comparison| {
@@ -4176,7 +5201,7 @@ fn find_primary_key_prefix(
         columns.push(*key_column);
         operands.push(operand.clone());
     }
-    (!columns.is_empty() && columns.len() < primary_key.len())
+    (!columns.is_empty() && columns.len() < key_columns.len())
         .then_some(KeyBinding { columns, operands })
 }
 
@@ -4184,7 +5209,7 @@ fn bind_primary_key_prefix_range_shape(
     comparisons: &[&BoundFilterExpression],
     primary_key: &[usize],
 ) -> Result<Option<(PrimaryKeyPrefixRange, usize)>, SqlError> {
-    let Some(prefix) = find_primary_key_prefix(comparisons, primary_key) else {
+    let Some(prefix) = find_key_prefix(comparisons, primary_key) else {
         return Ok(None);
     };
     let range_column = primary_key
@@ -4317,6 +5342,7 @@ fn bind_secondary_index_range_access(
     limit: Option<usize>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<Option<(SelectAccess, usize)>, SqlError> {
+    let mut matched_invalid_order = false;
     for (index, object) in &catalog.objects {
         let CatalogObject::SecondaryIndex(index_definition) = object else {
             continue;
@@ -4325,13 +5351,26 @@ fn bind_secondary_index_range_access(
             continue;
         }
         let columns = secondary_index_column_indices(definition, index_definition)?;
-        let Some((range, used_terms)) =
-            bind_secondary_index_range_shape(comparisons, &columns, parameter_count)?
-        else {
-            continue;
+        let bound_range = bind_secondary_index_range_shape(comparisons, &columns, parameter_count)?;
+        let (range, used_terms) = if let Some(range) = bound_range {
+            range
+        } else {
+            let Some(range) =
+                bind_secondary_index_prefix_range_shape(comparisons, &columns, parameter_count)?
+            else {
+                continue;
+            };
+            range
         };
         let limit = limit.ok_or(SqlError::InvalidSyntax)?;
-        validate_secondary_index_order(definition, order_by, &columns)?;
+        match validate_secondary_index_order(definition, order_by, &columns) {
+            Ok(()) => {}
+            Err(SqlError::InvalidSecondaryIndexRange) => {
+                matched_invalid_order = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
         return Ok(Some((
             SelectAccess::SecondaryIndexRangeScan {
                 index: *index,
@@ -4341,7 +5380,11 @@ fn bind_secondary_index_range_access(
             used_terms,
         )));
     }
-    Ok(None)
+    if matched_invalid_order {
+        Err(SqlError::InvalidSecondaryIndexRange)
+    } else {
+        Ok(None)
+    }
 }
 
 fn bind_secondary_index_range_shape(
@@ -4398,8 +5441,78 @@ fn bind_secondary_index_range_shape(
     }
     Ok(Some((
         SecondaryIndexRange {
-            lower,
-            upper,
+            kind: SecondaryIndexRangeKind::Complete { lower, upper },
+            parameter_count,
+        },
+        used_terms,
+    )))
+}
+
+fn bind_secondary_index_prefix_range_shape(
+    comparisons: &[&BoundFilterExpression],
+    index_columns: &[usize],
+    parameter_count: usize,
+) -> Result<Option<(SecondaryIndexRange, usize)>, SqlError> {
+    let Some(prefix) = find_key_prefix(comparisons, index_columns) else {
+        return Ok(None);
+    };
+    let range_column = index_columns
+        .get(prefix.columns.len())
+        .copied()
+        .ok_or(SqlError::InvalidSecondaryIndexRange)?;
+    let mut lower = None;
+    let mut upper = None;
+    let mut range_terms = 0_usize;
+    for predicate in comparisons {
+        let BoundFilterExpression::Comparison {
+            columns,
+            operator,
+            operands,
+        } = predicate
+        else {
+            continue;
+        };
+        if columns.as_slice() != [range_column] {
+            continue;
+        }
+        let [operand] = operands.as_slice() else {
+            return Err(SqlError::InvalidSecondaryIndexRange);
+        };
+        let endpoint = SecondaryIndexPrefixRangeEndpoint {
+            operand: operand.clone(),
+            inclusive: matches!(
+                operator,
+                ComparisonOperator::GreaterOrEqual | ComparisonOperator::LessOrEqual
+            ),
+        };
+        match operator {
+            ComparisonOperator::Greater | ComparisonOperator::GreaterOrEqual => {
+                if lower.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidSecondaryIndexRange);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Less | ComparisonOperator::LessOrEqual => {
+                if upper.replace(endpoint).is_some() {
+                    return Err(SqlError::InvalidSecondaryIndexRange);
+                }
+                range_terms = range_terms.saturating_add(1);
+            }
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual => {}
+        }
+    }
+    if lower.is_none() && upper.is_none() {
+        return Ok(None);
+    }
+    let used_terms = prefix.columns.len().saturating_add(range_terms);
+    Ok(Some((
+        SecondaryIndexRange {
+            kind: SecondaryIndexRangeKind::Prefix {
+                prefix,
+                range_column,
+                lower,
+                upper,
+            },
             parameter_count,
         },
         used_terms,
@@ -4481,6 +5594,16 @@ fn secondary_range_bound_name(endpoint: Option<&SecondaryIndexRangeEndpoint>) ->
     }
 }
 
+fn secondary_prefix_range_bound_name(
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+) -> &'static str {
+    match endpoint {
+        Some(endpoint) if endpoint.inclusive => "inclusive",
+        Some(_) => "exclusive",
+        None => "unbounded",
+    }
+}
+
 fn prefix_range_bound_name(endpoint: Option<&PrimaryKeyPrefixRangeEndpoint>) -> &'static str {
     match endpoint {
         Some(endpoint) if endpoint.inclusive => "inclusive",
@@ -4491,6 +5614,127 @@ fn prefix_range_bound_name(endpoint: Option<&PrimaryKeyPrefixRangeEndpoint>) -> 
 
 fn same_column_set(left: &[usize], right: &[usize]) -> bool {
     left.len() == right.len() && left.iter().all(|column| right.contains(column))
+}
+
+fn catalog_check_operator(operator: ComparisonOperator) -> ColumnCheckOperator {
+    match operator {
+        ComparisonOperator::Equal => ColumnCheckOperator::Equal,
+        ComparisonOperator::NotEqual => ColumnCheckOperator::NotEqual,
+        ComparisonOperator::Less => ColumnCheckOperator::Less,
+        ComparisonOperator::LessOrEqual => ColumnCheckOperator::LessOrEqual,
+        ComparisonOperator::Greater => ColumnCheckOperator::Greater,
+        ComparisonOperator::GreaterOrEqual => ColumnCheckOperator::GreaterOrEqual,
+    }
+}
+
+fn validate_checks(
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<(), SqlError> {
+    for (column_id, check) in &definition.checks {
+        let index = definition
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or(SqlError::InvalidCatalogObject)?;
+        let Some(value) = values.get(index).copied().flatten() else {
+            continue;
+        };
+        if matches!(value, SqlValue::Null) {
+            continue;
+        }
+        let ordering = compare_sql_values(
+            &definition.columns[index].logical_type,
+            value,
+            &check.operand,
+        )?
+        .ok_or(SqlError::CheckViolation)?;
+        let passes = match check.operator {
+            ColumnCheckOperator::Equal => ordering == Ordering::Equal,
+            ColumnCheckOperator::NotEqual => ordering != Ordering::Equal,
+            ColumnCheckOperator::Less => ordering == Ordering::Less,
+            ColumnCheckOperator::LessOrEqual => ordering != Ordering::Greater,
+            ColumnCheckOperator::Greater => ordering == Ordering::Greater,
+            ColumnCheckOperator::GreaterOrEqual => ordering != Ordering::Less,
+        };
+        if !passes {
+            return Err(SqlError::CheckViolation);
+        }
+    }
+    Ok(())
+}
+
+fn validate_foreign_keys(
+    transaction: &NativeWriteBatch,
+    definition: &RelationDefinition,
+    values: &[Option<&SqlValue>],
+) -> Result<(), SqlError> {
+    for foreign_key in &definition.foreign_keys {
+        let mut key = Vec::new();
+        let mut contains_null = false;
+        let Some(CatalogObject::Relation(parent)) = transaction
+            .state
+            .catalog
+            .object(foreign_key.referenced_relation)
+        else {
+            return Err(SqlError::InvalidCatalogObject);
+        };
+        for (child_column, parent_column) in foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+        {
+            let child_index = definition
+                .columns
+                .iter()
+                .position(|column| column.id == *child_column)
+                .ok_or(SqlError::InvalidCatalogObject)?;
+            let value = values.get(child_index).copied().flatten();
+            if value.is_none_or(|value| matches!(value, SqlValue::Null)) {
+                contains_null = true;
+                break;
+            }
+            let parent_type = &parent
+                .columns
+                .iter()
+                .find(|column| column.id == *parent_column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type;
+            key.extend_from_slice(
+                &value
+                    .ok_or(SqlError::InvalidCatalogObject)?
+                    .encode_ordered_component(parent_type)
+                    .map_err(|_| SqlError::TypeMismatch)?,
+            );
+        }
+        if !contains_null
+            && foreign_key.referenced_relation == definition.header.id
+            && encode_primary_key(definition, values)? == key
+        {
+            continue;
+        }
+        if !contains_null {
+            let parent_exists = if let Some(index) = foreign_key.referenced_index {
+                transaction
+                    .state
+                    .relational
+                    .indexes
+                    .get(&index)
+                    .and_then(|index| index.entries.get(&key))
+                    .is_some_and(|entries| !entries.is_empty())
+            } else {
+                transaction
+                    .state
+                    .relational
+                    .select(foreign_key.referenced_relation, &key)
+                    .is_some()
+            };
+            if !parent_exists {
+                return Err(SqlError::ForeignKeyViolation);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bind_insert_values<'value>(
@@ -4514,6 +5758,7 @@ fn bind_insert_values<'value>(
             return Err(SqlError::NullViolation);
         }
     }
+    validate_checks(definition, &values)?;
     Ok(values)
 }
 
@@ -4650,6 +5895,22 @@ fn encode_updated_tuple(
             .ok_or(SqlError::InvalidCatalogObject)?
             .clone_from(&assignment.value);
     }
+    let decoded = definition
+        .columns
+        .iter()
+        .zip(&values)
+        .map(|(column, value)| {
+            value
+                .as_ref()
+                .map(|encoded| {
+                    SqlValue::decode_storage(&column.logical_type, encoded)
+                        .map_err(|_| SqlError::InvalidStoredRow)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let references = decoded.iter().map(Option::as_ref).collect::<Vec<_>>();
+    validate_checks(definition, &references)?;
     RowTuple::new(values)
         .and_then(|tuple| tuple.encode())
         .map_err(|_| SqlError::InvalidStoredRow)
@@ -4951,15 +6212,45 @@ fn bind_secondary_index_range(
     if parameters.len() != range.parameter_count {
         return Err(SqlError::ParameterMismatch);
     }
+    match &range.kind {
+        SecondaryIndexRangeKind::Complete { lower, upper } => bind_complete_secondary_index_range(
+            relation,
+            index,
+            lower.as_ref(),
+            upper.as_ref(),
+            parameters,
+        ),
+        SecondaryIndexRangeKind::Prefix {
+            prefix,
+            range_column,
+            lower,
+            upper,
+        } => bind_secondary_index_prefix_range(
+            relation,
+            index,
+            prefix,
+            *range_column,
+            lower.as_ref(),
+            upper.as_ref(),
+            parameters,
+        ),
+    }
+}
+
+fn bind_complete_secondary_index_range(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    lower: Option<&SecondaryIndexRangeEndpoint>,
+    upper: Option<&SecondaryIndexRangeEndpoint>,
+    parameters: &[SqlValue],
+) -> Result<Option<KeyBounds>, SqlError> {
     let Some(lower) =
-        bind_secondary_index_range_endpoint(relation, index, range.lower.as_ref(), parameters)?
-            .into_bound()
+        bind_secondary_index_range_endpoint(relation, index, lower, parameters)?.into_bound()
     else {
         return Ok(None);
     };
     let Some(upper) =
-        bind_secondary_index_range_endpoint(relation, index, range.upper.as_ref(), parameters)?
-            .into_bound()
+        bind_secondary_index_range_endpoint(relation, index, upper, parameters)?.into_bound()
     else {
         return Ok(None);
     };
@@ -4986,23 +6277,150 @@ fn bind_secondary_index_range_endpoint(
     )
 }
 
-fn validate_secondary_index_row(
+fn bind_secondary_index_prefix_range(
     relation: &RelationDefinition,
     index: &SecondaryIndexDefinition,
-    stored_index_key: &[u8],
-    primary_key: &[u8],
-    stored: &[u8],
-) -> Result<(), SqlError> {
-    let values = decode_complete_row(relation, false, primary_key, stored)?;
-    let mut actual_index_key = Vec::new();
-    for column in secondary_index_column_indices(relation, index)? {
-        actual_index_key.extend_from_slice(
-            &values[column]
-                .encode_ordered_component(&relation.columns[column].logical_type)
-                .map_err(|_| SqlError::InvalidStoredRow)?,
-        );
+    prefix: &KeyBinding,
+    range_column: usize,
+    lower: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    upper: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    parameters: &[SqlValue],
+) -> Result<Option<KeyBounds>, SqlError> {
+    let prefix_column_count = prefix.columns.len();
+    let Some(encoded_prefix) = bind_secondary_index_prefix(relation, index, prefix, parameters)?
+    else {
+        return Ok(None);
+    };
+    let index_columns = secondary_index_column_indices(relation, index)?;
+    if index_columns.get(prefix_column_count) != Some(&range_column) {
+        return Err(SqlError::InvalidSecondaryIndexRange);
     }
-    if actual_index_key == stored_index_key {
+    let logical_type = &relation
+        .columns
+        .get(range_column)
+        .ok_or(SqlError::InvalidCatalogObject)?
+        .logical_type;
+    let prefix_upper = binary_prefix_successor(&encoded_prefix);
+    let lower =
+        bind_secondary_index_prefix_lower(&encoded_prefix, lower, logical_type, parameters)?;
+    let Some(lower) = lower else {
+        return Ok(None);
+    };
+    let upper = bind_secondary_index_prefix_upper(
+        &encoded_prefix,
+        prefix_upper,
+        upper,
+        logical_type,
+        parameters,
+    )?;
+    let Some(upper) = upper else {
+        return Ok(None);
+    };
+    Ok(Some((lower, upper)))
+}
+
+fn bind_secondary_index_prefix(
+    relation: &RelationDefinition,
+    index: &SecondaryIndexDefinition,
+    prefix: &KeyBinding,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let index_columns = secondary_index_column_indices(relation, index)?;
+    if prefix.columns.is_empty()
+        || prefix.columns.len() >= index_columns.len()
+        || !index_columns.starts_with(&prefix.columns)
+        || prefix.columns.len() != prefix.operands.len()
+    {
+        return Err(SqlError::InvalidSecondaryIndexRange);
+    }
+    let mut encoded = Vec::new();
+    for (column, operand) in prefix.columns.iter().zip(&prefix.operands) {
+        let value = resolve_operand(operand, parameters)?;
+        if matches!(value, SqlValue::Null) {
+            return Ok(None);
+        }
+        encoded = append_ordered_component(
+            &encoded,
+            value,
+            &relation
+                .columns
+                .get(*column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type,
+        )?;
+    }
+    Ok(Some(encoded))
+}
+
+fn bind_secondary_index_prefix_lower(
+    prefix: &[u8],
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    logical_type: &LogicalType,
+    parameters: &[SqlValue],
+) -> Result<Option<Bound<Vec<u8>>>, SqlError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(Some(Bound::Included(prefix.to_vec())));
+    };
+    let value = resolve_operand(&endpoint.operand, parameters)?;
+    if matches!(value, SqlValue::Null) {
+        return Ok(None);
+    }
+    let key = append_ordered_component(prefix, value, logical_type)?;
+    if endpoint.inclusive {
+        Ok(Some(Bound::Included(key)))
+    } else {
+        Ok(binary_prefix_successor(&key).map(Bound::Included))
+    }
+}
+
+fn bind_secondary_index_prefix_upper(
+    prefix: &[u8],
+    prefix_upper: Option<Vec<u8>>,
+    endpoint: Option<&SecondaryIndexPrefixRangeEndpoint>,
+    logical_type: &LogicalType,
+    parameters: &[SqlValue],
+) -> Result<Option<Bound<Vec<u8>>>, SqlError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(Some(prefix_upper.map_or(Bound::Unbounded, Bound::Excluded)));
+    };
+    let value = resolve_operand(&endpoint.operand, parameters)?;
+    if matches!(value, SqlValue::Null) {
+        return Ok(None);
+    }
+    let key = append_ordered_component(prefix, value, logical_type)?;
+    if endpoint.inclusive {
+        Ok(Some(
+            binary_prefix_successor(&key)
+                .or(prefix_upper)
+                .map_or(Bound::Unbounded, Bound::Excluded),
+        ))
+    } else {
+        Ok(Some(Bound::Excluded(key)))
+    }
+}
+
+fn validate_secondary_index_values(
+    relation: &RelationDefinition,
+    index_columns: &[usize],
+    stored_index_key: &[u8],
+    values: &[SqlValue],
+) -> Result<(), SqlError> {
+    let mut offset = 0_usize;
+    for &column in index_columns {
+        let component = values
+            .get(column)
+            .ok_or(SqlError::InvalidStoredRow)?
+            .encode_ordered_component(&relation.columns[column].logical_type)
+            .map_err(|_| SqlError::InvalidStoredRow)?;
+        let end = offset
+            .checked_add(component.len())
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if stored_index_key.get(offset..end) != Some(component.as_slice()) {
+            return Err(SqlError::InvalidStoredRow);
+        }
+        offset = end;
+    }
+    if offset == stored_index_key.len() {
         Ok(())
     } else {
         Err(SqlError::InvalidStoredRow)
@@ -5249,8 +6667,18 @@ fn materialize_filtered_row(
     parameters: &[SqlValue],
 ) -> Result<Option<Vec<SqlValue>>, SqlError> {
     let values = decode_complete_row(definition, legacy_binary, primary_key, stored)?;
+    materialize_decoded_row(definition, projection, &values, filter, parameters)
+}
+
+fn materialize_decoded_row(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    values: &[SqlValue],
+    filter: Option<&BoundFilterExpression>,
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<SqlValue>>, SqlError> {
     if let Some(expression) = filter
-        && evaluate_filter(definition, expression, &values, parameters)? != TruthValue::True
+        && evaluate_filter(definition, expression, values, parameters)? != TruthValue::True
     {
         return Ok(None);
     }
@@ -5344,8 +6772,14 @@ fn relation_named<'catalog>(
 ) -> Result<(ObjectId, &'catalog RelationDefinition), SqlError> {
     let id = catalog
         .id_named(name, EngineKind::Relational)
-        .map_err(NativeRuntimeError::from)?;
-    Ok((id, relation_by_id(catalog, id)?))
+        .map_err(|error| match error {
+            crate::model::ModelError::UnknownObject => SqlError::UnknownRelation,
+            error => SqlError::Runtime(NativeRuntimeError::from(error)),
+        })?;
+    match catalog.object(id) {
+        Some(CatalogObject::Relation(definition)) => Ok((id, definition)),
+        Some(_) | None => Err(SqlError::UnknownRelation),
+    }
 }
 
 fn relation_by_id(
@@ -5357,9 +6791,10 @@ fn relation_by_id(
         Some(
             CatalogObject::SecondaryIndex(_)
             | CatalogObject::Structure(_)
-            | CatalogObject::Search(_),
-        )
-        | None => Err(SqlError::InvalidCatalogObject),
+            | CatalogObject::Search(_)
+            | CatalogObject::CrossEngineLink(_),
+        ) => Err(SqlError::InvalidCatalogObject),
+        None => Err(SqlError::UnknownRelation),
     }
 }
 
@@ -5370,15 +6805,20 @@ fn secondary_index_by_id(
     match catalog.object(id) {
         Some(CatalogObject::SecondaryIndex(definition)) => Ok(definition),
         Some(
-            CatalogObject::Relation(_) | CatalogObject::Structure(_) | CatalogObject::Search(_),
+            CatalogObject::Relation(_)
+            | CatalogObject::Structure(_)
+            | CatalogObject::Search(_)
+            | CatalogObject::CrossEngineLink(_),
         )
         | None => Err(SqlError::InvalidCatalogObject),
     }
 }
 
-fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
+pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
     match error {
         NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
+        NativeRuntimeError::CheckConstraintViolation => SqlError::CheckViolation,
+        NativeRuntimeError::ForeignKeyConstraintViolation => SqlError::ForeignKeyViolation,
         error => SqlError::Runtime(error),
     }
 }
@@ -5425,8 +6865,30 @@ fn ensure_catalog_version(
 
 fn parse(statement: &str) -> Result<Statement, SqlError> {
     let mut parser = Parser::new(lex(statement)?);
-    let parsed = if parser.consume_keyword("CREATE") {
+    let parsed = if parser.consume_keyword("WITH") {
+        parse_with_select(&mut parser)?
+    } else if parser.consume_keyword("CREATE") {
         parse_create(&mut parser)?
+    } else if parser.consume_keyword("ALTER") {
+        parser.expect_keyword("TABLE")?;
+        let name = parser.identifier()?;
+        parser.expect_keyword("RENAME")?;
+        parser.expect_keyword("TO")?;
+        Statement::AlterTableRename {
+            name,
+            new_name: parser.identifier()?,
+        }
+    } else if parser.consume_keyword("DROP") {
+        let table = parser.consume_keyword("TABLE");
+        if !table {
+            parser.expect_keyword("INDEX")?;
+        }
+        let name = parser.identifier()?;
+        if table {
+            Statement::DropTable { name }
+        } else {
+            Statement::DropIndex { name }
+        }
     } else if parser.consume_keyword("INSERT") {
         parse_insert(&mut parser)?
     } else if parser.consume_keyword("UPDATE") {
@@ -5464,6 +6926,35 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
     Ok(parsed)
 }
 
+fn parse_with_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    if parser.consume_keyword("RECURSIVE") {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let name = parser.identifier()?;
+    parser.expect_keyword("AS")?;
+    parser.expect_symbol('(')?;
+    parser.expect_keyword("SELECT")?;
+    let inner = parse_select(parser)?;
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("SELECT")?;
+    let outer = parse_select(parser)?;
+    let Statement::Select {
+        name: outer_name, ..
+    } = &outer
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if normalize_identifier(outer_name) != normalize_identifier(&name) {
+        return Err(SqlError::InvalidSyntax);
+    }
+    Ok(Statement::WithSelect(ParsedCteSelect {
+        name,
+        inner: Box::new(inner),
+        outer: Box::new(outer),
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
     let unique = parser.consume_keyword("UNIQUE");
     if parser.consume_keyword("INDEX") {
@@ -5477,8 +6968,30 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_symbol('(')?;
     let mut columns = Vec::new();
     let mut table_primary_key = None;
+    let mut foreign_keys = Vec::new();
     loop {
-        if parser.consume_keyword("PRIMARY") {
+        let constraint_name = if parser.consume_keyword("CONSTRAINT") {
+            Some(parser.identifier()?)
+        } else {
+            None
+        };
+        if parser.consume_keyword("FOREIGN") {
+            parser.expect_keyword("KEY")?;
+            parser.expect_symbol('(')?;
+            let columns = parser.identifier_list(')')?;
+            parser.expect_keyword("REFERENCES")?;
+            let referenced_table = parser.identifier()?;
+            parser.expect_symbol('(')?;
+            let referenced_columns = parser.identifier_list(')')?;
+            foreign_keys.push(ParsedForeignKey {
+                columns,
+                name: constraint_name,
+                referenced_table,
+                referenced_columns,
+            });
+        } else if constraint_name.is_some() {
+            return Err(SqlError::InvalidSyntax);
+        } else if parser.consume_keyword("PRIMARY") {
             if table_primary_key.is_some() {
                 return Err(SqlError::InvalidSyntax);
             }
@@ -5492,6 +7005,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
             let mut nullable = true;
             let mut nullability_seen = false;
             let mut inline_primary_key = false;
+            let mut check = None;
             loop {
                 if parser.consume_keyword("NOT") {
                     if nullability_seen {
@@ -5513,6 +7027,24 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
                     parser.expect_keyword("KEY")?;
                     nullable = false;
                     inline_primary_key = true;
+                } else if parser.consume_keyword("CHECK") {
+                    if check.is_some() {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_symbol('(')?;
+                    if normalize_identifier(&parser.identifier()?)
+                        != normalize_identifier(&column_name)
+                    {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    let operator = parser.comparison_operator()?;
+                    let mut parameters = 0;
+                    let operand = parser.scalar_operand(&mut parameters)?;
+                    if parameters != 0 {
+                        return Err(SqlError::InvalidSyntax);
+                    }
+                    parser.expect_symbol(')')?;
+                    check = Some(ParsedColumnCheck { operator, operand });
                 } else {
                     break;
                 }
@@ -5522,6 +7054,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
                 logical_type,
                 nullable,
                 inline_primary_key,
+                check,
             });
         }
         if parser.consume_symbol(')') {
@@ -5547,6 +7080,7 @@ fn parse_create(parser: &mut Parser) -> Result<Statement, SqlError> {
         name,
         columns,
         primary_key,
+        foreign_keys,
     })
 }
 
@@ -5629,7 +7163,80 @@ fn parse_delete(parser: &mut Parser) -> Result<Statement, SqlError> {
     })
 }
 
+fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    let value_column = parser.identifier()?;
+    parser.expect_symbol(',')?;
+    let function = if parser.consume_keyword("ROW_NUMBER") {
+        WindowFunction::RowNumber
+    } else if parser.consume_keyword("RANK") {
+        WindowFunction::Rank
+    } else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    parser.expect_symbol('(')?;
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("OVER")?;
+    parser.expect_symbol('(')?;
+    let partition_column = if parser.consume_keyword("PARTITION") {
+        parser.expect_keyword("BY")?;
+        let column = parser.identifier()?;
+        if parser.consume_symbol(',') {
+            return Err(SqlError::InvalidSyntax);
+        }
+        Some(column)
+    } else {
+        None
+    };
+    parser.expect_keyword("ORDER")?;
+    parser.expect_keyword("BY")?;
+    let order_column = parser.identifier()?;
+    if parser.consume_keyword("DESC") || parser.consume_symbol(',') {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.expect_symbol(')')?;
+    parser.expect_keyword("AS")?;
+    let alias = parser.identifier()?;
+    parser.expect_keyword("FROM")?;
+    let name = parser.identifier()?;
+    parser.expect_keyword("ORDER")?;
+    parser.expect_keyword("BY")?;
+    let outer_order = parser.identifier()?;
+    let mut outer_order_by = vec![outer_order];
+    while parser.consume_symbol(',') {
+        outer_order_by.push(parser.identifier()?);
+    }
+    let expected_order_by = partition_column
+        .iter()
+        .cloned()
+        .chain(std::iter::once(order_column.clone()))
+        .collect::<Vec<_>>();
+    if outer_order_by
+        .iter()
+        .map(|column| normalize_identifier(column))
+        .ne(expected_order_by
+            .iter()
+            .map(|column| normalize_identifier(column)))
+    {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.expect_keyword("LIMIT")?;
+    let limit = parser.number_usize()?;
+    Ok(Statement::SelectWindow(ParsedWindowSelect {
+        name,
+        value_column,
+        function,
+        partition_column,
+        order_column,
+        alias,
+        outer_order_by,
+        limit,
+    }))
+}
+
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
+    if parser.looks_like_window_select() {
+        return parse_window_select(parser);
+    }
     let projection = if parser.consume_symbol('*') {
         Projection::All
     } else {
@@ -5966,6 +7573,16 @@ struct Parser {
 impl Parser {
     const fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, offset: 0 }
+    }
+
+    fn looks_like_window_select(&self) -> bool {
+        matches!(self.tokens.get(self.offset), Some(Token::Word(_)))
+            && self.tokens.get(self.offset + 1) == Some(&Token::Symbol(','))
+            && matches!(
+                self.tokens.get(self.offset + 2),
+                Some(Token::Word(value))
+                    if value.eq_ignore_ascii_case("ROW_NUMBER") || value.eq_ignore_ascii_case("RANK")
+            )
     }
 
     fn consume_keyword(&mut self, expected: &str) -> bool {

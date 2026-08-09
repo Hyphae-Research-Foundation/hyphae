@@ -32,3 +32,14 @@ cargo run -q -p hyphae-engine --example generate_disk_format_2_fixture -- \
 The generator's test compares the semantic JSON against
 `v2/data-directory.json`; the checked-in fixture omits Redb and therefore also
 proves snapshot-driven reconstruction of every materialized retrieval table.
+
+## Native protocol SDK fixture
+
+`native-protocol-v1-structure-get.bin` is one complete canonical `HYPHLCL1`
+frame containing a `HYPREQ01` structure-get request. Rust, Python, and
+TypeScript tests independently encode it and decode/re-encode it byte for byte.
+Regenerate it only when intentionally changing the append-only native protocol:
+
+```sh
+cargo run -p hyphae-native-protocol --example generate_sdk_fixture
+```

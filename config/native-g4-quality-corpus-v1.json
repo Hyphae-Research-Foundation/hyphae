@@ -1,0 +1,56 @@
+{
+  "schema": "hyphae-native-g4-quality-corpus-v1",
+  "metric": {
+    "name": "ndcg@10",
+    "scale": 1000000,
+    "discount_scale": 1000000000,
+    "discounts": [
+      1000000000,
+      630929754,
+      500000000,
+      430676558,
+      386852807,
+      356207187,
+      333333333,
+      315464877,
+      301029996,
+      289064826
+    ]
+  },
+  "documents": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "noise"],
+  "queries": [
+    {
+      "id": "native-rust-engine",
+      "qrels": {"a": 3, "b": 2, "c": 1},
+      "lexical": ["a", "b", "c", "noise"],
+      "hybrid": ["b", "a", "c", "noise"],
+      "negative": ["noise", "c", "b", "a"]
+    },
+    {
+      "id": "durable-sql-index",
+      "qrels": {"d": 3, "e": 2, "f": 1},
+      "lexical": ["d", "f", "e", "noise"],
+      "hybrid": ["d", "e", "f", "noise"],
+      "negative": ["noise", "f", "e", "d"]
+    },
+    {
+      "id": "vector-recall",
+      "qrels": {"g": 3, "h": 2},
+      "lexical": ["h", "g", "noise"],
+      "hybrid": ["g", "h", "noise"],
+      "negative": ["noise", "h", "g"]
+    },
+    {
+      "id": "hybrid-fusion",
+      "qrels": {"i": 3, "j": 2, "k": 1},
+      "lexical": ["i", "j", "k", "noise"],
+      "hybrid": ["i", "k", "j", "noise"],
+      "negative": ["noise", "k", "j", "i"]
+    }
+  ],
+  "thresholds": {
+    "lexical_mean_ndcg_ppm": 850000,
+    "hybrid_mean_ndcg_ppm": 850000,
+    "negative_max_ndcg_ppm": 700000
+  }
+}

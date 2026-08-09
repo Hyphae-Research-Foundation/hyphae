@@ -15,16 +15,29 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = ROOT / "contracts" / "json-schema"
-TS_OUTPUT = ROOT / "sdks" / "typescript" / "src" / "generated.ts"
-PY_OUTPUT = ROOT / "sdks" / "python" / "src" / "hyphae_sdk" / "generated.py"
+OUTPUTS = {
+    "v1": (
+        ROOT / "sdks" / "typescript" / "src" / "generated.ts",
+        ROOT / "sdks" / "python" / "src" / "hyphae_sdk" / "generated.py",
+    ),
+    "v2": (
+        ROOT / "sdks" / "typescript" / "src" / "v2" / "generated.ts",
+        ROOT / "sdks" / "python" / "src" / "hyphae_sdk" / "v2" / "generated.py",
+    ),
+}
 
 
-def load_models() -> tuple[dict[str, dict[str, Any]], str]:
+def load_models(version: str) -> tuple[dict[str, dict[str, Any]], str]:
     models: dict[str, dict[str, Any]] = {}
     digest = hashlib.sha256()
-    paths = sorted(SCHEMA_DIR.glob("*-v1.schema.json"))
+    paths = sorted(SCHEMA_DIR.glob(f"*-{version}.schema.json"))
+    if version == "v2":
+        # `native-v2` is the aggregate operation vocabulary. Its embedded
+        # `$defs` intentionally reference the canonical standalone v2 models;
+        # standalone definitions win so each model has one generation source.
+        paths.sort(key=lambda path: path.name == "native-v2.schema.json")
     if not paths:
-        raise ValueError("no version 1 schemas found")
+        raise ValueError(f"no {version} schemas found")
     for path in paths:
         encoded = path.read_bytes()
         digest.update(path.name.encode("utf-8"))
@@ -55,6 +68,8 @@ def add_model(
 ) -> None:
     existing = models.get(name)
     if existing is not None and canonical(existing) != canonical(schema):
+        if source == "native-v2.schema.json":
+            return
         raise ValueError(f"conflicting model {name} in {source}")
     models[name] = schema
 
@@ -164,12 +179,19 @@ def pascal(value: str) -> str:
     return "".join(part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", value) if part)
 
 
-def tagged_variants(name: str, schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def tagged_variants(
+    name: str,
+    schema: dict[str, Any],
+    models: dict[str, dict[str, Any]],
+) -> list[tuple[str, dict[str, Any]]]:
     variants = schema.get("oneOf")
     if not isinstance(variants, list) or not variants:
         return []
     output: list[tuple[str, dict[str, Any]]] = []
     for index, variant in enumerate(variants, start=1):
+        if isinstance(variant, dict) and isinstance(variant.get("$ref"), str):
+            referenced = variant["$ref"].rsplit("/", 1)[-1]
+            variant = models.get(referenced)
         if not isinstance(variant, dict) or variant.get("type") != "object":
             return []
         tag = None
@@ -193,20 +215,28 @@ def py_type(schema: Any) -> str:
     if isinstance(reference, str):
         return reference.rsplit("/", 1)[-1]
     if "const" in schema:
-        return f"Literal[{json.dumps(schema['const'], ensure_ascii=False)}]"
+        return f"Literal[{py_literal(schema['const'])}]"
     if isinstance(schema.get("enum"), list):
-        values = ", ".join(json.dumps(value, ensure_ascii=False) for value in schema["enum"])
+        values = ", ".join(py_literal(value) for value in schema["enum"])
         return f"Literal[{values}]"
     if isinstance(schema.get("anyOf"), list):
         return " | ".join(py_type(item) for item in schema["anyOf"])
     if isinstance(schema.get("oneOf"), list):
-        if all(isinstance(item, dict) and "const" in item for item in schema["oneOf"]):
-            return " | ".join(py_type(item) for item in schema["oneOf"])
-        return "dict[str, JsonValue]"
+        return " | ".join(py_type(item) for item in schema["oneOf"])
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
         return " | ".join(py_primitive(item, schema) for item in schema_type)
     return py_primitive(schema_type, schema)
+
+
+def py_literal(value: Any) -> str:
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    if value is None:
+        return "None"
+    return json.dumps(value, ensure_ascii=False)
 
 
 def py_primitive(schema_type: Any, schema: dict[str, Any]) -> str:
@@ -266,15 +296,16 @@ def render_python(models: dict[str, dict[str, Any]], digest: str) -> str:
     exported = ["CONTRACT_SHA256", "JsonValue"]
     for name in sorted(models):
         schema = models[name]
-        variants = tagged_variants(name, schema)
+        variants = tagged_variants(name, schema, models)
         if schema.get("type") == "object" and not variants:
             lines.extend(render_python_class(name, schema))
             lines.append("")
         elif variants:
             variant_names = []
             for variant_name, variant in variants:
-                lines.extend(render_python_class(variant_name, variant))
-                lines.append("")
+                if variant_name not in models:
+                    lines.extend(render_python_class(variant_name, variant))
+                    lines.append("")
                 variant_names.append(variant_name)
                 exported.append(variant_name)
             aliases.append(f"{name}: TypeAlias = {' | '.join(variant_names)}")
@@ -301,11 +332,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     arguments = parser.parse_args()
-    models, digest = load_models()
-    outputs = {
-        TS_OUTPUT: render_typescript(models, digest),
-        PY_OUTPUT: render_python(models, digest),
-    }
+    outputs: dict[Path, str] = {}
+    for version, (typescript, python) in OUTPUTS.items():
+        models, digest = load_models(version)
+        outputs[typescript] = render_typescript(models, digest)
+        outputs[python] = render_python(models, digest)
     stale = [path for path, content in outputs.items() if not write_or_check(path, content, arguments.check)]
     if stale:
         for path in stale:

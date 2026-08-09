@@ -39,11 +39,14 @@ before that retention floor.
 10. A vacuum that cannot reduce physical page count is a no-op: it writes no
     WAL transaction, advances no CSN, and publishes no generation.
 
-V1 does not promise historical snapshot reconstruction after process restart.
-That requires a configurable multi-generation retention window. A
-`NativeSnapshot` already materialized before vacuum remains usable because it
-owns its logical state. A detached `NativeWriteBatch` whose read CSN precedes
-the new floor fails explicitly instead of rebasing across retired history.
+V1 does not implicitly retain historical snapshots after process restart.
+[Durable snapshot pins v1](snapshot-pins-v1.md) now provide explicit,
+identity-bound multi-generation retention: vacuum preserves every generation
+named by a stable pin, while unpinned operation keeps this current-root policy.
+A `NativeSnapshot` already materialized before vacuum remains usable because
+it owns its logical state. A detached `NativeWriteBatch` whose read CSN
+precedes the new floor fails explicitly instead of rebasing across retired
+history.
 
 ## Current-root rewrite
 
@@ -99,10 +102,10 @@ The vacuum transaction contains exactly one kernel mutation with opcode
 `VacuumPageGeneration`. It has no target, key, value, or expiry. It changes no
 logical engine state and claims one global maintenance write identity.
 
-## Root manifest v2
+## Root manifest storage state
 
-Checkpoints after a generation transition use `HYROOT02`. The v2 header is 192
-bytes and retains the v1 root-entry payload:
+The standalone historical codec uses `HYROOT02` after a generation transition.
+Its 192-byte header retains the v1 root-entry payload:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -126,8 +129,12 @@ bytes and retains the v1 root-entry payload:
 | 184 | 8 | retention-floor CSN |
 | 192 | variable | canonical root entries |
 
-Generation-one/floor-one checkpoints remain byte-identical `HYROOT01`.
-Manifest-chain digests therefore continue to bind every storage transition.
+Native directories always publish `HYROOT03`, including at generation one.
+Its 216-byte header preserves these page-generation and retention-floor
+offsets, then adds the 24-byte directory lineage before the root payload.
+`HYROOT01` and `HYROOT02` remain byte-identical decodeable historical formats,
+but native-marker recovery rejects them as authority. Manifest-chain digests
+therefore bind every storage transition and its exact directory lineage.
 
 ## Publication and cleanup order
 
@@ -194,7 +201,8 @@ observation. Structure tombstone removal remains the separate reachability
 compaction gate; vacuum preserves every entry reachable from its captured
 current root.
 
-This vertical closes neither G1 nor the complete retention program. It does not
-collect blobs, retain multiple restartable historical generations, rewrite or
-truncate WAL blocks, schedule background work, or establish interference and
-p99.9 gates.
+This vertical closes neither G1 nor the complete retention program. Durable
+snapshot pins now retain multiple explicitly named restartable generations,
+but this vacuum protocol still does not collect blobs, rewrite or truncate WAL
+blocks, schedule background retention policy, define quotas, or establish
+interference and p99.9 gates.

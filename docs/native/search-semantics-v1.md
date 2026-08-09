@@ -1,11 +1,13 @@
 # Native search-engine semantics v1
 
-Status: normative target contract; deterministic tokenization, BM25, native
+Status: normative bounded G6 contract; canonical tokenization, BM25, native
 B+tree collection/document/term/posting namespaces, direct physical `MATCH`,
-catalogued vector/HNSW generations, exact/approximate vector query, legacy
-inline-state compatibility, and multilevel recovery evidence are implemented
-experimentally; positions, segments, phrases, filters, facets, hybrid fusion,
-and broad scale/quality evidence remain pending
+catalogued vector/HNSW generations, exact/approximate vector query, lexical
+document replacement/deletion, bounded boolean/phrase/prefix/fuzzy execution,
+typed doc values, filters, sort, facets, aggregations, native hybrid fusion,
+legacy inline-state compatibility, rebuild, corruption, and bounded quality
+evidence are implemented. Automatic segments, page-buffered ANN and
+production-scale performance remain non-claims.
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -46,19 +48,20 @@ unchanged.
 - A mutable transactional delta is searchable at commit; background merges do
   not define visibility.
 
-The first physical implementation uses marker `HYSEABT1` in one immutable
-copy-on-write native B+tree. It stores:
+The physical implementation uses marker `HYSEABT1`, `HYSEABT2`, or `HYSEABT3`
+in one immutable copy-on-write native B+tree. It stores:
 
 | Prefix | Key | Value |
 |---:|---|---|
-| `0x00` | exact format key | ASCII `HYSEABT1` |
+| `0x00` | exact format key | ASCII `HYSEABT1`, `HYSEABT2`, or `HYSEABT3` |
 | `0x01` | collection `ObjectId` | `HYIDX001` document count and total analyzed terms |
-| `0x02` | collection `ObjectId` + document ID | `HYDOCS01` token count and inline/blob source text |
-| `0x03` | collection `ObjectId` + canonical UTF-8 term | `HYTERM01` document frequency |
-| `0x04` | collection `ObjectId` + u32 term length + term + document ID | `HYPOST01` term frequency |
-| `0x05` | vector-index `ObjectId` | `HYANNM01` current generation metadata |
+| `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
+| `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
+| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01` or v2 `HYPOSTT1` tombstone |
+| `0x05` | vector-index `ObjectId` | legacy `HYANNM01` or current `HYANNM02` selected base-plus-delta metadata |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
+| `0x08` | vector-index `ObjectId` + object `ObjectId` | current `HYANND01` vector upsert or tombstone |
 
 The fixed 128-bit object ID is big-endian in every key. The posting term
 length is big-endian so a prefix scan identifies exactly one term even when
@@ -66,17 +69,44 @@ terms share byte prefixes. Terms and composite document identities must fit
 the native 4,096-byte key limit. Oversized identities are rejected before a
 logical mutation is staged.
 
-`INDEX DOCUMENT` is immutable in this slice. It analyzes source text once,
-stores per-document length, increments exact collection/term statistics, and
-inserts one posting per distinct term. Text above 8,192 bytes uses the common
-content-addressed blob store. The format does not yet store positions,
-offsets, field norms, tombstones, generations, or immutable merge segments.
+`INDEX DOCUMENT` creates one document. `REPLACE DOCUMENT` and `DELETE DOCUMENT`
+require one exact live identity and atomically maintain stored source,
+collection statistics, term metadata, and postings. The first accepted
+lifecycle mutation upgrades the current root to `HYSEABT2`; historical v1
+roots remain readable and v1 rejects every tombstone. Insertion may revive
+canonical v2 tombstones without overwriting a live identity. Text above 8,192
+bytes uses the common content-addressed blob store. Exact lifecycle semantics
+and tombstone encodings are fixed by
+[Native lexical document lifecycle v1](search-document-lifecycle-v1.md). The
+format does not store positions, offsets, field norms, generations, or
+immutable merge segments. The bounded G4 phrase/prefix/fuzzy executor derives
+canonical positions from stored source under explicit work budgets; it does
+not claim a production positional-posting layout.
+
+`compact_search` validates the complete current lexical and ANN projection,
+then rebuilds `HYSEABT2` without exact `HYDOCT01`, `HYTERMT1`, or `HYPOSTT1`
+tombstones. Every retained lexical and ANN key/value is copied byte-for-byte;
+historical roots remain immutable, and a root without tombstones advances no
+page, WAL identity, transaction ID, or CSN. Page vacuum and blob collection
+remain separate retention operations. The exact maintenance contract is
+[Native lexical tombstone compaction
+v1](search-tombstone-compaction-v1.md).
 
 `CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
-root and global transaction. Vector writes are grouped per index at commit so
-one duplicate-free batch produces one canonical HNSW generation rather than
-one rebuild per vector. The `0x05` record selects that generation atomically;
-older `0x06`/`0x07` records are retained until native reclamation exists.
+root and global transaction. Creation produces the initial canonical HNSW
+base. Later vector writes update the bounded object-keyed `0x08` delta and
+`HYANNM03` view metadata without rebuilding or repersisting the base graph.
+Exact query ranks the effective base-plus-delta set. Approximate query merges
+base graph candidates with exact live-delta candidates and suppresses every
+shadowed base object. `HYSEABT1`/`2` and `HYANNM01` remain readable.
+
+Bounded ANN consolidation captures an effective set, constructs a replacement
+base and publishes it through an ordinary root commit using append-only WAL
+opcode 50. A stale base rejects publication. Captured delta versions are
+consumed only if unchanged, so later object versions survive. The current root
+retains the configured number of superseded target generations; snapshot pins
+retain old page-file roots, and unpin plus page vacuum/collection reclaims them
+safely.
 
 Complete-state validation rebuilds terms, document frequencies, term
 frequencies, document count, and total length from stored source text and
@@ -92,10 +122,15 @@ aggregation, highlight, vector search and hybrid fusion.
 
 The implemented vertical slice is one analyzer, one text field, `MATCH`,
 exact vector ranking, approximate HNSW top-k with optional exact reranking,
-and stable-ID tie-breakers. Vector query receipts name the snapshot CSN, build
-identity, metric, breadth, candidate count, reranking flag and visited nodes.
-Phrase, boolean, range, prefix, fuzzy, wildcard, vector filters, facets,
-highlighting, doc values, and hybrid operators remain target work.
+and stable-ID tie-breakers. Filtered ANN separates connector navigation from
+candidate eligibility and adaptively executes exact scoring for restrictive
+sets. Receipts name the snapshot CSN, build identity, metric, breadth, truthful
+strategy/risk, candidate counts, reranking flag and visited nodes.
+Bounded boolean, phrase, prefix and fuzzy execution, stable-ID vector filters,
+typed doc-value filters/sort, terms facets, metric aggregations and native RRF
+hybrid execution are implemented as embedded G4 surfaces. Wildcard,
+highlighting, persistent multi-field doc-value columns and unrestricted query
+language remain non-claims.
 
 ## Lexical scoring
 
@@ -132,11 +167,16 @@ and are labelled with the skipped/error state.
 ## Verification
 
 Current tests cover reference/physical BM25 equivalence, multilevel postings,
-historical lexical and vector snapshots, optimistic disjoint document/vector
-rebase, vector batch atomicity, restart, single-page legacy compatibility,
-large-text blob reuse, key bounds, lexical/ANN metadata corruption, canonical
-graph restore, and all-engine crash recovery. Required remaining evidence
-includes analyzer/token/position goldens, BM25F score/explanation fixtures,
-broader query-operator properties, lexical delete/update visibility, buffered
-ANN traversal, merge interruption, facet/aggregation correctness, bounded
-cancellation, full-scale quality metrics, and cross-engine stable-ID joins.
+historical lexical and vector snapshots, lexical replace/delete/reinsert
+visibility, exact v1-to-v2 tombstone upgrade, optimistic disjoint
+document/vector rebase, vector batch atomicity, restart, single-page legacy
+compatibility, large-text blob reuse, key bounds, lexical/ANN metadata
+corruption, canonical graph restore, and all-engine crash recovery. G4 evidence
+also covers analyzer/token/position goldens, bounded query-operator properties,
+filtered ANN strategy receipts, facet/aggregation equivalence, NDCG/recall,
+rebuild and structured corruption matrices. Buffered ANN traversal, automatic
+background merge policy, cross-engine SQL joins and production-scale
+performance remain G7 work. G6 ANN evidence additionally covers foreground
+base-identity stability, effective exact equivalence, reopen, hard delta bounds,
+strict maintenance WAL shape, bounded consolidation, later-delta preservation,
+stale plans, interruption recovery and current-root generation cleanup.

@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g2-readiness-profile-v1",
+  "gate": "G2",
+  "scope": "bounded-correctness",
+  "universal_sql_compatibility_required": false,
+  "performance_evidence_permitted": false,
+  "requirements": [
+    {"id": "native-ddl-dml-and-constraints", "required_evidence": "hosted"},
+    {"id": "transactions-and-isolation", "required_evidence": "hosted"},
+    {"id": "indexes-joins-ctes-windows", "required_evidence": "hosted"},
+    {"id": "prepared-plans-and-explain", "required_evidence": "hosted"},
+    {"id": "sqllogictest-conformance", "required_evidence": "hosted"},
+    {"id": "metamorphic-sql-equivalence", "required_evidence": "hosted"},
+    {"id": "tpch-correctness", "required_evidence": "hosted"},
+    {"id": "tpcc-acid", "required_evidence": "hosted"}
+  ]
+}

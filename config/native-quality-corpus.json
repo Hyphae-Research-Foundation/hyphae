@@ -1,0 +1,32 @@
+{
+  "schema": "hyphae-native-quality-corpus-v1",
+  "corpora": [
+    {
+      "id": "lexical-bm25-reference-v1",
+      "engine": "lexical",
+      "producer": "crates/hyphae-native-runtime/src/lib.rs",
+      "test": "native_inverted_index_matches_reference_bm25_across_recovery",
+      "minimum_documents": 512,
+      "minimum_queries": 4,
+      "metrics": ["exact_score_order_equivalence", "reopen_equivalence"]
+    },
+    {
+      "id": "ann-recall-at-10-v1",
+      "engine": "ann",
+      "producer": "crates/hyphae-native-ann/examples/quality_smoke.rs",
+      "test": "quality_smoke",
+      "minimum_documents": 10000,
+      "minimum_queries": 100,
+      "metrics": ["recall_at_10", "minimum_query_overlap", "latency_percentiles"]
+    },
+    {
+      "id": "g4-lexical-hybrid-ndcg-v1",
+      "engine": "hybrid",
+      "producer": "tools/native_g4_quality.py",
+      "test": "evaluate_corpus",
+      "minimum_documents": 12,
+      "minimum_queries": 4,
+      "metrics": ["integer_ndcg_at_10", "negative_control", "corpus_digest"]
+    }
+  ]
+}

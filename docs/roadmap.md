@@ -1,6 +1,6 @@
 # Hyphae roadmap
 
-`0.2.1` is the latest published release. Its annotated `v0.2.1` tag peels to
+`0.2.1` is the retained compatibility release. Its annotated `v0.2.1` tag peels to
 `08028e8dac077846c638f067ce74fbcf6fb75501`, its
 [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1) is
 published, and all ten publishable Rust workspace crates are available on
@@ -18,10 +18,13 @@ format.
 
 ## Next program: native local data ecosystem
 
-The next product program is an accepted target but has no release number and
-no completed implementation gate yet. Hyphae will build its own relational
-SQL engine, native keyspace/data-structure engine, and native lexical/vector
-search engine in one process. They share a Hyphae-owned catalog, memory
+The Native product program ships as `1.0.0`. G0 through G6 have retained
+exact-SHA closure for their versioned, bounded profiles. G8 supplies
+exact-release safety evidence; G7 remains an independent post-release
+performance certification with machine-readable authority. See
+the [native gate status](gates/native-gate-status.md). Hyphae will build its own
+relational SQL engine, native keyspace/data-structure engine, and native
+lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory
 manager, page/blob store, WAL, MVCC/commit sequence, scheduler, backup, and
 proof substrate. They are not wrappers around PostgreSQL, Valkey, OpenSearch,
 Redb, or another database engine, and they are not projections of one another.
@@ -29,13 +32,24 @@ Redb, or another database engine, and they are not projections of one another.
 The governing documents are:
 
 - [ADR-0020](adr/0020-native-local-data-ecosystem.md);
+- [ADR-0021](adr/0021-native-cutover-and-format-evolution.md);
+- [ADR-0022](adr/0022-cloud-ready-local-primitives.md);
 - [native local ecosystem architecture](architecture/native-local-ecosystem.md);
 - [microsecond-first performance contract](performance/microsecond-first.md);
-  and
-- [ordered phase-1 gate](gates/native-local-phase-1.md).
+- [ordered phase-1 gate](gates/native-local-phase-1.md); and
+- [current native gate status](gates/native-gate-status.md).
+
+The accepted [G6 execution roadmap](roadmaps/native-g6-roadmap.md) makes the
+next gate a competitive local product rather than a thin wrapper. It fixes the
+embedded/local-first strategy, native HTTP `/v2`, Rust/Python/TypeScript SDKs,
+optional provider adapters, integrated filtered/hybrid search, incremental ANN
+lifecycle, and native offline proofs. Closing G8 will establish readiness for
+that bounded local contract, not universal superiority over a distributed
+vector platform; matched comparative evidence and distributed capabilities are
+later programs.
 
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
-and model integration do not begin until its release gate is closed.
+and model integration do not begin until G8 closes on one exact commit.
 
 The historical `0.2.0` implementation record remains in
 [`roadmap-0.2.md`](roadmap-0.2.md); its retained evidence limitations do not

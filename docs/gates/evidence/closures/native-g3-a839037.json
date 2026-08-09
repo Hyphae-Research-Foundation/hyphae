@@ -1,0 +1,25 @@
+{
+  "schema": "hyphae-native-g3-readiness-v1",
+  "gate": "G3",
+  "status": "passed",
+  "source_commit": "a83903773bab97007f19719ce6c1d94a50ff5201",
+  "workflow_run": 31029905694,
+  "scope": "bounded-correctness",
+  "production_scale": false,
+  "required": 11,
+  "passed": 11,
+  "requirements": [
+    "strings-and-counters",
+    "hashes",
+    "lists",
+    "sets",
+    "sorted-sets",
+    "streams",
+    "ttl-and-controlled-expiry",
+    "atomic-batches-and-conflicts",
+    "model-based-randomized-equivalence",
+    "restart-equivalence",
+    "memory-amplification"
+  ],
+  "artifact": "native-g3-evidence-a83903773bab97007f19719ce6c1d94a50ff5201"
+}

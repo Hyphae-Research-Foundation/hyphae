@@ -1,7 +1,7 @@
 # Microsecond-first performance contract
 
-Status: target contract; versioned local smoke observations exist, but no
-target gate has passed
+Status: target contract; one bounded structure-point observation meets its
+provisional p50/p99 targets, but no G7 performance gate has passed
 
 Hyphae's local ecosystem is designed around bounded hot paths measured in
 microseconds. This is not a claim that every query, transport, or durable
@@ -44,6 +44,15 @@ Strict durable group commit on a disclosed NVMe device has a research target
 of p50 250 us and p99 900 us. It is hardware-dependent and is not a portable
 product guarantee.
 
+The latency targets above are evaluated on the warm, concurrency-1 control
+receipt. Concurrency 8 and 32 are saturation points: they report throughput,
+queueing and tail growth under load rather than reapplying the concurrency-1
+latency ceiling to every contending request. The interference receipt is a
+paired degradation observation, not a duplicate idle-host threshold. Strict
+durable group commit remains an advisory research target because physical
+flush latency is explicitly hardware-dependent; its measured percentiles are
+required, but missing that advisory target does not by itself invalidate G7.
+
 ## Hot-path invariants
 
 - No TCP, HTTP, JSON, or compatibility-protocol hop exists between engines.
@@ -82,13 +91,26 @@ An accepted receipt records:
   virtualization status;
 - dataset generator and digest, row/document/vector counts, dimensions,
   payload sizes, selectivity, result size and index state;
-- durability class, warm/cold state and whether proofs are included;
+- durability class, warm state and whether proofs are included;
 - concurrency 1, 8 and 32 plus a saturation sweep;
 - at least 1,000,000 hot-path observations in an HDR-style histogram;
 - p50, p95, p99 and p99.9, throughput, allocations, RSS, CPU cycles, cache
   misses, page faults and bytes read/written; and
 - correctness, recall, crash-recovery, and cross-engine visibility results for
   the same build.
+
+Corpus construction is preparation, not a timed hot path. A matrix may publish
+one immutable search seed and reopen it for independent receipt and profiler
+processes only when its directory identity binds the exact source commit,
+generator, document/vector counts, and vector dimension. Every process must
+still reopen native durable state and revalidate exact-versus-ANN recall before
+measurement; a seed from another identity must never be reused.
+
+Cold first-touch observations are reported separately as diagnostics. They do
+not enter the million-observation hot-path histogram or a G7 closure threshold:
+repeating one access a million times silently turns a purported cold benchmark
+into a warm-cache benchmark, while evicting the host cache between every access
+measures an artificial privileged maintenance loop rather than product latency.
 
 Shared or virtualized machines may publish observations but cannot establish a
 hard regression threshold. Linux and Windows both require functional lanes;
@@ -107,6 +129,62 @@ dispatch. Neither is a passing receipt: the corpus is tiny, concurrency is
 one, scheduling is uncontrolled, hardware/allocation counters and real
 named-pipe/UDS transport are absent, and the clean run is virtualized.
 
+The first real
+[filesystem-backed UDS receipt](../gates/evidence/native-local-uds-linux-2026-08-03.md)
+uses three release runs on the AWS Linux devbox, one persistent connection,
+two pinned CPUs, 10,000 warmups, and 100,000 measured 32-byte `PING`
+round trips per run. The median run statistics are p50 `23.261 us`, p95
+`29.060 us`, p99 `35.290 us`, p99.9 `44.631 us`, and throughput
+`42,771.042 round trips/s`. Individual-run maxima were `1.069968 ms`,
+`0.132348 ms`, and `0.846969 ms`, so the observation does not erase
+scheduling tails. The route measures frame encode/write, kernel transport,
+server read/decode/echo, client read/decode, and scheduling together. It does
+not execute a structure `GET`; therefore it is transport budget evidence,
+not a pass of the 25-us/100-us native structure-point target. Its roughly
+23.3-us p50 consumed nearly that entire provisional p50 budget and made the
+engine-bearing transport vertical a deliberate performance constraint. The
+virtualized, warm, concurrency-one run is neither a regression threshold nor
+G7 closure.
+
+The follow-on
+[engine-bearing structure GET receipt](../gates/evidence/native-local-structure-get-linux-2026-08-03.md)
+uses the same host and affinity with a fresh height-two physical B+tree of
+2,048 scalar keys and 64-byte values. Across three release runs, the median
+embedded physical read observed p50/p99 `0.816/1.588 us`; persistent `PING`
+observed `23.338/35.457 us`; and the complete persistent `STRUCTURE GET`
+observed `23.466/35.939 us`. Both embedded and local-protocol bounded
+observations are below their provisional p50/p99 targets. Independent
+percentiles are not subtracted to infer execution cost. The receipt remains
+outside G7 because it has 100,000 warm observations, concurrency one,
+virtualized hardware, an owned value that may allocate, no cold/saturation/
+interference/counter lanes, and no Windows named-pipe counterpart.
+
+The
+[structure SET and TTL receipt](../gates/evidence/native-local-structure-set-ttl-linux-2026-08-03.md)
+keeps read and mutation surfaces separate. Across three release runs, median
+physical TTL p50/p99 was `0.832/0.886 us`; persistent GET and TTL round trips
+were `23.546/34.286 us` and `23.487/34.489 us`. A one-key, 64-byte memory
+`SET` with relative TTL measured `377.113/401.059 us`; strict `SET` measured
+`6,738.743/6,928.074 us`. The strict lane includes the selected page/WAL
+synchronization promise and is intentionally not folded into an execution
+claim. The memory lane is also above a microsecond mutation objective, so this
+receipt records a performance deficit rather than a pass. It supplies no
+subtractive transport estimate, timing decomposition, cold/saturation/
+interference/allocation/counter matrix, group scheduler, or regression
+threshold.
+
+The
+[local SEARCH MATCH receipt](../gates/evidence/native-local-search-match-linux-2026-08-03.md)
+uses a 2,048-document, height-two physical inverted index and one rare-term
+hit. Across three release runs, median embedded MATCH p50/p99 was
+`23.346/32.704 us`; persistent PING was `23.358/33.728 us`; and the complete
+32-byte MATCH result round trip was `56.150/68.327 us`. All three bounded
+surfaces remain in microseconds. Their independent percentiles are not
+subtracted to infer engine or transport cost. The virtualized, warm,
+concurrency-one observation lacks cold/saturation/interference/allocation/
+counter lanes, a Windows named-pipe counterpart, and an accepted regression
+threshold, so it does not pass G4, G6, or G7.
+
 Later native receipts keep this method versioned as the physical corpus
 changes. Schema v4 added a 2,048-key height-two scalar B+tree route. Schema v5
 added one explicitly typed hash with 2,048 independent 64-byte fields and
@@ -117,6 +195,85 @@ observed p50 `20.926 us` and p99 `71.596 us` in the checked
 [receipt](../gates/evidence/native-microsecond-smoke-search-wsl2.json).
 Cross-schema latency is not a controlled comparison, and none of these
 observations passes G7.
+
+Whole-hash lifecycle uses a separate harness because complete deletion is
+cardinality-sensitive and mutating. The checked
+[direct-Linux receipt](../gates/evidence/native-hash-lifecycle-linux.json)
+separates an already-prepared private `DELETE_HASH` call from memory-durability
+physical publication and strict page/WAL synchronization. At 2,048 fields,
+private retirement observed p50 `54.106 us`, memory commit p50 `3.561 ms`, and
+strict commit p50 `12.299 ms`. These are distinct surfaces: the physical path
+must enumerate and tombstone the complete live field prefix, and strict
+timings include ext4/EBS synchronization. They are not a universal
+microsecond-path claim and do not pass G7.
+
+Whole-hash TTL uses a second direct-Linux harness that separates logical TTL
+reads from physical reads, commits, and cardinality-sensitive cleanup. On a
+2,048-field hash, materialized `TTL_HASH` observed p50 `0.012 us`, physical
+`TTL_HASH` p50 `0.631 us`, and physical expiring-hash `HGET` p50 `1.364 us`.
+Memory expiry commit observed p50 `1.391 ms`, strict expiry commit p50 `8.355
+ms`, and cleanup of a 256-field hash p50 `0.614 ms`. The matched persistent
+`HGET` parent/current control changed by +3.037% at p50 and +6.389% at p95,
+inside its frozen 10% gate. The checked
+[receipt](../gates/evidence/native-hash-ttl-linux-2026-08-03.md) remains a
+warm, concurrency-one observation and does not pass G7.
+
+Whole-set TTL uses a dedicated direct-Linux harness over a 2,048-member set.
+Materialized `TTL_SET` observed p50 `0.012 us`, physical `TTL_SET` p50 `0.873
+us`, and physical expiring-set `SISMEMBER` p50 `1.902 us`. Memory expiry
+commit observed p50 `1.047 ms`, strict expiry commit `8.272 ms`, and cleanup
+observed `0.403 ms` for one member versus `0.602 ms` for 256 members. The
+matched persistent `SISMEMBER` control changed by -0.371% at p50 and -0.093%
+at p95, inside its frozen 10% gate. The checked
+[receipt](../gates/evidence/native-set-ttl-linux-2026-08-03.md) separates
+logical, physical, publication, durability, and cardinality-sensitive cleanup
+surfaces and does not pass G7.
+
+Whole-set lifecycle uses a separate direct-Linux release harness because
+physical deletion validates and tombstones the complete member prefix.
+At 2,048 members, private `DELETE_SET` preparation observed p50 `27.598 us`,
+Memory commit p50 `2.470 ms`, and Strict commit p50 `10.851 ms`. Empty-set
+private preparation observed p50 `0.101 us`; Strict publication remained
+`6.483 ms` because it includes ext4/EBS page and WAL synchronization. The
+checked
+[receipt](../gates/evidence/native-set-lifecycle-linux-2026-08-03.md)
+keeps private, unsynchronized publication, and synchronized publication as
+separate surfaces. It does not infer synchronization time by subtracting
+independent runs and does not pass G7.
+
+Whole-list lifecycle uses the same three-surface methodology over chunked
+deques. At 2,048 four-byte elements, private `DELETE_LIST` preparation
+observed p50 `34.036 us`, Memory commit p50 `1.201 ms`, and Strict commit p50
+`8.719 ms`. Empty-list preparation observed p50 `0.095 us`; empty Strict
+publication observed p50 `6.499 ms` including ext4/EBS synchronization. The
+checked
+[receipt](../gates/evidence/native-list-lifecycle-linux-2026-08-03.md)
+does not infer synchronization time by subtracting independent routes and
+does not pass G7.
+
+Whole-list TTL uses a dedicated direct-Linux harness over a 2,048-element
+chunked deque. Materialized `TTL_LIST` observed p50 `0.012 us`, physical
+`TTL_LIST` p50 `0.212 us`, and physical expiring-list `LLEN` p50 `0.216 us`.
+Memory expiry commit observed p50 `0.681 ms`, strict expiry commit `7.633 ms`,
+and cleanup observed `0.337 ms` for one element versus `0.401 ms` for 256
+elements. Five alternating parent/current persistent-`LLEN` pairs pinned to
+one vCPU changed by -0.461% at median p50 and +0.270% at median p95, inside
+the frozen 10% gate. The checked
+[receipt](../gates/evidence/native-list-ttl-linux-2026-08-03.md) separates
+logical, physical, publication, durability, and cardinality-sensitive cleanup
+surfaces and does not pass G7.
+
+Bounded hash field commands use a third direct-Linux harness over one
+2,048-field hash. Physical `HGET_MANY(32)` observed p50 `27.300 us` total and
+`0.853 us` per field, compared with `47.334 us` total and `1.479 us` per
+field for 32 singular physical calls. The batch reduced total p50 by 42.325%
+and raised call throughput by 73.337% within this process and corpus.
+Snapshot/private batches observed about `0.062 us` p50 per field. Memory
+`HSET_MANY(32)` commit observed p50 `4.638 ms`, strict commit `14.558 ms`,
+memory `HDELETE_MANY(32)` `6.829 ms`, and memory/strict signed field
+increments `1.476 ms`/`7.817 ms`. The checked
+[receipt](../gates/evidence/native-hash-field-commands-linux-2026-08-03.md)
+separates warm reads from publication and durability and does not pass G7.
 
 Schema v7 adds 2,048 rows under one unique text secondary index and measures
 one complete exact-key call per timer sample. The buffered physical
@@ -171,6 +328,29 @@ regression threshold or a G7 pass: WSL2 is virtualized, state is warm,
 durability is memory, concurrency is one, and the required cold-state,
 saturation, interference, allocation, transport, durability, and
 hardware-counter lanes are absent.
+
+The same schema-v15 build also ran on native Linux for the first time:
+an AWS EC2 devbox with the benchmark data directory on persistent ext4
+rather than tmpfs, recorded in the checked
+[receipt](../gates/evidence/native-microsecond-smoke-ext4-linux.json).
+The physical prepared secondary range observed p50 `42.698 us` and p99
+`90.215 us`, still inside the provisional bounded indexed-SQL target
+for this single scenario on that hardware. The hardware differs from
+the WSL2 receipts, so the numbers are a new baseline rather than a
+comparison. This is not a G7 pass or a regression threshold: EC2 is
+virtualized, state is warm, durability is memory, concurrency is one,
+and the timed paths do not fsync.
+
+The lineage-bearing source tree later merged by PR 53 has a same-host
+schema-v15 [repeat](../gates/evidence/native-microsecond-smoke-lineage-ext4-linux.json).
+Its local-frame decode plus embedded dispatch observed p50/p99
+`0.104/0.121 us`; buffered relational primary-key lookup observed
+`1.986/3.808 us`; BM25 `MATCH` top 1 observed `29.034/53.672 us`; and the
+ordered secondary range observed `42.989/83.120 us`. All 20 hot or indexed
+routes remained below one millisecond through p99.9. This is a direct-Linux
+observation, not a regression threshold or G7 pass: it is still virtualized,
+warm, memory-durability, concurrency one, and excludes physical transport,
+strict synchronization, power loss, and the controlled performance matrix.
 
 The checked `0.2.0` WSL2 evidence is a correctness baseline, not evidence for
 this target. Its 10,000-document, 128-dimensional scenario reports p50

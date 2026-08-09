@@ -8,7 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use hyphae_native_types::{Csn, EngineKind, Lsn, ManifestGeneration, TransactionId};
+use hyphae_native_types::{
+    Csn, EngineKind, LineageIdentity, Lsn, ManifestGeneration, TransactionId,
+};
 use thiserror::Error;
 
 /// Fixed WAL block size.
@@ -23,6 +25,8 @@ pub const WAL_RECORD_HEADER_SIZE: usize = 44;
 pub const WAL_RECORD_BODY_SIZE: usize = WAL_BLOCK_PAYLOAD_SIZE - WAL_RECORD_HEADER_SIZE;
 /// Exact encoded retention-anchor size.
 pub const WAL_RETENTION_ANCHOR_SIZE: usize = 256;
+/// Exact encoded lineage-bearing retention-anchor size.
+pub const WAL_RETENTION_ANCHOR_V2_SIZE: usize = 280;
 
 const WAL_BLOCK_SIZE_U64: u64 = 65_536;
 const WAL_BLOCK_HEADER_SIZE_U64: u64 = 112;
@@ -37,13 +41,18 @@ const BLOCK_DIGEST_START: usize = 80;
 const BLOCK_DIGEST_END: usize = 112;
 const RECORD_CHECKSUM_START: usize = 36;
 const RECORD_CHECKSUM_END: usize = 40;
-const RETENTION_MAGIC: [u8; 8] = *b"HYWAR001";
-const RETENTION_FORMAT_VERSION: u16 = 1;
-const RETENTION_HEADER_LENGTH: u16 = 256;
+const RETENTION_MAGIC_V1: [u8; 8] = *b"HYWAR001";
+const RETENTION_MAGIC_V2: [u8; 8] = *b"HYWAR002";
+const RETENTION_FORMAT_VERSION_V1: u16 = 1;
+const RETENTION_FORMAT_VERSION_V2: u16 = 2;
+const RETENTION_HEADER_LENGTH_V1: u16 = 256;
+const RETENTION_HEADER_LENGTH_V2: u16 = 280;
 const RETENTION_CHECKSUM_START: usize = 12;
 const RETENTION_CHECKSUM_END: usize = 16;
 const RETENTION_DIGEST_START: usize = 224;
 const RETENTION_DIGEST_END: usize = 256;
+const RETENTION_V2_DIGEST_START: usize = 248;
+const RETENTION_V2_DIGEST_END: usize = 280;
 
 /// Native WAL record role.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -179,9 +188,7 @@ pub enum WalError {
     #[error("native WAL address space is exhausted")]
     AddressExhausted,
     /// A retention anchor has the wrong exact length.
-    #[error(
-        "native WAL retention anchor has length {actual}; expected {WAL_RETENTION_ANCHOR_SIZE}"
-    )]
+    #[error("native WAL retention anchor has unsupported length {actual}")]
     InvalidRetentionAnchorLength {
         /// Actual encoded length.
         actual: usize,
@@ -207,6 +214,9 @@ pub enum WalError {
     /// WAL retention-anchor generations or digest links diverge.
     #[error("invalid native WAL retention anchor chain")]
     InvalidRetentionAnchorChain,
+    /// One retention-anchor authority chain carries mixed directory lineage.
+    #[error("native WAL retention anchor lineage does not match its authority chain")]
+    RetentionAnchorLineageMismatch,
     /// A staged or final anchor publication target already exists.
     #[error("native WAL retention publication target already exists")]
     RetentionPublicationTargetExists,
@@ -738,7 +748,7 @@ pub struct WalRetentionAnchorFields {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalRetentionAnchor {
     fields: WalRetentionAnchorFields,
-    digest: [u8; 32],
+    lineage: Option<LineageIdentity>,
 }
 
 impl WalRetentionAnchor {
@@ -749,9 +759,28 @@ impl WalRetentionAnchor {
     /// Returns an error when identities, counters, digests, or LSN/block
     /// relationships cannot describe one retained prefix.
     pub fn new(fields: WalRetentionAnchorFields) -> Result<Self, WalError> {
+        Self::new_internal(fields, None)
+    }
+
+    /// Validates fields and constructs one lineage-bearing canonical anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identities, counters, digests, or LSN/block
+    /// relationships cannot describe one retained prefix.
+    pub fn new_with_lineage(
+        fields: WalRetentionAnchorFields,
+        lineage: LineageIdentity,
+    ) -> Result<Self, WalError> {
+        Self::new_internal(fields, Some(lineage))
+    }
+
+    fn new_internal(
+        fields: WalRetentionAnchorFields,
+        lineage: Option<LineageIdentity>,
+    ) -> Result<Self, WalError> {
         validate_retention_anchor_fields(&fields)?;
-        let (_, digest) = encode_retention_anchor(fields);
-        Ok(Self { fields, digest })
+        Ok(Self { fields, lineage })
     }
 
     /// Returns the validated identity fields.
@@ -759,14 +788,19 @@ impl WalRetentionAnchor {
         self.fields
     }
 
-    /// Returns the complete canonical anchor digest.
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
+    /// Returns the directory lineage carried by v2 anchors.
+    pub const fn lineage(&self) -> Option<LineageIdentity> {
+        self.lineage
     }
 
-    /// Encodes the exact 256-byte canonical anchor.
-    pub fn encode(&self) -> [u8; WAL_RETENTION_ANCHOR_SIZE] {
-        encode_retention_anchor(self.fields).0
+    /// Returns the complete canonical anchor digest.
+    pub fn digest(&self) -> [u8; 32] {
+        encode_retention_anchor(self.fields, self.lineage).1
+    }
+
+    /// Encodes the exact canonical v1 or lineage-bearing v2 anchor.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_retention_anchor(self.fields, self.lineage).0
     }
 
     /// Decodes and verifies one exact canonical anchor.
@@ -776,25 +810,45 @@ impl WalRetentionAnchor {
     /// Returns an error for length, preamble, checksum, digest, identity,
     /// counter, or LSN/block divergence.
     pub fn decode(encoded: &[u8]) -> Result<Self, WalError> {
-        if encoded.len() != WAL_RETENTION_ANCHOR_SIZE {
-            return Err(WalError::InvalidRetentionAnchorLength {
-                actual: encoded.len(),
-            });
-        }
-        if encoded[0..8] != RETENTION_MAGIC
-            || read_u16(&encoded[8..10]) != RETENTION_FORMAT_VERSION
-            || read_u16(&encoded[10..12]) != RETENTION_HEADER_LENGTH
-        {
-            return Err(WalError::InvalidRetentionAnchorPreamble);
-        }
-        if retention_anchor_checksum(encoded)
+        let (digest_start, digest_end, lineage) = match encoded.len() {
+            WAL_RETENTION_ANCHOR_SIZE
+                if encoded[0..8] == RETENTION_MAGIC_V1
+                    && read_u16(&encoded[8..10]) == RETENTION_FORMAT_VERSION_V1
+                    && read_u16(&encoded[10..12]) == RETENTION_HEADER_LENGTH_V1 =>
+            {
+                (RETENTION_DIGEST_START, RETENTION_DIGEST_END, None)
+            }
+            WAL_RETENTION_ANCHOR_V2_SIZE
+                if encoded[0..8] == RETENTION_MAGIC_V2
+                    && read_u16(&encoded[8..10]) == RETENTION_FORMAT_VERSION_V2
+                    && read_u16(&encoded[10..12]) == RETENTION_HEADER_LENGTH_V2 =>
+            {
+                (
+                    RETENTION_V2_DIGEST_START,
+                    RETENTION_V2_DIGEST_END,
+                    Some(
+                        LineageIdentity::decode(&encoded[224..248])
+                            .map_err(|_| WalError::InvalidRetentionAnchorIdentity)?,
+                    ),
+                )
+            }
+            WAL_RETENTION_ANCHOR_SIZE | WAL_RETENTION_ANCHOR_V2_SIZE => {
+                return Err(WalError::InvalidRetentionAnchorPreamble);
+            }
+            _ => {
+                return Err(WalError::InvalidRetentionAnchorLength {
+                    actual: encoded.len(),
+                });
+            }
+        };
+        if retention_anchor_checksum(encoded, digest_start, digest_end)
             != read_u32(&encoded[RETENTION_CHECKSUM_START..RETENTION_CHECKSUM_END])
         {
             return Err(WalError::RetentionAnchorChecksumMismatch);
         }
         let mut stored_digest = [0_u8; 32];
-        stored_digest.copy_from_slice(&encoded[RETENTION_DIGEST_START..RETENTION_DIGEST_END]);
-        if retention_anchor_digest(encoded) != stored_digest {
+        stored_digest.copy_from_slice(&encoded[digest_start..digest_end]);
+        if retention_anchor_digest(encoded, digest_start, digest_end) != stored_digest {
             return Err(WalError::RetentionAnchorDigestMismatch);
         }
         let mut retired_block_digest = [0_u8; 32];
@@ -824,8 +878,8 @@ impl WalRetentionAnchor {
             committed_transaction_count: read_u64(&encoded[184..192]),
             previous_anchor_digest,
         };
-        let anchor = Self::new(fields)?;
-        if anchor.digest != stored_digest {
+        let anchor = Self::new_internal(fields, lineage)?;
+        if anchor.digest() != stored_digest {
             return Err(WalError::RetentionAnchorDigestMismatch);
         }
         Ok(anchor)
@@ -871,11 +925,32 @@ fn sequence_for_record_lsn(lsn: Lsn) -> Result<u64, WalError> {
 
 fn encode_retention_anchor(
     fields: WalRetentionAnchorFields,
-) -> ([u8; WAL_RETENTION_ANCHOR_SIZE], [u8; 32]) {
-    let mut encoded = [0_u8; WAL_RETENTION_ANCHOR_SIZE];
-    encoded[0..8].copy_from_slice(&RETENTION_MAGIC);
-    encoded[8..10].copy_from_slice(&RETENTION_FORMAT_VERSION.to_le_bytes());
-    encoded[10..12].copy_from_slice(&RETENTION_HEADER_LENGTH.to_le_bytes());
+    lineage: Option<LineageIdentity>,
+) -> (Vec<u8>, [u8; 32]) {
+    let (encoded_size, magic, format_version, header_length, digest_start, digest_end) =
+        if lineage.is_some() {
+            (
+                WAL_RETENTION_ANCHOR_V2_SIZE,
+                RETENTION_MAGIC_V2,
+                RETENTION_FORMAT_VERSION_V2,
+                RETENTION_HEADER_LENGTH_V2,
+                RETENTION_V2_DIGEST_START,
+                RETENTION_V2_DIGEST_END,
+            )
+        } else {
+            (
+                WAL_RETENTION_ANCHOR_SIZE,
+                RETENTION_MAGIC_V1,
+                RETENTION_FORMAT_VERSION_V1,
+                RETENTION_HEADER_LENGTH_V1,
+                RETENTION_DIGEST_START,
+                RETENTION_DIGEST_END,
+            )
+        };
+    let mut encoded = vec![0_u8; encoded_size];
+    encoded[0..8].copy_from_slice(&magic);
+    encoded[8..10].copy_from_slice(&format_version.to_le_bytes());
+    encoded[10..12].copy_from_slice(&header_length.to_le_bytes());
     encoded[16..24].copy_from_slice(&fields.epoch.to_le_bytes());
     encoded[24..32].copy_from_slice(&fields.retired_through_sequence.to_le_bytes());
     encoded[32..40].copy_from_slice(&fields.retired_checkpoint_lsn.get().to_le_bytes());
@@ -889,24 +964,27 @@ fn encode_retention_anchor(
     encoded[176..184].copy_from_slice(&fields.checkpoint_count.to_le_bytes());
     encoded[184..192].copy_from_slice(&fields.committed_transaction_count.to_le_bytes());
     encoded[192..224].copy_from_slice(&fields.previous_anchor_digest);
-    let checksum = retention_anchor_checksum(&encoded);
+    if let Some(lineage) = lineage {
+        encoded[224..248].copy_from_slice(&lineage.encode());
+    }
+    let checksum = retention_anchor_checksum(&encoded, digest_start, digest_end);
     encoded[RETENTION_CHECKSUM_START..RETENTION_CHECKSUM_END]
         .copy_from_slice(&checksum.to_le_bytes());
-    let digest = retention_anchor_digest(&encoded);
-    encoded[RETENTION_DIGEST_START..RETENTION_DIGEST_END].copy_from_slice(&digest);
+    let digest = retention_anchor_digest(&encoded, digest_start, digest_end);
+    encoded[digest_start..digest_end].copy_from_slice(&digest);
     (encoded, digest)
 }
 
-fn retention_anchor_checksum(encoded: &[u8]) -> u32 {
+fn retention_anchor_checksum(encoded: &[u8], digest_start: usize, digest_end: usize) -> u32 {
     let mut canonical = encoded.to_vec();
     canonical[RETENTION_CHECKSUM_START..RETENTION_CHECKSUM_END].fill(0);
-    canonical[RETENTION_DIGEST_START..RETENTION_DIGEST_END].fill(0);
+    canonical[digest_start..digest_end].fill(0);
     crc32c::crc32c(&canonical)
 }
 
-fn retention_anchor_digest(encoded: &[u8]) -> [u8; 32] {
+fn retention_anchor_digest(encoded: &[u8], digest_start: usize, digest_end: usize) -> [u8; 32] {
     let mut canonical = encoded.to_vec();
-    canonical[RETENTION_DIGEST_START..RETENTION_DIGEST_END].fill(0);
+    canonical[digest_start..digest_end].fill(0);
     *blake3::hash(&canonical).as_bytes()
 }
 
@@ -1010,6 +1088,12 @@ impl WalRetentionStore {
             if anchor.fields().epoch != epoch {
                 return Err(WalError::InvalidRetentionAnchorChain);
             }
+            if anchors
+                .last()
+                .is_some_and(|prior: &WalRetentionAnchor| prior.lineage != anchor.lineage)
+            {
+                return Err(WalError::RetentionAnchorLineageMismatch);
+            }
             anchors.push(anchor);
         }
         let candidate = if let Some((epoch, path)) = candidates.pop() {
@@ -1029,6 +1113,12 @@ impl WalRetentionStore {
                 ) != expected
             {
                 return Err(WalError::InvalidRetentionAnchorChain);
+            }
+            if anchors
+                .last()
+                .is_some_and(|prior| prior.lineage != candidate.lineage)
+            {
+                return Err(WalError::RetentionAnchorLineageMismatch);
             }
             Some(candidate)
         } else {
@@ -1067,6 +1157,25 @@ impl WalRetentionStore {
     /// Returns the latest stable anchor.
     pub fn current(&self) -> Option<&WalRetentionAnchor> {
         self.anchors.last()
+    }
+
+    /// Requires every stable and pending anchor to carry one exact lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a legacy anchor or any different identity.
+    pub fn validate_lineage(&self, expected: LineageIdentity) -> Result<(), WalError> {
+        let stable_mismatch = self
+            .anchors
+            .iter()
+            .any(|anchor| anchor.lineage != Some(expected));
+        let candidate_mismatch = self
+            .candidate
+            .is_some_and(|anchor| anchor.lineage != Some(expected));
+        if stable_mismatch || candidate_mismatch {
+            return Err(WalError::RetentionAnchorLineageMismatch);
+        }
+        Ok(())
     }
 
     /// Writes one synchronized create-new anchor stage.
@@ -1205,6 +1314,9 @@ impl WalRetentionStore {
             return Err(WalError::InvalidRetentionAnchorChain);
         }
         let (expected_epoch, expected_previous_digest) = if let Some(current) = self.current() {
+            if current.lineage != anchor.lineage {
+                return Err(WalError::RetentionAnchorLineageMismatch);
+            }
             (
                 current
                     .fields()
@@ -1618,12 +1730,15 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use hyphae_native_types::{Csn, EngineKind, Lsn, ManifestGeneration, TransactionId};
+    use hyphae_native_types::{
+        Csn, DirectoryUuid, EngineKind, HistoryEpoch, LineageIdentity, Lsn, ManifestGeneration,
+        TransactionId,
+    };
 
     use super::{
         PendingRecord, RecordKind, WAL_BLOCK_HEADER_SIZE, WAL_BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
-        WAL_RETENTION_ANCHOR_SIZE, WalBlock, WalError, WalFile, WalRetentionAnchor,
-        WalRetentionAnchorFields, WalRetentionStore,
+        WAL_RETENTION_ANCHOR_SIZE, WAL_RETENTION_ANCHOR_V2_SIZE, WalBlock, WalError, WalFile,
+        WalRetentionAnchor, WalRetentionAnchorFields, WalRetentionStore,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1691,6 +1806,16 @@ mod tests {
         })
     }
 
+    fn lineage(marker: u8) -> Result<LineageIdentity, Box<dyn std::error::Error>> {
+        let mut uuid = [marker; 16];
+        uuid[6] = (uuid[6] & 0x0f) | 0x70;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        Ok(LineageIdentity::new(
+            DirectoryUuid::new(uuid)?,
+            HistoryEpoch::FIRST,
+        ))
+    }
+
     #[test]
     fn retention_anchor_codec_is_exact_and_rejects_every_truncated_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1705,10 +1830,76 @@ mod tests {
         }
 
         for offset in [0, 8, 10, 16, 24, 32, 72, 80, 120, 160, 176, 184, 224] {
-            let mut corrupt = encoded;
+            let mut corrupt = encoded.clone();
             corrupt[offset] ^= 1;
             assert!(WalRetentionAnchor::decode(&corrupt).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_retention_anchor_v2_has_golden_offsets_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let anchor = WalRetentionAnchor::new_with_lineage(retention_anchor_fields()?, lineage)?;
+        let encoded = anchor.encode();
+
+        assert_eq!(encoded.len(), WAL_RETENTION_ANCHOR_V2_SIZE);
+        assert_eq!(&encoded[..8], b"HYWAR002");
+        assert_eq!(&encoded[8..10], &2_u16.to_le_bytes());
+        assert_eq!(&encoded[10..12], &280_u16.to_le_bytes());
+        assert_eq!(&encoded[224..248], &lineage.encode());
+        assert_eq!(WalRetentionAnchor::decode(&encoded)?, anchor);
+        assert_eq!(anchor.lineage(), Some(lineage));
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_retention_anchor_v2_rejects_every_truncated_prefix_and_single_byte_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let anchor = WalRetentionAnchor::new_with_lineage(retention_anchor_fields()?, lineage)?;
+        let encoded = anchor.encode();
+
+        for truncated_length in 0..encoded.len() {
+            assert!(WalRetentionAnchor::decode(&encoded[..truncated_length]).is_err());
+        }
+        for offset in 0..encoded.len() {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert!(WalRetentionAnchor::decode(&corrupt).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retention_store_rejects_mixed_lineage() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let mut store = WalRetentionStore::create(temporary.path())?;
+        let mut first_fields = retention_anchor_fields()?;
+        first_fields.epoch = 1;
+        first_fields.previous_anchor_digest = [0; 32];
+        let first = WalRetentionAnchor::new_with_lineage(first_fields, lineage(1)?)?;
+        store.publish_candidate(store.stage(first, false)?, false)?;
+        store.stabilize_candidate(1, false)?;
+
+        let mut second_fields = retention_anchor_fields()?;
+        second_fields.previous_anchor_digest = first.digest();
+        let divergent = WalRetentionAnchor::new_with_lineage(second_fields, lineage(2)?)?;
+        assert!(matches!(
+            store.stage(divergent, false),
+            Err(WalError::RetentionAnchorLineageMismatch)
+        ));
+        assert!(matches!(
+            store.validate_lineage(lineage(2)?),
+            Err(WalError::RetentionAnchorLineageMismatch)
+        ));
         Ok(())
     }
 

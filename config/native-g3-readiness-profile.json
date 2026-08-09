@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-g3-readiness-profile-v1",
+  "gate": "G3",
+  "requirements": [
+    {"id": "strings-and-counters", "required_evidence": "hosted"},
+    {"id": "hashes", "required_evidence": "hosted"},
+    {"id": "lists", "required_evidence": "hosted"},
+    {"id": "sets", "required_evidence": "hosted"},
+    {"id": "sorted-sets", "required_evidence": "hosted"},
+    {"id": "streams", "required_evidence": "hosted"},
+    {"id": "ttl-and-controlled-expiry", "required_evidence": "hosted"},
+    {"id": "atomic-batches-and-conflicts", "required_evidence": "hosted"},
+    {"id": "model-based-randomized-equivalence", "required_evidence": "hosted"},
+    {"id": "restart-equivalence", "required_evidence": "hosted"},
+    {"id": "memory-amplification", "required_evidence": "hosted"}
+  ]
+}

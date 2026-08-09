@@ -1,4 +1,8 @@
-# Local quickstart
+# Published 0.2.1 compatibility quickstart
+
+This guide is retained for the published format-2 `0.2.1` compatibility
+product. For Native 1.0 commands, use the
+[Native 1.0 quickstart](quickstart-native.md).
 
 This quickstart exercises Hyphae as one executable and one owned data
 directory. It does not start or contact a database, cache, cloud service,
@@ -10,7 +14,7 @@ option, see [`cli/reference.md`](cli/reference.md).
 
 ## Install the binary
 
-The latest published release is `0.2.1`. Install its crates.io CLI with:
+Install the retained `0.2.1` crates.io CLI with:
 
 ```bash
 cargo install hyphae-cli --version 0.2.1 --locked

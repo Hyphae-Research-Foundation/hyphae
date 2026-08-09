@@ -1,0 +1,34 @@
+{
+  "schema": "hyphae-native-g4-closure-v1",
+  "gate": "G4",
+  "status": "passed",
+  "source_commit": "0059fcee318f7e8fc14ae6651f6b43607ac0b219",
+  "workflow_run": 31040061717,
+  "scope": "bounded-search-correctness",
+  "production_scale": false,
+  "performance_gate_claimed": false,
+  "required": 12,
+  "passed": 12,
+  "requirements": [
+    "analyzers",
+    "postings-and-segments",
+    "bm25-and-scoring-goldens",
+    "phrase-search",
+    "prefix-and-fuzzy-search",
+    "doc-values-and-filtering",
+    "facets-and-aggregations",
+    "exact-vector-search",
+    "ann-search",
+    "hybrid-search",
+    "ndcg-and-recall-quality",
+    "rebuild-and-corruption"
+  ],
+  "artifact": "native-g4-closure-0059fcee318f7e8fc14ae6651f6b43607ac0b219",
+  "corpus_sha256": "11027caf4260337bd6730977794f0a715e10a658038cdb6b815732281a2c8d9d",
+  "non_claims": [
+    "universal search language compatibility",
+    "automatic background segment policy",
+    "page-buffered ANN production traversal",
+    "production-scale performance"
+  ]
+}

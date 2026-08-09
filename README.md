@@ -20,80 +20,70 @@
   <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
 </p>
 
-Hyphae is an autonomous, embeddable, and verifiable data engine written in
-Rust. Its base deployment is one native `hyphae` executable and one data
-directory. KV, structured query, recovery, and verification work offline
-without a database, cache, cloud service, embedding provider, or LLM.
+Hyphae is a local-first data engine written in Rust. One process owns one data
+directory and exposes relational SQL, native structures, lexical search, and
+vector search over a shared transaction, WAL, MVCC, recovery, and proof
+substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
+OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Latest published release:** [`v0.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
-Its annotated tag peels to
-`08028e8dac077846c638f067ce74fbcf6fb75501`, and all ten publishable Rust
-workspace crates are available on crates.io at version `0.2.1`. This release
-accepts large but bounded offline snapshot witnesses and adds SemVer-compatible
-bounded query, recovery, snapshot, and compaction paths used by the packaged
-CLI/server. The published `0.2.0` embedded entry points retain their
-signatures, exhaustive error surfaces, and compatibility behavior. See the
-[`0.2.1` publication receipt](docs/release/receipts/0.2.1.md) for exact source,
-tag, workflow, artifact, and registry identities.
+**Stable Native release:** Hyphae Native is the active architecture. G0
+through G6 are closed for their versioned, bounded profiles. G7 performance
+certification remains open; the exact-commit G8 release evidence is produced
+by the release workflow. The
+[native gate status](docs/gates/native-gate-status.md) is the current status
+authority; temporary workflow artifacts alone do not close a gate.
 
-**Forward architecture:** Hyphae is now targeting a fully native local data
-ecosystem with its own relational/SQL, keyspace/structure, and lexical/vector
-search engines. They will share one Hyphae-owned transaction, memory,
-durability, recovery, and proof substrate without embedding PostgreSQL,
-Valkey, OpenSearch, or another database engine. This is an accepted target,
-not shipped `0.2.1` behavior. See the
-[native architecture](docs/architecture/native-local-ecosystem.md) and its
-[ordered phase-1 gate](docs/gates/native-local-phase-1.md).
+**Published release:** [`v1.0.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0)
+is distributed as signed native archives from GitHub Releases. The prior
+`0.2.1` crates.io line remains the format-2 compatibility baseline; its
+publication receipt is retained at
+[`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
+
+The Native line releases as `1.0.0` after G8 closes on the exact release
+commit. G7 does not block publication, but Hyphae makes no certified latency,
+saturation, or production-scale performance claim until G7 closes on dedicated
+hardware.
 
 ## What Hyphae does
 
-- Atomically stores and deletes structured records under binary keys.
-- Recovers an append-only checksummed/digest-chained log and rebuilds embedded
-  Redb indexes.
-- Makes mutation retries durable and idempotent through caller-visible UUIDs.
-- Executes deterministic filters, global sorting, logical cursors, and
-  grouped/global aggregations with hard budgets and no partial results.
-- Persists named vector spaces and executes deterministic exact cosine
-  retrieval with explicit abstention.
-- Builds a reconstructible provider-free lexical index and fuses vector and
-  lexical results with deterministic reciprocal-rank fusion.
-- Creates canonical snapshots, commits anchored compaction generations, and
-  rejects unsupported or corrupt formats.
-- Produces portable result and retrieval proofs and verifies them offline
-  against their canonical request, result, semantics, and snapshot witnesses.
-- Creates, verifies, and atomically restores portable logical backups; `doctor`
-  reports complete local recovery evidence.
-- Optionally exposes a secure, loopback-first OpenAPI `/v1` server.
-- Supplies equivalent Rust, TypeScript, Python, remote CLI, and MCP clients.
-- Keeps PliegoRS, Astro, Next, and Vite adapters optional and outside the core.
+- Executes bounded SQL DDL, DML, prepared queries, secondary-index reads, and
+  transactions over a Hyphae-owned relational engine.
+- Provides native strings, counters, hashes, lists, sets, sorted sets, streams,
+  TTL, scans, algebra, and atomic structure batches.
+- Owns lexical, exact-vector, incremental ANN, filtered, faceted, metric, and
+  same-snapshot hybrid search without an external search engine.
+- Commits SQL, structure, and search mutations under one catalog, WAL, MVCC
+  root set, commit sequence, scheduler, and stable object-ID namespace.
+- Exposes one embedded Rust facade, local UDS/named-pipe protocol, CLI, optional
+  loopback HTTP `/v2`, and typed Python and TypeScript SDKs.
+- Creates Native checkpoints, proofs, witnesses, backups, restores, vacuum
+  generations, and complete `doctor` reports with bounded failure behavior.
+- Imports format-2 state offline into a separate pending Native directory,
+  verifies equivalence, and requires explicit promotion.
 
-The API server always returns proofs for successful get/query operations. The
-embedded facade exposes ordinary and proof-bearing methods; the local CLI
-creates proof files explicitly with `--proof-out`.
-
-See the complete [capability matrix](docs/product/capabilities.md), including
-surface differences, default limits, and deliberate non-capabilities.
+See the [Native capability matrix](docs/product/native-capabilities.md),
+including surface differences, boundaries, and deliberate non-capabilities.
+The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 
 ## Install
 
-Install the latest published native binary:
+Download the archive for your platform from the
+[`v1.0.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0),
+then verify its checksum and Sigstore bundle before installing the `hyphae`
+binary. Native 1.0 crates are not published to crates.io.
+
+Build and embed the exact release from source with:
 
 ```bash
-cargo install hyphae-cli --version 0.2.1 --locked
-hyphae version --json
+git checkout v1.0.0
+cargo build --release --locked -p hyphae-cli
+./target/release/hyphae version --json
 ```
 
-Embed the latest published engine with an exact product-version requirement:
+The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
+checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
 
-```bash
-cargo add hyphae-engine@=0.2.1
-```
-
-Native archives, checksums, SBOMs, provenance, signatures, and attestations
-for `0.2.1` are attached to its
-[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
-
-## Five-minute local flow
+## Published 0.2.1 compatibility flow
 
 ```bash
 cargo build --release --locked -p hyphae-cli
@@ -110,7 +100,9 @@ export HYPHAE_DATA_DIR="$PWD/hyphae-data"
 ./target/release/hyphae doctor
 ```
 
-The query response names the snapshot and anchor needed by `hyphae verify`.
+These commands describe the published format-2 compatibility release, not the
+Native `dev` command surface. The query response names the snapshot and anchor
+needed by `hyphae verify`.
 The [quickstart](docs/quickstart.md) covers Windows syntax, compaction,
 restore, offline proof verification, the optional server, and clients.
 
@@ -118,45 +110,52 @@ restore, offline proof verification, the optional server, and clients.
 
 ```text
 application
-  ├─ embedded Rust facade ───────────────────────────────┐
-  ├─ local CLI                                           │
-  └─ /v1 clients (Rust / TypeScript / Python / CLI / MCP)│
-                             │                           │
-                       secure HTTP server                │
-                             └──────────────┬────────────┘
-                                            ▼
-                         engine: documents / query / proof
-                              │                  │
-                 durable exact/lexical/hybrid   │
-                              │                  ▼
-                              └──── append-only durable log
-                                      │        │
-                                  snapshots  rebuildable index
+  ├─ embedded Rust facade ────────────────────────────────┐
+  ├─ local CLI                                            │
+  ├─ UDS / named-pipe clients (Rust / Python / TypeScript)│
+  └─ optional loopback HTTP /v2 ──────────────────────────┤
+                                                          ▼
+                     Native product and transaction authority
+                         │              │              │
+                        SQL         structures       search
+                         └──────────────┬──────────────┘
+                                        ▼
+                      catalog / WAL / MVCC / pages / blobs
+                              checkpoints / backup / proofs
 ```
 
-The append-only log is durable authority. Embedded indexes are replaceable.
-One operating-system lock gives one engine/server exclusive ownership of a
-data directory. See the [architecture overview](docs/architecture/overview.md)
-and versioned [storage specifications](docs/README.md#durable-formats).
+One operating-system lock gives one product instance exclusive ownership of a
+Native data directory. See the
+[Native architecture](docs/architecture/native-local-ecosystem.md) and
+[versioned Native specifications](docs/README.md#understand-correctness).
 
 ## Public surfaces
 
 | Surface | Purpose |
 |---|---|
-| `hyphae` binary | Local engine, operations, server, remote client, verifier, MCP |
-| `hyphae-engine` | Recommended embeddable Rust facade |
-| `/v1` | Stable proof-bearing HTTP contract |
-| `hyphae-client` | Bounded async Rust HTTP client |
-| `@celiums/hyphae` | Dependency-free TypeScript client |
-| `hyphae-sdk` | Dependency-free Python client |
-| MCP stdio | Twelve schema-bound tools over `/v1` |
-| Optional adapters | PliegoRS, Astro, Next, and Vite consumers |
+| `hyphae` binary | Native local operations, administration, migration, server, and verifier |
+| `hyphae-native-product` | Curated embedded Native product facade |
+| Native local protocol | Primary UDS/named-pipe multi-client transport |
+| HTTP `/v2` | Optional loopback-first Native edge |
+| `@celiums/hyphae` | TypeScript Native local-protocol and HTTP client |
+| `hyphae-sdk` | Python Native local-protocol and HTTP client |
+| `/v1` compatibility | Separately retained published format-2 HTTP product |
 
 OpenAPI 3.1 and JSON Schema 2020-12 under `contracts/` are the canonical wire
-contracts. Integrations consume public clients only; hosts continue to build
-and run with Hyphae absent.
+contracts. Native uses `hyphae-v2.yaml` and `native-v2.schema.json`; the
+published format-2 product retains `hyphae-v1.yaml`.
 
 ## Rust crates
+
+The Native line is organized around `hyphae-native-product` (embedded facade),
+`hyphae-native-runtime` (SQL, structures, search, transactions, and
+scheduling), `hyphae-native-protocol`/`hyphae-native-daemon` (local transport),
+and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,manifest,ann}`
+storage and execution primitives. `hyphae-cli` builds the single product
+binary.
+
+The following crates are the published format-2 compatibility libraries at
+`0.2.1`; their crates.io pages do not describe the unpublished Native facade:
 
 | Crate | Purpose | Documentation |
 |---|---|---|
@@ -175,14 +174,14 @@ and run with Hyphae absent.
 
 Start at the [documentation index](docs/README.md). Key guides:
 
-- [Capabilities and limits](docs/product/capabilities.md)
-- [Quickstart](docs/quickstart.md)
+- [Native capabilities and limits](docs/product/native-capabilities.md)
+- [Native 1.0 quickstart](docs/quickstart-native.md)
+- [Published 0.2.1 compatibility guide](docs/quickstart.md)
 - [CLI reference](docs/cli/reference.md)
 - [Configuration](docs/configuration.md)
-- [Data model](docs/concepts/data-model.md)
-- [Embed in Rust](docs/embedding/rust.md)
-- [HTTP API v1](docs/api/v1.md)
-- [Public clients](docs/clients/v1.md)
+- [Native product contract](docs/native/local-product-v1.md)
+- [Native HTTP API v2](docs/native/http-v2.md)
+- [Native local protocol](docs/native/local-protocol-v1.md)
 - [Operations and troubleshooting](docs/operations/troubleshooting.md)
 - [Security model](docs/security/threat-model.md)
 - [Native local ecosystem target](docs/architecture/native-local-ecosystem.md)
@@ -193,26 +192,28 @@ Start at the [documentation index](docs/README.md). Key guides:
 
 ## Product boundary
 
+Hyphae Native is a local, single-node data ecosystem with Hyphae-owned SQL,
+structures, lexical search, and ANN under one durable authority. G0 through G6
+are closed for their bounded contracts. G8 protects the exact release commit;
+G7 remains a post-release performance certification and is not a release claim.
+
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
-runtime, a hosted SaaS, or a framework-specific data layer. Release `0.2.1`
-does not ship SQL, replication, clustering, built-in TLS, at-rest encryption,
-multitenancy, billing, a control plane, an embedding model, or an LLM.
+runtime, a hosted SaaS, or a framework-specific data layer. The retained
+`0.2.1` compatibility line does not include the Native SQL/structures/search
+architecture. Replication, clustering, built-in TLS, at-rest encryption,
+multitenancy, billing, a control plane, an embedding model, and an LLM are also
+outside Native 1.0.
 
-The phase-1 target deliberately adds Hyphae-owned relational SQL, native
-keyspace structures, and native lexical/vector search inside the same local
-process. It does not add an external database, cache, search service, model, or
-cloud dependency. Hosted, distributed, and model-driven programs remain later
-phases.
-
-Applications own process supervision, remote TLS termination, filesystem
-permissions, backup media policy, and optional embedding providers. Semantic
-providers can supply vectors to the Rust retrieval API but never become a core
-dependency or authority.
+Hosted, distributed, and model-driven programs remain later phases. Applications
+still own process supervision, remote TLS termination, filesystem permissions,
+backup media policy, and optional embedding providers. Semantic providers can
+supply vectors to the Rust APIs but never become a core dependency or source of
+authority.
 
 ## Repository map
 
-- `crates/`: Rust storage, engine, query, retrieval, contracts, server, client,
-  and single CLI.
+- `crates/`: Native product/runtime/storage/protocol crates, retained format-2
+  libraries, public contracts, clients, servers, and the single CLI.
 - `contracts/`: canonical OpenAPI and JSON Schemas.
 - `sdks/`: TypeScript and Python clients/models.
 - `mcp/`: MCP adapter guide; implementation is in the single binary.

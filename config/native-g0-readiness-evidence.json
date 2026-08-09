@@ -1,0 +1,43 @@
+{
+  "architecture-and-versioned-specifications": {
+    "status": "passed",
+    "evidence_level": "local-integration",
+    "artifact": "docs/architecture/native-local-ecosystem.md",
+    "artifact_sha256": "61550f71005a1a880f929bb309c3f26cea6259e76928342ed8f71930b56705c6"
+  },
+  "canonical-type-goldens-and-properties": {
+    "status": "not-configured",
+    "evidence_level": "local-integration",
+    "artifact": "docs/native/types-v1.md"
+  },
+  "page-row-blob-wal-mvcc-goldens": {
+    "status": "not-configured",
+    "evidence_level": "local-integration",
+    "artifact": "docs/gates/native-local-phase-1.md"
+  },
+  "sql-structure-search-ann-contracts": {
+    "status": "not-configured",
+    "evidence_level": "local-integration",
+    "artifact": "docs/gates/native-local-phase-1.md"
+  },
+  "local-protocol-goldens-and-conformance": {
+    "status": "not-configured",
+    "evidence_level": "local-integration",
+    "artifact": "docs/native/local-protocol-v1.md"
+  },
+  "benchmark-and-quality-corpus": {
+    "status": "not-configured",
+    "evidence_level": "contract",
+    "artifact": "docs/native/search-semantics-v1.md"
+  },
+  "native-dependency-license-unsafe-audit": {
+    "status": "not-configured",
+    "evidence_level": "hosted",
+    "artifact": "docs/gates/evidence/native-dependency-closure-2026-08-02.md"
+  },
+  "clean-room-porting-ledger-review": {
+    "status": "not-configured",
+    "evidence_level": "contract",
+    "artifact": "docs/porting/ledger.md"
+  }
+}

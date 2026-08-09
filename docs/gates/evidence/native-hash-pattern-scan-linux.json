@@ -1,0 +1,189 @@
+{
+  "schema": "hyphae.native.hash-pattern-scan-evidence.v1",
+  "status": "direct-linux-ext4-observation",
+  "source_branch": "codex/native-hash-pattern-scan",
+  "stacked_parent_commit": "232ba96d848cec5ac37bf0bdf011d01c9aafacd7",
+  "contract_commit": "8c2e652b71403cb9ae22a6379f20e364b0e78af3",
+  "runtime_commit": "8c2eb1aa6db688ad74b2747ad9f465098cfb8787",
+  "benchmark_commit": "f5f76aa42ab2d4b57a894a5c3afa6f9e4ef8daf1",
+  "benchmark_tree": "14b1185eb73a8db872e037cb3296a9ac58876fc3",
+  "benchmark_harness_sha256": "a532864deaf0903660ff2a3bb06ea6dc69e7f72ab398bda40b6a2f3d5ab8d317",
+  "benchmark_output_sha256": "2af1ec0f92d6399af853abe2d36f8d418a68032dcc94a4e381679b39659e8618",
+  "control_harness_sha256": "8d03592813a5607be4ff1f63c7fced8c059a59a37ebd524c4098f1b9ed05b0eb",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "target": "x86_64-linux",
+  "profile": "release",
+  "concurrency": 1,
+  "environment": {
+    "provider": "AWS EC2",
+    "instance_type": "m6i.2xlarge",
+    "vcpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C at 2.90 GHz",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "filesystem": "ext4",
+    "device": "/dev/nvme0n1p1",
+    "storage_note": "EBS-backed root volume; benchmark temporary directories use the same ext4 filesystem",
+    "execution": "direct SSH Linux; no WSL",
+    "pinned_cpu": 2
+  },
+  "hash_pattern_scan_smoke": {
+    "schema": "hyphae.native.hash-pattern-scan-smoke.v1",
+    "hash_fields": 2048,
+    "page_fields": 32,
+    "field_bytes": 64,
+    "value_bytes": 64,
+    "observations_per_route": 10000,
+    "warmup_per_route": 1000,
+    "dataset_blake3": "d0027d267cfc83237552c006c6dfec04ac107439e6ea00bd50f448abd1a8aeb8",
+    "structure_tree_height": 2,
+    "route_counters": {
+      "prefix_native": {
+        "visited": 32,
+        "match_steps": 2080
+      },
+      "leading_wildcard_native": {
+        "visited": 1985,
+        "match_steps": 260243
+      }
+    },
+    "operations": {
+      "prefix_native_32": {
+        "p50_nanos": 16337,
+        "p95_nanos": 16646,
+        "p99_nanos": 25456,
+        "p999_nanos": 27660,
+        "maximum_nanos": 38565,
+        "throughput_per_second": 60301.602
+      },
+      "prefix_full_hscan_filter_32": {
+        "p50_nanos": 401302,
+        "p95_nanos": 419621,
+        "p99_nanos": 433324,
+        "p999_nanos": 819175,
+        "maximum_nanos": 840424,
+        "throughput_per_second": 2462.116
+      },
+      "leading_wildcard_native_32": {
+        "p50_nanos": 651244,
+        "p95_nanos": 663124,
+        "p99_nanos": 670262,
+        "p999_nanos": 1060640,
+        "maximum_nanos": 1332465,
+        "throughput_per_second": 1533.320
+      },
+      "leading_wildcard_full_hscan_filter_32": {
+        "p50_nanos": 401791,
+        "p95_nanos": 418600,
+        "p99_nanos": 424938,
+        "p999_nanos": 652875,
+        "maximum_nanos": 823311,
+        "throughput_per_second": 2465.045
+      }
+    },
+    "improvement_percent": {
+      "prefix": {
+        "p50": 95.929,
+        "p95": 96.033,
+        "p99": 94.125,
+        "throughput": 2349.178
+      },
+      "leading_wildcard": {
+        "p50": -62.085,
+        "p95": -58.415,
+        "p99": -57.732,
+        "throughput": -37.797
+      }
+    }
+  },
+  "matched_persistent_hget_control": {
+    "hash_fields": 2048,
+    "observations": 200000,
+    "operations_per_observation": 32,
+    "warmup": 20000,
+    "pinned_cpu": 2,
+    "pinned_rounds": [
+      {
+        "round": 1,
+        "execution_order": [
+          "current",
+          "parent"
+        ],
+        "current": {
+          "p50_nanos": 1354,
+          "p95_nanos": 1597,
+          "p99_nanos": 1655,
+          "p999_nanos": 2723,
+          "maximum_nanos": 4701,
+          "throughput_per_second": 726964.977
+        },
+        "parent": {
+          "p50_nanos": 1365,
+          "p95_nanos": 1596,
+          "p99_nanos": 1655,
+          "p999_nanos": 2291,
+          "maximum_nanos": 4874,
+          "throughput_per_second": 722879.374
+        }
+      },
+      {
+        "round": 2,
+        "execution_order": [
+          "parent",
+          "current"
+        ],
+        "parent": {
+          "p50_nanos": 1389,
+          "p95_nanos": 1648,
+          "p99_nanos": 1684,
+          "p999_nanos": 2648,
+          "maximum_nanos": 5143,
+          "throughput_per_second": 709866.209
+        },
+        "current": {
+          "p50_nanos": 1343,
+          "p95_nanos": 1572,
+          "p99_nanos": 1641,
+          "p999_nanos": 2625,
+          "maximum_nanos": 4823,
+          "throughput_per_second": 733634.465
+        }
+      }
+    ],
+    "pinned_two_round_median": {
+      "parent": {
+        "p50_nanos": 1377.0,
+        "p95_nanos": 1622.0,
+        "p99_nanos": 1669.5,
+        "p999_nanos": 2469.5,
+        "throughput_per_second": 716372.7915
+      },
+      "current": {
+        "p50_nanos": 1348.5,
+        "p95_nanos": 1584.5,
+        "p99_nanos": 1648.0,
+        "p999_nanos": 2674.0,
+        "throughput_per_second": 730299.721
+      },
+      "change_percent": {
+        "p50": -2.070,
+        "p95": -2.312,
+        "p99": -1.288,
+        "p999": 8.281,
+        "throughput": 1.944
+      }
+    },
+    "gate": {
+      "metric": "p50 and p95 increase no greater than 10 percent",
+      "passed": true,
+      "basis": "median of two alternating parent-current rounds pinned to CPU 2"
+    }
+  },
+  "boundaries": [
+    "Warm concurrency-one observations are not a universal latency SLO.",
+    "The full-HSCAN fallbacks deliberately materialize all 2,048 fields before application filtering and truncation.",
+    "Leading-literal pruning is demonstrated by 32 physical visits for 32 returned fields.",
+    "The leading-wildcard route visits 1,985 fields and is slower than full HSCAN plus the specialized application predicate; this retained negative result identifies matcher and decode overhead for future work.",
+    "The matched control freezes p50 and p95 only.",
+    "The observation does not close reverse-pattern scans, field TTL, local-protocol exposure, randomized model equivalence, saturation, cold-cache, allocation, RSS, hardware-counter, memory-amplification, complete G3, or G7 gates."
+  ]
+}

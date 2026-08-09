@@ -17,9 +17,14 @@ and Windows x64. It emits a SHA-256 checksum file, SPDX JSON and
 CycloneDX JSON SBOMs, Sigstore bundles for every release asset, and GitHub
 Actions SLSA v1 provenance plus SBOM attestations for every native archive
 before creating a release. Every package job also extracts its own archive and
-executes the documented offline version, KV, query, compaction, result proof,
-durable vector/lexical/hybrid retrieval, retrieval-proof verification,
-backup/restore, and doctor flow from the installed binary.
+uses only its installed binary to execute native initialization, structures,
+SQL, checkpoint, compaction, backup/restore, and doctor. The same installed
+binary exercises the retained format-2 compatibility proof path: it generates
+a result proof plus exact, lexical, and hybrid retrieval proofs, downloads the
+complete witnesses, stops the server, deletes the originating data directory,
+and verifies all four proofs offline. A tampered result-proof negative control
+must fail; the smoke cannot report success unless every positive verification
+succeeds and the negative control is rejected.
 
 A manual workflow run, including one dispatched from a tag ref, executes native
 build, provenance, SBOM, signing, and verification, then uploads a candidate
@@ -31,11 +36,12 @@ that commit to remain reachable from `main`, and re-fetches both immediately
 before publication. A tag may be pushed only after the complete gate is green
 and publication is explicitly authorized.
 
-A tagged `push` publication also records exactly 17 required checks. Each check
+A tagged `push` publication also records exactly 18 required checks. Each check
 is bound to the expected canonical workflow path and to successful workflow-run
 metadata for the same commit; a same-named job from another workflow is
-rejected. All selected runs must be `pull_request` runs for the same head
-branch, every workflow path must resolve to one run, and the commit must belong
+rejected. Seventeen selected runs must be `pull_request` runs; the exact-SHA
+G8 closure is the sole `workflow_dispatch` run. All use the same head branch,
+every workflow path must resolve to one run, and the commit must belong
 to exactly one merged in-repository PR targeting `main`; the complete PR
 history for that head branch must contain no second PR, and the PR's complete
 issue-event history must contain no base-ref change or successful automatic

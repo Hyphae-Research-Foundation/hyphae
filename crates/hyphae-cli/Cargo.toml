@@ -12,19 +12,26 @@ keywords.workspace = true
 categories.workspace = true
 description = "Single-binary CLI, server, verifier, and MCP adapter for Hyphae."
 documentation = "https://docs.rs/hyphae-cli"
-publish.workspace = true
+publish = false
 
 [[bin]]
 name = "hyphae"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 clap.workspace = true
 hyphae-client.workspace = true
 hyphae-contracts.workspace = true
 hyphae-core.workspace = true
 hyphae-engine.workspace = true
+hyphae-native-catalog.workspace = true
+hyphae-native-daemon.workspace = true
+hyphae-native-product.workspace = true
+hyphae-native-runtime.workspace = true
+hyphae-native-types.workspace = true
 hyphae-query.workspace = true
+hyphae-retrieval.workspace = true
 hyphae-server.workspace = true
 hyphae-storage.workspace = true
 serde.workspace = true
@@ -34,7 +41,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-hyphae-retrieval.workspace = true
-
 [lints]
 workspace = true

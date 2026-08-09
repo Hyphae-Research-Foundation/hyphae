@@ -9,10 +9,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = false
+include = ["Cargo.toml", "README.md", "src/**", "tests/**", "examples/**"]
 
 [dependencies]
 blake3.workspace = true
 crc32c.workspace = true
+getrandom.workspace = true
 hyphae-native-ann.workspace = true
 hyphae-native-blobs.workspace = true
 hyphae-native-btree.workspace = true
@@ -24,6 +26,10 @@ hyphae-native-records.workspace = true
 hyphae-native-types.workspace = true
 hyphae-native-wal.workspace = true
 thiserror.workspace = true
+unicode-casefold.workspace = true
+unicode-normalization.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

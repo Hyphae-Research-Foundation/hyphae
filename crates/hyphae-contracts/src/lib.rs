@@ -3,9 +3,28 @@
 //! Canonical public contract documents embedded for validation and generation.
 
 pub mod v1;
+pub mod v2;
 
 /// `OpenAPI` 3.1 document for HTTP API version 1.
 pub const OPENAPI_V1: &str = include_str!("../assets/openapi/hyphae-v1.yaml");
+
+/// `OpenAPI` 3.1 document for the Native HTTP version 2 adapter.
+pub const OPENAPI_V2: &str = include_str!("../assets/openapi/hyphae-v2.yaml");
+
+/// JSON Schema for the complete Native v2 operation vocabulary.
+pub const NATIVE_SCHEMA_V2: &str = include_str!("../assets/json-schema/native-v2.schema.json");
+
+/// JSON Schema for Native HTTP v2 Product errors.
+pub const PRODUCT_ERROR_SCHEMA_V2: &str =
+    include_str!("../assets/json-schema/product-error-v2.schema.json");
+
+/// JSON Schema for provisional Native HTTP v2 read stream records.
+pub const READ_STREAM_SCHEMA_V2: &str =
+    include_str!("../assets/json-schema/read-stream-v2.schema.json");
+
+/// JSON Schema for the explicit Native `/v1` compatibility policy.
+pub const V1_COMPATIBILITY_SCHEMA_V2: &str =
+    include_str!("../assets/json-schema/v1-compatibility-v2.schema.json");
 
 /// JSON Schema for the version 1 capability response.
 pub const CAPABILITIES_SCHEMA_V1: &str =
@@ -359,6 +378,112 @@ mod tests {
             }
             YamlValue::Tagged(value) => validate_external_schema_refs(&value.value, base)?,
             YamlValue::Null | YamlValue::Bool(_) | YamlValue::Number(_) | YamlValue::String(_) => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use std::{error::Error, fs, path::Path};
+
+    use serde_json::Value as JsonValue;
+    use serde_yaml_ng::Value as YamlValue;
+
+    use super::{
+        NATIVE_SCHEMA_V2, OPENAPI_V2, PRODUCT_ERROR_SCHEMA_V2, READ_STREAM_SCHEMA_V2,
+        V1_COMPATIBILITY_SCHEMA_V2,
+    };
+
+    #[test]
+    fn native_v2_assets_are_versioned_and_match_canonical_contracts() -> Result<(), Box<dyn Error>>
+    {
+        let document: YamlValue = serde_yaml_ng::from_str(OPENAPI_V2)?;
+        assert_eq!(
+            document.get("openapi").and_then(YamlValue::as_str),
+            Some("3.1.0")
+        );
+        let paths = document
+            .get("paths")
+            .and_then(YamlValue::as_mapping)
+            .ok_or("v2 paths are missing")?;
+        for path in [
+            "/v2/capabilities",
+            "/v2/execute",
+            "/v2/catalog",
+            "/v2/sql",
+            "/v2/structures",
+            "/v2/search",
+            "/v2/search/collection",
+            "/v2/search/ingest",
+            "/v2/admin",
+            "/v2/telemetry",
+            "/v2/doctor",
+            "/v2/backup",
+            "/v2/restore",
+            "/v2/proofs/verify",
+            "/v2/transactions/status",
+            "/v2/read-stream",
+        ] {
+            assert!(
+                paths.contains_key(YamlValue::String(path.to_owned())),
+                "{path}"
+            );
+        }
+
+        for schema in [
+            NATIVE_SCHEMA_V2,
+            PRODUCT_ERROR_SCHEMA_V2,
+            READ_STREAM_SCHEMA_V2,
+            V1_COMPATIBILITY_SCHEMA_V2,
+        ] {
+            let value: JsonValue = serde_json::from_str(schema)?;
+            assert_eq!(
+                value.get("$schema").and_then(JsonValue::as_str),
+                Some("https://json-schema.org/draft/2020-12/schema")
+            );
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts");
+        if root.is_dir() {
+            for (path, packaged) in [
+                ("json-schema/native-v2.schema.json", NATIVE_SCHEMA_V2),
+                (
+                    "json-schema/product-error-v2.schema.json",
+                    PRODUCT_ERROR_SCHEMA_V2,
+                ),
+                (
+                    "json-schema/read-stream-v2.schema.json",
+                    READ_STREAM_SCHEMA_V2,
+                ),
+                (
+                    "json-schema/v1-compatibility-v2.schema.json",
+                    V1_COMPATIBILITY_SCHEMA_V2,
+                ),
+            ] {
+                let canonical = fs::read_to_string(root.join(path))?;
+                let canonical: JsonValue = serde_json::from_str(&canonical)?;
+                let packaged: JsonValue = serde_json::from_str(packaged)?;
+                assert_eq!(canonical.get("$schema"), packaged.get("$schema"), "{path}");
+                assert_eq!(canonical.get("title"), packaged.get("title"), "{path}");
+            }
+
+            let canonical: YamlValue =
+                serde_yaml_ng::from_str(&fs::read_to_string(root.join("openapi/hyphae-v2.yaml"))?)?;
+            assert_eq!(
+                canonical.get("openapi").and_then(YamlValue::as_str),
+                document.get("openapi").and_then(YamlValue::as_str)
+            );
+            assert_eq!(
+                canonical
+                    .get("paths")
+                    .and_then(YamlValue::as_mapping)
+                    .map(serde_yaml_ng::Mapping::len),
+                document
+                    .get("paths")
+                    .and_then(YamlValue::as_mapping)
+                    .map(serde_yaml_ng::Mapping::len)
+            );
         }
         Ok(())
     }

@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-lexical-quality-v1",
+  "source_commit": "6154b6527e6d74e492eef84fc3220939592a4116",
+  "dataset_digest": "0074169aea59cd3a61e0cc59e9d0e264921fc21363d37bd8647bb6a3e095cd64",
+  "document_count": 512,
+  "query_count": 4,
+  "top_k": 25,
+  "exact_score_order_equivalence": true,
+  "reopen_equivalence": true,
+  "query_result_digests": [
+    "c37238c7c7e50dcbaec4999aea253e00029011ad19aeccff6267b69ffca29e29",
+    "903666722bf835350682e1a1224330730c5a03dc2c3ff29b10e06df28fcecb97",
+    "4814fa8bffa05fef4d8c14a69f8ad9823e6a759217f33c7d9e43732b8c2a7398",
+    "cdedb3a0ffba54fbfa293a766b67838ef8cfae5453567adbc0b036f88630cc85"
+  ]
+}

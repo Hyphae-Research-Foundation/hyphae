@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-g5-inventory-v1",
+  "gate": "G5",
+  "requirements": [
+    {"id": "all-engine-atomicity", "status": "implemented-unhosted", "present": ["one-CSN relational, structure, lexical and vector commit", "conflict, rollback, prior-snapshot, reopen and interruption checks"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "concurrent-readers", "status": "implemented-unhosted", "present": ["concurrent publication crossing", "retained and pinned snapshot checks", "zero-mixed-generation and zero-mixed-CSN oracle"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "stable-ids-and-links", "status": "implemented-unhosted", "present": ["catalog object IDs", "ObjectId cross-engine joins", "catalog dependency validation"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "structure-source", "status": "implemented-unhosted", "present": ["all native structure families as bounded relation-valued sources", "source strategy and limit-pushdown metrics"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "search-source", "status": "implemented-unhosted", "present": ["lexical, exact, ANN and hybrid relation-valued sources", "same-snapshot stable-ID results"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "joins-aggregates-pushdown", "status": "implemented-unhosted", "present": ["ObjectId inner joins", "count, sum, min and max", "bounded source strategies and explicit pushdown metrics", "fail-closed malformed plans"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "checkpoint-complete-state", "status": "implemented-unhosted", "present": ["one immutable all-engine root manifest checkpoint", "four-surface interruption recovery matrix"], "gaps": ["hosted exact-SHA receipt"]},
+    {"id": "backup-restore", "status": "implemented-unhosted", "present": ["bounded native data-directory backup", "offline verification", "atomic restore activation", "corruption and existing-destination failure paths"], "gaps": ["hosted exact-SHA receipt"]}
+  ],
+  "claims": [],
+  "closure_declared": false
+}

@@ -1,0 +1,60 @@
+{
+  "schema": "hyphae.native.process-crash-matrix.v1",
+  "status": "process-crash-not-power-loss",
+  "source_commit": "91af0b731785ec827177edf84e0fe5eaad732360",
+  "environment": "aws-m6i.2xlarge-ext4-ebs",
+  "target": "x86_64-linux",
+  "durability": "strict",
+  "all_engine_csn": 1,
+  "boundaries": [
+    {
+      "boundary": "blob-staged",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 0,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "blob-promoted",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-appended",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "page-synchronized",
+      "expected_state": "prior-empty",
+      "recovered_csn": null,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-appended",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "wal-synchronized",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    },
+    {
+      "boundary": "root-published",
+      "expected_state": "complete-csn-1",
+      "recovered_csn": 1,
+      "recovered_blob_count": 1,
+      "termination": "signal-9"
+    }
+  ]
+}

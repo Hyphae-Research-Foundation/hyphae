@@ -46,20 +46,31 @@ dependency, performance and replacement-cost review.
 |---|---|---|
 | `blake3` | digests, content identity | allowed primitive |
 | `crc32c` | corruption detection | allowed primitive |
+| `getrandom` | operating-system entropy for durable resolution identities | allowed operating-system primitive |
 | `uuid` | transaction/session ID construction | allowed primitive |
 | `unicode-normalization`, `unicode-casefold` | analyzer primitives | allowed primitive |
-| `tokio` | optional local server/runtime | allowed outside embedded hot path |
+| `tokio` | native daemon scheduling and asynchronous local IPC | allowed outside embedded hot path |
+| `interprocess` | safe UDS and Windows named-pipe local transport, peer credentials and endpoint ACLs | allowed operating-system IPC wrapper |
+| `widestring` | safe UTF-16 security-descriptor construction for the Windows named-pipe ACL | allowed Windows encoding primitive |
+| `recvmsg` | target-conditioned Windows named-pipe message primitive used by `interprocess` | allowed operating-system IPC wrapper |
+| `doctest-file` | transitive documentation macro used by `interprocess` | allowed build primitive |
+| `bytes`, `futures-core`, `mio`, `socket2`, `signal-hook-registry`, `errno`, `pin-project-lite` | transitive asynchronous and operating-system support for Tokio and IPC | allowed runtime primitives |
+| `windows-sys`, `windows-link`, `wasi` | target-conditioned operating-system bindings for IPC and async I/O | allowed platform bindings |
+| `r-efi`, `wasip2`, `wit-bindgen` | target-conditioned backends in the `getrandom` entropy closure | allowed platform bindings |
 | `thiserror` | typed errors | allowed primitive |
 | `proptest` | property tests | allowed test primitive |
 | `redb` | shipped `0.2` reconstructible index | compatibility only; forbidden as native target evidence |
 
-## Native-slice dependency capture
+## Native product dependency capture
 
-The experimental target path currently consists of:
+The native product daemon target path currently consists of:
 
 - `hyphae-native-ann`;
 - `hyphae-native-types`;
 - `hyphae-native-pages`;
+- `hyphae-native-product`;
+- `hyphae-native-protocol`;
+- `hyphae-native-daemon`;
 - `hyphae-native-wal`;
 - `hyphae-native-catalog`;
 - `hyphae-native-mvcc`;
@@ -69,18 +80,53 @@ The experimental target path currently consists of:
 - `hyphae-native-manifest`; and
 - `hyphae-native-runtime`.
 
-`cargo tree -p hyphae-native-runtime --locked` on 2026-08-01 showed only the
-workspace crates above plus `blake3 1.8.5`, `crc32c 0.6.8`, and `thiserror
-2.0.19` at runtime. Their proc-macro/build dependencies were `arrayref`,
+The exact locked normal/build metadata closure is rooted at
+`hyphae-native-daemon`, the local native product entry point. This root includes
+the protocol, product facade, runtime, and every native engine package: 14
+Hyphae-owned packages and 51 external package identities (50 package names) as
+of 2026-08-07. The two identities for `syn` are 2.0.119 on the Tokio macro
+path and 3.0.2 on the serde/thiserror derive paths. Target-conditioned
+dependencies remain in scope even when they are not compiled on the audit
+host.
+
+`hyphae-native-daemon` uses `interprocess` 2.4.3 as the reviewed safe OS IPC
+wrapper. The Rust standard library has no Windows named-pipe server API;
+`interprocess` supplies named-pipe server instances, peer process credentials,
+and security-descriptor attachment without unsafe code in Hyphae-owned crates.
+The reviewed wrapper does contain OS-boundary unsafe implementation blocks, so
+it remains subject to the existing transitive unsafe audit rather than being
+treated as safe-Rust-only. Its closure includes `doctest-file`, `futures-core`,
+`recvmsg`, `widestring`, `windows-sys`, and `windows-link`, plus Tokio's
+`bytes`, `mio`, `pin-project-lite`, `signal-hook-registry`, `errno`, `socket2`,
+`tokio-macros`, and `syn` 2.x support. These are documentation, async runtime,
+OS encoding, message, and API primitives rather than data-engine semantics.
+The daemon applies a protected owner/system Windows DACL and a 0600 filesystem
+mode on Unix.
+
+The runtime directly uses `getrandom` 0.3.4 for unpredictable durable
+transaction resolution identities. Its complete target-conditioned closure
+includes `r-efi` 5.3.0 for UEFI and `wasip2` 1.0.4+wasi-0.2.12 with
+`wit-bindgen` 0.57.1 for WASI preview2. `mio` also retains the target-conditioned
+`wasi` 0.11.1+wasi-snapshot-preview1 binding. None of these packages supplies
+database, transaction, protocol, or query semantics.
+
+The historical `cargo tree -p hyphae-native-runtime --locked` capture on
+2026-08-01 covered the engine closure before the G6 product facade, protocol,
+and daemon existed. The current gate instead starts at `hyphae-native-daemon`
+and therefore audits that complete native service closure. The remaining
+external primitives include `blake3`, `crc32c`, `thiserror`, Unicode and
+receipt JSON support. Their proc-macro/build dependencies include `arrayref`,
 `arrayvec`, `cfg-if`, `constant_time_eq`, `cpufeatures`, `cc`,
 `find-msvc-tools`, `shlex`, `rustc_version`, `semver`, `proc-macro2`, `quote`,
-`syn`, and `unicode-ident`.
+`syn` 3.x, and `unicode-ident`.
 
 A case-insensitive source and manifest scan found no forbidden engine
 dependency in those crates. The only product-name match was a crate-level
-non-compatibility disclaimer. Direct native source contains no `unsafe`
-token. This is implementation inventory evidence, not the still-pending
-transitive unsafe and license audit required to close G0.
+non-compatibility disclaimer. Direct native source contains no `unsafe` token.
+The daemon-rooted transitive unsafe scan is required to report reviewed
+third-party findings while keeping all 14 repository-owned packages at zero;
+that report remains audit evidence, not an approval of third-party unsafe
+implementations.
 
 The ANN, records, B+tree, blob, and manifest crates add no new third-party
 runtime dependency category. The runtime reaches the integrated crates only
@@ -103,9 +149,12 @@ OpenSearch, Lucene or historical Hyphae code is copied by this G0 work.
 ## Unsafe code
 
 Workspace code remains `unsafe_code = "forbid"`. A primitive dependency that
-contains unsafe code requires an audit record. Direct unsafe code requires a
-separate accepted ADR with a narrow invariant, platform matrix, fuzzing and
-review; it cannot enter through performance pressure alone.
+contains unsafe code requires an audit record. The unsafe scan follows the
+same daemon-rooted metadata closure, so transitive Tokio and interprocess unsafe
+implementation blocks are reported alongside the engine primitives. Every
+reachable repository-owned crate must retain zero unsafe findings. Direct
+unsafe code requires a separate accepted ADR with a narrow invariant, platform
+matrix, fuzzing and review; it cannot enter through performance pressure alone.
 
 ## G0 exit audit
 
@@ -120,7 +169,7 @@ Before G0 closes:
 
 ## Exact native-closure gate
 
-The G0 dependency gate is rooted at the `hyphae-native-runtime` package. It
+The native dependency gate is rooted at the `hyphae-native-daemon` package. It
 uses `cargo metadata --locked --format-version 1` and follows every non-dev
 normal and build edge, including target-conditioned edges. Development-only
 dependencies are outside this runtime closure and require their existing
@@ -132,6 +181,8 @@ The gate must fail when:
 - a reachable workspace package is outside the reviewed native package set;
 - a reachable external package is absent from the machine-readable inventory;
 - an inventoried external package is no longer reachable;
+- two reachable package identities share one name and therefore expose a gate
+  implementation limitation rather than being audited incorrectly;
 - a package version, registry source, or declared license differs from its
   reviewed inventory record;
 - a forbidden database, structure, query, search, or vector engine appears
@@ -151,8 +202,9 @@ change and review. The canonical allowlist is
 `cargo-geiger` is evidence rather than an authority over package semantics.
 Unsafe counts in reviewed third-party primitives are reported by package and
 may be nonzero. Unsafe counts in Hyphae-owned native crates must be zero. Parse
-diagnostics for packages outside the metadata closure are retained in the
-receipt but cannot silently expand or invalidate the audited package set.
+diagnostics for reviewed external packages are retained in the receipt; parser
+failure in repository-owned closure code is fatal. Diagnostics outside the
+metadata closure cannot silently expand or invalidate the audited package set.
 The first clean capture is the
 [2026-08-02 native dependency-closure
 evidence](../gates/evidence/native-dependency-closure-2026-08-02.md).

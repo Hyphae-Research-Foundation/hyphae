@@ -302,6 +302,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,7 +326,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -376,6 +382,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,6 +411,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -557,13 +575,19 @@ dependencies = [
 
 [[package]]
 name = "hyphae-cli"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
+ "blake3",
  "clap",
  "hyphae-client",
  "hyphae-contracts",
  "hyphae-core",
  "hyphae-engine",
+ "hyphae-native-catalog",
+ "hyphae-native-daemon",
+ "hyphae-native-product",
+ "hyphae-native-runtime",
+ "hyphae-native-types",
  "hyphae-query",
  "hyphae-retrieval",
  "hyphae-server",
@@ -577,18 +601,24 @@ dependencies = [
 
 [[package]]
 name = "hyphae-client"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-contracts",
+ "hyphae-native-daemon",
+ "hyphae-native-product",
+ "hyphae-native-protocol",
+ "hyphae-server",
+ "interprocess",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
 name = "hyphae-conformance-rust"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-client",
  "hyphae-contracts",
@@ -599,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -612,11 +642,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "0.2.1"
+version = "1.0.0"
 
 [[package]]
 name = "hyphae-engine"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -630,8 +660,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-independent-backup-verifier"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hyphae-native-ann"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -640,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -651,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-pages",
@@ -661,15 +700,27 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
 ]
 
 [[package]]
+name = "hyphae-native-daemon"
+version = "1.0.0"
+dependencies = [
+ "hyphae-native-product",
+ "hyphae-native-protocol",
+ "interprocess",
+ "thiserror",
+ "tokio",
+ "widestring",
+]
+
+[[package]]
 name = "hyphae-native-manifest"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -680,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -689,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -698,8 +749,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphae-native-product"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "hyphae-native-blobs",
+ "hyphae-native-btree",
+ "hyphae-native-catalog",
+ "hyphae-native-manifest",
+ "hyphae-native-pages",
+ "hyphae-native-records",
+ "hyphae-native-runtime",
+ "hyphae-native-types",
+ "hyphae-native-wal",
+]
+
+[[package]]
+name = "hyphae-native-protocol"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "hyphae-native-catalog",
+ "hyphae-native-product",
+ "hyphae-native-runtime",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "hyphae-native-records"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -708,10 +787,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
+ "getrandom 0.3.4",
  "hyphae-native-ann",
  "hyphae-native-blobs",
  "hyphae-native-btree",
@@ -722,16 +802,24 @@ dependencies = [
  "hyphae-native-records",
  "hyphae-native-types",
  "hyphae-native-wal",
+ "serde",
+ "serde_json",
  "thiserror",
+ "unicode-casefold",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "hyphae-native-types"
-version = "0.2.1"
+version = "1.0.0"
+dependencies = [
+ "proptest",
+ "serde_json",
+]
 
 [[package]]
 name = "hyphae-native-wal"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -741,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-pliegors"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-client",
  "thiserror",
@@ -749,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -760,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-retrieval"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "hyphae-core",
  "hyphae-query",
@@ -773,14 +861,21 @@ dependencies = [
 
 [[package]]
 name = "hyphae-server"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "axum",
  "base64 0.23.0",
  "blake3",
+ "futures-util",
+ "hyphae-client",
  "hyphae-contracts",
  "hyphae-core",
  "hyphae-engine",
+ "hyphae-native-catalog",
+ "hyphae-native-daemon",
+ "hyphae-native-product",
+ "hyphae-native-protocol",
+ "hyphae-native-types",
  "hyphae-query",
  "hyphae-retrieval",
  "hyphae-storage",
@@ -796,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-storage"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -922,6 +1017,21 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "interprocess"
+version = "2.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "798de1433ba514cc6c04c4144c2469af81396e4906195218737c776d47769572"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1156,7 +1266,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1243,6 +1353,12 @@ checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redb"
@@ -1356,7 +1472,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1645,10 +1761,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2009,6 +2125,12 @@ checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "windows-link"

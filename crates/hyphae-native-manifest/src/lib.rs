@@ -11,7 +11,8 @@ use std::{
 
 use hyphae_native_mvcc::{MvccError, RootSet, RootSlot, WalAnchor};
 use hyphae_native_types::{
-    CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageGeneration, PageId,
+    CatalogVersion, Csn, EngineKind, LineageIdentity, Lsn, ManifestGeneration, PageGeneration,
+    PageId,
 };
 use thiserror::Error;
 
@@ -19,15 +20,20 @@ use thiserror::Error;
 pub const MANIFEST_HEADER_SIZE: usize = 176;
 /// Root-manifest header size when page-retention state is present.
 pub const MANIFEST_V2_HEADER_SIZE: usize = 192;
+/// Root-manifest header size when directory lineage is present.
+pub const MANIFEST_V3_HEADER_SIZE: usize = 216;
 /// Maximum root slots in one manifest.
 pub const MAX_MANIFEST_ROOTS: usize = 4_096;
 
 const MAGIC_V1: &[u8; 8] = b"HYROOT01";
 const MAGIC_V2: &[u8; 8] = b"HYROOT02";
+const MAGIC_V3: &[u8; 8] = b"HYROOT03";
 const FORMAT_VERSION_V1: u16 = 1;
 const FORMAT_VERSION_V2: u16 = 2;
+const FORMAT_VERSION_V3: u16 = 3;
 const HEADER_SIZE_V1_U16: u16 = 176;
 const HEADER_SIZE_V2_U16: u16 = 192;
+const HEADER_SIZE_V3_U16: u16 = 216;
 const ROOT_ENTRY_SIZE: usize = 12;
 const CHECKSUM_START: usize = 64;
 const CHECKSUM_END: usize = 68;
@@ -71,6 +77,9 @@ pub enum ManifestError {
     /// Generation or predecessor digest does not continue the chain.
     #[error("native root manifest chain is not contiguous")]
     InvalidChain,
+    /// Manifests in one authority chain do not carry one exact lineage.
+    #[error("native root manifest lineage does not match its authority chain")]
+    LineageMismatch,
     /// The owned roots directory contains an unexpected material entry.
     #[error("native roots directory contains an unexpected entry")]
     UnexpectedDirectoryEntry,
@@ -89,6 +98,7 @@ pub struct RootManifest {
     blob_generation: u64,
     page_generation: PageGeneration,
     retention_floor_csn: Csn,
+    lineage: Option<LineageIdentity>,
     roots: BTreeMap<RootSlot, PageId>,
     previous_digest: [u8; 32],
     digest: [u8; 32],
@@ -105,6 +115,30 @@ impl RootManifest {
         generation: ManifestGeneration,
         previous_digest: [u8; 32],
         root_set: &RootSet,
+    ) -> Result<Self, ManifestError> {
+        Self::from_root_set_internal(generation, previous_digest, root_set, None)
+    }
+
+    /// Builds a lineage-bearing manifest from one committed immutable root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root set is uncommitted, empty, or exceeds
+    /// the manifest root bound.
+    pub fn from_root_set_with_lineage(
+        generation: ManifestGeneration,
+        previous_digest: [u8; 32],
+        root_set: &RootSet,
+        lineage: LineageIdentity,
+    ) -> Result<Self, ManifestError> {
+        Self::from_root_set_internal(generation, previous_digest, root_set, Some(lineage))
+    }
+
+    fn from_root_set_internal(
+        generation: ManifestGeneration,
+        previous_digest: [u8; 32],
+        root_set: &RootSet,
+        lineage: Option<LineageIdentity>,
     ) -> Result<Self, ManifestError> {
         let visible_csn = root_set
             .visible_csn()
@@ -126,6 +160,7 @@ impl RootManifest {
             retention_floor_csn: root_set
                 .retention_floor_csn()
                 .ok_or(ManifestError::UncommittedRootSet)?,
+            lineage,
             roots,
             previous_digest,
             digest: [0; 32],
@@ -162,6 +197,11 @@ impl RootManifest {
     /// Returns the earliest CSN whose physical roots remain retained.
     pub const fn retention_floor_csn(&self) -> Csn {
         self.retention_floor_csn
+    }
+
+    /// Returns the directory lineage carried by v3 manifests.
+    pub const fn lineage(&self) -> Option<LineageIdentity> {
+        self.lineage
     }
 
     /// Returns the prior manifest digest, or zero for generation one.
@@ -219,14 +259,17 @@ impl RootManifest {
         if encoded.len() < MANIFEST_HEADER_SIZE {
             return Err(ManifestError::InvalidLength);
         }
-        let (header_size, page_generation, retention_floor_csn) = match (
+        let (header_size, page_generation, retention_floor_csn, lineage) = match (
             &encoded[0..8],
             read_u16(&encoded[8..10]),
             read_u16(&encoded[10..12]),
         ) {
-            (magic, FORMAT_VERSION_V1, HEADER_SIZE_V1_U16) if magic == MAGIC_V1 => {
-                (MANIFEST_HEADER_SIZE, PageGeneration::FIRST, Csn::FIRST)
-            }
+            (magic, FORMAT_VERSION_V1, HEADER_SIZE_V1_U16) if magic == MAGIC_V1 => (
+                MANIFEST_HEADER_SIZE,
+                PageGeneration::FIRST,
+                Csn::FIRST,
+                None,
+            ),
             (magic, FORMAT_VERSION_V2, HEADER_SIZE_V2_U16) if magic == MAGIC_V2 => {
                 if encoded.len() < MANIFEST_V2_HEADER_SIZE {
                     return Err(ManifestError::InvalidLength);
@@ -237,6 +280,23 @@ impl RootManifest {
                         .map_err(|_| ManifestError::InvalidIdentity)?,
                     Csn::new(read_u64(&encoded[184..192]))
                         .map_err(|_| ManifestError::InvalidIdentity)?,
+                    None,
+                )
+            }
+            (magic, FORMAT_VERSION_V3, HEADER_SIZE_V3_U16) if magic == MAGIC_V3 => {
+                if encoded.len() < MANIFEST_V3_HEADER_SIZE {
+                    return Err(ManifestError::InvalidLength);
+                }
+                (
+                    MANIFEST_V3_HEADER_SIZE,
+                    PageGeneration::new(read_u64(&encoded[176..184]))
+                        .map_err(|_| ManifestError::InvalidIdentity)?,
+                    Csn::new(read_u64(&encoded[184..192]))
+                        .map_err(|_| ManifestError::InvalidIdentity)?,
+                    Some(
+                        LineageIdentity::decode(&encoded[192..216])
+                            .map_err(|_| ManifestError::InvalidIdentity)?,
+                    ),
                 )
             }
             _ => return Err(ManifestError::InvalidPreamble),
@@ -289,6 +349,7 @@ impl RootManifest {
             blob_generation,
             page_generation,
             retention_floor_csn,
+            lineage,
             roots,
             previous_digest,
             digest,
@@ -309,34 +370,38 @@ impl RootManifest {
             self.retention_floor_csn,
             self.visible_csn,
         )?;
-        let is_v1 =
-            self.page_generation == PageGeneration::FIRST && self.retention_floor_csn == Csn::FIRST;
-        let header_size = if is_v1 {
-            MANIFEST_HEADER_SIZE
+        let is_v1 = self.lineage.is_none()
+            && self.page_generation == PageGeneration::FIRST
+            && self.retention_floor_csn == Csn::FIRST;
+        let (header_size, magic, format_version, header_size_u16) = if self.lineage.is_some() {
+            (
+                MANIFEST_V3_HEADER_SIZE,
+                MAGIC_V3,
+                FORMAT_VERSION_V3,
+                HEADER_SIZE_V3_U16,
+            )
+        } else if is_v1 {
+            (
+                MANIFEST_HEADER_SIZE,
+                MAGIC_V1,
+                FORMAT_VERSION_V1,
+                HEADER_SIZE_V1_U16,
+            )
         } else {
-            MANIFEST_V2_HEADER_SIZE
+            (
+                MANIFEST_V2_HEADER_SIZE,
+                MAGIC_V2,
+                FORMAT_VERSION_V2,
+                HEADER_SIZE_V2_U16,
+            )
         };
         let total_length = header_size
             .checked_add(payload_length)
             .ok_or(ManifestError::InvalidLength)?;
         let mut encoded = vec![0_u8; total_length];
-        encoded[0..8].copy_from_slice(if is_v1 { MAGIC_V1 } else { MAGIC_V2 });
-        encoded[8..10].copy_from_slice(
-            &(if is_v1 {
-                FORMAT_VERSION_V1
-            } else {
-                FORMAT_VERSION_V2
-            })
-            .to_le_bytes(),
-        );
-        encoded[10..12].copy_from_slice(
-            &(if is_v1 {
-                HEADER_SIZE_V1_U16
-            } else {
-                HEADER_SIZE_V2_U16
-            })
-            .to_le_bytes(),
-        );
+        encoded[0..8].copy_from_slice(magic);
+        encoded[8..10].copy_from_slice(&format_version.to_le_bytes());
+        encoded[10..12].copy_from_slice(&header_size_u16.to_le_bytes());
         encoded[16..24].copy_from_slice(&self.generation.get().to_le_bytes());
         encoded[24..32].copy_from_slice(&self.visible_csn.get().to_le_bytes());
         encoded[32..40].copy_from_slice(&self.catalog_version.get().to_le_bytes());
@@ -357,6 +422,9 @@ impl RootManifest {
         if !is_v1 {
             encoded[176..184].copy_from_slice(&self.page_generation.get().to_le_bytes());
             encoded[184..192].copy_from_slice(&self.retention_floor_csn.get().to_le_bytes());
+        }
+        if let Some(lineage) = self.lineage {
+            encoded[192..216].copy_from_slice(&lineage.encode());
         }
         let mut offset = header_size;
         for (slot, page) in &self.roots {
@@ -607,6 +675,7 @@ impl RootManifestStore {
         let base_generation = retained_base.map_or(1, |(generation, _)| generation.get());
         let mut expected_generation = base_generation;
         let mut previous_digest = [0_u8; 32];
+        let mut expected_lineage: Option<Option<LineageIdentity>> = None;
         let mut retired_prefix = Vec::new();
         let mut retired_prefix_bytes = 0_u64;
         let mut retained_manifest_bytes = 0_u64;
@@ -623,6 +692,12 @@ impl RootManifestStore {
             }
             let encoded = fs::read(path)?;
             let manifest = RootManifest::decode(&encoded)?;
+            if expected_lineage.is_some_and(|lineage| lineage != manifest.lineage) {
+                return Err(ManifestError::LineageMismatch);
+            }
+            if expected_lineage.is_none() {
+                expected_lineage = Some(manifest.lineage);
+            }
             let is_base = generation == base_generation;
             let base_matches = retained_base.is_none_or(|(_, digest)| manifest.digest == digest);
             let predecessor_matches =
@@ -681,6 +756,22 @@ impl RootManifestStore {
     /// Returns the latest verified manifest.
     pub fn current(&self) -> Option<&RootManifest> {
         self.manifests.last()
+    }
+
+    /// Requires every retained manifest to carry one exact directory lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a legacy manifest or any different identity.
+    pub fn validate_lineage(&self, expected: LineageIdentity) -> Result<(), ManifestError> {
+        if self
+            .manifests
+            .iter()
+            .any(|manifest| manifest.lineage != Some(expected))
+        {
+            return Err(ManifestError::LineageMismatch);
+        }
+        Ok(())
     }
 
     /// Stages one create-new manifest under a non-visible temporary name.
@@ -842,6 +933,12 @@ impl RootManifestStore {
         } else {
             (1_u64, [0; 32])
         };
+        let lineage_matches = self
+            .current()
+            .is_none_or(|current| current.lineage == manifest.lineage);
+        if !lineage_matches {
+            return Err(ManifestError::LineageMismatch);
+        }
         if manifest.generation.get() != generation || manifest.previous_digest != digest {
             return Err(ManifestError::InvalidChain);
         }
@@ -902,10 +999,11 @@ mod tests {
 
     use hyphae_native_mvcc::{RootSet, RootSlot, WalAnchor};
     use hyphae_native_types::{
-        CatalogVersion, Csn, EngineKind, Lsn, ManifestGeneration, PageGeneration, PageId,
+        CatalogVersion, Csn, DirectoryUuid, EngineKind, HistoryEpoch, LineageIdentity, Lsn,
+        ManifestGeneration, PageGeneration, PageId,
     };
 
-    use super::{ManifestError, RootManifest, RootManifestStore};
+    use super::{MANIFEST_V3_HEADER_SIZE, ManifestError, RootManifest, RootManifestStore};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -935,6 +1033,16 @@ mod tests {
 
     fn root_set(csn: u64, marker: u8) -> Result<RootSet, Box<dyn std::error::Error>> {
         root_set_with_storage(csn, marker, PageGeneration::FIRST, Csn::FIRST)
+    }
+
+    fn lineage(marker: u8) -> Result<LineageIdentity, Box<dyn std::error::Error>> {
+        let mut uuid = [marker; 16];
+        uuid[6] = (uuid[6] & 0x0f) | 0x70;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        Ok(LineageIdentity::new(
+            DirectoryUuid::new(uuid)?,
+            HistoryEpoch::FIRST,
+        ))
     }
 
     fn root_set_with_storage(
@@ -1003,6 +1111,88 @@ mod tests {
             blake3::hash(&encoded).to_hex().as_str(),
             "b6211d9d373a4d01f5768126895aaaa4281bbba128929992259f9da7a4df047a"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_manifest_v3_has_golden_offsets_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let root = root_set(1, 0xa5)?;
+        let manifest = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(1)?,
+            [0; 32],
+            &root,
+            lineage,
+        )?;
+        let encoded = manifest.encode()?;
+
+        assert_eq!(encoded.len(), MANIFEST_V3_HEADER_SIZE + 48);
+        assert_eq!(&encoded[..8], b"HYROOT03");
+        assert_eq!(&encoded[8..10], &3_u16.to_le_bytes());
+        assert_eq!(&encoded[10..12], &216_u16.to_le_bytes());
+        assert_eq!(&encoded[176..184], &1_u64.to_le_bytes());
+        assert_eq!(&encoded[184..192], &1_u64.to_le_bytes());
+        assert_eq!(&encoded[192..216], &lineage.encode());
+        assert_eq!(RootManifest::decode(&encoded)?, manifest);
+        assert_eq!(manifest.lineage(), Some(lineage));
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_manifest_v3_rejects_every_truncated_prefix_and_single_byte_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lineage = LineageIdentity::new(
+            DirectoryUuid::parse_canonical("018f4e9d-3d7a-7b6c-8f12-123456789abc")?,
+            HistoryEpoch::new(42)?,
+        );
+        let manifest = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(1)?,
+            [0; 32],
+            &root_set(1, 0xa5)?,
+            lineage,
+        )?;
+        let encoded = manifest.encode()?;
+
+        for truncated_length in 0..encoded.len() {
+            assert!(RootManifest::decode(&encoded[..truncated_length]).is_err());
+        }
+        for offset in 0..encoded.len() {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert!(RootManifest::decode(&corrupt).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_chain_rejects_mixed_or_unbound_lineage() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = RootManifestStore::create(temporary.path())?;
+        let first = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(1)?,
+            [0; 32],
+            &root_set(1, 1)?,
+            lineage(1)?,
+        )?;
+        store.append(first.clone(), true)?;
+        let divergent = RootManifest::from_root_set_with_lineage(
+            ManifestGeneration::new(2)?,
+            first.digest(),
+            &root_set(2, 2)?,
+            lineage(2)?,
+        )?;
+        assert!(matches!(
+            store.append(divergent, false),
+            Err(ManifestError::LineageMismatch)
+        ));
+        assert!(matches!(
+            store.validate_lineage(lineage(2)?),
+            Err(ManifestError::LineageMismatch)
+        ));
         Ok(())
     }
 

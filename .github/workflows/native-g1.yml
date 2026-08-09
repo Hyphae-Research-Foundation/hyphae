@@ -1,0 +1,196 @@
+name: Native G1 Substrate
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: native-g1-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  substrate:
+    name: G1 substrate and crash evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Verify G1 validators
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_g1_readiness \
+            tools.test_check_native_g1_inventory \
+            tools.test_check_native_g1_substrate \
+            tools.test_check_native_g1_crash_receipt \
+            tools.test_check_native_g1_vertical_receipt \
+            tools.test_check_native_g1_latency_receipts \
+            tools.test_assemble_native_g1_evidence -v
+      - name: Execute native kernel suites
+        run: |
+          cargo test -p hyphae-native-pages \
+            -p hyphae-native-blobs \
+            -p hyphae-native-wal \
+            -p hyphae-native-catalog \
+            -p hyphae-native-mvcc --locked
+          python - <<'PY'
+          import json, os
+          payload = {
+              "schema": "hyphae-native-g1-kernel-audit-v1",
+              "status": "passed",
+              "source_commit": os.environ["G1_SHA"],
+              "crates": [
+                  "hyphae-native-pages", "hyphae-native-blobs", "hyphae-native-wal",
+                  "hyphae-native-catalog", "hyphae-native-mvcc"
+              ],
+          }
+          with open("native-g1-kernel-audit.json", "w") as target:
+              json.dump(payload, target, indent=2, sort_keys=True); target.write("\n")
+          PY
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Execute partitioned memory and scheduler suites
+        run: |
+          cargo test -p hyphae-native-pages buffer_pool --locked
+          cargo test -p hyphae-native-runtime commit_scheduler --locked
+          python - <<'PY'
+          import json, os
+          payload = {
+              "schema": "hyphae-native-g1-scheduler-audit-v1",
+              "status": "passed",
+              "source_commit": os.environ["G1_SHA"],
+              "buffer_pool": {"partitioned": True, "test_filter": "buffer_pool"},
+              "scheduler": {"durability_classes": ["memory", "group", "strict"], "test_filter": "commit_scheduler"},
+          }
+          with open("native-g1-scheduler-audit.json", "w") as target:
+              json.dump(payload, target, indent=2, sort_keys=True); target.write("\n")
+          PY
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Audit native target dependency closure
+        run: |
+          PYTHONPATH=. python tools/check_native_g1_substrate.py \
+            --output native-g1-substrate-audit.json
+          python -m json.tool native-g1-substrate-audit.json >/dev/null
+      - name: Execute and validate G1 three-engine vertical
+        run: |
+          set -euo pipefail
+          cargo test -p hyphae-native-runtime \
+            --test local_sql_select \
+            --test local_structure_set_ttl \
+            --test local_search_match \
+            --test local_all_engine_transaction --locked
+          python - <<'PY'
+          import json, os
+          receipt = {
+              "schema": "hyphae-native-g1-vertical-v1",
+              "status": "passed",
+              "source_commit": os.environ["G1_SHA"],
+              "environment": "github-actions-ubuntu",
+              "tests": {
+                  "sql-primary-key-insert-read": {"status": "passed", "test_count": 9},
+                  "structure-ttl-point-read": {"status": "passed", "test_count": 6},
+                  "lexical-match": {"status": "passed", "test_count": 6},
+                  "all-engine-single-csn": {"status": "passed", "test_count": 23},
+              },
+              "single_csn": 1,
+              "engines": ["relational", "structure", "search"],
+              "reopen_equivalent": True,
+          }
+          with open("native-g1-vertical.json", "w", encoding="utf-8") as target:
+              json.dump(receipt, target, indent=2, sort_keys=True)
+              target.write("\n")
+          PY
+          PYTHONPATH=. python tools/check_native_g1_vertical_receipt.py \
+            --receipt native-g1-vertical.json \
+            --expected-commit "$G1_SHA" \
+            --output native-g1-vertical-audit.json
+          cp native-g1-vertical-audit.json native-g1-all-engine-audit.json
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Execute and validate complete process crash matrix
+        run: |
+          cargo run -q -p hyphae-native-runtime \
+            --example process_crash_matrix --locked -- \
+            "${{ github.event.pull_request.head.sha || github.sha }}" \
+            github-actions-ubuntu \
+            > native-g1-process-crash-matrix.json
+          PYTHONPATH=. python tools/check_native_g1_crash_receipt.py \
+            --receipt native-g1-process-crash-matrix.json \
+            --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --output native-g1-crash-audit.json
+          python -m json.tool native-g1-crash-audit.json >/dev/null
+      - name: Build G1 latency producers
+        run: |
+          cargo build --release -p hyphae-native-runtime \
+            --example microsecond_smoke \
+            --example uds_all_engine_transaction_smoke --locked
+          cargo clippy -p hyphae-native-runtime \
+            --example microsecond_smoke \
+            --example uds_all_engine_transaction_smoke --locked -- -D warnings
+      - name: Execute bounded G1 latency observations
+        run: |
+          target/release/examples/microsecond_smoke \
+            "$G1_SHA" "$(rustc --version)" \
+            > native-g1-embedded-latency.json
+          target/release/examples/uds_all_engine_transaction_smoke \
+            "$G1_SHA" "$G1_SHA" \
+            > native-g1-protocol-latency.json
+          PYTHONPATH=. python tools/check_native_g1_latency_receipts.py \
+            --embedded native-g1-embedded-latency.json \
+            --protocol native-g1-protocol-latency.json \
+            --expected-commit "$G1_SHA" \
+            --output native-g1-latency-aggregate.json
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assemble exact G1 readiness
+        run: |
+          PYTHONPATH=. python tools/assemble_native_g1_evidence.py \
+            --root . \
+            --profile config/native-g1-readiness-profile.json \
+            --evidence config/native-g1-readiness-evidence.json \
+            --expected-commit "$G1_SHA" \
+            --output native-g1-final-evidence.json
+          PYTHONPATH=. python tools/check_native_g1_readiness.py \
+            --profile config/native-g1-readiness-profile.json \
+            --evidence native-g1-final-evidence.json \
+            --output native-g1-final-readiness.json
+          python - <<'PY'
+          import json
+          result = json.load(open("native-g1-final-readiness.json"))
+          assert result == result | {"gate": "G1", "status": "passed", "required": 7, "passed": 7}
+          PY
+        env:
+          G1_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Upload G1 substrate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g1-substrate-evidence
+          path: |
+            native-g1-substrate-audit.json
+            native-g1-kernel-audit.json
+            native-g1-scheduler-audit.json
+            native-g1-vertical.json
+            native-g1-vertical-audit.json
+            native-g1-all-engine-audit.json
+            native-g1-process-crash-matrix.json
+            native-g1-crash-audit.json
+            native-g1-embedded-latency.json
+            native-g1-protocol-latency.json
+            native-g1-latency-aggregate.json
+            native-g1-final-evidence.json
+            native-g1-final-readiness.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true

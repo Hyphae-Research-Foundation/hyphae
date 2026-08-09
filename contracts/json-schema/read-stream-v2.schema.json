@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/read-stream-v2.schema.json",
+  "title": "NativeReadStreamRecordV2",
+  "description": "One NDJSON record. Data records are provisional until the mandatory completion record arrives.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "provisional", "sequence", "data_base64"],
+      "properties": {
+        "type": { "const": "data" },
+        "provisional": { "const": true },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "data_base64": { "type": "string", "contentEncoding": "base64" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "request_id", "chunks", "response_bytes", "digest_hex"],
+      "properties": {
+        "type": { "const": "completion" },
+        "status": { "const": "complete" },
+        "request_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+        "chunks": { "type": "integer", "minimum": 0 },
+        "response_bytes": { "type": "integer", "minimum": 0 },
+        "digest_hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  ]
+}

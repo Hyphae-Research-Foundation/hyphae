@@ -1,0 +1,43 @@
+{
+  "schema": "hyphae-native-g1-closure-v1",
+  "gate": "G1",
+  "status": "passed",
+  "source_commit": "14b4ec9d5b5503572ff283585ef83aec8ab50ac6",
+  "workflow_run": 31057494970,
+  "scope": "native-substrate",
+  "production_scale": false,
+  "performance_gate_claimed": false,
+  "profile_sha256": "c80ea908a7deecaa6e5445e03eded4d2ddc33280ce807338a2daa3bb7315b356",
+  "evidence_sha256": "1df00a32f157c08e1e337115afa9ee7dfdf9ba852bbf9a71d879b243922a56ca",
+  "readiness_sha256": "322df3272c6a8e66d0229f1bf13a9e6cbd3488b0a28b3cb31bc095a91ef3bc11",
+  "predecessor": {
+    "gate": "G0",
+    "source_commit": "14b4ec9d5b5503572ff283585ef83aec8ab50ac6",
+    "evidence": "docs/gates/evidence/closures/native-g0-14b4ec9.json",
+    "evidence_sha256": "1c50fde44bda0743e0f11586fe54912ad1fbacdc5305f5a0bdf8c9fb9269e896"
+  },
+  "required": 7,
+  "passed": 7,
+  "requirements": [
+    "native-page-blob-wal-catalog-mvcc",
+    "partitioned-memory-and-scheduler",
+    "no-redb-on-native-target-path",
+    "three-engine-minimal-vertical",
+    "single-csn-all-engine-commit",
+    "commit-checkpoint-crash-matrix",
+    "embedded-and-local-protocol-latency"
+  ],
+  "artifact": "native-g1-substrate-evidence",
+  "artifact_id": 8951112427,
+  "artifact_archive_sha256": "69fcd16d81a639b677c788b88a5d5b3dd5398eac84a63d1a6d75e26f53bd6518",
+  "shared_audit_requirements": [
+    "three-engine-minimal-vertical",
+    "single-csn-all-engine-commit"
+  ],
+  "non_claims": [
+    "physical power-loss tolerance beyond the tested process-interruption matrix",
+    "production-scale performance",
+    "a universal microsecond latency bound",
+    "G2 through G8 closure by this evidence"
+  ]
+}

@@ -32,6 +32,7 @@ const SECONDARY_RANGE_LOWER_ROW: u32 = SECONDARY_TARGET_ROW;
 const SECONDARY_RANGE_UPPER_ROW: u32 = SECONDARY_RANGE_LOWER_ROW + 10;
 const SECONDARY_RANGE_LOWER_KEY: &str = "a";
 const SECONDARY_RANGE_UPPER_KEY: &str = "b";
+const SECONDARY_PREFIX_TARGET_TENANT: &str = "a";
 const SCAN_LIMIT: usize = 10;
 const SCAN_OBSERVATIONS: u32 = 100_000;
 const SCAN_OPERATIONS_PER_OBSERVATION: u32 = 1;
@@ -107,7 +108,16 @@ struct OperationStats {
     secondary_prepared_sql: Stats,
     secondary_range_scan: Stats,
     secondary_range_physical: Stats,
+    secondary_prefix_range_scan: Stats,
+    secondary_prefix_range_physical: Stats,
     codec_dispatch: Stats,
+}
+
+struct TreeHeights {
+    relational: usize,
+    secondary_prefix_relational: usize,
+    structure: usize,
+    search: usize,
 }
 
 struct BenchmarkInputs<'a> {
@@ -120,6 +130,8 @@ struct BenchmarkInputs<'a> {
     secondary_prepared: &'a PreparedStatement,
     secondary_range_scan_prepared: &'a PreparedStatement,
     secondary_range_prepared: &'a PreparedStatement,
+    secondary_prefix_range_scan_prepared: &'a PreparedStatement,
+    secondary_prefix_range_prepared: &'a PreparedStatement,
     table: ObjectId,
     scan_table: ObjectId,
     secondary_index: ObjectId,
@@ -128,6 +140,7 @@ struct BenchmarkInputs<'a> {
     secondary_index_key: &'a [u8],
     secondary_parameters: &'a [SqlValue],
     secondary_range_parameters: &'a [SqlValue],
+    secondary_prefix_range_parameters: &'a [SqlValue],
     range_lower: &'a [u8],
     range_upper: &'a [u8],
     range_parameters: &'a [SqlValue],
@@ -157,7 +170,7 @@ struct PrefixBenchmarkInput {
 struct SecondaryRangeBenchmarkInput {
     scan_prepared: PreparedStatement,
     physical_prepared: PreparedStatement,
-    parameters: [SqlValue; 2],
+    parameters: Vec<SqlValue>,
 }
 
 struct SecondaryExactBenchmarkInput {
@@ -302,6 +315,71 @@ fn seed_secondary_sql_data(
     Ok((table, index))
 }
 
+fn seed_secondary_prefix_range_sql_data(
+    transaction: &mut NativeTransaction<'_>,
+    dataset_hasher: &mut blake3::Hasher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    transaction.execute_sql(
+        "CREATE TABLE benchmark_events (
+            id BIGINT PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            ordered_email TEXT NOT NULL,
+            scan_email TEXT NOT NULL,
+            payload BINARY NOT NULL
+        )",
+        &[],
+    )?;
+    for row in 0..SECONDARY_SCALE_ROWS {
+        let tenant = if (SECONDARY_RANGE_LOWER_ROW..SECONDARY_RANGE_UPPER_ROW).contains(&row)
+            || row % 2 == 0
+        {
+            SECONDARY_PREFIX_TARGET_TENANT
+        } else {
+            "aa"
+        };
+        let email = benchmark_email(row)?;
+        let payload = vec![u8::try_from(row % 251)?; 96];
+        dataset_hasher.update(&row.to_be_bytes());
+        dataset_hasher.update(tenant.as_bytes());
+        dataset_hasher.update(email.as_bytes());
+        dataset_hasher.update(email.as_bytes());
+        dataset_hasher.update(&payload);
+        transaction.execute_sql(
+            "INSERT INTO benchmark_events
+             (id, tenant, ordered_email, scan_email, payload)
+             VALUES (?, ?, ?, ?, ?)",
+            &[
+                SqlValue::Signed(i64::from(row)),
+                SqlValue::Text(tenant.to_owned()),
+                SqlValue::Text(email.clone()),
+                SqlValue::Text(email),
+                SqlValue::Binary(payload),
+            ],
+        )?;
+    }
+    transaction.execute_sql(
+        "CREATE INDEX benchmark_event_order
+         ON benchmark_events (tenant, ordered_email)",
+        &[],
+    )?;
+    Ok(())
+}
+
+fn prepare_secondary_prefix_database(
+    dataset_hasher: &mut blake3::Hasher,
+) -> Result<(TemporaryDirectory, NativeDatabase, usize), Box<dyn std::error::Error>> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin(100, DurabilityClass::Memory)?;
+    seed_secondary_prefix_range_sql_data(&mut seed, dataset_hasher)?;
+    seed.commit()?;
+    let tree_height = database.latest_relational_tree_height()?;
+    if tree_height < 2 {
+        return Err("secondary prefix benchmark did not produce a multilevel B+tree".into());
+    }
+    Ok((temporary, database, tree_height))
+}
+
 fn benchmark_email(row: u32) -> Result<String, std::num::TryFromIntError> {
     if (SECONDARY_RANGE_LOWER_ROW..SECONDARY_RANGE_UPPER_ROW).contains(&row) {
         Ok("a".repeat(usize::try_from(row - SECONDARY_RANGE_LOWER_ROW + 1)?))
@@ -380,6 +458,7 @@ fn warm_operations(
 
 fn measure_operations(
     database: &NativeDatabase,
+    secondary_prefix_database: &NativeDatabase,
     snapshot: &NativeSnapshot,
     inputs: &BenchmarkInputs<'_>,
 ) -> Result<OperationStats, Box<dyn std::error::Error>> {
@@ -391,8 +470,23 @@ fn measure_operations(
     let prepared_sql_residual_range = measure_residual_filter(database, inputs);
     let prepared_sql_prefix = measure_prefix_scan(database, inputs);
     let prepared_sql_prefix_range = measure_prefix_range_scan(database, inputs);
-    let (secondary_range_scan, secondary_range_physical) =
-        measure_secondary_range(database, inputs);
+    let (secondary_range_scan, secondary_range_physical) = measure_secondary_range_pair(
+        database,
+        inputs.secondary_range_scan_prepared,
+        inputs.secondary_range_prepared,
+        inputs.secondary_range_parameters,
+    );
+    let (search_btree, prepared_sql, relational_btree) =
+        measure_inherited_point_routes(database, snapshot, inputs);
+    let (secondary_btree, secondary_prepared_sql) = measure_secondary_exact_pair(database, inputs);
+    let codec_dispatch = measure_codec_dispatch(snapshot, inputs);
+    let (secondary_prefix_range_scan, secondary_prefix_range_physical) =
+        measure_secondary_range_pair(
+            secondary_prefix_database,
+            inputs.secondary_prefix_range_scan_prepared,
+            inputs.secondary_prefix_range_prepared,
+            inputs.secondary_prefix_range_parameters,
+        );
     Ok(OperationStats {
         structure,
         structure_btree,
@@ -400,35 +494,9 @@ fn measure_operations(
         hash_btree,
         set,
         set_btree,
-        search_btree: measure_counted(
-            || {
-                black_box(
-                    database
-                        .match_latest_text(
-                            inputs.search_index,
-                            black_box(SEARCH_QUERY),
-                            black_box(1),
-                        )
-                        .is_ok(),
-                );
-            },
-            SEARCH_OBSERVATIONS,
-            SEARCH_OPERATIONS_PER_OBSERVATION,
-        ),
-        prepared_sql: measure(|| {
-            black_box(
-                snapshot
-                    .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))
-                    .is_ok(),
-            );
-        }),
-        relational_btree: measure(|| {
-            black_box(
-                database
-                    .select_latest_relational(inputs.table, black_box(inputs.relational_target))
-                    .is_ok(),
-            );
-        }),
+        search_btree,
+        prepared_sql,
+        relational_btree,
         relational_scan,
         prepared_sql_scan,
         relational_range,
@@ -436,63 +504,107 @@ fn measure_operations(
         prepared_sql_residual_range,
         prepared_sql_prefix,
         prepared_sql_prefix_range,
-        secondary_btree: measure_counted(
-            || {
-                black_box(
-                    database
-                        .select_latest_secondary_index(
-                            inputs.secondary_index,
-                            black_box(inputs.secondary_index_key),
-                        )
-                        .is_ok(),
-                );
-            },
-            SECONDARY_OBSERVATIONS,
-            SECONDARY_OPERATIONS_PER_OBSERVATION,
-        ),
-        secondary_prepared_sql: measure_counted(
-            || {
-                black_box(
-                    database
-                        .execute_prepared_latest(
-                            inputs.secondary_prepared,
-                            black_box(inputs.secondary_parameters),
-                        )
-                        .is_ok(),
-                );
-            },
-            SECONDARY_OBSERVATIONS,
-            SECONDARY_OPERATIONS_PER_OBSERVATION,
-        ),
+        secondary_btree,
+        secondary_prepared_sql,
         secondary_range_scan,
         secondary_range_physical,
-        codec_dispatch: measure(|| {
-            if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
-                black_box(snapshot.get(black_box(decoded.payload)));
-            }
-        }),
+        secondary_prefix_range_scan,
+        secondary_prefix_range_physical,
+        codec_dispatch,
     })
 }
 
-fn measure_secondary_range(
+fn measure_inherited_point_routes(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats, Stats) {
+    let search = measure_counted(
+        || {
+            black_box(
+                database
+                    .match_latest_text(inputs.search_index, black_box(SEARCH_QUERY), black_box(1))
+                    .is_ok(),
+            );
+        },
+        SEARCH_OBSERVATIONS,
+        SEARCH_OPERATIONS_PER_OBSERVATION,
+    );
+    let prepared = measure(|| {
+        black_box(
+            snapshot
+                .execute_prepared_binary(inputs.prepared, black_box(inputs.relational_target))
+                .is_ok(),
+        );
+    });
+    let relational = measure(|| {
+        black_box(
+            database
+                .select_latest_relational(inputs.table, black_box(inputs.relational_target))
+                .is_ok(),
+        );
+    });
+    (search, prepared, relational)
+}
+
+fn measure_codec_dispatch(snapshot: &NativeSnapshot, inputs: &BenchmarkInputs<'_>) -> Stats {
+    measure(|| {
+        if let Ok(decoded) = decode_frame(black_box(inputs.frame), DEFAULT_MAX_FRAME_PAYLOAD) {
+            black_box(snapshot.get(black_box(decoded.payload)));
+        }
+    })
+}
+
+fn measure_secondary_exact_pair(
     database: &NativeDatabase,
     inputs: &BenchmarkInputs<'_>,
+) -> (Stats, Stats) {
+    let direct = measure_counted(
+        || {
+            black_box(
+                database
+                    .select_latest_secondary_index(
+                        inputs.secondary_index,
+                        black_box(inputs.secondary_index_key),
+                    )
+                    .is_ok(),
+            );
+        },
+        SECONDARY_OBSERVATIONS,
+        SECONDARY_OPERATIONS_PER_OBSERVATION,
+    );
+    let prepared = measure_counted(
+        || {
+            black_box(
+                database
+                    .execute_prepared_latest(
+                        inputs.secondary_prepared,
+                        black_box(inputs.secondary_parameters),
+                    )
+                    .is_ok(),
+            );
+        },
+        SECONDARY_OBSERVATIONS,
+        SECONDARY_OPERATIONS_PER_OBSERVATION,
+    );
+    (direct, prepared)
+}
+
+fn measure_secondary_range_pair(
+    database: &NativeDatabase,
+    scan_prepared: &PreparedStatement,
+    physical_prepared: &PreparedStatement,
+    parameters: &[SqlValue],
 ) -> (Stats, Stats) {
     for _ in 0..SECONDARY_RANGE_WARMUP {
         black_box(
             database
-                .execute_prepared_latest(
-                    inputs.secondary_range_scan_prepared,
-                    black_box(inputs.secondary_range_parameters),
-                )
+                .execute_prepared_latest(scan_prepared, black_box(parameters))
                 .is_ok(),
         );
         black_box(
             database
-                .execute_prepared_latest(
-                    inputs.secondary_range_prepared,
-                    black_box(inputs.secondary_range_parameters),
-                )
+                .execute_prepared_latest(physical_prepared, black_box(parameters))
                 .is_ok(),
         );
     }
@@ -500,10 +612,7 @@ fn measure_secondary_range(
         || {
             black_box(
                 database
-                    .execute_prepared_latest(
-                        inputs.secondary_range_scan_prepared,
-                        black_box(inputs.secondary_range_parameters),
-                    )
+                    .execute_prepared_latest(scan_prepared, black_box(parameters))
                     .is_ok(),
             );
         },
@@ -514,10 +623,7 @@ fn measure_secondary_range(
         || {
             black_box(
                 database
-                    .execute_prepared_latest(
-                        inputs.secondary_range_prepared,
-                        black_box(inputs.secondary_range_parameters),
-                    )
+                    .execute_prepared_latest(physical_prepared, black_box(parameters))
                     .is_ok(),
             );
         },
@@ -822,7 +928,7 @@ fn prepare_secondary_range_benchmark(
          ORDER BY email
          LIMIT 10",
     )?;
-    let parameters = [
+    let parameters = vec![
         SqlValue::Text(SECONDARY_RANGE_LOWER_KEY.to_owned()),
         SqlValue::Text(SECONDARY_RANGE_UPPER_KEY.to_owned()),
     ];
@@ -833,6 +939,43 @@ fn prepare_secondary_range_benchmark(
     };
     if rows.len() != SCAN_LIMIT || scan != physical {
         return Err("secondary range benchmark routes did not return the same ten rows".into());
+    }
+    Ok(SecondaryRangeBenchmarkInput {
+        scan_prepared,
+        physical_prepared,
+        parameters,
+    })
+}
+
+fn prepare_secondary_prefix_range_benchmark(
+    database: &NativeDatabase,
+) -> Result<SecondaryRangeBenchmarkInput, Box<dyn std::error::Error>> {
+    let scan_prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_events
+         WHERE scan_email >= ? AND tenant = ? AND scan_email < ?
+         ORDER BY id
+         LIMIT 10",
+    )?;
+    let physical_prepared = database.prepare_sql_latest(
+        "SELECT id, payload FROM benchmark_events
+         WHERE ordered_email >= ? AND tenant = ? AND ordered_email < ?
+         ORDER BY tenant, ordered_email
+         LIMIT 10",
+    )?;
+    let parameters = vec![
+        SqlValue::Text(SECONDARY_RANGE_LOWER_KEY.to_owned()),
+        SqlValue::Text(SECONDARY_PREFIX_TARGET_TENANT.to_owned()),
+        SqlValue::Text(SECONDARY_RANGE_UPPER_KEY.to_owned()),
+    ];
+    let scan = database.execute_prepared_latest(&scan_prepared, &parameters)?;
+    let physical = database.execute_prepared_latest(&physical_prepared, &parameters)?;
+    let SqlResult::Rows { rows, .. } = &physical else {
+        return Err("physical secondary prefix-range benchmark did not return rows".into());
+    };
+    if rows.len() != SCAN_LIMIT || scan != physical {
+        return Err(
+            "secondary prefix-range benchmark routes did not return the same ten rows".into(),
+        );
     }
     Ok(SecondaryRangeBenchmarkInput {
         scan_prepared,
@@ -941,15 +1084,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transaction.insert(table, b"mario".to_vec(), b"active".to_vec())?;
     transaction.create_search_index(index, "notes")?;
     let mut dataset_hasher = blake3::Hasher::new();
-    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v15");
+    dataset_hasher.update(b"hyphae-native-microsecond-smoke-v16");
     seed_scaled_data(&mut transaction, table, index, &mut dataset_hasher)?;
     let (secondary_table, secondary_index) =
         seed_secondary_sql_data(&mut transaction, &mut dataset_hasher)?;
     seed_prefix_sql_data(&mut transaction, &mut dataset_hasher)?;
     transaction.set(b"session".to_vec(), vec![7_u8; 64], None)?;
     transaction.commit()?;
+    let (_secondary_prefix_temporary, secondary_prefix_database, secondary_prefix_height) =
+        prepare_secondary_prefix_database(&mut dataset_hasher)?;
     let (relational_tree_height, structure_tree_height, search_tree_height) =
         validate_multilevel_dataset(&database, index)?;
+    let tree_heights = TreeHeights {
+        relational: relational_tree_height,
+        secondary_prefix_relational: secondary_prefix_height,
+        structure: structure_tree_height,
+        search: search_tree_height,
+    };
     let snapshot = database.snapshot(101)?;
     let prepared = snapshot.prepare_sql("SELECT row FROM accounts WHERE primary_key = ?")?;
     let scan_prepared = database
@@ -958,6 +1109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (residual_prepared, residual_parameters) = prepare_residual_benchmark(&database)?;
     let prefix = prepare_prefix_benchmark(&database)?;
     let secondary_range = prepare_secondary_range_benchmark(&database)?;
+    let secondary_prefix_range =
+        prepare_secondary_prefix_range_benchmark(&secondary_prefix_database)?;
     let secondary_exact = prepare_secondary_exact_benchmark(&database, secondary_index)?;
     let relational_target = RELATIONAL_TARGET_ROW.to_be_bytes();
     validate_scan_routes(&database, secondary_table, &scan_prepared)?;
@@ -974,6 +1127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let operations = measure_operations(
         &database,
+        &secondary_prefix_database,
         &snapshot,
         &BenchmarkInputs {
             prepared: &prepared,
@@ -985,6 +1139,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             secondary_prepared: &secondary_exact.prepared,
             secondary_range_scan_prepared: &secondary_range.scan_prepared,
             secondary_range_prepared: &secondary_range.physical_prepared,
+            secondary_prefix_range_scan_prepared: &secondary_prefix_range.scan_prepared,
+            secondary_prefix_range_prepared: &secondary_prefix_range.physical_prepared,
             table,
             scan_table: secondary_table,
             secondary_index,
@@ -993,6 +1149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             secondary_index_key: &secondary_exact.index_key,
             secondary_parameters: &secondary_exact.parameters,
             secondary_range_parameters: &secondary_range.parameters,
+            secondary_prefix_range_parameters: &secondary_prefix_range.parameters,
             range_lower: &range.lower,
             range_upper: &range.upper,
             range_parameters: &range.parameters,
@@ -1008,15 +1165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dataset_hasher.update(b"accounts:mario=active;session=64x07");
     let dataset_digest = dataset_hasher.finalize();
 
-    print_report(
-        &commit,
-        &rustc,
-        dataset_digest,
-        relational_tree_height,
-        structure_tree_height,
-        search_tree_height,
-        &operations,
-    );
+    print_report(&commit, &rustc, dataset_digest, &tree_heights, &operations);
     Ok(())
 }
 
@@ -1024,13 +1173,11 @@ fn print_report(
     commit: &str,
     rustc: &str,
     dataset_digest: blake3::Hash,
-    relational_tree_height: usize,
-    structure_tree_height: usize,
-    search_tree_height: usize,
+    tree_heights: &TreeHeights,
     operations: &OperationStats,
 ) {
     println!("{{");
-    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v15\",");
+    println!("  \"schema\": \"hyphae.native.microsecond-smoke.v16\",");
     println!("  \"status\": \"observation-not-gate\",");
     println!("  \"commit\": \"{commit}\",");
     println!("  \"rustc\": \"{rustc}\",");
@@ -1057,6 +1204,7 @@ fn print_report(
     println!("  \"secondary_range_upper_row_exclusive\": {SECONDARY_RANGE_UPPER_ROW},");
     println!("  \"secondary_range_lower_key_inclusive\": \"{SECONDARY_RANGE_LOWER_KEY}\",");
     println!("  \"secondary_range_upper_key_exclusive\": \"{SECONDARY_RANGE_UPPER_KEY}\",");
+    println!("  \"secondary_prefix_target_tenant\": \"{SECONDARY_PREFIX_TARGET_TENANT}\",");
     println!("  \"scan_limit\": {SCAN_LIMIT},");
     println!("  \"range_lower_row_inclusive\": {RANGE_LOWER_ROW},");
     println!("  \"range_upper_row_exclusive\": {RANGE_UPPER_ROW},");
@@ -1074,6 +1222,13 @@ fn print_report(
         RELATIONAL_SCALE_ROWS.saturating_add(1)
     );
     println!("  \"secondary_index_rows\": {SECONDARY_SCALE_ROWS},");
+    println!("  \"secondary_prefix_relational_rows\": {SECONDARY_SCALE_ROWS},");
+    println!("  \"secondary_prefix_database\": \"isolated\",");
+    println!(
+        "  \"secondary_prefix_relational_tree_height\": \
+         {},",
+        tree_heights.secondary_prefix_relational
+    );
     println!(
         "  \"primary_key_prefix_rows\": {},",
         PREFIX_ROWS_PER_TENANT.saturating_mul(2)
@@ -1085,13 +1240,13 @@ fn print_report(
             .saturating_add(PREFIX_ROWS_PER_TENANT.saturating_mul(2))
             .saturating_add(1)
     );
-    println!("  \"relational_tree_height\": {relational_tree_height},");
+    println!("  \"relational_tree_height\": {},", tree_heights.relational);
     println!("  \"structure_keys\": {STRUCTURE_SCALE_KEYS},");
-    println!("  \"structure_tree_height\": {structure_tree_height},");
+    println!("  \"structure_tree_height\": {},", tree_heights.structure);
     println!("  \"hash_fields\": {HASH_SCALE_FIELDS},");
     println!("  \"set_members\": {SET_SCALE_MEMBERS},");
     println!("  \"search_documents\": {SEARCH_SCALE_DOCUMENTS},");
-    println!("  \"search_tree_height\": {search_tree_height},");
+    println!("  \"search_tree_height\": {},", tree_heights.search);
     println!("  \"search_query_document_frequency\": 1,");
     println!("  \"dataset_digest_blake3\": \"{dataset_digest}\",");
     println!("  \"transport_note\": \"codec plus embedded dispatch; no named-pipe transport\",");
@@ -1161,6 +1316,16 @@ fn print_operation_stats(operations: &OperationStats) {
     print_stats(
         "physical_prepared_sql_secondary_range_limit10_multilevel",
         operations.secondary_range_physical,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_unindexed_secondary_prefix_range_pk_scan_limit10_multilevel",
+        operations.secondary_prefix_range_scan,
+        true,
+    );
+    print_stats(
+        "physical_prepared_sql_secondary_prefix_range_limit10_multilevel",
+        operations.secondary_prefix_range_physical,
         true,
     );
     print_stats(

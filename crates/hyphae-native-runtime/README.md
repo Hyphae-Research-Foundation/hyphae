@@ -61,6 +61,9 @@ lists use bounded packed deque chunks, and sorted sets maintain both a
 member-to-score index and a score/member ordered index. Their mutations share
 the same WAL, MVCC root, conflict table, crash recovery, and strict reopen
 authority as scalar structure values; none is serialized as one scalar value.
+Whole-hash deletion publishes an incarnation fence, tombstones metadata and
+all live field paths under one CSN, and permits checked typed recreation
+without exposing retired fields.
 Legacy single-page structure roots remain readable and writable.
 New lexical-search roots use native collection, stored-document, term, and
 posting B+tree namespaces. Direct `MATCH` prunes to each query term's posting
@@ -77,22 +80,12 @@ index into one canonical persisted replacement. Retained roots preserve
 historical vector results; reopen validates and restores the complete graph
 before serving exact or explicitly approximate search.
 
-The implementation remains deliberately bounded: retained transaction
-snapshots still materialize relation state, while current-root page vacuum,
-WAL/manifest retention, and blob collection do not yet provide configurable
-multi-generation pins. Composite secondary equality-prefix ranges, descending
-traversal, streaming cursors, and zero-copy operator cursors remain pending.
-Structures still lack streams, bitmaps, probabilistic structures, geo,
-complete string/hash/set/list/sorted-set operations, collection TTL, active
-expiry backoff, blocking operations, eviction, and protocol exposure. Lexical
-search still lacks positions, phrases, filters, facets, doc values,
-deletes/updates, segments, and hybrid fusion. ANN still materializes the
-validated generation at open/snapshot time; direct buffer-pool graph
-traversal, snapshot filters, delta/tombstone merge, background build
-publication, and reclamation remain pending. Detached transactions can prepare
-concurrently without holding writer admission; commit validates their
-original read CSN and rebases disjoint mutations over the admitted current
-root. Publication and its durability I/O are still serialized and require
-exclusive access to the database handle. This proves the native
-transaction/recovery architecture; it is not the complete SQL, Valkey-class
-structure, or OpenSearch-class search engine.
+The implementation remains deliberately bounded by the closed G2-G6 profiles.
+It provides the versioned SQL, structure, lexical, vector, hybrid, lifecycle,
+transaction, backup, proof, and product surfaces listed in
+[`docs/product/capabilities.md`](../../docs/product/capabilities.md). It does
+not claim universal SQL, every Valkey or OpenSearch feature, unbounded query
+execution, or lock-free durability. Publication and durability I/O remain
+serialized where required for one-directory authority. The remaining Native
+1.0 work is controlled G7 performance evidence and G8 release evidence, not
+missing ownership of the three engines.

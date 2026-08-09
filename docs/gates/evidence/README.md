@@ -23,6 +23,23 @@ commit before its tag can be published.
 
 ## Native phase-1 observations
 
+### Retained gate closures
+
+These reviewed summaries preserve hosted evidence after temporary workflow
+artifacts expire. The SHA in each filename identifies the tested source
+candidate; the summary is necessarily committed later and does not claim its
+own commit as the evaluated source.
+
+- [Native G0 exact-SHA closure](closures/native-g0-14b4ec9.json)
+- [Native G1 exact-SHA closure](closures/native-g1-14b4ec9.json)
+- [Native G2 exact-SHA closure](closures/native-g2-a839037.json)
+- [Native G3 exact-SHA closure](closures/native-g3-a839037.json)
+- [Native G4 exact-SHA closure](closures/native-g4-0059fce.json)
+- [Native G5 exact-SHA closure](closures/native-g5-b7cf651.json)
+- [Native G6 exact-SHA local-product closure](closures/native-g6-c57cc07.json)
+
+### Source-bound observations
+
 - [Native phase-1 kernel evidence — 2026-08-01](native-phase1-kernel-2026-08-01.md)
   records the first page/WAL/MVCC/catalog convergence vertical and its explicit
   remaining gates.
@@ -244,6 +261,150 @@ commit before its tag can be published.
 - `native-sorted-set-wsl2.json` is its clean release observation for physical
   `ZCARD`, middle-member `ZSCORE`, and ten-entry head `ZRANGE` over 2,048
   members. It remains outside G3 and G7.
+- [Native sorted-set score-range evidence —
+  2026-08-02](native-sorted-set-score-ranges-linux-2026-08-02.md) binds
+  inclusive, exclusive, unbounded, empty, and inverted score bounds, live
+  offset/limit semantics, direct physical pruning, execution-mode
+  equivalence, and fail-closed decoding to one source commit.
+- `native-sorted-set-score-range-linux.json` is its direct-Linux release
+  observation for a ten-member middle score range over 2,048 members. It
+  remains outside G3 and G7.
+- [Native sorted-set member-rank evidence —
+  2026-08-02](native-sorted-set-ranks-linux-2026-08-02.md) binds
+  bidirectional zero-based ranks, reverse physical B+tree traversal,
+  execution-mode equivalence, live-only counting, and fail-closed decoding to
+  one source commit.
+- `native-sorted-set-rank-linux.json` is its direct-Linux position-sensitive
+  release observation over 2,048 members. It remains outside G3 and G7.
+- [PR #59–#61 direct-Linux integration evidence —
+  2026-08-02](native-pr59-pr60-pr61-integration-linux-2026-08-02.md) proves
+  exact ancestry for the SQL secondary-prefix, sorted-set score-range, and
+  sorted-set member-rank heads; combined runtime/documentation resolution;
+  direct-Linux gates; and same-corpus latency observations.
+- `native-pr59-pr60-pr61-integration-sql-linux.json`,
+  `native-pr59-pr60-pr61-integration-score-linux.json`, and
+  `native-pr59-pr60-pr61-integration-rank-linux.json` are the clean
+  single-process observations from the integrated source commit. They remain
+  outside G2, G3, and G7.
+- [Native sorted-set reverse-range evidence —
+  2026-08-02](native-sorted-set-reverse-ranges-linux-2026-08-02.md) binds
+  descending signed-rank and bounded-score ranges, complete tie reversal,
+  execution-mode equivalence, reverse physical pruning, live-only
+  rank/offset accounting, and fail-closed physical decoding to one source
+  commit.
+- `native-sorted-set-reverse-range-linux.json` is its direct-Linux release
+  observation over 2,048 members. It remains outside G3 and G7.
+- [Native bounded hash-scan evidence —
+  2026-08-02](native-hash-scan-linux-2026-08-02.md) binds exact binary field
+  order, exclusive cursor behavior, execution-mode equivalence, bounded
+  physical prefix traversal, live-only result accounting, and fail-closed
+  reached-state decoding to one source commit.
+- `native-hash-scan-linux.json` is its direct-Linux release observation over
+  2,048 fields. It remains outside G3 and G7.
+- [Native whole-hash lifecycle evidence —
+  2026-08-02](native-hash-lifecycle-linux-2026-08-02.md) binds typed
+  delete/recreate, lifecycle-fence concurrency, physical prefix tombstoning,
+  fail-closed replay, all seven singleton crash boundaries, compaction, and
+  separated private/memory/strict latency to one source commit.
+- `native-hash-lifecycle-linux.json` is its direct-Linux release observation
+  over 0-, 64-, and 2,048-field hashes. It remains outside complete G3 and G7.
+- [Native whole-hash TTL evidence —
+  2026-08-03](native-hash-ttl-linux-2026-08-03.md) binds absolute whole-family
+  expiry, compatible `HYHSHM01`/`HYHSHM02` metadata, a typed shared expiry
+  index, deterministic visibility, cross-family reuse, lifecycle conflicts,
+  mixed active cleanup, crash boundaries, and compaction to direct Linux.
+- `native-hash-ttl-linux.json` records separated private/snapshot/physical
+  TTL, physical `HGET`, memory/strict expiry commit, hash cleanup, and a
+  matched parent/current persistent-read control. It remains outside complete
+  G3 and G7.
+- [Native hash field commands evidence —
+  2026-08-03](native-hash-field-commands-linux-2026-08-03.md) binds bounded
+  multi-field read/set/delete, a signed field counter, canonical mutation
+  order, failure atomicity, field conflicts, lifecycle fencing, crash
+  boundaries, and reached-corruption checks to direct Linux.
+- `native-hash-field-commands-linux.json` records snapshot/private/physical
+  batch reads, a same-corpus singular-read control, memory/strict mutations,
+  and a matched parent/current persistent-read control. It remains outside
+  complete G3 and G7.
+- [Native reverse hash-scan evidence —
+  2026-08-03](native-hash-reverse-scan-linux-2026-08-03.md) binds descending
+  exact-byte order, exclusive live/dead cursors, private/snapshot/physical
+  equivalence, whole-hash TTL, height-two reverse pruning, early stop, and
+  reached-corruption handling to direct Linux.
+- `native-hash-reverse-scan-linux.json` records the native reverse visitor
+  against a full ascending materialize/reverse/truncate fallback plus repeated
+  pinned parent/current HGET controls. It remains outside complete G3 and G7.
+- [Native hash pattern-scan evidence —
+  2026-08-03](native-hash-pattern-scan-linux-2026-08-03.md) binds one bounded
+  binary-glob grammar, exact and leading-prefix physical routes, sparse
+  empty-page progress, matcher budgets, TTL/reopen equivalence, early stop,
+  and reached-corruption handling to direct Linux.
+- `native-hash-pattern-scan-linux.json` records a 32-visit prunable-prefix
+  route, a 1,985-visit leading-wildcard route, their full-HSCAN application
+  fallbacks, and repeated pinned parent/current HGET controls. It preserves
+  the leading-wildcard slowdown as an explicit optimization target and
+  remains outside complete G3 and G7.
+- [Native hash field TTL evidence —
+  2026-08-03](native-hash-field-ttl-linux-2026-08-03.md) binds absolute
+  per-field expiry, compatible `HYSTRV01` envelopes, accepted WAL opcode 32,
+  the collision-free `0x0c` index, all hash read surfaces, field/lifecycle
+  conflicts, bounded combined cleanup, crash boundaries, and compaction to
+  direct Linux.
+- `native-hash-field-ttl-linux.json` records separated TTL, `HGET`, no-due and
+  due `HLEN`, memory/strict mutation, 64-field cleanup, and repeated isolated
+  parent/current HGET controls. It retains invalid preliminary observations
+  as exclusions and remains outside complete G3 and G7.
+- [Native whole-set TTL evidence —
+  2026-08-03](native-set-ttl-linux-2026-08-03.md) binds absolute complete-set
+  expiry, compatible `HYSETM01`/`HYSETM02` metadata, typed shared cleanup,
+  set-algebra visibility, lifecycle conflicts, group durability, all seven
+  cleanup crash boundaries, corruption rejection, compaction, and page vacuum
+  to direct Linux.
+- `native-set-ttl-linux.json` records separated private/snapshot/physical TTL,
+  physical `SISMEMBER`, memory/strict expiry commit, 1- and 256-member cleanup,
+  and a matched parent/current persistent-read control. It remains outside
+  complete G3 and G7.
+- [Native set member commands evidence —
+  2026-08-03](native-set-commands-linux-2026-08-03.md) binds bounded batch
+  add/remove, positional membership, ascending cursor scans, canonical
+  mutation order, failure atomicity, whole-set TTL, member/lifecycle
+  conflicts, randomized model equivalence, all seven singleton crash
+  boundaries, multilevel pruning, and reached-corruption checks to direct
+  Linux.
+- `native-set-commands-linux.json` records private/snapshot/physical
+  membership batches, 32 singular physical membership calls, head/middle/tail
+  scans, private batch preparation, memory/strict commits, and a matched
+  parent/current persistent-read control. It remains outside complete G3 and
+  G7.
+- [Native whole-set lifecycle evidence —
+  2026-08-03](native-set-lifecycle-linux-2026-08-03.md) binds explicit
+  complete-set deletion, retained snapshots, same-transaction recreation as
+  every implemented structure family, lifecycle conflicts, all seven
+  singleton delete and replacement crash boundaries, reached corruption,
+  compaction, vacuum, and reopen to direct Linux.
+- `native-set-lifecycle-linux.json` records cardinality-separated private
+  deletion plus Memory and Strict publication for empty, 64-member, and
+  2,048-member sets. It remains outside process-kill/power-loss evidence,
+  complete G3, and G7.
+- [Native whole-list lifecycle evidence —
+  2026-08-03](native-list-lifecycle-linux-2026-08-03.md) binds explicit
+  complete-list deletion, all implemented typed recreations, whole-list
+  conflicts, 14 singleton crash boundaries, multichunk/blob retirement,
+  corruption rejection, compaction, vacuum, blob collection, and reopen to
+  direct Linux.
+- `native-list-lifecycle-linux.json` records private deletion plus Memory and
+  Strict publication for empty, 64-element, and 2,048-element lists. It
+  remains outside process-kill/power-loss evidence, complete G3, and G7.
+- [Native whole-list TTL evidence —
+  2026-08-03](native-list-ttl-linux-2026-08-03.md) binds absolute complete-list
+  expiry, compatible `HYLSTM01`/`HYLSTM02` metadata, typed shared cleanup,
+  both-end mutation visibility, lifecycle conflicts, Group durability, all
+  seven cleanup crash boundaries, corruption rejection, compaction, page
+  vacuum, and blob collection to direct Linux.
+- `native-list-ttl-linux.json` records separated private/snapshot/physical
+  TTL, physical `LLEN`, memory/strict expiry commit, 1- and 256-element
+  cleanup, five alternating pinned parent/current persistent-read pairs, and
+  a matched list-lifecycle control. It remains outside complete G3 and G7.
 - [Native durable scalar-expiry evidence —
   2026-08-01](native-expiry-2026-08-01.md) binds `HYSTRBT2`, ordered scalar
   expiry identities, bounded cleanup, renewal conflicts, fail-closed
@@ -270,15 +431,22 @@ commit before its tag can be published.
 - `native-structure-compaction-wsl2.json` records a 41-to-10 reduction in
   reachable pages and a 93.133% empty-expiry-scan p50 improvement while also
   recording append-only file growth. Physical page-file vacuum remains open.
+- [Native directory identity and writer exclusion evidence —
+  2026-08-02](native-directory-identity-linux-2026-08-02.md) binds canonical
+  native `FORMAT`, stable UUIDv7 identity, fail-closed marker validation, and
+  same-process plus cross-process writer exclusion to one direct Linux
+  commit. Offline promotion and manifest/anchor lineage threading remain
+  open.
 - [Native dependency-closure evidence —
   2026-08-02](native-dependency-closure-2026-08-02.md) binds the exact
-  non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
+  historical non-dev graph rooted at `hyphae-native-runtime`, reviewed versions,
   sources/licenses, forbidden-engine rejection, workspace lint inheritance,
   and host-observed unsafe metrics to one source commit.
 - `native-dependency-closure-wsl2.json` records 11 native workspace packages,
   19 external primitives/build dependencies, zero native unsafe findings, and
-  every external parser/exclusion residual. Semantic third-party unsafe review
-  and the remaining G0 corpus/conformance work stay open.
+  every external parser/exclusion residual. At that source commit, semantic
+  third-party unsafe review and the remaining G0 corpus/conformance work were
+  still open.
 - [Native bounded-WAL-replay evidence —
   2026-08-02](native-wal-replay-2026-08-02.md) binds fixed-size retention
   anchors, identity-preserving prefix retirement, suffix-only recovery, six
@@ -461,3 +629,140 @@ detectable.
   schema-v15 WSL2 release observation. It reports the ordered secondary
   range and its deliberately expensive unindexed differential baseline
   separately and remains outside G7.
+
+## Native SQL composite secondary prefix ranges
+
+- `native-secondary-index-prefix-ranges-linux-2026-08-02.md` binds a strict
+  ordered-secondary equality prefix plus a range on the immediately following
+  index column to exact Linux source. It covers canonical bounds, remaining
+  suffixes and primary-key ties, residual-before-limit behavior, private/
+  retained/current/reopen equivalence, legacy fallback, false-plan rejection,
+  and fail-closed physical corruption.
+- `native-microsecond-smoke-secondary-prefix-range-linux.json` is its clean
+  schema-v16 ext4 release observation. The new indexed and unindexed routes
+  use a second isolated native database so the inherited schema-v15 corpus
+  and measurement order remain unchanged. It remains outside G7.
+
+## Native ext4 Linux baseline
+
+- `native-ext4-linux-baseline-2026-08-02.md` binds the first native-Linux,
+  non-tmpfs execution of the schema-v15 smoke to exact source: an AWS EC2
+  devbox with the benchmark data directory on persistent ext4. It opens the
+  native-ext4 observation lane and its explicit warm/memory-durability,
+  virtualization, and non-comparability limits.
+- `native-microsecond-smoke-ext4-linux.json` is its clean schema-v15
+  release observation. Its numbers are a new devbox baseline, not
+  run-to-run comparable with the WSL2 or Windows receipts, and it remains
+  outside G7.
+
+## Native lineage ext4 latency
+
+- `native-lineage-ext4-latency-2026-08-02.md` binds a direct-Linux schema-v15
+  repeat to the exact lineage-bearing source tree later merged by PR 53. It
+  records all 21 routes and a bounded same-host comparison without inventing
+  a regression threshold.
+- `native-microsecond-smoke-lineage-ext4-linux.json` is the raw clean receipt.
+  It is warm, memory-durability, concurrency-one embedded/local-frame
+  evidence; it is not strict-durability, transport, power-loss, G1, or G7
+  closure.
+
+## Native process crash matrix on Linux
+
+- `native-process-crash-matrix-linux-2026-08-02.md` binds seven real
+  process-kill/reopen cycles to the exact singleton all-engine commit source.
+  It verifies prior-or-complete CSN visibility across relational,
+  structure/TTL, lexical, and blob state while the child retains the writer
+  lock until `SIGKILL`.
+- `native-process-crash-matrix-linux.json` is the exact release receipt from
+  AWS Linux/ext4. It is process-crash evidence, not sector, filesystem
+  reordering, device-cache, EC2-stop, or physical power-loss evidence.
+
+## Native checkpoint process crash matrix on Linux
+
+- `native-checkpoint-process-crash-linux-2026-08-02.md` extends the live
+  writer-lock/`SIGKILL` harness to staged manifest, published manifest,
+  appended checkpoint WAL, and synchronized checkpoint WAL boundaries.
+- `native-process-crash-matrix-v2-linux.json` preserves the prior seven
+  singleton results and records four checkpoint authority outcomes. It
+  remains process-crash evidence, not physical power-loss evidence.
+
+## Native durable snapshot pins on Linux
+
+- `native-snapshot-pins-linux-2026-08-02.md` binds the `HYPIN001` registry,
+  exact all-engine historical materialization, three retained page
+  generations, pin-aware WAL/blob blocking, explicit unpin/collection, and
+  direct Linux gates to source commit `01355d0`.
+- `native-snapshot-pins-linux.json` records three pin publications and
+  historical materializations, four-generation reopen, vacuum observations,
+  and exact retained/removed file bytes on AWS Linux/ext4.
+- `native-snapshot-pins-process-crash-linux.json` is schema v3 of the existing
+  process harness: seven commit, four checkpoint, and two snapshot-pin
+  `SIGKILL`/reopen scenarios. It remains process-crash evidence, not physical
+  power-loss evidence.
+
+## Native block-layer power-loss replay on Linux
+
+- `native-block-power-loss-replay-linux-2026-08-02.md` binds seven singleton
+  commit and four checkpoint interruption marks to an exact source tree,
+  Linux `dm-log-writes` target, pinned replay utility, and fresh ext4 images.
+- `native-block-power-loss-replay-linux.json` is the raw stable-media replay
+  receipt. It proves the worst recorded state through completed flush/FUA
+  barriers, normal ext4 journal recovery, native reopen, and exact cleanup.
+  Its status is deliberately `block-replay-not-physical-device-cut`; literal
+  EC2/EBS power removal and device-firmware behavior remain outside the claim.
+
+## Native local UDS transport on Linux
+
+- `native-local-uds-linux-2026-08-03.md` binds the first filesystem-backed
+  `HYPHLCL1` transport to exact contract, implementation, harness, failure
+  tests, direct-Linux host disclosure, and validation logs.
+- `native-local-uds-linux.json` records three release observations and their
+  median statistics. It measures framing plus a kernel UDS round trip, not an
+  engine operation, durability, saturation, Windows named-pipe behavior, or a
+  G1/G6/G7 gate closure.
+
+## Native local structure GET on Linux
+
+- `native-local-structure-get-linux-2026-08-03.md` binds the first
+  engine-bearing `HYPHLCL1` operation to its frozen binary contract, physical
+  B+tree execution, TTL clock authority, failure tests, exact Linux source,
+  and validation logs.
+- `native-local-structure-get-linux.json` records three release observations
+  of embedded physical `GET`, persistent `PING`, and persistent engine-bearing
+  `GET`. The bounded p50/p99 targets are met, but the receipt is not a
+  regression threshold or G0/G1/G6/G7 closure.
+
+## Native local structure SET and TTL on Linux
+
+- `native-local-structure-set-ttl-linux-2026-08-03.md` binds the frozen binary
+  contract, u128 transaction receipt correction, implicit native commits,
+  controlled expiry, failure recovery, strict reopen proof, and direct-Linux
+  validation to exact commits and logs.
+- `native-local-structure-set-ttl-linux.json` records three release
+  observations of physical TTL, persistent GET/TTL, and memory/strict SET.
+  The read routes remain in the microsecond domain, while memory SET is
+  hundreds of microseconds and strict SET is milliseconds. The receipt exposes
+  that deficit and is not a regression threshold or G0/G1/G3/G6/G7 closure.
+
+## Native local SEARCH MATCH on Linux
+
+- `native-local-search-match-linux-2026-08-03.md` binds the first local
+  search-engine operation to its canonical request/result contract, visible
+  CSN, physical inverted-index route, failure recovery, reopen proof, exact
+  Linux source, and validation logs.
+- `native-local-search-match-linux.json` records three release observations of
+  embedded physical MATCH, persistent PING, and persistent one-hit MATCH.
+  They remain in the microsecond domain but do not establish a regression
+  threshold or close G0/G1/G4/G6/G7.
+
+## Native local all-engine transaction on Linux
+
+- `native-local-all-engine-transaction-linux-2026-08-03.md` binds one explicit
+  local SQL + structure + lexical transaction to exact contracts, commits,
+  golden codecs, failure-state tests, optimistic conflict, strict reopen, and
+  all seven deterministic commit interruption boundaries.
+- `native-local-all-engine-transaction-linux.json` records three direct-Linux
+  release observations of PING, each engine's stage receipt, and memory/strict
+  commit. Staging remains in the microsecond domain; memory and strict commit
+  remain in milliseconds. The receipt exposes that deficit and is not a
+  regression threshold or G0/G1/G5/G6/G7 closure.

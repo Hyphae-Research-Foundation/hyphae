@@ -1,0 +1,26 @@
+{
+  "schema": "hyphae-native-sorted-set-smoke-v2",
+  "status": "observation-not-gate",
+  "source_commit": "5697114e3e38bec0713be0d98c283ed8482005d9",
+  "source_tree": "93dc4c9d4231130562e43638069dcb856fbbd05b",
+  "source_branch": "codex/native-sorted-set-score-ranges",
+  "environment": "aws-m6i.2xlarge-ubuntu-24.04.4-linux-6.17.0-1019-aws-ext4-ebs",
+  "profile": "release",
+  "durability": "strict-seed-and-reopen",
+  "cpu_affinity": "logical-cpu-2",
+  "warm_state": true,
+  "concurrency": 1,
+  "mode": "release-warm-concurrency-1",
+  "observations": 100000,
+  "warmup": 10000,
+  "members": 2048,
+  "member_bytes": 64,
+  "dataset_blake3": "b9dd892604bceb9c03720bf0f0322a1b18148ae3cc6cbf4c8d988697da2b71ab",
+  "structure_tree_height": 2,
+  "metrics": {
+    "zcard_physical": {"p50_nanos": 883, "p95_nanos": 905, "p99_nanos": 1427, "p999_nanos": 1600, "max_nanos": 6839, "throughput_per_second": 1120232.392},
+    "zscore_middle_physical": {"p50_nanos": 1895, "p95_nanos": 2219, "p99_nanos": 2594, "p999_nanos": 3476, "max_nanos": 8078, "throughput_per_second": 517567.595},
+    "zrange_head_10_physical": {"p50_nanos": 18134, "p95_nanos": 18524, "p99_nanos": 27635, "p999_nanos": 31123, "max_nanos": 45493, "throughput_per_second": 54211.268},
+    "zrange_by_score_middle_10_physical": {"p50_nanos": 10215, "p95_nanos": 10460, "p99_nanos": 19382, "p999_nanos": 22672, "max_nanos": 113793, "throughput_per_second": 95812.048}
+  }
+}

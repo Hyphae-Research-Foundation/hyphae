@@ -1,9 +1,7 @@
 # Native local protocol v1
 
-Status: normative target contract; the allocation-free borrowed frame decoder,
-encoder, version/kind validation, bounds, and CRC32C are implemented
-experimentally; named-pipe/UDS transport and session flow control remain
-pending
+Status: implemented normative contract; G6 cross-surface and cross-platform
+receipts are closed for the bounded product profile
 
 The local protocol exposes native typed operations without defining internal
 engine communication. Embedded calls remain direct Rust calls.
@@ -51,6 +49,40 @@ Payloads use canonical type encodings and little-endian fixed fields. The
 default maximum is 16 MiB. Larger inputs/results use bounded `DATA` frames on
 one stream with explicit total length and final digest.
 
+The v1 kind registry is append-only:
+
+| Code | Kind | Family |
+|---:|---|---|
+| 1 | `HELLO` | session |
+| 2 | `WELCOME` | session |
+| 3 | `PING` | session |
+| 4 | `PREPARE` | plan |
+| 5 | `EXECUTE` | plan |
+| 6 | `BEGIN` | transaction |
+| 7 | `COMMIT` | transaction |
+| 8 | `ROLLBACK` | transaction |
+| 9 | `STRUCTURE` | structure |
+| 10 | `SEARCH` | search |
+| 11 | `VALUE` | result |
+| 12 | `RECEIPT` | result |
+| 13 | `ERROR` | failure |
+| 14 | `CANCEL` | flow |
+| 15 | `CLOSE` | session |
+| 16 | `DEALLOCATE` | plan |
+| 17 | `EXPLAIN` | plan |
+| 18 | `SAVEPOINT` | transaction |
+| 19 | `DATA` | flow |
+| 20 | `END` | flow |
+| 21 | `WINDOW_UPDATE` | flow |
+| 22 | `ROW_SCHEMA` | result |
+| 23 | `ROW_BATCH` | result |
+| 24 | `DEADLINE` | flow |
+
+Codes 25 through 255 are unassigned in v1 and fail as unknown kinds. Adding a
+kind uses a previously unassigned code; existing assignments never change.
+Registry recognition does not imply that every corresponding product operation
+is implemented.
+
 ## Message families
 
 - session: `HELLO`, `WELCOME`, `PING`, `CLOSE`;
@@ -58,12 +90,35 @@ one stream with explicit total length and final digest.
 - transaction: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`;
 - structure: typed point and structure operations;
 - search: typed lexical, vector, hybrid and aggregation requests;
-- flow: `DATA`, `END`, `WINDOW_UPDATE`, `CANCEL`;
+- flow: `DATA`, `END`, `WINDOW_UPDATE`, `CANCEL`, `DEADLINE`;
 - result: `ROW_SCHEMA`, `ROW_BATCH`, `VALUE`, `RECEIPT`;
 - failure: `ERROR`.
 
 The transaction ID returned by `BEGIN` can carry SQL, structure and search
 operations on the same connection/session.
+
+The implemented engine-bearing subset now includes
+[native local structure GET v1](local-structure-get-v1.md) and
+[native local structure SET and TTL v1](local-structure-set-ttl-v1.md). They
+use the canonical frame header and a deliberately minimal serial session.
+Each `SET` owns one implicit native transaction; the complete message families,
+explicit transaction state, group scheduling, and multiplexing are not
+implemented.
+
+The implemented search subset is
+[native local SEARCH MATCH v1](local-search-match-v1.md). It carries one
+catalog object identity and bounded UTF-8 query directly to the physical
+inverted index, with the all-engine visible CSN in the canonical result.
+
+The implemented relational subset is
+[native local SQL SELECT v1](local-sql-select-v1.md). It prepares bounded
+session-local plans and executes canonical typed parameters directly against
+the physical current-root relational paths. Results preserve logical schema,
+typed rows, and the visible all-engine CSN.
+
+The prior serial handle remains available for G1 evidence. The G6
+`hyphae-native-daemon` adapter dispatches admitted operations through the sole
+`NativeProductService` owner; no engine behavior is implemented in the daemon.
 
 ## Multiplexing and flow control
 

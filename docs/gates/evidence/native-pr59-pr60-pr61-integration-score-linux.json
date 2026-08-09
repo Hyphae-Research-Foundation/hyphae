@@ -1,0 +1,16 @@
+{
+  "schema": "hyphae-native-sorted-set-smoke-v2",
+  "mode": "release-warm-concurrency-1",
+  "observations": 100000,
+  "warmup": 10000,
+  "members": 2048,
+  "member_bytes": 64,
+  "dataset_blake3": "b9dd892604bceb9c03720bf0f0322a1b18148ae3cc6cbf4c8d988697da2b71ab",
+  "structure_tree_height": 2,
+  "metrics": {
+    "zcard_physical": {"p50_nanos": 852, "p95_nanos": 1611, "p99_nanos": 1971, "p999_nanos": 2793, "max_nanos": 9101, "throughput_per_second": 1065913.485},
+    "zscore_middle_physical": {"p50_nanos": 1897, "p95_nanos": 3485, "p99_nanos": 4188, "p999_nanos": 5080, "max_nanos": 10074, "throughput_per_second": 480851.668},
+    "zrange_head_10_physical": {"p50_nanos": 18228, "p95_nanos": 38959, "p99_nanos": 46462, "p999_nanos": 57151, "max_nanos": 82701, "throughput_per_second": 45340.620},
+    "zrange_by_score_middle_10_physical": {"p50_nanos": 10221, "p95_nanos": 20731, "p99_nanos": 23654, "p999_nanos": 37359, "max_nanos": 137521, "throughput_per_second": 85539.915}
+  }
+}

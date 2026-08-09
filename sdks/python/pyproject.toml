@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyphae-sdk"
-version = "0.2.1"
-description = "Bounded Python client for the public Hyphae v1 API"
+version = "1.0.0"
+description = "Bounded Python client for Hyphae v1 and Native v2 APIs"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = []

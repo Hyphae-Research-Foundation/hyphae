@@ -98,15 +98,53 @@ ROW=6`, `DELETE ROW=7`, `CREATE SECONDARY INDEX=13`; structure `SET VALUE=3`,
 `DELETE HASH FIELD=12`, `CREATE SET=14`, `ADD SET MEMBER=15`, `DELETE SET
 MEMBER=16`, `CREATE LIST=20`, `PUSH LIST HEAD=21`, `PUSH LIST TAIL=22`, `POP
 LIST HEAD=23`, `POP LIST TAIL=24`, `CREATE SORTED SET=25`, `UPSERT SORTED SET
-MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`; and search
+MEMBER=26`, `DELETE SORTED SET MEMBER=27`, `COMPACT STRUCTURE=28`, `DELETE
+HASH=30`, `EXPIRE HASH=31`, `EXPIRE HASH FIELD=32`, `EXPIRE SET=33`, `DELETE
+SET=34`, `DELETE LIST=35`, `EXPIRE LIST=36`; and search
 `CREATE INDEX=4`, `INDEX DOCUMENT=5`, `CREATE ANN INDEX=17`, `UPSERT VECTOR=18`,
-`DELETE VECTOR=19`.
-`DELETE VALUE`, collection creation, hash-field deletion, set/sorted-set
+`DELETE VECTOR=19`, `REPLACE DOCUMENT=37`, `DELETE DOCUMENT=38`.
+`DELETE VALUE`, collection creation, whole-hash/hash-field deletion, set/sorted-set
 member deletion, and vector deletion require an empty value and no expiry.
 `EXPIRE VALUE` requires an explicit expiry and carries the retained logical
 value. The ordered expiry index is a derived physical structure maintained by
 the existing scalar opcodes, so it introduces no second mutation stream or
 WAL opcode.
+
+`EXPIRE HASH` uses the exact binary hash key, no target, an empty value, and an
+explicit signed expiry. The logical mutation is the replay authority; it
+updates versioned hash metadata and the typed ordered expiry entry without
+copying fields into the WAL body. Expiry-driven physical cleanup reuses
+`DELETE HASH`.
+
+`EXPIRE HASH FIELD=32` is the accepted additive opcode specified by
+[Native hash field TTL v1](native-hash-field-ttl-v1.md). It uses the canonical
+compound hash-key/field identity, no target, an empty value, and one explicit
+signed expiry. Replay preserves the admitted field value while deriving its
+collision-free field-expiry index update.
+
+`EXPIRE SET=33` and `DELETE SET=34` are the complete-set lifecycle opcodes
+specified by [Native whole-set TTL v1](native-set-ttl-v1.md).
+`DELETE LIST=35` and `EXPIRE LIST=36` are the complete-list lifecycle opcodes
+specified by [Native whole-list lifecycle v1](native-list-lifecycle-v1.md) and
+[Native whole-list TTL v1](native-list-ttl-v1.md). The expiry mutations carry
+an empty value and one explicit signed expiry. Complete deletion carries no
+expiry and is also the replay authority used by active cleanup.
+
+`REPLACE DOCUMENT=37` and `DELETE DOCUMENT=38` are the lexical lifecycle
+opcodes specified by
+[Native lexical document lifecycle v1](search-document-lifecycle-v1.md).
+Both use the exact binary document ID as key, the nonzero search collection as
+target, and no expiry. Replacement carries UTF-8 source text; deletion carries
+an empty value. They are the only replay authority for their derived
+document, collection-statistic, term, and posting updates.
+
+`COMPACT SEARCH=39` is the physical lexical-rebuild opcode specified by
+[Native lexical tombstone compaction
+v1](search-tombstone-compaction-v1.md). It requires the search engine, a zero
+target, empty key and value, and no expiry. The complete prior search root is
+its deterministic rebuild authority; recovery never interprets the empty
+maintenance body as a logical delete set. The opcode cannot be combined with
+user mutations.
 
 `COMPACT STRUCTURE` is a physical-maintenance opcode. It requires the structure
 engine, a zero target, empty key and value, and no expiry. Its commit advances
@@ -131,6 +169,16 @@ Hash field mutations use `u32` big-endian hash-key length, hash-key bytes, and
 field bytes as their mutation key. The decoder rejects truncated identities.
 This makes first-committer-wins field-granular while keeping creation of a hash
 on the same write key as scalar creation.
+
+`DELETE HASH` uses the exact binary hash key, an empty value, no expiry, and no
+target. It shares the scalar/collection ownership conflict identity with
+`CREATE HASH` and `EXPIRE HASH`. Hash-field mutations retain their field write
+identity and also
+validate that ownership identity as a lifecycle read dependency without
+publishing it. This rejects a stale field mutation after deletion/recreation
+without serializing disjoint field writers. The bounded logical mutation is
+the replay authority; physical publication deterministically tombstones the
+admitted current-root hash metadata and field prefix.
 
 Set member mutations use the same compound identity with the set key followed
 by the member bytes. Conflict identities add disjoint scalar/collection,
@@ -183,13 +231,14 @@ The implemented `HYCMT001` body is exactly 124 bytes:
 | 92 | 32 | four little-endian root page IDs |
 
 The current relational, scalar `SET`/`EXPIRE`, hash-field `HSET`, and search
-`INDEX DOCUMENT` mutation bodies store values at or below 8,192 bytes inline.
-Larger values are promoted to the shared immutable blob namespace first. The
-WAL stores the relational one-byte envelope, structure `HYSTRV01` envelope, or
-search `HYDOCS01` envelope with its 56-byte reference instead of duplicating
-large content. The search envelope also binds the analyzed token count. A
-structure or hash-field delete keeps its WAL value empty; page construction
-publishes the canonical `HYSTRV01` tombstone.
+`INDEX DOCUMENT`/`REPLACE DOCUMENT` mutation bodies store values at or below
+8,192 bytes inline. Larger values are promoted to the shared immutable blob
+namespace first. The WAL stores the relational one-byte envelope, structure
+`HYSTRV01` envelope, or search `HYDOCS01` envelope with its 56-byte reference
+instead of duplicating large content. The search envelope also binds the
+analyzed token count. A structure, whole-hash, hash-field, or lexical-document
+delete keeps its WAL value empty; page construction publishes the owning
+namespace's canonical tombstone.
 
 `ABORT` is advisory and never makes preceding mutations visible.
 
@@ -237,10 +286,12 @@ super-transaction.
 
 Recovery never guesses an opcode or skips an unknown committed mutation.
 Without a retention anchor, the current vertical still scans the complete WAL.
-With a verified `HYWAR001` anchor, it reconstructs the base roots from the
-bound immutable manifest, verifies and decodes only the identity-preserving WAL
-suffix, and rebuilds point-write conflict state from that suffix. The manifest
-chain is not yet pruned and remains separate unbounded recovery work.
+With a verified native `HYWAR002` anchor, it reconstructs the base roots from
+the bound immutable manifest, verifies and decodes only the identity-preserving
+WAL suffix, and rebuilds point-write conflict state from that suffix. The
+manifest chain is pruned from that exact lineage-bearing trust root.
+`HYWAR001` remains decodeable only for historical tooling and is not authority
+under `FORMAT`.
 
 ## Checkpoints
 
@@ -281,4 +332,9 @@ tail repair, deterministic blob/page/WAL/root/checkpoint interruptions, and
 set creation/member and ANN create/upsert/delete mutation round-trips. ANN
 shape tests reject truncated object identities and non-`f32`-aligned payloads;
 the cross-engine ANN matrix interrupts every implemented commit boundary. The
-broader list above remains gate work.
+direct-Linux process-crash matrix additionally retains the writer lock until
+the parent sends `SIGKILL` at every singleton blob/page/WAL/root boundary, then
+reopens to either the prior state or the complete relational, structure, and
+lexical CSN. Kernel page-cache survival means this is not sector, filesystem
+reordering, device-cache, or physical power-loss evidence. The broader list
+above remains gate work.

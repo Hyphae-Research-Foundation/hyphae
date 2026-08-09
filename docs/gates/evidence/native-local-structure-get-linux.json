@@ -1,0 +1,217 @@
+{
+  "schema": "hyphae.native.local-structure-get-evidence.v1",
+  "status": "observation-not-regression-gate",
+  "date": "2026-08-03",
+  "branch": "codex/native-local-structure-get",
+  "contract_commit": "dd69ef2a29d1e095669878eb5e3d003c1f9b1f2b",
+  "implementation_commit": "e3ecdf13b19f5bde667078fc5625d382ce822dc2",
+  "source_commit": "f6ca46b00cdadf472022d3efabe693bd3cd642dc",
+  "source_tree": "f33b6ad2cdd5e722160df7d83a30a52ac3508702",
+  "harness_commit": "f6ca46b00cdadf472022d3efabe693bd3cd642dc",
+  "harness": "crates/hyphae-native-runtime/examples/uds_structure_get_smoke.rs",
+  "harness_sha256": "02a4f0dbfcccdbc23d3393323fdc17b8a2533f5fe9bc3e65869265b2de52d793",
+  "red_gate": {
+    "command": "cargo test -p hyphae-native-runtime --test local_structure_get --no-run",
+    "expected_result": "E0432 unresolved imports for the frozen local operation and session types",
+    "log_sha256": "7c84357c8c473d653b2deab7f3ff0a1df901a6c4a3ea803e2cceadafbc721fe2"
+  },
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "region": "us-east-1",
+    "operating_system": "Ubuntu 24.04.4 LTS",
+    "kernel": "Linux 6.17.0-1019-aws",
+    "virtualization": "KVM full virtualization",
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "vcpus": 8,
+    "physical_cores_visible": 4,
+    "memory_gib": 30,
+    "filesystem": "ext4",
+    "filesystem_device": "/dev/nvme0n1p1",
+    "storage": "EBS",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "cpu_affinity": [
+      2,
+      3
+    ],
+    "cpu_governor": "unavailable"
+  },
+  "workload": {
+    "concurrency": 1,
+    "client_threads": 1,
+    "server_threads": 1,
+    "persistent_connection": true,
+    "maximum_payload_bytes": 128,
+    "structure_keys": 2048,
+    "structure_tree_height": 2,
+    "target_key": 1024,
+    "key_bytes": 4,
+    "value_bytes": 64,
+    "ping_bytes": 32,
+    "durability": "memory",
+    "warm_state": true,
+    "warmup_per_operation": 10000,
+    "observations_per_operation": 100000,
+    "dataset_digest_blake3": "03c89426c3fed14727a064336a560a3789da1b47a2bbee8edfe97d9bced67350"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "raw_sha256": "b82161fe1bd9fedfa087d90072f134cc985de7c6aa9a699131fba2c956c13f38",
+      "embedded_physical_structure_get_64b": {
+        "p50_nanos": 830,
+        "p95_nanos": 1167,
+        "p99_nanos": 1588,
+        "p999_nanos": 4876,
+        "maximum_nanos": 23300,
+        "throughput_per_second": 1107481.721
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23338,
+        "p95_nanos": 29272,
+        "p99_nanos": 35457,
+        "p999_nanos": 44376,
+        "maximum_nanos": 137531,
+        "throughput_per_second": 43334.563
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23503,
+        "p95_nanos": 29102,
+        "p99_nanos": 35663,
+        "p999_nanos": 45158,
+        "maximum_nanos": 966953,
+        "throughput_per_second": 42763.566
+      }
+    },
+    {
+      "run": 2,
+      "raw_sha256": "62b84df7dab796bfb768c1b019830e3303c22719c5ade56e8eb3c4f7905e7edd",
+      "embedded_physical_structure_get_64b": {
+        "p50_nanos": 814,
+        "p95_nanos": 865,
+        "p99_nanos": 900,
+        "p999_nanos": 4521,
+        "maximum_nanos": 14671,
+        "throughput_per_second": 1170610.745
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23342,
+        "p95_nanos": 29400,
+        "p99_nanos": 35716,
+        "p999_nanos": 45270,
+        "maximum_nanos": 813011,
+        "throughput_per_second": 42804.140
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23437,
+        "p95_nanos": 29047,
+        "p99_nanos": 36190,
+        "p999_nanos": 45807,
+        "maximum_nanos": 1108009,
+        "throughput_per_second": 43285.993
+      }
+    },
+    {
+      "run": 3,
+      "raw_sha256": "c5ef638b5482c93405f387628d4564a4580442f4df831d86bc17617ffa4fc2fb",
+      "embedded_physical_structure_get_64b": {
+        "p50_nanos": 816,
+        "p95_nanos": 1355,
+        "p99_nanos": 1672,
+        "p999_nanos": 10540,
+        "maximum_nanos": 64643,
+        "throughput_per_second": 1064555.406
+      },
+      "persistent_ping_round_trip_32b": {
+        "p50_nanos": 23318,
+        "p95_nanos": 28972,
+        "p99_nanos": 35291,
+        "p999_nanos": 44222,
+        "maximum_nanos": 170191,
+        "throughput_per_second": 43543.864
+      },
+      "persistent_structure_get_round_trip_64b": {
+        "p50_nanos": 23466,
+        "p95_nanos": 29007,
+        "p99_nanos": 35939,
+        "p999_nanos": 45557,
+        "maximum_nanos": 197555,
+        "throughput_per_second": 42902.518
+      }
+    }
+  ],
+  "median_run_statistics": {
+    "embedded_physical_structure_get_64b": {
+      "p50_nanos": 816,
+      "p95_nanos": 1167,
+      "p99_nanos": 1588,
+      "p999_nanos": 4876,
+      "maximum_nanos": 23300,
+      "throughput_per_second": 1107481.721
+    },
+    "persistent_ping_round_trip_32b": {
+      "p50_nanos": 23338,
+      "p95_nanos": 29272,
+      "p99_nanos": 35457,
+      "p999_nanos": 44376,
+      "maximum_nanos": 170191,
+      "throughput_per_second": 43334.563
+    },
+    "persistent_structure_get_round_trip_64b": {
+      "p50_nanos": 23466,
+      "p95_nanos": 29047,
+      "p99_nanos": 35939,
+      "p999_nanos": 45557,
+      "maximum_nanos": 966953,
+      "throughput_per_second": 42902.518
+    }
+  },
+  "provisional_target_observation": {
+    "embedded_structure_get": {
+      "p50_target_nanos": 2000,
+      "p99_target_nanos": 10000,
+      "bounded_observation_met": true
+    },
+    "local_protocol_structure_get": {
+      "p50_target_nanos": 25000,
+      "p99_target_nanos": 100000,
+      "bounded_observation_met": true
+    },
+    "g7_gate_passed": false
+  },
+  "verification": {
+    "workspace_tests_passed": 642,
+    "workspace_tests_failed": 0,
+    "workspace_tests_ignored": 1,
+    "runtime_unit_tests_passed": 332,
+    "structure_get_integration_tests_passed": 5,
+    "documentation_markdown_files": 235,
+    "documentation_json_examples": 12,
+    "workspace_test_log_sha256": "46fd2a3bb541b694098c168a005aa398b1f160c75255a5814a915079a63dae37",
+    "targeted_test_log_sha256": "1a41c2e7567447bc097e69346ea21d2da86d8a593722e0edad149042c04e81de",
+    "clippy_log_sha256": "ed64f077998dfde6486a0fa19ac6ee33e941161ac1ad62e42cd99f646b5364ae",
+    "rustdoc_log_sha256": "998c246adeda48d6067910eb610a6568bc666e825e054371c4c153eaf7a91888",
+    "release_check_log_sha256": "92434e198f27984c035c376ec77a7cf9e6ebdde782f8ccb1336ae3329b66ddb7",
+    "documentation_log_sha256": "71295b75526afcbe5932079f02b0955f3db2e9bb974e00b8a5bf5b8b96d5f284",
+    "format_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diff_check_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "boundaries": {
+    "engine_operation": true,
+    "physical_durability": false,
+    "cold_state": false,
+    "saturation": false,
+    "allocation_and_rss": false,
+    "hardware_counters": false,
+    "windows_named_pipe": false,
+    "complete_handshake": false,
+    "multiplexing": false,
+    "transaction_state": false,
+    "g0_closed": false,
+    "g1_closed": false,
+    "g6_closed": false,
+    "g7_closed": false,
+    "regression_threshold": false
+  }
+}

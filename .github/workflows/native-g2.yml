@@ -1,0 +1,84 @@
+name: Native G2 Relational
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: native-g2-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  relational:
+    name: G2 relational evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: "1.96.0"
+
+      - name: Execute prepared plans and EXPLAIN suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          G2_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          cargo test -p hyphae-native-runtime --lib sql::tests --locked 2>&1 | tee g2-sql-unit.log
+          cargo test -p hyphae-native-runtime --test local_sql_select --locked 2>&1 | tee g2-local-sql.log
+          CORPUS_SHA="$(sha256sum docs/native/sql-semantics-v1.md | cut -d' ' -f1)"
+          PYTHONPATH=. python tools/produce_native_g2_prepared_receipt.py \
+            --source-commit "$G2_SHA" \
+            --suite-log sql-unit g2-sql-unit.log \
+            --suite-log local-sql-select g2-local-sql.log \
+            --corpus-sha256 "$CORPUS_SHA" \
+            --output native-g2-prepared-receipt.json
+          PYTHONPATH=. python tools/check_native_g2_receipts.py \
+            --receipt native-g2-prepared-receipt.json \
+            --expected-commit "$G2_SHA" \
+            --expected-requirement prepared-plans-and-explain \
+            --output native-g2-prepared-audit.json
+          PYTHONPATH=. python tools/inject_native_g2_evidence.py \
+            --baseline config/native-g2-readiness-evidence.json \
+            --requirement prepared-plans-and-explain \
+            --reference native-g2-prepared-audit.json \
+            --expected-commit "$G2_SHA" \
+            --output native-g2-evidence-with-prepared.json
+          set +e
+          PYTHONPATH=. python tools/check_native_g2_readiness.py \
+            --profile config/native-g2-readiness-profile.json \
+            --evidence native-g2-evidence-with-prepared.json \
+            --output native-g2-readiness-with-prepared.json
+          READINESS_STATUS=$?
+          set -e
+          test "$READINESS_STATUS" -eq 1
+          python - <<'PY'
+          import json
+          receipt = json.load(open("native-g2-readiness-with-prepared.json"))
+          assert receipt["status"] == "failed"
+          assert receipt["required"] == 8
+          assert receipt["passed"] == 1
+          PY
+
+      - name: Run G2 receipt validators
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_g2_receipts \
+            tools.test_inject_native_g2_evidence \
+            tools.test_produce_native_g2_prepared_receipt -v
+
+      - name: Upload G2 prepared evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-g2-prepared-evidence
+          path: |
+            native-g2-prepared-receipt.json
+            native-g2-prepared-audit.json
+            native-g2-evidence-with-prepared.json
+            native-g2-readiness-with-prepared.json
+          if-no-files-found: error

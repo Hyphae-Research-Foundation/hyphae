@@ -1,0 +1,65 @@
+{
+  "schema": "hyphae-native-golden-inventory-v1",
+  "fixtures": [
+    {
+      "id": "canonical-logical-type-descriptors",
+      "producer": "crates/hyphae-native-types/src/lib.rs",
+      "test": "logical_type_descriptors_round_trip_with_golden_bytes",
+      "consumer": "crates/hyphae-native-types/src/lib.rs"
+    },
+    {
+      "id": "native-page-v1",
+      "producer": "crates/hyphae-native-pages/src/lib.rs",
+      "test": "golden_page_encoding_is_stable",
+      "consumer": "crates/hyphae-native-pages/src/lib.rs"
+    },
+    {
+      "id": "native-wal-block-v1",
+      "producer": "crates/hyphae-native-wal/src/lib.rs",
+      "test": "golden_wal_block_encoding_is_stable",
+      "consumer": "crates/hyphae-native-wal/src/lib.rs"
+    },
+    {
+      "id": "native-btree-leaf-v1",
+      "producer": "crates/hyphae-native-btree/src/lib.rs",
+      "test": "leaf_encoding_has_a_stable_golden",
+      "consumer": "crates/hyphae-native-btree/src/lib.rs"
+    },
+    {
+      "id": "native-directory-format-v1",
+      "producer": "crates/hyphae-native-runtime/src/directory.rs",
+      "test": "canonical_marker_has_golden_bytes",
+      "consumer": "crates/hyphae-native-runtime/src/directory.rs"
+    },
+    {
+      "id": "native-catalog-tree-v3",
+      "producer": "crates/hyphae-native-runtime/src/lib.rs",
+      "test": "catalog_tree_keys_and_inline_envelope_have_golden_bytes",
+      "consumer": "crates/hyphae-native-runtime/src/lib.rs"
+    },
+    {
+      "id": "local-structure-get-v1",
+      "producer": "crates/hyphae-native-runtime/tests/local_structure_get.rs",
+      "test": "local_operation_codecs_have_stable_golden_bytes",
+      "consumer": "crates/hyphae-native-runtime/src/local_operation.rs"
+    },
+    {
+      "id": "local-structure-set-ttl-v1",
+      "producer": "crates/hyphae-native-runtime/tests/local_structure_set_ttl.rs",
+      "test": "local_set_ttl_codecs_have_stable_golden_bytes",
+      "consumer": "crates/hyphae-native-runtime/src/local_operation.rs"
+    },
+    {
+      "id": "local-search-match-v1",
+      "producer": "crates/hyphae-native-runtime/tests/local_search_match.rs",
+      "test": "local_search_match_codecs_have_stable_golden_bytes",
+      "consumer": "crates/hyphae-native-runtime/src/local_search.rs"
+    },
+    {
+      "id": "local-all-engine-transaction-v1",
+      "producer": "crates/hyphae-native-runtime/tests/local_all_engine_transaction.rs",
+      "test": "transaction_engine_payloads_match_frozen_goldens",
+      "consumer": "crates/hyphae-native-runtime/src/local_transaction.rs"
+    }
+  ]
+}

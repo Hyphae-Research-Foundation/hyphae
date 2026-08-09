@@ -249,7 +249,7 @@ namespace:
 |---:|---|---|
 | `0x00` | exact one-byte format key | ASCII `HYSTRBT2` |
 | `0x01` | prefix + binary user key | canonical `HYSTRV01` TTL/storage envelope |
-| `0x02` | prefix + binary hash key | `HYHSHM01` live-field count |
+| `0x02` | prefix + binary hash key | `HYHSHM01` persistent or `HYHSHM02` expiring metadata |
 | `0x03` | prefix + length-delimited hash key + field | persistent `HYSTRV01` field envelope |
 | `0x04` | prefix + binary set key | `HYSETM01` live-member count |
 | `0x05` | prefix + length-delimited set key + member | persistent empty `HYSTRV01` marker |
@@ -258,29 +258,38 @@ namespace:
 | `0x08` | prefix + binary sorted-set key | `HYZSTM01` live-member count |
 | `0x09` | prefix + length-delimited sorted-set key + member | `HYZSCR01` canonical score |
 | `0x0a` | prefix + sorted-set key + sortable score + member | persistent empty `HYSTRV01` marker |
-| `0x0b` | prefix + sortable expiry + scalar key | one-byte live marker or tombstone |
+| `0x0b` | prefix + sortable expiry + structure key | typed one-byte live marker or tombstone |
+| `0x0c` | prefix + sortable expiry + compound hash-field identity | one-byte live field-expiry marker or tombstone |
 
 The value envelope and legacy single-page compatibility are specified in
 [Native structure-engine semantics v1](structures-semantics-v1.md). `SET`,
 `EXPIRE`, and `DELETE` rewrite only their copy-on-write leaf-to-root paths;
 `DELETE` stores the canonical scalar tombstone. Direct current reads traverse
 the buffer pool. Hash field changes rewrite their own field path plus the small
-hash metadata path rather than a whole serialized map. `HYSTRBT2` maintains
-the scalar expiry index in the same mutation path and validates it
-one-to-one on recovery. `HYSTRBT1` remains a compatibility format without
+hash metadata path rather than a whole serialized map. Whole-hash deletion
+enumerates its exact field prefix and submits live field plus metadata
+tombstones through one sorted copy-on-write batch. `HYSTRBT2` maintains
+scalar and whole-hash expiry in the same mutation path with distinct live
+markers and validates the typed index one-to-one on recovery. `HYSTRBT1`
+remains a compatibility format without
 that index. The current implementation has no general range/streaming cursor,
-expected-version response, whole-hash deletion, or layouts for the remaining
-collection families. The list layout rewrites metadata plus one packed end
+expected-version response, whole-family deletion for the remaining collection
+families, or layouts for unimplemented families. The list layout rewrites
+metadata plus one packed end
 chunk per push/pop; its exact metadata, chunk, tombstone, and
 corruption rules are specified in the structure contract.
 
 ## Lexical-search namespace
 
-New lexical-search roots use marker `HYSEABT1` and four independent private
-prefixes for collection statistics, stored documents, term statistics, and
-postings. Query execution performs point reads for collection/term/document
-metadata and a separator-pruned prefix scan for each requested term's
-postings. Exact key/value envelopes are specified in
+New lexical-search roots begin with marker `HYSEABT1`; the first document
+replacement or deletion upgrades the current copy-on-write root to
+`HYSEABT2`. Both formats use four independent private prefixes for collection
+statistics, stored documents, term statistics, and postings. V2 alone admits
+the exact `HYDOCT01`, `HYTERMT1`, and `HYPOSTT1` tombstones; v1 and malformed
+or cross-namespace tombstones fail closed. Query execution performs point
+reads for collection/term/document metadata and a separator-pruned prefix scan
+for each requested term's live postings. Exact key/value envelopes are
+specified in
 [Native search-engine semantics v1](search-semantics-v1.md).
 
 Legacy page-kind-10 `SearchState` roots remain readable and writable without
@@ -288,19 +297,21 @@ implicit conversion. New directories use the B+tree format.
 
 ## Current-root rebuild
 
-Structure reachability compaction validates and scans one complete current
-B+tree before writing. It removes only entries already proven to be canonical
-physical tombstones by the owning engine, then feeds the retained
-strictly-ordered key/value pairs into the empty-tree ordered batch builder.
+Structure and lexical-search reachability compaction each validate and scan
+one complete current B+tree before writing. They remove only entries already
+proven to be canonical physical tombstones by the owning engine, then feed the
+retained strictly-ordered key/value pairs into the empty-tree ordered batch
+builder. Lexical compaction additionally validates the catalog-bound ANN
+generation sharing the root and preserves every ANN key/value byte.
 
 The resulting tree is balanced, contains the retained values byte-for-byte,
 and uses pages created at the maintenance commit CSN. The old tree remains
 immutable and readable. An empty tombstone set is a no-op rather than a
 same-content rewrite.
 
-This rebuild reduces the pages and tombstones reachable from the current root.
-It does not reclaim superseded pages from the append-only page file; that
-requires retention-aware page-file generation garbage collection.
+These rebuilds reduce the pages and tombstones reachable from the owning
+current root. They do not reclaim superseded pages from the append-only page
+file; that requires retention-aware page-file generation garbage collection.
 
 ## Verification
 

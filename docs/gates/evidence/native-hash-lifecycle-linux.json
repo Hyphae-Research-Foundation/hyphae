@@ -1,0 +1,90 @@
+{
+  "schema": "hyphae-native-hash-lifecycle-smoke-v1",
+  "date": "2026-08-02",
+  "source_commit": "2549c37fe403ed68caabeefe03badd9ce1a5824a",
+  "source_tree": "915fa55b6ece222718a1adff903e1cc5572d5b0d",
+  "source_branch": "codex/native-hash-lifecycle",
+  "stacked_base_commit": "169ac4545145f18fc9dd3fc9323ac989a42ce5b4",
+  "mode": "release-concurrency-1",
+  "command": "HYPHAE_LIFECYCLE_OBSERVATIONS=31 target/release/examples/hash_lifecycle_smoke",
+  "observations_per_route": 31,
+  "value_bytes": 64,
+  "raw_stdout_sha256": "7a479603e397c951f71c24aabbb4ff9a938916ec6bb5575898102cb1e4a34fbe",
+  "environment": {
+    "host": "AWS EC2 m6i.2xlarge",
+    "logical_cpus": 8,
+    "cpu": "Intel Xeon Platinum 8375C CPU @ 2.90GHz",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.17.0-1019-aws",
+    "architecture": "x86_64",
+    "filesystem": "ext4 over /dev/nvme0n1p1 EBS",
+    "rustc": "1.96.0",
+    "cargo": "1.96.0",
+    "execution": "direct Linux SSH; WSL not used"
+  },
+  "metrics": [
+    {
+      "fields": 0,
+      "private_delete_hash": {
+        "p50_nanos": 103,
+        "p95_nanos": 162,
+        "p99_nanos": 162,
+        "max_nanos": 1067
+      },
+      "memory_commit": {
+        "p50_nanos": 177367,
+        "p95_nanos": 189808,
+        "p99_nanos": 189969,
+        "max_nanos": 192277
+      },
+      "strict_commit": {
+        "p50_nanos": 6500456,
+        "p95_nanos": 6758803,
+        "p99_nanos": 6786953,
+        "max_nanos": 6805512
+      }
+    },
+    {
+      "fields": 64,
+      "private_delete_hash": {
+        "p50_nanos": 1321,
+        "p95_nanos": 1430,
+        "p99_nanos": 1558,
+        "max_nanos": 2245
+      },
+      "memory_commit": {
+        "p50_nanos": 397373,
+        "p95_nanos": 421286,
+        "p99_nanos": 427872,
+        "max_nanos": 455689
+      },
+      "strict_commit": {
+        "p50_nanos": 7056868,
+        "p95_nanos": 7190503,
+        "p99_nanos": 7234069,
+        "max_nanos": 7318612
+      }
+    },
+    {
+      "fields": 2048,
+      "private_delete_hash": {
+        "p50_nanos": 54106,
+        "p95_nanos": 66155,
+        "p99_nanos": 66973,
+        "max_nanos": 75015
+      },
+      "memory_commit": {
+        "p50_nanos": 3561224,
+        "p95_nanos": 4974756,
+        "p99_nanos": 5179238,
+        "max_nanos": 5371311
+      },
+      "strict_commit": {
+        "p50_nanos": 12298940,
+        "p95_nanos": 13039834,
+        "p99_nanos": 13222939,
+        "max_nanos": 13333870
+      }
+    }
+  ]
+}
