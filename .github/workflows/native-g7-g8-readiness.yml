@@ -315,7 +315,7 @@ jobs:
   g8-linux-privileged:
     name: G8 Native media and resource faults
     if: inputs.g8_mode == 'matrix'
-    runs-on: [self-hosted, hyphae-g8, privileged, linux]
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out exact commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -329,13 +329,25 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.13.7
+      - name: Prepare isolated block replay infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes dmsetup e2fsprogs util-linux
+          sudo modprobe loop
+          sudo modprobe dm-log-writes
+          sudo dmsetup targets | grep -Eq '^log-writes[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+$'
+          git clone https://github.com/josefbacik/log-writes "${{ runner.temp }}/dm-log-writes"
+          git -C "${{ runner.temp }}/dm-log-writes" checkout --detach 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
+          test "$(git -C "${{ runner.temp }}/dm-log-writes" rev-parse HEAD)" = 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
       - name: Run isolated resource-exhaustion matrix
         shell: bash
         run: |
           set -euo pipefail
           python tools/run_native_resource_exhaustion_gate.py \
             --source-commit "${{ github.sha }}" \
-            --environment "g8-self-hosted-linux" \
+            --environment "g8-github-hosted-linux" \
             --output native-g8-resource-exhaustion.json
           PYTHONPATH=. python tools/produce_native_g8_receipt.py \
             --requirement resource-exhaustion \
@@ -349,8 +361,8 @@ jobs:
           set -euo pipefail
           python tools/run_native_power_loss_gate.py \
             --source-commit "${{ github.sha }}" \
-            --environment "g8-self-hosted-linux" \
-            --replay-tool-source /opt/hyphae/dm-log-writes \
+            --environment "g8-github-hosted-linux" \
+            --replay-tool-source "${{ runner.temp }}/dm-log-writes" \
             --output native-g8-power-loss.json
           PYTHONPATH=. python tools/produce_native_g8_receipt.py \
             --requirement power-loss-replay \
