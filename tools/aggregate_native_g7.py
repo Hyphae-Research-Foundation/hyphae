@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aggregate the exact-SHA G7 matrix from dedicated Linux hardware."""
+"""Aggregate one exact-SHA G7 matrix from supported dedicated hardware."""
 
 from __future__ import annotations
 
@@ -12,12 +12,19 @@ from pathlib import Path
 from tools.check_native_g7_matrix import GateFailure, validate_matrix
 
 
-PLATFORMS = ("linux",)
+SUPPORTED_PLATFORMS = ("linux", "darwin")
 
 
 def aggregate(root: Path, source_commit: str) -> dict:
+    platforms = tuple(
+        platform
+        for platform in SUPPORTED_PLATFORMS
+        if (root / platform / "native-g7-matrix.json").is_file()
+    )
+    if len(platforms) != 1:
+        raise GateFailure("G7 aggregate requires exactly one supported dedicated platform")
     matrices = {}
-    for platform in PLATFORMS:
+    for platform in platforms:
         path = root / platform / "native-g7-matrix.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         audit = validate_matrix(payload, source_commit)

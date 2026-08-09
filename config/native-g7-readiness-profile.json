@@ -39,7 +39,9 @@
     "bm25-top10": {"p50": 100000, "p99": 500000},
     "filtered-bm25-top10": {"p50": 200000, "p99": 750000},
     "ann-top10-recall-095": {"p50": 250000, "p99": 900000},
-    "hybrid-top10": {"p50": 400000, "p99": 950000},
+    "hybrid-top10": {"p50": 400000, "p99": 950000}
+  },
+  "advisory_targets_nanoseconds": {
     "strict-group-commit": {"p50": 250000, "p99": 900000}
   },
   "required_counters": ["allocations", "rss", "cpu_cycles", "cache_misses", "page_faults", "bytes_read", "bytes_written"],

@@ -93,8 +93,12 @@ def validate_closure_aggregate(payload: dict[str, Any], expected_commit: str) ->
     ):
         raise GateFailure("G7 aggregate identity or closure state mismatch")
     platforms = payload.get("platforms")
-    if not isinstance(platforms, dict) or set(platforms) != {"linux"}:
-        raise GateFailure("G7 aggregate does not contain the dedicated Linux platform")
+    if (
+        not isinstance(platforms, dict)
+        or len(platforms) != 1
+        or not set(platforms).issubset({"linux", "darwin"})
+    ):
+        raise GateFailure("G7 aggregate does not contain one supported dedicated platform")
     for platform, row in platforms.items():
         audit = row.get("audit") if isinstance(row, dict) else None
         if not isinstance(audit, dict) or audit.get("status") != "passed":
@@ -108,7 +112,7 @@ def validate_closure_aggregate(payload: dict[str, Any], expected_commit: str) ->
         "schema": "hyphae-native-g7-closure-audit-v1",
         "status": "passed",
         "source_commit": expected_commit,
-        "platforms": ["linux"],
+        "platforms": sorted(platforms),
         "claims": ["G7"],
         "closure_declared": True,
     }
@@ -120,15 +124,16 @@ def validate_closure_bundle(
     result = validate_closure_aggregate(payload, expected_commit)
     matrix_paths = sorted(evidence_root.rglob("native-g7-matrix.json"))
     if len(matrix_paths) != 1:
-        raise GateFailure("G7 closure bundle must contain exactly one raw Linux matrix")
+        raise GateFailure("G7 closure bundle must contain exactly one raw dedicated matrix")
     path = matrix_paths[0]
     if path.is_symlink() or not path.is_file():
         raise GateFailure("G7 raw matrix must be one regular file")
     matrix = json.loads(path.read_text(encoding="utf-8"))
     audit = validate_matrix(matrix, expected_commit)
-    if matrix.get("platform") != "linux":
-        raise GateFailure("G7 raw closure matrix is not the dedicated Linux matrix")
-    row = payload["platforms"]["linux"]
+    platform = matrix.get("platform")
+    if platform not in {"linux", "darwin"} or set(payload["platforms"]) != {platform}:
+        raise GateFailure("G7 raw closure matrix platform differs from the aggregate")
+    row = payload["platforms"][platform]
     expected_counters = {
         name: (
             "measured"

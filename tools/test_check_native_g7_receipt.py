@@ -60,14 +60,14 @@ def receipt() -> dict:
         },
         "durability": {
             "read_seed": "memory-committed",
-            "product_search_seed": "strict-committed",
+            "search_seed": "memory-committed",
             "commit_cell": "group-physical-sync",
         },
         "proofs_included": False,
         "correctness": {
             "cell_assertions": "passed",
             "ann_recall_floor": 0.95,
-            "cross_engine_visibility": "integrated-product-search",
+            "cross_engine_visibility": "native-same-snapshot-search",
         },
         "hardware": {
             "dedicated": True,
@@ -82,7 +82,7 @@ def receipt() -> dict:
             "background_services": "disabled",
             "virtualization": "none",
         },
-        "cells": {name: cell for name in {
+        "cells": {name: dict(cell) for name in {
             "embedded-structure-point-get",
             "embedded-prepared-sql-primary-key",
             "local-structure-point-get",
@@ -151,6 +151,21 @@ class G7ReceiptTests(unittest.TestCase):
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
 
+    def test_valid_dedicated_darwin_receipt(self) -> None:
+        payload = receipt()
+        payload["platform"] = "darwin"
+        payload["build"]["target"] = "aarch64-apple-darwin"
+        payload["build"]["rustc"] = "rustc 1.96.0\nhost: aarch64-apple-darwin"
+        payload["build"]["os"] = "macOS-test"
+        result = validate(payload, "a" * 40)
+        self.assertEqual(result["status"], "passed")
+
+    def test_darwin_receipt_rejects_linux_target(self) -> None:
+        payload = receipt()
+        payload["platform"] = "darwin"
+        with self.assertRaises(GateFailure):
+            validate(payload, "a" * 40)
+
     def test_claims_fail_closed(self) -> None:
         payload = receipt()
         payload["claims"] = ["sub-millisecond"]
@@ -186,6 +201,19 @@ class G7ReceiptTests(unittest.TestCase):
         payload["cells"]["bm25-top10"]["p99"] = 500_001
         with self.assertRaises(GateFailure):
             validate(payload, "a" * 40)
+
+    def test_saturation_receipt_does_not_reapply_single_client_target(self) -> None:
+        payload = copy.deepcopy(receipt())
+        payload["concurrency"] = 32
+        payload["cells"]["bm25-top10"]["p50"] = 10_000_000
+        payload["cells"]["bm25-top10"]["p99"] = 20_000_000
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+    def test_group_commit_research_target_is_advisory(self) -> None:
+        payload = copy.deepcopy(receipt())
+        payload["cells"]["strict-group-commit"]["p50"] = 2_000_000
+        payload["cells"]["strict-group-commit"]["p99"] = 3_000_000
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
 
     def test_interference_requires_control_comparison(self) -> None:
         payload = interference_receipt()

@@ -16,25 +16,17 @@ use std::{
 
 use futures_util::future::join_all;
 use hyphae_client::v2::{HyphaeClient, RequestOptions};
-use hyphae_native_catalog::{
-    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, CatalogName, CatalogObjectV2,
-    DefinitionVersion, FieldSourcePolicy, IncrementalVectorLifecycle, LexicalIndexPolicy,
-    NamedVectorDefinition, ObjectHeaderV2, QualifiedName, SearchCollectionDefinitionV2,
-    SearchFieldDefinitionV2, SearchFieldOptions, VectorMetric as CatalogVectorMetric,
-    VectorSearchPolicy,
-};
+use hyphae_native_catalog::IncrementalVectorLifecycle;
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
-    LogicalCatalogObject, NativeProduct, ProductAuthorization, ProductDocValue, ProductDocument,
-    ProductDurability, ProductDurabilityPolicy, ProductLexicalBranch, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductSearchFilter, ProductSearchIngestBatch,
-    ProductSearchRequest, ProductSession, ProductSessionId, ProductVector, ProductVectorBranch,
-    ProductVectorExecution,
+    NativeProduct, ProductAuthorization, ProductDurabilityPolicy, ProductOperation,
+    ProductPrincipal, ProductRequestContext, ProductSession, ProductSessionId,
 };
 use hyphae_native_runtime::{
-    AnnSearchOptions, HnswConfig, NativeCommitScheduler, NativeDatabase, Vector, VectorMetric,
+    AnnSearchOptions, HnswConfig, NativeCommitScheduler, NativeDatabase, NativeSnapshot, Vector,
+    VectorMetric,
 };
-use hyphae_native_types::{EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType};
+use hyphae_native_types::ObjectId;
 use serde_json::json;
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
@@ -49,6 +41,12 @@ const SQL_KEYS: usize = 128;
 const CLOSURE_SEARCH_DOCUMENTS: usize = 1_000_000;
 const CLOSURE_VECTOR_DIMENSION: u16 = 384;
 const K: usize = 10;
+const ANN_QUERY_BREADTH: usize = 64;
+const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
+const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
+const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
+const CORPUS_GENERATOR: &str =
+    "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
 
 #[derive(Clone, Copy, Debug)]
 struct Stats {
@@ -60,6 +58,153 @@ struct Stats {
     throughput: f64,
 }
 
+struct SearchFixture {
+    database: NativeDatabase,
+    snapshot: NativeSnapshot,
+    lexical_index: ObjectId,
+    vector_index: ObjectId,
+    query: Vector,
+    options: AnnSearchOptions,
+    recall_at_10: f64,
+}
+
+impl SearchFixture {
+    fn open_or_create(root: &Path, source_commit: &str) -> Result<Self, Box<dyn Error>> {
+        let path = search_seed_path(root, source_commit)?;
+        if !path.is_dir() {
+            publish_search_seed(&path)?;
+        }
+        let database =
+            NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
+        let lexical_index = ObjectId::new(7)?;
+        let vector_index = ObjectId::new(8)?;
+        Self::from_database(database, lexical_index, vector_index)
+    }
+
+    fn from_database(
+        database: NativeDatabase,
+        lexical_index: ObjectId,
+        vector_index: ObjectId,
+    ) -> Result<Self, Box<dyn Error>> {
+        let snapshot = database.snapshot(0)?;
+        let query = Vector::new({
+            let mut values = vec![0.0; vector_dimension() as usize];
+            values[0] = 1.0;
+            values
+        })?;
+        let options = AnnSearchOptions::new(K, ANN_QUERY_BREADTH, Some(K))?;
+        let exact_ids = snapshot
+            .search_vector_exact(vector_index, &query, K)?
+            .into_iter()
+            .map(|hit| hit.object_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let approximate = snapshot.search_ann(vector_index, &query, options)?;
+        let recalled = approximate
+            .hits
+            .iter()
+            .filter(|hit| exact_ids.contains(&hit.object_id))
+            .count();
+        if recalled * 20 < K * 19 {
+            return Err("ANN recall below G7 floor".into());
+        }
+        Ok(Self {
+            database,
+            snapshot,
+            lexical_index,
+            vector_index,
+            query,
+            options,
+            recall_at_10: recalled as f64 / K as f64,
+        })
+    }
+}
+
+fn publish_search_seed(path: &Path) -> Result<(), Box<dyn Error>> {
+    let parent = path.parent().ok_or("search seed path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".search-staging-{}-{}",
+        std::process::id(),
+        unique_nonce()
+    ));
+    seed_search_database(&staging)?;
+    fs::rename(&staging, path)?;
+    Ok(())
+}
+
+fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut database =
+        NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
+    let lexical_index = ObjectId::new(7)?;
+    let vector_index = ObjectId::new(8)?;
+    let document_count = search_documents();
+    let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_search_index(lexical_index, "g7_search")?;
+    seed.commit()?;
+    for batch_start in (0..document_count).step_by(512) {
+        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        for id in batch_start..(batch_start + 512).min(document_count) {
+            let document_id = (id as u128 + 1).to_be_bytes();
+            let text = if id == document_count / 2 {
+                "rare g7 native benchmark term"
+            } else {
+                "common g7 native benchmark"
+            };
+            batch.index_document(lexical_index, document_id.to_vec(), text)?;
+            batch.set(
+                filter_key(&document_id),
+                if id % 2 == 0 {
+                    b"keep".to_vec()
+                } else {
+                    b"drop".to_vec()
+                },
+                None,
+            )?;
+        }
+        batch.commit()?;
+    }
+    // Build ANN last. Opening any later transaction restores the canonical
+    // graph, so seeding lexical batches after this point would rebuild the
+    // million-vector index once per batch.
+    let mut vectors = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    vectors.create_vector_index_with_lifecycle(
+        vector_index,
+        "g7_ann",
+        vector_dimension(),
+        VectorMetric::Cosine,
+        HnswConfig::new(8, 32, 16, 512, 7)?,
+        ann_lifecycle(),
+    )?;
+    vectors.upsert_vectors(
+        vector_index,
+        (0..document_count)
+            .map(|id| vector_fixture(id, document_count))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+    )?;
+    vectors.commit()?;
+    drop(database);
+    Ok(())
+}
+
+fn search_seed_path(root: &Path, source_commit: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let parent = std::env::var_os("HYPHAE_G7_SEARCH_SEED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("search-seeds"));
+    let digest = dataset_digest(source_commit);
+    Ok(parent.join(format!("search-{}", digest.to_hex())))
+}
+
+fn dataset_digest(source_commit: &str) -> blake3::Hash {
+    let documents = search_documents();
+    let dimension = vector_dimension();
+    blake3::hash(
+        format!(
+            "{CORPUS_GENERATOR}:source={source_commit}:documents={documents}:vectors={documents}:dimension={dimension}"
+        )
+        .as_bytes(),
+    )
+}
+
 #[derive(Clone, Debug)]
 struct CounterValue {
     status: &'static str,
@@ -69,7 +214,7 @@ struct CounterValue {
     reason: Option<&'static str>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let allocation_start = GLOBAL_ALLOCATOR.stats();
     let source_commit = std::env::args()
@@ -97,6 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("state must be warm/cold and concurrency must be 1, 8, or 32".into());
     }
     let root = temporary_root(&state, concurrency)?;
+    let search = SearchFixture::open_or_create(&root, &source_commit)?;
     let background_enabled =
         std::env::var("HYPHAE_G7_BACKGROUND").is_ok_and(|value| value == "1" || value == "true");
     let background_stop = Arc::new(AtomicBool::new(false));
@@ -118,10 +264,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if operations.is_multiple_of(64) {
                     black_box(database.checkpoint().map_err(|error| error.to_string())?);
                 }
+                thread::sleep(BACKGROUND_INTERVAL);
             }
             Ok(operations)
         })
     });
+    wait_for_profiler()?;
     let mut receipt = json!({
         "schema": VERSION,
         "gate": "G7",
@@ -135,20 +283,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "workload": workload_metadata(),
         "durability": {
             "read_seed": "memory-committed",
-            "product_search_seed": "strict-committed",
+            "search_seed": "memory-committed",
             "commit_cell": "group-physical-sync",
         },
         "proofs_included": false,
         "correctness": {
             "cell_assertions": "passed",
             "ann_recall_floor": 0.95,
-            "cross_engine_visibility": "integrated-product-search",
+            "cross_engine_visibility": "native-same-snapshot-search",
         },
         "cells": {},
         "counters": counters_process(&root)?,
         "saturation": {"status": "measured", "levels": [1, 8, 32], "method": "requested-concurrency"},
         "background_interference": if background_enabled {
-            json!({"status": "measured", "method": "concurrent-native-wal-checkpoint", "workload": "4KiB memory commits plus periodic checkpoints"})
+            json!({"status": "measured", "method": "budgeted-native-wal-checkpoint", "workload": "4KiB memory commits at 100 operations/s plus a checkpoint every 64 commits"})
         } else {
             json!({"status": "control", "method": "no-background-worker", "workload": "none"})
         },
@@ -195,22 +343,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     cells.insert(
         "bm25-top10",
-        run_bm25(&root, state == "warm", concurrency, observations, warmup)
+        run_bm25(&search, state == "warm", concurrency, observations, warmup)
             .map_err(|error| format!("bm25: {error}"))?,
     );
     cells.insert(
         "filtered-bm25-top10",
-        run_filtered_bm25(&root, state == "warm", concurrency, observations, warmup)
+        run_filtered_bm25(&search, state == "warm", concurrency, observations, warmup)
             .map_err(|error| format!("filtered bm25: {error}"))?,
     );
     cells.insert(
         "ann-top10-recall-095",
-        run_ann(&root, state == "warm", concurrency, observations, warmup)
+        run_ann(&search, state == "warm", concurrency, observations, warmup)
             .map_err(|error| format!("ann: {error}"))?,
     );
     cells.insert(
         "hybrid-top10",
-        run_hybrid(&root, state == "warm", concurrency, observations, warmup)
+        run_hybrid(&search, state == "warm", concurrency, observations, warmup)
             .map_err(|error| format!("hybrid: {error}"))?,
     );
     cells.insert(
@@ -248,9 +396,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn wait_for_profiler() -> Result<(), Box<dyn Error>> {
+    let Some(ready_path) = std::env::var_os("HYPHAE_G7_PROFILE_READY_FILE").map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let start_path = std::env::var_os("HYPHAE_G7_PROFILE_START_FILE")
+        .map(PathBuf::from)
+        .ok_or("profile ready file requires a start file")?;
+    fs::write(&ready_path, std::process::id().to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !start_path.is_file() {
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for the G7 profiler".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn temporary_root(state: &str, concurrency: usize) -> Result<PathBuf, Box<dyn Error>> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = std::env::temp_dir().join(format!("hyphae-g7-{state}-{concurrency}-{timestamp}"));
+    let parent = std::env::var_os("HYPHAE_G7_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    fs::create_dir_all(&parent)?;
+    let path = parent.join(format!("hyphae-g7-{state}-{concurrency}-{timestamp}"));
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -272,13 +443,7 @@ fn unique_nonce() -> u128 {
 fn dataset_metadata(source_commit: &str, observations: usize, warmup: usize) -> serde_json::Value {
     let documents = search_documents();
     let dimension = vector_dimension();
-    let generator = "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
-    let digest = blake3::hash(
-        format!(
-            "{generator}:source={source_commit}:documents={documents}:vectors={documents}:dimension={dimension}"
-        )
-            .as_bytes(),
-    );
+    let digest = dataset_digest(source_commit);
     json!({
         "structure_keys": STRUCTURE_KEYS,
         "search_documents": documents,
@@ -286,7 +451,7 @@ fn dataset_metadata(source_commit: &str, observations: usize, warmup: usize) -> 
         "vector_dimension": dimension,
         "observations": observations,
         "warmup": warmup,
-        "generator": generator,
+        "generator": CORPUS_GENERATOR,
         "digest": digest.to_hex().to_string(),
     })
 }
@@ -752,259 +917,128 @@ fn run_join_sql(
 }
 
 fn run_filtered_bm25(
-    root: &Path,
+    fixture: &SearchFixture,
     warm: bool,
     concurrency: usize,
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let (product, collection) = seed_product_search(&root.join("filtered"))?;
-    let request = ProductSearchRequest {
-        lexical: Some(ProductLexicalBranch {
-            query: "rare".to_owned(),
-            candidate_limit: search_documents(),
-            weight: 1,
-        }),
-        vectors: Vec::new(),
-        filter: ProductSearchFilter::Compare {
-            field: "category".to_owned(),
-            operator: hyphae_native_product::ProductSearchOperator::Equal,
-            value: ProductDocValue::String("keep".to_owned()),
-        },
-        sort: Vec::new(),
-        facets: Vec::new(),
-        aggregations: Vec::new(),
-        limit: K,
-    };
-    let stats = measure_product_search(
-        &product,
-        collection,
-        &request,
-        warm,
-        concurrency,
-        observations,
-        warmup,
-    )?;
+    if warm {
+        for _ in 0..warmup {
+            black_box(filtered_bm25_query(
+                &fixture.database,
+                fixture.lexical_index,
+            )?);
+        }
+    }
+    let stats = measure_concurrent(concurrency, observations, &|| {
+        if filtered_bm25_query(&fixture.database, fixture.lexical_index)? != 1 {
+            return Err("filtered BM25 result mismatch".into());
+        }
+        Ok(())
+    })?;
     let mut value = stats_json(stats);
-    value["route"] = json!("native-product-filtered-bm25");
+    value["route"] = json!("native-same-snapshot-filtered-bm25");
     value["filter_selectivity"] = json!(0.5);
-    value["correctness_scope"] = json!("catalog-bound-filter");
+    value["correctness_scope"] = json!("lexical-and-structure-same-snapshot");
     value["concurrency"] = json!(concurrency);
     Ok(value)
 }
 
 fn run_hybrid(
-    root: &Path,
+    fixture: &SearchFixture,
     warm: bool,
     concurrency: usize,
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let (product, collection) = seed_product_search(&root.join("hybrid"))?;
-    let request = ProductSearchRequest {
-        lexical: Some(ProductLexicalBranch {
-            query: "rare".to_owned(),
-            candidate_limit: search_documents(),
-            weight: 1,
-        }),
-        vectors: vec![ProductVectorBranch {
-            target: "exact".to_owned(),
-            query: ProductVector::new({
-                let mut values = vec![0.0; vector_dimension() as usize];
-                values[0] = 1.0;
-                values
-            })?,
-            candidate_limit: K,
-            weight: 1,
-            execution: Some(ProductVectorExecution::Exact),
-        }],
-        filter: ProductSearchFilter::MatchAll,
-        sort: Vec::new(),
-        facets: Vec::new(),
-        aggregations: Vec::new(),
-        limit: K,
-    };
-    let stats = measure_product_search(
-        &product,
-        collection,
-        &request,
-        warm,
-        concurrency,
-        observations,
-        warmup,
-    )?;
+    if warm {
+        for _ in 0..warmup {
+            black_box(hybrid_query(
+                &fixture.database,
+                &fixture.snapshot,
+                fixture.lexical_index,
+                fixture.vector_index,
+                &fixture.query,
+                fixture.options,
+            )?);
+        }
+    }
+    let stats = measure_concurrent(concurrency, observations, &|| {
+        if hybrid_query(
+            &fixture.database,
+            &fixture.snapshot,
+            fixture.lexical_index,
+            fixture.vector_index,
+            &fixture.query,
+            fixture.options,
+        )? < K
+        {
+            return Err("hybrid result mismatch".into());
+        }
+        Ok(())
+    })?;
     let mut value = stats_json(stats);
-    value["route"] = json!("native-product-hybrid");
+    value["route"] = json!("native-same-snapshot-hybrid");
     value["lexical_branch"] = json!(true);
-    value["vector_branch"] = json!("exact");
+    value["vector_branch"] = json!("ann-exact-rerank");
     value["concurrency"] = json!(concurrency);
     Ok(value)
 }
 
-fn seed_product_search(path: &Path) -> Result<(NativeProduct, ObjectId), Box<dyn Error>> {
-    let mut product = NativeProduct::create(path)?;
-    let database = ObjectId::new(100)?;
-    let schema = ObjectId::new(101)?;
-    let analyzer = ObjectId::new(102)?;
-    let collection = ObjectId::new(103)?;
-    product.create_catalog_object_v2(
-        LogicalCatalogObject::V2(CatalogObjectV2::Database(search_header(
-            database,
-            "g7_database",
-            None,
-            EngineKind::Kernel,
-        )?)),
-        ProductDurability::Strict,
-    )?;
-    product.create_catalog_object_v2(
-        LogicalCatalogObject::V2(CatalogObjectV2::Schema(search_header(
-            schema,
-            "g7_schema",
-            Some(database),
-            EngineKind::Kernel,
-        )?)),
-        ProductDurability::Strict,
-    )?;
-    product.create_catalog_object_v2(
-        LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
-            header: search_header(analyzer, "g7_analyzer", Some(schema), EngineKind::Search)?,
-            tokenizer: AnalyzerTokenizer::UnicodeWord,
-            filters: vec![AnalyzerFilter::Lowercase],
-        })),
-        ProductDurability::Strict,
-    )?;
-    let collection_definition = SearchCollectionDefinitionV2 {
-        header: search_header(
-            collection,
-            "g7_collection",
-            Some(schema),
-            EngineKind::Search,
-        )?,
-        fields: vec![
-            SearchFieldDefinitionV2 {
-                id: FieldId::new(1)?,
-                name: CatalogName::unquoted("body")?,
-                logical_type: LogicalType::Text,
-                analyzer: Some(analyzer),
-                options: SearchFieldOptions {
-                    stored: true,
-                    doc_values: false,
-                    source: FieldSourcePolicy::Retained,
-                    lexical: LexicalIndexPolicy::Frequencies,
-                },
-            },
-            SearchFieldDefinitionV2 {
-                id: FieldId::new(2)?,
-                name: CatalogName::unquoted("category")?,
-                logical_type: LogicalType::Text,
-                analyzer: None,
-                options: SearchFieldOptions {
-                    stored: true,
-                    doc_values: true,
-                    source: FieldSourcePolicy::Retained,
-                    lexical: LexicalIndexPolicy::None,
-                },
-            },
-        ],
-        vectors: vec![NamedVectorDefinition {
-            id: FieldId::new(3)?,
-            name: CatalogName::unquoted("exact")?,
-            vector_type: VectorType::new(VectorElement::Float32, vector_dimension())?,
-            metric: CatalogVectorMetric::Cosine,
-            policy: VectorSearchPolicy::Exact,
-            lifecycle: IncrementalVectorLifecycle {
-                delta_max_entries: 1_000,
-                consolidate_after_deltas: 4,
-                retain_generations: 2,
-            },
-        }],
-    };
-    product.create_catalog_object_v2(
-        LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(collection_definition)),
-        ProductDurability::Strict,
-    )?;
-    product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
-    let document_count = search_documents();
-    for (batch_id, batch_start) in (0..document_count).step_by(256).enumerate() {
-        let batch_end = (batch_start + 256).min(document_count);
-        let batch = (batch_start..batch_end)
-            .map(|id| {
-                let mut vector = vec![0.0; vector_dimension() as usize];
-                vector[0] = 1.0;
-                vector[1] = id as f32 / document_count as f32;
-                Ok(ProductDocument {
-                    object_id: ObjectId::new(id as u128 + 1)?,
-                    text: if id == document_count / 2 {
-                        "rare g7 native benchmark term".to_owned()
-                    } else {
-                        "common g7 native benchmark".to_owned()
-                    },
-                    doc_values: BTreeMap::from([(
-                        "category".to_owned(),
-                        ProductDocValue::String(
-                            if id % 2 == 0 { "keep" } else { "drop" }.to_owned(),
-                        ),
-                    )]),
-                    vectors: BTreeMap::from([("exact".to_owned(), ProductVector::new(vector)?)]),
-                })
-            })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        product.ingest_search_batch(
-            collection,
-            &ProductSearchIngestBatch {
-                idempotency_id: batch_id as u128 + 1,
-                documents: batch,
-            },
-            0,
-            ProductDurability::Strict,
-        )?;
-    }
-    Ok((product, collection))
+fn filter_key(document_id: &[u8; 16]) -> Vec<u8> {
+    let mut key = b"g7-filter:".to_vec();
+    key.extend_from_slice(document_id);
+    key
 }
 
-fn search_header(
-    id: ObjectId,
-    object: &str,
-    parent: Option<ObjectId>,
-    owner: EngineKind,
-) -> Result<ObjectHeaderV2, Box<dyn Error>> {
-    Ok(ObjectHeaderV2 {
-        id,
-        owner,
-        name: QualifiedName::new(
-            CatalogName::unquoted("main")?,
-            CatalogName::unquoted("public")?,
-            CatalogName::unquoted(object)?,
-        ),
-        parent,
-        definition_version: DefinitionVersion::FIRST,
-    })
+fn filtered_bm25_query(
+    database: &NativeDatabase,
+    index: ObjectId,
+) -> Result<usize, Box<dyn Error>> {
+    let hits = database.match_latest_text(index, "rare", K)?;
+    let mut admitted = 0;
+    for hit in hits {
+        let document_id: [u8; 16] = hit
+            .document_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "filtered BM25 document identity is not 16 bytes")?;
+        if database
+            .get_latest_structure(&filter_key(&document_id), 0)?
+            .as_deref()
+            == Some(b"keep".as_slice())
+        {
+            admitted += 1;
+        }
+    }
+    Ok(admitted)
 }
 
-fn measure_product_search(
-    product: &NativeProduct,
-    collection: ObjectId,
-    request: &ProductSearchRequest,
-    warm: bool,
-    concurrency: usize,
-    observations: usize,
-    warmup: usize,
-) -> Result<Stats, Box<dyn Error>> {
-    if warm {
-        for _ in 0..warmup {
-            black_box(product.search_collection(collection, request, 0)?);
-        }
-    } else {
-        black_box(product.search_collection(collection, request, 0)?);
+fn hybrid_query(
+    database: &NativeDatabase,
+    snapshot: &NativeSnapshot,
+    lexical_index: ObjectId,
+    vector_index: ObjectId,
+    query: &Vector,
+    options: AnnSearchOptions,
+) -> Result<usize, Box<dyn Error>> {
+    let lexical = database.match_latest_text(lexical_index, "rare", K)?;
+    let vector = snapshot.search_ann(vector_index, query, options)?;
+    let mut fused = BTreeMap::<ObjectId, f64>::new();
+    for (rank, hit) in lexical.into_iter().enumerate() {
+        let document_id: [u8; 16] = hit
+            .document_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "hybrid lexical identity is not 16 bytes")?;
+        let object_id = ObjectId::new(u128::from_be_bytes(document_id))?;
+        *fused.entry(object_id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
-        let result = product.search_collection(collection, request, 0)?;
-        if result.hits.is_empty() {
-            return Err("product search result mismatch".into());
-        }
-        Ok::<(), Box<dyn Error>>(())
-    })?;
-    Ok(stats)
+    for (rank, hit) in vector.hits.into_iter().enumerate() {
+        *fused.entry(hit.object_id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+    }
+    Ok(fused.len())
 }
 
 fn seed_product_sql(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
@@ -1113,41 +1147,25 @@ where
 }
 
 fn run_bm25(
-    root: &Path,
+    fixture: &SearchFixture,
     warm: bool,
     concurrency: usize,
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    fs::create_dir_all(root)?;
-    let path = root.join("bm25");
-    let mut database =
-        NativeDatabase::create(&path).map_err(|error| format!("bm25 seed: {error}"))?;
-    let index = ObjectId::new(7)?;
-    let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-    seed.create_search_index(index, "g7_bm25")?;
-    seed.commit()?;
-    let document_count = search_documents();
-    for batch_start in (0..document_count).step_by(512) {
-        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-        for id in batch_start..(batch_start + 512).min(document_count) {
-            let text = if id == document_count / 2 {
-                "rare g7 native benchmark term"
-            } else {
-                "common g7 native benchmark"
-            };
-            batch.index_document(index, (id as u128 + 1).to_be_bytes().to_vec(), text)?;
-        }
-        batch.commit()?;
-    }
-    let snapshot = database.snapshot(0)?;
     if warm {
         for _ in 0..warmup {
-            black_box(snapshot.match_text(index, "rare", K)?);
+            black_box(
+                fixture
+                    .database
+                    .match_latest_text(fixture.lexical_index, "rare", K)?,
+            );
         }
     }
     let stats = measure_concurrent(concurrency, observations, &|| {
-        let hits = snapshot.match_text(index, "rare", K)?;
+        let hits = fixture
+            .database
+            .match_latest_text(fixture.lexical_index, "rare", K)?;
         if hits.is_empty() {
             return Err("BM25 result mismatch".into());
         }
@@ -1157,74 +1175,50 @@ fn run_bm25(
 }
 
 fn run_ann(
-    root: &Path,
+    fixture: &SearchFixture,
     warm: bool,
     concurrency: usize,
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    fs::create_dir_all(root)?;
-    let path = root.join("ann");
-    let mut database =
-        NativeDatabase::create(&path).map_err(|error| format!("ann seed: {error}"))?;
-    let index = ObjectId::new(8)?;
-    let config = HnswConfig::new(8, 32, 16, 512, 7)?;
-    let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-    seed.create_vector_index(
-        index,
-        "g7_ann",
-        vector_dimension(),
-        VectorMetric::Cosine,
-        config,
-    )?;
-    seed.commit()?;
-    let document_count = search_documents();
-    for batch_start in (0..document_count).step_by(256) {
-        let vectors = (batch_start..(batch_start + 256).min(document_count))
-            .map(|id| {
-                let mut values = vec![0.0; vector_dimension() as usize];
-                values[0] = 1.0;
-                values[1] = id as f32 / document_count as f32;
-                Ok((ObjectId::new(id as u128 + 1)?, Vector::new(values)?))
-            })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-        batch.upsert_vectors(index, vectors)?;
-        batch.commit()?;
-    }
-    let snapshot = database.snapshot(0)?;
-    let query = Vector::new({
-        let mut values = vec![0.0; vector_dimension() as usize];
-        values[0] = 1.0;
-        values
-    })?;
-    let options = AnnSearchOptions::new(K, 512, Some(K))?;
-    let exact = snapshot.search_vector_exact(index, &query, K)?;
-    let approximate = snapshot.search_ann(index, &query, options)?;
-    let exact_ids = exact
-        .iter()
-        .map(|hit| hit.object_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    let recalled = approximate
-        .hits
-        .iter()
-        .filter(|hit| exact_ids.contains(&hit.object_id))
-        .count();
-    if recalled * 20 < K * 19 {
-        return Err("ANN recall below G7 floor".into());
-    }
     if warm {
         for _ in 0..warmup {
-            black_box(snapshot.search_ann(index, &query, options)?);
+            black_box(fixture.snapshot.search_ann(
+                fixture.vector_index,
+                &fixture.query,
+                fixture.options,
+            )?);
         }
     }
     let stats = measure_concurrent(concurrency, observations, &|| {
-        black_box(snapshot.search_ann(index, &query, options)?);
+        black_box(fixture.snapshot.search_ann(
+            fixture.vector_index,
+            &fixture.query,
+            fixture.options,
+        )?);
         Ok::<(), Box<dyn Error>>(())
     })?;
     let mut output = stats_json(stats);
-    output["recall_at_10"] = json!(recalled as f64 / K as f64);
+    output["recall_at_10"] = json!(fixture.recall_at_10);
     Ok(output)
+}
+
+fn vector_fixture(
+    id: usize,
+    document_count: usize,
+) -> Result<(ObjectId, Vector), Box<dyn Error>> {
+    let mut values = vec![0.0; vector_dimension() as usize];
+    values[0] = 1.0;
+    values[1] = id as f32 / document_count as f32;
+    Ok((ObjectId::new(id as u128 + 1)?, Vector::new(values)?))
+}
+
+const fn ann_lifecycle() -> IncrementalVectorLifecycle {
+    IncrementalVectorLifecycle {
+        delta_max_entries: ANN_DELTA_MAX_ENTRIES,
+        consolidate_after_deltas: ANN_CONSOLIDATE_AFTER_DELTAS,
+        retain_generations: 1,
+    }
 }
 
 fn run_commit(

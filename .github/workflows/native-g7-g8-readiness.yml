@@ -28,6 +28,14 @@ on:
           - "1"
           - "8"
           - "32"
+      g7_platform:
+        description: Dedicated G7 performance host platform
+        required: false
+        default: linux
+        type: choice
+        options:
+          - linux
+          - darwin
       g8_mode:
         description: G8 authority-only validation or supporting execution matrix
         required: true
@@ -75,14 +83,9 @@ jobs:
           retention-days: 14
 
   g7-matrix:
-    name: G7 complete dedicated Linux matrix
+    name: G7 complete dedicated ${{ inputs.g7_platform }} matrix
     if: inputs.g7_mode == 'benchmark'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-    runs-on: [self-hosted, hyphae-g7, dedicated, "${{ matrix.platform }}"]
+    runs-on: [self-hosted, hyphae-g7, dedicated, "${{ inputs.g7_platform }}"]
     steps:
       - name: Check out exact commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,7 +110,7 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           PYTHONPATH=. python tools/run_native_g7.py \
             --source-commit "$SHA" \
-            --platform "${{ matrix.platform }}" \
+            --platform "${{ inputs.g7_platform }}" \
             --output native-g7-matrix.json \
             --background \
             --hardware-file "$HYPHAE_G7_HARDWARE_FILE" \
@@ -120,7 +123,7 @@ jobs:
       - name: Upload complete G7 matrix
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-g7-matrix-${{ matrix.platform }}-${{ github.sha }}
+          name: native-g7-matrix-${{ inputs.g7_platform }}-${{ github.sha }}
           path: |
             native-g7-matrix.json
             native-g7-matrix-audit.json
@@ -152,10 +155,9 @@ jobs:
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
-          for platform in linux; do
-            mkdir -p "g7-normalized/$platform"
-            cp "g7-platforms/native-g7-matrix-$platform-$SHA/native-g7-matrix.json" "g7-normalized/$platform/native-g7-matrix.json"
-          done
+          platform="${{ inputs.g7_platform }}"
+          mkdir -p "g7-normalized/$platform"
+          cp "g7-platforms/native-g7-matrix-$platform-$SHA/native-g7-matrix.json" "g7-normalized/$platform/native-g7-matrix.json"
           PYTHONPATH=. python tools/aggregate_native_g7.py \
             --source-commit "$SHA" \
             --platform-root g7-normalized \

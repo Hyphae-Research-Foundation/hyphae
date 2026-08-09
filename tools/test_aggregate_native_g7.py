@@ -28,6 +28,24 @@ class G7AggregateTests(unittest.TestCase):
                 "passed",
             )
 
+    def test_g7_darwin_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "darwin"
+            path.mkdir()
+            payload = matrix()
+            payload["platform"] = "darwin"
+            for receipt in payload["receipts"]:
+                receipt["platform"] = "darwin"
+                receipt["build"]["target"] = "aarch64-apple-darwin"
+            (path / "native-g7-matrix.json").write_text(json.dumps(payload))
+            result = aggregate(root, "a" * 40)
+            self.assertEqual(set(result["platforms"]), {"darwin"})
+            self.assertEqual(
+                validate_closure_bundle(result, root, "a" * 40)["status"],
+                "passed",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

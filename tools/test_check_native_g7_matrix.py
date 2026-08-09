@@ -37,6 +37,15 @@ class G7MatrixTests(unittest.TestCase):
         result = validate_matrix(matrix(), "a" * 40)
         self.assertEqual(result["receipts"], 6)
 
+    def test_complete_darwin_matrix(self) -> None:
+        payload = matrix()
+        payload["platform"] = "darwin"
+        for value in payload["receipts"]:
+            value["platform"] = "darwin"
+            value["build"]["target"] = "aarch64-apple-darwin"
+        result = validate_matrix(payload, "a" * 40)
+        self.assertEqual(result["platform"], "darwin")
+
     def test_missing_cell_fails(self) -> None:
         payload = matrix()
         payload["receipts"][0] = copy.deepcopy(payload["receipts"][0])
