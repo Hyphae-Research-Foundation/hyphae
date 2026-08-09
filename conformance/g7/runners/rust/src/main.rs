@@ -140,20 +140,6 @@ fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
     let document_count = search_documents();
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.create_search_index(lexical_index, "g7_search")?;
-    seed.create_vector_index_with_lifecycle(
-        vector_index,
-        "g7_ann",
-        vector_dimension(),
-        VectorMetric::Cosine,
-        HnswConfig::new(8, 32, 16, 512, 7)?,
-        ann_lifecycle(),
-    )?;
-    seed.upsert_vectors(
-        vector_index,
-        (0..document_count)
-            .map(|id| vector_fixture(id, document_count))
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
-    )?;
     seed.commit()?;
     for batch_start in (0..document_count).step_by(512) {
         let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
@@ -177,6 +163,25 @@ fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
         }
         batch.commit()?;
     }
+    // Build ANN last. Opening any later transaction restores the canonical
+    // graph, so seeding lexical batches after this point would rebuild the
+    // million-vector index once per batch.
+    let mut vectors = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    vectors.create_vector_index_with_lifecycle(
+        vector_index,
+        "g7_ann",
+        vector_dimension(),
+        VectorMetric::Cosine,
+        HnswConfig::new(8, 32, 16, 512, 7)?,
+        ann_lifecycle(),
+    )?;
+    vectors.upsert_vectors(
+        vector_index,
+        (0..document_count)
+            .map(|id| vector_fixture(id, document_count))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+    )?;
+    vectors.commit()?;
     drop(database);
     Ok(())
 }
