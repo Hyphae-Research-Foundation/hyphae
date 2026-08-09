@@ -48,7 +48,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: 3.11.15
+          python-version: 3.13.7
       - name: Validate open authority
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
@@ -101,7 +101,9 @@ jobs:
             --source-commit "$SHA" \
             --platform "${{ matrix.platform }}" \
             --output native-g7-matrix.json \
-            --background
+            --background \
+            --observations 100000 \
+            --warmup 10000
           PYTHONPATH=. python tools/check_native_g7_matrix.py \
             --matrix native-g7-matrix.json \
             --expected-commit "$SHA" \
@@ -129,7 +131,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: 3.11.15
+          python-version: 3.13.7
       - name: Download platform matrices
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
