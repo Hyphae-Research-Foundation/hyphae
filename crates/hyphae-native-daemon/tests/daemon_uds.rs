@@ -254,6 +254,31 @@ async fn local_protocol_exposes_the_shared_telemetry_snapshot() -> Result<(), Bo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_frames_release_the_stream_before_client_reuse() -> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("stream-reuse")?;
+    let daemon = NativeDaemon::start(
+        NativeProduct::create(&test.data)?,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect(&test.socket, 64 * 1024).await?;
+
+    for request_id in 2..=129 {
+        client
+            .send_request(1, request_id, &request(ProductOperation::Capabilities))
+            .await?;
+        assert!(matches!(
+            client.response(1, request_id).await?,
+            ProductResponse::Capabilities(_)
+        ));
+    }
+
+    drop(client);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_handles_are_session_local_and_disconnect_does_not_stop_daemon()
 -> Result<(), Box<dyn Error>> {
     let test = TestDirectory::new("prepared-disconnect")?;

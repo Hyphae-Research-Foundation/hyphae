@@ -842,6 +842,10 @@ async fn connection_loop(
                     token.cancel();
                 }
                 {
+                    // Admission shares the output lock with terminal frames so a
+                    // completed stream cannot be reused until its END or FAILURE
+                    // is visible on the connection.
+                    let _output = output.lock().await;
                     let mut active = requests.lock().map_err(|_| DaemonError::Task)?;
                     let mut active_windows = windows.lock().map_err(|_| DaemonError::Task)?;
                     if active.contains_key(&frame.request_id)
@@ -879,6 +883,7 @@ async fn connection_loop(
                 let pending = match client.submit(context, request.operation) {
                     Ok(pending) => pending,
                     Err(error) => {
+                        finish_request(&requests, &windows, frame.stream_id, frame.request_id)?;
                         send_product_error(
                             stream.as_ref(),
                             codec,
@@ -888,7 +893,6 @@ async fn connection_loop(
                             error,
                         )
                         .await?;
-                        finish_request(&requests, &windows, frame.stream_id, frame.request_id)?;
                         continue;
                     }
                 };
@@ -921,6 +925,7 @@ async fn connection_loop(
                                                     frame.stream_id,
                                                     frame.request_id,
                                                     &encoded,
+                                                    &response_requests,
                                                     &response_windows,
                                                     &response_notify,
                                                     &mut response_shutdown,
@@ -937,6 +942,12 @@ async fn connection_loop(
                                         }
                                     }
                                     Err(error) => {
+                                        finish_request(
+                                            &response_requests,
+                                            &response_windows,
+                                            frame.stream_id,
+                                            frame.request_id,
+                                        )?;
                                         send_product_error(
                                             response_stream.as_ref(),
                                             &response_codec,
@@ -1065,6 +1076,7 @@ async fn send_stream(
     stream_id: u32,
     request_id: u64,
     response: &[u8],
+    requests: &RequestState,
     windows: &WindowState,
     notify: &Notify,
     shutdown: &mut broadcast::Receiver<()>,
@@ -1111,6 +1123,7 @@ async fn send_stream(
     }
     let completion = StreamCompletion::for_data(response)?;
     let _output = output.lock().await;
+    finish_request(requests, windows, stream_id, request_id)?;
     codec
         .send(
             &mut &*stream,
