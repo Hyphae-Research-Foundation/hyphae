@@ -12,7 +12,7 @@ from tools.test_check_native_g7_matrix import matrix
 
 
 class G7AggregateTests(unittest.TestCase):
-    def test_dedicated_linux_exact_sha_aggregate(self) -> None:
+    def test_g7_linux_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for platform in ("linux",):
