@@ -204,6 +204,12 @@ class G8ProducerTests(unittest.TestCase):
             "platform": "x86_64-linux",
             "isolation": "owned-loopback-ext4",
             "image_bytes": 128 * 1024 * 1024,
+            "resource_limits": {
+                "filesystem_free_bytes": 32 * 1024,
+                "address_space_bytes": 16 * 1024 * 1024,
+                "open_files": 8,
+                "bounded_input_key_bytes": 70_000,
+            },
             "post_failure_doctor": "healthy",
             "cleanup": "complete",
             "observations": {

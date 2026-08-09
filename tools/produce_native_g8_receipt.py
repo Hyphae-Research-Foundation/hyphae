@@ -265,6 +265,13 @@ def validate_resource(payload: dict[str, Any], commit: str) -> dict[str, str]:
         or payload.get("cleanup") != "complete"
         or HEX40.fullmatch(str(payload.get("source_tree", ""))) is None
         or payload.get("image_bytes") != 128 * 1024 * 1024
+        or payload.get("resource_limits")
+        != {
+            "filesystem_free_bytes": 32 * 1024,
+            "address_space_bytes": 16 * 1024 * 1024,
+            "open_files": 8,
+            "bounded_input_key_bytes": 70_000,
+        }
         or not isinstance(payload.get("environment"), str)
         or not payload["environment"].strip()
         or not isinstance(payload.get("platform"), str)

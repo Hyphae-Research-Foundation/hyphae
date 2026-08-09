@@ -19,6 +19,10 @@ from typing import Any, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_BYTES = 128 * 1024 * 1024
+FILESYSTEM_FREE_BYTES = 32 * 1024
+ADDRESS_SPACE_BYTES = 16 * 1024 * 1024
+DESCRIPTOR_LIMIT = 8
+BOUNDED_INPUT_KEY_BYTES = 70_000
 REQUIRED = ("cargo", "df", "fallocate", "findmnt", "losetup", "mkfs.ext4", "mount", "sudo", "umount")
 
 
@@ -88,11 +92,11 @@ def require_failure(completed: subprocess.CompletedProcess[str], label: str) -> 
 
 
 def limit_address_space() -> None:
-    resource.setrlimit(resource.RLIMIT_AS, (32 * 1024 * 1024, 32 * 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_BYTES, ADDRESS_SPACE_BYTES))
 
 
 def limit_descriptors() -> None:
-    resource.setrlimit(resource.RLIMIT_NOFILE, (8, 8))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (DESCRIPTOR_LIMIT, DESCRIPTOR_LIMIT))
 
 
 def mount_source(mountpoint: Path) -> str | None:
@@ -155,7 +159,7 @@ def main() -> int:
 
             available = int(run(("df", "--output=avail", "-B1", mountpoint)).stdout.splitlines()[-1])
             filler = mountpoint / "owned-filler"
-            fill_bytes = max(0, available - 32 * 1024)
+            fill_bytes = max(0, available - FILESYSTEM_FREE_BYTES)
             run(("fallocate", "-l", str(fill_bytes), filler))
             disk_full = command(
                 binary, "structure", "--data-dir", str(data), "set", "--key", "disk-full",
@@ -178,7 +182,13 @@ def main() -> int:
             observations["descriptors"] = require_failure(descriptors, "descriptor-limited process")
             require_healthy(binary, data)
 
-            oversized = json.dumps({"operation": "string_get", "keyspace": 20, "key": "k" * 70_000})
+            oversized = json.dumps(
+                {
+                    "operation": "string_get",
+                    "keyspace": 20,
+                    "key": "k" * BOUNDED_INPUT_KEY_BYTES,
+                }
+            )
             bounded = command(binary, "structure", "--data-dir", str(data), "read", "--request-json", oversized)
             observations["bounded-input"] = require_failure(bounded, "oversized bounded input")
             require_healthy(binary, data)
@@ -194,6 +204,12 @@ def main() -> int:
         "platform": f"{platform.machine()}-{platform.system().lower()}",
         "isolation": "owned-loopback-ext4",
         "image_bytes": IMAGE_BYTES,
+        "resource_limits": {
+            "filesystem_free_bytes": FILESYSTEM_FREE_BYTES,
+            "address_space_bytes": ADDRESS_SPACE_BYTES,
+            "open_files": DESCRIPTOR_LIMIT,
+            "bounded_input_key_bytes": BOUNDED_INPUT_KEY_BYTES,
+        },
         "observations": observations,
         "post_failure_doctor": "healthy",
         "cleanup": "complete",
