@@ -29,7 +29,9 @@ commit after its complete hosted gate is green.
 
    The package audit rejects an incomplete publication set, a mismatched
    version, a non-exact internal dependency, an invalid dependency layer, or a
-   compile-time asset absent from the generated crate.
+   compile-time asset absent from the generated crate. Release readiness runs
+   the historical SemVer comparison only for packages present in the v0.2.1
+   baseline; newly introduced Native packages have no fabricated baseline.
 
 4. Authenticate with a least-privilege crates.io token using `cargo login`.
    Never place the token in a command line, repository file, workflow log, or

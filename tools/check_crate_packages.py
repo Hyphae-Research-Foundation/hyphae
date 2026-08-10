@@ -53,6 +53,7 @@ def validate_release_graph(
         return (), ["release config version or layers have invalid types"]
     expected_crates = tuple(crate for layer in layers for crate in layer)
     expected_set = set(expected_crates)
+    baseline_packages = release.get("semver_baseline_packages", [])
     layer_by_crate = {
         crate: layer_index
         for layer_index, layer in enumerate(layers)
@@ -60,6 +61,13 @@ def validate_release_graph(
     }
 
     failures: list[str] = []
+
+    if not isinstance(baseline_packages, list):
+        failures.append("semver baseline packages must be a list")
+    elif len(baseline_packages) != len(set(baseline_packages)):
+        failures.append("semver baseline package list contains duplicates")
+    elif not set(baseline_packages).issubset(expected_set):
+        failures.append("semver baseline packages must belong to the release closure")
 
     if len(expected_crates) != len(expected_set):
         failures.append("release config contains duplicate crate names")

@@ -61,6 +61,19 @@ class ReleaseGraphTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("publishable crate set differs", failures[0])
 
+    def test_rejects_invalid_semver_baseline_packages(self) -> None:
+        release = {
+            "version": "1.0.1",
+            "layers": [["base"]],
+            "semver_baseline_packages": ["base", "missing"],
+        }
+        packages = {"base": package("base", "1.0.1")}
+        _, failures = validate_release_graph(release, packages, ("base",))
+        self.assertEqual(
+            failures,
+            ["semver baseline packages must belong to the release closure"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

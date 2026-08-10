@@ -7,6 +7,17 @@
       "packaged": "crates/hyphae-cli/tests/fixtures/format2-data-directory.json"
     }
   ],
+  "semver_baseline_packages": [
+    "hyphae-client",
+    "hyphae-contracts",
+    "hyphae-core",
+    "hyphae-engine",
+    "hyphae-pliegors",
+    "hyphae-query",
+    "hyphae-retrieval",
+    "hyphae-server",
+    "hyphae-storage"
+  ],
   "layers": [
     [
       "hyphae-core",
