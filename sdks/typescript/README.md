@@ -2,7 +2,7 @@
 
 `@celiums/hyphae` is the bounded ESM client for APIs v1 and Native v2. It requires Node.js 20
 or newer, uses the runtime `fetch`, and has no runtime package dependencies.
-The development source package version is `1.0.0`. It is maintained in this repository;
+The release source package version is `1.0.1`. It is maintained in this repository;
 this guide does not claim npm publication without a separate registry release
 and receipt.
 

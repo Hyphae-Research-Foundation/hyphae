@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn openapi_contract_lists_every_native_http_v2_route() {
-        let contract = include_str!("../../../../contracts/openapi/hyphae-v2.yaml");
+        let contract = hyphae_contracts::OPENAPI_V2;
         for route in [
             "/v2/capabilities",
             "/v2/execute",

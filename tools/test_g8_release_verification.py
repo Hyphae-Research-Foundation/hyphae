@@ -15,7 +15,7 @@ from g8_release_verification import expected_archives, verify  # noqa: E402
 
 
 COMMIT = "a" * 40
-TAG = "v1.0.0"
+TAG = "v1.0.1"
 
 
 class G8ReleaseVerificationTests(unittest.TestCase):

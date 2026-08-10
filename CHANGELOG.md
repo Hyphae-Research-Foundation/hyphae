@@ -3,6 +3,21 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [1.0.1] - 2026-08-09
+
+Hyphae 1.0.1 is a distribution follow-up to 1.0.0. It publishes the complete
+24-crate Native Rust dependency closure to crates.io; it does not change the
+Native format or make a new performance claim. G7 performance certification
+remains open.
+
+### Changed
+
+- Enabled crates.io publication for every product crate, including the Native
+  storage/runtime substrate, protocol, daemon, client, server, CLI, and
+  PliegoRS adapter.
+- Added a machine-checked release graph that binds every crate to version
+  1.0.1, exact internal requirements, dependency order, and packaged assets.
+
 ## [1.0.0] - 2026-08-09
 
 Hyphae 1.0.0 introduces the Native local data ecosystem. G0 through G6 are

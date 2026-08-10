@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
 POWER_LOSS_COMMIT = "7b70d8a6863c5de30933d42a7672d35d01d2dc6c"
+ROOT = Path(__file__).resolve().parents[1]
 COMMIT_BOUNDARIES = {
     "blob-staged", "blob-promoted", "page-appended", "page-synchronized",
     "wal-appended", "wal-synchronized", "root-published",
@@ -352,8 +354,10 @@ def validate_fixed_suite(
 
 def validate_package(payload: dict[str, Any], commit: str, platform: str) -> dict[str, str]:
     digest = payload.get("archive_sha256")
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    version = workspace["workspace"]["package"]["version"]
     extension = "zip" if platform.endswith("windows-msvc") else "tar.gz"
-    expected_archive = f"hyphae-1.0.0-{platform}.{extension}"
+    expected_archive = f"hyphae-{version}-{platform}.{extension}"
     if (
         payload.get("schema") != "hyphae-native-installed-package-v1"
         or payload.get("status") != "ok"
@@ -361,7 +365,7 @@ def validate_package(payload: dict[str, Any], commit: str, platform: str) -> dic
         or payload.get("platform") != platform
         or payload.get("installed_smoke") != "passed"
         or payload.get("native_engines") != ["sql", "structures", "search"]
-        or payload.get("engine_version") != "1.0.0"
+        or payload.get("engine_version") != version
         or payload.get("archive") != expected_archive
         or payload.get("proofs_verified") != 4
         or HEX40.fullmatch(str(payload.get("source_tree", ""))) is None

@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-contracts",
  "hyphae-native-product",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -374,11 +374,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "hyphae-native-ann"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-native-pages",
  "hyphae-native-types",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-daemon"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-native-product",
  "hyphae-native-protocol",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-manifest"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-product"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-protocol"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-records"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -528,14 +528,14 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-types"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "hyphae-native-wal"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "crc32c",

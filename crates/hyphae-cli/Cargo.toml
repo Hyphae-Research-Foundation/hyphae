@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 description = "Single-binary CLI, server, verifier, and MCP adapter for Hyphae."
 documentation = "https://docs.rs/hyphae-cli"
-publish = false
+publish.workspace = true
 
 [[bin]]
 name = "hyphae"
