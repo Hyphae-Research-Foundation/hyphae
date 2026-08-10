@@ -791,7 +791,7 @@ version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hyphae-native-ann",
  "hyphae-native-blobs",
  "hyphae-native-btree",
