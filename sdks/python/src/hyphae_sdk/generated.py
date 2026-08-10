@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "abf4cb0e155877d22882ac3acbb6101f7e8f69c5a9ca25fce3ba846794724237"
+CONTRACT_SHA256 = "9b41f509a252f0e99fae4df33f96842755aa2273e9ce173d71a264796f15d90c"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -62,6 +62,16 @@ class CapabilitiesV1(TypedDict):
     features: list[str]
     limits: ApiLimitsV1
 
+ClassLimit = TypedDict(
+    "ClassLimit",
+    {
+        "class": "Class",
+        "compute_threads": "int",
+        "io_slots": "int",
+        "memory_bytes": "int",
+    },
+)
+
 class CommitReceiptV1(TypedDict):
     """Durable commit receipt."""
     commit_digest: str
@@ -69,6 +79,13 @@ class CommitReceiptV1(TypedDict):
     status: str
     transaction_digest: str
     transaction_id: str
+
+class Counter(TypedDict):
+    status: Literal["measured", "unsupported"]
+    value: int | None
+    unit: str
+    provider: str
+    reason: str | None
 
 class CursorV1(TypedDict):
     """Logical continuation cursor."""
@@ -256,6 +273,108 @@ class HybridRetrievalResponseV1(TypedDict):
     outcome: HybridRetrievalOutcomeV1
     proof: RetrievalProofV1
 
+class HyphaeNativeHardwareCalibrationV1(TypedDict):
+    schema: Literal["hyphae-native-hardware-calibration-v1"]
+    mode: Literal["quick", "thorough"]
+    status: Literal["stable", "unstable", "rejected"]
+    accepted_for_scheduling: bool
+    cache_status: Literal["disabled", "hit", "miss"]
+    elapsed_ms: int
+    identity: dict[str, JsonValue]
+    policy: dict[str, JsonValue]
+    feature_detection: dict[str, JsonValue]
+    measurements: list[Measurement]
+    selected_kernels: list[dict[str, JsonValue]]
+    thread_scaling: dict[str, JsonValue]
+    io_scaling: dict[str, JsonValue]
+    coverage: dict[str, JsonValue]
+    claims: list[JsonValue]
+
+class HyphaeNativeHardwareProfileV1(TypedDict):
+    schema: Literal["hyphae-native-hardware-profile-v1"]
+    fingerprint: Digest
+    cpu: dict[str, JsonValue]
+    memory: dict[str, JsonValue]
+    storage: dict[str, JsonValue]
+    operating_system: dict[str, JsonValue]
+
+class HyphaeNativePerformanceProgressV1(TypedDict):
+    schema: Literal["hyphae-native-performance-progress-v1"]
+    source_commit: Sha1
+    source_tree: Sha1
+    dataset_digest: Sha256
+    operation: str
+    stage: str
+    sequence: int
+    completed_units: int
+    total_units: int
+    unit: str
+    elapsed_nanos: int
+    status: Literal["running", "completed"]
+    checkpoint_digest: None | Sha256
+
+class HyphaeNativePerformanceReceiptV1(TypedDict):
+    schema: Literal["hyphae-native-performance-receipt-v1"]
+    status: Literal["passed"]
+    evidence_class: Literal["diagnostic-baseline", "regression-candidate", "qualification-candidate"]
+    source: dict[str, JsonValue]
+    environment: dict[str, JsonValue]
+    workload: dict[str, JsonValue]
+    dataset: dict[str, JsonValue]
+    measurement: dict[str, JsonValue]
+    counters: dict[str, JsonValue]
+    correctness: dict[str, JsonValue]
+    claims: list[JsonValue]
+    closure_declared: Literal[False]
+
+class HyphaeNativePerformanceSuiteV1(TypedDict):
+    schema: Literal["hyphae-native-performance-suite-v1"]
+    status: Literal["passed"]
+    suite_profile_sha256: Sha256
+    source_commit: Sha1
+    source_tree: Sha1
+    binary_sha256: Sha256
+    clean: bool
+    hardware_fingerprint: Sha256
+    receipts: list[HyphaeNativePerformanceReceiptV1]
+    claims: Literal[[]]
+    closure_declared: Literal[False]
+
+class HyphaeNativePersistentExecutionTopologyV1(TypedDict):
+    schema: Literal["hyphae-native-execution-topology-v1"]
+    hardware_fingerprint: str
+    schedulable_compute_threads: int
+    hard_affinity: bool
+    pools: list[Pool]
+
+class HyphaeNativeResourceGovernorPolicyV1(TypedDict):
+    schema: Literal["hyphae-native-governor-policy-v1"]
+    mode: Literal["latency", "bulk", "mixed"]
+    hardware_fingerprint: Digest
+    calibration_cache_key: Digest
+    calibrated_worker_limit: int
+    reserved_system_threads: int
+    schedulable_compute_threads: int
+    io_slots: int
+    memory_bytes: int
+    memory_headroom_percent: Literal[15]
+    admission_queue_capacity: int
+    foreground_burst_limit: Literal[16]
+    class_limits: list[ClassLimit]
+
+class HyphaeNativeVectorBulkBuildBakeoffV1(TypedDict):
+    schema: Literal["hyphae-native-vector-bulk-bakeoff-v1"]
+    status: Literal["diagnostic"]
+    source_commit: str
+    hardware_fingerprint: Digest
+    governor_calibration_cache_key: Digest
+    dataset: dict[str, JsonValue]
+    build: dict[str, JsonValue]
+    quality: dict[str, JsonValue]
+    missing_gate_evidence: list[str]
+    claims: Literal[[]]
+    closure_declared: Literal[False]
+
 class LexicalAbstentionV1(TypedDict):
     """Stable lexical abstention evidence."""
     query_tokens: list[str]
@@ -316,6 +435,19 @@ class LexicalTermContributionV1(TypedDict):
     score_nanos: int
     token: str
 
+class Measurement(TypedDict):
+    primitive: str
+    variant: str
+    input_size: int
+    input_unit: str
+    bytes_per_operation: int
+    operations_per_sample: int
+    maximum_operations_per_sample: int
+    sample_count: int
+    statistics: dict[str, JsonValue]
+    correctness: dict[str, JsonValue]
+    status: Literal["stable", "unstable", "rejected"]
+
 class MetricValueV1Count(TypedDict):
     """Unsigned count."""
     kind: Literal["count"]
@@ -358,6 +490,10 @@ class NamedMetricV1Max(TypedDict):
     metric: Literal["max"]
     name: str
     path: list[str]
+
+class Pool(TypedDict):
+    numa_node_id: NullableId
+    workers: list[Worker]
 
 class ProofV1(TypedDict):
     """Portable result proof plus its downloadable witness reference."""
@@ -437,7 +573,17 @@ class WitnessV1(TypedDict):
     file_bytes: int
     path: str
 
+class Worker(TypedDict):
+    worker_index: int
+    numa_node_id: NullableId
+    logical_processor_id: NullableId
+    socket_id: NullableId
+    core_id: NullableId
+    smt_rank: NullableId
+
+Class: TypeAlias = Literal["foreground-point", "foreground-bounded", "mutation", "bulk", "maintenance", "recovery", "administrative"]
 CompareOperatorV1: TypeAlias = Literal["equal"] | Literal["not_equal"] | Literal["less"] | Literal["less_or_equal"] | Literal["greater"] | Literal["greater_or_equal"]
+Digest: TypeAlias = str
 ExactAbstentionReasonV1: TypeAlias = Literal["no_candidates"] | Literal["below_threshold"] | Literal["ambiguous"]
 ExactRetrievalOutcomeV1: TypeAlias = ExactRetrievalOutcomeV1Matches | ExactRetrievalOutcomeV1Abstained
 FilterV1: TypeAlias = FilterV1MatchAll | FilterV1Exists | FilterV1Compare | FilterV1Prefix | FilterV1Contains | FilterV1All | FilterV1Any | FilterV1Not
@@ -448,8 +594,19 @@ LexicalAbstentionReasonV1: TypeAlias = Literal["no_candidates"]
 LexicalRetrievalOutcomeV1: TypeAlias = LexicalRetrievalOutcomeV1Matches | LexicalRetrievalOutcomeV1Abstained
 MetricValueV1: TypeAlias = MetricValueV1Count | MetricValueV1Integer | MetricValueV1Value
 NamedMetricV1: TypeAlias = NamedMetricV1Count | NamedMetricV1Sum | NamedMetricV1Min | NamedMetricV1Max
+Nonnegative: TypeAlias = int
+NonnegativeInteger: TypeAlias = int
 NullPlacementV1: TypeAlias = Literal["first"] | Literal["last"]
+NullableId: TypeAlias = int | None
+OptionalNonnegativeInteger: TypeAlias = None | int
+OptionalPositiveInteger: TypeAlias = None | int
+OptionalString: TypeAlias = None | str
+Positive: TypeAlias = int
+Recall: TypeAlias = int
+Sha1: TypeAlias = str
+Sha256: TypeAlias = str
 SortDirectionV1: TypeAlias = Literal["ascending"] | Literal["descending"]
+UniqueStrings: TypeAlias = list[str]
 VectorMetricV1: TypeAlias = Literal["cosine_q15_nanos"]
 
 __all__ = [
@@ -458,13 +615,17 @@ __all__ = [
     "ApiLimitsV1",
     "CONTRACT_SHA256",
     "CapabilitiesV1",
+    "Class",
+    "ClassLimit",
     "CommitReceiptV1",
     "CompareOperatorV1",
+    "Counter",
     "CursorV1",
     "DefineLexicalIndexRequestV1",
     "DefineVectorSpaceRequestV1",
     "DeleteRequestV1",
     "DeleteVectorsRequestV1",
+    "Digest",
     "ErrorV1",
     "ExactAbstentionReasonV1",
     "ExactAbstentionV1",
@@ -499,6 +660,14 @@ __all__ = [
     "HybridRetrievalOutcomeV1Matches",
     "HybridRetrievalRequestV1",
     "HybridRetrievalResponseV1",
+    "HyphaeNativeHardwareCalibrationV1",
+    "HyphaeNativeHardwareProfileV1",
+    "HyphaeNativePerformanceProgressV1",
+    "HyphaeNativePerformanceReceiptV1",
+    "HyphaeNativePerformanceSuiteV1",
+    "HyphaeNativePersistentExecutionTopologyV1",
+    "HyphaeNativeResourceGovernorPolicyV1",
+    "HyphaeNativeVectorBulkBuildBakeoffV1",
     "JsonValue",
     "LexicalAbstentionReasonV1",
     "LexicalAbstentionV1",
@@ -512,6 +681,7 @@ __all__ = [
     "LexicalRetrievalRequestV1",
     "LexicalRetrievalResponseV1",
     "LexicalTermContributionV1",
+    "Measurement",
     "MetricValueV1",
     "MetricValueV1Count",
     "MetricValueV1Integer",
@@ -522,18 +692,31 @@ __all__ = [
     "NamedMetricV1Max",
     "NamedMetricV1Min",
     "NamedMetricV1Sum",
+    "Nonnegative",
+    "NonnegativeInteger",
     "NullPlacementV1",
+    "NullableId",
+    "OptionalNonnegativeInteger",
+    "OptionalPositiveInteger",
+    "OptionalString",
+    "Pool",
+    "Positive",
     "ProofV1",
     "PutRequestV1",
     "PutVectorsRequestV1",
     "QueryRequestV1",
     "QueryResponseV1",
+    "Recall",
     "RecordV1",
     "RetrievalProofV1",
+    "Sha1",
+    "Sha256",
     "SortDirectionV1",
     "SortFieldV1",
+    "UniqueStrings",
     "VectorMetricV1",
     "VectorSpaceV1",
     "VectorV1",
     "WitnessV1",
+    "Worker",
 ]
