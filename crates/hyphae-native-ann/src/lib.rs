@@ -9,6 +9,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    ops::ControlFlow,
 };
 
 use hyphae_native_types::{Csn, ObjectId};
@@ -266,6 +267,21 @@ pub struct IndexSnapshot {
     pub build_identity: [u8; 32],
 }
 
+/// Scalar persistence metadata for one immutable HNSW generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnswGenerationDescriptor {
+    /// Digest of the complete logical build.
+    pub build_identity: [u8; 32],
+    /// Number of canonical vectors.
+    pub vector_count: usize,
+    /// Number of canonical graph nodes.
+    pub graph_node_count: usize,
+    /// Greedy traversal entry point.
+    pub entry_point: Option<ObjectId>,
+    /// Highest graph layer.
+    pub max_level: u16,
+}
+
 /// Complete persistence-facing experimental partitioned HNSW generation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionedIndexSnapshot {
@@ -425,6 +441,9 @@ pub enum AnnError {
     /// A deterministic bulk plan requires at least one bounded partition.
     #[error("native ANN bulk partition count is invalid")]
     InvalidPartitionCount,
+    /// Cooperative cancellation stopped a canonical build before publication.
+    #[error("native HNSW build was cancelled")]
+    BuildCancelled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -488,28 +507,55 @@ impl HnswPartitionPlan {
         records: impl IntoIterator<Item = VectorRecord>,
         partition_count: usize,
     ) -> Result<Self, AnnError> {
+        Self::build_cancellable(definition, records, partition_count, || {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Creates balanced recursive geometric partitions with cooperative
+    /// cancellation throughout validation, projection, sorting, and identity
+    /// construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnError::BuildCancelled`] when the controller requests
+    /// cancellation, or the same validation errors as [`Self::build`].
+    pub fn build_cancellable(
+        definition: VectorIndexDefinition,
+        records: impl IntoIterator<Item = VectorRecord>,
+        partition_count: usize,
+        mut control: impl FnMut() -> ControlFlow<()>,
+    ) -> Result<Self, AnnError> {
         if partition_count == 0 {
             return Err(AnnError::InvalidPartitionCount);
         }
         let mut identities = BTreeSet::new();
-        let mut records = records
-            .into_iter()
-            .map(|record| {
-                validate_vector(definition, &record.vector)?;
-                if !identities.insert(record.object_id) {
-                    return Err(AnnError::DuplicateObjectId);
-                }
-                Ok(record)
-            })
-            .collect::<Result<Vec<_>, AnnError>>()?;
+        let mut admitted_records = Vec::new();
+        for record in records {
+            check_build_control(&mut control)?;
+            validate_vector(definition, &record.vector)?;
+            if !identities.insert(record.object_id) {
+                return Err(AnnError::DuplicateObjectId);
+            }
+            admitted_records.push(record);
+        }
+        check_build_control(&mut control)?;
+        let mut records = admitted_records;
         records.sort_by_key(|record| record.object_id);
+        check_build_control(&mut control)?;
         let effective_partitions = partition_count.min(records.len()).max(1);
         let partitions = if records.is_empty() {
             Vec::new()
         } else {
-            recursive_projection_partitions(definition, records, effective_partitions)?
+            recursive_projection_partitions(
+                definition,
+                records,
+                effective_partitions,
+                &mut control,
+            )?
         };
-        let input_identity = partition_plan_identity(definition, &partitions)?;
+        let input_identity =
+            partition_plan_identity_with_control(definition, &partitions, &mut control)?;
         Ok(Self {
             definition,
             partitions,
@@ -688,7 +734,29 @@ impl HnswIndex {
     pub fn build_with_progress(
         definition: VectorIndexDefinition,
         records: impl IntoIterator<Item = VectorRecord>,
-        progress: impl FnMut(HnswBuildProgress),
+        mut progress: impl FnMut(HnswBuildProgress),
+    ) -> Result<Self, AnnError> {
+        Self::build_cancellable(definition, records, |value| {
+            progress(value);
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Builds one canonical generation with cooperative cancellation checkpoints.
+    ///
+    /// The controller receives the same deterministic observations as
+    /// [`Self::build_with_progress`]. Returning [`ControlFlow::Break`] stops the
+    /// build at that checkpoint and discards the private partial generation.
+    /// No index is returned unless construction and validation both complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnError::BuildCancelled`] when the controller requests
+    /// cancellation, or the same validation errors as [`Self::build`].
+    pub fn build_cancellable(
+        definition: VectorIndexDefinition,
+        records: impl IntoIterator<Item = VectorRecord>,
+        control: impl FnMut(HnswBuildProgress) -> ControlFlow<()>,
     ) -> Result<Self, AnnError> {
         let mut entries = BTreeMap::new();
         for record in records {
@@ -706,7 +774,42 @@ impl HnswIndex {
                 return Err(AnnError::DuplicateObjectId);
             }
         }
-        Self::from_entries_with_progress(definition, entries, progress)
+        Self::from_entries_with_control(definition, entries, control)
+    }
+
+    /// Builds one canonical generation from an owned partition while checking
+    /// cancellation before every validation, insertion, and graph checkpoint.
+    ///
+    /// This ownership-oriented surface is intended for governed bulk workers:
+    /// cancellation never waits for the complete partition to be ingested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnError::BuildCancelled`] when the controller requests
+    /// cancellation, or the same validation errors as [`Self::build`].
+    pub fn build_owned_cancellable(
+        definition: VectorIndexDefinition,
+        records: Vec<VectorRecord>,
+        mut control: impl FnMut() -> ControlFlow<()>,
+    ) -> Result<Self, AnnError> {
+        let mut entries = BTreeMap::new();
+        for record in records {
+            check_build_control(&mut control)?;
+            validate_vector(definition, &record.vector)?;
+            if entries
+                .insert(
+                    record.object_id,
+                    Entry {
+                        creating_csn: record.creating_csn,
+                        vector: record.vector,
+                    },
+                )
+                .is_some()
+            {
+                return Err(AnnError::DuplicateObjectId);
+            }
+        }
+        Self::from_entries_with_control(definition, entries, |_| control())
     }
 
     /// Restores one persisted generation after validating its canonical
@@ -825,9 +928,20 @@ impl HnswIndex {
         entries: BTreeMap<ObjectId, Entry>,
         mut progress: impl FnMut(HnswBuildProgress),
     ) -> Result<Self, AnnError> {
+        Self::from_entries_with_control(definition, entries, |value| {
+            progress(value);
+            ControlFlow::Continue(())
+        })
+    }
+
+    fn from_entries_with_control(
+        definition: VectorIndexDefinition,
+        entries: BTreeMap<ObjectId, Entry>,
+        mut control: impl FnMut(HnswBuildProgress) -> ControlFlow<()>,
+    ) -> Result<Self, AnnError> {
         let mut index = Self::new(definition)?;
         index.entries = entries;
-        index.rebuild_with_progress(&mut progress)?;
+        index.rebuild_with_control(&mut control)?;
         Ok(index)
     }
 
@@ -846,9 +960,43 @@ impl HnswIndex {
         self.entries.is_empty()
     }
 
+    /// Returns one immutable vector version by stable object identity.
+    pub fn vector_record(&self, object_id: ObjectId) -> Option<(Csn, &Vector)> {
+        self.entries
+            .get(&object_id)
+            .map(|entry| (entry.creating_csn, &entry.vector))
+    }
+
+    /// Visits every immutable vector version in stable object-ID order without
+    /// exporting or cloning the graph generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error produced by `visitor`.
+    pub fn try_for_each_vector_record<E>(
+        &self,
+        mut visitor: impl FnMut(ObjectId, Csn, &Vector) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for (object_id, entry) in &self.entries {
+            visitor(*object_id, entry.creating_csn, &entry.vector)?;
+        }
+        Ok(())
+    }
+
     /// Returns the canonical graph generation digest.
     pub const fn build_identity(&self) -> [u8; 32] {
         self.build_identity
+    }
+
+    /// Returns scalar persistence metadata without exporting the generation.
+    pub fn generation_descriptor(&self) -> HnswGenerationDescriptor {
+        HnswGenerationDescriptor {
+            build_identity: self.build_identity,
+            vector_count: self.entries.len(),
+            graph_node_count: self.nodes.len(),
+            entry_point: self.entry_point,
+            max_level: self.max_level,
+        }
     }
 
     /// Inserts or replaces one vector and deterministically rebuilds the
@@ -1110,6 +1258,46 @@ impl HnswIndex {
         }
     }
 
+    /// Transfers this complete generation into canonical persistence records
+    /// without cloning vector or graph payloads.
+    pub fn into_snapshot(self) -> IndexSnapshot {
+        let Self {
+            definition,
+            entries,
+            nodes,
+            entry_point,
+            max_level,
+            build_identity,
+            ..
+        } = self;
+        IndexSnapshot {
+            definition,
+            vectors: entries
+                .into_iter()
+                .map(|(object_id, entry)| VectorRecord {
+                    object_id,
+                    creating_csn: entry.creating_csn,
+                    vector: entry.vector,
+                })
+                .collect(),
+            nodes: nodes
+                .into_iter()
+                .map(|(object_id, node)| GraphNodeRecord {
+                    object_id,
+                    level: node.level,
+                    neighbors: node
+                        .neighbors
+                        .into_iter()
+                        .map(|neighbors| neighbors.into_iter().collect())
+                        .collect(),
+                })
+                .collect(),
+            entry_point,
+            max_level,
+            build_identity,
+        }
+    }
+
     /// Exports graph nodes in canonical object-ID order.
     pub fn export_graph(&self) -> Vec<GraphNodeRecord> {
         self.nodes
@@ -1174,9 +1362,9 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn rebuild_with_progress(
+    fn rebuild_with_control(
         &mut self,
-        progress: &mut impl FnMut(HnswBuildProgress),
+        control: &mut impl FnMut(HnswBuildProgress) -> ControlFlow<()>,
     ) -> Result<(), AnnError> {
         self.nodes.clear();
         self.entry_point = None;
@@ -1188,10 +1376,14 @@ impl HnswIndex {
             .collect::<Vec<_>>();
         order.sort_by_key(|(creating_csn, object_id)| (creating_csn.get(), object_id.get()));
         let total = order.len();
-        progress(HnswBuildProgress::new(0, total));
+        if control(HnswBuildProgress::new(0, total)).is_break() {
+            return Err(AnnError::BuildCancelled);
+        }
         for (offset, (_, object_id)) in order.into_iter().enumerate() {
             self.insert_graph_node(object_id)?;
-            progress(HnswBuildProgress::new(offset + 1, total));
+            if control(HnswBuildProgress::new(offset + 1, total)).is_break() {
+                return Err(AnnError::BuildCancelled);
+            }
         }
         self.refresh_build_identity()?;
         self.validate()
@@ -1656,9 +1848,38 @@ impl PartitionedHnswIndex {
         input_identity: [u8; 32],
         partitions: Vec<HnswIndex>,
     ) -> Result<Self, AnnError> {
-        validate_governed_partitions(definition, input_identity, &partitions)?;
-        let build_identity = partitioned_build_identity(definition, input_identity, &partitions)?;
-        let summaries = summarize_partitions(&partitions)?;
+        Self::from_governed_partitions_cancellable(definition, input_identity, partitions, || {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Assembles governed child generations with cooperative cancellation
+    /// throughout boundary reconstruction, identity validation, and routing
+    /// summary construction.
+    ///
+    /// No fan-out index is returned unless every child and aggregate identity
+    /// has been validated and every routing summary is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnError::BuildCancelled`] when the controller requests
+    /// cancellation, or the same validation errors as
+    /// [`Self::from_governed_partitions`].
+    pub fn from_governed_partitions_cancellable(
+        definition: VectorIndexDefinition,
+        input_identity: [u8; 32],
+        partitions: Vec<HnswIndex>,
+        mut control: impl FnMut() -> ControlFlow<()>,
+    ) -> Result<Self, AnnError> {
+        validate_governed_partitions(definition, input_identity, &partitions, &mut control)?;
+        let build_identity = partitioned_build_identity_with_control(
+            definition,
+            input_identity,
+            &partitions,
+            &mut control,
+        )?;
+        let summaries = summarize_partitions_with_control(&partitions, &mut control)?;
+        check_build_control(&mut control)?;
         Ok(Self {
             definition,
             partitions,
@@ -1698,6 +1919,55 @@ impl PartitionedHnswIndex {
         self.partitions.len()
     }
 
+    /// Returns child persistence metadata without exporting any generation.
+    pub fn generation_descriptors(&self) -> Vec<HnswGenerationDescriptor> {
+        self.partitions
+            .iter()
+            .map(HnswIndex::generation_descriptor)
+            .collect()
+    }
+
+    /// Returns one immutable vector version and its owning child partition.
+    pub fn vector_record(&self, object_id: ObjectId) -> Option<(usize, Csn, &Vector)> {
+        self.partitions
+            .iter()
+            .enumerate()
+            .find_map(|(partition, index)| {
+                index
+                    .vector_record(object_id)
+                    .map(|(creating_csn, vector)| (partition, creating_csn, vector))
+            })
+    }
+
+    /// Returns one immutable vector version from an exact child partition.
+    pub fn partition_vector_record(
+        &self,
+        partition: usize,
+        object_id: ObjectId,
+    ) -> Option<(Csn, &Vector)> {
+        self.partitions
+            .get(partition)
+            .and_then(|index| index.vector_record(object_id))
+    }
+
+    /// Visits every immutable vector version in child order and stable
+    /// object-ID order without exporting or cloning any child graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error produced by `visitor`.
+    pub fn try_for_each_vector_record<E>(
+        &self,
+        mut visitor: impl FnMut(usize, ObjectId, Csn, &Vector) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for (partition, index) in self.partitions.iter().enumerate() {
+            index.try_for_each_vector_record(|object_id, creating_csn, vector| {
+                visitor(partition, object_id, creating_csn, vector)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Canonical centroid/radius summaries in partition order.
     pub fn partition_summaries(&self) -> &[HnswPartitionSummary] {
         &self.summaries
@@ -1713,6 +1983,27 @@ impl PartitionedHnswIndex {
                 .partitions
                 .iter()
                 .map(HnswIndex::export_snapshot)
+                .collect(),
+        }
+    }
+
+    /// Transfers complete child generations into canonical persistence
+    /// records without retaining or cloning the in-memory indexes.
+    pub fn into_snapshot(self) -> PartitionedIndexSnapshot {
+        let Self {
+            definition,
+            partitions,
+            input_identity,
+            build_identity,
+            ..
+        } = self;
+        PartitionedIndexSnapshot {
+            definition,
+            input_identity,
+            build_identity,
+            partitions: partitions
+                .into_iter()
+                .map(HnswIndex::into_snapshot)
                 .collect(),
         }
     }
@@ -1866,23 +2157,34 @@ fn merge_partitioned_search(
 }
 
 fn summarize_partitions(partitions: &[HnswIndex]) -> Result<Vec<HnswPartitionSummary>, AnnError> {
-    partitions
-        .iter()
-        .enumerate()
-        .map(|(partition, index)| summarize_partition(partition, index))
-        .collect()
+    summarize_partitions_with_control(partitions, &mut || ControlFlow::Continue(()))
 }
 
-fn summarize_partition(
+fn summarize_partitions_with_control(
+    partitions: &[HnswIndex],
+    control: &mut impl FnMut() -> ControlFlow<()>,
+) -> Result<Vec<HnswPartitionSummary>, AnnError> {
+    let mut summaries = Vec::with_capacity(partitions.len());
+    for (partition, index) in partitions.iter().enumerate() {
+        check_build_control(control)?;
+        summaries.push(summarize_partition_with_control(partition, index, control)?);
+    }
+    Ok(summaries)
+}
+
+fn summarize_partition_with_control(
     partition_index: usize,
     index: &HnswIndex,
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<HnswPartitionSummary, AnnError> {
+    check_build_control(control)?;
     let count = u32::try_from(index.entries.len()).map_err(|_| AnnError::LengthOverflow)?;
     if count == 0 {
         return Err(AnnError::CorruptGraph);
     }
     let mut centroid = vec![0.0_f64; usize::from(index.definition.dimension)];
     for entry in index.entries.values() {
+        check_build_control(control)?;
         for (total, value) in centroid.iter_mut().zip(entry.vector.values()) {
             *total += f64::from(*value);
         }
@@ -1894,10 +2196,16 @@ fn summarize_partition(
     let mut representative = None::<(f64, ObjectId, &Vector)>;
     let mut squared_l2_radius = 0.0_f64;
     let projection_identity = index.definition.digest();
+    let projection_weights = deterministic_projection_weights(
+        projection_identity,
+        0,
+        usize::from(index.definition.dimension),
+    );
     let mut projection_minimum = f64::INFINITY;
     let mut projection_maximum = f64::NEG_INFINITY;
     for (object_id, entry) in &index.entries {
-        let projection = deterministic_projection(projection_identity, &entry.vector);
+        check_build_control(control)?;
+        let projection = project_with_weights(&entry.vector, &projection_weights);
         projection_minimum = projection_minimum.min(projection);
         projection_maximum = projection_maximum.max(projection);
         let squared_l2 = entry
@@ -1922,6 +2230,7 @@ fn summarize_partition(
     }
     let (_, representative_object_id, routing_vector) =
         representative.ok_or(AnnError::CorruptGraph)?;
+    check_build_control(control)?;
     Ok(HnswPartitionSummary {
         partition_index,
         vector_count: index.entries.len(),
@@ -1992,7 +2301,9 @@ fn recursive_projection_partitions(
     definition: VectorIndexDefinition,
     records: Vec<VectorRecord>,
     partition_count: usize,
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<Vec<Vec<VectorRecord>>, AnnError> {
+    check_build_control(control)?;
     let base_records = records.len() / partition_count;
     let remainder = records.len() % partition_count;
     let target_sizes = (0..partition_count)
@@ -2006,17 +2317,20 @@ fn recursive_projection_partitions(
         &target_sizes,
         &mut split_sequence,
         &mut partitions,
+        control,
     )?;
     Ok(partitions)
 }
 
 fn split_projection_partition(
     projection_identity: [u8; 32],
-    mut records: Vec<VectorRecord>,
+    records: Vec<VectorRecord>,
     target_sizes: &[usize],
     split_sequence: &mut u64,
     partitions: &mut Vec<Vec<VectorRecord>>,
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<(), AnnError> {
+    check_build_control(control)?;
     if target_sizes.len() == 1 {
         if records.len() != target_sizes[0] {
             return Err(AnnError::CorruptGraph);
@@ -2028,15 +2342,7 @@ fn split_projection_partition(
     *split_sequence = split_sequence
         .checked_add(1)
         .ok_or(AnnError::LengthOverflow)?;
-    records.sort_by(|left, right| {
-        deterministic_projection_axis(projection_identity, axis, &left.vector)
-            .total_cmp(&deterministic_projection_axis(
-                projection_identity,
-                axis,
-                &right.vector,
-            ))
-            .then_with(|| left.object_id.cmp(&right.object_id))
-    });
+    let mut records = sort_records_by_projection(records, projection_identity, axis, control)?;
     let left_partitions = target_sizes.len() / 2;
     let left_records = target_sizes[..left_partitions]
         .iter()
@@ -2052,6 +2358,7 @@ fn split_projection_partition(
         &target_sizes[..left_partitions],
         split_sequence,
         partitions,
+        control,
     )?;
     split_projection_partition(
         projection_identity,
@@ -2059,7 +2366,16 @@ fn split_projection_partition(
         &target_sizes[left_partitions..],
         split_sequence,
         partitions,
+        control,
     )
+}
+
+fn check_build_control(control: &mut impl FnMut() -> ControlFlow<()>) -> Result<(), AnnError> {
+    if control().is_break() {
+        Err(AnnError::BuildCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn deterministic_projection(projection_identity: [u8; 32], vector: &Vector) -> f64 {
@@ -2067,11 +2383,17 @@ fn deterministic_projection(projection_identity: [u8; 32], vector: &Vector) -> f
 }
 
 fn deterministic_projection_axis(projection_identity: [u8; 32], axis: u64, vector: &Vector) -> f64 {
-    vector
-        .values()
-        .iter()
-        .enumerate()
-        .map(|(component, value)| {
+    let weights = deterministic_projection_weights(projection_identity, axis, vector.dimension());
+    project_with_weights(vector, &weights)
+}
+
+fn deterministic_projection_weights(
+    projection_identity: [u8; 32],
+    axis: u64,
+    dimension: usize,
+) -> Vec<f64> {
+    (0..dimension)
+        .map(|component| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"hyphae-ann-balanced-projection-v1");
             hasher.update(&projection_identity);
@@ -2081,15 +2403,25 @@ fn deterministic_projection_axis(projection_identity: [u8; 32], axis: u64, vecto
             let mut bytes = [0_u8; 8];
             bytes.copy_from_slice(&digest.as_bytes()[..8]);
             let bits = u64::from_le_bytes(bytes);
-            let signed = f64::from((bits >> 32) as u32) - f64::from(u32::MAX) / 2.0;
-            f64::from(*value) * signed
+            f64::from((bits >> 32) as u32) - f64::from(u32::MAX) / 2.0
         })
+        .collect()
+}
+
+fn project_with_weights(vector: &Vector, weights: &[f64]) -> f64 {
+    debug_assert_eq!(vector.dimension(), weights.len());
+    vector
+        .values()
+        .iter()
+        .zip(weights)
+        .map(|(value, weight)| f64::from(*value) * weight)
         .sum()
 }
 
-fn partition_plan_identity(
+fn partition_plan_identity_with_control(
     definition: VectorIndexDefinition,
     partitions: &[Vec<VectorRecord>],
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<[u8; 32], AnnError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hyphae-ann-partition-plan-v1");
@@ -2100,6 +2432,7 @@ fn partition_plan_identity(
             .to_le_bytes(),
     );
     for (partition, records) in partitions.iter().enumerate() {
+        check_build_control(control)?;
         hasher.update(
             &u64::try_from(partition)
                 .map_err(|_| AnnError::LengthOverflow)?
@@ -2111,6 +2444,7 @@ fn partition_plan_identity(
                 .to_le_bytes(),
         );
         for record in records {
+            check_build_control(control)?;
             hasher.update(&record.object_id.get().to_be_bytes());
             hasher.update(&record.creating_csn.get().to_le_bytes());
             for value in record.vector.values() {
@@ -2126,11 +2460,23 @@ fn partitioned_build_identity(
     input_identity: [u8; 32],
     partitions: &[HnswIndex],
 ) -> Result<[u8; 32], AnnError> {
+    partitioned_build_identity_with_control(definition, input_identity, partitions, &mut || {
+        ControlFlow::Continue(())
+    })
+}
+
+fn partitioned_build_identity_with_control(
+    definition: VectorIndexDefinition,
+    input_identity: [u8; 32],
+    partitions: &[HnswIndex],
+    control: &mut impl FnMut() -> ControlFlow<()>,
+) -> Result<[u8; 32], AnnError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hyphae-partitioned-hnsw-build-v1");
     hasher.update(&definition.canonical_bytes());
     hasher.update(&input_identity);
     for partition in partitions {
+        check_build_control(control)?;
         hasher.update(&partition.build_identity);
         hasher.update(
             &u64::try_from(partition.len())
@@ -2138,6 +2484,7 @@ fn partitioned_build_identity(
                 .to_le_bytes(),
         );
     }
+    check_build_control(control)?;
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -2148,13 +2495,69 @@ struct BuiltRecordRef<'a> {
     entry: &'a Entry,
 }
 
+trait GeometricPartitionRecord {
+    fn object_id(&self) -> ObjectId;
+
+    fn vector(&self) -> &Vector;
+}
+
+impl GeometricPartitionRecord for VectorRecord {
+    fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    fn vector(&self) -> &Vector {
+        &self.vector
+    }
+}
+
+impl GeometricPartitionRecord for BuiltRecordRef<'_> {
+    fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    fn vector(&self) -> &Vector {
+        &self.entry.vector
+    }
+}
+
+fn sort_records_by_projection<T: GeometricPartitionRecord>(
+    records: Vec<T>,
+    projection_identity: [u8; 32],
+    axis: u64,
+    control: &mut impl FnMut() -> ControlFlow<()>,
+) -> Result<Vec<T>, AnnError> {
+    let dimension = records
+        .first()
+        .map(|record| record.vector().dimension())
+        .ok_or(AnnError::CorruptGraph)?;
+    let projection_weights = deterministic_projection_weights(projection_identity, axis, dimension);
+    let mut projected = Vec::with_capacity(records.len());
+    for record in records {
+        check_build_control(control)?;
+        projected.push((
+            project_with_weights(record.vector(), &projection_weights),
+            record,
+        ));
+    }
+    projected.sort_by(|(left_projection, left), (right_projection, right)| {
+        left_projection
+            .total_cmp(right_projection)
+            .then_with(|| left.object_id().cmp(&right.object_id()))
+    });
+    check_build_control(control)?;
+    Ok(projected.into_iter().map(|(_, record)| record).collect())
+}
+
 fn split_built_record_refs<'a>(
     projection_identity: [u8; 32],
-    mut records: Vec<BuiltRecordRef<'a>>,
+    records: Vec<BuiltRecordRef<'a>>,
     target_sizes: &[usize],
     split_sequence: &mut u64,
     partitions: &mut Vec<Vec<BuiltRecordRef<'a>>>,
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<(), AnnError> {
+    check_build_control(control)?;
     if target_sizes.len() == 1 {
         if records.len() != target_sizes[0] {
             return Err(AnnError::CorruptGraph);
@@ -2166,15 +2569,7 @@ fn split_built_record_refs<'a>(
     *split_sequence = split_sequence
         .checked_add(1)
         .ok_or(AnnError::LengthOverflow)?;
-    records.sort_by(|left, right| {
-        deterministic_projection_axis(projection_identity, axis, &left.entry.vector)
-            .total_cmp(&deterministic_projection_axis(
-                projection_identity,
-                axis,
-                &right.entry.vector,
-            ))
-            .then_with(|| left.object_id.cmp(&right.object_id))
-    });
+    let mut records = sort_records_by_projection(records, projection_identity, axis, control)?;
     let left_partitions = target_sizes.len() / 2;
     let left_records = target_sizes[..left_partitions]
         .iter()
@@ -2190,6 +2585,7 @@ fn split_built_record_refs<'a>(
         &target_sizes[..left_partitions],
         split_sequence,
         partitions,
+        control,
     )?;
     split_built_record_refs(
         projection_identity,
@@ -2197,6 +2593,7 @@ fn split_built_record_refs<'a>(
         &target_sizes[left_partitions..],
         split_sequence,
         partitions,
+        control,
     )
 }
 
@@ -2204,9 +2601,12 @@ fn validate_governed_partitions(
     definition: VectorIndexDefinition,
     input_identity: [u8; 32],
     partitions: &[HnswIndex],
+    control: &mut impl FnMut() -> ControlFlow<()>,
 ) -> Result<(), AnnError> {
+    check_build_control(control)?;
     if partitions.is_empty() {
-        return if input_identity == partition_plan_identity(definition, &[])? {
+        return if input_identity == partition_plan_identity_with_control(definition, &[], control)?
+        {
             Ok(())
         } else {
             Err(AnnError::CorruptGraph)
@@ -2216,10 +2616,12 @@ fn validate_governed_partitions(
     let mut identities = BTreeSet::new();
     let mut records = Vec::new();
     for (partition, index) in partitions.iter().enumerate() {
+        check_build_control(control)?;
         if index.definition != definition || index.entries.is_empty() {
             return Err(AnnError::CorruptGraph);
         }
         for (object_id, entry) in &index.entries {
+            check_build_control(control)?;
             if !identities.insert(*object_id) {
                 return Err(AnnError::CorruptGraph);
             }
@@ -2244,6 +2646,7 @@ fn validate_governed_partitions(
         &target_sizes,
         &mut split_sequence,
         &mut expected_partitions,
+        control,
     )?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hyphae-ann-partition-plan-v1");
@@ -2254,6 +2657,7 @@ fn validate_governed_partitions(
             .to_le_bytes(),
     );
     for (partition, records) in expected_partitions.iter().enumerate() {
+        check_build_control(control)?;
         if records
             .iter()
             .any(|record| record.actual_partition != partition)
@@ -2271,6 +2675,7 @@ fn validate_governed_partitions(
                 .to_le_bytes(),
         );
         for record in records {
+            check_build_control(control)?;
             hasher.update(&record.object_id.get().to_be_bytes());
             hasher.update(&record.entry.creating_csn.get().to_le_bytes());
             for value in record.entry.vector.values() {
@@ -2281,6 +2686,7 @@ fn validate_governed_partitions(
     if input_identity != *hasher.finalize().as_bytes() {
         return Err(AnnError::CorruptGraph);
     }
+    check_build_control(control)?;
     Ok(())
 }
 
@@ -2377,7 +2783,7 @@ fn sort_and_deduplicate_candidates(candidates: &mut Vec<Candidate>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, ops::ControlFlow};
 
     use hyphae_native_types::{Csn, ObjectId};
 
@@ -2518,6 +2924,93 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_build_success_matches_the_canonical_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition(Metric::Cosine)?;
+        let records = (1..=32_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 2)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let expected = HnswIndex::build(definition, records.clone())?;
+        let mut observations = Vec::new();
+
+        let built = HnswIndex::build_cancellable(definition, records, |progress| {
+            observations.push((progress.completed(), progress.total()));
+            ControlFlow::Continue(())
+        })?;
+
+        assert_eq!(built.export_snapshot(), expected.export_snapshot());
+        assert_eq!(observations.first(), Some(&(0, 32)));
+        assert_eq!(observations.last(), Some(&(32, 32)));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellable_build_stops_at_the_requested_checkpoint_without_returning_an_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition(Metric::SquaredL2)?;
+        let records = (1..=32_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 2)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut observations = Vec::new();
+
+        let result = HnswIndex::build_cancellable(definition, records, |progress| {
+            observations.push((progress.completed(), progress.total()));
+            if progress.completed() == 7 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+
+        assert_eq!(result, Err(AnnError::BuildCancelled));
+        assert_eq!(observations.first(), Some(&(0, 32)));
+        assert_eq!(observations.last(), Some(&(7, 32)));
+        assert_eq!(observations.len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_cancellable_build_stops_during_partition_ingestion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition(Metric::SquaredL2)?;
+        let records = (1..=1_024_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 2)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut checkpoints = 0_usize;
+
+        let result = HnswIndex::build_owned_cancellable(definition, records, || {
+            checkpoints += 1;
+            if checkpoints == 7 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+
+        assert_eq!(result, Err(AnnError::BuildCancelled));
+        assert_eq!(checkpoints, 7);
+        Ok(())
+    }
+
+    #[test]
     fn canonical_build_identity_is_frozen() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             restore_fixture()?.build_identity(),
@@ -2614,6 +3107,7 @@ mod tests {
         assert_eq!(restored.export_snapshot(), snapshot);
         assert_eq!(restored_owned.export_snapshot(), snapshot);
         assert_eq!(canonical.export_snapshot(), snapshot);
+        assert_eq!(index.clone().into_snapshot(), snapshot);
         assert_eq!(
             restored.search(&query, options)?,
             index.search(&query, options)?
@@ -2826,6 +3320,28 @@ mod tests {
             HnswPartitionPlan::build(definition, Vec::<VectorRecord>::new(), 0),
             Err(AnnError::InvalidPartitionCount)
         ));
+        let cancellable_records = (1..=1_024_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 8)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut checkpoints = 0_usize;
+        assert!(matches!(
+            HnswPartitionPlan::build_cancellable(definition, cancellable_records, 8, || {
+                checkpoints += 1;
+                if checkpoints == 7 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },),
+            Err(AnnError::BuildCancelled)
+        ));
+        assert_eq!(checkpoints, 7);
         Ok(())
     }
 
@@ -2833,6 +3349,7 @@ mod tests {
         index: &PartitionedHnswIndex,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = index.export_snapshot();
+        assert_eq!(index.clone().into_snapshot(), snapshot);
         assert_eq!(
             PartitionedHnswIndex::restore_snapshot(snapshot.clone())?,
             *index
@@ -2952,6 +3469,99 @@ mod tests {
             expected += exact_ids.len();
         }
         assert!(recalled * 100 >= expected * 95);
+        Ok(())
+    }
+
+    #[test]
+    fn cancellable_governed_assembly_preserves_the_exact_canonical_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(97)?,
+            8,
+            Metric::Cosine,
+            HnswConfig::new(8, 48, 32, 64, 0xfade)?,
+        )?;
+        let records = (1..=64_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 8)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let plan = HnswPartitionPlan::build(definition, records, 4)?;
+        let input_identity = plan.input_identity();
+        let children = plan
+            .into_partitions()
+            .into_iter()
+            .map(|partition| HnswIndex::build(definition, partition))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let expected = PartitionedHnswIndex::from_governed_partitions(
+            definition,
+            input_identity,
+            children.clone(),
+        )?;
+        let observed = PartitionedHnswIndex::from_governed_partitions_cancellable(
+            definition,
+            input_identity,
+            children,
+            || ControlFlow::Continue(()),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert_eq!(observed.build_identity(), expected.build_identity());
+        assert_eq!(observed.input_identity(), expected.input_identity());
+        Ok(())
+    }
+
+    #[test]
+    fn governed_partition_assembly_cancels_during_boundary_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(97)?,
+            8,
+            Metric::Cosine,
+            HnswConfig::new(8, 48, 32, 64, 0xfade)?,
+        )?;
+        let records = (1..=64_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 8)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let plan = HnswPartitionPlan::build(definition, records, 4)?;
+        let input_identity = plan.input_identity();
+        let children = plan
+            .into_partitions()
+            .into_iter()
+            .map(|partition| HnswIndex::build(definition, partition))
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = children.iter().map(HnswIndex::len).sum::<usize>();
+        let cancel_after_collection = records + children.len() + 8;
+        let mut checkpoints = 0_usize;
+
+        let result = PartitionedHnswIndex::from_governed_partitions_cancellable(
+            definition,
+            input_identity,
+            children,
+            || {
+                checkpoints += 1;
+                if checkpoints == cancel_after_collection {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+
+        assert_eq!(result, Err(AnnError::BuildCancelled));
+        assert_eq!(checkpoints, cancel_after_collection);
+        assert!(checkpoints > records);
         Ok(())
     }
 

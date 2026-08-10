@@ -527,6 +527,8 @@ def validate_progress(
         "status",
         "checkpoint_digest",
     }
+    if "details" in payload:
+        fields.add("details")
     _require_fields(payload, fields, "performance progress")
     if payload["schema"] != profile["progress_schema"]:
         raise GateFailure("performance progress schema mismatch")
@@ -546,6 +548,12 @@ def validate_progress(
     if payload["status"] not in {"running", "completed"}:
         raise GateFailure("performance progress status is invalid")
     checkpoint = payload["checkpoint_digest"]
+    if (
+        "details" in payload
+        and payload["details"] is not None
+        and not isinstance(payload["details"], dict)
+    ):
+        raise GateFailure("performance progress details must be an object or null")
     if checkpoint is not None:
         _require_sha(checkpoint, HEX64, "progress checkpoint digest")
     if payload["status"] == "completed" and (completed != total or checkpoint is None):

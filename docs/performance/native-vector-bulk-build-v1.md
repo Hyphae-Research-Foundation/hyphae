@@ -76,9 +76,10 @@ vectors and does not retain a second full corpus copy.
 `PartitionedIndexSnapshot` now freezes the definition, recursive-plan identity,
 aggregate build identity, and canonical child snapshots. Restore validates each
 child graph, reconstructs every recursive boundary without cloning vector
-payloads, and rejects reordered children or either identity mismatch. This is
-the persistence-facing logical format; it is not yet wired to page/WAL
-publication.
+payloads, and rejects reordered children or either identity mismatch. The
+separate initial-publication surface consumes this owned snapshot and persists
+it through the ordinary page/WAL/root protocol; the experimental build method
+itself remains process-local.
 
 ## Query semantics
 
@@ -96,11 +97,13 @@ fanout silently.
 
 ## Durability boundary
 
-The candidate is process-local. The build API does not append pages or WAL,
-does not move the current ANN root, and does not publish a generation. Durable
-checkpoints, online deltas, interruption/restart, cross-partition navigation,
-atomic generation publication, consolidation, and reopen belong to the next
-P4 slices.
+The experimental candidate is process-local. The build API does not append
+pages or WAL, move the current ANN root, or publish a generation. The separate
+durable publication surface is specified in
+[`native-ann-initial-bulk-publication-v1.md`](native-ann-initial-bulk-publication-v1.md).
+Its existence does not promote this experimental surface to closure evidence.
+Cross-partition navigation and final algorithm selection remain later P4
+slices.
 
 ## Qualification still required
 

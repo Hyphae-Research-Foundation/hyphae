@@ -127,6 +127,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
 - [Native structure execution v1](performance/native-structure-execution-v1.md)
 - [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)
+- [Native ANN initial bulk publication v1](performance/native-ann-initial-bulk-publication-v1.md)
 - [Native SQL vector execution v1](performance/native-sql-vector-execution-v1.md)
 - [Result proof format v1](provenance/result-proof-v1.md)
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)

@@ -18,7 +18,7 @@ def matrix() -> dict:
                 value["concurrency"] = concurrency
                 receipts.append(value)
     return {
-        "schema": "hyphae-native-g7-matrix-v2",
+        "schema": "hyphae-native-g7-matrix-v3",
         "gate": "G7",
         "status": "closure-candidate",
         "source_commit": "a" * 40,
@@ -57,6 +57,12 @@ class G7MatrixTests(unittest.TestCase):
         payload = matrix()
         payload["receipts"][0]["build"]["binary_sha256"] = "d" * 64
         with self.assertRaises(GateFailure):
+            validate_matrix(payload, "a" * 40)
+
+    def test_mixed_initial_ann_generation_fails(self) -> None:
+        payload = matrix()
+        payload["receipts"][0]["initial_ann_bulk"]["aggregate_identity"] = "e" * 64
+        with self.assertRaisesRegex(GateFailure, "ANN generation"):
             validate_matrix(payload, "a" * 40)
 
 

@@ -9,7 +9,7 @@ use std::{
     hint::black_box,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Barrier, OnceLock},
+    sync::{Arc, Barrier, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,8 +23,11 @@ use hyphae_native_product::{
     ProductPrincipal, ProductRequestContext, ProductSession, ProductSessionId,
 };
 use hyphae_native_runtime::{
-    AnnSearchOptions, HnswConfig, NativeCommitScheduler, NativeDatabase, NativeSnapshot, Vector,
-    VectorMetric,
+    AnnSearchOptions, HardwareProfile, HnswConfig, InitialAnnBulkBuildEvidence,
+    InitialAnnBulkBuilder, InitialAnnBulkProgress, InitialAnnBulkProgressStage,
+    MAX_INITIAL_ANN_BULK_PARTITIONS, NativeCommitScheduler, NativeDatabase, NativeExecutionPool,
+    NativeExecutionTopology, NativeGovernorPolicy, NativeResourceGovernor, NativeSnapshot, Vector,
+    VectorMetric, WorkloadClass,
 };
 use hyphae_native_types::ObjectId;
 use serde_json::json;
@@ -33,7 +36,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
 
-const VERSION: &str = "hyphae-native-g7-receipt-v2";
+const VERSION: &str = "hyphae-native-g7-receipt-v3";
 const DEFAULT_OBSERVATIONS: usize = 1_000_000;
 const DEFAULT_WARMUP: usize = 100_000;
 const STRUCTURE_KEYS: usize = 2_048;
@@ -46,8 +49,7 @@ const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
 const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
 const CORPUS_GENERATOR: &str =
-    "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
-const ANN_PROGRESS_INTERVAL: usize = 4_096;
+    "hyphae-native-g7-corpus-v3:durable-partitioned-hnsw-v1-id-linear-vector-and-rare-term";
 
 #[derive(Clone, Copy, Debug)]
 struct Stats {
@@ -67,6 +69,14 @@ struct SearchFixture {
     query: Vector,
     options: AnnSearchOptions,
     recall_at_10: f64,
+    initial_ann_bulk: serde_json::Value,
+}
+
+struct ExecutionAuthority {
+    profile: HardwareProfile,
+    policy: NativeGovernorPolicy,
+    topology: NativeExecutionTopology,
+    topology_digest: String,
 }
 
 struct AnnProgressSink {
@@ -76,6 +86,17 @@ struct AnnProgressSink {
     dataset_digest: String,
     started: Instant,
     sequence: u64,
+    total_vectors: usize,
+    completed_vectors: usize,
+}
+
+struct AnnProgressUpdate<'a> {
+    operation: &'a str,
+    stage: &'a str,
+    completed: usize,
+    status: &'a str,
+    checkpoint_digest: Option<String>,
+    details: Option<serde_json::Value>,
 }
 
 impl AnnProgressSink {
@@ -92,69 +113,130 @@ impl AnnProgressSink {
             dataset_digest: dataset_digest(source_commit).to_hex().to_string(),
             started: Instant::now(),
             sequence: 0,
+            total_vectors: search_documents(),
+            completed_vectors: 0,
         }))
     }
 
-    fn observe(
-        &mut self,
-        progress: hyphae_native_runtime::HnswBuildProgress,
-    ) -> std::io::Result<()> {
-        let completed = progress.completed();
-        if completed != 0
-            && completed != progress.total()
-            && !completed.is_multiple_of(ANN_PROGRESS_INTERVAL)
-        {
-            return Ok(());
-        }
-        self.write(
-            "ann-private-build",
+    fn begin_build(&mut self, authority: &ExecutionAuthority) -> std::io::Result<()> {
+        self.write(AnnProgressUpdate {
+            operation: "ann-bulk-build",
+            stage: "ann-private-build",
+            completed: 0,
+            status: "running",
+            checkpoint_digest: None,
+            details: Some(json!({
+                "builder": "partitioned-hnsw-v1",
+                "requested_partitions": authority.topology.worker_count(),
+                "topology_workers": authority.topology.worker_count(),
+                "topology_digest": authority.topology_digest,
+                "planned_workers": null,
+                "planned_memory_bytes": null,
+                "worker_batches": null,
+            })),
+        })
+    }
+
+    fn begin_publication(&mut self, evidence: &serde_json::Value) -> std::io::Result<()> {
+        self.write(AnnProgressUpdate {
+            operation: "ann-bulk-build",
+            stage: "ann-publication",
+            completed: self.total_vectors,
+            status: "running",
+            checkpoint_digest: None,
+            details: Some(evidence.clone()),
+        })
+    }
+
+    fn update_build(&mut self, progress: InitialAnnBulkProgress) -> std::io::Result<()> {
+        let stage = match progress.stage {
+            InitialAnnBulkProgressStage::Planning => "ann-planning",
+            InitialAnnBulkProgressStage::Building => "ann-child-build",
+        };
+        let completed = if progress.stage == InitialAnnBulkProgressStage::Planning {
+            0
+        } else {
+            self.total_vectors
+                .checked_mul(progress.completed)
+                .ok_or_else(|| std::io::Error::other("G7 ANN progress multiplication overflow"))?
+                .checked_div(progress.total)
+                .ok_or_else(|| std::io::Error::other("G7 ANN progress total must be nonzero"))?
+        };
+        self.write(AnnProgressUpdate {
+            operation: "ann-bulk-build",
+            stage,
             completed,
-            progress.total(),
-            "running",
-            None,
-        )
+            status: "running",
+            checkpoint_digest: None,
+            details: Some(json!({
+                "builder": "partitioned-hnsw-v1",
+                "unit": if progress.stage == InitialAnnBulkProgressStage::Planning {
+                    "plan"
+                } else {
+                    "child-generation"
+                },
+                "stage_completed": progress.completed,
+                "stage_total": progress.total,
+            })),
+        })
     }
 
-    fn begin_publication(&mut self, total: usize) -> std::io::Result<()> {
-        self.write("ann-publication", total, total, "running", None)
-    }
-
-    fn complete(&mut self, total: usize, checkpoint: [u8; 32]) -> std::io::Result<()> {
-        self.write(
-            "ann-published",
-            total,
-            total,
-            "completed",
-            Some(blake3::Hash::from_bytes(checkpoint).to_hex().to_string()),
-        )
-    }
-
-    fn write(
+    fn complete(
         &mut self,
-        stage: &str,
-        completed: usize,
-        total: usize,
-        status: &str,
-        checkpoint_digest: Option<String>,
+        operation: &str,
+        checkpoint: [u8; 32],
+        evidence: &serde_json::Value,
     ) -> std::io::Result<()> {
+        self.write(AnnProgressUpdate {
+            operation,
+            stage: "ann-published",
+            completed: self.total_vectors,
+            status: "completed",
+            checkpoint_digest: Some(blake3::Hash::from_bytes(checkpoint).to_hex().to_string()),
+            details: Some(evidence.clone()),
+        })
+    }
+
+    fn write(&mut self, update: AnnProgressUpdate<'_>) -> std::io::Result<()> {
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("G7 progress sequence overflow"))?;
+        if update.completed > self.total_vectors {
+            return Err(std::io::Error::other(
+                "G7 ANN progress completed vectors exceed dataset total",
+            ));
+        }
+        self.completed_vectors = self.completed_vectors.max(update.completed);
+        let mut details = update.details.unwrap_or_else(|| json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert(
+                "eta".to_owned(),
+                progress_eta(
+                    self.started.elapsed(),
+                    self.completed_vectors,
+                    self.total_vectors,
+                    update.status == "completed",
+                )?,
+            );
+        }
+        let elapsed_nanos = u64::try_from(self.started.elapsed().as_nanos())
+            .map_err(|_| std::io::Error::other("G7 ANN progress elapsed time exceeds u64"))?;
         let record = json!({
             "schema": "hyphae-native-performance-progress-v1",
             "source_commit": self.source_commit,
             "source_tree": self.source_tree,
             "dataset_digest": self.dataset_digest,
-            "operation": "ann-bulk-build",
-            "stage": stage,
+            "operation": update.operation,
+            "stage": update.stage,
             "sequence": self.sequence,
-            "completed_units": completed,
-            "total_units": total,
+            "completed_units": self.completed_vectors,
+            "total_units": self.total_vectors,
             "unit": "vectors",
-            "elapsed_nanos": u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            "status": status,
-            "checkpoint_digest": checkpoint_digest,
+            "elapsed_nanos": elapsed_nanos,
+            "status": update.status,
+            "checkpoint_digest": update.checkpoint_digest,
+            "details": details,
         });
         let parent = self
             .path
@@ -176,23 +258,102 @@ impl AnnProgressSink {
     }
 }
 
+impl ExecutionAuthority {
+    fn from_environment(data_path: &Path) -> Result<Self, Box<dyn Error>> {
+        let expected_profile = read_required_json("HYPHAE_G7_HARDWARE_PROFILE_FILE")?;
+        let policy: NativeGovernorPolicy =
+            serde_json::from_value(read_required_json("HYPHAE_G7_GOVERNOR_POLICY_FILE")?)
+                .map_err(|error| format!("invalid G7 governor policy: {error}"))?;
+        let expected_topology = read_required_json("HYPHAE_G7_EXECUTION_TOPOLOGY_FILE")?;
+        let profile = HardwareProfile::discover(data_path)
+            .map_err(|error| format!("G7 hardware discovery failed: {error}"))?;
+        let expected_fingerprint = required_json_string(&expected_profile, "fingerprint")?;
+        if expected_fingerprint != profile.fingerprint {
+            return Err("live G7 hardware differs from the supplied hardware profile".into());
+        }
+        if policy.hardware_fingerprint != profile.fingerprint {
+            return Err("G7 governor policy targets another hardware profile".into());
+        }
+        let topology = NativeExecutionTopology::derive(&profile, &policy)
+            .map_err(|error| format!("G7 execution topology derivation failed: {error}"))?;
+        let actual_topology = serde_json::to_value(&topology)?;
+        if actual_topology != expected_topology {
+            return Err("live G7 execution topology differs from the supplied topology".into());
+        }
+        if topology.worker_count() == 0 {
+            return Err("G7 execution topology has no workers".into());
+        }
+        if topology.worker_count() > MAX_INITIAL_ANN_BULK_PARTITIONS {
+            return Err(format!(
+                "G7 execution topology has {} workers but durable ANN supports at most {} partitions",
+                topology.worker_count(),
+                MAX_INITIAL_ANN_BULK_PARTITIONS,
+            )
+            .into());
+        }
+        let topology_digest = blake3::hash(&serde_json::to_vec(&actual_topology)?)
+            .to_hex()
+            .to_string();
+        Ok(Self {
+            profile,
+            policy,
+            topology,
+            topology_digest,
+        })
+    }
+
+    fn install(&self, database: &mut NativeDatabase) -> Result<(), Box<dyn Error>> {
+        let governor = Arc::new(NativeResourceGovernor::new(self.policy.clone()));
+        let execution_pool = Arc::new(
+            NativeExecutionPool::new(&self.profile, &self.policy)
+                .map_err(|error| format!("G7 execution pool creation failed: {error}"))?,
+        );
+        database
+            .set_resource_governor_with_execution_pool(
+                Arc::clone(&governor),
+                Arc::clone(&execution_pool),
+                Duration::ZERO,
+            )
+            .map_err(|error| format!("G7 execution authority install failed: {error}"))?;
+        if database.resource_governor().is_none() || database.execution_pool().is_none() {
+            return Err("G7 database did not retain its execution authority".into());
+        }
+        Ok(())
+    }
+}
+
 impl SearchFixture {
     fn open_or_create(root: &Path, source_commit: &str) -> Result<Self, Box<dyn Error>> {
         let path = search_seed_path(root, source_commit)?;
+        let authority = ExecutionAuthority::from_environment(&path)?;
+        let created = !path.is_dir();
         if !path.is_dir() {
-            publish_search_seed(&path, source_commit)?;
+            publish_search_seed(&path, source_commit, &authority)?;
         }
         let database =
             NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
         let lexical_index = ObjectId::new(7)?;
         let vector_index = ObjectId::new(8)?;
-        Self::from_database(database, lexical_index, vector_index)
+        let initial_ann_bulk = load_initial_ann_bulk_evidence(&path, source_commit, &authority)?;
+        let observed = database.observe_ann_index(vector_index)?;
+        let aggregate_identity = required_json_string(&initial_ann_bulk, "aggregate_identity")?;
+        let observed_identity = blake3::Hash::from_bytes(observed.base_identity)
+            .to_hex()
+            .to_string();
+        if aggregate_identity != observed_identity {
+            return Err("published G7 ANN base differs from its durable build evidence".into());
+        }
+        if !created && let Some(sink) = AnnProgressSink::from_environment(source_commit)?.as_mut() {
+            sink.complete("ann-seed-verify", observed.base_identity, &initial_ann_bulk)?;
+        }
+        Self::from_database(database, lexical_index, vector_index, initial_ann_bulk)
     }
 
     fn from_database(
         database: NativeDatabase,
         lexical_index: ObjectId,
         vector_index: ObjectId,
+        initial_ann_bulk: serde_json::Value,
     ) -> Result<Self, Box<dyn Error>> {
         let snapshot = database.snapshot(0)?;
         let query = Vector::new({
@@ -223,11 +384,16 @@ impl SearchFixture {
             query,
             options,
             recall_at_10: recalled as f64 / K as f64,
+            initial_ann_bulk,
         })
     }
 }
 
-fn publish_search_seed(path: &Path, source_commit: &str) -> Result<(), Box<dyn Error>> {
+fn publish_search_seed(
+    path: &Path,
+    source_commit: &str,
+    authority: &ExecutionAuthority,
+) -> Result<(), Box<dyn Error>> {
     let parent = path.parent().ok_or("search seed path has no parent")?;
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(
@@ -235,18 +401,24 @@ fn publish_search_seed(path: &Path, source_commit: &str) -> Result<(), Box<dyn E
         std::process::id(),
         unique_nonce()
     ));
-    seed_search_database(&staging, source_commit)?;
+    let evidence = seed_search_database(&staging, source_commit, authority)?;
     fs::rename(&staging, path)?;
-    Ok(())
+    write_json_atomic(&initial_ann_bulk_evidence_path(path), &evidence)
 }
 
-fn seed_search_database(path: &Path, source_commit: &str) -> Result<(), Box<dyn Error>> {
+fn seed_search_database(
+    path: &Path,
+    source_commit: &str,
+    authority: &ExecutionAuthority,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut database =
         NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
+    authority.install(&mut database)?;
     let lexical_index = ObjectId::new(7)?;
     let vector_index = ObjectId::new(8)?;
     let document_count = search_documents();
-    let mut progress = AnnProgressSink::from_environment(source_commit)?;
+    let progress =
+        AnnProgressSink::from_environment(source_commit)?.map(|sink| Arc::new(Mutex::new(sink)));
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.create_search_index(lexical_index, "g7_search")?;
     seed.create_vector_index_with_lifecycle(
@@ -257,35 +429,66 @@ fn seed_search_database(path: &Path, source_commit: &str) -> Result<(), Box<dyn 
         HnswConfig::new(8, 32, 16, 512, 7)?,
         ann_lifecycle(),
     )?;
-    let mut progress_error = None;
-    seed.upsert_vectors_with_progress(
+    seed.commit()?;
+    if let Some(sink) = &progress {
+        sink.lock()
+            .map_err(|_| "G7 ANN progress sink synchronization failed")?
+            .begin_build(authority)?;
+    }
+    let vectors = (0..document_count)
+        .map(|id| vector_fixture(id, document_count))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let progress_failure = Arc::new(Mutex::new(None::<String>));
+    let callback_sink = progress.clone();
+    let callback_failure = Arc::clone(&progress_failure);
+    let plan = database.plan_initial_ann_bulk_with_progress(
         vector_index,
-        (0..document_count)
-            .map(|id| vector_fixture(id, document_count))
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
-        |value| {
-            if progress_error.is_some() {
+        vectors,
+        authority.topology.worker_count(),
+        move |update| {
+            let Some(sink) = &callback_sink else {
                 return;
-            }
-            if let Some(sink) = progress.as_mut()
-                && let Err(error) = sink.observe(value)
+            };
+            let outcome = sink
+                .lock()
+                .map_err(|_| "G7 ANN progress sink synchronization failed".to_owned())
+                .and_then(|mut sink| sink.update_build(update).map_err(|error| error.to_string()));
+            if let Err(error) = outcome
+                && let Ok(mut failure) = callback_failure.lock()
+                && failure.is_none()
             {
-                progress_error = Some(error);
+                *failure = Some(error);
             }
         },
     )?;
-    if let Some(error) = progress_error {
+    if let Some(error) = progress_failure
+        .lock()
+        .map_err(|_| "G7 ANN progress failure synchronization failed")?
+        .take()
+    {
         return Err(error.into());
     }
-    if let Some(sink) = progress.as_mut() {
-        sink.begin_publication(document_count)?;
+    let build = plan.build_evidence();
+    validate_initial_ann_bulk_build(build, authority)?;
+    let evidence = initial_ann_bulk_evidence(source_commit, build, authority)?;
+    if let Some(sink) = &progress {
+        sink.lock()
+            .map_err(|_| "G7 ANN progress sink synchronization failed")?
+            .begin_publication(&evidence)?;
     }
-    seed.commit()?;
-    if let Some(sink) = progress.as_mut() {
-        sink.complete(
-            document_count,
-            database.observe_ann_index(vector_index)?.base_identity,
-        )?;
+    let published =
+        database.publish_initial_ann_bulk(plan, hyphae_native_types::DurabilityClass::Memory)?;
+    if published.build != build {
+        return Err("published G7 ANN build evidence changed after planning".into());
+    }
+    let observed = database.observe_ann_index(vector_index)?;
+    if observed.base_identity != build.build_identity {
+        return Err("published G7 ANN generation differs from its planned aggregate".into());
+    }
+    if let Some(sink) = &progress {
+        sink.lock()
+            .map_err(|_| "G7 ANN progress sink synchronization failed")?
+            .complete("ann-bulk-build", observed.base_identity, &evidence)?;
     }
     // Lexical documents and scalar filters use the physical all-engine delta
     // path. Each batch resolves only the touched identities and preserves the
@@ -322,6 +525,204 @@ fn seed_search_database(path: &Path, source_commit: &str) -> Result<(), Box<dyn 
     }
     database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
     drop(database);
+    Ok(evidence)
+}
+
+fn validate_initial_ann_bulk_build(
+    build: InitialAnnBulkBuildEvidence,
+    authority: &ExecutionAuthority,
+) -> Result<(), Box<dyn Error>> {
+    if build.builder != InitialAnnBulkBuilder::PartitionedHnswV1 {
+        return Err("G7 initial ANN bulk selected an unexpected builder".into());
+    }
+    if build.planned_vectors != search_documents()
+        || build.planned_partitions != authority.topology.worker_count()
+        || build.planned_compute_threads == 0
+        || build.planned_compute_threads as usize > authority.topology.worker_count()
+        || build.planned_memory_bytes == 0
+        || build.worker_batches == 0
+    {
+        return Err("G7 initial ANN bulk returned incomplete resource evidence".into());
+    }
+    if authority.topology.worker_count() > 1 && build.planned_compute_threads <= 1 {
+        return Err("G7 initial ANN bulk ignored a multi-worker execution topology".into());
+    }
+    if build.planned_compute_threads > 1 && build.worker_batches <= 1 {
+        return Err("G7 initial ANN bulk did not execute multiple worker batches".into());
+    }
+    let execution = build
+        .execution
+        .ok_or("G7 initial ANN bulk did not use the resource governor")?;
+    if execution.class != WorkloadClass::Bulk
+        || execution.request.compute_threads != build.planned_compute_threads
+        || execution.request.memory_bytes != build.planned_memory_bytes
+    {
+        return Err("G7 initial ANN bulk governor evidence differs from its plan".into());
+    }
+    Ok(())
+}
+
+fn progress_eta(
+    elapsed: Duration,
+    completed: usize,
+    total: usize,
+    finished: bool,
+) -> std::io::Result<serde_json::Value> {
+    if finished || completed >= total {
+        return Ok(json!({
+            "status": "completed",
+            "estimated_remaining_nanos": 0,
+        }));
+    }
+    if completed == 0 {
+        return Ok(json!({
+            "status": "pending",
+            "estimated_remaining_nanos": null,
+        }));
+    }
+    let remaining_units = total
+        .checked_sub(completed)
+        .ok_or_else(|| std::io::Error::other("G7 ANN progress exceeds total"))?
+        as u128;
+    let remaining_nanos = elapsed
+        .as_nanos()
+        .checked_mul(remaining_units)
+        .ok_or_else(|| std::io::Error::other("G7 ANN progress ETA multiplication overflow"))?
+        .checked_div(completed as u128)
+        .ok_or_else(|| std::io::Error::other("G7 ANN progress ETA divisor must be nonzero"))?;
+    let remaining_nanos = u64::try_from(remaining_nanos)
+        .map_err(|_| std::io::Error::other("G7 ANN progress ETA exceeds u64"))?;
+    Ok(json!({
+        "status": "estimated",
+        "estimated_remaining_nanos": remaining_nanos,
+    }))
+}
+
+fn initial_ann_bulk_evidence(
+    source_commit: &str,
+    build: InitialAnnBulkBuildEvidence,
+    authority: &ExecutionAuthority,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let execution = build
+        .execution
+        .ok_or("G7 initial ANN bulk did not produce governor execution evidence")?;
+    Ok(json!({
+        "schema": "hyphae-native-g7-initial-ann-bulk-v1",
+        "source_commit": source_commit,
+        "dataset_digest": dataset_digest(source_commit).to_hex().to_string(),
+        "builder": "partitioned-hnsw-v1",
+        "input_identity": blake3::Hash::from_bytes(build.input_identity).to_hex().to_string(),
+        "aggregate_identity": blake3::Hash::from_bytes(build.build_identity).to_hex().to_string(),
+        "planned_vectors": build.planned_vectors,
+        "planned_partitions": build.planned_partitions,
+        "planned_workers": build.planned_compute_threads,
+        "planned_memory_bytes": build.planned_memory_bytes,
+        "worker_batches": build.worker_batches,
+        "total_time_nanos": u64::try_from(build.total_time.as_nanos()).unwrap_or(u64::MAX),
+        "hardware_profile_fingerprint": authority.profile.fingerprint,
+        "governor_policy_schema": authority.policy.schema,
+        "governor_mode": serde_json::to_value(authority.policy.mode)?,
+        "calibration_cache_key": authority.policy.calibration_cache_key,
+        "topology_digest": authority.topology_digest,
+        "topology_workers": authority.topology.worker_count(),
+        "hard_affinity": authority.topology.hard_affinity,
+        "governor_execution": {
+            "class": "bulk",
+            "compute_threads": execution.request.compute_threads,
+            "io_slots": execution.request.io_slots,
+            "memory_bytes": execution.request.memory_bytes,
+            "queue_ticket": execution.queue_ticket,
+            "initial_queue_depth": execution.initial_queue_depth,
+            "queue_time_nanos": u64::try_from(execution.queue_time.as_nanos()).unwrap_or(u64::MAX),
+            "execution_time_nanos": u64::try_from(execution.execution_time.as_nanos()).unwrap_or(u64::MAX),
+        },
+    }))
+}
+
+fn initial_ann_bulk_evidence_path(seed_path: &Path) -> PathBuf {
+    let name = seed_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("search-seed");
+    seed_path.with_file_name(format!("{name}.initial-ann-bulk.json"))
+}
+
+fn load_initial_ann_bulk_evidence(
+    seed_path: &Path,
+    source_commit: &str,
+    authority: &ExecutionAuthority,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let path = initial_ann_bulk_evidence_path(seed_path);
+    let evidence: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    if required_json_string(&evidence, "schema")? != "hyphae-native-g7-initial-ann-bulk-v1"
+        || required_json_string(&evidence, "source_commit")? != source_commit
+        || required_json_string(&evidence, "dataset_digest")?
+            != dataset_digest(source_commit).to_hex().as_str()
+        || required_json_string(&evidence, "builder")? != "partitioned-hnsw-v1"
+        || required_json_string(&evidence, "hardware_profile_fingerprint")?
+            != authority.profile.fingerprint
+        || required_json_string(&evidence, "topology_digest")? != authority.topology_digest
+        || required_json_u64(&evidence, "topology_workers")?
+            != authority.topology.worker_count() as u64
+        || required_json_u64(&evidence, "planned_vectors")? != search_documents() as u64
+    {
+        return Err("G7 initial ANN bulk evidence is not bound to this run".into());
+    }
+    let workers = required_json_u64(&evidence, "planned_workers")?;
+    let worker_batches = required_json_u64(&evidence, "worker_batches")?;
+    if workers == 0
+        || required_json_u64(&evidence, "planned_memory_bytes")? == 0
+        || worker_batches == 0
+        || (workers > 1 && worker_batches <= 1)
+    {
+        return Err("G7 initial ANN bulk evidence does not prove governed parallel work".into());
+    }
+    Ok(evidence)
+}
+
+fn read_required_json(environment_name: &str) -> Result<serde_json::Value, Box<dyn Error>> {
+    let path = PathBuf::from(
+        std::env::var_os(environment_name)
+            .ok_or_else(|| format!("missing required G7 contract: {environment_name}"))?,
+    );
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("G7 contract is not a regular file: {}", path.display()).into());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn required_json_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, Box<dyn Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("G7 evidence is missing string field {field}").into())
+}
+
+fn required_json_u64(value: &serde_json::Value, field: &str) -> Result<u64, Box<dyn Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("G7 evidence is missing integer field {field}").into())
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let parent = path.parent().ok_or("G7 evidence path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("initial-ann-bulk"),
+        std::process::id(),
+        unique_nonce(),
+    ));
+    fs::write(&staging, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(staging, path)?;
     Ok(())
 }
 
@@ -438,6 +839,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "ann_recall_floor": 0.95,
             "cross_engine_visibility": "native-same-snapshot-search",
         },
+        "initial_ann_bulk": search.initial_ann_bulk.clone(),
         "cells": {},
         "counters": counters_process(&root)?,
         "saturation": {"status": "measured", "levels": [1, 8, 32], "method": "requested-concurrency"},

@@ -14,6 +14,7 @@ from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+MAX_INITIAL_ANN_BULK_PARTITIONS = 221
 CELLS = {
     "embedded-structure-point-get",
     "embedded-prepared-sql-primary-key",
@@ -62,11 +63,12 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         "state", "concurrency", "background_mode", "dataset", "hardware", "cells", "counters", "saturation",
         "background_interference", "claims", "closure_declared", "physical_observation",
         "build", "workload", "durability", "proofs_included", "correctness",
+        "initial_ann_bulk",
     }
     if set(payload) != required:
         raise GateFailure("G7 receipt fields mismatch")
     if (
-        payload["schema"] != "hyphae-native-g7-receipt-v2"
+        payload["schema"] != "hyphae-native-g7-receipt-v3"
         or payload["gate"] != "G7"
         or payload["status"] != "passed"
         or payload["evidence_class"] != "closure-candidate"
@@ -140,6 +142,7 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         "cross_engine_visibility": "native-same-snapshot-search",
     }:
         raise GateFailure("G7 correctness evidence differs")
+    validate_initial_ann_bulk(payload["initial_ann_bulk"], payload)
     hardware = payload["hardware"]
     hardware_fields = {"dedicated", "cpu", "topology", "ram_bytes", "storage", "filesystem", "governor", "affinity", "priority", "background_services", "virtualization"}
     if not isinstance(hardware, dict) or set(hardware) != hardware_fields or hardware.get("dedicated") is not True or hardware.get("virtualization") != "none":
@@ -240,6 +243,104 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         "claims": [],
         "closure_declared": False,
     }
+
+
+def validate_initial_ann_bulk(evidence: Any, receipt: dict[str, Any]) -> None:
+    fields = {
+        "schema", "source_commit", "dataset_digest", "builder", "input_identity",
+        "aggregate_identity", "planned_vectors", "planned_partitions", "planned_workers",
+        "planned_memory_bytes", "worker_batches", "total_time_nanos",
+        "hardware_profile_fingerprint", "governor_policy_schema", "governor_mode",
+        "calibration_cache_key", "topology_digest", "topology_workers", "hard_affinity",
+        "governor_execution",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        raise GateFailure("G7 initial ANN bulk evidence fields mismatch")
+    if (
+        evidence["schema"] != "hyphae-native-g7-initial-ann-bulk-v1"
+        or evidence["source_commit"] != receipt["source_commit"]
+        or evidence["dataset_digest"] != receipt["dataset"]["digest"]
+        or evidence["builder"] != "partitioned-hnsw-v1"
+        or evidence["governor_mode"] not in {"bulk", "mixed"}
+        or not isinstance(evidence["governor_policy_schema"], str)
+        or not evidence["governor_policy_schema"]
+        or not isinstance(evidence["calibration_cache_key"], str)
+        or not evidence["calibration_cache_key"]
+    ):
+        raise GateFailure("G7 initial ANN bulk evidence identity mismatch")
+    for name in (
+        "input_identity", "aggregate_identity", "hardware_profile_fingerprint",
+        "topology_digest",
+    ):
+        if not isinstance(evidence[name], str) or HEX64.fullmatch(evidence[name]) is None:
+            raise GateFailure(f"G7 initial ANN bulk digest is invalid: {name}")
+    for name in (
+        "planned_vectors", "planned_partitions", "planned_workers",
+        "planned_memory_bytes", "worker_batches", "topology_workers",
+    ):
+        value = evidence[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise GateFailure(f"G7 initial ANN bulk resource is invalid: {name}")
+    if (
+        evidence["planned_vectors"] != receipt["dataset"]["vector_count"]
+        or evidence["planned_partitions"] > evidence["planned_vectors"]
+        or evidence["planned_partitions"] > MAX_INITIAL_ANN_BULK_PARTITIONS
+        or evidence["topology_workers"] > MAX_INITIAL_ANN_BULK_PARTITIONS
+        or evidence["planned_workers"] > evidence["topology_workers"]
+        or (
+            evidence["topology_workers"] > 1
+            and evidence["planned_workers"] <= 1
+        )
+        or (
+            evidence["planned_workers"] > 1
+            and evidence["worker_batches"] <= 1
+        )
+        or not isinstance(evidence["total_time_nanos"], int)
+        or isinstance(evidence["total_time_nanos"], bool)
+        or evidence["total_time_nanos"] <= 0
+        or not isinstance(evidence["hard_affinity"], bool)
+        or (receipt["platform"] == "linux" and evidence["hard_affinity"] is not True)
+    ):
+        raise GateFailure("G7 initial ANN bulk did not prove governed parallel construction")
+    execution = evidence["governor_execution"]
+    execution_fields = {
+        "class", "compute_threads", "io_slots", "memory_bytes", "queue_ticket",
+        "initial_queue_depth", "queue_time_nanos", "execution_time_nanos",
+    }
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != execution_fields
+        or execution["class"] != "bulk"
+        or not isinstance(execution["compute_threads"], int)
+        or isinstance(execution["compute_threads"], bool)
+        or execution["compute_threads"] <= 0
+        or execution["compute_threads"] != evidence["planned_workers"]
+        or not isinstance(execution["memory_bytes"], int)
+        or isinstance(execution["memory_bytes"], bool)
+        or execution["memory_bytes"] <= 0
+        or execution["memory_bytes"] != evidence["planned_memory_bytes"]
+        or not isinstance(execution["io_slots"], int)
+        or isinstance(execution["io_slots"], bool)
+        or execution["io_slots"] != 0
+        or not isinstance(execution["initial_queue_depth"], int)
+        or isinstance(execution["initial_queue_depth"], bool)
+        or execution["initial_queue_depth"] < 0
+        or not isinstance(execution["queue_time_nanos"], int)
+        or isinstance(execution["queue_time_nanos"], bool)
+        or execution["queue_time_nanos"] < 0
+        or not isinstance(execution["execution_time_nanos"], int)
+        or isinstance(execution["execution_time_nanos"], bool)
+        or execution["execution_time_nanos"] <= 0
+        or (
+            execution["queue_ticket"] is not None
+            and (
+                not isinstance(execution["queue_ticket"], int)
+                or isinstance(execution["queue_ticket"], bool)
+                or execution["queue_ticket"] < 0
+            )
+        )
+    ):
+        raise GateFailure("G7 initial ANN bulk governor execution evidence mismatch")
 
 
 def main() -> int:

@@ -27,7 +27,7 @@ def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, 
     }:
         raise GateFailure("G7 matrix fields mismatch")
     if (
-        payload["schema"] != "hyphae-native-g7-matrix-v2"
+        payload["schema"] != "hyphae-native-g7-matrix-v3"
         or payload["gate"] != "G7"
         or payload["status"] != "closure-candidate"
         or payload["source_commit"] != expected_commit
@@ -46,6 +46,7 @@ def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, 
         raise GateFailure("G7 matrix must contain six warm concurrency/background receipts")
     seen: set[tuple[str, int, str]] = set()
     build_identities: set[str] = set()
+    initial_ann_bulk_identities: set[str] = set()
     dataset_digests: set[str] = set()
     for receipt in receipts:
         audit = validate(receipt, expected_commit)
@@ -58,9 +59,18 @@ def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, 
         if set(receipt["counters"]) != COUNTERS:
             raise GateFailure("G7 matrix receipt is missing a required counter")
         build_identities.add(json.dumps(receipt["build"], sort_keys=True))
+        initial_ann_bulk_identities.add(
+            json.dumps(receipt["initial_ann_bulk"], sort_keys=True)
+        )
         dataset_digests.add(receipt["dataset"]["digest"])
-    if len(build_identities) != 1 or len(dataset_digests) != 1:
-        raise GateFailure("G7 matrix receipts do not share one build and dataset")
+    if (
+        len(build_identities) != 1
+        or len(initial_ann_bulk_identities) != 1
+        or len(dataset_digests) != 1
+    ):
+        raise GateFailure(
+            "G7 matrix receipts do not share one build, ANN generation, and dataset"
+        )
     if seen != {
         (state, concurrency, background)
         for state in STATES

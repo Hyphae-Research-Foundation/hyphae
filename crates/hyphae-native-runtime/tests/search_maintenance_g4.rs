@@ -202,8 +202,8 @@ fn structured_corruption_matrix_has_zero_silent_acceptance_or_partial_writes()
             persisted_magic: b"HYPOST01",
         },
         CorruptionCase {
-            name: "ANN metadata",
-            persisted_magic: b"HYANNM01",
+            name: "ANN metadata V4",
+            persisted_magic: b"HYANNM04",
         },
         CorruptionCase {
             name: "ANN vector",

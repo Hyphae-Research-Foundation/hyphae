@@ -15,9 +15,9 @@ measurement contract.
 | P0 evidence | Versioned receipt, progress, and suite contracts; external required-cell authority; embedded structure baseline; ANN kernel-to-publication progress | implemented, no G7 claim |
 | P1 discovery | Read-only embedded API and `hyphae hardware discover`; Linux per-processor core/socket/NUMA/SMT placement plus macOS and Windows fingerprint adapters | in progress |
 | P1 calibration | Versioned CPU/memory/engine/storage/WAL receipt, Native B+tree, posting, filesystem sync, block-framed WAL, Linux hard-affinity scaling, representative local/remote NUMA reads, and controlled I/O-depth cells | in progress |
-| P2 governor | Versioned hardware-derived policy plus rollback-safe global/class CPU, I/O, and memory admission; RAII cancellation and parent-only nested subdivision | persistent physical-core-first NUMA queues and governed exact-ANN batches now complement routed reads/mutations/hybrid/maintenance/recovery/backup/WAL retention; exact ANN has plan-sized memory and query-local component receipts, and worker completion is published before caller notification; pool connections beyond exact ANN, calibrated cross-node stealing, broader receipts, proof routing, and measured interference pending |
+| P2 governor | Versioned hardware-derived policy plus rollback-safe global/class CPU, I/O, and memory admission; RAII cancellation and parent-only nested subdivision | persistent physical-core-first NUMA queues and governed exact-ANN batches now complement routed reads/mutations/hybrid/maintenance/recovery/backup/WAL retention; exact ANN has target-query workspace accounting and component receipts, and worker completion is published before caller notification; index-scoped/all-engine hydration accounting, pool connections beyond exact ANN, calibrated cross-node stealing, broader receipts, proof routing, and measured interference pending |
 | P3 segmented substrate | Immutable B+tree leaf planning with root-bound range/cardinality summaries, snapshot-frozen readers, and governed parallel relational, hash, set, stream, sorted-set score/rank, list, BM25, and contiguous exact-vector batches; directional/tie order is deterministic; multi-root recovery and deterministic maintained/compaction amplification bounds are proven | in progress; richer SQL/structure/lexical/vector pruning summaries plus dedicated-hardware pruning and foreground-interference receipts pending |
-| P4 vector execution | Deterministic recursively projected balanced plans, centroid/radius/projection summaries, explicit selected-partition routing, governed persistent-pool child builds without a second corpus copy, canonical exact/approximate merge, aggregate identities, and a process-local validated bakeoff receipt are implemented | in progress; cross-links, accepted pruning policy, competing algorithms, durable checkpoints/publication, lifecycle/reopen, and full quality/build matrix pending |
+| P4 vector execution | Deterministic recursively projected balanced plans with one projection evaluation per vector/split, centroid/radius/projection summaries, explicit selected-partition routing, pre-plan `Bulk` admission, cancelable planning/child ingestion, governed persistent-pool child builds without a second corpus copy, canonical exact/approximate merge, aggregate identities, an ownership-transferred HYANNM04 partitioned base, append-only WAL publication, exact stale-plan checks, prior-or-complete recovery, retained-child ownership, online delta/consolidation lifecycle, and process-local plus durable receipts are implemented | in progress; bounded cross-links, accepted pruning policy, competing algorithms, resumable build checkpoints, full lifecycle/interference matrix, allocation/RSS proof, and bare-metal quality/build evidence pending |
 | P5 SQL execution | Direct small-query path, catalog-version-bound 256-entry prepared plan/expression cache, exact ordered multi-index intersection with root-bound leaf-summary ordering for 3+ streams, governed 1,024-row decode/filter/project batches, indexed nested-loop join/probe receipts, independent fail-closed 1,048,576-candidate ceilings for scans and joins, a 64-byte-aligned selection bitmap, and a CSN/root-bound execution receipt | in progress; allocation proof, SIMD/columnar kernels, persisted fine-grained statistics and stale controls, aggregation/sort, hash/merge join alternatives and adaptive choice, spill, reusable cross-engine masks, adversarial budget matrices, and dedicated-hardware evidence pending |
 | P6 structure execution | Direct governed points; immutable segmented hash/set/list/stream/sorted-set ranges; bounded hash/set batches, set algebra, and expiry sweeps; per-field/member optimistic conflicts; componentized commit/group durability receipts; HYSTRBT3 incarnation/key/typed-family metadata/retirement codecs; explicit lossless V2-to-V3 WAL migration and V3 backup/restore; public constant-cardinality deletion for all five collection families; public V3 scalar set/conditional/increment/expire/delete plus five-family due-key reuse; public incarnation-aware create/recreate plus hash set/batch/increment/delete, set add/batch/remove, list head/tail push and pop, stream append, sorted-set add/rescore/remove, collection/Hash-field TTL mutation, and ordered bounded active-expiry paths; all 30 current-root logical structure commands (52 public Rust methods), including Hash scans/patterns, Set algebra/scans, List/Stream ranges, and Sorted Set rank/rank-range/score-range paths, now execute directly or through governed immutable V3 segments without complete structure-state materialization; scalar all-engine delta commits hydrate only point metadata under HYSTRBT3, preserve conflict/recovery semantics, and enter group durability without loading complete engine state; governor-admitted, shared-buffer-pool reclamation in at most 1,024-entry steps with progress/no-op receipts; V3 compaction that preserves active retirements; and delete, recreate, scalar/member/list-boundary mutation, direct-read/range, TTL, expiry-sweep, partial-cleanup, terminal-cleanup, migration, backup/restore, corruption, and reopen matrices | in progress; retained snapshots, legacy public transactions, and collection-valued delta mutations still materialize complete state or lack a physical checked surface; page-generation and broader backup interruption matrices; million-member and allocation proof; SIMD kernels; hot-key and concurrent lifecycle scaling; and dedicated-hardware evidence pending |
 | P7–P8 | Cross-engine fusion through durability and maintenance convergence | pending |
@@ -278,9 +278,19 @@ builds, canonical aggregate validation, and exact fanout merge. It remains
 process-local and intentionally does not claim cross-partition links, selective
 fanout, checkpoints, or durable publication.
 
-Search fans out only to planner-selected partitions, oversamples within a
-bounded budget, merges top-k canonically, and reranks when required by the
-declared quality policy.
+The durable companion vertical is specified in
+[`native-ann-initial-bulk-publication-v1.md`](../performance/native-ann-initial-bulk-publication-v1.md).
+It freezes the empty-base precondition, off-lock governed build, exact stale-plan
+checks, partition-aware durable metadata, WAL anchoring, cooperative
+cancellation, and prior-or-complete recovery. The runtime implementation, local
+correctness matrix, and fail-closed G7 wiring are present; bare-metal quality,
+capacity, and latency evidence remains a separate gate and cannot be inferred
+from those local tests.
+
+Durable default search currently performs full partition fanout and canonical
+top-k merge. The experimental selected-partition route provides bounded
+oversampling and canonical merge, but it cannot become the default until its
+pruning and reranking policy satisfies the accepted recall gate.
 
 ### Gate P4
 
@@ -292,6 +302,15 @@ declared quality policy.
 - Update, delete, consolidation, interruption, and reopen preserve visibility.
 - The million-vector, 384-dimensional corpus completes within a frozen build
   budget before it may enter a release G7 run.
+
+The `1,000,000 x 384` corpus remains the frozen G7 qualification shape for the
+1.0 release line. A later release must add independent `1,000,000 x 768` and
+`1,000,000 x 1,024` capacity lanes without changing or retroactively weakening
+that receipt. Those lanes require their own calibrated build/query memory
+budgets, NUMA and partition curves, SIMD kernel selection, persistence and
+recovery measurements, recall floors, index-scoped multi-ANN loading or
+full-root admission, and exact-SHA receipts. They are future architecture work,
+not additional closure requirements for 1.0.
 
 ## Program 5: SQL execution
 

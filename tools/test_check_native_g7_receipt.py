@@ -24,7 +24,7 @@ def receipt() -> dict:
         },
     }
     return {
-        "schema": "hyphae-native-g7-receipt-v2",
+        "schema": "hyphae-native-g7-receipt-v3",
         "gate": "G7",
         "status": "passed",
         "evidence_class": "closure-candidate",
@@ -73,6 +73,37 @@ def receipt() -> dict:
             "cell_assertions": "passed",
             "ann_recall_floor": 0.95,
             "cross_engine_visibility": "native-same-snapshot-search",
+        },
+        "initial_ann_bulk": {
+            "schema": "hyphae-native-g7-initial-ann-bulk-v1",
+            "source_commit": "a" * 40,
+            "dataset_digest": "b" * 64,
+            "builder": "partitioned-hnsw-v1",
+            "input_identity": "1" * 64,
+            "aggregate_identity": "2" * 64,
+            "planned_vectors": 1_000_000,
+            "planned_partitions": 48,
+            "planned_workers": 44,
+            "planned_memory_bytes": 4_000_000_000,
+            "worker_batches": 48,
+            "total_time_nanos": 1,
+            "hardware_profile_fingerprint": "3" * 64,
+            "governor_policy_schema": "hyphae-native-governor-policy-v1",
+            "governor_mode": "mixed",
+            "calibration_cache_key": "test-calibration",
+            "topology_digest": "4" * 64,
+            "topology_workers": 48,
+            "hard_affinity": True,
+            "governor_execution": {
+                "class": "bulk",
+                "compute_threads": 44,
+                "io_slots": 0,
+                "memory_bytes": 4_000_000_000,
+                "queue_ticket": None,
+                "initial_queue_depth": 0,
+                "queue_time_nanos": 0,
+                "execution_time_nanos": 1,
+            },
         },
         "hardware": {
             "dedicated": True,
@@ -156,6 +187,34 @@ class G7ReceiptTests(unittest.TestCase):
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
 
+    def test_initial_bulk_accepts_compute_only_governor_request(self) -> None:
+        payload = receipt()
+        self.assertEqual(payload["initial_ann_bulk"]["governor_execution"]["io_slots"], 0)
+        result = validate(payload, "a" * 40)
+        self.assertEqual(result["status"], "passed")
+
+    def test_initial_bulk_rejects_governor_resource_mismatch(self) -> None:
+        for field, value in (("compute_threads", 43), ("memory_bytes", 3_999_999_999)):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["initial_ann_bulk"]["governor_execution"][field] = value
+                with self.assertRaisesRegex(GateFailure, "governor execution"):
+                    validate(payload, "a" * 40)
+
+    def test_initial_bulk_rejects_negative_governor_resources(self) -> None:
+        for field in ("compute_threads", "io_slots", "memory_bytes"):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["initial_ann_bulk"]["governor_execution"][field] = -1
+                with self.assertRaisesRegex(GateFailure, "governor execution"):
+                    validate(payload, "a" * 40)
+
+    def test_initial_bulk_rejects_invented_io_reservation(self) -> None:
+        payload = receipt()
+        payload["initial_ann_bulk"]["governor_execution"]["io_slots"] = 1
+        with self.assertRaisesRegex(GateFailure, "governor execution"):
+            validate(payload, "a" * 40)
+
     def test_hot_path_complete_state_loads_fail_closure(self) -> None:
         for counter in ("process_full_state_loads", "process_full_catalog_loads"):
             with self.subTest(counter=counter):
@@ -166,6 +225,25 @@ class G7ReceiptTests(unittest.TestCase):
                 ] = 1
                 with self.assertRaisesRegex(GateFailure, "hot path materialized"):
                     validate(payload, "a" * 40)
+
+    def test_parallel_topology_requires_multiple_worker_batches(self) -> None:
+        payload = receipt()
+        payload["initial_ann_bulk"]["worker_batches"] = 1
+        with self.assertRaisesRegex(GateFailure, "parallel construction"):
+            validate(payload, "a" * 40)
+
+    def test_linux_initial_bulk_requires_hard_affinity(self) -> None:
+        payload = receipt()
+        payload["initial_ann_bulk"]["hard_affinity"] = False
+        with self.assertRaisesRegex(GateFailure, "parallel construction"):
+            validate(payload, "a" * 40)
+
+    def test_initial_bulk_rejects_unrepresentable_partition_count(self) -> None:
+        payload = receipt()
+        payload["initial_ann_bulk"]["planned_partitions"] = 222
+        payload["initial_ann_bulk"]["topology_workers"] = 222
+        with self.assertRaisesRegex(GateFailure, "parallel construction"):
+            validate(payload, "a" * 40)
 
     def test_valid_dedicated_darwin_receipt(self) -> None:
         payload = receipt()

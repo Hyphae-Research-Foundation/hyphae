@@ -844,6 +844,19 @@ pub enum NativeRuntimeError {
     /// The ANN base selected by a captured consolidation plan is no longer current.
     #[error("native ANN consolidation plan is stale")]
     AnnConsolidationStale,
+    /// The empty ANN root captured by an initial bulk plan is no longer current.
+    #[error("native ANN initial bulk publication plan is stale")]
+    InitialAnnBulkStale,
+    /// The durable V4 metadata entry cannot represent the requested child count.
+    #[error(
+        "native ANN initial bulk plan requires {requested} partitions; durable maximum is {maximum}"
+    )]
+    InitialAnnBulkPartitionLimit {
+        /// Effective requested child generation count.
+        requested: usize,
+        /// Maximum child count representable by the current durable format.
+        maximum: usize,
+    },
     /// A search document or analyzed term cannot fit one canonical B+tree key.
     #[error("native search identity exceeds the canonical B+tree key limit")]
     SearchIdentityTooLarge,
@@ -2246,6 +2259,7 @@ pub struct AnnMaintenanceStatus {
 #[derive(Clone, Debug)]
 pub struct AnnConsolidationPlan {
     inner: ann_store::ConsolidationPlan,
+    resource_permit: Option<OwnedGovernorPermit>,
 }
 
 impl AnnConsolidationPlan {
@@ -2275,7 +2289,7 @@ impl AnnConsolidationPlan {
     }
 
     /// Canonical replacement base generation identity.
-    pub const fn replacement_identity(&self) -> [u8; 32] {
+    pub fn replacement_identity(&self) -> [u8; 32] {
         self.inner.replacement_identity()
     }
 }
@@ -2295,6 +2309,198 @@ pub struct AnnConsolidationReceipt {
     pub preserved_later_delta_records: usize,
     /// Ordinary native root commit selecting the replacement generation.
     pub commit: CommitReceipt,
+}
+
+/// Canonical builder selected for one initial ANN bulk generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialAnnBulkBuilder {
+    /// Deterministic geometric partitioning followed by canonical child HNSW builds.
+    PartitionedHnswV1,
+}
+
+/// Stage reported by a governed initial ANN bulk plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialAnnBulkProgressStage {
+    /// Input validation, deterministic projection, sorting, and plan identity.
+    Planning,
+    /// Canonical child HNSW generations executing in the shared pool.
+    Building,
+}
+
+/// Monotonic progress for an initial ANN bulk plan before publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialAnnBulkProgress {
+    /// Active deterministic build stage.
+    pub stage: InitialAnnBulkProgressStage,
+    /// Completed units in the active stage.
+    pub completed: usize,
+    /// Complete units in the active stage.
+    pub total: usize,
+}
+
+/// Frozen evidence for one governed initial ANN bulk build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialAnnBulkBuildEvidence {
+    /// Concrete builder whose output was validated and assembled.
+    pub builder: InitialAnnBulkBuilder,
+    /// Canonical geometric-plan identity.
+    pub input_identity: [u8; 32],
+    /// Aggregate identity over every canonical child generation.
+    pub build_identity: [u8; 32],
+    /// Source vectors transferred into disjoint build partitions.
+    pub planned_vectors: usize,
+    /// Balanced geometric partitions selected before admission.
+    pub planned_partitions: usize,
+    /// Bulk compute threads reserved by the build.
+    pub planned_compute_threads: u64,
+    /// Conservative vector and maximum-layer graph memory reservation.
+    pub planned_memory_bytes: u64,
+    /// Persistent-pool batches that actually built child generations.
+    pub worker_batches: usize,
+    /// Shared-governor admission and execution evidence.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Complete planning, queueing, build, validation, and assembly time.
+    pub total_time: Duration,
+}
+
+/// Complete off-lock candidate for one empty native vector index.
+#[derive(Debug)]
+pub struct InitialAnnBulkPlan {
+    index_id: ObjectId,
+    expected_roots: RootSet,
+    expected_base_identity: [u8; 32],
+    expected_view_identity: [u8; 32],
+    candidate_csn: Csn,
+    candidate: PartitionedHnswIndex,
+    build: InitialAnnBulkBuildEvidence,
+    resource_permit: Option<DatabaseGovernorPermit>,
+}
+
+impl InitialAnnBulkPlan {
+    /// Catalog-bound vector index selected by this plan.
+    pub const fn index_id(&self) -> ObjectId {
+        self.index_id
+    }
+
+    /// Commit CSN frozen into every candidate vector version.
+    pub const fn candidate_csn(&self) -> Csn {
+        self.candidate_csn
+    }
+
+    /// Empty base generation that must remain selected until publication.
+    pub const fn expected_base_identity(&self) -> [u8; 32] {
+        self.expected_base_identity
+    }
+
+    /// Empty base-plus-delta view that must remain selected until publication.
+    pub const fn expected_view_identity(&self) -> [u8; 32] {
+        self.expected_view_identity
+    }
+
+    /// Governed build evidence captured before writer admission.
+    pub const fn build_evidence(&self) -> InitialAnnBulkBuildEvidence {
+        self.build
+    }
+}
+
+/// Result of one ordinary-root initial ANN bulk publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialAnnBulkPublishReceipt {
+    /// Vector index whose empty base was replaced.
+    pub index_id: ObjectId,
+    /// Governed build evidence for the selected candidate.
+    pub build: InitialAnnBulkBuildEvidence,
+    /// Ordinary native root commit selecting the complete generation.
+    pub commit: CommitReceipt,
+}
+
+/// Maximum child generations that remain representable after one retained V4
+/// generation is created by the ordinary consolidation lifecycle.
+pub const MAX_INITIAL_ANN_BULK_PARTITIONS: usize = 221;
+
+fn report_initial_ann_bulk_progress(
+    progress: Option<&(dyn Fn(InitialAnnBulkProgress) + Send + Sync)>,
+    stage: InitialAnnBulkProgressStage,
+    completed: usize,
+    total: usize,
+) {
+    if let Some(progress) = progress {
+        progress(InitialAnnBulkProgress {
+            stage,
+            completed,
+            total,
+        });
+    }
+}
+
+#[derive(Clone)]
+struct InitialAnnBulkChildControl {
+    definition: VectorIndexDefinition,
+    cancellation: Option<GovernorCancellation>,
+    progress: Option<Arc<dyn Fn(InitialAnnBulkProgress) + Send + Sync>>,
+    completed: Arc<Mutex<usize>>,
+    total: usize,
+}
+
+impl InitialAnnBulkChildControl {
+    fn build(self, partition: Vec<VectorRecord>) -> Result<HnswIndex, hyphae_native_ann::AnnError> {
+        let cancellation = self.cancellation.clone();
+        let index = HnswIndex::build_owned_cancellable(self.definition, partition, move || {
+            if cancellation
+                .as_ref()
+                .is_some_and(GovernorCancellation::is_cancelled)
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *completed = completed
+            .checked_add(1)
+            .ok_or(hyphae_native_ann::AnnError::LengthOverflow)?;
+        report_initial_ann_bulk_progress(
+            self.progress.as_deref(),
+            InitialAnnBulkProgressStage::Building,
+            *completed,
+            self.total,
+        );
+        Ok(index)
+    }
+}
+
+fn execute_initial_ann_bulk_children(
+    execution_pool: Option<&NativeExecutionPool>,
+    permit: Option<&DatabaseGovernorPermit>,
+    partition_records: Vec<Vec<VectorRecord>>,
+    planned_compute_threads: u64,
+    control: InitialAnnBulkChildControl,
+) -> Result<(Vec<HnswIndex>, usize), NativeRuntimeError> {
+    if partition_records.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    if let (Some(execution_pool), Some(permit)) = (execution_pool, permit)
+        && planned_compute_threads > 1
+        && partition_records.len() > 1
+    {
+        let (children, worker_batches) = execution_pool.execute_ordered_profiled(
+            permit.permit(),
+            partition_records,
+            move |partition| control.clone().build(partition),
+        )?;
+        return Ok((
+            children.into_iter().collect::<Result<Vec<_>, _>>()?,
+            worker_batches,
+        ));
+    }
+    let children = partition_records
+        .into_iter()
+        .map(|partition| control.clone().build(partition))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((children, 1))
 }
 
 /// Receipt for one current-root physical page-generation vacuum.
@@ -2582,6 +2788,11 @@ pub struct NativePartitionedHnswBuildReceipt {
     pub execution: Option<NativeEngineWorkReceipt>,
     /// Complete planning, queueing, child-build, validation, and merge time.
     pub total_time: Duration,
+}
+
+struct BuiltPartitionedHnswCandidate {
+    receipt: NativePartitionedHnswBuildReceipt,
+    resource_permit: Option<DatabaseGovernorPermit>,
 }
 
 /// One row reached through an exact native secondary-index key.
@@ -3659,6 +3870,7 @@ fn open_blob_store(path: &Path) -> Result<(BlobStore, Duration), BlobError> {
     Ok((blobs, started.elapsed()))
 }
 
+#[derive(Debug)]
 enum DatabaseGovernorPermit {
     Immediate {
         permit: OwnedGovernorPermit,
@@ -3682,7 +3894,7 @@ impl DatabaseGovernorPermit {
         }
     }
 
-    fn finish(self) -> NativeEngineWorkReceipt {
+    fn evidence(&self) -> NativeEngineWorkReceipt {
         match self {
             Self::Immediate {
                 permit,
@@ -3696,17 +3908,39 @@ impl DatabaseGovernorPermit {
                 execution_time: execution_started.elapsed(),
             },
             Self::Queued(permit) => {
-                let receipt = permit.finish();
+                let admission = permit.admission();
                 NativeEngineWorkReceipt {
-                    class: receipt.admission.class,
-                    request: receipt.admission.request,
-                    queue_ticket: Some(receipt.admission.ticket),
-                    initial_queue_depth: receipt.admission.initial_queue_depth,
-                    queue_time: receipt.admission.queue_time,
-                    execution_time: receipt.execution_time,
+                    class: admission.class,
+                    request: admission.request,
+                    queue_ticket: Some(admission.ticket),
+                    initial_queue_depth: admission.initial_queue_depth,
+                    queue_time: admission.queue_time,
+                    execution_time: permit.execution_time(),
                 }
             }
         }
+    }
+
+    fn retain_memory(self, memory_bytes: u64) -> Result<Self, NativeRuntimeError> {
+        let request = GovernorRequest {
+            compute_threads: 0,
+            io_slots: 0,
+            memory_bytes,
+        };
+        match self {
+            Self::Immediate {
+                permit,
+                execution_started,
+            } => Ok(Self::Immediate {
+                permit: permit.shrink_to(request)?,
+                execution_started,
+            }),
+            Self::Queued(permit) => Ok(Self::Queued(permit.shrink_to(request)?)),
+        }
+    }
+
+    fn finish(self) -> NativeEngineWorkReceipt {
+        self.evidence()
     }
 }
 
@@ -3715,6 +3949,7 @@ fn admit_governor_work(
     maximum_wait: Duration,
     class: WorkloadClass,
     request: GovernorRequest,
+    cancellation: Option<&GovernorCancellation>,
 ) -> Result<DatabaseGovernorPermit, NativeRuntimeError> {
     if maximum_wait.is_zero() {
         return governor
@@ -3725,9 +3960,15 @@ fn admit_governor_work(
             })
             .map_err(NativeRuntimeError::from);
     }
-    let cancellation = governor.cancellation_token();
+    if let Some(cancellation) = cancellation {
+        return governor
+            .admit_queued_owned(class, request, maximum_wait, cancellation)
+            .map(DatabaseGovernorPermit::Queued)
+            .map_err(NativeRuntimeError::from);
+    }
+    let internal_cancellation = governor.cancellation_token();
     governor
-        .admit_queued_owned(class, request, maximum_wait, &cancellation)
+        .admit_queued_owned(class, request, maximum_wait, &internal_cancellation)
         .map(DatabaseGovernorPermit::Queued)
         .map_err(NativeRuntimeError::from)
 }
@@ -4053,6 +4294,7 @@ impl NativeDatabase {
                 io_slots: 1,
                 memory_bytes: RECOVERY_MEMORY_BYTES,
             },
+            None,
         )?;
         let mut database = Self::open_with_marker(path, pending)?;
         database.resource_governor = Some(governor);
@@ -4349,12 +4591,19 @@ impl NativeDatabase {
     }
 
     fn admit_maintenance_owned(&self) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
+        self.admit_maintenance_owned_with_memory(MAINTENANCE_MEMORY_BYTES)
+    }
+
+    fn admit_maintenance_owned_with_memory(
+        &self,
+        memory_bytes: u64,
+    ) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
         self.admit_database_work(
             WorkloadClass::Maintenance,
             GovernorRequest {
                 compute_threads: 1,
                 io_slots: 1,
-                memory_bytes: MAINTENANCE_MEMORY_BYTES,
+                memory_bytes,
             },
         )
         .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
@@ -4364,6 +4613,7 @@ impl NativeDatabase {
         &self,
         memory_bytes: u64,
         maximum_workers: usize,
+        cancellation: Option<&GovernorCancellation>,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
         let worker_limit = u64::try_from(maximum_workers).unwrap_or(u64::MAX).max(1);
         let compute_threads = self
@@ -4381,12 +4631,26 @@ impl NativeDatabase {
                     .min(worker_limit)
                     .max(1)
             });
-        self.admit_database_work(
+        self.admit_database_work_with_cancellation(
             WorkloadClass::Bulk,
             GovernorRequest {
                 compute_threads,
                 io_slots: 0,
                 memory_bytes,
+            },
+            cancellation,
+        )
+    }
+
+    fn admit_initial_ann_publication(
+        &self,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: 0,
             },
         )
     }
@@ -4410,10 +4674,26 @@ impl NativeDatabase {
         class: WorkloadClass,
         request: GovernorRequest,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work_with_cancellation(class, request, None)
+    }
+
+    fn admit_database_work_with_cancellation(
+        &self,
+        class: WorkloadClass,
+        request: GovernorRequest,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
         let Some(governor) = &self.resource_governor else {
             return Ok(None);
         };
-        admit_governor_work(governor, self.resource_queue_wait, class, request).map(Some)
+        admit_governor_work(
+            governor,
+            self.resource_queue_wait,
+            class,
+            request,
+            cancellation,
+        )
+        .map(Some)
     }
 
     /// Returns a retained durable outcome by its opaque resolution identity.
@@ -6412,6 +6692,7 @@ impl NativeDatabase {
                     mode: NativeWriteBatchMode::PhysicalStructureExpiry,
                     delta: None,
                     ann_consolidation: None,
+                    ann_initial_bulk: None,
                     _resource_permit: None,
                 },
             }
@@ -6535,13 +6816,11 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalStructureCompaction,
                 delta: None,
                 ann_consolidation: None,
+                ann_initial_bulk: None,
                 _resource_permit: None,
             },
         };
-        let commit = match interruption {
-            Some(boundary) => transaction.commit_with_interruption(boundary)?,
-            None => transaction.commit()?,
-        };
+        let commit = commit_transaction_at(transaction, interruption)?;
         let pages_appended = self
             .pages
             .page_count()
@@ -6647,13 +6926,11 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalStructureMigrationV3,
                 delta: None,
                 ann_consolidation: None,
+                ann_initial_bulk: None,
                 _resource_permit: None,
             },
         };
-        let commit = match interruption {
-            Some(boundary) => transaction.commit_with_interruption(boundary)?,
-            None => transaction.commit()?,
-        };
+        let commit = commit_transaction_at(transaction, interruption)?;
         self.structure_format = StructureFormat::BTreeV3;
 
         let pages_appended = self
@@ -6801,13 +7078,11 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalStructureRetirementV3,
                 delta: None,
                 ann_consolidation: None,
+                ann_initial_bulk: None,
                 _resource_permit: None,
             },
         };
-        let commit = match interruption {
-            Some(boundary) => transaction.commit_with_interruption(boundary)?,
-            None => transaction.commit()?,
-        };
+        let commit = commit_transaction_at(transaction, interruption)?;
 
         let current_root = self
             .coordinator
@@ -6979,6 +7254,7 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalSearchCompaction,
                 delta: None,
                 ann_consolidation: None,
+                ann_initial_bulk: None,
                 _resource_permit: None,
             },
         };
@@ -7023,22 +7299,44 @@ impl NativeDatabase {
         max_vectors: usize,
         max_delta_records: usize,
     ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
-        let _permit = self.admit_maintenance_owned()?;
+        if max_vectors == 0
+            || max_vectors > ann_store::MAX_ANN_CONSOLIDATION_VECTORS
+            || max_delta_records == 0
+            || max_delta_records > ann_store::MAX_ANN_DELTA_RECORDS
+        {
+            return Err(NativeRuntimeError::InvalidAnnConsolidationLimit);
+        }
         let snapshot = self.coordinator.snapshot(0)?;
         let root = snapshot
             .roots()
             .root(SLOT_SEARCH)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let definition = ann_store::definition_for_index(&catalog, index)?;
+        let retained_memory_bytes = partitioned_hnsw_build_memory_bytes(max_vectors, definition);
+        let peak_memory_bytes = retained_memory_bytes
+            .saturating_add(retained_memory_bytes.saturating_sub(MAINTENANCE_MEMORY_BYTES));
+        let permit = self.admit_maintenance_owned_with_memory(peak_memory_bytes)?;
+        let inner = ann_store::plan_consolidation(
+            &self.pages,
+            root,
+            &catalog,
+            index,
+            max_vectors,
+            max_delta_records,
+        )?;
+        let resource_permit = permit
+            .map(|permit| {
+                permit.shrink_to(GovernorRequest {
+                    compute_threads: 0,
+                    io_slots: 0,
+                    memory_bytes: peak_memory_bytes,
+                })
+            })
+            .transpose()?;
         Ok(AnnConsolidationPlan {
-            inner: ann_store::plan_consolidation(
-                &self.pages,
-                root,
-                &catalog,
-                index,
-                max_vectors,
-                max_delta_records,
-            )?,
+            inner,
+            resource_permit,
         })
     }
 
@@ -7134,7 +7432,8 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
-        let _permit = self.admit_maintenance_owned()?;
+        let _resource_permit = plan.resource_permit.clone();
+        let _publication_permit = self.admit_initial_ann_publication()?;
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
@@ -7197,6 +7496,7 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalAnnConsolidation,
                 delta: None,
                 ann_consolidation: Some(plan.inner),
+                ann_initial_bulk: None,
                 _resource_permit: None,
             },
         };
@@ -12989,6 +13289,145 @@ impl NativeDatabase {
         self.search_vector_exact_profiled(index, query, k, Some(allowlist))
     }
 
+    /// Captures an empty native vector index and builds its complete initial
+    /// generation without holding writer admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the index has an empty base, no deltas, and no
+    /// retained generation. Invalid vectors, rejected bulk admission, worker
+    /// failure, or noncanonical child output also fail before publication.
+    pub fn plan_initial_ann_bulk(
+        &self,
+        index: ObjectId,
+        vectors: Vec<(ObjectId, Vector)>,
+        requested_partitions: usize,
+    ) -> Result<InitialAnnBulkPlan, NativeRuntimeError> {
+        self.plan_initial_ann_bulk_with_control(index, vectors, requested_partitions, None, None)
+    }
+
+    /// Builds one publication-ready initial ANN generation and reports
+    /// planning plus per-child completion without holding writer admission.
+    ///
+    /// The callback may run on persistent execution-pool workers and must not
+    /// perform unbounded or fallible work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::plan_initial_ann_bulk`].
+    pub fn plan_initial_ann_bulk_with_progress(
+        &self,
+        index: ObjectId,
+        vectors: Vec<(ObjectId, Vector)>,
+        requested_partitions: usize,
+        progress: impl Fn(InitialAnnBulkProgress) + Send + Sync + 'static,
+    ) -> Result<InitialAnnBulkPlan, NativeRuntimeError> {
+        self.plan_initial_ann_bulk_with_control(
+            index,
+            vectors,
+            requested_partitions,
+            None,
+            Some(Arc::new(progress)),
+        )
+    }
+
+    /// Builds one publication-ready initial ANN generation with cooperative
+    /// cancellation while no writer admission is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::plan_initial_ann_bulk`], plus
+    /// [`hyphae_native_ann::AnnError::BuildCancelled`] when cancellation is
+    /// observed before the complete candidate is validated.
+    pub fn plan_initial_ann_bulk_with_cancellation(
+        &self,
+        index: ObjectId,
+        vectors: Vec<(ObjectId, Vector)>,
+        requested_partitions: usize,
+        cancellation: &GovernorCancellation,
+    ) -> Result<InitialAnnBulkPlan, NativeRuntimeError> {
+        self.plan_initial_ann_bulk_with_control(
+            index,
+            vectors,
+            requested_partitions,
+            Some(cancellation),
+            None,
+        )
+    }
+
+    fn plan_initial_ann_bulk_with_control(
+        &self,
+        index: ObjectId,
+        vectors: Vec<(ObjectId, Vector)>,
+        requested_partitions: usize,
+        cancellation: Option<&GovernorCancellation>,
+        progress: Option<Arc<dyn Fn(InitialAnnBulkProgress) + Send + Sync>>,
+    ) -> Result<InitialAnnBulkPlan, NativeRuntimeError> {
+        if vectors.is_empty() || requested_partitions == 0 {
+            return Err(hyphae_native_ann::AnnError::InvalidPartitionCount.into());
+        }
+        let effective_partitions = requested_partitions.min(vectors.len());
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let authority =
+            ann_store::capture_initial_bulk_authority(&self.pages, root, &catalog, index)?;
+        let maximum_partitions =
+            ann_store::maximum_initial_ann_bulk_partitions(authority.lifecycle.retain_generations);
+        if effective_partitions > maximum_partitions {
+            return Err(NativeRuntimeError::InitialAnnBulkPartitionLimit {
+                requested: effective_partitions,
+                maximum: maximum_partitions,
+            });
+        }
+        let candidate_csn = snapshot
+            .visible_csn
+            .and_then(Csn::checked_next)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let records = vectors
+            .into_iter()
+            .map(|(object_id, vector)| VectorRecord {
+                object_id,
+                creating_csn: candidate_csn,
+                vector,
+            })
+            .collect();
+        let candidate_result = self.build_partitioned_hnsw_candidate(
+            authority.definition,
+            records,
+            requested_partitions,
+            cancellation,
+            progress,
+            true,
+        )?;
+        let receipt = candidate_result.receipt;
+        let evidence = InitialAnnBulkBuildEvidence {
+            builder: InitialAnnBulkBuilder::PartitionedHnswV1,
+            input_identity: receipt.index.input_identity(),
+            build_identity: receipt.index.build_identity(),
+            planned_vectors: receipt.planned_vectors,
+            planned_partitions: receipt.planned_partitions,
+            planned_compute_threads: receipt.planned_compute_threads,
+            planned_memory_bytes: receipt.planned_memory_bytes,
+            worker_batches: receipt.worker_batches,
+            execution: receipt.execution,
+            total_time: receipt.total_time,
+        };
+        Ok(InitialAnnBulkPlan {
+            index_id: index,
+            expected_roots: snapshot.roots().clone(),
+            expected_base_identity: authority.base_identity,
+            expected_view_identity: authority.view_identity,
+            candidate_csn,
+            candidate: receipt.index,
+            build: evidence,
+            resource_permit: candidate_result.resource_permit,
+        })
+    }
+
     /// Builds one process-local deterministic partitioned HNSW candidate
     /// under the shared bulk governor and persistent worker pool.
     ///
@@ -13005,56 +13444,259 @@ impl NativeDatabase {
         records: Vec<VectorRecord>,
         requested_partitions: usize,
     ) -> Result<NativePartitionedHnswBuildReceipt, NativeRuntimeError> {
+        self.build_partitioned_hnsw_candidate(
+            definition,
+            records,
+            requested_partitions,
+            None,
+            None,
+            false,
+        )
+        .map(|built| built.receipt)
+    }
+
+    fn build_partitioned_hnsw_candidate(
+        &self,
+        definition: VectorIndexDefinition,
+        records: Vec<VectorRecord>,
+        requested_partitions: usize,
+        cancellation: Option<&GovernorCancellation>,
+        progress: Option<Arc<dyn Fn(InitialAnnBulkProgress) + Send + Sync>>,
+        retain_resources: bool,
+    ) -> Result<BuiltPartitionedHnswCandidate, NativeRuntimeError> {
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(hyphae_native_ann::AnnError::BuildCancelled.into());
+        }
         let total_started = Instant::now();
         let planned_vectors = records.len();
-        let plan = HnswPartitionPlan::build(definition, records, requested_partitions)?;
-        let input_identity = plan.input_identity();
-        let planned_partitions = plan.partition_count();
+        let effective_partitions = requested_partitions.min(planned_vectors).max(1);
         let planned_memory_bytes = partitioned_hnsw_build_memory_bytes(planned_vectors, definition);
-        let permit = self.admit_parallel_bulk(planned_memory_bytes, planned_partitions.max(1))?;
+        let permit =
+            self.admit_parallel_bulk(planned_memory_bytes, effective_partitions, cancellation)?;
         let planned_compute_threads = permit
             .as_ref()
             .map_or(1, |permit| permit.permit().request().compute_threads);
+        report_initial_ann_bulk_progress(
+            progress.as_deref(),
+            InitialAnnBulkProgressStage::Planning,
+            0,
+            1,
+        );
+        let plan = HnswPartitionPlan::build_cancellable(
+            definition,
+            records,
+            requested_partitions,
+            || {
+                if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        let input_identity = plan.input_identity();
+        let planned_partitions = plan.partition_count();
+        report_initial_ann_bulk_progress(
+            progress.as_deref(),
+            InitialAnnBulkProgressStage::Planning,
+            1,
+            1,
+        );
+        report_initial_ann_bulk_progress(
+            progress.as_deref(),
+            InitialAnnBulkProgressStage::Building,
+            0,
+            planned_partitions,
+        );
         let partition_records = plan.into_partitions();
-        let (children, worker_batches) = match (
+        let (children, worker_batches) = execute_initial_ann_bulk_children(
             self.execution_pool.as_deref(),
             permit.as_ref(),
-            partition_records.is_empty(),
-        ) {
-            (_, _, true) => (Vec::new(), 0),
-            (Some(execution_pool), Some(permit), false)
-                if planned_compute_threads > 1 && planned_partitions > 1 =>
-            {
-                let (children, worker_batches) = execution_pool.execute_ordered_profiled(
-                    permit.permit(),
-                    partition_records,
-                    move |partition| HnswIndex::build(definition, partition),
-                )?;
-                (
-                    children.into_iter().collect::<Result<Vec<_>, _>>()?,
-                    worker_batches,
-                )
-            }
-            _ => (
-                partition_records
-                    .into_iter()
-                    .map(|partition| HnswIndex::build(definition, partition))
-                    .collect::<Result<Vec<_>, _>>()?,
-                1,
-            ),
-        };
-        let index =
-            PartitionedHnswIndex::from_governed_partitions(definition, input_identity, children)?;
-        let execution = permit.map(DatabaseGovernorPermit::finish);
-        Ok(NativePartitionedHnswBuildReceipt {
-            index,
-            planned_vectors,
-            planned_partitions,
+            partition_records,
             planned_compute_threads,
-            planned_memory_bytes,
-            worker_batches,
-            execution,
-            total_time: total_started.elapsed(),
+            InitialAnnBulkChildControl {
+                definition,
+                cancellation: cancellation.cloned(),
+                progress,
+                completed: Arc::new(Mutex::new(0)),
+                total: planned_partitions,
+            },
+        )?;
+        let index = PartitionedHnswIndex::from_governed_partitions_cancellable(
+            definition,
+            input_identity,
+            children,
+            || {
+                if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )?;
+        let (execution, resource_permit) = match (retain_resources, permit) {
+            (true, Some(permit)) => {
+                let evidence = permit.evidence();
+                let retained = permit.retain_memory(planned_memory_bytes)?;
+                (Some(evidence), Some(retained))
+            }
+            (false, Some(permit)) => (Some(permit.finish()), None),
+            (_, None) => (None, None),
+        };
+        Ok(BuiltPartitionedHnswCandidate {
+            receipt: NativePartitionedHnswBuildReceipt {
+                index,
+                planned_vectors,
+                planned_partitions,
+                planned_compute_threads,
+                planned_memory_bytes,
+                worker_batches,
+                execution,
+                total_time: total_started.elapsed(),
+            },
+            resource_permit,
+        })
+    }
+
+    /// Atomically selects one previously built initial ANN generation.
+    ///
+    /// Writer admission is held only while the captured empty authority is
+    /// revalidated and the completed candidate is persisted. Any intervening
+    /// commit makes the plan stale; the candidate is never silently rebased.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InitialAnnBulkStale`] when roots, selected
+    /// ANN identities, or the candidate CSN changed after planning. It also
+    /// returns storage, WAL, MVCC, or candidate-validation failures.
+    pub fn publish_initial_ann_bulk(
+        &mut self,
+        plan: InitialAnnBulkPlan,
+        durability: DurabilityClass,
+    ) -> Result<InitialAnnBulkPublishReceipt, NativeRuntimeError> {
+        self.publish_initial_ann_bulk_at(plan, durability, None)
+    }
+
+    /// Publishes an initial ANN bulk plan with one deterministic ordinary
+    /// commit interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedCrash`] at the requested boundary,
+    /// or the same failures as [`Self::publish_initial_ann_bulk`].
+    pub fn publish_initial_ann_bulk_with_interruption(
+        &mut self,
+        plan: InitialAnnBulkPlan,
+        durability: DurabilityClass,
+        boundary: CommitBoundary,
+    ) -> Result<InitialAnnBulkPublishReceipt, NativeRuntimeError> {
+        self.publish_initial_ann_bulk_at(plan, durability, Some(boundary))
+    }
+
+    fn publish_initial_ann_bulk_at(
+        &mut self,
+        plan: InitialAnnBulkPlan,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<InitialAnnBulkPublishReceipt, NativeRuntimeError> {
+        let publication_permit = self.admit_initial_ann_publication()?;
+        if self.search_format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let InitialAnnBulkPlan {
+            index_id,
+            expected_roots,
+            expected_base_identity,
+            expected_view_identity,
+            candidate_csn,
+            candidate,
+            build,
+            resource_permit,
+        } = plan;
+        let _resource_permit = resource_permit;
+        let _publication_permit = publication_permit;
+        let snapshot = self.coordinator.snapshot(0)?;
+        if snapshot.roots() != &expected_roots {
+            return Err(NativeRuntimeError::InitialAnnBulkStale);
+        }
+        let root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let authority =
+            ann_store::capture_initial_bulk_authority(&self.pages, root, &catalog, index_id)?;
+        validate_initial_ann_bulk_plan(
+            authority,
+            expected_base_identity,
+            expected_view_identity,
+            &candidate,
+            build,
+        )?;
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let publication = InitialAnnBulkPublication {
+            index: index_id,
+            expected_base_identity,
+            expected_view_identity,
+            candidate_csn,
+            candidate: candidate.into_snapshot(),
+        };
+        let mutation_value = ann_store::encode_initial_bulk_publication(&publication)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        validate_initial_ann_bulk_commit_authority(
+            &root_transaction,
+            &expected_roots,
+            candidate_csn,
+        )?;
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState {
+                    catalog,
+                    ..MaterializedState::default()
+                },
+                mutations: vec![Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::PublishInitialAnnBulk,
+                    target: Some(index_id),
+                    key: Vec::new(),
+                    value: mutation_value,
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, false, true],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalInitialAnnBulkPublication,
+                delta: None,
+                ann_consolidation: None,
+                ann_initial_bulk: Some(publication),
+                _resource_permit: None,
+            },
+        };
+        let commit = commit_transaction_at(transaction, interruption)?;
+        let observed = self.observe_ann_index_unadmitted(index_id)?;
+        validate_published_initial_ann(observed, build)?;
+        Ok(InitialAnnBulkPublishReceipt {
+            index_id,
+            build,
+            commit,
         })
     }
 
@@ -13217,6 +13859,7 @@ impl NativeDatabase {
             mode: NativeWriteBatchMode::Materialized,
             delta: None,
             ann_consolidation: None,
+            ann_initial_bulk: None,
             _resource_permit: resource_permit,
         })
     }
@@ -13259,6 +13902,7 @@ impl NativeDatabase {
             mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
             delta: Some(DeltaOverlay::default()),
             ann_consolidation: None,
+            ann_initial_bulk: None,
             _resource_permit: resource_permit,
         })
     }
@@ -15245,6 +15889,15 @@ struct DeltaUniqueProbe {
     key: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct InitialAnnBulkPublication {
+    index: ObjectId,
+    expected_base_identity: [u8; 32],
+    expected_view_identity: [u8; 32],
+    candidate_csn: Csn,
+    candidate: PartitionedIndexSnapshot,
+}
+
 /// Detached private write set over one immutable all-engine snapshot.
 ///
 /// A batch owns no file handle and holds no writer guard. It may be prepared
@@ -15261,6 +15914,7 @@ pub struct NativeWriteBatch {
     mode: NativeWriteBatchMode,
     delta: Option<DeltaOverlay>,
     ann_consolidation: Option<ann_store::ConsolidationPlan>,
+    ann_initial_bulk: Option<InitialAnnBulkPublication>,
     _resource_permit: Option<OwnedGovernorPermit>,
 }
 
@@ -15274,6 +15928,7 @@ enum NativeWriteBatchMode {
     PhysicalStructureRetirementV3,
     PhysicalSearchCompaction,
     PhysicalAnnConsolidation,
+    PhysicalInitialAnnBulkPublication,
 }
 
 #[derive(Debug)]
@@ -19396,6 +20051,9 @@ fn apply_mutations_to_state(
                     apply_search_mutation_to_state(state, mutation)?;
                 }
             }
+            Opcode::PublishInitialAnnBulk => {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
         }
     }
     apply_initial_ann_vectors(state, initial_ann_vectors)
@@ -19779,6 +20437,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             }
             Opcode::CompactSearch => vec![6],
             Opcode::ConsolidateAnn => vec![7],
+            Opcode::PublishInitialAnnBulk => vec![10],
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
@@ -20361,6 +21020,62 @@ fn validate_checkpoints(
     })
 }
 
+fn commit_transaction_at(
+    transaction: NativeTransaction<'_>,
+    interruption: Option<CommitBoundary>,
+) -> Result<CommitReceipt, NativeRuntimeError> {
+    match interruption {
+        Some(boundary) => transaction.commit_with_interruption(boundary),
+        None => transaction.commit(),
+    }
+}
+
+fn validate_initial_ann_bulk_plan(
+    authority: ann_store::InitialBulkAuthority,
+    expected_base_identity: [u8; 32],
+    expected_view_identity: [u8; 32],
+    candidate: &PartitionedHnswIndex,
+    build: InitialAnnBulkBuildEvidence,
+) -> Result<(), NativeRuntimeError> {
+    if authority.base_identity == expected_base_identity
+        && authority.view_identity == expected_view_identity
+        && candidate.input_identity() == build.input_identity
+        && candidate.build_identity() == build.build_identity
+        && candidate.len() == build.planned_vectors
+        && candidate.partition_count() == build.planned_partitions
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InitialAnnBulkStale)
+    }
+}
+
+fn validate_initial_ann_bulk_commit_authority(
+    transaction: &RootTransaction<'_>,
+    expected_roots: &RootSet,
+    candidate_csn: Csn,
+) -> Result<(), NativeRuntimeError> {
+    if transaction.base_roots() == expected_roots && transaction.commit_csn()? == candidate_csn {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InitialAnnBulkStale)
+    }
+}
+
+fn validate_published_initial_ann(
+    observed: AnnIndexObservation,
+    build: InitialAnnBulkBuildEvidence,
+) -> Result<(), NativeRuntimeError> {
+    if observed.base_identity == build.build_identity
+        && observed.base_vector_count == build.planned_vectors
+        && observed.delta_records == 0
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidAnnTree)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit_engine_roots(
     pages: &mut PageStore,
@@ -20433,6 +21148,7 @@ fn commit_engine_roots(
                 mutations: &batch.mutations,
                 blob_references,
                 ann_consolidation: batch.ann_consolidation.as_ref(),
+                ann_initial_bulk: batch.ann_initial_bulk.as_ref(),
             },
         )?;
     }
@@ -21255,6 +21971,9 @@ fn validate_write_batch_shape(
         NativeWriteBatchMode::PhysicalAnnConsolidation => {
             validate_physical_ann_consolidation(batch, roots, structure_format, search_format)
         }
+        NativeWriteBatchMode::PhysicalInitialAnnBulkPublication => {
+            validate_physical_initial_ann_bulk(batch, roots, structure_format, search_format)
+        }
     }
 }
 
@@ -21282,6 +22001,7 @@ fn validate_physical_structure_v3_migration(
         && batch.dirty == [false, false, true, false]
         && batch.delta.is_none()
         && batch.ann_consolidation.is_none()
+        && batch.ann_initial_bulk.is_none()
         && valid_mutation
     {
         Ok(())
@@ -21307,6 +22027,7 @@ fn validate_physical_structure_v3_retirement(
         && batch.dirty == [false, false, true, false]
         && batch.delta.is_none()
         && batch.ann_consolidation.is_none()
+        && batch.ann_initial_bulk.is_none()
         && valid_mutation
     {
         Ok(())
@@ -21521,6 +22242,42 @@ fn validate_physical_ann_consolidation(
         && batch.state.ann == ann_store::AnnState::default()
         && batch.dirty == [false, false, false, true]
         && batch.delta.is_none()
+        && batch.ann_initial_bulk.is_none()
+        && valid_plan
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
+    }
+}
+
+fn validate_physical_initial_ann_bulk(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_plan = batch.ann_initial_bulk.as_ref().is_some_and(|plan| {
+        matches!(batch.mutations.as_slice(), [mutation]
+            if mutation.engine == EngineKind::Search
+                && mutation.opcode == Opcode::PublishInitialAnnBulk
+                && mutation.target == Some(plan.index)
+                && mutation.key.is_empty()
+                && mutation.expires_at_micros.is_none()
+                && ann_store::encode_initial_bulk_publication(plan)
+                    .is_ok_and(|encoded| mutation.value == encoded))
+    });
+    if roots.iter().all(Option::is_some)
+        && search_format == SearchFormat::InvertedBTreeV1
+        && batch.search_format == SearchFormat::InvertedBTreeV1
+        && batch.structure_format == structure_format
+        && batch.state.relational == RelationState::default()
+        && batch.state.structures == StructureState::default()
+        && batch.state.search == SearchState::default()
+        && batch.state.ann == ann_store::AnnState::default()
+        && batch.dirty == [false, false, false, true]
+        && batch.delta.is_none()
+        && batch.ann_consolidation.is_none()
         && valid_plan
     {
         Ok(())
@@ -21608,6 +22365,7 @@ fn validate_delta_write_batch_shape(
         && !batch.dirty[0]
         && batch.state.ann == ann_store::AnnState::default()
         && batch.ann_consolidation.is_none()
+        && batch.ann_initial_bulk.is_none()
     {
         Ok(())
     } else {
@@ -26547,6 +27305,7 @@ struct SearchMutationContext<'a> {
     mutations: &'a [Mutation],
     blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
     ann_consolidation: Option<&'a ann_store::ConsolidationPlan>,
+    ann_initial_bulk: Option<&'a InitialAnnBulkPublication>,
 }
 
 fn search_root_after_mutations(
@@ -26555,6 +27314,26 @@ fn search_root_after_mutations(
     creating_csn: Csn,
     context: &SearchMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
+    if context.mode == NativeWriteBatchMode::PhysicalInitialAnnBulkPublication {
+        if context.format != SearchFormat::InvertedBTreeV1 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let publication = context
+            .ann_initial_bulk
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let replacement = ann_store::publish_initial_bulk_tree(
+            pages,
+            root,
+            creating_csn,
+            context.catalog,
+            publication,
+        )?;
+        let replacement_root = replacement
+            .root()
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        load_search_state_root(pages, context.blobs, replacement_root)?;
+        return Ok(Some(replacement_root));
+    }
     if context.mode == NativeWriteBatchMode::PhysicalAnnConsolidation {
         if context.format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -30239,6 +31018,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use hyphae_native_ann::Metric;
     use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree};
     use hyphae_native_catalog::{
         CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
@@ -48895,6 +49675,8 @@ mod tests {
         let physical_before = database.physical_observation()?;
         let serial =
             database.build_partitioned_hnsw_experimental(definition, records.clone(), 4)?;
+        let serial_two =
+            database.build_partitioned_hnsw_experimental(definition, records.clone(), 2)?;
         assert_eq!(serial.planned_vectors, 256);
         assert_eq!(serial.planned_partitions, 4);
         assert_eq!(serial.planned_compute_threads, 1);
@@ -48911,6 +49693,14 @@ mod tests {
             Duration::ZERO,
         )?;
         let completed_before = execution_pool.completed_jobs();
+        let parallel_two = database.build_partitioned_hnsw_experimental(
+            definition,
+            records.iter().cloned().rev().collect(),
+            2,
+        )?;
+        assert_eq!(parallel_two.index, serial_two.index);
+        assert_eq!(parallel_two.planned_compute_threads, 2);
+        assert_eq!(parallel_two.worker_batches, 2);
         let parallel = database.build_partitioned_hnsw_experimental(
             definition,
             records.into_iter().rev().collect(),
@@ -48919,7 +49709,7 @@ mod tests {
         assert_eq!(parallel.index, serial.index);
         assert_eq!(parallel.planned_compute_threads, 4);
         assert_eq!(parallel.worker_batches, 4);
-        assert_eq!(execution_pool.completed_jobs() - completed_before, 4);
+        assert_eq!(execution_pool.completed_jobs() - completed_before, 6);
         assert_eq!(
             parallel.planned_memory_bytes,
             super::partitioned_hnsw_build_memory_bytes(256, definition)
@@ -48948,6 +49738,688 @@ mod tests {
                 hyphae_native_ann::AnnError::InvalidPartitionCount
             ))
         ));
+        Ok(())
+    }
+
+    fn assert_initial_ann_bulk_lifecycle(
+        mut database: NativeDatabase,
+        data_directory: &std::path::Path,
+        index: ObjectId,
+        query: &Vector,
+        evidence: super::InitialAnnBulkBuildEvidence,
+        expected: &[super::VectorHit],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::from_secs(5),
+        )?;
+        let reopened_observation = database.observe_ann_index(index)?;
+        assert_eq!(reopened_observation.base_identity, evidence.build_identity);
+        assert_eq!(reopened_observation.base_vector_count, 128);
+        assert_eq!(
+            database.search_vector_exact_latest(index, query, 8)?,
+            expected
+        );
+        let inserted = ObjectId::new(129)?;
+        let mut update = database.begin(0, DurabilityClass::Strict)?;
+        update.upsert_vector(
+            index,
+            inserted,
+            Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?,
+        )?;
+        assert!(update.delete_vector(index, ObjectId::new(1)?)?);
+        update.commit()?;
+        let with_deltas = database.observe_ann_index(index)?;
+        assert_eq!(with_deltas.base_identity, evidence.build_identity);
+        assert_eq!(with_deltas.effective_vector_count, 128);
+        assert_eq!(with_deltas.delta_records, 2);
+        let expected_after_delta = database.search_vector_exact_latest(index, query, 8)?;
+        assert!(
+            expected_after_delta
+                .iter()
+                .any(|hit| hit.object_id == inserted)
+        );
+        let consolidation = database.plan_ann_consolidation(index, 256, 8)?;
+        let retained_memory = super::partitioned_hnsw_build_memory_bytes(
+            256,
+            VectorIndexDefinition::new(
+                index,
+                8,
+                Metric::SquaredL2,
+                HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?,
+            )?,
+        );
+        let expected_memory = retained_memory
+            .saturating_add(retained_memory.saturating_sub(super::MAINTENANCE_MEMORY_BYTES));
+        assert_eq!(governor.usage_snapshot().memory_bytes, expected_memory);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        let cloned = consolidation.clone();
+        assert_eq!(governor.usage_snapshot().memory_bytes, expected_memory);
+        drop(cloned);
+        let consolidated = database.consolidate_ann(consolidation, DurabilityClass::Strict)?;
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(consolidated.consumed_delta_records, 2);
+        let after_consolidation = database.observe_ann_index(index)?;
+        assert_eq!(after_consolidation.delta_records, 0);
+        assert!(
+            after_consolidation.generation_records
+                > after_consolidation.selected_generation_records
+        );
+        assert_eq!(
+            database.search_vector_exact_latest(index, query, 8)?,
+            expected_after_delta
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(data_directory)?;
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, query, 8)?,
+            expected_after_delta
+        );
+        Ok(())
+    }
+
+    fn assert_initial_ann_bulk_progress(
+        progress: &[super::InitialAnnBulkProgress],
+        partitions: usize,
+    ) {
+        for update in [
+            super::InitialAnnBulkProgress {
+                stage: super::InitialAnnBulkProgressStage::Planning,
+                completed: 0,
+                total: 1,
+            },
+            super::InitialAnnBulkProgress {
+                stage: super::InitialAnnBulkProgressStage::Planning,
+                completed: 1,
+                total: 1,
+            },
+        ] {
+            assert!(progress.contains(&update));
+        }
+        for completed in 0..=partitions {
+            assert!(progress.contains(&super::InitialAnnBulkProgress {
+                stage: super::InitialAnnBulkProgressStage::Building,
+                completed,
+                total: partitions,
+            }));
+        }
+        let building = progress
+            .iter()
+            .filter(|update| update.stage == super::InitialAnnBulkProgressStage::Building)
+            .map(|update| update.completed)
+            .collect::<Vec<_>>();
+        assert_eq!(building, (0..=partitions).collect::<Vec<_>>());
+    }
+
+    fn initial_ann_bulk_test_vectors() -> Result<Vec<(ObjectId, Vector)>, Box<dyn std::error::Error>>
+    {
+        (1..=128_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([
+                        f32::from(value),
+                        f32::from(value % 3),
+                        f32::from(value % 5),
+                        f32::from(value % 7),
+                        f32::from(value % 11),
+                        f32::from(value % 13),
+                        f32::from(value % 17),
+                        1.0,
+                    ])?,
+                ))
+            })
+            .collect()
+    }
+
+    fn queue_competing_ann_memory(
+        governor: &Arc<NativeResourceGovernor>,
+        policy: &NativeGovernorPolicy,
+    ) -> Result<std::thread::JoinHandle<Result<(), GovernorQueueError>>, std::io::Error> {
+        let waiting_governor = Arc::clone(governor);
+        let waiting_cancellation = governor.cancellation_token();
+        let waiting_memory = policy.limit(WorkloadClass::Mutation).memory_bytes;
+        let waiting = std::thread::spawn(move || {
+            let permit = waiting_governor.admit_queued_owned(
+                WorkloadClass::Mutation,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: waiting_memory,
+                },
+                Duration::from_secs(5),
+                &waiting_cancellation,
+            )?;
+            drop(permit);
+            Ok(())
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while governor.queued_requests() == 0 {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other(
+                    "competing ANN request did not enter the queue",
+                ));
+            }
+            std::thread::yield_now();
+        }
+        Ok(waiting)
+    }
+
+    #[test]
+    fn initial_ann_bulk_publication_is_governed_atomic_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(75)?;
+        let mut create = database.begin(0, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "partitioned-durable",
+            8,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?,
+        )?;
+        create.commit()?;
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::from_secs(5),
+        )?;
+        let dropped = database.plan_initial_ann_bulk(
+            index,
+            vec![(
+                ObjectId::new(1)?,
+                Vector::new([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])?,
+            )],
+            1,
+        )?;
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            dropped.build_evidence().planned_memory_bytes
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        drop(dropped);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        let vectors = initial_ann_bulk_test_vectors()?;
+        let physical_before = database.physical_observation()?;
+        let completed_before = execution_pool.completed_jobs();
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_progress = Arc::clone(&progress);
+        let plan =
+            database.plan_initial_ann_bulk_with_progress(index, vectors, 4, move |update| {
+                observed_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(update);
+            })?;
+        let evidence = plan.build_evidence();
+        assert_eq!(
+            evidence.builder,
+            super::InitialAnnBulkBuilder::PartitionedHnswV1
+        );
+        assert_eq!(evidence.planned_vectors, 128);
+        assert_eq!(evidence.planned_partitions, 4);
+        assert_eq!(evidence.planned_compute_threads, 4);
+        assert_eq!(evidence.worker_batches, 4);
+        let progress = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_initial_ann_bulk_progress(&progress, 4);
+        drop(progress);
+        assert_eq!(execution_pool.completed_jobs() - completed_before, 4);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            evidence.planned_memory_bytes
+        );
+        let physical_after_build = database.physical_observation()?;
+        assert_eq!(physical_after_build.page_count, physical_before.page_count);
+        assert_eq!(physical_after_build.wal_bytes, physical_before.wal_bytes);
+
+        let waiting = queue_competing_ann_memory(&governor, &policy)?;
+        let published = database.publish_initial_ann_bulk(plan, DurabilityClass::Strict)?;
+        waiting
+            .join()
+            .map_err(|_| std::io::Error::other("competing ANN request panicked"))??;
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(published.index_id, index);
+        assert_eq!(published.build, evidence);
+        let observed = database.observe_ann_index(index)?;
+        assert_eq!(observed.base_identity, evidence.build_identity);
+        assert_eq!(observed.base_vector_count, 128);
+        assert_eq!(observed.effective_vector_count, 128);
+        assert_eq!(observed.delta_records, 0);
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+        let expected = database.search_vector_exact_latest(index, &query, 8)?;
+        drop(database);
+        assert_initial_ann_bulk_lifecycle(
+            NativeDatabase::open(temporary.path())?,
+            temporary.path(),
+            index,
+            &query,
+            evidence,
+            &expected,
+        )
+    }
+
+    #[test]
+    fn initial_ann_bulk_publication_rejects_an_intervening_root_without_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(76)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "stale-partitioned",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let vectors = (1..=16_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([f32::from(value), 1.0])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let plan = database.plan_initial_ann_bulk(index, vectors, 2)?;
+        let mut intervening = database.begin(0, DurabilityClass::Memory)?;
+        intervening.set(b"winner".to_vec(), b"root".to_vec(), None)?;
+        intervening.commit()?;
+        let physical_before_rejection = database.physical_observation()?;
+
+        assert!(matches!(
+            database.publish_initial_ann_bulk(plan, DurabilityClass::Memory),
+            Err(NativeRuntimeError::InitialAnnBulkStale)
+        ));
+        let physical_after_rejection = database.physical_observation()?;
+        assert_eq!(
+            physical_after_rejection.page_count,
+            physical_before_rejection.page_count
+        );
+        assert_eq!(
+            physical_after_rejection.wal_bytes,
+            physical_before_rejection.wal_bytes
+        );
+        assert_eq!(
+            database.get_latest_structure(b"winner", 0)?,
+            Some(b"root".to_vec())
+        );
+        let observed = database.observe_ann_index(index)?;
+        assert_eq!(observed.base_vector_count, 0);
+        assert_eq!(observed.effective_vector_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_cancellation_releases_governor_without_a_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(77)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "cancel-partitioned",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let cancellation = governor.cancellation_token();
+        cancellation.cancel();
+        let physical_before = database.physical_observation()?;
+        let result = database.plan_initial_ann_bulk_with_cancellation(
+            index,
+            vec![(ObjectId::new(1)?, Vector::new([1.0, 1.0])?)],
+            1,
+            &cancellation,
+        );
+        assert!(matches!(
+            result,
+            Err(NativeRuntimeError::Ann(
+                hyphae_native_ann::AnnError::BuildCancelled
+            ))
+        ));
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(database.observe_ann_index(index)?.base_vector_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_rejects_unrepresentable_partition_metadata_before_building()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::ann_store::maximum_initial_ann_bulk_partitions(1),
+            221
+        );
+        assert_eq!(
+            super::ann_store::maximum_initial_ann_bulk_partitions(2),
+            220
+        );
+        assert_eq!(
+            super::ann_store::maximum_initial_ann_bulk_partitions(64),
+            123
+        );
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(84)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "partition-limit",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let vectors = (1..=222_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([f32::from(value), 1.0])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let physical_before = database.physical_observation()?;
+
+        assert!(matches!(
+            database.plan_initial_ann_bulk(index, vectors, 222),
+            Err(NativeRuntimeError::InitialAnnBulkPartitionLimit {
+                requested: 222,
+                maximum: super::MAX_INITIAL_ANN_BULK_PARTITIONS,
+            })
+        ));
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+
+        let representable = database.plan_initial_ann_bulk(
+            index,
+            (1..=221_u16)
+                .map(|value| {
+                    Ok((
+                        ObjectId::new(u128::from(value))?,
+                        Vector::new([f32::from(value), 1.0])?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+            221,
+        )?;
+        assert_eq!(representable.build_evidence().planned_partitions, 221);
+        let reduced = database.plan_initial_ann_bulk(
+            index,
+            vec![(ObjectId::new(1)?, Vector::new([1.0, 1.0])?)],
+            usize::MAX,
+        )?;
+        assert_eq!(reduced.build_evidence().planned_partitions, 1);
+
+        let retained_index = ObjectId::new(85)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index_with_lifecycle(
+            retained_index,
+            "partition-limit-retained",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+            hyphae_native_catalog::IncrementalVectorLifecycle {
+                delta_max_entries: 4_096,
+                consolidate_after_deltas: 4_096,
+                retain_generations: 64,
+            },
+        )?;
+        create.commit()?;
+        let retained_vectors = (1..=124_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([f32::from(value), 1.0])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        assert!(matches!(
+            database.plan_initial_ann_bulk(retained_index, retained_vectors, 124),
+            Err(NativeRuntimeError::InitialAnnBulkPartitionLimit {
+                requested: 124,
+                maximum: 123,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_cancellation_wakes_queued_admission_without_a_candidate()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(83)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "queued-cancel-partitioned",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::from_secs(5),
+        )?;
+        let bulk_limit = policy.limit(WorkloadClass::Bulk);
+        let held = governor.try_admit_owned(
+            WorkloadClass::Bulk,
+            GovernorRequest {
+                compute_threads: bulk_limit.compute_threads,
+                io_slots: 0,
+                memory_bytes: bulk_limit.memory_bytes,
+            },
+        )?;
+        let cancellation = governor.cancellation_token();
+        let cancellation_thread = cancellation.clone();
+        let queued_governor = Arc::clone(&governor);
+        let cancel = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while queued_governor.queued_requests() == 0 {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::other(
+                        "initial ANN build did not enter the governor queue",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            cancellation_thread.cancel();
+            Ok(())
+        });
+        let physical_before = database.physical_observation()?;
+        assert!(matches!(
+            database.plan_initial_ann_bulk_with_cancellation(
+                index,
+                vec![(ObjectId::new(1)?, Vector::new([1.0, 1.0])?)],
+                1,
+                &cancellation,
+            ),
+            Err(NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::Cancelled
+            ))
+        ));
+        cancel
+            .join()
+            .map_err(|_| std::io::Error::other("cancellation thread panicked"))??;
+        drop(held);
+        assert_eq!(governor.queued_requests(), 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(database.observe_ann_index(index)?.base_vector_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_crash_matrix_reopens_to_prior_or_complete_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let index = ObjectId::new(78)?;
+            let mut create = database.begin(0, DurabilityClass::Strict)?;
+            create.create_vector_index(
+                index,
+                "crash-partitioned",
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            create.commit()?;
+            let prior_identity = database.observe_ann_index(index)?.base_identity;
+            let vectors = (1..=16_u16)
+                .map(|value| {
+                    Ok((
+                        ObjectId::new(u128::from(value))?,
+                        Vector::new([f32::from(value), 1.0])?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let plan = database.plan_initial_ann_bulk(index, vectors, 4)?;
+            let complete_identity = plan.build_evidence().build_identity;
+            assert!(matches!(
+                database.publish_initial_ann_bulk_with_interruption(
+                    plan,
+                    DurabilityClass::Strict,
+                    boundary,
+                ),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let observed = reopened.observe_ann_index(index)?;
+            match observed.base_vector_count {
+                0 => assert_eq!(observed.base_identity, prior_identity),
+                16 => {
+                    assert_eq!(observed.base_identity, complete_identity);
+                    assert_eq!(
+                        reopened
+                            .search_vector_exact_latest(index, &Vector::new([8.0, 1.0])?, 16,)?
+                            .len(),
+                        16
+                    );
+                }
+                count => return Err(format!("partial ANN generation with {count} vectors").into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_medium_corpus_executes_governed_partitions_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(79)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "medium-partitioned",
+            16,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(8, 48, 32, 64, 0x4D45_4449)?,
+        )?;
+        create.commit()?;
+        let mut policy = parallel_engine_admission_test_policy();
+        policy.memory_bytes = 256 * 1_024 * 1_024;
+        for limit in &mut policy.class_limits {
+            limit.memory_bytes = policy.memory_bytes;
+        }
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let vectors = (1..=4_097_u16)
+            .map(|value| {
+                let components: [f32; 16] = std::array::from_fn(|dimension| {
+                    f32::from(value.wrapping_mul(u16::try_from(dimension + 1).unwrap_or(u16::MAX)))
+                        / 4_097.0
+                });
+                Ok((ObjectId::new(u128::from(value))?, Vector::new(components)?))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let completed_before = execution_pool.completed_jobs();
+        let plan = database.plan_initial_ann_bulk(index, vectors, 8)?;
+        let evidence = plan.build_evidence();
+        assert_eq!(
+            evidence.builder,
+            super::InitialAnnBulkBuilder::PartitionedHnswV1
+        );
+        assert_eq!(evidence.planned_vectors, 4_097);
+        assert_eq!(evidence.planned_partitions, 8);
+        assert_eq!(evidence.planned_compute_threads, 4);
+        assert_eq!(evidence.worker_batches, 4);
+        assert_eq!(execution_pool.completed_jobs() - completed_before, 4);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            evidence.planned_memory_bytes
+        );
+        database.publish_initial_ann_bulk(plan, DurabilityClass::Memory)?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let observed = reopened.observe_ann_index(index)?;
+        assert_eq!(observed.base_identity, evidence.build_identity);
+        assert_eq!(observed.base_vector_count, 4_097);
+        assert_eq!(observed.delta_records, 0);
         Ok(())
     }
 
@@ -51297,6 +52769,7 @@ mod tests {
             mode: super::NativeWriteBatchMode::PhysicalStructureCompaction,
             delta: None,
             ann_consolidation: None,
+            ann_initial_bulk: None,
             _resource_permit: None,
         };
         let compacted = super::commit_engine_roots(

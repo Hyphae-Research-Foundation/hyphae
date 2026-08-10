@@ -36,6 +36,43 @@ STATES = ("warm",)
 CONCURRENCIES = (1, 8, 32)
 BACKGROUND_MODES = ("control", "interference")
 ACTIVE_PROCESS: subprocess.Popen[str] | None = None
+MAX_INITIAL_ANN_BULK_PARTITIONS = 221
+
+
+class ProgressWatchdog:
+    def __init__(self, path: Path, timeout_seconds: float, started: float) -> None:
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        self.last_activity = started
+        self.last_sequence: int | None = None
+        self.last_progress_summary = "no progress payload observed"
+        self.completed = False
+
+    def observe(self, now: float) -> None:
+        if self.path.is_file():
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            sequence = payload.get("sequence")
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+                raise RuntimeError("G7 runner progress has an invalid sequence")
+            if self.last_sequence is None or sequence > self.last_sequence:
+                self.last_sequence = sequence
+                self.last_activity = now
+            elif sequence < self.last_sequence:
+                raise RuntimeError("G7 runner progress sequence regressed")
+            details = payload.get("details")
+            eta = details.get("eta") if isinstance(details, dict) else None
+            self.last_progress_summary = (
+                f"sequence={sequence}, stage={payload.get('stage')!r}, "
+                f"completed={payload.get('completed_units')!r}/"
+                f"{payload.get('total_units')!r}, eta="
+                f"{json.dumps(eta, sort_keys=True, separators=(',', ':'))}"
+            )
+            self.completed = payload.get("status") == "completed"
+        if not self.completed and now - self.last_activity >= self.timeout_seconds:
+            raise RuntimeError(
+                f"G7 runner progress stalled for {self.timeout_seconds:.0f}s; "
+                f"last progress: {self.last_progress_summary}"
+            )
 
 
 def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
@@ -198,6 +235,8 @@ def run_cell(
     environment: dict[str, str] | None = None,
     macos_counter_template: Path | None = None,
     timeout_seconds: float | None = None,
+    progress_path: Path | None = None,
+    stall_timeout_seconds: float | None = None,
 ) -> dict:
     global ACTIVE_PROCESS
     base_command = [str(binary), commit, platform, state, str(concurrency)]
@@ -223,6 +262,12 @@ def run_cell(
             *base_command,
         ]
     started = time.monotonic()
+    watchdog = (
+        ProgressWatchdog(progress_path, stall_timeout_seconds, started)
+        if progress_path is not None and stall_timeout_seconds is not None
+        else None
+    )
+    next_progress_check = started
     environment = dict(os.environ if environment is None else environment)
     environment["RUST_BACKTRACE"] = "1"
     child_usage_before = (
@@ -241,7 +286,21 @@ def run_cell(
     metrics = ProcessMetrics(process.pid)
     while process.poll() is None:
         metrics.sample()
-        if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
+        now = time.monotonic()
+        if watchdog is not None and now >= next_progress_check:
+            try:
+                watchdog.observe(now)
+            except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as error:
+                stop_process(process)
+                stdout, stderr = process.communicate()
+                if perf_output is not None:
+                    perf_output.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"G7 cell progress watchdog failed ({state}/{concurrency}): {error}; "
+                    f"runner stderr: {stderr.strip()}"
+                ) from error
+            next_progress_check = now + 1.0
+        if timeout_seconds is not None and now - started >= timeout_seconds:
             stop_process(process)
             stdout, stderr = process.communicate()
             if perf_output is not None:
@@ -522,12 +581,140 @@ def validate_completed_ann_progress(
 ) -> None:
     validate_progress(progress, expected_commit)
     if (
-        progress.get("operation") != "ann-bulk-build"
+        progress.get("operation") not in {"ann-bulk-build", "ann-seed-verify"}
         or progress.get("stage") != "ann-published"
         or progress.get("status") != "completed"
         or progress.get("unit") != "vectors"
     ):
         raise RuntimeError("G7 ANN progress did not reach durable publication")
+    details = progress.get("details")
+    if not isinstance(details, dict):
+        raise RuntimeError("G7 ANN progress omitted its details")
+    validate_progress_eta(details.get("eta"), completed=True)
+    evidence = {name: value for name, value in details.items() if name != "eta"}
+    validate_initial_ann_bulk_evidence(evidence, expected_commit)
+    if evidence["dataset_digest"] != progress["dataset_digest"]:
+        raise RuntimeError("G7 ANN progress details target another dataset")
+
+
+def validate_progress_eta(value: object, *, completed: bool) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "status", "estimated_remaining_nanos"
+    }:
+        raise RuntimeError("G7 runner progress ETA fields mismatch")
+    status = value["status"]
+    remaining = value["estimated_remaining_nanos"]
+    if completed:
+        if status != "completed" or remaining != 0:
+            raise RuntimeError("completed G7 progress has an invalid ETA")
+        return
+    if status not in {"pending", "estimated"}:
+        raise RuntimeError("running G7 progress has an invalid ETA status")
+    if status == "pending" and remaining is not None:
+        raise RuntimeError("pending G7 progress ETA must be unknown")
+    if status == "estimated" and (
+        not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0
+    ):
+        raise RuntimeError("estimated G7 progress ETA is invalid")
+
+
+def validate_initial_ann_bulk_evidence(
+    evidence: object, expected_commit: str
+) -> None:
+    fields = {
+        "schema", "source_commit", "dataset_digest", "builder", "input_identity",
+        "aggregate_identity", "planned_vectors", "planned_partitions", "planned_workers",
+        "planned_memory_bytes", "worker_batches", "total_time_nanos",
+        "hardware_profile_fingerprint", "governor_policy_schema", "governor_mode",
+        "calibration_cache_key", "topology_digest", "topology_workers", "hard_affinity",
+        "governor_execution",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        raise RuntimeError("G7 initial ANN bulk evidence fields mismatch")
+    if (
+        evidence["schema"] != "hyphae-native-g7-initial-ann-bulk-v1"
+        or evidence["source_commit"] != expected_commit
+        or evidence["builder"] != "partitioned-hnsw-v1"
+        or evidence["governor_mode"] not in {"bulk", "mixed"}
+        or not isinstance(evidence["hard_affinity"], bool)
+    ):
+        raise RuntimeError("G7 initial ANN bulk evidence identity mismatch")
+    for name in (
+        "dataset_digest", "input_identity", "aggregate_identity",
+        "hardware_profile_fingerprint", "topology_digest",
+    ):
+        value = evidence[name]
+        if not isinstance(value, str) or len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise RuntimeError(f"G7 initial ANN bulk {name} is not a canonical digest")
+    for name in (
+        "planned_vectors", "planned_partitions", "planned_workers",
+        "planned_memory_bytes", "worker_batches", "topology_workers",
+    ):
+        value = evidence[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RuntimeError(f"G7 initial ANN bulk {name} is invalid")
+    if evidence["planned_partitions"] > evidence["planned_vectors"]:
+        raise RuntimeError("G7 initial ANN bulk partition plan exceeds its vectors")
+    if evidence["planned_partitions"] > MAX_INITIAL_ANN_BULK_PARTITIONS:
+        raise RuntimeError("G7 initial ANN bulk exceeds its durable partition limit")
+    if evidence["topology_workers"] > MAX_INITIAL_ANN_BULK_PARTITIONS:
+        raise RuntimeError("G7 execution topology exceeds the durable ANN partition limit")
+    if evidence["planned_workers"] > evidence["topology_workers"]:
+        raise RuntimeError("G7 initial ANN bulk worker plan exceeds its topology")
+    if evidence["topology_workers"] > 1 and evidence["planned_workers"] <= 1:
+        raise RuntimeError("G7 initial ANN bulk ignored its multi-worker topology")
+    if evidence["planned_workers"] > 1 and evidence["worker_batches"] <= 1:
+        raise RuntimeError("G7 initial ANN bulk did not prove parallel worker batches")
+    execution = evidence["governor_execution"]
+    execution_fields = {
+        "class", "compute_threads", "io_slots", "memory_bytes", "queue_ticket",
+        "initial_queue_depth", "queue_time_nanos", "execution_time_nanos",
+    }
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != execution_fields
+        or execution["class"] != "bulk"
+        or not isinstance(execution["compute_threads"], int)
+        or isinstance(execution["compute_threads"], bool)
+        or execution["compute_threads"] <= 0
+        or execution["compute_threads"] != evidence["planned_workers"]
+        or not isinstance(execution["memory_bytes"], int)
+        or isinstance(execution["memory_bytes"], bool)
+        or execution["memory_bytes"] <= 0
+        or execution["memory_bytes"] != evidence["planned_memory_bytes"]
+        or not isinstance(execution["io_slots"], int)
+        or isinstance(execution["io_slots"], bool)
+        or execution["io_slots"] != 0
+        or not isinstance(execution["initial_queue_depth"], int)
+        or isinstance(execution["initial_queue_depth"], bool)
+        or execution["initial_queue_depth"] < 0
+        or not isinstance(execution["queue_time_nanos"], int)
+        or isinstance(execution["queue_time_nanos"], bool)
+        or execution["queue_time_nanos"] < 0
+        or not isinstance(execution["execution_time_nanos"], int)
+        or isinstance(execution["execution_time_nanos"], bool)
+        or execution["execution_time_nanos"] <= 0
+        or (
+            execution["queue_ticket"] is not None
+            and (
+                not isinstance(execution["queue_ticket"], int)
+                or isinstance(execution["queue_ticket"], bool)
+                or execution["queue_ticket"] < 0
+            )
+        )
+    ):
+        raise RuntimeError("G7 initial ANN bulk governor execution evidence mismatch")
+
+
+def load_contract_path(path: Path, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} must contain one JSON object")
+    return payload
 
 
 def prepare_macos_counter_template(directory: Path) -> Path:
@@ -641,10 +828,18 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=100_000)
     parser.add_argument("--background", action="store_true")
     parser.add_argument("--hardware-file", type=Path)
+    parser.add_argument("--hardware-profile", type=Path)
+    parser.add_argument("--governor-policy", type=Path)
+    parser.add_argument("--execution-topology", type=Path)
     parser.add_argument("--cell-timeout-seconds", type=int, default=7_200)
     parser.add_argument("--matrix-timeout-seconds", type=int, default=39_600)
+    parser.add_argument("--stall-timeout-seconds", type=int, default=1_800)
     arguments = parser.parse_args()
-    if arguments.cell_timeout_seconds <= 0 or arguments.matrix_timeout_seconds <= 0:
+    if (
+        arguments.cell_timeout_seconds <= 0
+        or arguments.matrix_timeout_seconds <= 0
+        or arguments.stall_timeout_seconds <= 0
+    ):
         raise ValueError("G7 timeout bounds must be positive")
     source_tree = verify_source(arguments.source_commit)
     hardware_path = arguments.hardware_file or (
@@ -669,6 +864,33 @@ def main() -> int:
             "virtualization": "unknown",
         }
     )
+    contract_arguments = (
+        (
+            "hardware profile",
+            arguments.hardware_profile,
+            "HYPHAE_G7_HARDWARE_PROFILE_FILE",
+        ),
+        (
+            "governor policy",
+            arguments.governor_policy,
+            "HYPHAE_G7_GOVERNOR_POLICY_FILE",
+        ),
+        (
+            "execution topology",
+            arguments.execution_topology,
+            "HYPHAE_G7_EXECUTION_TOPOLOGY_FILE",
+        ),
+    )
+    contract_paths: dict[str, Path] = {}
+    for label, argument_path, environment_name in contract_arguments:
+        path = argument_path or (
+            Path(os.environ[environment_name])
+            if environment_name in os.environ else None
+        )
+        if path is None:
+            raise RuntimeError(f"G7 runner requires --{label.replace(' ', '-')}")
+        load_contract_path(path, label)
+        contract_paths[environment_name] = path.resolve()
     binary = ROOT / "conformance" / "g7" / "runners" / "rust" / "target" / "release" / "hyphae-native-g7-runner"
     if os.name == "nt":
         binary = binary.with_suffix(".exe")
@@ -697,6 +919,8 @@ def main() -> int:
     environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
     environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
     environment["HYPHAE_G7_SOURCE_TREE"] = source_tree
+    for environment_name, path in contract_paths.items():
+        environment[environment_name] = str(path)
     progress_path = arguments.output.with_name(
         f"{arguments.output.stem}.progress.json"
     )
@@ -780,6 +1004,7 @@ def main() -> int:
                 else:
                     cell_environment.pop("HYPHAE_G7_BACKGROUND", None)
                 try:
+                    runner_progress_path.unlink(missing_ok=True)
                     receipt = run_cell(
                         binary,
                         arguments.source_commit,
@@ -789,6 +1014,29 @@ def main() -> int:
                         cell_environment,
                         macos_counter_template,
                         min(float(arguments.cell_timeout_seconds), remaining_seconds),
+                        runner_progress_path,
+                        float(arguments.stall_timeout_seconds),
+                    )
+                except BaseException:
+                    write_matrix_progress(
+                        progress_path,
+                        arguments.source_commit,
+                        arguments.platform,
+                        completed_cells,
+                        total_cells,
+                        current_cell,
+                        "failed",
+                        started_unix_nanos,
+                    )
+                    raise
+                try:
+                    if not runner_progress_path.is_file():
+                        raise RuntimeError("G7 runner did not produce mandatory progress")
+                    runner_progress = json.loads(
+                        runner_progress_path.read_text(encoding="utf-8")
+                    )
+                    validate_completed_ann_progress(
+                        runner_progress, arguments.source_commit
                     )
                 except BaseException:
                     write_matrix_progress(
@@ -805,6 +1053,14 @@ def main() -> int:
                 receipt["background_mode"] = background_mode
                 receipt["hardware"] = hardware
                 receipt["build"] = build
+                validate_initial_ann_bulk_evidence(
+                    receipt.get("initial_ann_bulk"), arguments.source_commit
+                )
+                if (
+                    receipt["initial_ann_bulk"]["dataset_digest"]
+                    != receipt["dataset"]["digest"]
+                ):
+                    raise RuntimeError("G7 ANN evidence targets another receipt dataset")
                 receipts.append(receipt)
                 completed_cells.append(current_cell)
                 write_matrix_progress(
@@ -859,7 +1115,7 @@ def main() -> int:
     for receipt in receipts:
         receipt.pop("controller", None)
     result = {
-        "schema": "hyphae-native-g7-matrix-v2",
+        "schema": "hyphae-native-g7-matrix-v3",
         "gate": "G7",
         "status": "closure-candidate",
         "source_commit": arguments.source_commit,
@@ -873,11 +1129,11 @@ def main() -> int:
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    runner_progress_status = "not-produced"
-    if runner_progress_path.is_file():
-        runner_progress = json.loads(runner_progress_path.read_text(encoding="utf-8"))
-        validate_completed_ann_progress(runner_progress, arguments.source_commit)
-        runner_progress_status = runner_progress["status"]
+    if not runner_progress_path.is_file():
+        raise RuntimeError("G7 runner progress disappeared before matrix completion")
+    runner_progress = json.loads(runner_progress_path.read_text(encoding="utf-8"))
+    validate_completed_ann_progress(runner_progress, arguments.source_commit)
+    runner_progress_status = runner_progress["status"]
     write_matrix_progress(
         progress_path,
         arguments.source_commit,

@@ -397,6 +397,19 @@ impl QueuedGovernorPermit {
         &self.permit
     }
 
+    /// Returns elapsed execution time without releasing the allocation.
+    pub fn execution_time(&self) -> Duration {
+        self.execution_started.elapsed()
+    }
+
+    pub(crate) fn shrink_to(
+        mut self,
+        request: GovernorRequest,
+    ) -> Result<Self, GovernorAdmissionError> {
+        self.permit = self.permit.shrink_to(request)?;
+        Ok(self)
+    }
+
     /// Converts queued admission into a long-lived owned allocation.
     ///
     /// This deliberately discards component timing when a transaction must
@@ -643,7 +656,7 @@ impl NativeResourceGovernor {
                     .records
                     .remove(&ticket)
                     .ok_or(GovernorQueueError::Synchronization)?;
-                queue.queue_mut(class).pop_front();
+                queue.queue_mut(class).retain(|queued| *queued != ticket);
                 queue.selected = None;
                 queue.record_dispatch(class, self.policy.foreground_burst_limit);
                 self.select_next_locked(&mut queue);
@@ -760,25 +773,28 @@ impl NativeResourceGovernor {
         }
         let force_background = !queue.background.is_empty()
             && queue.foreground_dispatches_since_background >= self.policy.foreground_burst_limit;
+        let first_admissible = |tickets: &VecDeque<u64>| {
+            tickets.iter().copied().find(|ticket| {
+                queue
+                    .records
+                    .get(ticket)
+                    .is_some_and(|record| self.can_reserve_admission(record.class, record.request))
+            })
+        };
         let candidates = if force_background {
             [
-                queue.background.front(),
-                queue.high.front(),
-                queue.normal.front(),
+                first_admissible(&queue.background),
+                first_admissible(&queue.high),
+                first_admissible(&queue.normal),
             ]
         } else {
             [
-                queue.high.front(),
-                queue.normal.front(),
-                queue.background.front(),
+                first_admissible(&queue.high),
+                first_admissible(&queue.normal),
+                first_admissible(&queue.background),
             ]
         };
-        queue.selected = candidates.into_iter().flatten().copied().find(|ticket| {
-            queue
-                .records
-                .get(ticket)
-                .is_some_and(|record| self.can_reserve_admission(record.class, record.request))
-        });
+        queue.selected = candidates.into_iter().flatten().next();
     }
 
     fn remove_ticket_locked(queue: &mut AdmissionQueueState, ticket: u64, class: WorkloadClass) {
@@ -787,6 +803,27 @@ impl NativeResourceGovernor {
         if queue.selected == Some(ticket) {
             queue.selected = None;
         }
+    }
+
+    fn shrink_admission(
+        &self,
+        class: WorkloadClass,
+        current: GovernorRequest,
+        retained: GovernorRequest,
+    ) {
+        let released = GovernorRequest {
+            compute_threads: current.compute_threads - retained.compute_threads,
+            io_slots: current.io_slots - retained.io_slots,
+            memory_bytes: current.memory_bytes - retained.memory_bytes,
+        };
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        release_usage(&self.classes[class.index()], released);
+        release_usage(&self.global, released);
+        self.select_next_locked(&mut queue);
+        self.queue_changed.notify_all();
     }
 
     fn release_admission(&self, class: WorkloadClass, request: GovernorRequest) {
@@ -854,6 +891,36 @@ impl OwnedGovernorPermit {
     /// Returns the complete parent allocation.
     pub fn request(&self) -> GovernorRequest {
         self.allocation.request
+    }
+
+    pub(crate) fn shrink_to(
+        mut self,
+        request: GovernorRequest,
+    ) -> Result<Self, GovernorAdmissionError> {
+        if request.compute_threads == 0 && request.io_slots == 0 && request.memory_bytes == 0 {
+            return Err(GovernorAdmissionError::EmptyRequest);
+        }
+        let allocation =
+            Arc::get_mut(&mut self.allocation).ok_or(GovernorAdmissionError::ParentCapacity)?;
+        let current = allocation.request;
+        if request.compute_threads > current.compute_threads
+            || request.io_slots > current.io_slots
+            || request.memory_bytes > current.memory_bytes
+            || allocation
+                .nested_usage
+                .compute_threads
+                .load(Ordering::Acquire)
+                > request.compute_threads
+            || allocation.nested_usage.io_slots.load(Ordering::Acquire) > request.io_slots
+            || allocation.nested_usage.memory_bytes.load(Ordering::Acquire) > request.memory_bytes
+        {
+            return Err(GovernorAdmissionError::ParentCapacity);
+        }
+        allocation.request = request;
+        allocation
+            .governor
+            .shrink_admission(allocation.class, current, request);
+        Ok(self)
     }
 
     /// Subdivides already-owned resources without reacquiring global tokens.
@@ -1369,6 +1436,37 @@ mod tests {
         ));
         drop(cloned_permit);
         assert!(survivor.try_admit(WorkloadClass::Bulk, request).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_permit_atomically_retains_memory_while_releasing_compute_and_io()
+    -> Result<(), GovernorAdmissionError> {
+        let governor = Arc::new(NativeResourceGovernor::new(test_policy()));
+        let permit = governor.try_admit_owned(WorkloadClass::Bulk, request(3, 2, 512))?;
+        let permit = permit.shrink_to(request(0, 0, 512))?;
+        assert_eq!(
+            governor.usage_snapshot(),
+            GovernorUsageSnapshot {
+                compute_threads: 0,
+                io_slots: 0,
+                memory_bytes: 512,
+                queued_requests: 0,
+            }
+        );
+        let foreground = governor.try_admit_owned(WorkloadClass::Mutation, request(1, 1, 0))?;
+        assert_eq!(governor.usage_snapshot().memory_bytes, 512);
+        drop(foreground);
+        drop(permit);
+        assert_eq!(
+            governor.usage_snapshot(),
+            GovernorUsageSnapshot {
+                compute_threads: 0,
+                io_slots: 0,
+                memory_bytes: 0,
+                queued_requests: 0,
+            }
+        );
         Ok(())
     }
 
