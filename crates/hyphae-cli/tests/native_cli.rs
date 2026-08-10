@@ -62,9 +62,8 @@ fn path(path: &Path) -> String {
 }
 
 fn materialize_format2_fixture(destination: &Path) -> Result<(), Box<dyn Error>> {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../compatibility/v2/data-directory.json"
-    ))?;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/format2-data-directory.json"))?;
     for (relative, encoded) in fixture["files_hex"]
         .as_object()
         .ok_or("fixture files_hex is not an object")?

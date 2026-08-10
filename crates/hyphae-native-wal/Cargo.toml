@@ -7,9 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/hyphae-native-wal"
 readme = "README.md"
 description = "Block-framed authoritative WAL codec and file for native Hyphae."
-publish = false
+publish.workspace = true
 
 [dependencies]
 blake3.workspace = true

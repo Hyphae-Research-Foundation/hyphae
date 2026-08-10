@@ -260,14 +260,14 @@ class G8ProducerTests(unittest.TestCase):
             "platform": target,
             "installed_smoke": "passed",
             "native_engines": ["sql", "structures", "search"],
-            "engine_version": "1.0.0",
-            "archive": f"hyphae-1.0.0-{target}.tar.gz",
+            "engine_version": "1.0.1",
+            "archive": f"hyphae-1.0.1-{target}.tar.gz",
             "proofs_verified": 4,
             "archive_sha256": "c" * 64,
         }, platform=target)
 
     def test_signed_release_requires_all_four_provenance_targets(self) -> None:
-        version = "1.0.0"
+        version = "1.0.1"
         self.assert_valid("sbom-signatures-provenance", {
             "schema": "hyphae-native-g8-signed-release-v1",
             "status": "passed",
@@ -293,7 +293,7 @@ class G8ProducerTests(unittest.TestCase):
             "schema": "hyphae-native-g8-signed-release-v1",
             "status": "passed",
             "source_commit": COMMIT,
-            "tag": "v1.0.0",
+            "tag": "v1.0.1",
             "archive_count": 4,
             "signature_verifications": 12,
             "attestation_verifications": 12,

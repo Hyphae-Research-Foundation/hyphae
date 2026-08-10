@@ -33,14 +33,13 @@ by the release workflow. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 
-**Published release:** [`v1.0.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0)
-is distributed as signed native archives from GitHub Releases. The prior
-`0.2.1` crates.io line remains the format-2 compatibility baseline; its
-publication receipt is retained at
+**Current release:** `v1.0.1` distributes the complete 24-crate Native Rust
+ecosystem through crates.io and signed native archives through GitHub Releases.
+The prior `0.2.1` compatibility publication receipt is retained at
 [`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
 
-The Native line releases as `1.0.0` after G8 closes on the exact release
-commit. G7 does not block publication, but Hyphae makes no certified latency,
+G8 release evidence binds publication to the exact release commit. G7 does
+not block publication, but Hyphae makes no certified latency,
 saturation, or production-scale performance claim until G7 closes on dedicated
 hardware.
 
@@ -68,14 +67,18 @@ The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 ## Install
 
 Download the archive for your platform from the
-[`v1.0.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.0.0),
+[`v1.0.1` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.0.1),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
-binary. Native 1.0 crates are not published to crates.io.
+binary. To install from crates.io, run:
+
+```bash
+cargo install hyphae-cli --version 1.0.1 --locked
+```
 
 Build and embed the exact release from source with:
 
 ```bash
-git checkout v1.0.0
+git checkout v1.0.1
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```

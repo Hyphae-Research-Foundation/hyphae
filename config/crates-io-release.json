@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "version": "1.0.1",
+  "mirrors": [
+    {
+      "source": "compatibility/v2/data-directory.json",
+      "packaged": "crates/hyphae-cli/tests/fixtures/format2-data-directory.json"
+    }
+  ],
+  "semver_baseline_packages": [
+    "hyphae-client",
+    "hyphae-contracts",
+    "hyphae-core",
+    "hyphae-engine",
+    "hyphae-pliegors",
+    "hyphae-query",
+    "hyphae-retrieval",
+    "hyphae-server",
+    "hyphae-storage"
+  ],
+  "layers": [
+    [
+      "hyphae-core",
+      "hyphae-native-types"
+    ],
+    [
+      "hyphae-native-ann",
+      "hyphae-native-catalog",
+      "hyphae-native-mvcc",
+      "hyphae-native-pages",
+      "hyphae-native-records",
+      "hyphae-native-wal",
+      "hyphae-query"
+    ],
+    [
+      "hyphae-contracts",
+      "hyphae-native-blobs",
+      "hyphae-native-btree",
+      "hyphae-native-manifest",
+      "hyphae-retrieval"
+    ],
+    [
+      "hyphae-native-runtime",
+      "hyphae-storage"
+    ],
+    [
+      "hyphae-engine",
+      "hyphae-native-product"
+    ],
+    [
+      "hyphae-native-protocol"
+    ],
+    [
+      "hyphae-client",
+      "hyphae-native-daemon",
+      "hyphae-server"
+    ],
+    [
+      "hyphae-cli",
+      "hyphae-pliegors"
+    ]
+  ]
+}

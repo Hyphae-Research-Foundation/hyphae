@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 description = "Bounded Rust client for Hyphae HTTP and native-local APIs."
 documentation = "https://docs.rs/hyphae-client"
-publish = false
+publish.workspace = true
 
 [dependencies]
 hyphae-contracts.workspace = true

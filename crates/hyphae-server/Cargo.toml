@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 description = "Secure loopback-first HTTP server for the Hyphae data engine."
 documentation = "https://docs.rs/hyphae-server"
-publish = false
+publish.workspace = true
 
 [dependencies]
 axum.workspace = true

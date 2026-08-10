@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 description = "Optional public-contract adapter between PliegoRS and Hyphae."
 documentation = "https://docs.rs/hyphae-pliegors"
-publish = false
+publish.workspace = true
 
 [dependencies]
 hyphae-client.workspace = true
