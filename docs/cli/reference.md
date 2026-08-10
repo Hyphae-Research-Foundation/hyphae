@@ -26,6 +26,7 @@ This page explains semantics and side effects that do not fit in short help.
 - `search`
 - `transaction`
 - `explain`
+- `hardware`
 - `status`
 - `telemetry`
 - `doctor`
@@ -165,6 +166,55 @@ hyphae capabilities --data-dir <NATIVE_DIRECTORY>
 `init` fails if the destination exists. `capabilities` reports the Native
 product API, directory format, operations, limits, and durability classes
 without starting a listener.
+
+## `hardware`
+
+```text
+hyphae hardware discover [--data-dir <PATH>]
+hyphae hardware calibrate [--data-dir <PATH>] [--mode <quick|thorough>]
+                           [--cache-dir <PATH> | --no-cache]
+hyphae hardware governor-policy [--data-dir <PATH>]
+                                --calibration <RECEIPT.json>
+                                [--mode <latency|bulk|mixed>]
+hyphae hardware execution-topology [--data-dir <PATH>]
+                                   --calibration <RECEIPT.json>
+                                   [--mode <latency|bulk|mixed>]
+```
+
+Discovers the process-visible CPU topology and features, memory and page
+configuration, operating system, virtualization status, and the filesystem and
+device containing the selected path. It performs no host or database mutation.
+The JSON fingerprint excludes available memory and the literal data path while
+binding scheduling-relevant topology, affinity, quota, mount, device, and
+kernel properties. Missing platform data remains explicit rather than being
+reported as zero.
+
+`calibrate` binds the static profile to the exact executable and compiler, then
+measures the implemented CPU, memory, engine, storage, WAL, thread-scaling,
+I/O-depth, and supported NUMA-local/remote matrix. Linux scaling workers use
+the discovered per-core affinity order when topology is complete. Storage work
+is confined to a bounded temporary directory on the
+selected filesystem and is removed before return. Quick mode targets
+5–15 seconds; thorough mode targets 3–10 minutes. The receipt reports variance,
+differential correctness, accepted kernel selections, and all unsupported P1
+surfaces. An unstable or out-of-window receipt is diagnostic and publishes no
+kernel selection. Accepted receipts use an immutable per-user cache keyed by
+hardware, kernel, filesystem, compiler, build, executable bytes, mode, and
+policy. `--no-cache` performs a diagnostic run without persistence.
+
+`governor-policy` re-discovers the selected path and fails unless its hardware
+fingerprint matches the receipt. It independently derives the stable scaling
+recommendation, preserves 15 percent total-memory headroom, and emits the
+versioned global and per-class CPU/I/O/memory policy plus the canonical
+admission-queue capacity and foreground burst bound for inspection. The default
+is `mixed`; this command admits no work and modifies no state.
+
+`execution-topology` derives that policy and emits the versioned persistent
+worker placement without starting threads. Complete processor discovery is
+physical-core-first, grouped by NUMA node, and includes logical processor,
+socket, core, and SMT rank; incomplete platforms emit one explicit portable
+unbound pool. The semantic checker rejects missing workers, duplicate CPUs,
+cross-node placement, partial topology, and noncanonical SMT ranks.
 
 ## `catalog`
 

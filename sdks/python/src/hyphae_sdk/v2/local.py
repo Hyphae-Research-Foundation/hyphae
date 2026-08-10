@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 """Serial AF_UNIX and Windows named-pipe HYPHLCL1 transport."""
 
 from __future__ import annotations

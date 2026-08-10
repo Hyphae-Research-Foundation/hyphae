@@ -1,4 +1,5 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-only
 
 use hyphae_core::{Q15Vector, VectorSpaceName};
 use hyphae_retrieval::{ExactRetrievalLimits, ExactRetrievalRequest, retrieve_exact};

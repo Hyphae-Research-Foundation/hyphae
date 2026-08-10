@@ -23,5 +23,6 @@ The crate ships a byte-identical package-local mirror of the canonical files
 under the repository-level `contracts/` directory. Workspace tests reject
 drift between the two copies.
 
-Apache-2.0. Canonical contract files and security policy:
+Code and machine-readable contracts are GPL-3.0-only; documentation is
+CC-BY-SA-4.0. Canonical contract files and security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

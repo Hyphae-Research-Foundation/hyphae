@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Controlled Native G7 benchmark runner.
 
@@ -47,6 +47,7 @@ const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
 const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
 const CORPUS_GENERATOR: &str =
     "hyphae-native-g7-corpus-v2:deterministic-id-linear-vector-and-rare-term";
+const ANN_PROGRESS_INTERVAL: usize = 4_096;
 
 #[derive(Clone, Copy, Debug)]
 struct Stats {
@@ -68,11 +69,118 @@ struct SearchFixture {
     recall_at_10: f64,
 }
 
+struct AnnProgressSink {
+    path: PathBuf,
+    source_commit: String,
+    source_tree: String,
+    dataset_digest: String,
+    started: Instant,
+    sequence: u64,
+}
+
+impl AnnProgressSink {
+    fn from_environment(source_commit: &str) -> Result<Option<Self>, Box<dyn Error>> {
+        let Some(path) = std::env::var_os("HYPHAE_G7_PROGRESS_FILE").map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let source_tree = std::env::var("HYPHAE_G7_SOURCE_TREE")
+            .map_err(|_| "G7 progress requires HYPHAE_G7_SOURCE_TREE")?;
+        Ok(Some(Self {
+            path,
+            source_commit: source_commit.to_owned(),
+            source_tree,
+            dataset_digest: dataset_digest(source_commit).to_hex().to_string(),
+            started: Instant::now(),
+            sequence: 0,
+        }))
+    }
+
+    fn observe(
+        &mut self,
+        progress: hyphae_native_runtime::HnswBuildProgress,
+    ) -> std::io::Result<()> {
+        let completed = progress.completed();
+        if completed != 0
+            && completed != progress.total()
+            && !completed.is_multiple_of(ANN_PROGRESS_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.write(
+            "ann-private-build",
+            completed,
+            progress.total(),
+            "running",
+            None,
+        )
+    }
+
+    fn begin_publication(&mut self, total: usize) -> std::io::Result<()> {
+        self.write("ann-publication", total, total, "running", None)
+    }
+
+    fn complete(&mut self, total: usize, checkpoint: [u8; 32]) -> std::io::Result<()> {
+        self.write(
+            "ann-published",
+            total,
+            total,
+            "completed",
+            Some(blake3::Hash::from_bytes(checkpoint).to_hex().to_string()),
+        )
+    }
+
+    fn write(
+        &mut self,
+        stage: &str,
+        completed: usize,
+        total: usize,
+        status: &str,
+        checkpoint_digest: Option<String>,
+    ) -> std::io::Result<()> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("G7 progress sequence overflow"))?;
+        let record = json!({
+            "schema": "hyphae-native-performance-progress-v1",
+            "source_commit": self.source_commit,
+            "source_tree": self.source_tree,
+            "dataset_digest": self.dataset_digest,
+            "operation": "ann-bulk-build",
+            "stage": stage,
+            "sequence": self.sequence,
+            "completed_units": completed,
+            "total_units": total,
+            "unit": "vectors",
+            "elapsed_nanos": u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "status": status,
+            "checkpoint_digest": checkpoint_digest,
+        });
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("G7 progress path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let staging = parent.join(format!(
+            ".{}-{}-{}",
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("g7-progress"),
+            std::process::id(),
+            self.sequence,
+        ));
+        let encoded = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+        fs::write(&staging, encoded)?;
+        fs::rename(staging, &self.path)
+    }
+}
+
 impl SearchFixture {
     fn open_or_create(root: &Path, source_commit: &str) -> Result<Self, Box<dyn Error>> {
         let path = search_seed_path(root, source_commit)?;
         if !path.is_dir() {
-            publish_search_seed(&path)?;
+            publish_search_seed(&path, source_commit)?;
         }
         let database =
             NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
@@ -119,7 +227,7 @@ impl SearchFixture {
     }
 }
 
-fn publish_search_seed(path: &Path) -> Result<(), Box<dyn Error>> {
+fn publish_search_seed(path: &Path, source_commit: &str) -> Result<(), Box<dyn Error>> {
     let parent = path.parent().ok_or("search seed path has no parent")?;
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(
@@ -127,22 +235,65 @@ fn publish_search_seed(path: &Path) -> Result<(), Box<dyn Error>> {
         std::process::id(),
         unique_nonce()
     ));
-    seed_search_database(&staging)?;
+    seed_search_database(&staging, source_commit)?;
     fs::rename(&staging, path)?;
     Ok(())
 }
 
-fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
+fn seed_search_database(path: &Path, source_commit: &str) -> Result<(), Box<dyn Error>> {
     let mut database =
         NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
     let lexical_index = ObjectId::new(7)?;
     let vector_index = ObjectId::new(8)?;
     let document_count = search_documents();
+    let mut progress = AnnProgressSink::from_environment(source_commit)?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.create_search_index(lexical_index, "g7_search")?;
+    seed.create_vector_index_with_lifecycle(
+        vector_index,
+        "g7_ann",
+        vector_dimension(),
+        VectorMetric::Cosine,
+        HnswConfig::new(8, 32, 16, 512, 7)?,
+        ann_lifecycle(),
+    )?;
+    let mut progress_error = None;
+    seed.upsert_vectors_with_progress(
+        vector_index,
+        (0..document_count)
+            .map(|id| vector_fixture(id, document_count))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+        |value| {
+            if progress_error.is_some() {
+                return;
+            }
+            if let Some(sink) = progress.as_mut()
+                && let Err(error) = sink.observe(value)
+            {
+                progress_error = Some(error);
+            }
+        },
+    )?;
+    if let Some(error) = progress_error {
+        return Err(error.into());
+    }
+    if let Some(sink) = progress.as_mut() {
+        sink.begin_publication(document_count)?;
+    }
     seed.commit()?;
+    if let Some(sink) = progress.as_mut() {
+        sink.complete(
+            document_count,
+            database.observe_ann_index(vector_index)?.base_identity,
+        )?;
+    }
+    // Lexical documents and scalar filters use the physical all-engine delta
+    // path. Each batch resolves only the touched identities and preserves the
+    // already-published ANN generation, avoiding the former O(n^2) sequence of
+    // complete-state transaction materializations.
     for batch_start in (0..document_count).step_by(512) {
-        let mut batch = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        let mut batch =
+            database.begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Memory)?;
         for id in batch_start..(batch_start + 512).min(document_count) {
             let document_id = (id as u128 + 1).to_be_bytes();
             let text = if id == document_count / 2 {
@@ -150,8 +301,14 @@ fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
             } else {
                 "common g7 native benchmark"
             };
-            batch.index_document(lexical_index, document_id.to_vec(), text)?;
-            batch.set(
+            database.stage_delta_index_document(
+                &mut batch,
+                lexical_index,
+                document_id.to_vec(),
+                text.to_owned(),
+            )?;
+            database.stage_delta_set(
+                &mut batch,
                 filter_key(&document_id),
                 if id % 2 == 0 {
                     b"keep".to_vec()
@@ -161,27 +318,9 @@ fn seed_search_database(path: &Path) -> Result<(), Box<dyn Error>> {
                 None,
             )?;
         }
-        batch.commit()?;
+        database.commit_optimistic(batch)?;
     }
-    // Build ANN last. Opening any later transaction restores the canonical
-    // graph, so seeding lexical batches after this point would rebuild the
-    // million-vector index once per batch.
-    let mut vectors = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-    vectors.create_vector_index_with_lifecycle(
-        vector_index,
-        "g7_ann",
-        vector_dimension(),
-        VectorMetric::Cosine,
-        HnswConfig::new(8, 32, 16, 512, 7)?,
-        ann_lifecycle(),
-    )?;
-    vectors.upsert_vectors(
-        vector_index,
-        (0..document_count)
-            .map(|id| vector_fixture(id, document_count))
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
-    )?;
-    vectors.commit()?;
+    database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
     drop(database);
     Ok(())
 }
@@ -253,13 +392,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut database = NativeDatabase::create(path).map_err(|error| error.to_string())?;
             let mut operations = 0_u64;
             while !stop.load(Ordering::Relaxed) {
-                let mut transaction = database
-                    .begin(0, hyphae_native_types::DurabilityClass::Memory)
+                let mut batch = database
+                    .begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Memory)
                     .map_err(|error| error.to_string())?;
-                transaction
-                    .set(operations.to_be_bytes().to_vec(), vec![0x7b; 4_096], None)
+                database
+                    .stage_delta_set(
+                        &mut batch,
+                        operations.to_be_bytes().to_vec(),
+                        vec![0x7b; 4_096],
+                        None,
+                    )
                     .map_err(|error| error.to_string())?;
-                transaction.commit().map_err(|error| error.to_string())?;
+                database
+                    .commit_optimistic(batch)
+                    .map_err(|error| error.to_string())?;
                 operations = operations.saturating_add(1);
                 if operations.is_multiple_of(64) {
                     black_box(database.checkpoint().map_err(|error| error.to_string())?);
@@ -600,7 +746,9 @@ fn run_embedded_structure(
         seed.set(index.to_be_bytes().to_vec(), vec![0xa5; 64], None)?;
     }
     seed.commit()?;
+    database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
     let target = (STRUCTURE_KEYS / 2).to_be_bytes();
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(database.get_latest_structure(&target, 0)?);
@@ -614,7 +762,7 @@ fn run_embedded_structure(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    Ok(stats_json(stats))
+    stats_with_materialization(stats, materialization)
 }
 
 fn run_embedded_sql(
@@ -647,6 +795,7 @@ fn run_embedded_sql(
     let parameters = [hyphae_native_runtime::SqlValue::Signed(
         (SQL_KEYS / 2) as i64,
     )];
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
@@ -660,7 +809,7 @@ fn run_embedded_sql(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    Ok(stats_json(stats))
+    stats_with_materialization(stats, materialization)
 }
 
 async fn run_local_structure(
@@ -687,6 +836,13 @@ async fn run_local_structure(
         },
     )?;
     drop(session);
+    drop(product);
+    let mut database = NativeDatabase::open(&path)
+        .map_err(|error| format!("local structure migration open: {error}"))?;
+    database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+    drop(database);
+    let product = NativeProduct::open(&path)
+        .map_err(|error| format!("local structure reopen after migration: {error}"))?;
     let endpoint = short_endpoint("structure");
     let daemon = NativeDaemon::start(
         product,
@@ -696,6 +852,7 @@ async fn run_local_structure(
     let result = async {
         let client = HyphaeClient::local(endpoint.to_string_lossy().into_owned())?;
         let options = RequestOptions::default();
+        let materialization = NativeDatabase::process_materialization_observation();
         if warm {
             for _ in 0..warmup {
                 require_structure_response(
@@ -718,7 +875,7 @@ async fn run_local_structure(
             }
         })
         .await?;
-        Ok::<_, Box<dyn Error>>(stats_json(stats))
+        stats_with_materialization(stats, materialization)
     }
     .await;
     let shutdown = daemon.shutdown().await?;
@@ -756,6 +913,7 @@ async fn run_local_sql(
         let hyphae_native_product::ProductResponse::PreparedSql { handle, .. } = prepared else {
             return Err("local SQL prepare returned an unexpected response".into());
         };
+        let materialization = NativeDatabase::process_materialization_observation();
         if warm {
             for _ in 0..warmup {
                 require_sql_response(
@@ -790,7 +948,7 @@ async fn run_local_sql(
             }
         })
         .await?;
-        Ok::<_, Box<dyn Error>>(stats_json(stats))
+        stats_with_materialization(stats, materialization)
     }
     .await;
     let shutdown = daemon.shutdown().await?;
@@ -834,6 +992,7 @@ fn run_indexed_sql(
         "g7-email-{}",
         SQL_KEYS / 2
     ))];
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
@@ -847,7 +1006,7 @@ fn run_indexed_sql(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    let mut value = stats_json(stats);
+    let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-indexed-sql");
     value["concurrency"] = json!(concurrency);
     Ok(value)
@@ -900,6 +1059,7 @@ fn run_join_sql(
         "join-email-{}",
         SQL_KEYS / 2
     ))];
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
@@ -913,7 +1073,7 @@ fn run_join_sql(
         }
         Ok(())
     })?;
-    Ok(stats_json(stats))
+    stats_with_materialization(stats, materialization)
 }
 
 fn run_filtered_bm25(
@@ -923,6 +1083,7 @@ fn run_filtered_bm25(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(filtered_bm25_query(
@@ -937,7 +1098,7 @@ fn run_filtered_bm25(
         }
         Ok(())
     })?;
-    let mut value = stats_json(stats);
+    let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-same-snapshot-filtered-bm25");
     value["filter_selectivity"] = json!(0.5);
     value["correctness_scope"] = json!("lexical-and-structure-same-snapshot");
@@ -952,6 +1113,7 @@ fn run_hybrid(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(hybrid_query(
@@ -978,7 +1140,7 @@ fn run_hybrid(
         }
         Ok(())
     })?;
-    let mut value = stats_json(stats);
+    let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-same-snapshot-hybrid");
     value["lexical_branch"] = json!(true);
     value["vector_branch"] = json!("ann-exact-rerank");
@@ -1153,6 +1315,7 @@ fn run_bm25(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(
@@ -1171,7 +1334,7 @@ fn run_bm25(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    Ok(stats_json(stats))
+    stats_with_materialization(stats, materialization)
 }
 
 fn run_ann(
@@ -1181,6 +1344,7 @@ fn run_ann(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(fixture.snapshot.search_ann(
@@ -1198,15 +1362,12 @@ fn run_ann(
         )?);
         Ok::<(), Box<dyn Error>>(())
     })?;
-    let mut output = stats_json(stats);
+    let mut output = stats_with_materialization(stats, materialization)?;
     output["recall_at_10"] = json!(fixture.recall_at_10);
     Ok(output)
 }
 
-fn vector_fixture(
-    id: usize,
-    document_count: usize,
-) -> Result<(ObjectId, Vector), Box<dyn Error>> {
+fn vector_fixture(id: usize, document_count: usize) -> Result<(ObjectId, Vector), Box<dyn Error>> {
     let mut values = vec![0.0; vector_dimension() as usize];
     values[0] = 1.0;
     values[1] = id as f32 / document_count as f32;
@@ -1228,8 +1389,13 @@ fn run_commit(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let group_path = root.join("group");
-    let database =
+    let mut database =
         NativeDatabase::create(&group_path).map_err(|error| format!("group seed: {error}"))?;
+    let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
+    seed.commit()?;
+    database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+    let materialization = NativeDatabase::process_materialization_observation();
     let scheduler = NativeCommitScheduler::start(
         database,
         hyphae_native_runtime::GroupCommitConfig::new(concurrency, Duration::from_millis(2), 64)?,
@@ -1251,10 +1417,11 @@ fn run_commit(
                 for sequence in 0..count {
                     let sample = Instant::now();
                     let mut batch = client
-                        .begin_optimistic(0, hyphae_native_types::DurabilityClass::Group)
+                        .begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Group)
                         .map_err(|error| error.to_string())?;
-                    batch
-                        .set(
+                    client
+                        .stage_delta_set(
+                            &mut batch,
                             format!("g7-group-{producer}-{sequence}").into_bytes(),
                             b"v".to_vec(),
                             None,
@@ -1281,7 +1448,7 @@ fn run_commit(
     .collect::<Vec<_>>();
     let stats = stats_from_samples(samples, started.elapsed().as_secs_f64());
     scheduler.shutdown()?;
-    let mut output = stats_json(stats);
+    let mut output = stats_with_materialization(stats, materialization)?;
     output["group_concurrency"] = json!(concurrency);
     output["durability"] = json!("group-physical-sync");
     Ok(output)
@@ -1357,6 +1524,34 @@ fn stats_json(stats: Stats) -> serde_json::Value {
         "maximum": stats.maximum,
         "throughput_per_second": stats.throughput,
     })
+}
+
+fn stats_with_materialization(
+    stats: Stats,
+    before: hyphae_native_runtime::NativeMaterializationObservation,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let after = NativeDatabase::process_materialization_observation();
+    let full_state_loads = after
+        .full_state_loads
+        .checked_sub(before.full_state_loads)
+        .ok_or("full-state materialization counter regressed")?;
+    let full_catalog_loads = after
+        .full_catalog_loads
+        .checked_sub(before.full_catalog_loads)
+        .ok_or("catalog materialization counter regressed")?;
+    if full_state_loads != 0 || full_catalog_loads != 0 {
+        return Err(format!(
+            "measured hot path materialized complete state: full_state={full_state_loads}, full_catalog={full_catalog_loads}"
+        )
+        .into());
+    }
+    let mut value = stats_json(stats);
+    value["materialization"] = json!({
+        "full_state_loads": full_state_loads,
+        "full_catalog_loads": full_catalog_loads,
+        "provider": "process-interval-atomic-counters",
+    });
+    Ok(value)
 }
 
 fn physical_observation(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Regenerates checked-in JSON Schema 2020-12 public contract files.
 

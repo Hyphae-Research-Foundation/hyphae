@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Deterministic Hyphae-owned HNSW kernel and exact vector-search oracle.
 //!
@@ -16,7 +16,8 @@ use thiserror::Error;
 
 const MIN_M: u16 = 2;
 const MAX_M: u16 = 64;
-const MAX_LEVEL: u16 = 32;
+/// Maximum deterministic HNSW layer used for validation and build budgeting.
+pub const MAX_HNSW_LEVEL: u16 = 32;
 const BUILD_IDENTITY_VERSION: u16 = 1;
 
 /// Native vector metric. Smaller distances always rank first.
@@ -175,6 +176,7 @@ impl VectorIndexDefinition {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vector {
     values: Box<[f32]>,
+    norm_squared: f64,
 }
 
 impl Vector {
@@ -201,8 +203,16 @@ impl Vector {
         if values.is_empty() || values.len() > usize::from(u16::MAX) {
             return Err(AnnError::InvalidDimension);
         }
+        let norm_squared = values
+            .iter()
+            .map(|value| {
+                let value = f64::from(*value);
+                value * value
+            })
+            .sum();
         Ok(Self {
             values: values.into_boxed_slice(),
+            norm_squared,
         })
     }
 
@@ -254,6 +264,19 @@ pub struct IndexSnapshot {
     pub max_level: u16,
     /// Digest of the complete logical build.
     pub build_identity: [u8; 32],
+}
+
+/// Complete persistence-facing experimental partitioned HNSW generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionedIndexSnapshot {
+    /// Immutable definition shared by every child generation.
+    pub definition: VectorIndexDefinition,
+    /// Canonical recursive partition plan identity.
+    pub input_identity: [u8; 32],
+    /// Aggregate child generation identity.
+    pub build_identity: [u8; 32],
+    /// Child snapshots in canonical partition order.
+    pub partitions: Vec<IndexSnapshot>,
 }
 
 /// One exact-distance vector result.
@@ -399,6 +422,9 @@ pub enum AnnError {
     /// A canonical count cannot fit its versioned field.
     #[error("native HNSW canonical count exceeds its versioned field")]
     LengthOverflow,
+    /// A deterministic bulk plan requires at least one bounded partition.
+    #[error("native ANN bulk partition count is invalid")]
+    InvalidPartitionCount,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -440,6 +466,180 @@ pub struct HnswIndex {
     build_identity: [u8; 32],
 }
 
+/// Deterministic geometrically ordered input partitions for an experimental
+/// bulk HNSW build.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HnswPartitionPlan {
+    definition: VectorIndexDefinition,
+    partitions: Vec<Vec<VectorRecord>>,
+    input_identity: [u8; 32],
+}
+
+impl HnswPartitionPlan {
+    /// Creates balanced recursive geometric partitions. Every split uses a
+    /// distinct definition-derived projection and stable object-ID tie break.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero partitions, duplicate identities, or invalid
+    /// vectors.
+    pub fn build(
+        definition: VectorIndexDefinition,
+        records: impl IntoIterator<Item = VectorRecord>,
+        partition_count: usize,
+    ) -> Result<Self, AnnError> {
+        if partition_count == 0 {
+            return Err(AnnError::InvalidPartitionCount);
+        }
+        let mut identities = BTreeSet::new();
+        let mut records = records
+            .into_iter()
+            .map(|record| {
+                validate_vector(definition, &record.vector)?;
+                if !identities.insert(record.object_id) {
+                    return Err(AnnError::DuplicateObjectId);
+                }
+                Ok(record)
+            })
+            .collect::<Result<Vec<_>, AnnError>>()?;
+        records.sort_by_key(|record| record.object_id);
+        let effective_partitions = partition_count.min(records.len()).max(1);
+        let partitions = if records.is_empty() {
+            Vec::new()
+        } else {
+            recursive_projection_partitions(definition, records, effective_partitions)?
+        };
+        let input_identity = partition_plan_identity(definition, &partitions)?;
+        Ok(Self {
+            definition,
+            partitions,
+            input_identity,
+        })
+    }
+
+    /// Fixed native vector definition shared by every partition.
+    pub const fn definition(&self) -> VectorIndexDefinition {
+        self.definition
+    }
+
+    /// Exact number of planned partitions.
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    /// Canonical source and boundary identity for this plan.
+    pub const fn input_identity(&self) -> [u8; 32] {
+        self.input_identity
+    }
+
+    /// Immutable canonically ordered partition records.
+    pub fn partitions(&self) -> &[Vec<VectorRecord>] {
+        &self.partitions
+    }
+
+    /// Transfers canonically ordered partitions to an external governed
+    /// executor.
+    pub fn into_partitions(self) -> Vec<Vec<VectorRecord>> {
+        self.partitions
+    }
+}
+
+/// Experimental fan-out index built from independent deterministic HNSW
+/// partitions. It is not a durable production format until P4 qualification.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionedHnswIndex {
+    definition: VectorIndexDefinition,
+    partitions: Vec<HnswIndex>,
+    summaries: Vec<HnswPartitionSummary>,
+    input_identity: [u8; 32],
+    build_identity: [u8; 32],
+}
+
+/// Deterministic routing summary for one child HNSW generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HnswPartitionSummary {
+    partition_index: usize,
+    vector_count: usize,
+    centroid: Box<[f64]>,
+    squared_l2_radius: f64,
+    projection_minimum: f64,
+    projection_maximum: f64,
+    representative_object_id: ObjectId,
+    routing_vector: Vector,
+}
+
+impl HnswPartitionSummary {
+    /// Stable child position committed by the partition plan.
+    pub const fn partition_index(&self) -> usize {
+        self.partition_index
+    }
+
+    /// Complete vector count in this child generation.
+    pub const fn vector_count(&self) -> usize {
+        self.vector_count
+    }
+
+    /// Canonical f64 centroid components in index-dimension order.
+    pub fn centroid(&self) -> &[f64] {
+        &self.centroid
+    }
+
+    /// Maximum squared-L2 distance from the centroid to a child vector.
+    pub const fn squared_l2_radius(&self) -> f64 {
+        self.squared_l2_radius
+    }
+
+    /// Inclusive minimum definition-derived projection in this partition.
+    pub const fn projection_minimum(&self) -> f64 {
+        self.projection_minimum
+    }
+
+    /// Inclusive maximum definition-derived projection in this partition.
+    pub const fn projection_maximum(&self) -> f64 {
+        self.projection_maximum
+    }
+
+    /// Stable vector nearest the centroid, used if cosine centroid norm is zero.
+    pub const fn representative_object_id(&self) -> ObjectId {
+        self.representative_object_id
+    }
+}
+
+/// Approximate partition-routing evidence plus the ordinary ANN result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionedAnnSearchResult {
+    /// Canonically merged child result.
+    pub result: AnnSearchResult,
+    /// Partitions selected in deterministic routing-score order.
+    pub selected_partitions: Vec<usize>,
+    /// Complete available partition count.
+    pub total_partitions: usize,
+}
+
+/// Monotonic canonical-node progress for one complete HNSW generation build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnswBuildProgress {
+    completed: usize,
+    total: usize,
+}
+
+impl HnswBuildProgress {
+    const fn new(completed: usize, total: usize) -> Self {
+        debug_assert!(completed <= total);
+        Self { completed, total }
+    }
+
+    /// Canonical nodes inserted into the new generation.
+    pub const fn completed(self) -> usize {
+        self.completed
+    }
+
+    /// Complete admitted node count for the new generation.
+    pub const fn total(self) -> usize {
+        self.total
+    }
+}
+
 impl HnswIndex {
     /// Creates an empty index.
     ///
@@ -473,6 +673,23 @@ impl HnswIndex {
         definition: VectorIndexDefinition,
         records: impl IntoIterator<Item = VectorRecord>,
     ) -> Result<Self, AnnError> {
+        Self::build_with_progress(definition, records, |_| {})
+    }
+
+    /// Builds one canonical generation and observes deterministic node progress.
+    ///
+    /// The observer receives zero admitted nodes before graph construction and
+    /// one observation after every node is inserted in canonical rebuild order.
+    /// Observing progress cannot alter the graph or its build identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::build`].
+    pub fn build_with_progress(
+        definition: VectorIndexDefinition,
+        records: impl IntoIterator<Item = VectorRecord>,
+        progress: impl FnMut(HnswBuildProgress),
+    ) -> Result<Self, AnnError> {
         let mut entries = BTreeMap::new();
         for record in records {
             validate_vector(definition, &record.vector)?;
@@ -489,7 +706,7 @@ impl HnswIndex {
                 return Err(AnnError::DuplicateObjectId);
             }
         }
-        Self::from_entries(definition, entries)
+        Self::from_entries_with_progress(definition, entries, progress)
     }
 
     /// Restores one persisted generation after validating its canonical
@@ -600,9 +817,17 @@ impl HnswIndex {
         definition: VectorIndexDefinition,
         entries: BTreeMap<ObjectId, Entry>,
     ) -> Result<Self, AnnError> {
+        Self::from_entries_with_progress(definition, entries, |_| {})
+    }
+
+    fn from_entries_with_progress(
+        definition: VectorIndexDefinition,
+        entries: BTreeMap<ObjectId, Entry>,
+        mut progress: impl FnMut(HnswBuildProgress),
+    ) -> Result<Self, AnnError> {
         let mut index = Self::new(definition)?;
         index.entries = entries;
-        index.rebuild()?;
+        index.rebuild_with_progress(&mut progress)?;
         Ok(index)
     }
 
@@ -925,7 +1150,7 @@ impl HnswIndex {
             return Err(AnnError::CorruptGraph);
         }
         for (object_id, node) in &self.nodes {
-            if node.level > MAX_LEVEL
+            if node.level > MAX_HNSW_LEVEL
                 || node.level > self.max_level
                 || node.level != self.level_for(*object_id)
                 || node.neighbors.len() != usize::from(node.level) + 1
@@ -949,7 +1174,10 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn rebuild(&mut self) -> Result<(), AnnError> {
+    fn rebuild_with_progress(
+        &mut self,
+        progress: &mut impl FnMut(HnswBuildProgress),
+    ) -> Result<(), AnnError> {
         self.nodes.clear();
         self.entry_point = None;
         self.max_level = 0;
@@ -959,8 +1187,11 @@ impl HnswIndex {
             .map(|(object_id, entry)| (entry.creating_csn, *object_id))
             .collect::<Vec<_>>();
         order.sort_by_key(|(creating_csn, object_id)| (creating_csn.get(), object_id.get()));
-        for (_, object_id) in order {
+        let total = order.len();
+        progress(HnswBuildProgress::new(0, total));
+        for (offset, (_, object_id)) in order.into_iter().enumerate() {
             self.insert_graph_node(object_id)?;
+            progress(HnswBuildProgress::new(offset + 1, total));
         }
         self.refresh_build_identity()?;
         self.validate()
@@ -1300,7 +1531,7 @@ impl HnswIndex {
         let mut random = u64::from_le_bytes(random_bytes);
         let divisor = u64::from(self.definition.config.m);
         let mut level = 0_u16;
-        while level < MAX_LEVEL && random % divisor == 0 {
+        while level < MAX_HNSW_LEVEL && random % divisor == 0 {
             level += 1;
             random /= divisor;
         }
@@ -1353,6 +1584,717 @@ impl HnswIndex {
     }
 }
 
+impl PartitionedHnswIndex {
+    /// Builds every planned partition with the canonical HNSW baseline.
+    /// This serial convenience path is an oracle for the governed runtime
+    /// executor, not the production bulk scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a child build or plan validation fails.
+    pub fn build(plan: &HnswPartitionPlan) -> Result<Self, AnnError> {
+        let partitions = plan
+            .partitions
+            .iter()
+            .cloned()
+            .map(|records| HnswIndex::build(plan.definition, records))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_built_partitions(plan, partitions)
+    }
+
+    /// Validates externally built partitions against their immutable plan and
+    /// assembles one deterministic fan-out index.
+    ///
+    /// # Errors
+    ///
+    /// Rejects reordered, missing, duplicated, or definition-mismatched child
+    /// generations.
+    pub fn from_built_partitions(
+        plan: &HnswPartitionPlan,
+        partitions: Vec<HnswIndex>,
+    ) -> Result<Self, AnnError> {
+        if partitions.len() != plan.partitions.len() {
+            return Err(AnnError::CorruptGraph);
+        }
+        for (planned, built) in plan.partitions.iter().zip(&partitions) {
+            if built.definition != plan.definition || built.entries.len() != planned.len() {
+                return Err(AnnError::CorruptGraph);
+            }
+            for record in planned {
+                let entry = built
+                    .entries
+                    .get(&record.object_id)
+                    .ok_or(AnnError::CorruptGraph)?;
+                if entry.creating_csn != record.creating_csn || entry.vector != record.vector {
+                    return Err(AnnError::CorruptGraph);
+                }
+            }
+        }
+        let build_identity =
+            partitioned_build_identity(plan.definition, plan.input_identity, &partitions)?;
+        let summaries = summarize_partitions(&partitions)?;
+        Ok(Self {
+            definition: plan.definition,
+            partitions,
+            summaries,
+            input_identity: plan.input_identity,
+            build_identity,
+        })
+    }
+
+    /// Assembles externally built child generations after independently
+    /// reconstructing their geometric partition boundaries and plan identity.
+    /// This path lets a governed executor transfer each partition into one
+    /// worker without retaining a second full vector copy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty child, repeated identity, definition mismatch,
+    /// noncanonical boundary, or input identity mismatch.
+    pub fn from_governed_partitions(
+        definition: VectorIndexDefinition,
+        input_identity: [u8; 32],
+        partitions: Vec<HnswIndex>,
+    ) -> Result<Self, AnnError> {
+        validate_governed_partitions(definition, input_identity, &partitions)?;
+        let build_identity = partitioned_build_identity(definition, input_identity, &partitions)?;
+        let summaries = summarize_partitions(&partitions)?;
+        Ok(Self {
+            definition,
+            partitions,
+            summaries,
+            input_identity,
+            build_identity,
+        })
+    }
+
+    /// Fixed definition shared by every child generation.
+    pub const fn definition(&self) -> VectorIndexDefinition {
+        self.definition
+    }
+
+    /// Exact vector count across disjoint partitions.
+    pub fn len(&self) -> usize {
+        self.partitions.iter().map(HnswIndex::len).sum()
+    }
+
+    /// Returns whether the fan-out index has no vectors.
+    pub fn is_empty(&self) -> bool {
+        self.partitions.is_empty()
+    }
+
+    /// Deterministic geometric input and boundary identity.
+    pub const fn input_identity(&self) -> [u8; 32] {
+        self.input_identity
+    }
+
+    /// Aggregate identity over the plan and every canonical child graph.
+    pub const fn build_identity(&self) -> [u8; 32] {
+        self.build_identity
+    }
+
+    /// Complete child generation count.
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    /// Canonical centroid/radius summaries in partition order.
+    pub fn partition_summaries(&self) -> &[HnswPartitionSummary] {
+        &self.summaries
+    }
+
+    /// Exports complete child generations in canonical partition order.
+    pub fn export_snapshot(&self) -> PartitionedIndexSnapshot {
+        PartitionedIndexSnapshot {
+            definition: self.definition,
+            input_identity: self.input_identity,
+            build_identity: self.build_identity,
+            partitions: self
+                .partitions
+                .iter()
+                .map(HnswIndex::export_snapshot)
+                .collect(),
+        }
+    }
+
+    /// Restores and independently revalidates every child generation,
+    /// recursive geometric boundary, plan identity, and aggregate identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed child state, reordered partitions, or
+    /// any identity mismatch.
+    pub fn restore_snapshot(snapshot: PartitionedIndexSnapshot) -> Result<Self, AnnError> {
+        let partitions = snapshot
+            .partitions
+            .into_iter()
+            .map(HnswIndex::restore_owned)
+            .collect::<Result<Vec<_>, _>>()?;
+        let restored = Self::from_governed_partitions(
+            snapshot.definition,
+            snapshot.input_identity,
+            partitions,
+        )?;
+        if restored.build_identity != snapshot.build_identity {
+            return Err(AnnError::CorruptGraph);
+        }
+        Ok(restored)
+    }
+
+    /// Executes exact fan-out and canonical top-k merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query admission.
+    pub fn search_exact(&self, query: &Vector, k: usize) -> Result<Vec<VectorHit>, AnnError> {
+        let mut hits = self
+            .partitions
+            .iter()
+            .map(|partition| partition.search_exact(query, k))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        hits.sort_by(compare_hits);
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Fans one approximate query to every experimental partition and merges
+    /// child top-k results canonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query or search bounds.
+    pub fn search(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+    ) -> Result<AnnSearchResult, AnnError> {
+        Ok(self
+            .search_selected(query, options, self.partitions.len().max(1))?
+            .result)
+    }
+
+    /// Routes an approximate query to no more than `maximum_partitions`
+    /// centroid-ranked children and merges their results canonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero selected capacity, invalid query, routing
+    /// summary corruption, or ordinary child-search bounds.
+    pub fn search_selected(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<PartitionedAnnSearchResult, AnnError> {
+        if maximum_partitions == 0 {
+            return Err(AnnError::InvalidPartitionCount);
+        }
+        validate_vector(self.definition, query)?;
+        if options.ef_search > usize::from(self.definition.config.ef_search_max) {
+            return Err(AnnError::SearchBreadthExceeded);
+        }
+        let query_projection = deterministic_projection(self.definition.digest(), query);
+        let mut selected = self
+            .summaries
+            .iter()
+            .map(|summary| {
+                Ok((
+                    partition_routing_distance(self.definition.metric, query, summary)?,
+                    projection_interval_distance(query_projection, summary),
+                    summary.partition_index,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        selected.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        selected.truncate(maximum_partitions.min(selected.len()));
+        let children = selected
+            .iter()
+            .map(|(_, _, partition)| {
+                self.partitions
+                    .get(*partition)
+                    .ok_or(AnnError::CorruptGraph)?
+                    .search(query, options)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = merge_partitioned_search(self, options, &children)?;
+        Ok(PartitionedAnnSearchResult {
+            result,
+            selected_partitions: selected
+                .into_iter()
+                .map(|(_, _, partition)| partition)
+                .collect(),
+            total_partitions: self.partitions.len(),
+        })
+    }
+}
+
+fn merge_partitioned_search(
+    index: &PartitionedHnswIndex,
+    options: SearchOptions,
+    children: &[AnnSearchResult],
+) -> Result<AnnSearchResult, AnnError> {
+    let mut hits = children
+        .iter()
+        .flat_map(|child| child.hits.iter().copied())
+        .collect::<Vec<_>>();
+    hits.sort_by(compare_hits);
+    hits.dedup_by_key(|hit| hit.object_id);
+    hits.truncate(options.k);
+    Ok(AnnSearchResult {
+        approximate: true,
+        build_identity: index.build_identity,
+        metric: index.definition.metric,
+        ef_search: options.ef_search,
+        candidate_count: checked_child_sum(children, |child| child.candidate_count)?,
+        eligible_candidate_count: checked_child_sum(children, |child| {
+            child.eligible_candidate_count
+        })?,
+        strategy: AnnSearchStrategy::GraphTraversal,
+        recall_risk: AnnRecallRisk::ApproximateTraversal,
+        exact_reranked: options.exact_rerank.is_some(),
+        visited_nodes: checked_child_sum(children, |child| child.visited_nodes)?,
+        hits,
+    })
+}
+
+fn summarize_partitions(partitions: &[HnswIndex]) -> Result<Vec<HnswPartitionSummary>, AnnError> {
+    partitions
+        .iter()
+        .enumerate()
+        .map(|(partition, index)| summarize_partition(partition, index))
+        .collect()
+}
+
+fn summarize_partition(
+    partition_index: usize,
+    index: &HnswIndex,
+) -> Result<HnswPartitionSummary, AnnError> {
+    let count = u32::try_from(index.entries.len()).map_err(|_| AnnError::LengthOverflow)?;
+    if count == 0 {
+        return Err(AnnError::CorruptGraph);
+    }
+    let mut centroid = vec![0.0_f64; usize::from(index.definition.dimension)];
+    for entry in index.entries.values() {
+        for (total, value) in centroid.iter_mut().zip(entry.vector.values()) {
+            *total += f64::from(*value);
+        }
+    }
+    let divisor = f64::from(count);
+    for value in &mut centroid {
+        *value /= divisor;
+    }
+    let mut representative = None::<(f64, ObjectId, &Vector)>;
+    let mut squared_l2_radius = 0.0_f64;
+    let projection_identity = index.definition.digest();
+    let mut projection_minimum = f64::INFINITY;
+    let mut projection_maximum = f64::NEG_INFINITY;
+    for (object_id, entry) in &index.entries {
+        let projection = deterministic_projection(projection_identity, &entry.vector);
+        projection_minimum = projection_minimum.min(projection);
+        projection_maximum = projection_maximum.max(projection);
+        let squared_l2 = entry
+            .vector
+            .values()
+            .iter()
+            .zip(&centroid)
+            .map(|(value, center)| {
+                let difference = f64::from(*value) - center;
+                difference * difference
+            })
+            .sum::<f64>();
+        squared_l2_radius = squared_l2_radius.max(squared_l2);
+        if representative.as_ref().is_none_or(|current| {
+            squared_l2
+                .total_cmp(&current.0)
+                .then_with(|| object_id.cmp(&current.1))
+                == Ordering::Less
+        }) {
+            representative = Some((squared_l2, *object_id, &entry.vector));
+        }
+    }
+    let (_, representative_object_id, routing_vector) =
+        representative.ok_or(AnnError::CorruptGraph)?;
+    Ok(HnswPartitionSummary {
+        partition_index,
+        vector_count: index.entries.len(),
+        centroid: centroid.into_boxed_slice(),
+        squared_l2_radius,
+        projection_minimum,
+        projection_maximum,
+        representative_object_id,
+        routing_vector: routing_vector.clone(),
+    })
+}
+
+fn projection_interval_distance(query_projection: f64, summary: &HnswPartitionSummary) -> f64 {
+    if query_projection < summary.projection_minimum {
+        summary.projection_minimum - query_projection
+    } else if query_projection > summary.projection_maximum {
+        query_projection - summary.projection_maximum
+    } else {
+        0.0
+    }
+}
+
+fn partition_routing_distance(
+    metric: Metric,
+    query: &Vector,
+    summary: &HnswPartitionSummary,
+) -> Result<f64, AnnError> {
+    if query.dimension() != summary.centroid.len() {
+        return Err(AnnError::CorruptGraph);
+    }
+    match metric {
+        Metric::SquaredL2 => Ok(query
+            .values()
+            .iter()
+            .zip(&summary.centroid)
+            .map(|(query, center)| {
+                let difference = f64::from(*query) - center;
+                difference * difference
+            })
+            .sum()),
+        Metric::NegativeDot => Ok(-query
+            .values()
+            .iter()
+            .zip(&summary.centroid)
+            .map(|(query, center)| f64::from(*query) * center)
+            .sum::<f64>()),
+        Metric::Cosine => {
+            let centroid_norm = summary
+                .centroid
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>();
+            if centroid_norm == 0.0 {
+                return distance(metric, query, &summary.routing_vector);
+            }
+            let dot = query
+                .values()
+                .iter()
+                .zip(&summary.centroid)
+                .map(|(query, center)| f64::from(*query) * center)
+                .sum::<f64>();
+            Ok(1.0 - dot / (query.norm_squared.sqrt() * centroid_norm.sqrt()))
+        }
+    }
+}
+
+fn recursive_projection_partitions(
+    definition: VectorIndexDefinition,
+    records: Vec<VectorRecord>,
+    partition_count: usize,
+) -> Result<Vec<Vec<VectorRecord>>, AnnError> {
+    let base_records = records.len() / partition_count;
+    let remainder = records.len() % partition_count;
+    let target_sizes = (0..partition_count)
+        .map(|partition| base_records + usize::from(partition < remainder))
+        .collect::<Vec<_>>();
+    let mut partitions = Vec::with_capacity(partition_count);
+    let mut split_sequence = 0_u64;
+    split_projection_partition(
+        definition.digest(),
+        records,
+        &target_sizes,
+        &mut split_sequence,
+        &mut partitions,
+    )?;
+    Ok(partitions)
+}
+
+fn split_projection_partition(
+    projection_identity: [u8; 32],
+    mut records: Vec<VectorRecord>,
+    target_sizes: &[usize],
+    split_sequence: &mut u64,
+    partitions: &mut Vec<Vec<VectorRecord>>,
+) -> Result<(), AnnError> {
+    if target_sizes.len() == 1 {
+        if records.len() != target_sizes[0] {
+            return Err(AnnError::CorruptGraph);
+        }
+        partitions.push(records);
+        return Ok(());
+    }
+    let axis = *split_sequence;
+    *split_sequence = split_sequence
+        .checked_add(1)
+        .ok_or(AnnError::LengthOverflow)?;
+    records.sort_by(|left, right| {
+        deterministic_projection_axis(projection_identity, axis, &left.vector)
+            .total_cmp(&deterministic_projection_axis(
+                projection_identity,
+                axis,
+                &right.vector,
+            ))
+            .then_with(|| left.object_id.cmp(&right.object_id))
+    });
+    let left_partitions = target_sizes.len() / 2;
+    let left_records = target_sizes[..left_partitions]
+        .iter()
+        .try_fold(0_usize, |total, count| total.checked_add(*count))
+        .ok_or(AnnError::LengthOverflow)?;
+    if left_records == 0 || left_records >= records.len() {
+        return Err(AnnError::CorruptGraph);
+    }
+    let right = records.split_off(left_records);
+    split_projection_partition(
+        projection_identity,
+        records,
+        &target_sizes[..left_partitions],
+        split_sequence,
+        partitions,
+    )?;
+    split_projection_partition(
+        projection_identity,
+        right,
+        &target_sizes[left_partitions..],
+        split_sequence,
+        partitions,
+    )
+}
+
+fn deterministic_projection(projection_identity: [u8; 32], vector: &Vector) -> f64 {
+    deterministic_projection_axis(projection_identity, 0, vector)
+}
+
+fn deterministic_projection_axis(projection_identity: [u8; 32], axis: u64, vector: &Vector) -> f64 {
+    vector
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(component, value)| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"hyphae-ann-balanced-projection-v1");
+            hasher.update(&projection_identity);
+            hasher.update(&axis.to_le_bytes());
+            hasher.update(&u64::try_from(component).unwrap_or(u64::MAX).to_le_bytes());
+            let digest = hasher.finalize();
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(&digest.as_bytes()[..8]);
+            let bits = u64::from_le_bytes(bytes);
+            let signed = f64::from((bits >> 32) as u32) - f64::from(u32::MAX) / 2.0;
+            f64::from(*value) * signed
+        })
+        .sum()
+}
+
+fn partition_plan_identity(
+    definition: VectorIndexDefinition,
+    partitions: &[Vec<VectorRecord>],
+) -> Result<[u8; 32], AnnError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-partition-plan-v1");
+    hasher.update(&definition.canonical_bytes());
+    hasher.update(
+        &u64::try_from(partitions.len())
+            .map_err(|_| AnnError::LengthOverflow)?
+            .to_le_bytes(),
+    );
+    for (partition, records) in partitions.iter().enumerate() {
+        hasher.update(
+            &u64::try_from(partition)
+                .map_err(|_| AnnError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+        hasher.update(
+            &u64::try_from(records.len())
+                .map_err(|_| AnnError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+        for record in records {
+            hasher.update(&record.object_id.get().to_be_bytes());
+            hasher.update(&record.creating_csn.get().to_le_bytes());
+            for value in record.vector.values() {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn partitioned_build_identity(
+    definition: VectorIndexDefinition,
+    input_identity: [u8; 32],
+    partitions: &[HnswIndex],
+) -> Result<[u8; 32], AnnError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-partitioned-hnsw-build-v1");
+    hasher.update(&definition.canonical_bytes());
+    hasher.update(&input_identity);
+    for partition in partitions {
+        hasher.update(&partition.build_identity);
+        hasher.update(
+            &u64::try_from(partition.len())
+                .map_err(|_| AnnError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Clone, Copy)]
+struct BuiltRecordRef<'a> {
+    object_id: ObjectId,
+    actual_partition: usize,
+    entry: &'a Entry,
+}
+
+fn split_built_record_refs<'a>(
+    projection_identity: [u8; 32],
+    mut records: Vec<BuiltRecordRef<'a>>,
+    target_sizes: &[usize],
+    split_sequence: &mut u64,
+    partitions: &mut Vec<Vec<BuiltRecordRef<'a>>>,
+) -> Result<(), AnnError> {
+    if target_sizes.len() == 1 {
+        if records.len() != target_sizes[0] {
+            return Err(AnnError::CorruptGraph);
+        }
+        partitions.push(records);
+        return Ok(());
+    }
+    let axis = *split_sequence;
+    *split_sequence = split_sequence
+        .checked_add(1)
+        .ok_or(AnnError::LengthOverflow)?;
+    records.sort_by(|left, right| {
+        deterministic_projection_axis(projection_identity, axis, &left.entry.vector)
+            .total_cmp(&deterministic_projection_axis(
+                projection_identity,
+                axis,
+                &right.entry.vector,
+            ))
+            .then_with(|| left.object_id.cmp(&right.object_id))
+    });
+    let left_partitions = target_sizes.len() / 2;
+    let left_records = target_sizes[..left_partitions]
+        .iter()
+        .try_fold(0_usize, |total, count| total.checked_add(*count))
+        .ok_or(AnnError::LengthOverflow)?;
+    if left_records == 0 || left_records >= records.len() {
+        return Err(AnnError::CorruptGraph);
+    }
+    let right = records.split_off(left_records);
+    split_built_record_refs(
+        projection_identity,
+        records,
+        &target_sizes[..left_partitions],
+        split_sequence,
+        partitions,
+    )?;
+    split_built_record_refs(
+        projection_identity,
+        right,
+        &target_sizes[left_partitions..],
+        split_sequence,
+        partitions,
+    )
+}
+
+fn validate_governed_partitions(
+    definition: VectorIndexDefinition,
+    input_identity: [u8; 32],
+    partitions: &[HnswIndex],
+) -> Result<(), AnnError> {
+    if partitions.is_empty() {
+        return if input_identity == partition_plan_identity(definition, &[])? {
+            Ok(())
+        } else {
+            Err(AnnError::CorruptGraph)
+        };
+    }
+    let projection_identity = definition.digest();
+    let mut identities = BTreeSet::new();
+    let mut records = Vec::new();
+    for (partition, index) in partitions.iter().enumerate() {
+        if index.definition != definition || index.entries.is_empty() {
+            return Err(AnnError::CorruptGraph);
+        }
+        for (object_id, entry) in &index.entries {
+            if !identities.insert(*object_id) {
+                return Err(AnnError::CorruptGraph);
+            }
+            records.push(BuiltRecordRef {
+                object_id: *object_id,
+                actual_partition: partition,
+                entry,
+            });
+        }
+    }
+    records.sort_by_key(|record| record.object_id);
+    let base_records = records.len() / partitions.len();
+    let remainder = records.len() % partitions.len();
+    let target_sizes = (0..partitions.len())
+        .map(|partition| base_records + usize::from(partition < remainder))
+        .collect::<Vec<_>>();
+    let mut expected_partitions = Vec::with_capacity(partitions.len());
+    let mut split_sequence = 0_u64;
+    split_built_record_refs(
+        projection_identity,
+        records,
+        &target_sizes,
+        &mut split_sequence,
+        &mut expected_partitions,
+    )?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-partition-plan-v1");
+    hasher.update(&definition.canonical_bytes());
+    hasher.update(
+        &u64::try_from(partitions.len())
+            .map_err(|_| AnnError::LengthOverflow)?
+            .to_le_bytes(),
+    );
+    for (partition, records) in expected_partitions.iter().enumerate() {
+        if records
+            .iter()
+            .any(|record| record.actual_partition != partition)
+        {
+            return Err(AnnError::CorruptGraph);
+        }
+        hasher.update(
+            &u64::try_from(partition)
+                .map_err(|_| AnnError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+        hasher.update(
+            &u64::try_from(records.len())
+                .map_err(|_| AnnError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+        for record in records {
+            hasher.update(&record.object_id.get().to_be_bytes());
+            hasher.update(&record.entry.creating_csn.get().to_le_bytes());
+            for value in record.entry.vector.values() {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    if input_identity != *hasher.finalize().as_bytes() {
+        return Err(AnnError::CorruptGraph);
+    }
+    Ok(())
+}
+
+fn checked_child_sum(
+    children: &[AnnSearchResult],
+    value: impl Fn(&AnnSearchResult) -> usize,
+) -> Result<usize, AnnError> {
+    children.iter().try_fold(0_usize, |total, child| {
+        total
+            .checked_add(value(child))
+            .ok_or(AnnError::LengthOverflow)
+    })
+}
+
 fn validate_vector(definition: VectorIndexDefinition, vector: &Vector) -> Result<(), AnnError> {
     if vector.dimension() != usize::from(definition.dimension) {
         return Err(AnnError::DimensionMismatch);
@@ -1372,19 +2314,15 @@ fn distance(metric: Metric, left: &Vector, right: &Vector) -> Result<f64, AnnErr
     match metric {
         Metric::Cosine => {
             let mut dot = 0.0_f64;
-            let mut left_norm = 0.0_f64;
-            let mut right_norm = 0.0_f64;
             for (left, right) in left.values().iter().zip(right.values()) {
                 let left = f64::from(*left);
                 let right = f64::from(*right);
                 dot += left * right;
-                left_norm += left * left;
-                right_norm += right * right;
             }
-            if left_norm == 0.0 || right_norm == 0.0 {
+            if left.norm_squared == 0.0 || right.norm_squared == 0.0 {
                 return Err(AnnError::ZeroCosineVector);
             }
-            Ok(1.0 - dot / (left_norm.sqrt() * right_norm.sqrt()))
+            Ok(1.0 - dot / (left.norm_squared.sqrt() * right.norm_squared.sqrt()))
         }
         Metric::NegativeDot => Ok(-left
             .values()
@@ -1444,8 +2382,9 @@ mod tests {
     use hyphae_native_types::{Csn, ObjectId};
 
     use super::{
-        AnnError, AnnRecallRisk, AnnSearchStrategy, HnswConfig, HnswIndex, Metric, SearchOptions,
-        Vector, VectorIndexDefinition, VectorRecord,
+        AnnError, AnnRecallRisk, AnnSearchStrategy, HnswConfig, HnswIndex, HnswPartitionPlan,
+        HnswPartitionSummary, Metric, PartitionedHnswIndex, SearchOptions, Vector,
+        VectorIndexDefinition, VectorRecord,
     };
 
     fn object(value: u128) -> Result<ObjectId, Box<dyn std::error::Error>> {
@@ -1534,6 +2473,47 @@ mod tests {
 
         assert_eq!(forward.build_identity(), reverse.build_identity());
         assert_eq!(forward.export_graph(), reverse.export_graph());
+        Ok(())
+    }
+
+    #[test]
+    fn build_progress_is_monotonic_and_preserves_the_canonical_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition(Metric::Cosine)?;
+        let records = (1..=64_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 2)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let expected = HnswIndex::build(definition, records.clone())?;
+        let mut progress = Vec::new();
+
+        let observed = HnswIndex::build_with_progress(definition, records, |value| {
+            progress.push(value);
+        })?;
+
+        assert_eq!(observed.export_snapshot(), expected.export_snapshot());
+        assert_eq!(progress.len(), 65);
+        assert_eq!(
+            progress
+                .first()
+                .map(|value| (value.completed(), value.total())),
+            Some((0, 64))
+        );
+        assert_eq!(
+            progress
+                .last()
+                .map(|value| (value.completed(), value.total())),
+            Some((64, 64))
+        );
+        assert!(progress.windows(2).all(|values| {
+            values[1].completed() == values[0].completed() + 1
+                && values[1].total() == values[0].total()
+        }));
         Ok(())
     }
 
@@ -1808,6 +2788,170 @@ mod tests {
         assert!(filtered.eligible_candidate_count >= 4);
         assert!(filtered.eligible_candidate_count <= 8);
         assert!(filtered.candidate_count >= filtered.eligible_candidate_count);
+        Ok(())
+    }
+
+    #[test]
+    fn geometric_partition_plan_is_balanced_and_input_order_independent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(94)?,
+            8,
+            Metric::Cosine,
+            HnswConfig::new(8, 48, 32, 64, 0xbeef)?,
+        )?;
+        let records = (1..=257_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 8)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let forward = HnswPartitionPlan::build(definition, records.clone(), 8)?;
+        let reverse = HnswPartitionPlan::build(definition, records.into_iter().rev(), 8)?;
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.partition_count(), 8);
+        let sizes = forward
+            .partitions()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        assert_eq!(sizes.iter().sum::<usize>(), 257);
+        let maximum = sizes.iter().copied().max().ok_or("missing partition")?;
+        let minimum = sizes.iter().copied().min().ok_or("missing partition")?;
+        assert!(maximum - minimum <= 1);
+        assert!(matches!(
+            HnswPartitionPlan::build(definition, Vec::<VectorRecord>::new(), 0),
+            Err(AnnError::InvalidPartitionCount)
+        ));
+        Ok(())
+    }
+
+    fn assert_partitioned_snapshot_validation(
+        index: &PartitionedHnswIndex,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = index.export_snapshot();
+        assert_eq!(
+            PartitionedHnswIndex::restore_snapshot(snapshot.clone())?,
+            *index
+        );
+        let mut reordered = snapshot.clone();
+        reordered.partitions.swap(0, 1);
+        assert!(matches!(
+            PartitionedHnswIndex::restore_snapshot(reordered),
+            Err(AnnError::CorruptGraph)
+        ));
+        let mut wrong_identity = snapshot;
+        wrong_identity.build_identity[0] ^= 1;
+        assert!(matches!(
+            PartitionedHnswIndex::restore_snapshot(wrong_identity),
+            Err(AnnError::CorruptGraph)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_hnsw_exact_merge_and_build_identity_are_canonical()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(95)?,
+            8,
+            Metric::Cosine,
+            HnswConfig::new(16, 96, 64, 128, 0xcafe)?,
+        )?;
+        let records = (1..=256_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 8)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let canonical = HnswIndex::build(definition, records.clone())?;
+        let first_plan = HnswPartitionPlan::build(definition, records.clone(), 4)?;
+        let first = PartitionedHnswIndex::build(&first_plan)?;
+        let second_plan = HnswPartitionPlan::build(definition, records.into_iter().rev(), 4)?;
+        let second = PartitionedHnswIndex::build(&second_plan)?;
+        let governed_plan =
+            HnswPartitionPlan::build(definition, canonical.export_snapshot().vectors, 4)?;
+        let governed_identity = governed_plan.input_identity();
+        let governed_children = governed_plan
+            .into_partitions()
+            .into_iter()
+            .map(|partition| HnswIndex::build(definition, partition))
+            .collect::<Result<Vec<_>, _>>()?;
+        let governed = PartitionedHnswIndex::from_governed_partitions(
+            definition,
+            governed_identity,
+            governed_children.clone(),
+        )?;
+        assert_eq!(first, second);
+        assert_eq!(first, governed);
+        assert_partitioned_snapshot_validation(&first)?;
+        assert_eq!(first.len(), 256);
+        assert_eq!(first.partition_count(), 4);
+        assert_eq!(first.partition_summaries().len(), 4);
+        assert_eq!(
+            first
+                .partition_summaries()
+                .iter()
+                .map(HnswPartitionSummary::vector_count)
+                .sum::<usize>(),
+            256
+        );
+        assert!(first.partition_summaries().iter().all(|summary| {
+            summary.centroid().len() == 8
+                && summary.squared_l2_radius().is_finite()
+                && summary.projection_minimum() <= summary.projection_maximum()
+        }));
+        let mut reordered = governed_children;
+        reordered.swap(0, 1);
+        assert!(matches!(
+            PartitionedHnswIndex::from_governed_partitions(
+                definition,
+                governed_identity,
+                reordered
+            ),
+            Err(AnnError::CorruptGraph)
+        ));
+        let mut recalled = 0_usize;
+        let mut expected = 0_usize;
+        for query_id in 1..=16_u16 {
+            let query = deterministic_vector(query_id, 8)?;
+            assert_eq!(
+                first.search_exact(&query, 10)?,
+                canonical.search_exact(&query, 10)?
+            );
+            let approximate = first.search(&query, SearchOptions::new(10, 64, Some(64))?)?;
+            let all_partitions =
+                first.search_selected(&query, SearchOptions::new(10, 64, Some(64))?, 4)?;
+            assert_eq!(all_partitions.result, approximate);
+            assert_eq!(all_partitions.selected_partitions.len(), 4);
+            assert_eq!(all_partitions.total_partitions, 4);
+            let selected =
+                first.search_selected(&query, SearchOptions::new(10, 64, Some(64))?, 2)?;
+            assert_eq!(selected.selected_partitions.len(), 2);
+            assert_eq!(selected.total_partitions, 4);
+            assert!(matches!(
+                first.search_selected(&query, SearchOptions::new(10, 64, Some(64))?, 0),
+                Err(AnnError::InvalidPartitionCount)
+            ));
+            let exact_ids = first
+                .search_exact(&query, 10)?
+                .into_iter()
+                .map(|hit| hit.object_id)
+                .collect::<BTreeSet<_>>();
+            recalled += approximate
+                .hits
+                .iter()
+                .filter(|hit| exact_ids.contains(&hit.object_id))
+                .count();
+            expected += exact_ids.len();
+        }
+        assert!(recalled * 100 >= expected * 95);
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 
 """Run the complete controlled G7 state/concurrency matrix for one platform."""
 
@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform as platform_module
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,14 +25,89 @@ if os.name == "posix":
 
 try:
     from tools.prepare_native_g7_macos_template import prepare as prepare_macos_template
+    from tools.check_native_performance_receipt import validate_progress
 except ModuleNotFoundError:
     from prepare_native_g7_macos_template import prepare as prepare_macos_template
+    from check_native_performance_receipt import validate_progress
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STATES = ("warm",)
 CONCURRENCIES = (1, 8, 32)
 BACKGROUND_MODES = ("control", "interference")
+ACTIVE_PROCESS: subprocess.Popen[str] | None = None
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_matrix_progress(
+    path: Path,
+    source_commit: str,
+    platform: str,
+    completed: list[dict[str, object]],
+    total_cells: int,
+    current: dict[str, object] | None,
+    status: str,
+    started_unix_nanos: int,
+) -> None:
+    write_json_atomic(path, {
+        "schema": "hyphae-native-g7-matrix-progress-v1",
+        "source_commit": source_commit,
+        "platform": platform,
+        "status": status,
+        "completed_cells": completed,
+        "completed_count": len(completed),
+        "total_cells": total_cells,
+        "current_cell": current,
+        "started_unix_nanos": started_unix_nanos,
+        "updated_unix_nanos": time.time_ns(),
+    })
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def handle_controller_signal(signum: int, _frame: object) -> None:
+    process = ACTIVE_PROCESS
+    if process is not None:
+        stop_process(process)
+    raise SystemExit(128 + signum)
 
 
 class MacRusageInfoV4(ctypes.Structure):
@@ -78,11 +154,11 @@ def verify_source(expected_commit: str) -> str:
     if head != expected_commit:
         raise RuntimeError("source commit differs from checked-out HEAD")
     dirty = subprocess.run(
-        ("git", "status", "--porcelain", "--untracked-files=no"), cwd=ROOT,
+        ("git", "status", "--porcelain", "--untracked-files=all"), cwd=ROOT,
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     if dirty:
-        raise RuntimeError("tracked source worktree must be clean")
+        raise RuntimeError("source worktree, including untracked files, must be clean")
     return subprocess.run(
         ("git", "rev-parse", "HEAD^{tree}"), cwd=ROOT, check=True,
         capture_output=True, text=True,
@@ -121,7 +197,9 @@ def run_cell(
     concurrency: int,
     environment: dict[str, str] | None = None,
     macos_counter_template: Path | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict:
+    global ACTIVE_PROCESS
     base_command = [str(binary), commit, platform, state, str(concurrency)]
     command = base_command
     perf_output: Path | None = None
@@ -157,12 +235,24 @@ def run_cell(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=os.name == "posix",
     )
+    ACTIVE_PROCESS = process
     metrics = ProcessMetrics(process.pid)
     while process.poll() is None:
         metrics.sample()
+        if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
+            stop_process(process)
+            stdout, stderr = process.communicate()
+            if perf_output is not None:
+                perf_output.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"G7 cell timed out after {timeout_seconds:.0f}s "
+                f"({state}/{concurrency}): {stderr.strip()}"
+            )
         time.sleep(0.01)
     stdout, stderr = process.communicate()
+    ACTIVE_PROCESS = None
     metrics.sample()
     if child_usage_before is not None:
         metrics.record_child_usage(
@@ -171,27 +261,11 @@ def run_cell(
         )
     completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if completed.returncode != 0:
-        if (
-            "No permission to enable" in completed.stderr
-            or "Permission denied" in completed.stderr
-            or "perf_event_paranoid" in completed.stderr
-            or "performance monitoring" in completed.stderr
-        ):
-            command = base_command
-            completed = subprocess.run(
-                command,
-                cwd=ROOT,
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
         if perf_output is not None:
             perf_output.unlink(missing_ok=True)
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"G7 cell failed ({state}/{concurrency}): {completed.stderr.strip()}"
-            )
+        raise RuntimeError(
+            f"G7 cell failed ({state}/{concurrency}): {completed.stderr.strip()}"
+        )
     payload = json.loads(completed.stdout)
     if perf_output is None:
         metrics.inject(payload)
@@ -443,6 +517,19 @@ def parse_macos_counter_export(path: Path) -> dict[str, int]:
     return totals
 
 
+def validate_completed_ann_progress(
+    progress: dict[str, object], expected_commit: str
+) -> None:
+    validate_progress(progress, expected_commit)
+    if (
+        progress.get("operation") != "ann-bulk-build"
+        or progress.get("stage") != "ann-published"
+        or progress.get("status") != "completed"
+        or progress.get("unit") != "vectors"
+    ):
+        raise RuntimeError("G7 ANN progress did not reach durable publication")
+
+
 def prepare_macos_counter_template(directory: Path) -> Path:
     bootstrap = directory / "bootstrap.trace"
     completed = subprocess.run(
@@ -542,6 +629,9 @@ def measure_macos_cache_misses(
 
 
 def main() -> int:
+    if os.name == "posix":
+        signal.signal(signal.SIGTERM, handle_controller_signal)
+        signal.signal(signal.SIGINT, handle_controller_signal)
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--platform", default=sys.platform)
@@ -551,7 +641,11 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=100_000)
     parser.add_argument("--background", action="store_true")
     parser.add_argument("--hardware-file", type=Path)
+    parser.add_argument("--cell-timeout-seconds", type=int, default=7_200)
+    parser.add_argument("--matrix-timeout-seconds", type=int, default=39_600)
     arguments = parser.parse_args()
+    if arguments.cell_timeout_seconds <= 0 or arguments.matrix_timeout_seconds <= 0:
+        raise ValueError("G7 timeout bounds must be positive")
     source_tree = verify_source(arguments.source_commit)
     hardware_path = arguments.hardware_file or (
         Path(os.environ["HYPHAE_G7_HARDWARE_FILE"])
@@ -602,7 +696,24 @@ def main() -> int:
     environment = os.environ.copy()
     environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
     environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
+    environment["HYPHAE_G7_SOURCE_TREE"] = source_tree
+    progress_path = arguments.output.with_name(
+        f"{arguments.output.stem}.progress.json"
+    )
+    runner_progress_path = arguments.output.with_name(
+        f"{arguments.output.stem}.runner-progress.json"
+    )
+    progress_path.unlink(missing_ok=True)
+    runner_progress_path.unlink(missing_ok=True)
+    environment["HYPHAE_G7_PROGRESS_FILE"] = str(runner_progress_path.resolve())
     transient_seed_workspace: Path | None = None
+    if arguments.background:
+        data_root_value = environment.get("HYPHAE_G7_DATA_ROOT")
+        if data_root_value is None:
+            raise RuntimeError("complete G7 matrix requires HYPHAE_G7_DATA_ROOT")
+        data_root = Path(data_root_value)
+        if not data_root.is_absolute() or data_root.is_symlink() or not data_root.is_dir():
+            raise RuntimeError("G7 data root must be an existing absolute real directory")
     if "HYPHAE_G7_SEARCH_SEED_ROOT" not in environment:
         data_root = environment.get("HYPHAE_G7_DATA_ROOT")
         if data_root is None:
@@ -614,27 +725,98 @@ def main() -> int:
             seed_root = Path(data_root) / "shared-search-seeds"
         environment["HYPHAE_G7_SEARCH_SEED_ROOT"] = str(seed_root)
     receipts = []
+    completed_cells: list[dict[str, object]] = []
+    matrix_started = time.monotonic()
+    started_unix_nanos = time.time_ns()
+    background_modes = BACKGROUND_MODES if arguments.background else ("control",)
+    total_cells = len(STATES) * len(background_modes) * len(CONCURRENCIES)
+    write_matrix_progress(
+        progress_path,
+        arguments.source_commit,
+        arguments.platform,
+        completed_cells,
+        total_cells,
+        None,
+        "running",
+        started_unix_nanos,
+    )
     for state in STATES:
-        for background_mode in (BACKGROUND_MODES if arguments.background else ("control",)):
+        for background_mode in background_modes:
             for concurrency in CONCURRENCIES:
+                current_cell = {
+                    "state": state,
+                    "background_mode": background_mode,
+                    "concurrency": concurrency,
+                }
+                write_matrix_progress(
+                    progress_path,
+                    arguments.source_commit,
+                    arguments.platform,
+                    completed_cells,
+                    total_cells,
+                    current_cell,
+                    "running",
+                    started_unix_nanos,
+                )
+                remaining_seconds = (
+                    arguments.matrix_timeout_seconds
+                    - (time.monotonic() - matrix_started)
+                )
+                if remaining_seconds <= 0:
+                    write_matrix_progress(
+                        progress_path,
+                        arguments.source_commit,
+                        arguments.platform,
+                        completed_cells,
+                        total_cells,
+                        current_cell,
+                        "failed",
+                        started_unix_nanos,
+                    )
+                    raise RuntimeError("G7 matrix exceeded its controller deadline")
                 cell_environment = environment.copy()
                 if background_mode == "interference":
                     cell_environment["HYPHAE_G7_BACKGROUND"] = "1"
                 else:
                     cell_environment.pop("HYPHAE_G7_BACKGROUND", None)
-                receipt = run_cell(
-                    binary,
-                    arguments.source_commit,
-                    arguments.platform,
-                    state,
-                    concurrency,
-                    cell_environment,
-                    macos_counter_template,
-                )
+                try:
+                    receipt = run_cell(
+                        binary,
+                        arguments.source_commit,
+                        arguments.platform,
+                        state,
+                        concurrency,
+                        cell_environment,
+                        macos_counter_template,
+                        min(float(arguments.cell_timeout_seconds), remaining_seconds),
+                    )
+                except BaseException:
+                    write_matrix_progress(
+                        progress_path,
+                        arguments.source_commit,
+                        arguments.platform,
+                        completed_cells,
+                        total_cells,
+                        current_cell,
+                        "failed",
+                        started_unix_nanos,
+                    )
+                    raise
                 receipt["background_mode"] = background_mode
                 receipt["hardware"] = hardware
                 receipt["build"] = build
                 receipts.append(receipt)
+                completed_cells.append(current_cell)
+                write_matrix_progress(
+                    progress_path,
+                    arguments.source_commit,
+                    arguments.platform,
+                    completed_cells,
+                    total_cells,
+                    None,
+                    "running",
+                    started_unix_nanos,
+                )
     for state in STATES:
         for background_mode in ({value["background_mode"] for value in receipts}):
             sweep = {
@@ -691,11 +873,34 @@ def main() -> int:
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    runner_progress_status = "not-produced"
+    if runner_progress_path.is_file():
+        runner_progress = json.loads(runner_progress_path.read_text(encoding="utf-8"))
+        validate_completed_ann_progress(runner_progress, arguments.source_commit)
+        runner_progress_status = runner_progress["status"]
+    write_matrix_progress(
+        progress_path,
+        arguments.source_commit,
+        arguments.platform,
+        completed_cells,
+        total_cells,
+        None,
+        "completed",
+        started_unix_nanos,
+    )
     if macos_counter_workspace is not None:
         shutil.rmtree(macos_counter_workspace)
     if transient_seed_workspace is not None:
         shutil.rmtree(transient_seed_workspace)
-    print(json.dumps({"status": "ok", "output": str(arguments.output), "cells": len(receipts)}))
+    print(json.dumps({
+        "status": "ok",
+        "output": str(arguments.output),
+        "cells": len(receipts),
+        "progress": str(progress_path),
+        "progress_status": "completed",
+        "runner_progress": str(runner_progress_path),
+        "runner_progress_status": runner_progress_status,
+    }))
     return 0
 
 

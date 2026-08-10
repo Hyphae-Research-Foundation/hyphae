@@ -1,4 +1,5 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-only
 
 use hyphae_core::VectorSpaceName;
 use hyphae_query::FieldPath;

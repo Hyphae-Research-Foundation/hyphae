@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 
 import copy
 import unittest
@@ -17,6 +17,11 @@ def receipt() -> dict:
         "maximum": 5,
         "throughput_per_second": 1.0,
         "recall_at_10": 1.0,
+        "materialization": {
+            "full_state_loads": 0,
+            "full_catalog_loads": 0,
+            "provider": "process-interval-atomic-counters",
+        },
     }
     return {
         "schema": "hyphae-native-g7-receipt-v2",
@@ -150,6 +155,17 @@ class G7ReceiptTests(unittest.TestCase):
     def test_valid_receipt(self) -> None:
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
+
+    def test_hot_path_complete_state_loads_fail_closure(self) -> None:
+        for counter in ("process_full_state_loads", "process_full_catalog_loads"):
+            with self.subTest(counter=counter):
+                payload = receipt()
+                materialization_counter = counter.removeprefix("process_")
+                payload["cells"]["embedded-structure-point-get"]["materialization"][
+                    materialization_counter
+                ] = 1
+                with self.assertRaisesRegex(GateFailure, "hot path materialized"):
+                    validate(payload, "a" * 40)
 
     def test_valid_dedicated_darwin_receipt(self) -> None:
         payload = receipt()

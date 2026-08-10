@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Build one deterministic Hyphae release archive from a native binary."""
 
 from __future__ import annotations
@@ -18,7 +19,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INCLUDED_DOCUMENTS = ("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md")
+INCLUDED_DOCUMENTS = (
+    "LICENSE",
+    "LICENSE-DOCUMENTATION",
+    "LICENSE-POLICY.md",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+)
 
 
 def product_version() -> str:

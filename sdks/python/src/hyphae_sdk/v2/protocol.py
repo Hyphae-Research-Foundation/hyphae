@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 """Exact dependency-free HYPHLCL1 and product-envelope codecs."""
 
 from __future__ import annotations

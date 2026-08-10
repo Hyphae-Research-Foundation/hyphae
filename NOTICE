@@ -3,6 +3,10 @@ Copyright 2026 Celiums Solutions LLC
 
 This product includes software developed by Celiums Solutions LLC.
 
+Current software is licensed under GPL-3.0-only. Repository documentation is
+licensed under CC-BY-SA-4.0. See LICENSE-POLICY.md for scope. Published
+releases through v1.0.1 retain their original Apache-2.0 terms.
+
 The optional HTTPS client includes Mozilla/CCADB root-certificate data through
 webpki-roots under the Community Data License Agreement Permissive 2.0:
 https://cdla.dev/permissive-2-0/

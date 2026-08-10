@@ -29,5 +29,6 @@ policy and `query_with_byte_limit` for aggregate scanned-byte accounting. The
 through snapshot creation; legacy proof methods snapshot afterward under the
 stored maintenance policy. The standalone server selects the bounded paths.
 
-Apache-2.0. Source, examples, and security policy:
+Code is GPL-3.0-only; documentation is CC-BY-SA-4.0. Source, examples, and
+security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

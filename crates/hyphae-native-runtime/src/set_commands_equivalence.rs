@@ -1,15 +1,22 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
     collections::BTreeSet,
     error::Error,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use hyphae_native_types::{Csn, DurabilityClass};
 
-use crate::{CommitBoundary, MAX_SET_MEMBER_BATCH_SIZE, NativeDatabase, NativeRuntimeError, Ttl};
+use crate::{
+    CommitBoundary, MAX_SET_MEMBER_BATCH_SIZE, NativeDatabase, NativeExecutionPool,
+    NativeResourceGovernor, NativeRuntimeError, NativeSetScanExecutionReceipt, Ttl,
+};
 
 struct TestDirectory {
     path: PathBuf,
@@ -397,6 +404,38 @@ fn every_set_member_batch_boundary_recovers_prior_or_complete_state() -> Result<
     Ok(())
 }
 
+fn assert_parallel_set_scan_matches(
+    database: &mut NativeDatabase,
+    serial: &NativeSetScanExecutionReceipt,
+) -> Result<(), Box<dyn Error>> {
+    let policy = crate::tests::parallel_engine_admission_test_policy();
+    let profile = crate::tests::portable_execution_profile(&policy);
+    let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+    let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+    database.set_resource_governor_with_execution_pool(
+        Arc::clone(&governor),
+        execution_pool,
+        Duration::ZERO,
+    )?;
+    let parallel = database.sscan_latest_set_at_profiled(
+        b"large",
+        Some(1_023_u32.to_be_bytes().as_slice()),
+        512,
+        103,
+    )?;
+    assert_eq!(parallel.members, serial.members);
+    assert!(parallel.planning.is_some());
+    assert!(parallel.execution.is_some());
+    assert_eq!(
+        u64::try_from(parallel.worker_batches)?,
+        parallel.planned_workers
+    );
+    assert_eq!(governor.usage_snapshot().compute_threads, 0);
+    assert_eq!(governor.usage_snapshot().io_slots, 0);
+    database.clear_resource_governor();
+    Ok(())
+}
+
 #[test]
 fn multilevel_set_scan_prunes_tombstones_and_fails_closed() -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new();
@@ -426,6 +465,19 @@ fn multilevel_set_scan_prunes_tombstones_and_fails_closed() -> Result<(), Box<dy
         database.sscan_latest_set_at(b"large", Some(1_023_u32.to_be_bytes().as_slice()), 4, 103,)?,
         expected
     );
+
+    let serial_segmented = database.sscan_latest_set_at_profiled(
+        b"large",
+        Some(1_023_u32.to_be_bytes().as_slice()),
+        512,
+        103,
+    )?;
+    assert_eq!(serial_segmented.members.len(), 512);
+    assert!(serial_segmented.planned_segments > 1);
+    assert_eq!(serial_segmented.planned_workers, 1);
+    assert_eq!(serial_segmented.worker_batches, 0);
+
+    assert_parallel_set_scan_matches(&mut database, &serial_segmented)?;
 
     let root = database
         .coordinator

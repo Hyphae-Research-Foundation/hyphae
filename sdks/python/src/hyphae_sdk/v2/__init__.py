@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 
 from .client import HyphaeClient, Transport
 from .generated import *  # noqa: F403

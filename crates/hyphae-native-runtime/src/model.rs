@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -883,7 +883,13 @@ pub(crate) struct HashPatternModelRequest<'request> {
 impl StructureState {
     #[allow(dead_code, reason = "first G3 stream model slice; WAL wiring follows")]
     pub(crate) fn create_stream(&mut self, key: Vec<u8>) -> Result<(), ModelError> {
-        if self.streams.contains_key(&key) {
+        if self.entries.contains_key(&key)
+            || self.hashes.contains_key(&key)
+            || self.sets.contains_key(&key)
+            || self.lists.contains_key(&key)
+            || self.sorted_sets.contains_key(&key)
+            || self.streams.contains_key(&key)
+        {
             return Err(ModelError::DuplicateEncodedEntry);
         }
         self.streams.insert(key, BTreeMap::new());
@@ -1818,6 +1824,35 @@ impl StructureState {
         true
     }
 
+    pub(crate) fn sorted_set_is_visible(&self, key: &[u8], logical_time_micros: i64) -> bool {
+        self.sorted_sets.contains_key(key)
+            && self
+                .sorted_set_expiries
+                .get(key)
+                .is_none_or(|expiry| *expiry > logical_time_micros)
+    }
+
+    pub(crate) fn expire_sorted_set(
+        &mut self,
+        key: &[u8],
+        expires_at_micros: i64,
+        logical_time_micros: i64,
+    ) -> bool {
+        if !self.sorted_set_is_visible(key, logical_time_micros) {
+            return false;
+        }
+        self.set_sorted_set_expiry(key, expires_at_micros)
+    }
+
+    pub(crate) fn set_sorted_set_expiry(&mut self, key: &[u8], expires_at_micros: i64) -> bool {
+        if !self.sorted_sets.contains_key(key) {
+            return false;
+        }
+        self.sorted_set_expiries
+            .insert(key.to_vec(), expires_at_micros);
+        true
+    }
+
     pub(crate) fn zadd(
         &mut self,
         key: &[u8],
@@ -2035,6 +2070,22 @@ impl StructureState {
                     TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
                 })
         })
+    }
+
+    pub(crate) fn ttl_sorted_set_micros(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<TtlValue> {
+        self.sorted_set_is_visible(key, logical_time_micros)
+            .then(|| {
+                self.sorted_set_expiries
+                    .get(key)
+                    .copied()
+                    .map_or(TtlValue::Persistent, |expiry| {
+                        TtlValue::Remaining(expiry.saturating_sub(logical_time_micros))
+                    })
+            })
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ModelError> {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! First executable convergence slice for Hyphae's native local data engine.
 //!
@@ -11,9 +11,13 @@ mod analyzer;
 mod ann_store;
 mod backup;
 mod bounded_search;
+mod calibration;
 mod convergence;
 mod directory;
+mod execution;
+mod governor;
 mod group_commit;
+mod hardware;
 #[cfg(test)]
 mod hash_model_equivalence;
 mod hash_pattern;
@@ -48,6 +52,8 @@ mod set_lifecycle_equivalence;
 mod set_ttl_equivalence;
 mod snapshot_pins;
 mod sql;
+#[allow(dead_code)]
+mod structure_v3;
 mod wal_codec;
 
 pub use analyzer::{
@@ -57,12 +63,20 @@ pub use analyzer::{
 pub use ann_store::{MAX_ANN_CONSOLIDATION_VECTORS, MAX_ANN_DELTA_BYTES, MAX_ANN_DELTA_RECORDS};
 pub use backup::{
     NativeBackupError, NativeBackupInfo, NativeBackupLimits, NativeRestoreInfo,
-    restore_native_backup, restore_native_backup_with_limits, verify_native_backup,
-    verify_native_backup_with_limits,
+    restore_native_backup, restore_native_backup_with_limits,
+    restore_native_backup_with_resource_governor, verify_native_backup,
+    verify_native_backup_with_limits, verify_native_backup_with_resource_governor,
 };
 pub use bounded_search::{
     BoundedSearchError, BoundedSearchLimits, BoundedSearchQuery, BoundedSearchResults,
     MAX_BOUNDED_SEARCH_DEPTH, MAX_BOUNDED_SEARCH_EDIT_DISTANCE,
+};
+pub use calibration::{
+    CalibrationCacheStatus, CalibrationCorrectness, CalibrationCoverage, CalibrationError,
+    CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling, CalibrationMeasurement,
+    CalibrationMode, CalibrationPolicy, CalibrationRequest, CalibrationStatistics,
+    CalibrationThreadScaling, HardwareCalibration, SelectedCalibrationKernel,
+    UnsupportedCalibration,
 };
 pub use convergence::{
     AggregateOperation, AggregateResult, AggregateSpec, ConvergenceError, ConvergenceExplanation,
@@ -72,6 +86,17 @@ pub use convergence::{
     StructureSource,
 };
 pub use directory::{NativeDirectoryError, NativeDirectoryIdentity, PromotionBoundary};
+pub use execution::{
+    NativeExecutionError, NativeExecutionPool, NativeExecutionTopology, NativeNumaPoolTopology,
+    NativeWorkerPlacement,
+};
+pub use governor::{
+    GovernorAdmissionError, GovernorAdmissionReceipt, GovernorCancellation, GovernorClassLimit,
+    GovernorMode, GovernorPermit, GovernorPolicyError, GovernorQueueError, GovernorRequest,
+    GovernorUsageSnapshot, GovernorWorkReceipt, NativeGovernorPolicy, NativeResourceGovernor,
+    NestedGovernorPermit, OwnedGovernorPermit, OwnedNestedGovernorPermit, QueuedGovernorPermit,
+    WorkloadClass,
+};
 pub use group_commit::{
     ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
     CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
@@ -80,14 +105,21 @@ pub use group_commit::{
     NativeCommitCancellation, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
     NativeSchedulerClock, ScheduledCommitReceipt,
 };
+pub use hardware::{
+    HardwareCache, HardwareCpu, HardwareMemory, HardwareNumaNode, HardwareOperatingSystem,
+    HardwareProcessor, HardwareProfile, HardwareProfileError, HardwareStorage,
+};
 pub use hash_pattern::{
     HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
     MAX_HASH_PATTERN_BYTES, MAX_HASH_PATTERN_MATCH_STEPS,
 };
 pub use hyphae_native_ann::{
-    AnnRecallRisk, AnnSearchStrategy, HnswConfig, Metric as VectorMetric,
-    SearchOptions as AnnSearchOptions, Vector, VectorHit, VectorRecord,
+    AnnRecallRisk, AnnSearchStrategy, HnswBuildProgress, HnswConfig, HnswPartitionPlan,
+    HnswPartitionSummary, Metric as VectorMetric, PartitionedAnnSearchResult, PartitionedHnswIndex,
+    PartitionedIndexSnapshot, SearchOptions as AnnSearchOptions, Vector, VectorHit,
+    VectorIndexDefinition, VectorRecord,
 };
+use hyphae_native_ann::{HnswIndex, MAX_HNSW_LEVEL};
 pub use local_operation::{
     LOCAL_COMMIT_RECEIPT_SIZE, LOCAL_OPERATION_HEADER_SIZE, LOCAL_STRUCTURE_SET_HEADER_SIZE,
     LOCAL_TRANSACTION_STRUCTURE_SET_HEADER_SIZE, LOCAL_TTL_PAYLOAD_SIZE, LocalFailureCode,
@@ -174,7 +206,10 @@ pub use set_algebra::{
     SetAlgebraOperation, SetAlgebraRequest, SetAlgebraResult,
 };
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
-pub use sql::{PreparedStatement, SqlError, SqlResult, SqlValue};
+pub use sql::{
+    MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
+    NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlValue,
+};
 
 use std::{
     cmp::Ordering as ValueOrdering,
@@ -182,7 +217,10 @@ use std::{
     fs,
     ops::{Bound, ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -190,7 +228,7 @@ use directory::NativeDirectoryGuard;
 use hyphae_native_blobs::{
     BlobError, BlobInventory, BlobRecovery, BlobReferenceSet, BlobStore, StagedBlob,
 };
-use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError};
+use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError, BTreeSegment};
 use hyphae_native_catalog::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, CatalogObjectKind,
     ColumnCheckOperator, ColumnDefinition, DependencyDirection, DependencyEdge, DependencyKind,
@@ -228,8 +266,19 @@ thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_FULL_CATALOG_STATE_LOAD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static FAIL_FULL_STRUCTURE_STATE_LOAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static DELTA_LATEST_VERSION_PAGE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reject_full_structure_state_load_for_test() -> Result<(), NativeRuntimeError> {
+    if FAIL_FULL_STRUCTURE_STATE_LOAD.get() {
+        Err(NativeRuntimeError::UnexpectedFullStateLoad)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +312,61 @@ use crate::{
 
 const PAGE_FILE: &str = "pages.hydb";
 const WAL_FILE: &str = "wal.hywal";
+const FOREGROUND_POINT_MEMORY_BYTES: u64 = 64 * 1_024;
+const FOREGROUND_BOUNDED_MEMORY_BYTES: u64 = 16 * 1_024 * 1_024;
+const EXACT_ANN_RECORD_OVERHEAD_BYTES: u64 = 192;
+const HNSW_EDGE_MEMORY_BYTES: u64 = 64;
+const RELATIONAL_SEGMENT_SCAN_THRESHOLD: usize = 256;
+const STRUCTURE_SEGMENT_SCAN_THRESHOLD: usize = 256;
+const SEARCH_SEGMENT_SCAN_THRESHOLD: u64 = 256;
+const SEGMENT_RESULT_OVERHEAD_BYTES: u64 = 128;
+const MUTATION_MEMORY_BYTES: u64 = 32 * 1_024 * 1_024;
+const MAINTENANCE_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
+const RECOVERY_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
+const ADMINISTRATIVE_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
+
+fn exact_ann_memory_bytes(vector_count: usize, dimension: usize) -> u64 {
+    let vector_count = u64::try_from(vector_count).unwrap_or(u64::MAX);
+    let dimension = u64::try_from(dimension).unwrap_or(u64::MAX);
+    let bytes_per_record = dimension
+        .saturating_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(u64::MAX))
+        .saturating_mul(2)
+        .saturating_add(EXACT_ANN_RECORD_OVERHEAD_BYTES);
+    vector_count
+        .saturating_mul(bytes_per_record)
+        .saturating_add(FOREGROUND_BOUNDED_MEMORY_BYTES)
+}
+
+fn partitioned_hnsw_build_memory_bytes(
+    vector_count: usize,
+    definition: VectorIndexDefinition,
+) -> u64 {
+    let vector_count = u64::try_from(vector_count).unwrap_or(u64::MAX);
+    let dimension = u64::from(definition.dimension());
+    let vector_bytes = dimension
+        .saturating_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(u64::MAX))
+        .saturating_add(EXACT_ANN_RECORD_OVERHEAD_BYTES);
+    let maximum_graph_bytes = u64::from(definition.config().m())
+        .saturating_mul(u64::from(MAX_HNSW_LEVEL).saturating_add(1))
+        .saturating_mul(HNSW_EDGE_MEMORY_BYTES);
+    vector_count
+        .saturating_mul(vector_bytes.saturating_add(maximum_graph_bytes))
+        .saturating_add(MAINTENANCE_MEMORY_BYTES)
+}
+
+fn segmented_result_memory_bytes(physical_entries: usize) -> u64 {
+    u64::try_from(physical_entries)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(SEGMENT_RESULT_OVERHEAD_BYTES)
+        .saturating_add(FOREGROUND_BOUNDED_MEMORY_BYTES)
+}
+
+fn default_buffer_pool() -> Result<Arc<BufferPool>, BufferPoolError> {
+    Ok(Arc::new(BufferPool::new(
+        DEFAULT_BUFFER_POOL_FRAMES,
+        DEFAULT_BUFFER_POOL_PARTITIONS,
+    )?))
+}
 const CATALOG_FORMAT_KEY: &[u8] = b"\x00";
 const CATALOG_FORMAT_VALUE_V3: &[u8] = b"HYCAT003";
 const CATALOG_FORMAT_VALUE_V4: &[u8] = b"HYCAT004";
@@ -318,6 +422,8 @@ const STRUCTURE_SET_META_MAGIC: &[u8; 8] = b"HYSETM01";
 const STRUCTURE_SET_EXPIRING_META_MAGIC: &[u8; 8] = b"HYSETM02";
 const STRUCTURE_LIST_META_MAGIC: &[u8; 8] = b"HYLSTM01";
 const STRUCTURE_LIST_EXPIRING_META_MAGIC: &[u8; 8] = b"HYLSTM02";
+const STRUCTURE_LIST_SIZED_META_MAGIC: &[u8; 8] = b"HYLSTM03";
+const STRUCTURE_LIST_SIZED_EXPIRING_META_MAGIC: &[u8; 8] = b"HYLSTM04";
 const STRUCTURE_LIST_CHUNK_MAGIC: &[u8; 8] = b"HYLSTC01";
 const STRUCTURE_SORTED_SET_META_MAGIC: &[u8; 8] = b"HYZSTM01";
 const STRUCTURE_SORTED_SET_SCORE_MAGIC: &[u8; 8] = b"HYZSCR01";
@@ -327,6 +433,8 @@ const STRUCTURE_SET_META_SIZE: usize = 16;
 const STRUCTURE_SET_EXPIRING_META_SIZE: usize = 24;
 const STRUCTURE_LIST_META_SIZE: usize = 32;
 const STRUCTURE_LIST_EXPIRING_META_SIZE: usize = 40;
+const STRUCTURE_LIST_SIZED_META_SIZE: usize = 40;
+const STRUCTURE_LIST_SIZED_EXPIRING_META_SIZE: usize = 48;
 const STRUCTURE_LIST_CHUNK_HEADER_SIZE: usize = 16;
 const STRUCTURE_LIST_CHUNK_MAX_ELEMENTS: usize = 64;
 const STRUCTURE_LIST_CHUNK_MAX_ENCODED_BYTES: usize = 10_000;
@@ -440,15 +548,24 @@ enum StructureFormat {
     InlineStateV1,
     BTreeV1,
     BTreeV2,
+    BTreeV3,
 }
 
 impl StructureFormat {
-    const fn is_btree(self) -> bool {
+    const fn uses_legacy_collection_layout(self) -> bool {
         matches!(self, Self::BTreeV1 | Self::BTreeV2)
     }
 
-    const fn has_expiry_index(self) -> bool {
-        matches!(self, Self::BTreeV2)
+    const fn uses_ordered_expiry_index(self) -> bool {
+        matches!(self, Self::BTreeV2 | Self::BTreeV3)
+    }
+
+    const fn supports_collection_retirement(self) -> bool {
+        matches!(self, Self::BTreeV2 | Self::BTreeV3)
+    }
+
+    const fn supports_materialized_collection_writes(self) -> bool {
+        matches!(self, Self::BTreeV1 | Self::BTreeV2 | Self::BTreeV3)
     }
 
     const fn marker(self) -> Option<&'static [u8]> {
@@ -456,6 +573,7 @@ impl StructureFormat {
             Self::InlineStateV1 => None,
             Self::BTreeV1 => Some(STRUCTURE_FORMAT_VALUE_V1),
             Self::BTreeV2 => Some(STRUCTURE_FORMAT_VALUE_V2),
+            Self::BTreeV3 => Some(structure_v3::STRUCTURE_FORMAT_VALUE_V3),
         }
     }
 }
@@ -491,6 +609,15 @@ impl PhysicalSearchFormat {
 /// Native runtime or recovery failure.
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
+    /// The shared Native resource governor rejected this unit of work.
+    #[error(transparent)]
+    ResourceAdmission(#[from] GovernorAdmissionError),
+    /// The bounded shared admission queue rejected or cancelled this work.
+    #[error(transparent)]
+    ResourceQueue(#[from] GovernorQueueError),
+    /// The shared persistent execution pool failed closed.
+    #[error(transparent)]
+    Execution(#[from] NativeExecutionError),
     /// Native binary-glob compilation, request validation, or matching failed.
     #[error(transparent)]
     HashPattern(#[from] HashPatternError),
@@ -681,9 +808,24 @@ pub enum NativeRuntimeError {
         /// Rejected caller-supplied key bound.
         requested: usize,
     },
-    /// Structure reachability compaction requires the indexed V2 format.
-    #[error("native structure compaction requires HYSTRBT2")]
+    /// Structure reachability compaction requires a validated B+tree format.
+    #[error("native structure compaction requires HYSTRBT2 or HYSTRBT3")]
     StructureCompactionUnsupported,
+    /// Explicit structure migration accepts only a validated indexed V2 root.
+    #[error("native structure V3 migration requires HYSTRBT2")]
+    StructureV3MigrationUnsupported,
+    /// HYSTRBT3 recovery is enabled before its mutation writer is activated.
+    #[error("HYSTRBT3 structure mutations are not enabled")]
+    StructureV3MutationUnsupported,
+    /// Incremental retirement cleanup requires the incarnation-fenced format.
+    #[error("native structure retirement cleanup requires HYSTRBT3")]
+    StructureV3RetirementUnsupported,
+    /// One retirement cleanup step is below the dual-index minimum or above its hard bound.
+    #[error("native structure retirement entry budget {requested} is outside 2..=1024")]
+    InvalidStructureRetirementLimit {
+        /// Rejected caller-supplied physical-entry budget.
+        requested: usize,
+    },
     /// Search reachability compaction requires the native inverted B+tree.
     #[error("native search compaction requires a HYSEABT search root")]
     SearchCompactionUnsupported,
@@ -891,7 +1033,7 @@ fn page_store_error_is_corruption(source: &PageStoreError) -> bool {
                 | hyphae_native_pages::PageError::ChecksumMismatch
                 | hyphae_native_pages::PageError::DigestMismatch
         ),
-        PageStoreError::InvalidFileLength { .. } => true,
+        PageStoreError::InvalidFileLength { .. } | PageStoreError::PageOutsideBoundary(_) => true,
         PageStoreError::Io(_) | PageStoreError::Poisoned | PageStoreError::PageIdExhausted => false,
     }
 }
@@ -906,6 +1048,7 @@ fn blob_error_is_corruption(source: &BlobError) -> bool {
             | BlobError::IdentityMismatch
             | BlobError::UnexpectedDirectoryEntry
             | BlobError::IdentityCollision
+            | BlobError::ReferenceOutsideBoundary(_)
             | BlobError::InconsistentGeneration
     )
 }
@@ -932,7 +1075,8 @@ fn btree_error_is_corruption(source: &BTreeError) -> bool {
         | BTreeError::KeyTooLarge
         | BTreeError::EntryTooLarge
         | BTreeError::NoValidSplit
-        | BTreeError::DuplicateKey => false,
+        | BTreeError::DuplicateKey
+        | BTreeError::ForeignSegment => false,
     }
 }
 
@@ -1220,6 +1364,160 @@ pub struct HashFieldEntry {
     value: Vec<u8>,
 }
 
+/// Execution evidence for one current-root physical hash scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeHashScanExecutionReceipt {
+    /// Immutable all-engine CSN used by the scan.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ordered live field/value entries.
+    pub entries: Vec<HashFieldEntry>,
+    /// Live field cardinality declared by current hash metadata.
+    pub declared_field_count: usize,
+    /// Immutable leaf segments selected by the physical range plan.
+    pub planned_segments: usize,
+    /// Physical leaf entries covered before tombstone/TTL filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this scan.
+    pub worker_batches: usize,
+}
+
+/// Execution evidence for one current-root physical set-member scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSetScanExecutionReceipt {
+    /// Immutable all-engine CSN used by the scan.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ordered live members.
+    pub members: Vec<Vec<u8>>,
+    /// Live member cardinality declared by current set metadata.
+    pub declared_member_count: usize,
+    /// Immutable leaf segments selected by the physical range plan.
+    pub planned_segments: usize,
+    /// Physical entries covered before tombstone filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this scan.
+    pub worker_batches: usize,
+}
+
+fn empty_hash_scan_execution_receipt(
+    snapshot_csn: Option<Csn>,
+    declared_field_count: usize,
+    planning: Option<NativeEngineWorkReceipt>,
+) -> NativeHashScanExecutionReceipt {
+    NativeHashScanExecutionReceipt {
+        snapshot_csn,
+        entries: Vec::new(),
+        declared_field_count,
+        planned_segments: 0,
+        planned_physical_entries: 0,
+        planning,
+        execution: None,
+        planned_workers: 0,
+        worker_batches: 0,
+    }
+}
+
+/// One canonical native stream field/value map.
+pub type NativeStreamFields = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// One stable native stream ID and its canonical field/value map.
+pub type NativeStreamEntry = (u64, NativeStreamFields);
+
+/// Execution evidence for one current-root physical stream-ID range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeStreamRangeExecutionReceipt {
+    /// Immutable all-engine CSN used by the range.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ordered live stream entries.
+    pub entries: Vec<NativeStreamEntry>,
+    /// Highest stream ID declared by current metadata.
+    pub declared_last_id: u64,
+    /// Immutable leaf segments selected by the physical range plan.
+    pub planned_segments: usize,
+    /// Physical entries covered before tombstone filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this range.
+    pub worker_batches: usize,
+}
+
+/// Execution evidence for one current-root native-list logical range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeListRangeExecutionReceipt {
+    /// Immutable all-engine CSN used by the range.
+    pub snapshot_csn: Option<Csn>,
+    /// Logical list values in head-to-tail order.
+    pub values: Vec<Vec<u8>>,
+    /// Live element count declared by current list metadata.
+    pub declared_length: usize,
+    /// Immutable B+tree leaf segments selected by the chunk-key plan.
+    pub planned_segments: usize,
+    /// Physical leaf entries covered before chunk decoding.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this range.
+    pub worker_batches: usize,
+}
+
+/// Execution evidence for one current-root sorted-set score range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSortedSetRangeExecutionReceipt {
+    /// Immutable all-engine CSN used by the range.
+    pub snapshot_csn: Option<Csn>,
+    /// Requested-direction live entries after offset and limit.
+    pub entries: Vec<SortedSetEntry>,
+    /// Immutable ordered-index leaf segments selected by the score plan.
+    pub planned_segments: usize,
+    /// Physical entries covered before tombstone filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this range.
+    pub worker_batches: usize,
+}
+
+fn direct_sorted_set_range_receipt(
+    snapshot_csn: Option<Csn>,
+    entries: Vec<SortedSetEntry>,
+    execution: Option<NativeEngineWorkReceipt>,
+) -> NativeSortedSetRangeExecutionReceipt {
+    NativeSortedSetRangeExecutionReceipt {
+        snapshot_csn,
+        entries,
+        planned_segments: 0,
+        planned_physical_entries: 0,
+        planning: None,
+        execution,
+        planned_workers: 1,
+        worker_batches: 0,
+    }
+}
+
 impl HashFieldEntry {
     /// Creates one owned binary field/value pair.
     pub const fn new(field: Vec<u8>, value: Vec<u8>) -> Self {
@@ -1469,6 +1767,16 @@ pub struct NativePhysicalObservation {
     pub process_full_catalog_loads: u64,
 }
 
+/// Process-wide counters used to prove that one bounded execution interval did
+/// not materialize complete engine or catalog state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeMaterializationObservation {
+    /// Complete all-engine state materializations observed by this process.
+    pub full_state_loads: u64,
+    /// Complete catalog-tree materializations observed by this process.
+    pub full_catalog_loads: u64,
+}
+
 /// Current catalog point lookup plus its exact immutable root-set identity.
 #[derive(Clone, Debug)]
 pub struct IdentifiedCatalogObject {
@@ -1710,9 +2018,11 @@ struct SingletonCommitReport {
 
 struct PageCommitInput<'commit> {
     roots: [Option<PageId>; 4],
+    buffer_pool: &'commit BufferPool,
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    transaction_id: TransactionId,
     commit_csn: Csn,
     batch: &'commit NativeWriteBatch,
     staged_blobs: BTreeMap<[u8; 32], StagedBlob>,
@@ -1808,6 +2118,69 @@ pub struct StructureCompactionReceipt {
     pub pages_appended: u64,
     /// Native maintenance commit, absent when no tombstone existed.
     pub commit: Option<CommitReceipt>,
+}
+
+/// Result of one explicit complete-root `HYSTRBT2` to `HYSTRBT3` migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureV3MigrationReceipt {
+    /// Complete physical entries inspected in the validated V2 source root.
+    pub source_entries: usize,
+    /// Canonical live entries emitted into the validated V3 target root.
+    pub target_entries: usize,
+    /// Canonical V2 tombstones omitted from the replacement root.
+    pub dropped_tombstones: usize,
+    /// B+tree node pages reachable from the immutable V2 source root.
+    pub reachable_pages_before: usize,
+    /// B+tree node pages reachable from the published V3 root.
+    pub reachable_pages_after: usize,
+    /// New B+tree pages appended for the complete replacement root.
+    pub pages_appended: u64,
+    /// Native maintenance commit that atomically published the V3 root.
+    pub commit: CommitReceipt,
+}
+
+/// Stable identity of one retired collection incarnation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructureRetirementIdentity {
+    /// Exact user key owned by the retired collection.
+    pub collection_key: Vec<u8>,
+    /// Transaction that allocated the retired incarnation.
+    pub transaction_id: TransactionId,
+    /// Zero-based lifecycle mutation ordinal inside that transaction.
+    pub mutation_ordinal: u32,
+}
+
+/// Result of one governor-admitted incremental `HYSTRBT3` reclamation step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructureRetirementCleanupReceipt {
+    /// Retired incarnation selected in canonical physical-key order.
+    pub retirement: Option<StructureRetirementIdentity>,
+    /// Caller-supplied upper bound for one primary-child visit step.
+    pub entry_budget: usize,
+    /// Primary child entries visited and advanced past by this step.
+    pub processed_primary_entries: usize,
+    /// Physical child/secondary/expiry/retirement entries updated atomically.
+    pub physical_mutations: usize,
+    /// Whether the selected retirement retains unprocessed child state.
+    pub more_remaining: bool,
+    /// Whether this or another active retirement still requires maintenance.
+    pub more_retirements: bool,
+    /// New immutable B+tree pages appended by the maintenance commit.
+    pub pages_appended: u64,
+    /// Native maintenance commit, absent when no active retirement exists.
+    pub commit: Option<CommitReceipt>,
+}
+
+const fn empty_structure_compaction_receipt() -> StructureCompactionReceipt {
+    StructureCompactionReceipt {
+        scanned_entries: 0,
+        retained_entries: 0,
+        dropped_tombstones: 0,
+        reachable_pages_before: 0,
+        reachable_pages_after: 0,
+        pages_appended: 0,
+        commit: None,
+    }
 }
 
 /// Result of one current-root lexical tombstone compaction.
@@ -2092,6 +2465,29 @@ pub struct MatchHit {
     pub score: f64,
 }
 
+/// Execution evidence for one current-root native BM25 query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeLexicalSearchExecutionReceipt {
+    /// Immutable all-engine CSN used by the query.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ranked BM25 hits.
+    pub hits: Vec<MatchHit>,
+    /// Live query terms resolved through the current inverted index.
+    pub planned_terms: usize,
+    /// Immutable posting-list leaf segments selected by the physical plan.
+    pub planned_segments: usize,
+    /// Physical posting entries covered before tombstone filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Posting execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the posting plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this query.
+    pub worker_batches: usize,
+}
+
 /// Runtime receipt for one approximate native vector query.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnSearchReceipt {
@@ -2124,6 +2520,70 @@ pub struct AnnSearchReceipt {
     pub hits: Vec<VectorHit>,
 }
 
+/// Admission and component timing for one completed native engine scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEngineWorkReceipt {
+    /// Workload class selected by the engine plan.
+    pub class: WorkloadClass,
+    /// Exact resources reserved for this scope.
+    pub request: GovernorRequest,
+    /// Process-local queue ticket, absent for immediate admission.
+    pub queue_ticket: Option<u64>,
+    /// Requests already waiting when a queued scope entered admission.
+    pub initial_queue_depth: u64,
+    /// Time waiting for governor selection and resource ownership.
+    pub queue_time: Duration,
+    /// Time from resource ownership through explicit engine completion.
+    pub execution_time: Duration,
+}
+
+/// Execution evidence for one complete exact native vector query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeExactAnnExecutionReceipt {
+    /// Immutable all-engine CSN used by the query.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ordered exact vector hits.
+    pub hits: Vec<VectorHit>,
+    /// Exact effective vectors admitted after stable-ID filtering.
+    pub planned_vectors: usize,
+    /// Contiguous exact-ranking batches planned for canonical reduction.
+    pub planned_batches: usize,
+    /// Metadata-observation admission, absent without an installed governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Exact-ranking admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute threads reserved by the exact-ranking plan.
+    pub planned_compute_threads: u64,
+    /// Arena and scratch bytes reserved by the exact-ranking plan.
+    pub planned_memory_bytes: u64,
+    /// Persistent-pool batches that actually executed this query.
+    pub worker_batches: usize,
+    /// Complete query time, including planning, queueing, state load, and ranking.
+    pub total_time: Duration,
+}
+
+/// Experimental P4 evidence for one deterministic partitioned HNSW bulk build.
+/// The returned index is process-local and is not a durable published generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativePartitionedHnswBuildReceipt {
+    /// Complete validated fan-out generation produced by this build.
+    pub index: PartitionedHnswIndex,
+    /// Source vectors transferred into disjoint build partitions.
+    pub planned_vectors: usize,
+    /// Balanced geometric partitions selected before admission.
+    pub planned_partitions: usize,
+    /// Bulk compute threads reserved by the build.
+    pub planned_compute_threads: u64,
+    /// Conservative vector and maximum-layer graph memory reservation.
+    pub planned_memory_bytes: u64,
+    /// Persistent-pool batches that actually built child generations.
+    pub worker_batches: usize,
+    /// Bulk admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Complete planning, queueing, child-build, validation, and merge time.
+    pub total_time: Duration,
+}
+
 /// One row reached through an exact native secondary-index key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecondaryIndexRow {
@@ -2146,6 +2606,28 @@ pub struct RelationalScanRow {
     pub row: Vec<u8>,
 }
 
+/// Execution evidence for one current-root relational range scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeRelationalScanExecutionReceipt {
+    /// Immutable all-engine CSN used by the scan.
+    pub snapshot_csn: Option<Csn>,
+    /// Canonically ordered visible rows.
+    pub rows: Vec<RelationalScanRow>,
+    /// Immutable leaf segments selected by the physical range plan.
+    /// Zero denotes the direct small-range visitor.
+    pub planned_segments: usize,
+    /// Physical leaf entries covered before MVCC/tombstone filtering.
+    pub planned_physical_entries: usize,
+    /// Segment-planning admission, absent on the direct path or without a governor.
+    pub planning: Option<NativeEngineWorkReceipt>,
+    /// Segment-execution admission, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Compute and I/O workers reserved by the segment plan.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that actually executed this scan.
+    pub worker_batches: usize,
+}
+
 pub(crate) enum RelationalVisitError<E> {
     Runtime(NativeRuntimeError),
     Visitor(E),
@@ -2158,6 +2640,110 @@ struct MaterializedState {
     structures: StructureState,
     search: SearchState,
     ann: ann_store::AnnState,
+}
+
+struct NativeBTreeSegmentPlan {
+    tree: BTree,
+    prefix: Vec<u8>,
+    segments: Vec<BTreeSegment>,
+    physical_entries: usize,
+}
+
+struct NativePhysicalKeyRange {
+    prefix: Vec<u8>,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+}
+
+struct HashSegmentBatch {
+    physical_live: usize,
+    entries: Vec<HashFieldEntry>,
+}
+
+struct SetSegmentBatch {
+    physical_live: usize,
+    members: Vec<Vec<u8>>,
+}
+
+struct ListChunkBatch {
+    chunks: Vec<(i64, Vec<Vec<u8>>)>,
+}
+
+struct LexicalTermSegmentPlan {
+    posting_prefix: Vec<u8>,
+    document_frequency: u64,
+    idf: f64,
+    segments: Vec<BTreeSegment>,
+    physical_entries: usize,
+}
+
+struct LexicalSegmentWork {
+    term_index: usize,
+    posting_prefix: Arc<Vec<u8>>,
+    idf: f64,
+    segment: BTreeSegment,
+}
+
+struct LexicalPostingBatch {
+    term_index: usize,
+    live_postings: u64,
+    contributions: Vec<(Vec<u8>, f64)>,
+}
+
+struct LexicalExecutionPlan {
+    snapshot_csn: Csn,
+    tree: BTree,
+    format: PhysicalSearchFormat,
+    index: ObjectId,
+    average_length: f64,
+    planned_terms: usize,
+    planned_segments: usize,
+    planned_physical_entries: usize,
+    expected_document_frequencies: Vec<u64>,
+    work: Vec<LexicalSegmentWork>,
+    planning: Option<NativeEngineWorkReceipt>,
+}
+
+struct SortedSetScoreRangeRequest {
+    snapshot_csn: Option<Csn>,
+    tree: BTree,
+    key: Vec<u8>,
+    bounds: (Bound<SortedSetScore>, Bound<SortedSetScore>),
+    offset: usize,
+    limit: usize,
+    direction: SortedSetDirection,
+    planning_permit: Option<DatabaseGovernorPermit>,
+}
+
+struct SortedSetRankRangeRequest {
+    snapshot_csn: Option<Csn>,
+    tree: BTree,
+    key: Vec<u8>,
+    start: i64,
+    stop: i64,
+    direction: SortedSetDirection,
+    planning_permit: Option<DatabaseGovernorPermit>,
+}
+
+struct ListRangeRequest {
+    snapshot_csn: Option<Csn>,
+    tree: BTree,
+    key: Vec<u8>,
+    logical_time_micros: i64,
+    start: i64,
+    stop: i64,
+    planning_permit: Option<DatabaseGovernorPermit>,
+}
+
+struct StreamRangeSegmentRequest<'key> {
+    snapshot_csn: Option<Csn>,
+    tree: BTree,
+    key: &'key [u8],
+    start: u64,
+    end: u64,
+    last_id: u64,
+    limit: usize,
+    planning_permit: Option<DatabaseGovernorPermit>,
 }
 
 fn set_algebra_in_state(
@@ -2354,10 +2940,14 @@ impl NativeSnapshot {
 
     /// Returns one sorted-set family's TTL state in this snapshot.
     pub fn ttl_sorted_set(&self, key: &[u8]) -> Ttl {
-        if self.state.structures.sorted_sets.contains_key(key) {
-            Ttl::Persistent
-        } else {
-            Ttl::Missing
+        match self
+            .state
+            .structures
+            .ttl_sorted_set_micros(key, self.metadata.logical_time_micros)
+        {
+            None => Ttl::Missing,
+            Some(TtlValue::Persistent) => Ttl::Persistent,
+            Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
         }
     }
 
@@ -3069,12 +3659,173 @@ fn open_blob_store(path: &Path) -> Result<(BlobStore, Duration), BlobError> {
     Ok((blobs, started.elapsed()))
 }
 
+enum DatabaseGovernorPermit {
+    Immediate {
+        permit: OwnedGovernorPermit,
+        execution_started: Instant,
+    },
+    Queued(QueuedGovernorPermit),
+}
+
+impl DatabaseGovernorPermit {
+    fn permit(&self) -> &OwnedGovernorPermit {
+        match self {
+            Self::Immediate { permit, .. } => permit,
+            Self::Queued(permit) => permit.permit(),
+        }
+    }
+
+    fn into_owned(self) -> OwnedGovernorPermit {
+        match self {
+            Self::Immediate { permit, .. } => permit,
+            Self::Queued(permit) => permit.into_owned(),
+        }
+    }
+
+    fn finish(self) -> NativeEngineWorkReceipt {
+        match self {
+            Self::Immediate {
+                permit,
+                execution_started,
+            } => NativeEngineWorkReceipt {
+                class: permit.class(),
+                request: permit.request(),
+                queue_ticket: None,
+                initial_queue_depth: 0,
+                queue_time: Duration::ZERO,
+                execution_time: execution_started.elapsed(),
+            },
+            Self::Queued(permit) => {
+                let receipt = permit.finish();
+                NativeEngineWorkReceipt {
+                    class: receipt.admission.class,
+                    request: receipt.admission.request,
+                    queue_ticket: Some(receipt.admission.ticket),
+                    initial_queue_depth: receipt.admission.initial_queue_depth,
+                    queue_time: receipt.admission.queue_time,
+                    execution_time: receipt.execution_time,
+                }
+            }
+        }
+    }
+}
+
+fn admit_governor_work(
+    governor: &Arc<NativeResourceGovernor>,
+    maximum_wait: Duration,
+    class: WorkloadClass,
+    request: GovernorRequest,
+) -> Result<DatabaseGovernorPermit, NativeRuntimeError> {
+    if maximum_wait.is_zero() {
+        return governor
+            .try_admit_owned(class, request)
+            .map(|permit| DatabaseGovernorPermit::Immediate {
+                permit,
+                execution_started: Instant::now(),
+            })
+            .map_err(NativeRuntimeError::from);
+    }
+    let cancellation = governor.cancellation_token();
+    governor
+        .admit_queued_owned(class, request, maximum_wait, &cancellation)
+        .map(DatabaseGovernorPermit::Queued)
+        .map_err(NativeRuntimeError::from)
+}
+
+/// Maximum successful prepared SQL statements retained per open handle.
+pub const MAX_NATIVE_SQL_PLAN_CACHE_ENTRIES: usize = 256;
+
+/// Current state of the catalog-bound prepared SQL plan cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSqlPlanCacheStats {
+    /// Catalog version shared by every retained plan.
+    pub catalog_version: Option<CatalogVersion>,
+    /// Current number of retained prepared plans.
+    pub entries: usize,
+    /// Successful lookups since this database handle opened.
+    pub hits: u64,
+    /// Lookups that required binding since this database handle opened.
+    pub misses: u64,
+    /// Catalog-version transitions that retired all cached plans.
+    pub catalog_invalidations: u64,
+    /// Capacity evictions within one catalog version.
+    pub capacity_evictions: u64,
+}
+
+#[derive(Debug, Default)]
+struct NativeSqlPlanCache {
+    catalog_version: Option<CatalogVersion>,
+    entries: BTreeMap<String, PreparedStatement>,
+    insertion_order: VecDeque<String>,
+    hits: u64,
+    misses: u64,
+    catalog_invalidations: u64,
+    capacity_evictions: u64,
+}
+
+impl NativeSqlPlanCache {
+    fn align_catalog(&mut self, catalog_version: CatalogVersion) {
+        if self.catalog_version == Some(catalog_version) {
+            return;
+        }
+        if self.catalog_version.is_some() {
+            self.catalog_invalidations = self.catalog_invalidations.saturating_add(1);
+        }
+        self.catalog_version = Some(catalog_version);
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+
+    fn lookup(
+        &mut self,
+        catalog_version: CatalogVersion,
+        statement: &str,
+    ) -> Option<PreparedStatement> {
+        self.align_catalog(catalog_version);
+        let prepared = self.entries.get(statement).cloned();
+        if prepared.is_some() {
+            self.hits = self.hits.saturating_add(1);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        prepared
+    }
+
+    fn insert(&mut self, statement: &str, prepared: PreparedStatement) {
+        if self.entries.contains_key(statement) {
+            self.entries.insert(statement.to_owned(), prepared);
+            return;
+        }
+        while self.entries.len() >= MAX_NATIVE_SQL_PLAN_CACHE_ENTRIES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+            }
+        }
+        self.entries.insert(statement.to_owned(), prepared);
+        self.insertion_order.push_back(statement.to_owned());
+    }
+
+    fn stats(&self) -> NativeSqlPlanCacheStats {
+        NativeSqlPlanCacheStats {
+            catalog_version: self.catalog_version,
+            entries: self.entries.len(),
+            hits: self.hits,
+            misses: self.misses,
+            catalog_invalidations: self.catalog_invalidations,
+            capacity_evictions: self.capacity_evictions,
+        }
+    }
+}
+
 /// One Hyphae-owned native data directory.
 #[derive(Debug)]
 pub struct NativeDatabase {
     data_directory: PathBuf,
     pages: PageStore,
-    buffer_pool: BufferPool,
+    buffer_pool: Arc<BufferPool>,
     blobs: BlobStore,
     wal: WalFile,
     wal_retention: WalRetentionStore,
@@ -3092,6 +3843,10 @@ pub struct NativeDatabase {
     last_checkpoint_visible_csn: Option<Csn>,
     last_checkpoint_manifest_digest: Option<[u8; 32]>,
     recovery: RecoveryReport,
+    resource_governor: Option<Arc<NativeResourceGovernor>>,
+    execution_pool: Option<Arc<NativeExecutionPool>>,
+    resource_queue_wait: Duration,
+    sql_plan_cache: Mutex<NativeSqlPlanCache>,
     directory_guard: NativeDirectoryGuard,
 }
 
@@ -3128,8 +3883,7 @@ impl NativeDatabase {
             NativeDirectoryGuard::initialize(path)?
         };
         let pages = PageStore::create(path.join(PAGE_FILE))?;
-        let buffer_pool =
-            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let buffer_pool = default_buffer_pool()?;
         let blobs = BlobStore::create(path)?;
         let wal = WalFile::create(path.join(WAL_FILE))?;
         let wal_retention = WalRetentionStore::create(path)?;
@@ -3195,6 +3949,10 @@ impl NativeDatabase {
                 recovered_temporary_blobs: 0,
                 recovered_temporary_wal_anchors: 0,
             },
+            resource_governor: None,
+            execution_pool: None,
+            resource_queue_wait: Duration::ZERO,
+            sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
             directory_guard,
         })
     }
@@ -3248,6 +4006,60 @@ impl NativeDatabase {
         Self::open_with_marker(path.as_ref(), false)
     }
 
+    /// Admits recovery before opening, verifying, or repairing a native data directory.
+    ///
+    /// The installed governor remains attached to the returned handle. A zero
+    /// wait preserves fail-fast admission; a positive wait uses its bounded
+    /// priority queue. No durable file is touched when admission fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource-admission/queue error before recovery begins, or the
+    /// same validation and recovery errors as [`Self::open`].
+    pub fn open_with_resource_governor(
+        path: impl AsRef<Path>,
+        governor: Arc<NativeResourceGovernor>,
+        maximum_wait: Duration,
+    ) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker_and_resource_governor(path.as_ref(), false, governor, maximum_wait)
+    }
+
+    /// Admits recovery before opening an importer-owned pending target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource-admission/queue error before recovery begins, or the
+    /// same validation and recovery errors as [`Self::open_pending`].
+    pub fn open_pending_with_resource_governor(
+        path: impl AsRef<Path>,
+        governor: Arc<NativeResourceGovernor>,
+        maximum_wait: Duration,
+    ) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker_and_resource_governor(path.as_ref(), true, governor, maximum_wait)
+    }
+
+    fn open_with_marker_and_resource_governor(
+        path: &Path,
+        pending: bool,
+        governor: Arc<NativeResourceGovernor>,
+        maximum_wait: Duration,
+    ) -> Result<Self, NativeRuntimeError> {
+        let _permit = admit_governor_work(
+            &governor,
+            maximum_wait,
+            WorkloadClass::Recovery,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: RECOVERY_MEMORY_BYTES,
+            },
+        )?;
+        let mut database = Self::open_with_marker(path, pending)?;
+        database.resource_governor = Some(governor);
+        database.resource_queue_wait = maximum_wait;
+        Ok(database)
+    }
+
     fn open_with_marker(path: &Path, pending: bool) -> Result<Self, NativeRuntimeError> {
         let open_started = Instant::now();
         let directory_guard = if pending {
@@ -3271,8 +4083,7 @@ impl NativeDatabase {
             page_generation_path(path, active_page_generation),
             active_page_generation,
         )?;
-        let buffer_pool =
-            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let buffer_pool = default_buffer_pool()?;
         let conflicts = replay_conflicts(commits)?;
         let root_validation_started = Instant::now();
         let (committed_roots, latest_root) = recover_committed_roots(
@@ -3344,6 +4155,10 @@ impl NativeDatabase {
             last_checkpoint_visible_csn: recovered.checkpoint_validation.latest_visible_csn,
             last_checkpoint_manifest_digest: recovered.checkpoint_validation.latest_digest,
             recovery,
+            resource_governor: None,
+            execution_pool: None,
+            resource_queue_wait: Duration::ZERO,
+            sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
             directory_guard,
         })
     }
@@ -3361,6 +4176,244 @@ impl NativeDatabase {
     /// Returns recovery evidence produced when this handle was opened.
     pub const fn recovery_report(&self) -> &RecoveryReport {
         &self.recovery
+    }
+
+    fn sql_plan_cache(&self) -> MutexGuard<'_, NativeSqlPlanCache> {
+        self.sql_plan_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns process-local prepared SQL cache counters for this handle.
+    pub fn sql_plan_cache_stats(&self) -> NativeSqlPlanCacheStats {
+        self.sql_plan_cache().stats()
+    }
+
+    /// Installs one process-local admission authority for subsequent engine work.
+    ///
+    /// The caller must derive and verify the immutable policy before opening
+    /// traffic. The governor has no durable state and is deliberately not
+    /// reconstructed from the data directory.
+    pub fn set_resource_governor(&mut self, governor: Arc<NativeResourceGovernor>) {
+        self.resource_governor = Some(governor);
+        self.execution_pool = None;
+        self.resource_queue_wait = Duration::ZERO;
+    }
+
+    /// Installs process-local admission with one maximum synchronous wait.
+    ///
+    /// A zero wait preserves fail-fast admission. A positive wait uses the
+    /// policy-bounded priority queue for every routed database operation.
+    pub fn set_resource_governor_with_queue_wait(
+        &mut self,
+        governor: Arc<NativeResourceGovernor>,
+        maximum_wait: Duration,
+    ) {
+        self.resource_governor = Some(governor);
+        self.execution_pool = None;
+        self.resource_queue_wait = maximum_wait;
+    }
+
+    /// Installs one verified governor and its matching persistent worker pool.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a pool derived from another hardware fingerprint or worker
+    /// budget without changing the current database execution configuration.
+    pub fn set_resource_governor_with_execution_pool(
+        &mut self,
+        governor: Arc<NativeResourceGovernor>,
+        execution_pool: Arc<NativeExecutionPool>,
+        maximum_wait: Duration,
+    ) -> Result<(), NativeExecutionError> {
+        execution_pool.validate_policy(governor.policy())?;
+        self.resource_governor = Some(governor);
+        self.execution_pool = Some(execution_pool);
+        self.resource_queue_wait = maximum_wait;
+        Ok(())
+    }
+
+    /// Removes process-local admission without changing durable state.
+    pub fn clear_resource_governor(&mut self) {
+        self.resource_governor = None;
+        self.execution_pool = None;
+        self.resource_queue_wait = Duration::ZERO;
+    }
+
+    /// Returns the currently installed process-local admission authority.
+    pub fn resource_governor(&self) -> Option<&Arc<NativeResourceGovernor>> {
+        self.resource_governor.as_ref()
+    }
+
+    /// Returns the persistent worker pool paired with the installed governor.
+    pub fn execution_pool(&self) -> Option<&Arc<NativeExecutionPool>> {
+        self.execution_pool.as_ref()
+    }
+
+    fn admit_foreground_point(&self) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::ForegroundPoint,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: FOREGROUND_POINT_MEMORY_BYTES,
+            },
+        )
+    }
+
+    fn admit_foreground_bounded(
+        &self,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: FOREGROUND_BOUNDED_MEMORY_BYTES,
+            },
+        )
+    }
+
+    fn admit_parallel_foreground_bounded(
+        &self,
+        memory_bytes: u64,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let compute_threads = self
+            .resource_governor
+            .as_ref()
+            .zip(self.execution_pool.as_ref())
+            .map_or(1, |(governor, execution_pool)| {
+                governor
+                    .policy()
+                    .limit(WorkloadClass::ForegroundBounded)
+                    .compute_threads
+                    .min(
+                        u64::try_from(execution_pool.topology().worker_count()).unwrap_or(u64::MAX),
+                    )
+                    .max(1)
+            });
+        self.admit_database_work(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads,
+                io_slots: 1,
+                memory_bytes,
+            },
+        )
+    }
+
+    fn admit_parallel_foreground_bounded_io(
+        &self,
+        memory_bytes: u64,
+        maximum_workers: usize,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let worker_limit = u64::try_from(maximum_workers).unwrap_or(u64::MAX).max(1);
+        let workers = self
+            .resource_governor
+            .as_ref()
+            .zip(self.execution_pool.as_ref())
+            .map_or(1, |(governor, execution_pool)| {
+                let class = governor.policy().limit(WorkloadClass::ForegroundBounded);
+                governor
+                    .policy()
+                    .schedulable_compute_threads
+                    .min(governor.policy().io_slots)
+                    .min(class.compute_threads)
+                    .min(class.io_slots)
+                    .min(
+                        u64::try_from(execution_pool.topology().worker_count()).unwrap_or(u64::MAX),
+                    )
+                    .min(worker_limit)
+                    .max(1)
+            });
+        self.admit_database_work(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: workers,
+                io_slots: workers,
+                memory_bytes,
+            },
+        )
+    }
+
+    fn admit_mutation_owned(&self) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: MUTATION_MEMORY_BYTES,
+            },
+        )
+        .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
+    }
+
+    fn admit_maintenance_owned(&self) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::Maintenance,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: MAINTENANCE_MEMORY_BYTES,
+            },
+        )
+        .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
+    }
+
+    fn admit_parallel_bulk(
+        &self,
+        memory_bytes: u64,
+        maximum_workers: usize,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let worker_limit = u64::try_from(maximum_workers).unwrap_or(u64::MAX).max(1);
+        let compute_threads = self
+            .resource_governor
+            .as_ref()
+            .zip(self.execution_pool.as_ref())
+            .map_or(1, |(governor, execution_pool)| {
+                governor
+                    .policy()
+                    .limit(WorkloadClass::Bulk)
+                    .compute_threads
+                    .min(
+                        u64::try_from(execution_pool.topology().worker_count()).unwrap_or(u64::MAX),
+                    )
+                    .min(worker_limit)
+                    .max(1)
+            });
+        self.admit_database_work(
+            WorkloadClass::Bulk,
+            GovernorRequest {
+                compute_threads,
+                io_slots: 0,
+                memory_bytes,
+            },
+        )
+    }
+
+    fn admit_administrative_owned(
+        &self,
+    ) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work(
+            WorkloadClass::Administrative,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: ADMINISTRATIVE_MEMORY_BYTES,
+            },
+        )
+        .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
+    }
+
+    fn admit_database_work(
+        &self,
+        class: WorkloadClass,
+        request: GovernorRequest,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let Some(governor) = &self.resource_governor else {
+            return Ok(None);
+        };
+        admit_governor_work(governor, self.resource_queue_wait, class, request).map(Some)
     }
 
     /// Returns a retained durable outcome by its opaque resolution identity.
@@ -3434,6 +4487,7 @@ impl NativeDatabase {
         &self,
         id: ObjectId,
     ) -> Result<IdentifiedCatalogObject, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         let snapshot = self.coordinator.snapshot(0)?;
         let object = snapshot
             .roots()
@@ -3477,6 +4531,7 @@ impl NativeDatabase {
         &self,
         name: &QualifiedName,
     ) -> Result<IdentifiedCatalogObject, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         let snapshot = self.coordinator.snapshot(0)?;
         let object = snapshot
             .roots()
@@ -3499,6 +4554,7 @@ impl NativeDatabase {
     ///
     /// Returns an error for snapshot coordination failure.
     pub fn catalog_snapshot(&self) -> Result<NativeCatalogSnapshot, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         let snapshot = self.coordinator.snapshot(0)?;
         Ok(NativeCatalogSnapshot {
             identity: CatalogSnapshotIdentity {
@@ -4023,6 +5079,14 @@ impl NativeDatabase {
     ///
     /// Returns an error for synchronization, page, root, or state corruption.
     pub fn snapshot(&self, logical_time_micros: i64) -> Result<NativeSnapshot, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
+        self.snapshot_unadmitted(logical_time_micros)
+    }
+
+    fn snapshot_unadmitted(
+        &self,
+        logical_time_micros: i64,
+    ) -> Result<NativeSnapshot, NativeRuntimeError> {
         let metadata = self.coordinator.snapshot(logical_time_micros)?;
         let state = load_state(&self.pages, &self.blobs, metadata.roots())?;
         Ok(NativeSnapshot { metadata, state })
@@ -4072,10 +5136,11 @@ impl NativeDatabase {
         logical_time_micros: i64,
         interruption: Option<SnapshotPinBoundary>,
     ) -> Result<SnapshotPinReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         if self.snapshot_pins.get(id).is_some() {
             return Err(NativeRuntimeError::SnapshotPinExists);
         }
-        let checkpoint = self.checkpoint()?;
+        let checkpoint = self.checkpoint_at(None)?;
         let manifest = self
             .manifests
             .current()
@@ -4120,6 +5185,7 @@ impl NativeDatabase {
         &self,
         id: SnapshotPinId,
     ) -> Result<NativeSnapshot, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         let pin = self
             .snapshot_pins
             .get(id)
@@ -4152,6 +5218,7 @@ impl NativeDatabase {
     ///
     /// Returns an error for an unknown identity or uncertain file removal.
     pub fn unpin(&mut self, id: SnapshotPinId) -> Result<SnapshotUnpinReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         let pin = self
             .snapshot_pins
             .remove(id, true)?
@@ -4173,6 +5240,7 @@ impl NativeDatabase {
     pub fn collect_retired_page_generations(
         &mut self,
     ) -> Result<PageGenerationCollectionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         collect_page_generation_files(
             &self.data_directory,
             self.pages.generation(),
@@ -4190,18 +5258,27 @@ impl NativeDatabase {
     /// Returns an error for snapshot coordination, catalog corruption,
     /// unsupported syntax, or an unknown relation.
     pub fn prepare_sql_latest(&self, statement: &str) -> Result<PreparedStatement, SqlError> {
+        let _permit = self.admit_foreground_bounded()?;
         let metadata = self
             .coordinator
             .snapshot(0)
             .map_err(NativeRuntimeError::from)?;
+        if let Some(prepared) = self
+            .sql_plan_cache()
+            .lookup(metadata.catalog_version, statement)
+        {
+            return Ok(prepared);
+        }
         let catalog = load_catalog_state(&self.pages, &self.blobs, metadata.roots())?;
         let ordered_secondary_indexes = self.ordered_secondary_indexes_at(&metadata, &catalog)?;
-        sql::prepare_catalog(
+        let prepared = sql::prepare_catalog(
             metadata.catalog_version,
             &catalog,
             &ordered_secondary_indexes,
             statement,
-        )
+        )?;
+        self.sql_plan_cache().insert(statement, prepared.clone());
+        Ok(prepared)
     }
 
     /// Executes one current catalog-bound SQL plan through physical roots.
@@ -4218,8 +5295,67 @@ impl NativeDatabase {
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
-        self.execute_prepared_latest_identified(prepared, parameters)
-            .map(|(_, _, _, result)| result)
+        self.execute_prepared_latest_profiled(prepared, parameters)
+            .map(|receipt| receipt.result)
+    }
+
+    /// Executes a current catalog-bound SQL plan and reports its physical path.
+    ///
+    /// Large bounded primary-key scans reserve one parent governor request and
+    /// may subdivide it across the persistent NUMA-aware execution pool. Small
+    /// operations retain the direct single-worker path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_prepared_latest`], including
+    /// fail-closed governor admission errors.
+    pub fn execute_prepared_latest_profiled(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+    ) -> Result<NativeSqlExecutionReceipt, SqlError> {
+        let permit = match prepared.parallel_scan_limit() {
+            Some(limit) => self.admit_parallel_foreground_bounded_io(
+                segmented_result_memory_bytes(limit),
+                limit.div_ceil(sql::SQL_VECTOR_PATH_THRESHOLD),
+            )?,
+            None => self.admit_foreground_bounded()?,
+        };
+        let metadata = self
+            .coordinator
+            .snapshot(0)
+            .map_err(NativeRuntimeError::from)?;
+        let snapshot_csn = metadata
+            .visible_csn
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog_version = metadata.catalog_version;
+        let root_digest = metadata.roots().digest();
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (result, profile) = sql::execute_prepared_latest(
+            self,
+            &metadata,
+            prepared,
+            parameters,
+            permit.as_ref().map(DatabaseGovernorPermit::permit),
+        )?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSqlExecutionReceipt {
+            snapshot_csn,
+            catalog_version,
+            root_digest,
+            path: profile.path,
+            candidate_rows: profile.candidate_rows,
+            index_stream_rows: profile.index_stream_rows,
+            intersection_start_rows: profile.intersection_start_rows,
+            join_right_probes: profile.join_right_probes,
+            vector_batches: profile.vector_batches,
+            planned_workers: planned_workers.max(profile.planned_workers),
+            worker_batches: profile.worker_batches,
+            execution,
+            result,
+        })
     }
 
     /// Executes one current catalog-bound SQL plan and returns the exact CSN
@@ -4233,17 +5369,15 @@ impl NativeDatabase {
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
     ) -> Result<(Csn, CatalogVersion, [u8; 32], SqlResult), SqlError> {
-        let metadata = self
-            .coordinator
-            .snapshot(0)
-            .map_err(NativeRuntimeError::from)?;
-        let visible_csn = metadata
-            .visible_csn
-            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let catalog_version = metadata.catalog_version;
-        let root_digest = metadata.roots().digest();
-        let result = sql::execute_prepared_latest(self, &metadata, prepared, parameters)?;
-        Ok((visible_csn, catalog_version, root_digest, result))
+        self.execute_prepared_latest_profiled(prepared, parameters)
+            .map(|receipt| {
+                (
+                    receipt.snapshot_csn,
+                    receipt.catalog_version,
+                    receipt.root_digest,
+                    receipt.result,
+                )
+            })
     }
 
     pub(crate) fn execute_prepared_latest_with_csn(
@@ -4266,6 +5400,7 @@ impl NativeDatabase {
         table: ObjectId,
         primary_key: &[u8],
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         let snapshot = self.coordinator.snapshot(0)?;
         self.select_relational_at(&snapshot, table, primary_key)
     }
@@ -4358,6 +5493,7 @@ impl NativeDatabase {
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
         self.scan_relational_at(&snapshot, table, start_after, limit)
     }
@@ -4379,8 +5515,98 @@ impl NativeDatabase {
         upper: Bound<&[u8]>,
         limit: usize,
     ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        Ok(self
+            .scan_latest_relational_range_profiled(table, lower, upper, limit)?
+            .rows)
+    }
+
+    /// Scans one bounded primary-key range and reports whether the direct or
+    /// immutable-segment physical path executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relation does not exist, resource admission
+    /// fails, or a reached physical key, row, page, blob, or version chain is
+    /// malformed.
+    pub fn scan_latest_relational_range_profiled(
+        &self,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<NativeRelationalScanExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
-        self.scan_relational_range_at(&snapshot, table, lower, upper, limit)
+        if limit <= RELATIONAL_SEGMENT_SCAN_THRESHOLD {
+            let rows = self.scan_relational_range_at(&snapshot, table, lower, upper, limit)?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeRelationalScanExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                rows,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        let (tree, prefix) = self.relational_table_tree_at(&snapshot, table)?;
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix,
+            map_primary_key_bound(table, lower),
+            map_primary_key_bound(table, upper),
+            NativeRuntimeError::InvalidRelationalTree,
+        )?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        if plan.segments.is_empty() {
+            return Ok(NativeRelationalScanExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                rows: Vec::new(),
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            FOREGROUND_BOUNDED_MEMORY_BYTES,
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (rows, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_relational_segment_plan_parallel(
+                    &snapshot,
+                    table,
+                    plan,
+                    limit,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_relational_segment_plan_serial(&snapshot, table, &plan, limit)?,
+                0,
+            ),
+        };
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeRelationalScanExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            rows,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
     }
 
     fn scan_relational_at(
@@ -4402,12 +5628,70 @@ impl NativeDatabase {
         upper: Bound<&[u8]>,
         limit: usize,
     ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        self.scan_relational_range_at_profiled(snapshot, table, lower, upper, limit)
+            .map(|(rows, _, _)| rows)
+    }
+
+    pub(crate) fn scan_relational_range_at_governed(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        limit: usize,
+        permit: Option<&OwnedGovernorPermit>,
+    ) -> Result<(Vec<RelationalScanRow>, u64, usize), NativeRuntimeError> {
         let (tree, prefix) = self.relational_table_tree_at(snapshot, table)?;
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0, 0));
+        }
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix,
+            map_primary_key_bound(table, lower),
+            map_primary_key_bound(table, upper),
+            NativeRuntimeError::InvalidRelationalTree,
+        )?;
+        if plan.segments.is_empty() {
+            return Ok((Vec::new(), 0, 0));
+        }
+        let planned_workers = permit.map_or(1, |permit| permit.request().compute_threads);
+        let (rows, worker_batches) = match (self.execution_pool.as_deref(), permit) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_relational_segment_plan_parallel(
+                    snapshot,
+                    table,
+                    plan,
+                    limit,
+                    execution_pool,
+                    permit,
+                )?,
+            _ => (
+                self.scan_relational_segment_plan_serial(snapshot, table, &plan, limit)?,
+                0,
+            ),
+        };
+        Ok((rows, planned_workers, worker_batches))
+    }
+
+    fn scan_relational_range_at_profiled(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<RelationalScanRow>, usize, usize), NativeRuntimeError> {
+        let (tree, prefix) = self.relational_table_tree_at(snapshot, table)?;
+        if limit == 0 {
+            return Ok((Vec::new(), 0, 0));
         }
         let lower = map_primary_key_bound(table, lower);
         let upper = map_primary_key_bound(table, upper);
+        if limit > RELATIONAL_SEGMENT_SCAN_THRESHOLD {
+            return self
+                .scan_relational_segments_at(snapshot, tree, table, prefix, lower, upper, limit);
+        }
         let context = RelationalReadContext {
             pages: &self.pages,
             pool: &self.buffer_pool,
@@ -4452,7 +5736,171 @@ impl NativeDatabase {
         if let Some(error) = scan_error {
             return Err(error);
         }
+        Ok((rows, 0, 0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_relational_segments_at(
+        &self,
+        snapshot: &Snapshot,
+        tree: BTree,
+        table: ObjectId,
+        prefix: Vec<u8>,
+        lower: Bound<Vec<u8>>,
+        upper: Bound<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Vec<RelationalScanRow>, usize, usize), NativeRuntimeError> {
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix,
+            lower,
+            upper,
+            NativeRuntimeError::InvalidRelationalTree,
+        )?;
+        let rows = self.scan_relational_segment_plan_serial(snapshot, table, &plan, limit)?;
+        Ok((rows, plan.segments.len(), plan.physical_entries))
+    }
+
+    fn plan_btree_segments(
+        &self,
+        tree: BTree,
+        prefix: Vec<u8>,
+        lower: Bound<Vec<u8>>,
+        upper: Bound<Vec<u8>>,
+        invalid_tree: NativeRuntimeError,
+    ) -> Result<NativeBTreeSegmentPlan, NativeRuntimeError> {
+        let planned_lower = match lower {
+            Bound::Unbounded => Bound::Included(prefix.clone()),
+            bound => bound,
+        };
+        let planned_upper = match upper {
+            Bound::Unbounded => {
+                byte_prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded)
+            }
+            bound => bound,
+        };
+        let segments = tree.plan_range_segments(
+            &self.pages,
+            bound_as_slice(&planned_lower),
+            bound_as_slice(&planned_upper),
+        )?;
+        let mut planned_physical_entries = 0_usize;
+        for segment in &segments {
+            let Some(next) = planned_physical_entries.checked_add(segment.entry_count()) else {
+                return Err(invalid_tree);
+            };
+            planned_physical_entries = next;
+        }
+        Ok(NativeBTreeSegmentPlan {
+            tree,
+            prefix,
+            segments,
+            physical_entries: planned_physical_entries,
+        })
+    }
+
+    fn scan_relational_segment_plan_serial(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        plan: &NativeBTreeSegmentPlan,
+        limit: usize,
+    ) -> Result<Vec<RelationalScanRow>, NativeRuntimeError> {
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut rows = Vec::with_capacity(limit.min(1_024));
+        'segments: for segment in &plan.segments {
+            for (physical_key, encoded) in plan.tree.scan_planned_segment(&self.pages, segment)? {
+                let Some(primary_key) = physical_key.get(plan.prefix.len()..) else {
+                    return Err(NativeRuntimeError::InvalidRelationalTree);
+                };
+                if let Some(row) =
+                    decode_relational_value_cached(&context, table, primary_key, &encoded)?
+                {
+                    rows.push(RelationalScanRow {
+                        table,
+                        primary_key: primary_key.to_vec(),
+                        row,
+                    });
+                    if rows.len() == limit {
+                        break 'segments;
+                    }
+                }
+            }
+        }
         Ok(rows)
+    }
+
+    fn scan_relational_segment_plan_parallel(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        plan: NativeBTreeSegmentPlan,
+        limit: usize,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<RelationalScanRow>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let blobs = Arc::new(self.blobs.read_handle());
+        let pool = Arc::clone(&self.buffer_pool);
+        let prefix = Arc::new(plan.prefix);
+        let tree = plan.tree;
+        let format = self.relational_format;
+        let visible_csn = snapshot.visible_csn;
+        let (segment_rows, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    let context = RelationalReadContext {
+                        pages: &pages,
+                        pool: &pool,
+                        blobs: &blobs,
+                        format,
+                        visible_csn,
+                    };
+                    tree.scan_planned_segment(&pages, &segment)?
+                        .into_iter()
+                        .filter_map(|(physical_key, encoded)| {
+                            let Some(primary_key) = physical_key.get(prefix.len()..) else {
+                                return Some(Err(NativeRuntimeError::InvalidRelationalTree));
+                            };
+                            match decode_relational_value_cached(
+                                &context,
+                                table,
+                                primary_key,
+                                &encoded,
+                            ) {
+                                Ok(Some(row)) => Some(Ok(RelationalScanRow {
+                                    table,
+                                    primary_key: primary_key.to_vec(),
+                                    row,
+                                })),
+                                Ok(None) => None,
+                                Err(error) => Some(Err(error)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )?;
+        let mut rows = segment_rows
+            .into_iter()
+            .collect::<Result<Vec<_>, NativeRuntimeError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        rows.truncate(limit);
+        Ok((rows, worker_batches))
     }
 
     fn relational_table_tree_at(
@@ -4548,6 +5996,7 @@ impl NativeDatabase {
         index: ObjectId,
         index_key: &[u8],
     ) -> Result<Vec<SecondaryIndexRow>, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
         self.select_secondary_index_at(&snapshot, index, index_key)
     }
@@ -4571,6 +6020,41 @@ impl NativeDatabase {
             RelationalVisitError::Runtime(error) | RelationalVisitError::Visitor(error) => error,
         })?;
         Ok(rows)
+    }
+
+    pub(crate) fn estimate_secondary_index_rows_at(
+        &self,
+        snapshot: &Snapshot,
+        index: ObjectId,
+        index_key: &[u8],
+    ) -> Result<usize, NativeRuntimeError> {
+        let root = snapshot
+            .roots()
+            .root(SLOT_RELATIONAL)
+            .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })?;
+        let tree = BTree::from_root(root);
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &relational_secondary_index_key(index),
+            )?
+            .ok_or(NativeRuntimeError::UnknownSecondaryIndex { index })?;
+        let (_, _, _, layout) = decode_secondary_index_metadata(metadata.bytes())?;
+        let prefix = relational_secondary_entry_prefix(index, layout, index_key)?;
+        let upper =
+            byte_prefix_successor(&prefix).ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        tree.plan_range_segments(
+            &self.pages,
+            Bound::Included(prefix.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+        )?
+        .into_iter()
+        .try_fold(0_usize, |total, segment| {
+            total
+                .checked_add(segment.entry_count())
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)
+        })
     }
 
     pub(crate) fn visit_secondary_index_at<E>(
@@ -4793,6 +6277,7 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         Ok(self.latest_structure_entry(key)?.and_then(|entry| {
             entry
                 .expires_at_micros
@@ -4811,6 +6296,7 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
         Ok(match self.latest_structure_entry(key)? {
             None => Ttl::Missing,
             Some(entry)
@@ -4853,6 +6339,7 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<ExpirySweepReceipt, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
         if !(1..=MAX_EXPIRY_SWEEP_KEYS).contains(&max_keys) {
             return Err(NativeRuntimeError::InvalidExpirySweepLimit {
                 requested: max_keys,
@@ -4869,7 +6356,10 @@ impl NativeDatabase {
             });
         }
         let expired_keys = due_keys.len();
-        let transaction = if self.structure_format == StructureFormat::BTreeV2 {
+        let transaction = if matches!(
+            self.structure_format,
+            StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+        ) {
             let transaction_id = TransactionId::new(self.next_transaction_id)
                 .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
             let root_transaction = self.coordinator.begin_write()?;
@@ -4897,6 +6387,7 @@ impl NativeDatabase {
                 .collect();
             NativeTransaction {
                 pages: &mut self.pages,
+                buffer_pool: self.buffer_pool.clone(),
                 blobs: &mut self.blobs,
                 wal: &mut self.wal,
                 conflicts: &mut self.conflicts,
@@ -4921,6 +6412,7 @@ impl NativeDatabase {
                     mode: NativeWriteBatchMode::PhysicalStructureExpiry,
                     delta: None,
                     ann_consolidation: None,
+                    _resource_permit: None,
                 },
             }
         } else {
@@ -4935,9 +6427,9 @@ impl NativeDatabase {
             transaction
         };
         let commit = match interruption {
-            Some(boundary) => transaction.commit_with_interruption(boundary)?,
-            None => transaction.commit()?,
-        };
+            Some(boundary) => transaction.commit_with_interruption(boundary),
+            None => transaction.commit(),
+        }?;
         Ok(ExpirySweepReceipt {
             expired_keys,
             more_due,
@@ -4945,7 +6437,7 @@ impl NativeDatabase {
         })
     }
 
-    /// Rebuilds the current `HYSTRBT2` root without reachable tombstones.
+    /// Rebuilds the current `HYSTRBT2` or `HYSTRBT3` root without safe tombstones.
     ///
     /// Live physical entries are retained byte-for-byte. A root containing no
     /// tombstones is a no-op and advances neither the WAL nor the global CSN.
@@ -4954,8 +6446,10 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeRuntimeError::StructureCompactionUnsupported`] for a
-    /// legacy structure format, or a storage, corruption, synchronization,
+    /// V3 compaction retains and validates every active retirement record and
+    /// its remaining child state. Returns
+    /// [`NativeRuntimeError::StructureCompactionUnsupported`] for a legacy
+    /// structure format, or a storage, corruption, synchronization,
     /// transaction, or durability error.
     pub fn compact_structure(
         &mut self,
@@ -4969,27 +6463,29 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<StructureCompactionReceipt, NativeRuntimeError> {
-        if self.structure_format != StructureFormat::BTreeV2 {
+        let _permit = self.admit_maintenance_owned()?;
+        if !matches!(
+            self.structure_format,
+            StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+        ) {
             return Err(NativeRuntimeError::StructureCompactionUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
         let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
-            return Ok(StructureCompactionReceipt {
-                scanned_entries: 0,
-                retained_entries: 0,
-                dropped_tombstones: 0,
-                reachable_pages_before: 0,
-                reachable_pages_after: 0,
-                pages_appended: 0,
-                commit: None,
-            });
+            return Ok(empty_structure_compaction_receipt());
         };
-        let plan = plan_structure_compaction(&self.pages, &self.blobs, root)?;
+        let observation =
+            observe_structure_compaction(&self.pages, &self.blobs, root, self.structure_format)?;
+        let StructureCompactionObservation {
+            scanned_entries,
+            retained_entries,
+            dropped_tombstones,
+        } = observation;
         let reachable_pages_before = BTree::from_root(root).reachable_page_count(&self.pages)?;
-        if plan.dropped_tombstones == 0 {
+        if dropped_tombstones == 0 {
             return Ok(StructureCompactionReceipt {
-                scanned_entries: plan.scanned_entries,
-                retained_entries: plan.retained_entries.len(),
+                scanned_entries,
+                retained_entries,
                 dropped_tombstones: 0,
                 reachable_pages_before,
                 reachable_pages_after: reachable_pages_before,
@@ -5007,6 +6503,7 @@ impl NativeDatabase {
         let pages_before = self.pages.page_count();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
@@ -5038,6 +6535,7 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalStructureCompaction,
                 delta: None,
                 ann_consolidation: None,
+                _resource_permit: None,
             },
         };
         let commit = match interruption {
@@ -5058,11 +6556,326 @@ impl NativeDatabase {
         let reachable_pages_after =
             BTree::from_root(compacted_root).reachable_page_count(&self.pages)?;
         Ok(StructureCompactionReceipt {
-            scanned_entries: plan.scanned_entries,
-            retained_entries: plan.retained_entries.len(),
-            dropped_tombstones: plan.dropped_tombstones,
+            scanned_entries,
+            retained_entries,
+            dropped_tombstones,
             reachable_pages_before,
             reachable_pages_after,
+            pages_appended,
+            commit: Some(commit),
+        })
+    }
+
+    /// Atomically rewrites the current validated `HYSTRBT2` root as `HYSTRBT3`.
+    ///
+    /// The migration is explicit and complete-root: open never converts a
+    /// directory implicitly. Logical state and existing blob references are
+    /// preserved, canonical V2 tombstones are omitted, and the old immutable
+    /// root remains available to retained snapshots. Structure mutations on
+    /// the resulting V3 root remain disabled until the public V3 command path
+    /// is activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::StructureV3MigrationUnsupported`] unless
+    /// the current root is `HYSTRBT2`, or a validation, storage, transaction,
+    /// synchronization, WAL, or durability error.
+    pub fn migrate_structure_to_v3(
+        &mut self,
+        durability: DurabilityClass,
+    ) -> Result<StructureV3MigrationReceipt, NativeRuntimeError> {
+        self.migrate_structure_to_v3_at(durability, None)
+    }
+
+    fn migrate_structure_to_v3_at(
+        &mut self,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<StructureV3MigrationReceipt, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
+        if self.structure_format != StructureFormat::BTreeV2 {
+            return Err(NativeRuntimeError::StructureV3MigrationUnsupported);
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let source_root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let source_tree = BTree::from_root(source_root);
+        let source_entries = source_tree.scan(&self.pages)?.len();
+        load_structure_state_root(&self.pages, &self.blobs, source_root)?;
+        let reachable_pages_before = source_tree.reachable_page_count(&self.pages)?;
+
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        if root_transaction.base_roots() != snapshot.roots() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let pages_before = self.pages.page_count();
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState::default(),
+                mutations: vec![Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::MigrateStructureV3,
+                    target: None,
+                    key: Vec::new(),
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, true, false],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalStructureMigrationV3,
+                delta: None,
+                ann_consolidation: None,
+                _resource_permit: None,
+            },
+        };
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+        self.structure_format = StructureFormat::BTreeV3;
+
+        let pages_appended = self
+            .pages
+            .page_count()
+            .checked_sub(pages_before)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let target_root = self
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let target_tree = BTree::from_root(target_root);
+        let target_entries = target_tree.scan(&self.pages)?.len();
+        let dropped_tombstones = source_entries
+            .checked_sub(target_entries)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        structure_v3::load_structure_state_v3(&self.pages, &self.blobs, target_tree)?;
+        let reachable_pages_after = target_tree.reachable_page_count(&self.pages)?;
+        Ok(StructureV3MigrationReceipt {
+            source_entries,
+            target_entries,
+            dropped_tombstones,
+            reachable_pages_before,
+            reachable_pages_after,
+            pages_appended,
+            commit,
+        })
+    }
+
+    /// Reclaims one bounded step from the first active `HYSTRBT3` retirement.
+    ///
+    /// Retirement records are selected in canonical physical-key order. The
+    /// shared maintenance governor is held across selection, page mutation,
+    /// WAL durability, and publication. A request with no active retirement
+    /// writes nothing and advances no CSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::StructureV3RetirementUnsupported`] unless
+    /// the current root is `HYSTRBT3`,
+    /// [`NativeRuntimeError::InvalidStructureRetirementLimit`] outside
+    /// `2..=1024`, or a validation, storage, transaction, synchronization,
+    /// WAL, or durability error.
+    pub fn cleanup_structure_retirements(
+        &mut self,
+        entry_budget: usize,
+        durability: DurabilityClass,
+    ) -> Result<StructureRetirementCleanupReceipt, NativeRuntimeError> {
+        self.cleanup_structure_retirements_at(entry_budget, durability, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn cleanup_structure_retirements_at(
+        &mut self,
+        entry_budget: usize,
+        durability: DurabilityClass,
+        interruption: Option<CommitBoundary>,
+    ) -> Result<StructureRetirementCleanupReceipt, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
+        if self.structure_format != StructureFormat::BTreeV3 {
+            return Err(NativeRuntimeError::StructureV3RetirementUnsupported);
+        }
+        if !(2..=structure_v3::MAX_STRUCTURE_RETIREMENT_STEP_ENTRIES).contains(&entry_budget) {
+            return Err(NativeRuntimeError::InvalidStructureRetirementLimit {
+                requested: entry_budget,
+            });
+        }
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let Some(retirement_key) =
+            structure_v3::next_active_retirement_key_v3(&self.pages, &self.buffer_pool, tree)?
+        else {
+            return Ok(StructureRetirementCleanupReceipt {
+                retirement: None,
+                entry_budget,
+                processed_primary_entries: 0,
+                physical_mutations: 0,
+                more_remaining: false,
+                more_retirements: false,
+                pages_appended: 0,
+                commit: None,
+            });
+        };
+        let encoded_before = tree
+            .get(&self.pages, &retirement_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let before = structure_v3::decode_retirement_record(&encoded_before)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let (collection_key, incarnation) = structure_v3::decode_retirement_key(&retirement_key)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let retirement = StructureRetirementIdentity {
+            collection_key: collection_key.to_vec(),
+            transaction_id: incarnation.transaction_id(),
+            mutation_ordinal: incarnation.mutation_ordinal(),
+        };
+
+        let transaction_id = TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let root_transaction = self.coordinator.begin_write()?;
+        if root_transaction.base_roots() != snapshot.roots() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let pages_before = self.pages.page_count();
+        let encoded_budget = u32::try_from(entry_budget)
+            .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?
+            .to_le_bytes()
+            .to_vec();
+        let transaction = NativeTransaction {
+            pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
+            blobs: &mut self.blobs,
+            wal: &mut self.wal,
+            conflicts: &mut self.conflicts,
+            relational_format: self.relational_format,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            root_transaction,
+            conflict_read_csn: snapshot.visible_csn,
+            transaction_id,
+            next_transaction_id: &mut self.next_transaction_id,
+            transaction_resolutions: &mut self.transaction_resolutions,
+            transaction_receipts: &mut self.transaction_receipts,
+            resolution: None,
+            batch: NativeWriteBatch {
+                snapshot,
+                state: MaterializedState::default(),
+                mutations: vec![Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::CleanupStructureRetirementV3,
+                    target: None,
+                    key: retirement_key.clone(),
+                    value: encoded_budget,
+                    expires_at_micros: None,
+                }],
+                dirty: [false, false, true, false],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalStructureRetirementV3,
+                delta: None,
+                ann_consolidation: None,
+                _resource_permit: None,
+            },
+        };
+        let commit = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary)?,
+            None => transaction.commit()?,
+        };
+
+        let current_root = self
+            .coordinator
+            .snapshot(0)?
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let current_tree = BTree::from_root(current_root);
+        let encoded_after = current_tree
+            .get(&self.pages, &retirement_key)?
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let after = if is_structure_tombstone(&encoded_after) {
+            None
+        } else {
+            Some(
+                structure_v3::decode_retirement_record(&encoded_after)
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )
+        };
+        let remaining_primary_entries = after
+            .as_ref()
+            .map_or(0, |record| record.remaining_primary_entries);
+        let remaining_secondary_entries = after
+            .as_ref()
+            .map_or(0, |record| record.remaining_secondary_entries);
+        let remaining_expiry_entries = after
+            .as_ref()
+            .map_or(0, |record| record.remaining_expiry_entries);
+        let processed_primary = before
+            .remaining_primary_entries
+            .checked_sub(remaining_primary_entries)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let processed_secondary = before
+            .remaining_secondary_entries
+            .checked_sub(remaining_secondary_entries)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let processed_expiry = before
+            .remaining_expiry_entries
+            .checked_sub(remaining_expiry_entries)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let physical_mutations = processed_primary
+            .checked_add(processed_secondary)
+            .and_then(|count| count.checked_add(processed_expiry))
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let processed_primary_entries = usize::try_from(processed_primary)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let more_remaining = after.is_some();
+        let more_retirements = more_remaining
+            || structure_v3::next_active_retirement_key_v3(
+                &self.pages,
+                &self.buffer_pool,
+                current_tree,
+            )?
+            .is_some();
+        let pages_appended = self
+            .pages
+            .page_count()
+            .checked_sub(pages_before)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        Ok(StructureRetirementCleanupReceipt {
+            retirement: Some(retirement),
+            entry_budget,
+            processed_primary_entries,
+            physical_mutations,
+            more_remaining,
+            more_retirements,
             pages_appended,
             commit: Some(commit),
         })
@@ -5087,11 +6900,13 @@ impl NativeDatabase {
         self.compact_search_at(durability, None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn compact_search_at(
         &mut self,
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<SearchCompactionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::SearchCompactionUnsupported);
         }
@@ -5132,6 +6947,7 @@ impl NativeDatabase {
         let pages_before = self.pages.page_count();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
@@ -5163,6 +6979,7 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalSearchCompaction,
                 delta: None,
                 ann_consolidation: None,
+                _resource_permit: None,
             },
         };
         let commit = match interruption {
@@ -5206,6 +7023,7 @@ impl NativeDatabase {
         max_vectors: usize,
         max_delta_records: usize,
     ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
         let snapshot = self.coordinator.snapshot(0)?;
         let root = snapshot
             .roots()
@@ -5316,6 +7134,7 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
+        let _permit = self.admit_maintenance_owned()?;
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
@@ -5343,6 +7162,7 @@ impl NativeDatabase {
         }
         let transaction = NativeTransaction {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
@@ -5377,6 +7197,7 @@ impl NativeDatabase {
                 mode: NativeWriteBatchMode::PhysicalAnnConsolidation,
                 delta: None,
                 ann_consolidation: Some(plan.inner),
+                _resource_permit: None,
             },
         };
         let commit = match interruption {
@@ -5409,6 +7230,14 @@ impl NativeDatabase {
         &self,
         index: ObjectId,
     ) -> Result<AnnIndexObservation, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
+        self.observe_ann_index_unadmitted(index)
+    }
+
+    fn observe_ann_index_unadmitted(
+        &self,
+        index: ObjectId,
+    ) -> Result<AnnIndexObservation, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
         let root = snapshot
             .roots()
@@ -5436,7 +7265,7 @@ impl NativeDatabase {
         logical_time_micros: i64,
         max_keys: usize,
     ) -> Result<(Vec<DueStructureKey>, bool), NativeRuntimeError> {
-        if !self.structure_format.has_expiry_index() {
+        if !self.structure_format.uses_ordered_expiry_index() {
             let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
             let mut due = state
                 .entries
@@ -5505,9 +7334,44 @@ impl NativeDatabase {
                     if expiry > logical_time_micros {
                         return Ok(ControlFlow::Break(()));
                     }
-                    if let Some(due_key) =
-                        self.validate_due_structure_key(tree, expiry, key, marker)?
+                    let due_key = if self.structure_format == StructureFormat::BTreeV3
+                        && !matches!(marker, [STRUCTURE_EXPIRY_TOMBSTONE | STRUCTURE_EXPIRY_LIVE])
                     {
+                        let (validated_expiry, key, family) =
+                            structure_v3::validate_due_collection_expiry_v3(
+                                &self.pages,
+                                &self.buffer_pool,
+                                tree,
+                                physical_key,
+                                marker,
+                            )?;
+                        if validated_expiry != expiry {
+                            return Err(NativeRuntimeError::InvalidStructureTree);
+                        }
+                        Some(DueStructureKey {
+                            kind: match family {
+                                structure_v3::StructureCollectionFamily::Hash => {
+                                    DueStructureKind::Hash
+                                }
+                                structure_v3::StructureCollectionFamily::Set => {
+                                    DueStructureKind::Set
+                                }
+                                structure_v3::StructureCollectionFamily::List => {
+                                    DueStructureKind::List
+                                }
+                                structure_v3::StructureCollectionFamily::Stream => {
+                                    DueStructureKind::Stream
+                                }
+                                structure_v3::StructureCollectionFamily::SortedSet => {
+                                    DueStructureKind::SortedSet
+                                }
+                            },
+                            key,
+                        })
+                    } else {
+                        self.validate_due_structure_key(tree, expiry, key, marker)?
+                    };
+                    if let Some(due_key) = due_key {
                         due.push(OrderedDueStructure {
                             expiry,
                             namespace_order: 0,
@@ -5559,14 +7423,47 @@ impl NativeDatabase {
                     if expiry > logical_time_micros {
                         return Ok(ControlFlow::Break(()));
                     }
-                    if let Some(due_key) = self.validate_due_hash_field(
-                        tree,
-                        expiry,
-                        key,
-                        field,
-                        marker,
-                        logical_time_micros,
-                    )? {
+                    let due_key = if self.structure_format == StructureFormat::BTreeV3 {
+                        if marker == [STRUCTURE_EXPIRY_TOMBSTONE] {
+                            None
+                        } else {
+                            structure_v3::validate_due_hash_field_expiry_v3(
+                                &self.pages,
+                                &self.buffer_pool,
+                                tree,
+                                physical_key,
+                                marker,
+                                logical_time_micros,
+                            )?
+                            .map(|(validated_expiry, identity)| {
+                                (
+                                    validated_expiry,
+                                    DueStructureKey {
+                                        kind: DueStructureKind::HashField,
+                                        key: identity,
+                                    },
+                                )
+                            })
+                            .map(|(validated_expiry, due)| {
+                                if validated_expiry == expiry {
+                                    Ok(due)
+                                } else {
+                                    Err(NativeRuntimeError::InvalidStructureTree)
+                                }
+                            })
+                            .transpose()?
+                        }
+                    } else {
+                        self.validate_due_hash_field(
+                            tree,
+                            expiry,
+                            key,
+                            field,
+                            marker,
+                            logical_time_micros,
+                        )?
+                    };
+                    if let Some(due_key) = due_key {
                         due.push(OrderedDueStructure {
                             expiry,
                             namespace_order: 1,
@@ -5758,11 +7655,13 @@ impl NativeDatabase {
                 let state = load_structure_state(&self.pages, &self.blobs, snapshot.roots())?;
                 Ok(state.entries.get(key).cloned())
             }
-            StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => BTree::from_root(root)
-                .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
-                .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
-                .transpose()
-                .map(Option::flatten),
+            StructureFormat::BTreeV1 | StructureFormat::BTreeV2 | StructureFormat::BTreeV3 => {
+                BTree::from_root(root)
+                    .get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                    .map(|encoded| decode_structure_value(encoded.bytes(), &self.blobs))
+                    .transpose()
+                    .map(Option::flatten)
+            }
         }
     }
 
@@ -5792,7 +7691,24 @@ impl NativeDatabase {
         field: &[u8],
         logical_time_micros: i64,
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::hash_get_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                field,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -5888,7 +7804,25 @@ impl NativeDatabase {
         fields: &[Vec<u8>],
         logical_time_micros: i64,
     ) -> Result<Vec<Option<Vec<u8>>>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            validate_hash_field_positions(key, fields)?;
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::hash_get_many_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                fields,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -5948,7 +7882,11 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            return self.hlen_latest_hash_at_v3(key, logical_time_micros);
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -6042,6 +7980,26 @@ impl NativeDatabase {
         Ok(visible_count)
     }
 
+    fn hlen_latest_hash_at_v3(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<usize, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        structure_v3::hash_len_latest_at_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
+            BTree::from_root(root),
+            key,
+            logical_time_micros,
+        )
+    }
+
     /// Returns one current physical hash family's TTL at explicit logical
     /// time.
     ///
@@ -6053,7 +8011,22 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::collection_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::Hash,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -6094,7 +8067,23 @@ impl NativeDatabase {
         field: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            validate_hash_field_identity(key, field)?;
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::hash_field_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                field,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_hash_field_identity(key, field)?;
@@ -6149,8 +8138,9 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, another structure kind, a missing
-    /// hash, or malformed reached metadata, identity, value, page, or blob.
+    /// Returns an error for an unsupported structure format, another structure
+    /// kind, a missing hash, or malformed reached metadata, identity, value,
+    /// page, or blob.
     pub fn hscan_latest_hash(
         &self,
         key: &[u8],
@@ -6164,8 +8154,8 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, another structure kind, a missing
-    /// or expired hash, or malformed reached physical state.
+    /// Returns an error for an unsupported structure format, another structure
+    /// kind, a missing or expired hash, or malformed reached physical state.
     pub fn hscan_latest_hash_at(
         &self,
         key: &[u8],
@@ -6173,7 +8163,36 @@ impl NativeDatabase {
         limit: usize,
         logical_time_micros: i64,
     ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        Ok(self
+            .hscan_latest_hash_at_profiled(key, start_after, limit, logical_time_micros)?
+            .entries)
+    }
+
+    /// Scans one current hash-field range and reports the direct or immutable
+    /// segment physical execution path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::hscan_latest_hash_at`]
+    /// plus resource admission or persistent execution failures.
+    pub fn hscan_latest_hash_at_profiled(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<NativeHashScanExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let request = structure_v3::CollectionScanRequestV3::new(
+                key,
+                start_after,
+                limit,
+                logical_time_micros,
+            );
+            return self.hscan_latest_hash_at_v3(request, planning_permit);
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -6181,13 +8200,118 @@ impl NativeDatabase {
             .roots()
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        self.hash_scan_in_tree_at(
+        let tree = BTree::from_root(root);
+        let metadata = self.visible_hash_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let declared_field_count = usize::try_from(metadata.field_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if limit <= STRUCTURE_SEGMENT_SCAN_THRESHOLD {
+            let entries =
+                self.hash_scan_in_tree_at(tree, key, start_after, limit, logical_time_micros)?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeHashScanExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                entries,
+                declared_field_count,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        let prefix = structure_hash_field_key(key, &[])?;
+        let lower = start_after
+            .map(|field| structure_hash_field_key(key, field))
+            .transpose()?
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix,
+            lower,
+            Bound::Unbounded,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        let verify_complete = start_after.is_none() && limit >= declared_field_count;
+        if plan.segments.is_empty() {
+            if verify_complete && declared_field_count != 0 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(empty_hash_scan_execution_receipt(
+                snapshot.visible_csn,
+                declared_field_count,
+                planning,
+            ));
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            FOREGROUND_BOUNDED_MEMORY_BYTES,
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_hash_segment_plan_parallel(
+                    key,
+                    logical_time_micros,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_hash_segment_plan_serial(key, logical_time_micros, &plan)?,
+                0,
+            ),
+        };
+        let entries =
+            finalize_hash_segment_batches(batches, declared_field_count, verify_complete, limit)?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeHashScanExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            entries,
+            declared_field_count,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn hscan_latest_hash_at_v3(
+        &self,
+        request: structure_v3::CollectionScanRequestV3<'_>,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeHashScanExecutionReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = structure_v3::hash_scan_latest_at_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
             BTree::from_root(root),
-            key,
-            start_after,
-            limit,
-            logical_time_micros,
-        )
+            request,
+        )?;
+        let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeHashScanExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            entries: result.entries,
+            declared_field_count: result.declared_field_count,
+            planned_segments: 0,
+            planned_physical_entries: 0,
+            planning: None,
+            execution,
+            planned_workers: 1,
+            worker_batches: 0,
+        })
     }
 
     #[cfg(test)]
@@ -6290,13 +8414,71 @@ impl NativeDatabase {
         Ok(entries)
     }
 
+    fn scan_hash_segment_plan_serial(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<HashSegmentBatch>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                decode_hash_segment(
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    &self.blobs,
+                    logical_time_micros,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_hash_segment_plan_parallel(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<HashSegmentBatch>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let blobs = Arc::new(self.blobs.read_handle());
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    decode_hash_segment(
+                        tree.scan_planned_segment(&pages, &segment)?,
+                        &key,
+                        &blobs,
+                        logical_time_micros,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
     /// Scans one bounded current hash-field range in descending exact-byte
     /// order without materializing the complete hash.
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, an invalid cursor identity,
-    /// another structure kind, a missing hash, or malformed reached state.
+    /// Returns an error for an unsupported structure format, an invalid cursor
+    /// identity, another structure kind, a missing hash, or malformed reached
+    /// state.
     pub fn hscan_reverse_latest_hash(
         &self,
         key: &[u8],
@@ -6310,9 +8492,9 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, an invalid cursor identity,
-    /// another structure kind, a missing or expired hash, or malformed
-    /// reached physical state.
+    /// Returns an error for an unsupported structure format, an invalid cursor
+    /// identity, another structure kind, a missing or expired hash, or
+    /// malformed reached physical state.
     pub fn hscan_reverse_latest_hash_at(
         &self,
         key: &[u8],
@@ -6320,7 +8502,29 @@ impl NativeDatabase {
         limit: usize,
         logical_time_micros: i64,
     ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let request = structure_v3::CollectionScanRequestV3::new(
+                key,
+                start_before,
+                limit,
+                logical_time_micros,
+            );
+            return Ok(structure_v3::hash_scan_reverse_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                request,
+            )?
+            .entries);
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -6426,9 +8630,9 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, invalid request/key identities,
-    /// another structure kind, a missing hash, an exhausted matcher budget,
-    /// or malformed reached physical state.
+    /// Returns an error for an unsupported structure format, invalid
+    /// request/key identities, another structure kind, a missing hash, an
+    /// exhausted matcher budget, or malformed reached physical state.
     pub fn hscan_match_latest_hash(
         &self,
         key: &[u8],
@@ -6441,16 +8645,34 @@ impl NativeDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error for legacy storage, invalid request/key identities,
-    /// another structure kind, a missing or expired hash, an exhausted
-    /// matcher budget, or malformed reached physical state.
+    /// Returns an error for an unsupported structure format, invalid
+    /// request/key identities, another structure kind, a missing or expired
+    /// hash, an exhausted matcher budget, or malformed reached physical state.
     pub fn hscan_match_latest_hash_at(
         &self,
         key: &[u8],
         request: &HashPatternScanRequest,
         logical_time_micros: i64,
     ) -> Result<HashPatternScanPage, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            validate_hash_pattern_identity(key, request)?;
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::hash_pattern_scan_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                request,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -6799,7 +9021,25 @@ impl NativeDatabase {
         member: &[u8],
         logical_time_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            validate_set_member_identity(key, member)?;
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::set_contains_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                member,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_set_member_identity(key, member)?;
@@ -6859,7 +9099,25 @@ impl NativeDatabase {
         members: &[Vec<u8>],
         logical_time_micros: i64,
     ) -> Result<Vec<bool>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            validate_set_member_positions(key, members)?;
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::set_contains_many_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                members,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_set_member_positions(key, members)?;
@@ -6907,7 +9165,24 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::collection_cardinality_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::Set,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -6960,7 +9235,36 @@ impl NativeDatabase {
         limit: usize,
         logical_time_micros: i64,
     ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        Ok(self
+            .sscan_latest_set_at_profiled(key, start_after, limit, logical_time_micros)?
+            .members)
+    }
+
+    /// Scans one current set-member range and reports the direct or immutable
+    /// segment physical execution path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::sscan_latest_set_at`]
+    /// plus resource admission or persistent execution failures.
+    pub fn sscan_latest_set_at_profiled(
+        &self,
+        key: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<NativeSetScanExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let request = structure_v3::CollectionScanRequestV3::new(
+                key,
+                start_after,
+                limit,
+                logical_time_micros,
+            );
+            return self.sscan_latest_set_at_v3(request, planning_permit);
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_set_scan_identity(key, start_after)?;
@@ -6969,13 +9273,116 @@ impl NativeDatabase {
             .roots()
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        self.set_scan_in_tree_at(
+        let tree = BTree::from_root(root);
+        let metadata = self.visible_set_metadata_in_tree_at(tree, key, logical_time_micros)?;
+        let declared_member_count = usize::try_from(metadata.member_count)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        if limit <= STRUCTURE_SEGMENT_SCAN_THRESHOLD {
+            let members =
+                self.set_scan_in_tree_at(tree, key, start_after, limit, logical_time_micros)?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeSetScanExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                members,
+                declared_member_count,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        let prefix = structure_set_member_key(key, &[])?;
+        let lower = start_after
+            .map(|member| structure_set_member_key(key, member))
+            .transpose()?
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix,
+            lower,
+            Bound::Unbounded,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        let verify_complete = start_after.is_none() && limit >= declared_member_count;
+        if plan.segments.is_empty() {
+            if verify_complete && declared_member_count != 0 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            return Ok(NativeSetScanExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                members: Vec::new(),
+                declared_member_count,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            FOREGROUND_BOUNDED_MEMORY_BYTES,
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => {
+                self.scan_set_segment_plan_parallel(key, plan, execution_pool, permit.permit())?
+            }
+            _ => (self.scan_set_segment_plan_serial(key, &plan)?, 0),
+        };
+        let members =
+            finalize_set_segment_batches(batches, declared_member_count, verify_complete, limit)?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSetScanExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            members,
+            declared_member_count,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn sscan_latest_set_at_v3(
+        &self,
+        request: structure_v3::CollectionScanRequestV3<'_>,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeSetScanExecutionReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(request.logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = structure_v3::set_scan_latest_at_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
             BTree::from_root(root),
-            key,
-            start_after,
-            limit,
-            logical_time_micros,
-        )
+            request,
+        )?;
+        let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSetScanExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            members: result.members,
+            declared_member_count: result.declared_member_count,
+            planned_segments: 0,
+            planned_physical_entries: 0,
+            planning: None,
+            execution,
+            planned_workers: 1,
+            worker_batches: 0,
+        })
     }
 
     fn set_scan_in_tree_at(
@@ -7048,6 +9455,50 @@ impl NativeDatabase {
         Ok(members)
     }
 
+    fn scan_set_segment_plan_serial(
+        &self,
+        key: &[u8],
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<SetSegmentBatch>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                decode_set_segment(plan.tree.scan_planned_segment(&self.pages, segment)?, key)
+            })
+            .collect()
+    }
+
+    fn scan_set_segment_plan_parallel(
+        &self,
+        key: &[u8],
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<SetSegmentBatch>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    decode_set_segment(tree.scan_planned_segment(&pages, &segment)?, &key)
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
     /// Returns one current physical set family's TTL at explicit logical
     /// time.
     ///
@@ -7059,7 +9510,22 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::collection_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::Set,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7165,7 +9631,23 @@ impl NativeDatabase {
         request: &SetAlgebraRequest,
         logical_time_micros: i64,
     ) -> Result<SetAlgebraResult, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::set_algebra_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                request,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         validate_set_algebra_keys(request)?;
@@ -7476,7 +9958,40 @@ impl NativeDatabase {
         limit: usize,
         logical_time_micros: i64,
     ) -> Result<Vec<(u64, model::StreamFields)>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        Ok(self
+            .xrange_latest_stream_at_profiled(key, start, end, limit, logical_time_micros)?
+            .entries)
+    }
+
+    /// Reads a current stream-ID range and reports the direct or immutable
+    /// segment physical execution path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::xrange_latest_stream_at`]
+    /// plus resource admission or persistent execution failures.
+    pub fn xrange_latest_stream_at_profiled(
+        &self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+        logical_time_micros: i64,
+    ) -> Result<NativeStreamRangeExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            return self.xrange_latest_stream_at_profiled_v3(
+                structure_v3::StreamRangeRequestV3 {
+                    key,
+                    start,
+                    end,
+                    limit,
+                    logical_time_micros,
+                },
+                planning_permit,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7485,6 +10000,250 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
+        let last = self.visible_stream_last_id_in_tree_at(tree, key, logical_time_micros)?;
+        let effective_end = end.min(last);
+        let range_width = effective_end
+            .checked_sub(start)
+            .and_then(|width| width.checked_add(1))
+            .unwrap_or(0);
+        if limit <= STRUCTURE_SEGMENT_SCAN_THRESHOLD
+            && range_width <= STRUCTURE_SEGMENT_SCAN_THRESHOLD as u64
+        {
+            let entries = self.stream_range_in_tree(tree, key, start, effective_end, limit)?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeStreamRangeExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                entries,
+                declared_last_id: last,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        if limit == 0 || start > effective_end {
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeStreamRangeExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                entries: Vec::new(),
+                declared_last_id: last,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_stream_range_segments(StreamRangeSegmentRequest {
+            snapshot_csn: snapshot.visible_csn,
+            tree,
+            key,
+            start,
+            end: effective_end,
+            last_id: last,
+            limit,
+            planning_permit,
+        })
+    }
+
+    fn execute_stream_range_segments(
+        &self,
+        request: StreamRangeSegmentRequest<'_>,
+    ) -> Result<NativeStreamRangeExecutionReceipt, NativeRuntimeError> {
+        let prefix = structure_stream_entry_prefix(request.key)?;
+        let plan = self.plan_btree_segments(
+            request.tree,
+            prefix,
+            Bound::Included(structure_stream_entry_key(request.key, request.start)?),
+            Bound::Included(structure_stream_entry_key(request.key, request.end)?),
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        if plan.segments.is_empty() {
+            return Ok(NativeStreamRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries: Vec::new(),
+                declared_last_id: request.last_id,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            FOREGROUND_BOUNDED_MEMORY_BYTES,
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_stream_segment_plan_parallel(
+                    request.key,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (self.scan_stream_segment_plan_serial(request.key, &plan)?, 0),
+        };
+        let mut entries = batches.into_iter().flatten().collect::<Vec<_>>();
+        entries.truncate(request.limit);
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeStreamRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            entries,
+            declared_last_id: request.last_id,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn xrange_latest_stream_at_profiled_v3(
+        &self,
+        request: structure_v3::StreamRangeRequestV3<'_>,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeStreamRangeExecutionReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(request.logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let plan = structure_v3::prepare_stream_range_latest_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
+            tree,
+            request,
+        )?;
+        if plan.empty
+            || (request.limit <= STRUCTURE_SEGMENT_SCAN_THRESHOLD
+                && plan.range_width <= STRUCTURE_SEGMENT_SCAN_THRESHOLD as u64)
+        {
+            let entries = structure_v3::stream_range_latest_at_v3(
+                &self.pages,
+                &self.buffer_pool,
+                tree,
+                request.key,
+                &plan,
+                request.limit,
+            )?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeStreamRangeExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                entries,
+                declared_last_id: plan.last_id,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_stream_range_segments_v3(
+            snapshot.visible_csn,
+            tree,
+            request,
+            &plan,
+            planning_permit,
+        )
+    }
+
+    fn execute_stream_range_segments_v3(
+        &self,
+        snapshot_csn: Option<Csn>,
+        tree: BTree,
+        request: structure_v3::StreamRangeRequestV3<'_>,
+        plan: &structure_v3::StreamRangePlanV3,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeStreamRangeExecutionReceipt, NativeRuntimeError> {
+        let segment_plan = self.plan_btree_segments(
+            tree,
+            plan.prefix.clone(),
+            plan.lower.clone(),
+            plan.upper.clone(),
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        if segment_plan.segments.is_empty() {
+            let entries =
+                structure_v3::finalize_stream_segment_batches_v3(Vec::new(), plan, request.limit)?;
+            return Ok(NativeStreamRangeExecutionReceipt {
+                snapshot_csn,
+                entries,
+                declared_last_id: plan.last_id,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = segment_plan.segments.len();
+        let planned_physical_entries = segment_plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            FOREGROUND_BOUNDED_MEMORY_BYTES,
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_stream_segment_plan_v3_parallel(
+                    request.key,
+                    plan.incarnation,
+                    plan.last_id,
+                    segment_plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_stream_segment_plan_v3_serial(
+                    request.key,
+                    plan.incarnation,
+                    plan.last_id,
+                    &segment_plan,
+                )?,
+                0,
+            ),
+        };
+        let entries =
+            structure_v3::finalize_stream_segment_batches_v3(batches, plan, request.limit)?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeStreamRangeExecutionReceipt {
+            snapshot_csn,
+            entries,
+            declared_last_id: plan.last_id,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn visible_stream_last_id_in_tree_at(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<u64, NativeRuntimeError> {
         let metadata = tree
             .get_cached_pinned(
                 &self.pages,
@@ -7495,27 +10254,26 @@ impl NativeDatabase {
         if is_structure_tombstone(metadata.bytes()) {
             return Err(NativeRuntimeError::UnknownStructureStream);
         }
-        let raw = metadata.bytes();
-        let last = u64::from_be_bytes(
-            raw.get(..8)
-                .ok_or(NativeRuntimeError::InvalidStructureTree)?
-                .try_into()
-                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
-        );
-        let expiry = match raw.len() {
-            8 => None,
-            16 => Some(i64::from_be_bytes(
-                raw[8..16]
-                    .try_into()
-                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
-            )),
-            _ => return Err(NativeRuntimeError::InvalidStructureTree),
-        };
+        let (last, expiry) = decode_stream_metadata(metadata.bytes())?;
         if expiry.is_some_and(|expiry| expiry <= logical_time_micros) {
             return Err(NativeRuntimeError::UnknownStructureStream);
         }
+        Ok(last)
+    }
+
+    fn stream_range_in_tree(
+        &self,
+        tree: BTree,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<NativeStreamEntry>, NativeRuntimeError> {
+        if limit == 0 || start > end {
+            return Ok(Vec::new());
+        }
         let mut entries = Vec::new();
-        for id in start..=end.min(last) {
+        for id in start..=end {
             if entries.len() == limit {
                 break;
             }
@@ -7537,6 +10295,108 @@ impl NativeDatabase {
         Ok(entries)
     }
 
+    fn scan_stream_segment_plan_serial(
+        &self,
+        key: &[u8],
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<Vec<NativeStreamEntry>>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                decode_stream_segment(plan.tree.scan_planned_segment(&self.pages, segment)?, key)
+            })
+            .collect()
+    }
+
+    fn scan_stream_segment_plan_parallel(
+        &self,
+        key: &[u8],
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<Vec<NativeStreamEntry>>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    decode_stream_segment(tree.scan_planned_segment(&pages, &segment)?, &key)
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
+    fn scan_stream_segment_plan_v3_serial(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        last_id: u64,
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<structure_v3::StreamSegmentBatchV3>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                structure_v3::decode_stream_segment_v3(
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    incarnation,
+                    last_id,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_stream_segment_plan_v3_parallel(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        last_id: u64,
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<structure_v3::StreamSegmentBatchV3>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    structure_v3::decode_stream_segment_v3(
+                        tree.scan_planned_segment(&pages, &segment)?,
+                        &key,
+                        incarnation,
+                        last_id,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
     /// Returns one current physical stream family's TTL at explicit logical time.
     ///
     /// # Errors
@@ -7547,7 +10407,22 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::collection_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::Stream,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7606,7 +10481,32 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        self.llen_latest_list_at_unadmitted(key, logical_time_micros)
+    }
+
+    fn llen_latest_list_at_unadmitted(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<usize, NativeRuntimeError> {
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::collection_cardinality_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::List,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7677,7 +10577,9 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
-        self.lrange_latest_list_at(key, start, stop, i64::MIN)
+        Ok(self
+            .lrange_latest_list_at_profiled(key, start, stop, i64::MIN)?
+            .values)
     }
 
     /// Reads an inclusive signed-index range through physical list chunks at
@@ -7694,7 +10596,42 @@ impl NativeDatabase {
         stop: i64,
         logical_time_micros: i64,
     ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        Ok(self
+            .lrange_latest_list_at_profiled(key, start, stop, logical_time_micros)?
+            .values)
+    }
+
+    /// Reads an inclusive signed-index range and reports whether it used the
+    /// direct chunk walk or governed immutable B+tree leaf segments.
+    ///
+    /// Large ranges are segmented only when they cover at least half of the
+    /// live list. Narrow ranges retain the head/tail direct walk until list
+    /// chunks carry persisted logical prefix-count summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::lrange_latest_list_at`] plus
+    /// resource admission or persistent execution failures.
+    pub fn lrange_latest_list_at_profiled(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        logical_time_micros: i64,
+    ) -> Result<NativeListRangeExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            return self.lrange_latest_list_at_profiled_v3(
+                structure_v3::ListRangeRequestV3 {
+                    key,
+                    start,
+                    stop,
+                    logical_time_micros,
+                },
+                planning_permit,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7703,34 +10640,393 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        let metadata_key = structure_list_meta_key(key)?;
-        let metadata = tree
+        self.list_range_profiled_at(ListRangeRequest {
+            snapshot_csn: snapshot.visible_csn,
+            tree,
+            key: key.to_vec(),
+            logical_time_micros,
+            start,
+            stop,
+            planning_permit,
+        })
+    }
+
+    fn lrange_latest_list_at_profiled_v3(
+        &self,
+        request: structure_v3::ListRangeRequestV3<'_>,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeListRangeExecutionReceipt, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(request.logical_time_micros)?;
+        let root = snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let plan = structure_v3::prepare_list_range_latest_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
+            tree,
+            request,
+        )?;
+        let requested = plan
+            .normalized
+            .map_or(0, |(range_start, range_stop)| range_stop - range_start + 1);
+        if requested == 0
+            || requested <= STRUCTURE_SEGMENT_SCAN_THRESHOLD
+            || requested.saturating_mul(2) < plan.element_count
+        {
+            let values = structure_v3::list_range_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                tree,
+                request.key,
+                &plan,
+            )?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeListRangeExecutionReceipt {
+                snapshot_csn: snapshot.visible_csn,
+                values,
+                declared_length: plan.element_count,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_list_range_segments_v3(
+            snapshot.visible_csn,
+            tree,
+            request.key,
+            requested,
+            &plan,
+            planning_permit,
+        )
+    }
+
+    fn execute_list_range_segments_v3(
+        &self,
+        snapshot_csn: Option<Csn>,
+        tree: BTree,
+        key: &[u8],
+        requested: usize,
+        plan: &structure_v3::ListRangePlanV3,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeListRangeExecutionReceipt, NativeRuntimeError> {
+        let segment_plan = self.plan_btree_segments(
+            tree,
+            plan.prefix.clone(),
+            plan.lower.clone(),
+            plan.upper.clone(),
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        if segment_plan.segments.is_empty() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let planned_segments = segment_plan.segments.len();
+        let planned_physical_entries = segment_plan.physical_entries;
+        let memory_bytes = plan
+            .logical_value_bytes
+            .saturating_add(segmented_result_memory_bytes(planned_physical_entries));
+        let permit = self.admit_parallel_foreground_bounded_io(memory_bytes, planned_segments)?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_list_segment_plan_v3_parallel(
+                    key,
+                    plan.incarnation,
+                    segment_plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_list_segment_plan_v3_serial(key, plan.incarnation, &segment_plan)?,
+                0,
+            ),
+        };
+        let all_values = structure_v3::finalize_list_segment_batches_v3(batches, plan)?;
+        let (range_start, _) = plan
+            .normalized
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let values = all_values
+            .into_iter()
+            .skip(range_start)
+            .take(requested)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeListRangeExecutionReceipt {
+            snapshot_csn,
+            values,
+            declared_length: plan.element_count,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn list_range_profiled_at(
+        &self,
+        request: ListRangeRequest,
+    ) -> Result<NativeListRangeExecutionReceipt, NativeRuntimeError> {
+        let metadata_key = structure_list_meta_key(&request.key)?;
+        let metadata = request
+            .tree
             .get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
             .map(|encoded| decode_live_list_metadata(encoded.bytes()))
             .transpose()?
             .flatten();
         let Some(metadata) =
-            metadata.filter(|metadata| metadata.is_visible_at(logical_time_micros))
+            metadata.filter(|metadata| metadata.is_visible_at(request.logical_time_micros))
         else {
-            return match self.llen_latest_list_at(key, logical_time_micros) {
+            return match self
+                .llen_latest_list_at_unadmitted(&request.key, request.logical_time_micros)
+            {
                 Err(error) => Err(error),
                 Ok(_) => Err(NativeRuntimeError::InvalidStructureTree),
             };
         };
         let length = usize::try_from(metadata.length)
             .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
-        let Some((range_start, range_stop)) = normalize_list_range(length, start, stop) else {
-            return Ok(Vec::new());
+        let Some((range_start, range_stop)) =
+            normalize_list_range(length, request.start, request.stop)
+        else {
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeListRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                values: Vec::new(),
+                declared_length: length,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
         };
-        let values = if range_start <= length - 1 - range_stop {
-            read_list_range_from_head(self, tree, key, metadata, range_start, range_stop)?
-        } else {
-            read_list_range_from_tail(self, tree, key, metadata, range_start, range_stop)?
-        };
-        if values.len() != range_stop - range_start + 1 {
+        let requested = range_stop - range_start + 1;
+        if metadata.value_bytes.is_none()
+            || requested <= STRUCTURE_SEGMENT_SCAN_THRESHOLD
+            || requested.saturating_mul(2) < length
+        {
+            let values = if range_start <= length - 1 - range_stop {
+                read_list_range_from_head(
+                    self,
+                    request.tree,
+                    &request.key,
+                    metadata,
+                    range_start,
+                    range_stop,
+                )?
+            } else {
+                read_list_range_from_tail(
+                    self,
+                    request.tree,
+                    &request.key,
+                    metadata,
+                    range_start,
+                    range_stop,
+                )?
+            };
+            if values.len() != requested {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeListRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                values,
+                declared_length: length,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_list_range_segments(request, metadata, length, range_start, requested)
+    }
+
+    fn execute_list_range_segments(
+        &self,
+        request: ListRangeRequest,
+        metadata: ListMetadata,
+        declared_length: usize,
+        range_start: usize,
+        requested: usize,
+    ) -> Result<NativeListRangeExecutionReceipt, NativeRuntimeError> {
+        let declared_value_bytes = metadata
+            .value_bytes
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let prefix = structure_list_chunk_prefix(&request.key)?;
+        let lower = Bound::Included(structure_list_chunk_key(&request.key, metadata.head_chunk)?);
+        let upper = Bound::Included(structure_list_chunk_key(&request.key, metadata.tail_chunk)?);
+        let plan = self.plan_btree_segments(
+            request.tree,
+            prefix,
+            lower,
+            upper,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        if plan.segments.is_empty() {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
-        Ok(values)
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let memory_bytes = declared_value_bytes
+            .saturating_add(segmented_result_memory_bytes(planned_physical_entries));
+        let permit = self.admit_parallel_foreground_bounded_io(memory_bytes, planned_segments)?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_list_segment_plan_parallel(
+                    &request.key,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (self.scan_list_segment_plan_serial(&request.key, &plan)?, 0),
+        };
+        let values = finalize_list_segment_batches(
+            batches,
+            metadata,
+            declared_length,
+            declared_value_bytes,
+        )?;
+        let values = values
+            .into_iter()
+            .skip(range_start)
+            .take(requested)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeListRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            values,
+            declared_length,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn scan_list_segment_plan_serial(
+        &self,
+        key: &[u8],
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<ListChunkBatch>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                decode_list_segment(
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    &self.blobs,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_list_segment_plan_parallel(
+        &self,
+        key: &[u8],
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<ListChunkBatch>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let blobs = Arc::new(self.blobs.read_handle());
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    decode_list_segment(tree.scan_planned_segment(&pages, &segment)?, &key, &blobs)
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
+    fn scan_list_segment_plan_v3_serial(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<structure_v3::ListSegmentBatchV3>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                structure_v3::decode_list_segment_v3(
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    incarnation,
+                    &self.blobs,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_list_segment_plan_v3_parallel(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<structure_v3::ListSegmentBatchV3>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let blobs = Arc::new(self.blobs.read_handle());
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    structure_v3::decode_list_segment_v3(
+                        tree.scan_planned_segment(&pages, &segment)?,
+                        &key,
+                        incarnation,
+                        &blobs,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
     }
 
     /// Returns one current physical list family's TTL at explicit logical
@@ -7744,7 +11040,22 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::collection_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::List,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7784,7 +11095,23 @@ impl NativeDatabase {
         key: &[u8],
         member: &[u8],
     ) -> Result<Option<f64>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::sorted_set_score_latest_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                member,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -7831,7 +11158,24 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::collection_cardinality_latest_at_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::SortedSet,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -7866,7 +11210,22 @@ impl NativeDatabase {
         key: &[u8],
         logical_time_micros: i64,
     ) -> Result<Ttl, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+            let Some(root) = snapshot.roots().root(SLOT_STRUCTURE) else {
+                return Ok(Ttl::Missing);
+            };
+            return structure_v3::collection_ttl_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                structure_v3::StructureCollectionFamily::SortedSet,
+                logical_time_micros,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
@@ -7931,7 +11290,24 @@ impl NativeDatabase {
         member: &[u8],
         reverse: bool,
     ) -> Result<Option<usize>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        let _permit = self.admit_foreground_point()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return structure_v3::sorted_set_rank_latest_v3(
+                &self.pages,
+                &self.blobs,
+                &self.buffer_pool,
+                BTree::from_root(root),
+                key,
+                member,
+                reverse,
+            );
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -8054,7 +11430,25 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        self.sorted_set_rank_range_latest(key, start, stop, SortedSetDirection::Ascending)
+        Ok(self
+            .zrange_latest_sorted_set_profiled(key, start, stop)?
+            .entries)
+    }
+
+    /// Reads an ascending signed-rank range and reports whether it used the
+    /// direct visitor or governed immutable leaf segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::zrange_latest_sorted_set`] plus
+    /// resource admission or persistent execution failures.
+    pub fn zrange_latest_sorted_set_profiled(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        self.sorted_set_rank_range_latest_profiled(key, start, stop, SortedSetDirection::Ascending)
     }
 
     /// Reads an inclusive signed-rank range in descending order through the
@@ -8073,17 +11467,52 @@ impl NativeDatabase {
         start: i64,
         stop: i64,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        self.sorted_set_rank_range_latest(key, start, stop, SortedSetDirection::Descending)
+        Ok(self
+            .zrevrange_latest_sorted_set_profiled(key, start, stop)?
+            .entries)
     }
 
-    fn sorted_set_rank_range_latest(
+    /// Reads a descending signed-rank range and reports whether it used the
+    /// direct visitor or governed immutable leaf segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::zrevrange_latest_sorted_set`] plus
+    /// resource admission or persistent execution failures.
+    pub fn zrevrange_latest_sorted_set_profiled(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        self.sorted_set_rank_range_latest_profiled(key, start, stop, SortedSetDirection::Descending)
+    }
+
+    fn sorted_set_rank_range_latest_profiled(
         &self,
         key: &[u8],
         start: i64,
         stop: i64,
         direction: SortedSetDirection,
-    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return self.sorted_set_rank_range_profiled_v3(SortedSetRankRangeRequest {
+                snapshot_csn: snapshot.visible_csn,
+                tree: BTree::from_root(root),
+                key: key.to_vec(),
+                start,
+                stop,
+                direction,
+                planning_permit,
+            });
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let snapshot = self.coordinator.snapshot(0)?;
@@ -8092,7 +11521,240 @@ impl NativeDatabase {
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        self.sorted_set_rank_range_in_tree(tree, key, start, stop, direction)
+        self.sorted_set_rank_range_profiled_at(SortedSetRankRangeRequest {
+            snapshot_csn: snapshot.visible_csn,
+            tree,
+            key: key.to_vec(),
+            start,
+            stop,
+            direction,
+            planning_permit,
+        })
+    }
+
+    fn sorted_set_rank_range_profiled_v3(
+        &self,
+        request: SortedSetRankRangeRequest,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let plan = structure_v3::prepare_sorted_set_order_plan_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
+            request.tree,
+            &request.key,
+            None,
+        )?;
+        let Some((range_start, range_stop)) =
+            normalize_list_range(plan.member_count, request.start, request.stop)
+        else {
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_sorted_set_range_receipt(
+                request.snapshot_csn,
+                Vec::new(),
+                execution,
+            ));
+        };
+        let requested = range_stop - range_start + 1;
+        if requested <= STRUCTURE_SEGMENT_SCAN_THRESHOLD
+            || requested.saturating_mul(2) < plan.member_count
+        {
+            let entries = structure_v3::sorted_set_rank_range_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                request.tree,
+                &request.key,
+                &plan,
+                structure_v3::SortedSetRankRangeRequestV3 {
+                    start: request.start,
+                    stop: request.stop,
+                    direction: request.direction,
+                },
+            )?;
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_sorted_set_range_receipt(
+                request.snapshot_csn,
+                entries,
+                execution,
+            ));
+        }
+        self.execute_sorted_set_rank_segments_v3(request, &plan, range_start, requested)
+    }
+
+    fn execute_sorted_set_rank_segments_v3(
+        &self,
+        request: SortedSetRankRangeRequest,
+        order_plan: &structure_v3::SortedSetOrderPlanV3,
+        range_start: usize,
+        requested: usize,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let mut plan = self.plan_btree_segments(
+            request.tree,
+            order_plan.prefix.clone(),
+            Bound::Unbounded,
+            Bound::Unbounded,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        if request.direction == SortedSetDirection::Descending {
+            plan.segments.reverse();
+        }
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            segmented_result_memory_bytes(planned_physical_entries),
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = self.scan_sorted_set_segment_plan_v3(
+            &request.key,
+            order_plan.incarnation,
+            request.direction,
+            plan,
+            permit.as_ref(),
+            planned_workers,
+        )?;
+        let live_entries = batches
+            .into_iter()
+            .flat_map(|batch| batch.entries)
+            .collect::<Vec<_>>();
+        if live_entries.len() != order_plan.member_count {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entries = live_entries
+            .into_iter()
+            .skip(range_start)
+            .take(requested)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSortedSetRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            entries,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn sorted_set_rank_range_profiled_at(
+        &self,
+        request: SortedSetRankRangeRequest,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let metadata_key = structure_sorted_set_meta_key(&request.key)?;
+        let Some(metadata) =
+            request
+                .tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(request.tree, &request.key);
+        };
+        let length = usize::try_from(decode_sorted_set_metadata(metadata.bytes())?)
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+        let Some((range_start, range_stop)) =
+            normalize_list_range(length, request.start, request.stop)
+        else {
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeSortedSetRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries: Vec::new(),
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        };
+        let requested = range_stop - range_start + 1;
+        if requested <= STRUCTURE_SEGMENT_SCAN_THRESHOLD || requested.saturating_mul(2) < length {
+            let entries = self.sorted_set_rank_range_in_tree(
+                request.tree,
+                &request.key,
+                request.start,
+                request.stop,
+                request.direction,
+            )?;
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeSortedSetRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_sorted_set_rank_segments(request, length, range_start, requested)
+    }
+
+    fn execute_sorted_set_rank_segments(
+        &self,
+        request: SortedSetRankRangeRequest,
+        declared_length: usize,
+        range_start: usize,
+        requested: usize,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let prefix = structure_sorted_set_order_prefix(&request.key)?;
+        let mut plan = self.plan_btree_segments(
+            request.tree,
+            prefix,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        if request.direction == SortedSetDirection::Descending {
+            plan.segments.reverse();
+        }
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            segmented_result_memory_bytes(planned_physical_entries),
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_sorted_set_segment_plan_parallel(
+                    &request.key,
+                    request.direction,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_sorted_set_segment_plan_serial(&request.key, request.direction, &plan)?,
+                0,
+            ),
+        };
+        let live_entries: Vec<_> = batches.into_iter().flatten().collect();
+        if live_entries.len() != declared_length {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entries = live_entries
+            .into_iter()
+            .skip(range_start)
+            .take(requested)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSortedSetRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            entries,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
     }
 
     fn sorted_set_rank_range_in_tree(
@@ -8191,7 +11853,27 @@ impl NativeDatabase {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        self.sorted_set_score_range_latest(
+        Ok(self
+            .zrange_by_score_latest_sorted_set_profiled(key, lower, upper, offset, limit)?
+            .entries)
+    }
+
+    /// Reads an ascending score range and reports its direct or immutable
+    /// segment physical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::zrange_by_score_latest_sorted_set`]
+    /// plus resource admission or persistent execution failures.
+    pub fn zrange_by_score_latest_sorted_set_profiled(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        self.sorted_set_score_range_latest_profiled(
             key,
             lower,
             upper,
@@ -8220,7 +11902,28 @@ impl NativeDatabase {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        self.sorted_set_score_range_latest(
+        Ok(self
+            .zrevrange_by_score_latest_sorted_set_profiled(key, lower, upper, offset, limit)?
+            .entries)
+    }
+
+    /// Reads a descending score range and reports its direct or immutable
+    /// segment physical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::zrevrange_by_score_latest_sorted_set`] plus resource admission
+    /// or persistent execution failures.
+    pub fn zrevrange_by_score_latest_sorted_set_profiled(
+        &self,
+        key: &[u8],
+        lower: Bound<f64>,
+        upper: Bound<f64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        self.sorted_set_score_range_latest_profiled(
             key,
             lower,
             upper,
@@ -8230,7 +11933,7 @@ impl NativeDatabase {
         )
     }
 
-    fn sorted_set_score_range_latest(
+    fn sorted_set_score_range_latest_profiled(
         &self,
         key: &[u8],
         lower: Bound<f64>,
@@ -8238,18 +11941,417 @@ impl NativeDatabase {
         offset: usize,
         limit: usize,
         direction: SortedSetDirection,
-    ) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
+        let (lower, upper) = canonical_sorted_set_score_bounds(lower, upper)?;
+        if self.structure_format == StructureFormat::BTreeV3 {
+            let snapshot = self.coordinator.snapshot(0)?;
+            let root = snapshot
+                .roots()
+                .root(SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            return self.sorted_set_score_range_profiled_v3(SortedSetScoreRangeRequest {
+                snapshot_csn: snapshot.visible_csn,
+                tree: BTree::from_root(root),
+                key: key.to_vec(),
+                bounds: (lower, upper),
+                offset,
+                limit,
+                direction,
+                planning_permit,
+            });
+        }
+        if !self.structure_format.uses_legacy_collection_layout() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
-        let (lower, upper) = canonical_sorted_set_score_bounds(lower, upper)?;
         let snapshot = self.coordinator.snapshot(0)?;
         let root = snapshot
             .roots()
             .root(SLOT_STRUCTURE)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let tree = BTree::from_root(root);
-        self.sorted_set_score_range_in_tree(tree, key, (lower, upper), offset, limit, direction)
+        self.sorted_set_score_range_profiled_at(SortedSetScoreRangeRequest {
+            snapshot_csn: snapshot.visible_csn,
+            tree,
+            key: key.to_vec(),
+            bounds: (lower, upper),
+            offset,
+            limit,
+            direction,
+            planning_permit,
+        })
+    }
+
+    fn sorted_set_score_range_profiled_v3(
+        &self,
+        request: SortedSetScoreRangeRequest,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let plan = structure_v3::prepare_sorted_set_order_plan_v3(
+            &self.pages,
+            &self.blobs,
+            &self.buffer_pool,
+            request.tree,
+            &request.key,
+            Some(request.bounds),
+        )?;
+        let direct_work =
+            request.offset.saturating_add(request.limit) <= STRUCTURE_SEGMENT_SCAN_THRESHOLD;
+        if direct_work
+            || request.limit == 0
+            || sorted_set_score_range_is_empty(&request.bounds.0, &request.bounds.1)
+        {
+            let entries = structure_v3::sorted_set_score_range_latest_v3(
+                &self.pages,
+                &self.buffer_pool,
+                request.tree,
+                &request.key,
+                &plan,
+                structure_v3::SortedSetScoreRangeRequestV3 {
+                    offset: request.offset,
+                    limit: request.limit,
+                    direction: request.direction,
+                },
+            )?;
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_sorted_set_range_receipt(
+                request.snapshot_csn,
+                entries,
+                execution,
+            ));
+        }
+        self.execute_sorted_set_score_segments_v3(request, &plan)
+    }
+
+    fn execute_sorted_set_score_segments_v3(
+        &self,
+        request: SortedSetScoreRangeRequest,
+        order_plan: &structure_v3::SortedSetOrderPlanV3,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let mut plan = self.plan_btree_segments(
+            request.tree,
+            order_plan.prefix.clone(),
+            order_plan.lower.clone(),
+            order_plan.upper.clone(),
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        if request.direction == SortedSetDirection::Descending {
+            plan.segments.reverse();
+        }
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        if plan.segments.is_empty() {
+            return Ok(NativeSortedSetRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries: Vec::new(),
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            segmented_result_memory_bytes(planned_physical_entries),
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = self.scan_sorted_set_segment_plan_v3(
+            &request.key,
+            order_plan.incarnation,
+            request.direction,
+            plan,
+            permit.as_ref(),
+            planned_workers,
+        )?;
+        let live_entries = batches
+            .into_iter()
+            .flat_map(|batch| batch.entries)
+            .collect::<Vec<_>>();
+        if live_entries.len() > order_plan.member_count
+            || (matches!(request.bounds.0, Bound::Unbounded)
+                && matches!(request.bounds.1, Bound::Unbounded)
+                && live_entries.len() != order_plan.member_count)
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let entries = live_entries
+            .into_iter()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSortedSetRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            entries,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn sorted_set_score_range_profiled_at(
+        &self,
+        request: SortedSetScoreRangeRequest,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let metadata_key = structure_sorted_set_meta_key(&request.key)?;
+        let Some(metadata) =
+            request
+                .tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &metadata_key)?
+        else {
+            return self.sorted_set_missing_or_kind_error(request.tree, &request.key);
+        };
+        decode_sorted_set_metadata(metadata.bytes())?;
+        let direct_work =
+            request.offset.saturating_add(request.limit) <= STRUCTURE_SEGMENT_SCAN_THRESHOLD;
+        if direct_work
+            || request.limit == 0
+            || sorted_set_score_range_is_empty(&request.bounds.0, &request.bounds.1)
+        {
+            let entries = self.sorted_set_score_range_in_tree(
+                request.tree,
+                &request.key,
+                request.bounds,
+                request.offset,
+                request.limit,
+                request.direction,
+            )?;
+            let execution = request.planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(NativeSortedSetRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries,
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning: None,
+                execution,
+                planned_workers: 1,
+                worker_batches: 0,
+            });
+        }
+        self.execute_sorted_set_score_segments(request)
+    }
+
+    fn execute_sorted_set_score_segments(
+        &self,
+        request: SortedSetScoreRangeRequest,
+    ) -> Result<NativeSortedSetRangeExecutionReceipt, NativeRuntimeError> {
+        let range =
+            sorted_set_score_physical_bounds(&request.key, request.bounds.0, request.bounds.1)?;
+        let mut plan = self.plan_btree_segments(
+            request.tree,
+            range.prefix,
+            range.lower,
+            range.upper,
+            NativeRuntimeError::InvalidStructureTree,
+        )?;
+        if request.direction == SortedSetDirection::Descending {
+            plan.segments.reverse();
+        }
+        let planning = request.planning_permit.map(DatabaseGovernorPermit::finish);
+        if plan.segments.is_empty() {
+            return Ok(NativeSortedSetRangeExecutionReceipt {
+                snapshot_csn: request.snapshot_csn,
+                entries: Vec::new(),
+                planned_segments: 0,
+                planned_physical_entries: 0,
+                planning,
+                execution: None,
+                planned_workers: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_segments = plan.segments.len();
+        let planned_physical_entries = plan.physical_entries;
+        let permit = self.admit_parallel_foreground_bounded_io(
+            segmented_result_memory_bytes(planned_physical_entries),
+            planned_segments,
+        )?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_sorted_set_segment_plan_parallel(
+                    &request.key,
+                    request.direction,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_sorted_set_segment_plan_serial(&request.key, request.direction, &plan)?,
+                0,
+            ),
+        };
+        let entries = batches
+            .into_iter()
+            .flatten()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect();
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeSortedSetRangeExecutionReceipt {
+            snapshot_csn: request.snapshot_csn,
+            entries,
+            planned_segments,
+            planned_physical_entries,
+            planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    fn scan_sorted_set_segment_plan_serial(
+        &self,
+        key: &[u8],
+        direction: SortedSetDirection,
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<Vec<SortedSetEntry>>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                decode_sorted_set_segment(
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    direction,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_sorted_set_segment_plan_v3(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        direction: SortedSetDirection,
+        plan: NativeBTreeSegmentPlan,
+        permit: Option<&DatabaseGovernorPermit>,
+        planned_workers: u64,
+    ) -> Result<(Vec<structure_v3::SortedSetSegmentBatchV3>, usize), NativeRuntimeError> {
+        match (self.execution_pool.as_deref(), permit) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_sorted_set_segment_plan_v3_parallel(
+                    key,
+                    incarnation,
+                    direction,
+                    plan,
+                    execution_pool,
+                    permit.permit(),
+                ),
+            _ => Ok((
+                self.scan_sorted_set_segment_plan_v3_serial(key, incarnation, direction, &plan)?,
+                0,
+            )),
+        }
+    }
+
+    fn scan_sorted_set_segment_plan_v3_serial(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        direction: SortedSetDirection,
+        plan: &NativeBTreeSegmentPlan,
+    ) -> Result<Vec<structure_v3::SortedSetSegmentBatchV3>, NativeRuntimeError> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                structure_v3::decode_sorted_set_segment_v3(
+                    &self.pages,
+                    &self.buffer_pool,
+                    plan.tree,
+                    plan.tree.scan_planned_segment(&self.pages, segment)?,
+                    key,
+                    incarnation,
+                    direction,
+                )
+            })
+            .collect()
+    }
+
+    fn scan_sorted_set_segment_plan_v3_parallel(
+        &self,
+        key: &[u8],
+        incarnation: structure_v3::StructureIncarnation,
+        direction: SortedSetDirection,
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<structure_v3::SortedSetSegmentBatchV3>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let pool = Arc::clone(&self.buffer_pool);
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    structure_v3::decode_sorted_set_segment_v3(
+                        &pages,
+                        &pool,
+                        tree,
+                        tree.scan_planned_segment(&pages, &segment)?,
+                        &key,
+                        incarnation,
+                        direction,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
+    }
+
+    fn scan_sorted_set_segment_plan_parallel(
+        &self,
+        key: &[u8],
+        direction: SortedSetDirection,
+        plan: NativeBTreeSegmentPlan,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<Vec<SortedSetEntry>>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let key = Arc::new(key.to_vec());
+        let tree = plan.tree;
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                plan.segments,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |segment| {
+                    decode_sorted_set_segment(
+                        tree.scan_planned_segment(&pages, &segment)?,
+                        &key,
+                        direction,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
     }
 
     fn sorted_set_score_range_in_tree(
@@ -8402,8 +12504,7 @@ impl NativeDatabase {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
-        self.match_latest_text_with_csn(index, query, limit)
-            .map(|(_, hits)| hits)
+        Ok(self.match_latest_text_profiled(index, query, limit)?.hits)
     }
 
     pub(crate) fn match_latest_text_with_csn(
@@ -8412,13 +12513,46 @@ impl NativeDatabase {
         query: &str,
         limit: usize,
     ) -> Result<(Csn, Vec<MatchHit>), NativeRuntimeError> {
+        let receipt = self.match_latest_text_profiled(index, query, limit)?;
+        let visible_csn = receipt
+            .snapshot_csn
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        Ok((visible_csn, receipt.hits))
+    }
+
+    /// Executes current-root BM25 matching and reports the selected direct or
+    /// immutable-segment physical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation failures as [`Self::match_latest_text`]
+    /// plus resource admission or persistent execution failures.
+    pub fn match_latest_text_profiled(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
+        let planning_permit = self.admit_foreground_bounded()?;
         if self.search_format == SearchFormat::InlineStateV1 {
-            let snapshot = self.snapshot(0)?;
+            let snapshot = self.snapshot_unadmitted(0)?;
             let visible_csn = snapshot
                 .visible_csn()
                 .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-            return Ok((visible_csn, snapshot.match_text(index, query, limit)?));
+            let hits = snapshot.match_text(index, query, limit)?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_lexical_receipt(visible_csn, hits, execution));
         }
+        self.match_btree_text_profiled(index, query, limit, planning_permit)
+    }
+
+    fn match_btree_text_profiled(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        planning_permit: Option<DatabaseGovernorPermit>,
+    ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
         let snapshot = self.coordinator.snapshot(0)?;
         let visible_csn = snapshot
             .visible_csn
@@ -8440,10 +12574,131 @@ impl NativeDatabase {
             decode_search_index_metadata(metadata.bytes())?;
         let query_tokens: BTreeSet<String> = analyze(query).into_iter().collect();
         if query_tokens.is_empty() || limit == 0 || document_count == 0 {
-            return Ok((visible_csn, Vec::new()));
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_lexical_receipt(visible_csn, Vec::new(), execution));
         }
         let document_count_f64 = search_count_f64(document_count)?;
         let average_length = search_count_f64(total_document_terms)? / document_count_f64;
+        if document_count <= SEARCH_SEGMENT_SCAN_THRESHOLD {
+            let hits = self.match_text_in_tree_direct(
+                tree,
+                format,
+                index,
+                query_tokens,
+                document_count,
+                document_count_f64,
+                average_length,
+                limit,
+            )?;
+            let execution = planning_permit.map(DatabaseGovernorPermit::finish);
+            return Ok(direct_lexical_receipt(visible_csn, hits, execution));
+        }
+        let term_plans = self.plan_lexical_term_segments(
+            tree,
+            format,
+            index,
+            query_tokens,
+            document_count,
+            document_count_f64,
+        )?;
+        let planned_terms = term_plans.len();
+        let planned_segments = term_plans.iter().try_fold(0_usize, |total, plan| {
+            total
+                .checked_add(plan.segments.len())
+                .ok_or(NativeRuntimeError::InvalidSearchTree)
+        })?;
+        let planned_physical_entries = term_plans.iter().try_fold(0_usize, |total, plan| {
+            total
+                .checked_add(plan.physical_entries)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)
+        })?;
+        let expected_document_frequencies = term_plans
+            .iter()
+            .map(|plan| plan.document_frequency)
+            .collect::<Vec<_>>();
+        let work = lexical_segment_work(term_plans);
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        self.execute_lexical_plan(
+            LexicalExecutionPlan {
+                snapshot_csn: visible_csn,
+                tree,
+                format,
+                index,
+                average_length,
+                planned_terms,
+                planned_segments,
+                planned_physical_entries,
+                expected_document_frequencies,
+                work,
+                planning,
+            },
+            limit,
+        )
+    }
+
+    fn execute_lexical_plan(
+        &self,
+        plan: LexicalExecutionPlan,
+        limit: usize,
+    ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
+        if plan.work.is_empty() {
+            return Ok(empty_segmented_lexical_receipt(&plan));
+        }
+        let planned_memory_bytes = segmented_result_memory_bytes(plan.planned_physical_entries);
+        let permit =
+            self.admit_parallel_foreground_bounded_io(planned_memory_bytes, plan.work.len())?;
+        let planned_workers = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let (batches, worker_batches) = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit)) if planned_workers > 1 => self
+                .scan_lexical_segments_parallel(
+                    plan.tree,
+                    plan.format,
+                    plan.index,
+                    plan.average_length,
+                    plan.work,
+                    execution_pool,
+                    permit.permit(),
+                )?,
+            _ => (
+                self.scan_lexical_segments_serial(
+                    plan.tree,
+                    plan.format,
+                    plan.index,
+                    plan.average_length,
+                    &plan.work,
+                )?,
+                0,
+            ),
+        };
+        let hits = finalize_lexical_batches(batches, &plan.expected_document_frequencies, limit)?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeLexicalSearchExecutionReceipt {
+            snapshot_csn: Some(plan.snapshot_csn),
+            hits,
+            planned_terms: plan.planned_terms,
+            planned_segments: plan.planned_segments,
+            planned_physical_entries: plan.planned_physical_entries,
+            planning: plan.planning,
+            execution,
+            planned_workers,
+            worker_batches,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_text_in_tree_direct(
+        &self,
+        tree: BTree,
+        format: PhysicalSearchFormat,
+        index: ObjectId,
+        query_tokens: BTreeSet<String>,
+        document_count: u64,
+        document_count_f64: f64,
+        average_length: f64,
+        limit: usize,
+    ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
         let mut scores = BTreeMap::<Vec<u8>, f64>::new();
         let mut document_lengths = BTreeMap::<Vec<u8>, u64>::new();
         for term in query_tokens {
@@ -8506,7 +12761,119 @@ impl NativeDatabase {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
         }
-        Ok((visible_csn, rank_match_hits(scores, limit)))
+        Ok(rank_match_hits(scores, limit))
+    }
+
+    fn plan_lexical_term_segments(
+        &self,
+        tree: BTree,
+        format: PhysicalSearchFormat,
+        index: ObjectId,
+        query_tokens: BTreeSet<String>,
+        document_count: u64,
+        document_count_f64: f64,
+    ) -> Result<Vec<LexicalTermSegmentPlan>, NativeRuntimeError> {
+        let mut plans = Vec::with_capacity(query_tokens.len());
+        for term in query_tokens {
+            let term_key = search_term_meta_key(index, term.as_bytes())?;
+            let Some(term_metadata) =
+                tree.get_cached_pinned(&self.pages, &self.buffer_pool, &term_key)?
+            else {
+                continue;
+            };
+            let Some(document_frequency) =
+                decode_live_search_term_metadata(term_metadata.bytes(), format)?
+            else {
+                continue;
+            };
+            if document_frequency == 0 || document_frequency > document_count {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            let posting_prefix = search_posting_prefix(index, term.as_bytes())?;
+            let segment_plan = self.plan_btree_segments(
+                tree,
+                posting_prefix.clone(),
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NativeRuntimeError::InvalidSearchTree,
+            )?;
+            if segment_plan.segments.is_empty() {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            plans.push(LexicalTermSegmentPlan {
+                posting_prefix,
+                document_frequency,
+                idf: bm25_idf(document_count_f64, search_count_f64(document_frequency)?),
+                segments: segment_plan.segments,
+                physical_entries: segment_plan.physical_entries,
+            });
+        }
+        Ok(plans)
+    }
+
+    fn scan_lexical_segments_serial(
+        &self,
+        tree: BTree,
+        format: PhysicalSearchFormat,
+        index: ObjectId,
+        average_length: f64,
+        work: &[LexicalSegmentWork],
+    ) -> Result<Vec<LexicalPostingBatch>, NativeRuntimeError> {
+        work.iter()
+            .map(|work| {
+                decode_lexical_segment(
+                    tree,
+                    &self.pages,
+                    &self.buffer_pool,
+                    format,
+                    index,
+                    average_length,
+                    work,
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_lexical_segments_parallel(
+        &self,
+        tree: BTree,
+        format: PhysicalSearchFormat,
+        index: ObjectId,
+        average_length: f64,
+        work: Vec<LexicalSegmentWork>,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<(Vec<LexicalPostingBatch>, usize), NativeRuntimeError> {
+        let pages = Arc::new(self.pages.read_handle()?);
+        let pool = Arc::clone(&self.buffer_pool);
+        let (batches, worker_batches) = execution_pool
+            .execute_ordered_profiled_with_child_request(
+                permit,
+                work,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+                move |work| {
+                    decode_lexical_segment(
+                        tree,
+                        &pages,
+                        &pool,
+                        format,
+                        index,
+                        average_length,
+                        &work,
+                    )
+                },
+            )?;
+        Ok((
+            batches
+                .into_iter()
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+            worker_batches,
+        ))
     }
 
     /// Executes approximate vector search against the current committed
@@ -8522,6 +12889,7 @@ impl NativeDatabase {
         query: &Vector,
         options: AnnSearchOptions,
     ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
         let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         let result = state.ann.search(index, query, options)?;
@@ -8542,6 +12910,7 @@ impl NativeDatabase {
         options: AnnSearchOptions,
         allowlist: &BTreeSet<ObjectId>,
     ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
         let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         let result = state
@@ -8563,10 +12932,25 @@ impl NativeDatabase {
         query: &Vector,
         k: usize,
     ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
-        let snapshot = self.coordinator.snapshot(0)?;
-        load_state(&self.pages, &self.blobs, snapshot.roots())?
-            .ann
-            .search_exact(index, query, k)
+        Ok(self
+            .search_vector_exact_latest_profiled(index, query, k)?
+            .hits)
+    }
+
+    /// Executes the exact vector oracle and returns explicit governor and
+    /// persistent-worker evidence for the completed query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index, invalid query, malformed
+    /// catalog/root state, or rejected resource admission.
+    pub fn search_vector_exact_latest_profiled(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+    ) -> Result<NativeExactAnnExecutionReceipt, NativeRuntimeError> {
+        self.search_vector_exact_profiled(index, query, k, None)
     }
 
     /// Executes the complete exact vector oracle over a stable-ID allowlist
@@ -8583,10 +12967,148 @@ impl NativeDatabase {
         k: usize,
         allowlist: &BTreeSet<ObjectId>,
     ) -> Result<Vec<VectorHit>, NativeRuntimeError> {
+        Ok(self
+            .search_vector_exact_filtered_latest_profiled(index, query, k, allowlist)?
+            .hits)
+    }
+
+    /// Executes the allowlist-filtered exact vector oracle and returns
+    /// explicit governor and persistent-worker evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown ANN index, invalid query, malformed
+    /// catalog/root state, or rejected resource admission.
+    pub fn search_vector_exact_filtered_latest_profiled(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<NativeExactAnnExecutionReceipt, NativeRuntimeError> {
+        self.search_vector_exact_profiled(index, query, k, Some(allowlist))
+    }
+
+    /// Builds one process-local deterministic partitioned HNSW candidate
+    /// under the shared bulk governor and persistent worker pool.
+    ///
+    /// This is a P4 bakeoff surface. It deliberately does not modify the data
+    /// directory or publish the candidate as the current ANN generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid vectors or partition count, rejected
+    /// bulk admission, worker failure, or noncanonical child output.
+    pub fn build_partitioned_hnsw_experimental(
+        &self,
+        definition: VectorIndexDefinition,
+        records: Vec<VectorRecord>,
+        requested_partitions: usize,
+    ) -> Result<NativePartitionedHnswBuildReceipt, NativeRuntimeError> {
+        let total_started = Instant::now();
+        let planned_vectors = records.len();
+        let plan = HnswPartitionPlan::build(definition, records, requested_partitions)?;
+        let input_identity = plan.input_identity();
+        let planned_partitions = plan.partition_count();
+        let planned_memory_bytes = partitioned_hnsw_build_memory_bytes(planned_vectors, definition);
+        let permit = self.admit_parallel_bulk(planned_memory_bytes, planned_partitions.max(1))?;
+        let planned_compute_threads = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
+        let partition_records = plan.into_partitions();
+        let (children, worker_batches) = match (
+            self.execution_pool.as_deref(),
+            permit.as_ref(),
+            partition_records.is_empty(),
+        ) {
+            (_, _, true) => (Vec::new(), 0),
+            (Some(execution_pool), Some(permit), false)
+                if planned_compute_threads > 1 && planned_partitions > 1 =>
+            {
+                let (children, worker_batches) = execution_pool.execute_ordered_profiled(
+                    permit.permit(),
+                    partition_records,
+                    move |partition| HnswIndex::build(definition, partition),
+                )?;
+                (
+                    children.into_iter().collect::<Result<Vec<_>, _>>()?,
+                    worker_batches,
+                )
+            }
+            _ => (
+                partition_records
+                    .into_iter()
+                    .map(|partition| HnswIndex::build(definition, partition))
+                    .collect::<Result<Vec<_>, _>>()?,
+                1,
+            ),
+        };
+        let index =
+            PartitionedHnswIndex::from_governed_partitions(definition, input_identity, children)?;
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativePartitionedHnswBuildReceipt {
+            index,
+            planned_vectors,
+            planned_partitions,
+            planned_compute_threads,
+            planned_memory_bytes,
+            worker_batches,
+            execution,
+            total_time: total_started.elapsed(),
+        })
+    }
+
+    fn search_vector_exact_profiled(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+    ) -> Result<NativeExactAnnExecutionReceipt, NativeRuntimeError> {
+        let total_started = Instant::now();
+        let planning_permit = self.admit_foreground_bounded()?;
+        let observation = self.observe_ann_index_unadmitted(index)?;
+        let planning = planning_permit.map(DatabaseGovernorPermit::finish);
+        let eligible_count = allowlist.map_or(observation.effective_vector_count, |allowlist| {
+            observation.effective_vector_count.min(allowlist.len())
+        });
+        let planned_memory_bytes = exact_ann_memory_bytes(eligible_count, query.dimension());
+        let permit = self.admit_parallel_foreground_bounded(planned_memory_bytes)?;
+        let planned_compute_threads = permit
+            .as_ref()
+            .map_or(1, |permit| permit.permit().request().compute_threads);
         let snapshot = self.coordinator.snapshot(0)?;
-        load_state(&self.pages, &self.blobs, snapshot.roots())?
-            .ann
-            .search_exact_filtered(index, query, k, allowlist)
+        let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
+        let exact = match (self.execution_pool.as_deref(), permit.as_ref()) {
+            (Some(execution_pool), Some(permit))
+                if permit.permit().request().compute_threads > 1 =>
+            {
+                state.ann.search_exact_parallel(
+                    index,
+                    query,
+                    k,
+                    allowlist,
+                    execution_pool,
+                    permit.permit(),
+                )?
+            }
+            _ => state
+                .ann
+                .search_exact_profiled(index, query, k, allowlist)?,
+        };
+        let execution = permit.map(DatabaseGovernorPermit::finish);
+        Ok(NativeExactAnnExecutionReceipt {
+            snapshot_csn: snapshot.visible_csn,
+            hits: exact.hits,
+            planned_vectors: exact.planned_vectors,
+            planned_batches: exact.planned_batches,
+            planning,
+            execution,
+            planned_compute_threads,
+            planned_memory_bytes,
+            worker_batches: exact.worker_batches,
+            total_time: total_started.elapsed(),
+        })
     }
 
     /// Verifies the current relational B+tree and returns its node height.
@@ -8657,6 +13179,15 @@ impl NativeDatabase {
         })
     }
 
+    /// Returns process-wide materialization counters without touching durable
+    /// state. Subtract two observations around a measured interval.
+    pub fn process_materialization_observation() -> NativeMaterializationObservation {
+        NativeMaterializationObservation {
+            full_state_loads: FULL_STATE_LOADS.load(Ordering::Relaxed),
+            full_catalog_loads: FULL_CATALOG_STATE_LOADS.load(Ordering::Relaxed),
+        }
+    }
+
     /// Prepares one detached optimistic write transaction.
     ///
     /// Preparation captures and materializes an immutable snapshot without
@@ -8672,6 +13203,7 @@ impl NativeDatabase {
         logical_time_micros: i64,
         durability: DurabilityClass,
     ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let resource_permit = self.admit_mutation_owned()?;
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         Ok(NativeWriteBatch {
@@ -8685,6 +13217,7 @@ impl NativeDatabase {
             mode: NativeWriteBatchMode::Materialized,
             delta: None,
             ann_consolidation: None,
+            _resource_permit: resource_permit,
         })
     }
 
@@ -8704,8 +13237,12 @@ impl NativeDatabase {
         logical_time_micros: i64,
         durability: DurabilityClass,
     ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let resource_permit = self.admit_mutation_owned()?;
         if self.relational_format != RelationalFormat::VersionChainV2
-            || self.structure_format != StructureFormat::BTreeV2
+            || !matches!(
+                self.structure_format,
+                StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+            )
             || self.search_format != SearchFormat::InvertedBTreeV1
         {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -8722,6 +13259,7 @@ impl NativeDatabase {
             mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
             delta: Some(DeltaOverlay::default()),
             ann_consolidation: None,
+            _resource_permit: resource_permit,
         })
     }
 
@@ -9111,27 +13649,57 @@ impl NativeDatabase {
         if already_loaded {
             return Ok(());
         }
-        let root = batch
-            .snapshot
-            .roots()
-            .root(SLOT_STRUCTURE)
-            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let tree = BTree::from_root(root);
-        let collection_kinds = u8::from(self.hydrate_delta_hash(batch, key, tree)?)
-            + u8::from(self.hydrate_delta_set(batch, key, tree)?)
-            + u8::from(self.hydrate_delta_list(batch, key, tree)?)
-            + u8::from(self.hydrate_delta_sorted_set(batch, key, tree)?);
-        if collection_kinds > 1 {
-            return Err(NativeRuntimeError::InvalidStructureTree);
-        }
-        if let Some(encoded) =
-            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
-            && let Some(entry) = decode_structure_value(encoded.bytes(), &self.blobs)?
-        {
-            if collection_kinds != 0 {
-                return Err(NativeRuntimeError::InvalidStructureTree);
+        let Some(root) = batch.snapshot.roots().root(SLOT_STRUCTURE) else {
+            if root_set_is_pristine(batch.snapshot.roots()) {
+                batch
+                    .delta
+                    .as_mut()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                    .structure_scalars
+                    .insert(key.to_vec());
+                return Ok(());
             }
-            batch.state.structures.entries.insert(key.to_vec(), entry);
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        };
+        let tree = BTree::from_root(root);
+        match self.structure_format {
+            StructureFormat::BTreeV2 => {
+                let collection_kinds = u8::from(self.hydrate_delta_hash(batch, key, tree)?)
+                    + u8::from(self.hydrate_delta_set(batch, key, tree)?)
+                    + u8::from(self.hydrate_delta_list(batch, key, tree)?)
+                    + u8::from(self.hydrate_delta_stream(batch, key, tree)?)
+                    + u8::from(self.hydrate_delta_sorted_set(batch, key, tree)?);
+                if collection_kinds > 1 {
+                    return Err(NativeRuntimeError::InvalidStructureTree);
+                }
+                if let Some(encoded) =
+                    tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
+                    && let Some(entry) = decode_structure_value(encoded.bytes(), &self.blobs)?
+                {
+                    if collection_kinds != 0 {
+                        return Err(NativeRuntimeError::InvalidStructureTree);
+                    }
+                    batch.state.structures.entries.insert(key.to_vec(), entry);
+                }
+            }
+            StructureFormat::BTreeV3 => {
+                let hydrated = structure_v3::delta_scalar_state_latest_at_v3(
+                    &self.pages,
+                    &self.blobs,
+                    &self.buffer_pool,
+                    tree,
+                    key,
+                )?;
+                if let Some(entry) = hydrated.scalar {
+                    batch.state.structures.entries.insert(key.to_vec(), entry);
+                }
+                if let Some(collection) = hydrated.collection {
+                    Self::insert_delta_collection_state_v3(batch, key, collection);
+                }
+            }
+            StructureFormat::InlineStateV1 | StructureFormat::BTreeV1 => {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
         }
         batch
             .delta
@@ -9249,13 +13817,130 @@ impl NativeDatabase {
         else {
             return Ok(false);
         };
-        decode_sorted_set_metadata(encoded.bytes())?;
+        if is_structure_tombstone(encoded.bytes()) {
+            return Ok(false);
+        }
+        let (_, expiry) = decode_sorted_set_metadata_state(encoded.bytes())?;
         batch
             .state
             .structures
             .sorted_sets
             .insert(key.to_vec(), BTreeMap::new());
+        if let Some(expiry) = expiry {
+            batch
+                .state
+                .structures
+                .sorted_set_expiries
+                .insert(key.to_vec(), expiry);
+        }
         Ok(true)
+    }
+
+    fn hydrate_delta_stream(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        tree: BTree,
+    ) -> Result<bool, NativeRuntimeError> {
+        let Some(encoded) = tree.get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &structure_stream_meta_key(key)?,
+        )?
+        else {
+            return Ok(false);
+        };
+        if is_structure_tombstone(encoded.bytes()) {
+            return Ok(false);
+        }
+        let (_, expiry) = decode_stream_metadata(encoded.bytes())?;
+        batch
+            .state
+            .structures
+            .streams
+            .insert(key.to_vec(), BTreeMap::new());
+        if let Some(expiry) = expiry {
+            batch
+                .state
+                .structures
+                .stream_expiries
+                .insert(key.to_vec(), expiry);
+        }
+        Ok(true)
+    }
+
+    fn insert_delta_collection_state_v3(
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+        collection: structure_v3::CollectionStateV3,
+    ) {
+        let key = key.to_vec();
+        match collection {
+            structure_v3::CollectionStateV3::Hash {
+                expires_at_micros, ..
+            } => {
+                batch
+                    .state
+                    .structures
+                    .hashes
+                    .insert(key.clone(), BTreeMap::new());
+                if let Some(expiry) = expires_at_micros {
+                    batch.state.structures.hash_expiries.insert(key, expiry);
+                }
+            }
+            structure_v3::CollectionStateV3::Set {
+                expires_at_micros, ..
+            } => {
+                batch
+                    .state
+                    .structures
+                    .sets
+                    .insert(key.clone(), BTreeSet::new());
+                if let Some(expiry) = expires_at_micros {
+                    batch.state.structures.set_expiries.insert(key, expiry);
+                }
+            }
+            structure_v3::CollectionStateV3::List {
+                expires_at_micros, ..
+            } => {
+                batch
+                    .state
+                    .structures
+                    .lists
+                    .insert(key.clone(), VecDeque::new());
+                if let Some(expiry) = expires_at_micros {
+                    batch.state.structures.list_expiries.insert(key, expiry);
+                }
+            }
+            structure_v3::CollectionStateV3::SortedSet {
+                expires_at_micros, ..
+            } => {
+                batch
+                    .state
+                    .structures
+                    .sorted_sets
+                    .insert(key.clone(), BTreeMap::new());
+                if let Some(expiry) = expires_at_micros {
+                    batch
+                        .state
+                        .structures
+                        .sorted_set_expiries
+                        .insert(key, expiry);
+                }
+            }
+            structure_v3::CollectionStateV3::Stream {
+                expires_at_micros, ..
+            } => {
+                batch
+                    .state
+                    .structures
+                    .streams
+                    .insert(key.clone(), BTreeMap::new());
+                if let Some(expiry) = expires_at_micros {
+                    batch.state.structures.stream_expiries.insert(key, expiry);
+                }
+            }
+        }
     }
 
     /// Begins one serialized native write transaction.
@@ -9275,6 +13960,7 @@ impl NativeDatabase {
         let root_transaction = self.coordinator.begin_write()?;
         Ok(NativeTransaction {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
@@ -9550,6 +14236,7 @@ impl NativeDatabase {
         )?;
         let mut transaction = NativeTransaction {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.clone(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
@@ -9651,6 +14338,7 @@ impl NativeDatabase {
 
         let mut storage_receipt = GroupCommitStorage {
             pages: &mut self.pages,
+            buffer_pool: self.buffer_pool.as_ref(),
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             root_group,
@@ -9693,6 +14381,7 @@ impl NativeDatabase {
     /// Returns an error for page corruption, candidate divergence, filesystem
     /// publication, WAL synchronization, or MVCC publication failure.
     pub fn vacuum_pages(&mut self) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.vacuum_pages_at(None)
     }
 
@@ -9709,6 +14398,7 @@ impl NativeDatabase {
         &mut self,
         boundary: VacuumBoundary,
     ) -> Result<PageVacuumReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.vacuum_pages_at(Some(boundary))
     }
 
@@ -9756,8 +14446,7 @@ impl NativeDatabase {
         sync_page_generation_directory(&self.data_directory)?;
         interrupt_vacuum(interruption, VacuumBoundary::CandidatePublished)?;
         let replacement_pages = PageStore::open_generation(&candidate.final_path, next_generation)?;
-        let replacement_buffer =
-            BufferPool::new(DEFAULT_BUFFER_POOL_FRAMES, DEFAULT_BUFFER_POOL_PARTITIONS)?;
+        let replacement_buffer = default_buffer_pool()?;
         let transaction_id = TransactionId::new(self.next_transaction_id)
             .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
         let wal_receipt = append_vacuum_wal(
@@ -9842,6 +14531,7 @@ impl NativeDatabase {
     /// Returns an error before the first commit, on identity exhaustion, or
     /// for manifest/WAL publication and synchronization failures.
     pub fn checkpoint(&mut self) -> Result<CheckpointReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.checkpoint_at(None)
     }
 
@@ -9858,6 +14548,7 @@ impl NativeDatabase {
         &mut self,
         boundary: CheckpointBoundary,
     ) -> Result<CheckpointReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.checkpoint_at(Some(boundary))
     }
 
@@ -9937,6 +14628,7 @@ impl NativeDatabase {
     pub fn truncate_wal_at_retention_checkpoint(
         &mut self,
     ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.truncate_wal_at_retention_checkpoint_at(None)
     }
 
@@ -9954,6 +14646,7 @@ impl NativeDatabase {
         &mut self,
         boundary: WalRetentionBoundary,
     ) -> Result<WalRetentionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.truncate_wal_at_retention_checkpoint_at(Some(boundary))
     }
 
@@ -10215,6 +14908,7 @@ impl NativeDatabase {
     /// Returns an error for ineligible retained state, root/blob corruption,
     /// uncertain removal, or namespace synchronization failure.
     pub fn collect_blobs(&mut self) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.collect_blobs_at(None)
     }
 
@@ -10231,6 +14925,7 @@ impl NativeDatabase {
         &mut self,
         boundary: BlobCollectionBoundary,
     ) -> Result<BlobCollectionReceipt, NativeRuntimeError> {
+        let _permit = self.admit_administrative_owned()?;
         self.collect_blobs_at(Some(boundary))
     }
 
@@ -10566,6 +15261,7 @@ pub struct NativeWriteBatch {
     mode: NativeWriteBatchMode,
     delta: Option<DeltaOverlay>,
     ann_consolidation: Option<ann_store::ConsolidationPlan>,
+    _resource_permit: Option<OwnedGovernorPermit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10574,6 +15270,8 @@ enum NativeWriteBatchMode {
     PhysicalAllEngineDelta,
     PhysicalStructureExpiry,
     PhysicalStructureCompaction,
+    PhysicalStructureMigrationV3,
+    PhysicalStructureRetirementV3,
     PhysicalSearchCompaction,
     PhysicalAnnConsolidation,
 }
@@ -10594,11 +15292,12 @@ struct GroupCommitAdmission {
     outcomes: Vec<Option<GroupCommitOutcome>>,
     conflicts_after_commit: ConflictTable,
     next_transaction_id: u128,
-    initial_state: MaterializedState,
+    initial_state: Option<MaterializedState>,
 }
 
 struct GroupCommitStorage<'database, 'coordinator> {
     pages: &'database mut PageStore,
+    buffer_pool: &'database BufferPool,
     blobs: &'database mut BlobStore,
     wal: &'database mut WalFile,
     root_group: RootGroupTransaction<'coordinator>,
@@ -10617,7 +15316,7 @@ impl GroupCommitStorage<'_, '_> {
     fn commit(
         mut self,
         accepted: Vec<AdmittedGroupCommit>,
-        mut physical_state: MaterializedState,
+        mut physical_state: Option<MaterializedState>,
         interruption: Option<GroupCommitBoundary>,
     ) -> Result<GroupCommitStorageReceipt, NativeRuntimeError> {
         let cohort_size = accepted.len();
@@ -10653,7 +15352,7 @@ impl GroupCommitStorage<'_, '_> {
     fn stage_one(
         &mut self,
         admitted: AdmittedGroupCommit,
-        physical_state: &mut MaterializedState,
+        physical_state: &mut Option<MaterializedState>,
         cohort_size: usize,
         cohort_position: usize,
     ) -> Result<(usize, CommitReceipt), NativeRuntimeError> {
@@ -10668,11 +15367,17 @@ impl GroupCommitStorage<'_, '_> {
         if self.root_group.next_commit_csn()? != commit_csn {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        apply_mutations_to_state(physical_state, &batch.mutations)?;
+        if let Some(state) = physical_state.as_mut() {
+            apply_mutations_to_state(state, &batch.mutations)?;
+        }
         batch.snapshot = self
             .root_group
             .base_snapshot(batch.snapshot.logical_time_micros);
-        batch.state = std::mem::take(physical_state);
+        if batch.mode == NativeWriteBatchMode::Materialized {
+            batch.state = physical_state
+                .take()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        }
 
         let roots = roots_from_snapshot(self.root_group.base_roots());
         let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
@@ -10681,16 +15386,20 @@ impl GroupCommitStorage<'_, '_> {
         let blob_generation = self.blobs.generation()?;
         let roots = commit_engine_roots(
             self.pages,
+            self.buffer_pool,
             self.blobs,
             roots,
             self.relational_format,
             self.structure_format,
             self.search_format,
+            transaction_id,
             commit_csn,
             &batch,
             &blob_references,
         )?;
-        *physical_state = std::mem::take(&mut batch.state);
+        if batch.mode == NativeWriteBatchMode::Materialized {
+            *physical_state = Some(std::mem::take(&mut batch.state));
+        }
 
         let concrete_roots = require_roots(roots)?;
         let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
@@ -10753,6 +15462,7 @@ impl GroupCommitStorage<'_, '_> {
 #[derive(Debug)]
 pub struct NativeTransaction<'database> {
     pages: &'database mut PageStore,
+    buffer_pool: Arc<BufferPool>,
     blobs: &'database mut BlobStore,
     wal: &'database mut WalFile,
     conflicts: &'database mut ConflictTable,
@@ -11114,20 +15824,7 @@ impl NativeWriteBatch {
     ) -> Result<SetOutcome, NativeRuntimeError> {
         let key = key.into();
         let value = value.into();
-        if self
-            .state
-            .structures
-            .hash_is_visible(&key, self.snapshot.logical_time_micros)
-            || self
-                .state
-                .structures
-                .set_is_visible(&key, self.snapshot.logical_time_micros)
-            || self
-                .state
-                .structures
-                .list_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.sorted_sets.contains_key(&key)
-        {
+        if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let exists = self
@@ -11146,7 +15843,9 @@ impl NativeWriteBatch {
         self.retire_expired_hash_for_reuse(&key);
         self.retire_expired_set_for_reuse(&key);
         self.retire_expired_list_for_reuse(&key);
-        if self.structure_format.has_expiry_index()
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
+        if self.structure_format.uses_ordered_expiry_index()
             && let Some(expiry) = expires_at_micros
         {
             let _identity = structure_expiry_key(expiry, &key)?;
@@ -11179,14 +15878,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
         let key = key.into();
-        if self
-            .state
-            .structures
-            .hash_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.sets.contains_key(&key)
-            || self.state.structures.lists.contains_key(&key)
-            || self.state.structures.sorted_sets.contains_key(&key)
-        {
+        if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         if self
@@ -11216,14 +15908,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
         let key = key.into();
-        if self
-            .state
-            .structures
-            .hash_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.sets.contains_key(&key)
-            || self.state.structures.lists.contains_key(&key)
-            || self.state.structures.sorted_sets.contains_key(&key)
-        {
+        if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let is_due = self
@@ -11316,10 +16001,82 @@ impl NativeWriteBatch {
         true
     }
 
+    fn retire_expired_stream_for_reuse(&mut self, key: &[u8]) -> bool {
+        let is_due = self.state.structures.streams.contains_key(key)
+            && self
+                .state
+                .structures
+                .stream_expiries
+                .get(key)
+                .is_some_and(|expiry| *expiry <= self.snapshot.logical_time_micros);
+        if !is_due {
+            return false;
+        }
+        let removed = self.state.structures.delete_stream(key);
+        debug_assert!(removed.is_some());
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteStream,
+            target: None,
+            key: key.to_vec(),
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        true
+    }
+
+    fn retire_expired_sorted_set_for_reuse(&mut self, key: &[u8]) -> bool {
+        let is_due = self.state.structures.sorted_sets.contains_key(key)
+            && self
+                .state
+                .structures
+                .sorted_set_expiries
+                .get(key)
+                .is_some_and(|expiry| *expiry <= self.snapshot.logical_time_micros);
+        if !is_due {
+            return false;
+        }
+        let removed = self.state.structures.delete_sorted_set(key);
+        debug_assert!(removed.is_some());
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSet,
+            target: None,
+            key: key.to_vec(),
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        true
+    }
+
     fn private_hash_is_visible(&self, key: &[u8]) -> bool {
         self.state
             .structures
             .hash_is_visible(key, self.snapshot.logical_time_micros)
+    }
+
+    fn private_collection_is_visible(&self, key: &[u8]) -> bool {
+        self.state
+            .structures
+            .hash_is_visible(key, self.snapshot.logical_time_micros)
+            || self
+                .state
+                .structures
+                .set_is_visible(key, self.snapshot.logical_time_micros)
+            || self
+                .state
+                .structures
+                .list_is_visible(key, self.snapshot.logical_time_micros)
+            || self
+                .state
+                .structures
+                .stream_is_visible(key, self.snapshot.logical_time_micros)
+            || self
+                .state
+                .structures
+                .sorted_set_is_visible(key, self.snapshot.logical_time_micros)
     }
 
     fn require_private_hash(&self, key: &[u8]) -> Result<(), NativeRuntimeError> {
@@ -11368,14 +16125,7 @@ impl NativeWriteBatch {
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
         let key = key.into();
-        if self
-            .state
-            .structures
-            .hash_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.sets.contains_key(&key)
-            || self.state.structures.lists.contains_key(&key)
-            || self.state.structures.sorted_sets.contains_key(&key)
-        {
+        if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let Some(value) = self
@@ -11386,7 +16136,7 @@ impl NativeWriteBatch {
         else {
             return Ok(false);
         };
-        if self.structure_format.has_expiry_index() {
+        if self.structure_format.uses_ordered_expiry_index() {
             let _identity = structure_expiry_key(expires_at_micros, &key)?;
         }
         self.state
@@ -11421,17 +16171,7 @@ impl NativeWriteBatch {
         delta: i64,
     ) -> Result<i64, NativeRuntimeError> {
         let key = key.into();
-        if self.private_hash_is_visible(&key)
-            || self
-                .state
-                .structures
-                .set_is_visible(&key, self.snapshot.logical_time_micros)
-            || self
-                .state
-                .structures
-                .list_is_visible(&key, self.snapshot.logical_time_micros)
-            || self.state.structures.sorted_sets.contains_key(&key)
-        {
+        if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
         }
         let existing = self
@@ -11523,13 +16263,18 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing scalar/hash key.
     pub fn create_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
         self.retire_expired_hash_for_reuse(&key);
         self.retire_expired_set_for_reuse(&key);
         self.retire_expired_list_for_reuse(&key);
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
         if !self.state.structures.create_hash(key.clone()) {
             return Err(NativeRuntimeError::StructureKeyExists);
         }
@@ -11558,7 +16303,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11610,7 +16358,10 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11659,7 +16410,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11702,7 +16453,10 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<HashSetOutcome, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11763,7 +16517,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         updates: Vec<HashFieldUpdate>,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11809,7 +16566,10 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         delta: i64,
     ) -> Result<i64, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11892,7 +16652,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         field: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -11954,7 +16717,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         fields: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12122,13 +16888,18 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
         self.retire_expired_hash_for_reuse(&key);
         self.retire_expired_set_for_reuse(&key);
         self.retire_expired_list_for_reuse(&key);
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
         if !self.state.structures.create_set(key.clone()) {
             return Err(NativeRuntimeError::StructureKeyExists);
         }
@@ -12157,7 +16928,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12204,7 +16978,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_set(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12249,7 +17023,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12296,7 +17073,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         members: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12393,7 +17173,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12440,7 +17223,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         members: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12548,7 +17334,10 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_list(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12556,6 +17345,8 @@ impl NativeWriteBatch {
         self.retire_expired_hash_for_reuse(&key);
         self.retire_expired_set_for_reuse(&key);
         self.retire_expired_list_for_reuse(&key);
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
         if !self.state.structures.create_list(key.clone()) {
             return Err(NativeRuntimeError::StructureKeyExists);
         }
@@ -12584,7 +17375,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12635,7 +17429,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_list(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12700,7 +17494,10 @@ impl NativeWriteBatch {
         value: Vec<u8>,
         opcode: Opcode,
     ) -> Result<usize, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         structure_list_meta_key(&key)?;
@@ -12760,7 +17557,10 @@ impl NativeWriteBatch {
         key: Vec<u8>,
         opcode: Opcode,
     ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         structure_list_meta_key(&key)?;
@@ -12848,11 +17648,19 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage, an oversized key, or an existing key.
     pub fn create_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
         u32::try_from(key.len()).map_err(|_| NativeRuntimeError::StructureIdentityTooLarge)?;
+        self.retire_expired_hash_for_reuse(&key);
+        self.retire_expired_set_for_reuse(&key);
+        self.retire_expired_list_for_reuse(&key);
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
         if self.state.structures.create_stream(key.clone()).is_err() {
             return Err(NativeRuntimeError::StructureKeyExists);
         }
@@ -12925,7 +17733,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12950,7 +17761,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage.
     pub fn delete_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12976,7 +17787,10 @@ impl NativeWriteBatch {
     /// Returns an error for legacy storage, an oversized key, or an existing
     /// structure key.
     pub fn create_sorted_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -12984,6 +17798,8 @@ impl NativeWriteBatch {
         self.retire_expired_hash_for_reuse(&key);
         self.retire_expired_set_for_reuse(&key);
         self.retire_expired_list_for_reuse(&key);
+        self.retire_expired_stream_for_reuse(&key);
+        self.retire_expired_sorted_set_for_reuse(&key);
         if !self.state.structures.create_sorted_set(key.clone()) {
             return Err(NativeRuntimeError::StructureKeyExists);
         }
@@ -13003,15 +17819,24 @@ impl NativeWriteBatch {
     ///
     /// # Errors
     ///
-    /// This infallible admission surface retains `Result` for family symmetry.
-    #[allow(clippy::unnecessary_wraps)]
+    /// Returns an error for legacy storage.
     pub fn expire_sorted_set(
         &mut self,
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
         let key = key.into();
-        if !self.state.structures.sorted_sets.contains_key(&key) {
+        if !self.state.structures.expire_sorted_set(
+            &key,
+            expires_at_micros,
+            self.snapshot.logical_time_micros,
+        ) {
             return Ok(false);
         }
         self.mutations.push(Mutation {
@@ -13035,7 +17860,7 @@ impl NativeWriteBatch {
         &mut self,
         key: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -13066,7 +17891,10 @@ impl NativeWriteBatch {
         score: f64,
         member: impl Into<Vec<u8>>,
     ) -> Result<ZAddOutcome, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -13135,7 +17963,10 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
-        if !self.structure_format.is_btree() {
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
         let key = key.into();
@@ -13545,6 +18376,24 @@ impl NativeWriteBatch {
         index: ObjectId,
         vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.upsert_vectors_with_progress(index, vectors, |_| {})
+    }
+
+    /// Inserts one duplicate-free vector batch and observes an initial graph build.
+    ///
+    /// Progress is emitted only when the vector index was created by this
+    /// transaction and therefore requires a complete canonical base generation.
+    /// Incremental batches use the bounded delta path and emit no build progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::upsert_vectors`].
+    pub fn upsert_vectors_with_progress(
+        &mut self,
+        index: ObjectId,
+        vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
+        progress: impl FnMut(HnswBuildProgress),
+    ) -> Result<usize, NativeRuntimeError> {
         let vectors = vectors.into_iter().collect::<Vec<_>>();
         if vectors.is_empty() {
             return Ok(0);
@@ -13560,10 +18409,11 @@ impl NativeWriteBatch {
             mutation.opcode == Opcode::CreateAnnIndex && mutation.target == Some(index)
         });
         if initializes_index {
-            self.state.ann.upsert_initial_many(
+            self.state.ann.upsert_initial_many_with_progress(
                 index,
                 ann_store::private_mutation_csn()?,
                 &vectors,
+                progress,
             )?;
         } else {
             self.state
@@ -13839,6 +18689,7 @@ impl NativeTransaction<'_> {
         if self.batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
         }
+        reject_unsupported_v3_structure_mutations(self.structure_format, &self.batch)?;
         let commit_csn = self.root_transaction.commit_csn()?;
         let write_keys = self.validated_write_keys()?;
         let catalog_version = self.commit_catalog_version()?;
@@ -13852,9 +18703,11 @@ impl NativeTransaction<'_> {
             self.blobs,
             PageCommitInput {
                 roots,
+                buffer_pool: &self.buffer_pool,
                 relational_format: self.relational_format,
                 structure_format: self.structure_format,
                 search_format: self.search_format,
+                transaction_id: self.transaction_id,
                 commit_csn,
                 batch: &batch,
                 staged_blobs,
@@ -13948,11 +18801,13 @@ fn commit_pages_and_blobs(
     interrupt(input.interruption, CommitBoundary::BlobPromoted)?;
     let roots = commit_engine_roots(
         pages,
+        input.buffer_pool,
         blobs,
         input.roots,
         input.relational_format,
         input.structure_format,
         input.search_format,
+        input.transaction_id,
         input.commit_csn,
         input.batch,
         &blob_references,
@@ -13979,6 +18834,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.streams.contains_key(&mutation.key)
                 || state.sorted_sets.contains_key(&mutation.key)
             {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -13996,6 +18852,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.streams.contains_key(&mutation.key)
                 || state.sorted_sets.contains_key(&mutation.key)
                 || state.delete(&mutation.key).is_none()
             {
@@ -14008,6 +18865,7 @@ fn apply_structure_mutation(
                 || state.hashes.contains_key(&mutation.key)
                 || state.sets.contains_key(&mutation.key)
                 || state.lists.contains_key(&mutation.key)
+                || state.streams.contains_key(&mutation.key)
                 || state.sorted_sets.contains_key(&mutation.key)
                 || !state.entries.contains_key(&mutation.key)
             {
@@ -14218,6 +19076,26 @@ fn decode_stream_wal_entry(
     Ok((id, fields))
 }
 
+fn decode_stream_metadata(encoded: &[u8]) -> Result<(u64, Option<i64>), NativeRuntimeError> {
+    let last = u64::from_be_bytes(
+        encoded
+            .get(..8)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+    );
+    let expiry = match encoded.len() {
+        8 => None,
+        16 => Some(i64::from_be_bytes(
+            encoded[8..16]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        )),
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    Ok((last, expiry))
+}
+
 fn decode_stream_wal_bytes(
     encoded: &[u8],
     offset: &mut usize,
@@ -14264,7 +19142,14 @@ fn apply_sorted_set_mutation(
             if !mutation.value.is_empty() || mutation.expires_at_micros.is_none() {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
-            return Ok(());
+            if !state.set_sorted_set_expiry(
+                &mutation.key,
+                mutation
+                    .expires_at_micros
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+            ) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
         }
         Opcode::DeleteSortedSet => {
             if !mutation.value.is_empty() || state.delete_sorted_set(&mutation.key).is_none() {
@@ -14465,6 +19350,8 @@ fn apply_mutations_to_state(
                 apply_structure_mutation(&mut state.structures, mutation)?;
             }
             Opcode::CompactStructure
+            | Opcode::MigrateStructureV3
+            | Opcode::CleanupStructureRetirementV3
             | Opcode::VacuumPageGeneration
             | Opcode::CompactSearch
             | Opcode::ConsolidateAnn => {
@@ -14617,22 +19504,48 @@ fn apply_search_mutation_to_state(
 
 fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntimeError> {
     let expected_engine = match mutation.opcode {
-        Opcode::CompactStructure => EngineKind::Structure,
+        Opcode::CompactStructure
+        | Opcode::MigrateStructureV3
+        | Opcode::CleanupStructureRetirementV3 => EngineKind::Structure,
         Opcode::VacuumPageGeneration => EngineKind::Kernel,
         Opcode::CompactSearch | Opcode::ConsolidateAnn => EngineKind::Search,
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     };
-    if mutation.engine != expected_engine
-        || (mutation.opcode != Opcode::ConsolidateAnn && mutation.target.is_some())
-        || !mutation.key.is_empty()
-        || (mutation.opcode != Opcode::ConsolidateAnn && !mutation.value.is_empty())
-        || (mutation.opcode == Opcode::ConsolidateAnn
-            && (mutation.target.is_none() || mutation.value.len() != 112))
-        || mutation.expires_at_micros.is_some()
-    {
+    if mutation.engine != expected_engine || mutation.expires_at_micros.is_some() {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
-    Ok(())
+    match mutation.opcode {
+        Opcode::CleanupStructureRetirementV3 => {
+            let encoded_budget: [u8; 4] = mutation
+                .value
+                .as_slice()
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+            let entry_budget = u32::from_le_bytes(encoded_budget);
+            if mutation.target.is_some()
+                || structure_v3::decode_retirement_key(&mutation.key).is_err()
+                || !(2..=u32::try_from(structure_v3::MAX_STRUCTURE_RETIREMENT_STEP_ENTRIES)
+                    .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?)
+                    .contains(&entry_budget)
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Ok(())
+        }
+        Opcode::ConsolidateAnn => {
+            if mutation.target.is_none() || !mutation.key.is_empty() || mutation.value.len() != 112
+            {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Ok(())
+        }
+        _ => {
+            if mutation.target.is_some() || !mutation.key.is_empty() || !mutation.value.is_empty() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14857,6 +19770,13 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
                 identity
             }
             Opcode::CompactStructure => vec![5],
+            Opcode::MigrateStructureV3 => vec![8],
+            Opcode::CleanupStructureRetirementV3 => {
+                let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
+                identity.push(9);
+                identity.extend_from_slice(&mutation.key);
+                identity
+            }
             Opcode::CompactSearch => vec![6],
             Opcode::ConsolidateAnn => vec![7],
             _ => mutation.key.clone(),
@@ -14978,7 +19898,12 @@ impl GroupCommitAdmissionContext<'_, '_> {
             structure_format,
             search_format,
         } = self;
-        let initial_state = load_state(pages, blobs, root_group.base_roots())?;
+        let needs_materialized_state = batches
+            .iter()
+            .any(|batch| batch.mode == NativeWriteBatchMode::Materialized);
+        let initial_state = needs_materialized_state
+            .then(|| load_state(pages, blobs, root_group.base_roots()))
+            .transpose()?;
         let mut admission_state = initial_state.clone();
         let mut catalog_version = root_group.base_roots().catalog_version();
         let mut conflicts_after_commit = conflicts.clone();
@@ -15005,7 +19930,9 @@ impl GroupCommitAdmissionContext<'_, '_> {
             };
 
             let mut candidate_state = admission_state.clone();
-            if let Err(error) = apply_mutations_to_state(&mut candidate_state, &batch.mutations) {
+            if let Some(state) = candidate_state.as_mut()
+                && let Err(error) = apply_mutations_to_state(state, &batch.mutations)
+            {
                 outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
                 continue;
             }
@@ -15060,11 +19987,22 @@ fn group_admission_rejection(
     if batch.durability != DurabilityClass::Group {
         return Err(NativeRuntimeError::GroupCommitRequiresGroupDurability);
     }
-    if batch.mode != NativeWriteBatchMode::Materialized
-        || batch.structure_format != structure_format
+    if !matches!(
+        batch.mode,
+        NativeWriteBatchMode::Materialized | NativeWriteBatchMode::PhysicalAllEngineDelta
+    ) || batch.structure_format != structure_format
         || batch.search_format != search_format
     {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    reject_unsupported_v3_structure_mutations(structure_format, batch)?;
+    if batch.mode == NativeWriteBatchMode::PhysicalAllEngineDelta {
+        validate_delta_write_batch_shape(
+            batch,
+            &roots_from_snapshot(root_group.base_roots()),
+            structure_format,
+            search_format,
+        )?;
     }
     if batch.mutations.is_empty() {
         return Err(WalSemanticError::InvalidSequence.into());
@@ -15079,8 +20017,8 @@ fn group_admission_rejection(
             retention_floor_csn,
         });
     }
-    let write_keys = mutation_write_keys(&batch.mutations);
-    let validation_keys = mutation_validation_keys(&batch.mutations);
+    let write_keys = write_batch_write_keys(batch);
+    let validation_keys = write_batch_validation_keys(batch);
     conflicts.validate(batch.snapshot.visible_csn, &validation_keys)?;
     Ok(write_keys)
 }
@@ -15426,11 +20364,13 @@ fn validate_checkpoints(
 #[allow(clippy::too_many_arguments)]
 fn commit_engine_roots(
     pages: &mut PageStore,
+    buffer_pool: &BufferPool,
     blobs: &BlobStore,
     mut roots: [Option<PageId>; 4],
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    transaction_id: TransactionId,
     commit_csn: Csn,
     batch: &NativeWriteBatch,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -15468,8 +20408,10 @@ fn commit_engine_roots(
             commit_csn,
             &StructureMutationContext {
                 blobs,
+                buffer_pool,
                 format: structure_format,
                 mode: batch.mode,
+                transaction_id,
                 logical_time_micros: batch.snapshot.logical_time_micros,
                 state: &batch.state.structures,
                 mutations: &batch.mutations,
@@ -16167,7 +21109,7 @@ fn rebuild_page_generation(
             PageKind::StructureNode,
             vacuum_csn,
         )?,
-        StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => {
+        StructureFormat::BTreeV1 | StructureFormat::BTreeV2 | StructureFormat::BTreeV3 => {
             rebuild_btree_root(source, candidate, source_roots[2], vacuum_csn)?
         }
     };
@@ -16279,6 +21221,7 @@ fn validate_write_batch_shape(
     structure_format: StructureFormat,
     search_format: SearchFormat,
 ) -> Result<(), NativeRuntimeError> {
+    reject_unsupported_v3_structure_mutations(structure_format, batch)?;
     match batch.mode {
         NativeWriteBatchMode::Materialized => Ok(()),
         NativeWriteBatchMode::PhysicalAllEngineDelta => {
@@ -16295,6 +21238,12 @@ fn validate_write_batch_shape(
             EngineKind::Structure,
             Opcode::CompactStructure,
         ),
+        NativeWriteBatchMode::PhysicalStructureMigrationV3 => {
+            validate_physical_structure_v3_migration(batch, roots, structure_format, search_format)
+        }
+        NativeWriteBatchMode::PhysicalStructureRetirementV3 => {
+            validate_physical_structure_v3_retirement(batch, roots, structure_format, search_format)
+        }
         NativeWriteBatchMode::PhysicalSearchCompaction => validate_physical_compaction(
             batch,
             roots,
@@ -16306,6 +21255,161 @@ fn validate_write_batch_shape(
         NativeWriteBatchMode::PhysicalAnnConsolidation => {
             validate_physical_ann_consolidation(batch, roots, structure_format, search_format)
         }
+    }
+}
+
+fn validate_physical_structure_v3_migration(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_mutation = matches!(batch.mutations.as_slice(), [mutation]
+        if mutation.engine == EngineKind::Structure
+            && mutation.opcode == Opcode::MigrateStructureV3
+            && mutation.target.is_none()
+            && mutation.key.is_empty()
+            && mutation.value.is_empty()
+            && mutation.expires_at_micros.is_none());
+    if roots.iter().all(Option::is_some)
+        && matches!(
+            structure_format,
+            StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+        )
+        && batch.structure_format == structure_format
+        && batch.search_format == search_format
+        && batch.state == MaterializedState::default()
+        && batch.dirty == [false, false, true, false]
+        && batch.delta.is_none()
+        && batch.ann_consolidation.is_none()
+        && valid_mutation
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
+    }
+}
+
+fn validate_physical_structure_v3_retirement(
+    batch: &NativeWriteBatch,
+    roots: &[Option<PageId>; 4],
+    structure_format: StructureFormat,
+    search_format: SearchFormat,
+) -> Result<(), NativeRuntimeError> {
+    let valid_mutation = matches!(batch.mutations.as_slice(), [mutation]
+        if validate_maintenance_mutation(mutation).is_ok()
+            && mutation.opcode == Opcode::CleanupStructureRetirementV3);
+    if roots.iter().all(Option::is_some)
+        && structure_format == StructureFormat::BTreeV3
+        && batch.structure_format == StructureFormat::BTreeV3
+        && batch.search_format == search_format
+        && batch.state == MaterializedState::default()
+        && batch.dirty == [false, false, true, false]
+        && batch.delta.is_none()
+        && batch.ann_consolidation.is_none()
+        && valid_mutation
+    {
+        Ok(())
+    } else {
+        Err(NativeRuntimeError::InvalidPreparedMutation)
+    }
+}
+
+fn reject_unsupported_v3_structure_mutations(
+    structure_format: StructureFormat,
+    batch: &NativeWriteBatch,
+) -> Result<(), NativeRuntimeError> {
+    if structure_format == StructureFormat::BTreeV3
+        && batch.mode != NativeWriteBatchMode::PhysicalStructureCompaction
+        && batch.mode != NativeWriteBatchMode::PhysicalStructureExpiry
+        && batch.mode != NativeWriteBatchMode::PhysicalStructureRetirementV3
+        && !is_materialized_v3_structure_write_batch(batch)
+        && !is_delta_v3_structure_write_batch(batch)
+        && (batch.dirty[2]
+            || batch
+                .mutations
+                .iter()
+                .any(|mutation| mutation.engine == EngineKind::Structure))
+    {
+        Err(NativeRuntimeError::StructureV3MutationUnsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn is_delta_v3_structure_write_batch(batch: &NativeWriteBatch) -> bool {
+    batch.mode == NativeWriteBatchMode::PhysicalAllEngineDelta
+        && batch.structure_format == StructureFormat::BTreeV3
+        && batch
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.engine == EngineKind::Structure)
+            .all(is_supported_v3_structure_mutation)
+}
+
+fn is_materialized_v3_structure_write_batch(batch: &NativeWriteBatch) -> bool {
+    batch.mode == NativeWriteBatchMode::Materialized
+        && batch.dirty[2]
+        && batch
+            .mutations
+            .iter()
+            .any(|mutation| mutation.engine == EngineKind::Structure)
+        && batch
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.engine == EngineKind::Structure)
+            .all(is_supported_v3_structure_mutation)
+}
+
+fn is_supported_v3_structure_mutation(mutation: &Mutation) -> bool {
+    if mutation.target.is_some() {
+        return false;
+    }
+    match mutation.opcode {
+        Opcode::SetValue => return true,
+        Opcode::ExpireValue => return mutation.expires_at_micros.is_some(),
+        Opcode::DeleteValue => {
+            return mutation.value.is_empty() && mutation.expires_at_micros.is_none();
+        }
+        _ => {}
+    }
+    if matches!(
+        mutation.opcode,
+        Opcode::ExpireHash
+            | Opcode::ExpireHashField
+            | Opcode::ExpireSet
+            | Opcode::ExpireList
+            | Opcode::ExpireStream
+            | Opcode::ExpireSortedSet
+    ) {
+        return mutation.value.is_empty() && mutation.expires_at_micros.is_some();
+    }
+    if mutation.expires_at_micros.is_some() {
+        return false;
+    }
+    match mutation.opcode {
+        Opcode::CreateHash
+        | Opcode::DeleteHash
+        | Opcode::CreateSet
+        | Opcode::DeleteSet
+        | Opcode::CreateList
+        | Opcode::DeleteList
+        | Opcode::CreateStream
+        | Opcode::DeleteStream
+        | Opcode::CreateSortedSet
+        | Opcode::DeleteSortedSet
+        | Opcode::AddSetMember
+        | Opcode::DeleteHashField
+        | Opcode::DeleteSetMember
+        | Opcode::DeleteSortedSetMember => mutation.value.is_empty(),
+        Opcode::SetHashField
+        | Opcode::PushListHead
+        | Opcode::PushListTail
+        | Opcode::PopListHead
+        | Opcode::PopListTail => true,
+        Opcode::AppendStreamEntry => decode_stream_wal_entry(&mutation.value).is_ok(),
+        Opcode::UpsertSortedSetMember => decode_sorted_set_wal_score(&mutation.value).is_ok(),
+        _ => false,
     }
 }
 
@@ -16333,8 +21437,11 @@ fn validate_physical_structure_expiry(
                 && mutation.expires_at_micros.is_none()
         });
     if roots.iter().all(Option::is_some)
-        && structure_format == StructureFormat::BTreeV2
-        && batch.structure_format == StructureFormat::BTreeV2
+        && matches!(
+            structure_format,
+            StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+        )
+        && batch.structure_format == structure_format
         && batch.search_format == search_format
         && batch.state == MaterializedState::default()
         && batch.dirty == [false, false, true, false]
@@ -16355,8 +21462,10 @@ fn validate_physical_compaction(
     opcode: Opcode,
 ) -> Result<(), NativeRuntimeError> {
     let valid_formats = if engine == EngineKind::Structure {
-        structure_format == StructureFormat::BTreeV2
-            && batch.structure_format == StructureFormat::BTreeV2
+        matches!(
+            structure_format,
+            StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+        ) && batch.structure_format == structure_format
             && batch.search_format == search_format
     } else {
         search_format == SearchFormat::InvertedBTreeV1
@@ -16426,9 +21535,12 @@ fn validate_delta_write_batch_shape(
     structure_format: StructureFormat,
     search_format: SearchFormat,
 ) -> Result<(), NativeRuntimeError> {
-    let valid_roots = roots.iter().all(Option::is_some);
-    let valid_formats = structure_format == StructureFormat::BTreeV2
-        && batch.structure_format == StructureFormat::BTreeV2
+    let valid_roots = roots.iter().all(Option::is_some)
+        || (batch.snapshot.visible_csn.is_none() && roots.iter().all(Option::is_none));
+    let valid_formats = matches!(
+        structure_format,
+        StructureFormat::BTreeV2 | StructureFormat::BTreeV3
+    ) && batch.structure_format == structure_format
         && search_format == SearchFormat::InvertedBTreeV1
         && batch.search_format == SearchFormat::InvertedBTreeV1;
     let Some(delta) = batch.delta.as_ref() else {
@@ -16460,6 +21572,7 @@ fn validate_delta_write_batch_shape(
                             Opcode::DeleteHash
                             | Opcode::DeleteSet
                             | Opcode::DeleteList
+                            | Opcode::DeleteStream
                             | Opcode::DeleteSortedSet => {
                                 mutation.value.is_empty() && mutation.expires_at_micros.is_none()
                             }
@@ -16494,6 +21607,7 @@ fn validate_delta_write_batch_shape(
         && batch.dirty == expected_dirty
         && !batch.dirty[0]
         && batch.state.ann == ann_store::AnnState::default()
+        && batch.ann_consolidation.is_none()
     {
         Ok(())
     } else {
@@ -16701,6 +21815,12 @@ struct StructureCompactionPlan {
     dropped_tombstones: usize,
 }
 
+struct StructureCompactionObservation {
+    scanned_entries: usize,
+    retained_entries: usize,
+    dropped_tombstones: usize,
+}
+
 fn plan_structure_compaction(
     pages: &PageStore,
     blobs: &BlobStore,
@@ -16728,6 +21848,36 @@ fn plan_structure_compaction(
     })
 }
 
+fn observe_structure_compaction(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+    format: StructureFormat,
+) -> Result<StructureCompactionObservation, NativeRuntimeError> {
+    match format {
+        StructureFormat::BTreeV2 => {
+            let plan = plan_structure_compaction(pages, blobs, root)?;
+            Ok(StructureCompactionObservation {
+                scanned_entries: plan.scanned_entries,
+                retained_entries: plan.retained_entries.len(),
+                dropped_tombstones: plan.dropped_tombstones,
+            })
+        }
+        StructureFormat::BTreeV3 => {
+            let plan =
+                structure_v3::plan_structure_v3_compaction(pages, blobs, BTree::from_root(root))?;
+            Ok(StructureCompactionObservation {
+                scanned_entries: plan.scanned_entries,
+                retained_entries: plan.retained_entries,
+                dropped_tombstones: plan.dropped_tombstones,
+            })
+        }
+        StructureFormat::InlineStateV1 | StructureFormat::BTreeV1 => {
+            Err(NativeRuntimeError::StructureCompactionUnsupported)
+        }
+    }
+}
+
 fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, NativeRuntimeError> {
     if key == STRUCTURE_FORMAT_KEY {
         return Ok(false);
@@ -16739,7 +21889,8 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
             | STRUCTURE_SET_MEMBER_PREFIX
             | STRUCTURE_LIST_CHUNK_PREFIX
             | STRUCTURE_SORTED_SET_MEMBER_PREFIX
-            | STRUCTURE_SORTED_SET_ORDER_PREFIX,
+            | STRUCTURE_SORTED_SET_ORDER_PREFIX
+            | STRUCTURE_STREAM_ENTRY_PREFIX,
         ) => Ok(is_structure_tombstone(value)),
         Some(STRUCTURE_EXPIRY_PREFIX) => match value {
             [STRUCTURE_EXPIRY_TOMBSTONE] => Ok(true),
@@ -16778,6 +21929,13 @@ fn compactable_structure_tombstone(key: &[u8], value: &[u8]) -> Result<bool, Nat
                 Ok(true)
             } else {
                 decode_set_metadata_state(value).map(|_| false)
+            }
+        }
+        Some(STRUCTURE_STREAM_META_PREFIX) => {
+            if is_structure_tombstone(value) {
+                Ok(true)
+            } else {
+                decode_stream_metadata(value).map(|_| false)
             }
         }
         _ => Err(NativeRuntimeError::InvalidStructureTree),
@@ -17054,6 +22212,35 @@ fn canonical_sorted_set_score_bounds(
         canonical_sorted_set_score_bound(lower)?,
         canonical_sorted_set_score_bound(upper)?,
     ))
+}
+
+fn sorted_set_score_physical_bounds(
+    key: &[u8],
+    lower: Bound<SortedSetScore>,
+    upper: Bound<SortedSetScore>,
+) -> Result<NativePhysicalKeyRange, NativeRuntimeError> {
+    let prefix = structure_sorted_set_order_prefix(key)?;
+    let lower = match lower {
+        Bound::Included(score) => Bound::Included(structure_sorted_set_score_prefix(key, score)?),
+        Bound::Excluded(score) => Bound::Included(
+            byte_prefix_successor(&structure_sorted_set_score_prefix(key, score)?)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        ),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let upper = match upper {
+        Bound::Included(score) => Bound::Excluded(
+            byte_prefix_successor(&structure_sorted_set_score_prefix(key, score)?)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        ),
+        Bound::Excluded(score) => Bound::Excluded(structure_sorted_set_score_prefix(key, score)?),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    Ok(NativePhysicalKeyRange {
+        prefix,
+        lower,
+        upper,
+    })
 }
 
 fn sorted_set_rank_range_from_state(
@@ -17659,6 +22846,135 @@ fn decode_hash_scan_entry(
     ))
 }
 
+fn decode_hash_segment(
+    physical_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    expected_hash: &[u8],
+    blobs: &BlobStore,
+    logical_time_micros: i64,
+) -> Result<HashSegmentBatch, NativeRuntimeError> {
+    let mut physical_live = 0_usize;
+    let mut entries = Vec::new();
+    for (physical_key, encoded) in physical_entries {
+        let (live, entry) = decode_hash_scan_entry(
+            &physical_key,
+            &encoded,
+            expected_hash,
+            blobs,
+            logical_time_micros,
+        )?;
+        physical_live = physical_live
+            .checked_add(usize::from(live))
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if let Some(entry) = entry {
+            entries.push(entry);
+        }
+    }
+    Ok(HashSegmentBatch {
+        physical_live,
+        entries,
+    })
+}
+
+fn finalize_hash_segment_batches(
+    batches: Vec<HashSegmentBatch>,
+    declared_field_count: usize,
+    verify_complete: bool,
+    limit: usize,
+) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+    let physical_live = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.physical_live)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)
+    })?;
+    if physical_live > declared_field_count
+        || (verify_complete && physical_live != declared_field_count)
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut entries = batches
+        .into_iter()
+        .flat_map(|batch| batch.entries)
+        .collect::<Vec<_>>();
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+fn decode_set_segment(
+    physical_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    expected_set: &[u8],
+) -> Result<SetSegmentBatch, NativeRuntimeError> {
+    let mut physical_live = 0_usize;
+    let mut members = Vec::new();
+    for (physical_key, encoded) in physical_entries {
+        let member = decode_set_scan_member_identity(&physical_key, expected_set)?;
+        if decode_set_member_value(&encoded)? {
+            physical_live = physical_live
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            members.push(member.to_vec());
+        }
+    }
+    Ok(SetSegmentBatch {
+        physical_live,
+        members,
+    })
+}
+
+fn finalize_set_segment_batches(
+    batches: Vec<SetSegmentBatch>,
+    declared_member_count: usize,
+    verify_complete: bool,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    let physical_live = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.physical_live)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)
+    })?;
+    if physical_live > declared_member_count
+        || (verify_complete && physical_live != declared_member_count)
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut members = batches
+        .into_iter()
+        .flat_map(|batch| batch.members)
+        .collect::<Vec<_>>();
+    members.truncate(limit);
+    Ok(members)
+}
+
+fn decode_stream_segment(
+    physical_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    expected_stream: &[u8],
+) -> Result<Vec<NativeStreamEntry>, NativeRuntimeError> {
+    let prefix = structure_stream_entry_prefix(expected_stream)?;
+    let expected_key_length = prefix
+        .len()
+        .checked_add(8)
+        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    let mut entries = Vec::new();
+    for (physical_key, encoded) in physical_entries {
+        if physical_key.len() != expected_key_length || !physical_key.starts_with(&prefix) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        if is_structure_tombstone(&encoded) {
+            continue;
+        }
+        let id = u64::from_be_bytes(
+            physical_key[prefix.len()..]
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+        );
+        let (payload_id, fields) = decode_stream_wal_entry(&encoded)?;
+        if payload_id != id {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        entries.push((id, fields));
+    }
+    Ok(entries)
+}
+
 fn decode_hash_scan_field_identity<'key>(
     physical_key: &'key [u8],
     expected_hash: &[u8],
@@ -17784,6 +23100,29 @@ fn decode_live_sorted_set_order_entry<'entry>(
     Ok(decode_set_member_value(value)?.then_some((score, member)))
 }
 
+fn decode_sorted_set_segment(
+    mut physical_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    expected_key: &[u8],
+    direction: SortedSetDirection,
+) -> Result<Vec<SortedSetEntry>, NativeRuntimeError> {
+    if direction == SortedSetDirection::Descending {
+        physical_entries.reverse();
+    }
+    physical_entries
+        .into_iter()
+        .filter_map(|(physical_key, value)| {
+            match decode_live_sorted_set_order_entry(expected_key, &physical_key, &value) {
+                Ok(Some((score, member))) => Some(Ok(SortedSetEntry {
+                    member: member.to_vec(),
+                    score,
+                })),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
 fn encode_sorted_set_metadata(member_count: u64) -> Vec<u8> {
     encode_sorted_set_metadata_state(member_count, None)
 }
@@ -17856,6 +23195,7 @@ fn decode_sorted_set_wal_score(encoded: &[u8]) -> Result<SortedSetScore, NativeR
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ListMetadata {
     length: u64,
+    value_bytes: Option<u64>,
     head_chunk: i64,
     tail_chunk: i64,
     expires_at_micros: Option<i64>,
@@ -17865,6 +23205,7 @@ impl ListMetadata {
     const fn empty() -> Self {
         Self {
             length: 0,
+            value_bytes: Some(0),
             head_chunk: 0,
             tail_chunk: 0,
             expires_at_micros: None,
@@ -17877,20 +23218,62 @@ impl ListMetadata {
     }
 }
 
+fn add_list_value_bytes(
+    metadata: &mut ListMetadata,
+    value_length: usize,
+) -> Result<(), NativeRuntimeError> {
+    let Some(value_bytes) = metadata.value_bytes else {
+        return Ok(());
+    };
+    metadata.value_bytes = Some(
+        value_bytes
+            .checked_add(
+                u64::try_from(value_length)
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+    );
+    Ok(())
+}
+
+fn remove_list_value_bytes(
+    metadata: &mut ListMetadata,
+    value_length: usize,
+) -> Result<(), NativeRuntimeError> {
+    let Some(value_bytes) = metadata.value_bytes else {
+        return Ok(());
+    };
+    metadata.value_bytes = Some(
+        value_bytes
+            .checked_sub(
+                u64::try_from(value_length)
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+    );
+    Ok(())
+}
+
 fn encode_list_metadata(metadata: ListMetadata) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(if metadata.expires_at_micros.is_some() {
-        STRUCTURE_LIST_EXPIRING_META_SIZE
-    } else {
-        STRUCTURE_LIST_META_SIZE
-    });
-    encoded.extend_from_slice(if metadata.expires_at_micros.is_some() {
-        STRUCTURE_LIST_EXPIRING_META_MAGIC
-    } else {
-        STRUCTURE_LIST_META_MAGIC
+    let mut encoded =
+        Vec::with_capacity(match (metadata.value_bytes, metadata.expires_at_micros) {
+            (Some(_), Some(_)) => STRUCTURE_LIST_SIZED_EXPIRING_META_SIZE,
+            (Some(_), None) => STRUCTURE_LIST_SIZED_META_SIZE,
+            (None, Some(_)) => STRUCTURE_LIST_EXPIRING_META_SIZE,
+            (None, None) => STRUCTURE_LIST_META_SIZE,
+        });
+    encoded.extend_from_slice(match (metadata.value_bytes, metadata.expires_at_micros) {
+        (Some(_), Some(_)) => STRUCTURE_LIST_SIZED_EXPIRING_META_MAGIC,
+        (Some(_), None) => STRUCTURE_LIST_SIZED_META_MAGIC,
+        (None, Some(_)) => STRUCTURE_LIST_EXPIRING_META_MAGIC,
+        (None, None) => STRUCTURE_LIST_META_MAGIC,
     });
     encoded.extend_from_slice(&metadata.length.to_le_bytes());
     encoded.extend_from_slice(&metadata.head_chunk.to_le_bytes());
     encoded.extend_from_slice(&metadata.tail_chunk.to_le_bytes());
+    if let Some(value_bytes) = metadata.value_bytes {
+        encoded.extend_from_slice(&value_bytes.to_le_bytes());
+    }
     if let Some(expiry) = metadata.expires_at_micros {
         encoded.extend_from_slice(&expiry.to_le_bytes());
     }
@@ -17898,16 +23281,33 @@ fn encode_list_metadata(metadata: ListMetadata) -> Vec<u8> {
 }
 
 fn decode_list_metadata(encoded: &[u8]) -> Result<ListMetadata, NativeRuntimeError> {
-    let expires_at_micros = if encoded.len() == STRUCTURE_LIST_META_SIZE
+    let (value_bytes, expires_at_micros) = if encoded.len() == STRUCTURE_LIST_META_SIZE
         && encoded.get(..8) == Some(STRUCTURE_LIST_META_MAGIC.as_slice())
     {
-        None
+        (None, None)
     } else if encoded.len() == STRUCTURE_LIST_EXPIRING_META_SIZE
         && encoded.get(..8) == Some(STRUCTURE_LIST_EXPIRING_META_MAGIC.as_slice())
     {
         let mut expiry = [0_u8; 8];
         expiry.copy_from_slice(&encoded[32..40]);
-        Some(i64::from_le_bytes(expiry))
+        (None, Some(i64::from_le_bytes(expiry)))
+    } else if encoded.len() == STRUCTURE_LIST_SIZED_META_SIZE
+        && encoded.get(..8) == Some(STRUCTURE_LIST_SIZED_META_MAGIC.as_slice())
+    {
+        let mut value_bytes = [0_u8; 8];
+        value_bytes.copy_from_slice(&encoded[32..40]);
+        (Some(u64::from_le_bytes(value_bytes)), None)
+    } else if encoded.len() == STRUCTURE_LIST_SIZED_EXPIRING_META_SIZE
+        && encoded.get(..8) == Some(STRUCTURE_LIST_SIZED_EXPIRING_META_MAGIC.as_slice())
+    {
+        let mut value_bytes = [0_u8; 8];
+        value_bytes.copy_from_slice(&encoded[32..40]);
+        let mut expiry = [0_u8; 8];
+        expiry.copy_from_slice(&encoded[40..48]);
+        (
+            Some(u64::from_le_bytes(value_bytes)),
+            Some(i64::from_le_bytes(expiry)),
+        )
     } else {
         return Err(NativeRuntimeError::InvalidStructureTree);
     };
@@ -17919,12 +23319,18 @@ fn decode_list_metadata(encoded: &[u8]) -> Result<ListMetadata, NativeRuntimeErr
     tail_chunk.copy_from_slice(&encoded[24..32]);
     let metadata = ListMetadata {
         length: u64::from_le_bytes(length),
+        value_bytes,
         head_chunk: i64::from_le_bytes(head_chunk),
         tail_chunk: i64::from_le_bytes(tail_chunk),
         expires_at_micros,
     };
     if metadata.length == 0 {
-        if metadata.head_chunk != 0 || metadata.tail_chunk != 0 {
+        if metadata.head_chunk != 0
+            || metadata.tail_chunk != 0
+            || metadata
+                .value_bytes
+                .is_some_and(|value_bytes| value_bytes != 0)
+        {
             return Err(NativeRuntimeError::InvalidStructureTree);
         }
     } else if metadata.head_chunk > metadata.tail_chunk {
@@ -18043,6 +23449,72 @@ fn decode_list_element(encoded: &[u8], blobs: &BlobStore) -> Result<Vec<u8>, Nat
         Some(entry) if entry.expires_at_micros.is_none() => Ok(entry.value),
         _ => Err(NativeRuntimeError::InvalidStructureTree),
     }
+}
+
+fn decode_list_segment(
+    physical_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    expected_list: &[u8],
+    blobs: &BlobStore,
+) -> Result<ListChunkBatch, NativeRuntimeError> {
+    let mut chunks = Vec::new();
+    for (physical_key, encoded) in physical_entries {
+        if physical_key.first().copied() != Some(STRUCTURE_LIST_CHUNK_PREFIX) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let (list, chunk_id) = decode_list_chunk_identity(
+            physical_key
+                .get(1..)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        )?;
+        if list != expected_list {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let envelopes =
+            decode_list_chunk_storage(&encoded)?.ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let values = envelopes
+            .iter()
+            .map(|element| decode_list_element(element, blobs))
+            .collect::<Result<Vec<_>, _>>()?;
+        chunks.push((chunk_id, values));
+    }
+    Ok(ListChunkBatch { chunks })
+}
+
+fn finalize_list_segment_batches(
+    batches: Vec<ListChunkBatch>,
+    metadata: ListMetadata,
+    declared_length: usize,
+    declared_value_bytes: u64,
+) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+    let mut expected_chunk = metadata.head_chunk;
+    let mut reached_tail = false;
+    let mut values = Vec::with_capacity(declared_length);
+    let mut value_bytes = 0_u64;
+    for (chunk_id, chunk_values) in batches.into_iter().flat_map(|batch| batch.chunks) {
+        if reached_tail || chunk_id != expected_chunk {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        for value in chunk_values {
+            value_bytes = value_bytes
+                .checked_add(
+                    u64::try_from(value.len())
+                        .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                )
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            values.push(value);
+        }
+        if chunk_id == metadata.tail_chunk {
+            reached_tail = true;
+        } else {
+            expected_chunk = expected_chunk
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        }
+    }
+    if !reached_tail || values.len() != declared_length || value_bytes != declared_value_bytes {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(values)
 }
 
 fn list_chunk_with_push(
@@ -18392,6 +23864,133 @@ fn rank_match_hits(scores: BTreeMap<Vec<u8>, f64>, limit: usize) -> Vec<MatchHit
     hits
 }
 
+fn direct_lexical_receipt(
+    snapshot_csn: Csn,
+    hits: Vec<MatchHit>,
+    execution: Option<NativeEngineWorkReceipt>,
+) -> NativeLexicalSearchExecutionReceipt {
+    NativeLexicalSearchExecutionReceipt {
+        snapshot_csn: Some(snapshot_csn),
+        hits,
+        planned_terms: 0,
+        planned_segments: 0,
+        planned_physical_entries: 0,
+        planning: None,
+        execution,
+        planned_workers: 1,
+        worker_batches: 0,
+    }
+}
+
+fn empty_segmented_lexical_receipt(
+    plan: &LexicalExecutionPlan,
+) -> NativeLexicalSearchExecutionReceipt {
+    NativeLexicalSearchExecutionReceipt {
+        snapshot_csn: Some(plan.snapshot_csn),
+        hits: Vec::new(),
+        planned_terms: plan.planned_terms,
+        planned_segments: plan.planned_segments,
+        planned_physical_entries: plan.planned_physical_entries,
+        planning: plan.planning,
+        execution: None,
+        planned_workers: 0,
+        worker_batches: 0,
+    }
+}
+
+fn lexical_segment_work(plans: Vec<LexicalTermSegmentPlan>) -> Vec<LexicalSegmentWork> {
+    plans
+        .into_iter()
+        .enumerate()
+        .flat_map(|(term_index, plan)| {
+            let posting_prefix = Arc::new(plan.posting_prefix);
+            plan.segments
+                .into_iter()
+                .map(move |segment| LexicalSegmentWork {
+                    term_index,
+                    posting_prefix: Arc::clone(&posting_prefix),
+                    idf: plan.idf,
+                    segment,
+                })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_lexical_segment(
+    tree: BTree,
+    pages: &PageStore,
+    pool: &BufferPool,
+    format: PhysicalSearchFormat,
+    index: ObjectId,
+    average_length: f64,
+    work: &LexicalSegmentWork,
+) -> Result<LexicalPostingBatch, NativeRuntimeError> {
+    let mut live_postings = 0_u64;
+    let mut contributions = Vec::with_capacity(work.segment.entry_count());
+    for (key, encoded_frequency) in tree.scan_planned_segment(pages, &work.segment)? {
+        let document_id = key
+            .strip_prefix(work.posting_prefix.as_slice())
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?
+            .to_vec();
+        let Some(term_frequency) = decode_live_search_posting(&encoded_frequency, format)? else {
+            continue;
+        };
+        live_postings = live_postings
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let document = tree
+            .get_cached_pinned(pages, pool, &search_document_key(index, &document_id)?)?
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        if is_search_document_tombstone(document.bytes()) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let (document_length, _, _) = decode_search_document_header(document.bytes())?;
+        contributions.push((
+            document_id,
+            bm25_term_score(
+                work.idf,
+                f64::from(term_frequency),
+                search_count_f64(document_length)?,
+                average_length,
+            ),
+        ));
+    }
+    Ok(LexicalPostingBatch {
+        term_index: work.term_index,
+        live_postings,
+        contributions,
+    })
+}
+
+fn finalize_lexical_batches(
+    batches: Vec<LexicalPostingBatch>,
+    expected_document_frequencies: &[u64],
+    limit: usize,
+) -> Result<Vec<MatchHit>, NativeRuntimeError> {
+    let mut live_postings = vec![0_u64; expected_document_frequencies.len()];
+    let mut scores = BTreeMap::<Vec<u8>, f64>::new();
+    let mut previous_term = None;
+    for batch in batches {
+        if batch.term_index >= live_postings.len()
+            || previous_term.is_some_and(|previous| previous > batch.term_index)
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        previous_term = Some(batch.term_index);
+        live_postings[batch.term_index] = live_postings[batch.term_index]
+            .checked_add(batch.live_postings)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        for (document_id, score) in batch.contributions {
+            *scores.entry(document_id).or_default() += score;
+        }
+    }
+    if live_postings != expected_document_frequencies {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    Ok(rank_match_hits(scores, limit))
+}
+
 fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
     let text =
         std::str::from_utf8(value).map_err(|_| NativeRuntimeError::StructureValueNotInteger)?;
@@ -18441,7 +24040,18 @@ fn create_hash_in_tree(
             .flatten()
             .is_some()
         || tree
+            .get(pages, &structure_stream_meta_key(&mutation.key)?)?
+            .as_deref()
+            .filter(|value| !is_structure_tombstone(value))
+            .map(decode_stream_metadata)
+            .transpose()?
+            .is_some()
+        || tree
             .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
+            .as_deref()
+            .filter(|value| !is_structure_tombstone(value))
+            .map(decode_sorted_set_metadata_state)
+            .transpose()?
             .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -19169,9 +24779,14 @@ fn structure_stream_meta_key(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> 
 }
 
 fn structure_stream_entry_key(key: &[u8], id: u64) -> Result<Vec<u8>, NativeRuntimeError> {
+    let mut encoded = structure_stream_entry_prefix(key)?;
+    encoded.extend_from_slice(&id.to_be_bytes());
+    Ok(encoded)
+}
+
+fn structure_stream_entry_prefix(key: &[u8]) -> Result<Vec<u8>, NativeRuntimeError> {
     let mut encoded = structure_stream_meta_key(key)?;
     encoded[0] = STRUCTURE_STREAM_ENTRY_PREFIX;
-    encoded.extend_from_slice(&id.to_be_bytes());
     Ok(encoded)
 }
 
@@ -19511,7 +25126,7 @@ fn upsert_sorted_set_member_in_tree(
     let metadata = tree
         .get(pages, &metadata_key)?
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    let mut count = decode_sorted_set_metadata(&metadata)?;
+    let (mut count, expiry) = decode_sorted_set_metadata_state(&metadata)?;
     let member_key = structure_sorted_set_member_key(key, member)?;
     let previous = tree
         .get(pages, &member_key)?
@@ -19546,7 +25161,7 @@ fn upsert_sorted_set_member_in_tree(
                 pages,
                 creating_csn,
                 metadata_key.clone(),
-                encode_sorted_set_metadata(count),
+                encode_sorted_set_metadata_state(count, expiry),
             )?
             .tree;
     }
@@ -19584,7 +25199,7 @@ fn delete_sorted_set_member_in_tree(
     let metadata = tree
         .get(pages, &metadata_key)?
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
-    let count = decode_sorted_set_metadata(&metadata)?;
+    let (count, expiry) = decode_sorted_set_metadata_state(&metadata)?;
     let member_key = structure_sorted_set_member_key(key, member)?;
     let score = tree
         .get(pages, &member_key)?
@@ -19613,7 +25228,7 @@ fn delete_sorted_set_member_in_tree(
             pages,
             creating_csn,
             metadata_key,
-            encode_sorted_set_metadata(count),
+            encode_sorted_set_metadata_state(count, expiry),
         )?
         .tree)
 }
@@ -19653,6 +25268,10 @@ fn push_list_in_tree(
             .tree;
         metadata = ListMetadata {
             length: 1,
+            value_bytes: Some(
+                u64::try_from(mutation.value.len())
+                    .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            ),
             head_chunk: 0,
             tail_chunk: 0,
             expires_at_micros: metadata.expires_at_micros,
@@ -19706,6 +25325,7 @@ fn push_list_in_tree(
             .length
             .checked_add(1)
             .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        add_list_value_bytes(&mut metadata, mutation.value.len())?;
     }
     Ok(tree
         .upsert(
@@ -19762,6 +25382,7 @@ fn pop_list_in_tree(
         .length
         .checked_sub(1)
         .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+    remove_list_value_bytes(&mut metadata, mutation.value.len())?;
     if elements.is_empty() {
         tree = tree
             .upsert(pages, creating_csn, chunk_key, structure_tombstone_value())?
@@ -19903,7 +25524,7 @@ fn apply_structure_tree_mutation(
             upsert_scalar_structure_mutation(
                 pages,
                 tree,
-                format.has_expiry_index(),
+                format.uses_ordered_expiry_index(),
                 creating_csn,
                 mutation,
                 blob_references,
@@ -19954,7 +25575,18 @@ fn upsert_scalar_structure_mutation(
             .flatten()
             .is_some()
         || tree
+            .get(pages, &structure_stream_meta_key(&mutation.key)?)?
+            .as_deref()
+            .filter(|value| !is_structure_tombstone(value))
+            .map(decode_stream_metadata)
+            .transpose()?
+            .is_some()
+        || tree
             .get(pages, &structure_sorted_set_meta_key(&mutation.key)?)?
+            .as_deref()
+            .filter(|value| !is_structure_tombstone(value))
+            .map(decode_sorted_set_metadata_state)
+            .transpose()?
             .is_some()
     {
         return Err(NativeRuntimeError::InvalidStructureTree);
@@ -19996,8 +25628,10 @@ fn upsert_scalar_structure_mutation(
 
 struct StructureMutationContext<'a> {
     blobs: &'a BlobStore,
+    buffer_pool: &'a BufferPool,
     format: StructureFormat,
     mode: NativeWriteBatchMode,
+    transaction_id: TransactionId,
     logical_time_micros: i64,
     state: &'a StructureState,
     mutations: &'a [Mutation],
@@ -20011,23 +25645,66 @@ fn structure_root_after_mutations(
     context: &StructureMutationContext<'_>,
 ) -> Result<Option<PageId>, NativeRuntimeError> {
     if context.mode == NativeWriteBatchMode::PhysicalStructureExpiry {
+        return structure_expiry_root_after_mutations(pages, root, creating_csn, context);
+    }
+    if context.mode == NativeWriteBatchMode::PhysicalStructureCompaction {
+        let source = BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?);
+        return match context.format {
+            StructureFormat::BTreeV2 => {
+                Ok(compact_structure_tree(pages, context.blobs, root, creating_csn)?.root())
+            }
+            StructureFormat::BTreeV3 => Ok(structure_v3::compact_structure_v3_tree(
+                pages,
+                context.blobs,
+                source,
+                creating_csn,
+            )?
+            .0
+            .root()),
+            StructureFormat::InlineStateV1 | StructureFormat::BTreeV1 => {
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            }
+        };
+    }
+    if context.mode == NativeWriteBatchMode::PhysicalStructureMigrationV3 {
         if context.format != StructureFormat::BTreeV2 {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        return Ok(physical_expiry_tree_after_mutations(
+        let source = BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?);
+        return Ok(structure_v3::migrate_v2_structure_tree_to_v3(
             pages,
-            root,
+            context.blobs,
+            source,
             creating_csn,
-            context.logical_time_micros,
-            context.mutations,
+            context.transaction_id,
         )?
         .root());
     }
-    if context.mode == NativeWriteBatchMode::PhysicalStructureCompaction {
-        if context.format != StructureFormat::BTreeV2 {
+    if context.mode == NativeWriteBatchMode::PhysicalStructureRetirementV3 {
+        if context.format != StructureFormat::BTreeV3 {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        return Ok(compact_structure_tree(pages, context.blobs, root, creating_csn)?.root());
+        let [mutation] = context.mutations else {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        };
+        validate_maintenance_mutation(mutation)?;
+        let entry_budget = usize::try_from(u32::from_le_bytes(
+            mutation
+                .value
+                .as_slice()
+                .try_into()
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+        ))
+        .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+        return Ok(structure_v3::cleanup_structure_retirement_v3_step(
+            pages,
+            context.buffer_pool,
+            BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?),
+            creating_csn,
+            &mutation.key,
+            entry_budget,
+        )?
+        .root());
     }
     match context.format {
         StructureFormat::InlineStateV1 => Ok(Some(pages.append(
@@ -20045,6 +25722,44 @@ fn structure_root_after_mutations(
             context.blob_references,
         )?
         .root()),
+        StructureFormat::BTreeV3 => Ok(structure_v3::apply_structure_mutations_v3(
+            pages,
+            BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?),
+            creating_csn,
+            context.transaction_id,
+            context.mutations,
+            context.blob_references,
+        )?
+        .root()),
+    }
+}
+
+fn structure_expiry_root_after_mutations(
+    pages: &mut PageStore,
+    root: Option<PageId>,
+    creating_csn: Csn,
+    context: &StructureMutationContext<'_>,
+) -> Result<Option<PageId>, NativeRuntimeError> {
+    match context.format {
+        StructureFormat::BTreeV2 => Ok(physical_expiry_tree_after_mutations(
+            pages,
+            root,
+            creating_csn,
+            context.logical_time_micros,
+            context.mutations,
+        )?
+        .root()),
+        StructureFormat::BTreeV3 => Ok(structure_v3::expire_due_structure_mutations_v3(
+            pages,
+            BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?),
+            creating_csn,
+            context.logical_time_micros,
+            context.mutations,
+        )?
+        .root()),
+        StructureFormat::InlineStateV1 | StructureFormat::BTreeV1 => {
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        }
     }
 }
 
@@ -22081,6 +27796,13 @@ fn roots_from_snapshot(root_set: &RootSet) -> [Option<PageId>; 4] {
     ROOT_SLOTS.map(|slot| root_set.root(slot))
 }
 
+fn root_set_is_pristine(root_set: &RootSet) -> bool {
+    root_set.visible_csn().is_none()
+        && ROOT_SLOTS
+            .into_iter()
+            .all(|slot| root_set.root(slot).is_none())
+}
+
 fn require_roots(roots: [Option<PageId>; 4]) -> Result<[PageId; 4], NativeRuntimeError> {
     let [
         Some(catalog),
@@ -23300,6 +29022,8 @@ fn load_structure_state_root(
     blobs: &BlobStore,
     root: PageId,
 ) -> Result<StructureState, NativeRuntimeError> {
+    #[cfg(test)]
+    reject_full_structure_state_load_for_test()?;
     let page = pages.read(root)?;
     if page.kind() == PageKind::StructureNode {
         return Ok(StructureState::decode(page.payload())?);
@@ -23314,6 +29038,9 @@ fn load_structure_state_root(
     };
     if format_key != STRUCTURE_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if format_value.as_slice() == structure_v3::STRUCTURE_FORMAT_VALUE_V3 {
+        return structure_v3::load_structure_state_v3(pages, blobs, BTree::from_root(root));
     }
     let require_expiry_index = match format_value.as_slice() {
         STRUCTURE_FORMAT_VALUE_V1 => false,
@@ -23820,6 +29547,7 @@ fn materialize_lists(
     let mut lists = BTreeMap::new();
     for (key, metadata) in metadata {
         let mut values = VecDeque::new();
+        let mut value_bytes = 0_u64;
         let mut list_chunks = chunks.remove(&key).unwrap_or_default();
         if metadata.length == 0 {
             if !list_chunks.is_empty() {
@@ -23832,7 +29560,14 @@ fn materialize_lists(
                     .remove(&chunk_id)
                     .ok_or(NativeRuntimeError::InvalidStructureTree)?;
                 for element in elements {
-                    values.push_back(decode_list_element(&element, blobs)?);
+                    let value = decode_list_element(&element, blobs)?;
+                    value_bytes = value_bytes
+                        .checked_add(
+                            u64::try_from(value.len())
+                                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+                        )
+                        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                    values.push_back(value);
                 }
                 if chunk_id == metadata.tail_chunk {
                     break;
@@ -23845,6 +29580,9 @@ fn materialize_lists(
                 || u64::try_from(values.len())
                     .map_err(|_| NativeRuntimeError::InvalidStructureTree)?
                     != metadata.length
+                || metadata
+                    .value_bytes
+                    .is_some_and(|expected| expected != value_bytes)
             {
                 return Err(NativeRuntimeError::InvalidStructureTree);
             }
@@ -24185,6 +29923,8 @@ fn structure_format_for_root(
                 Ok(StructureFormat::BTreeV1)
             } else if marker == STRUCTURE_FORMAT_VALUE_V2 {
                 Ok(StructureFormat::BTreeV2)
+            } else if marker == structure_v3::STRUCTURE_FORMAT_VALUE_V3 {
+                Ok(StructureFormat::BTreeV3)
             } else {
                 Err(NativeRuntimeError::InvalidStructureTree)
             }
@@ -24499,7 +30239,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use hyphae_native_btree::BTree;
+    use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree};
     use hyphae_native_catalog::{
         CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
         CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
@@ -24525,16 +30265,20 @@ mod tests {
         CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogDependencyRequest, CatalogListRequest,
         CatalogName, CatalogObject, CatalogPageStop, CatalogState, CheckpointBoundary,
         ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
-        GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError,
-        HashFieldEntry, HashPatternError, HashPatternScanPage, HashPatternScanRequest,
-        HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError, Mutation,
-        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
-        NativeRuntimeError, NativeSchedulerClock, NativeTransaction, NativeWriteBatch,
-        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
-        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorMetric, WAL_FILE, WalError,
-        WalRetentionAnchor, WalRetentionBoundary, ZAddOutcome, append_catalog_object_entries,
+        GovernorAdmissionError, GovernorClassLimit, GovernorMode, GovernorQueueError,
+        GovernorRequest, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
+        GroupCommitSubmitError, HardwareCpu, HardwareMemory, HardwareOperatingSystem,
+        HardwareProfile, HardwareStorage, HashFieldEntry, HashPatternError, HashPatternScanPage,
+        HashPatternScanRequest, HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError,
+        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
+        NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion, NativeHybridRequest,
+        NativeResourceGovernor, NativeRuntimeError, NativeSchedulerClock, NativeTransaction,
+        NativeVectorBranch, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
+        PromotionBoundary, QualifiedName, RelationDefinition, RelationalScanRow, RootManifest,
+        SLOT_CATALOG, SetCondition, SetOutcome, SnapshotPinBoundary, SnapshotPinError,
+        SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector,
+        VectorIndexDefinition, VectorMetric, VectorRecord, WAL_FILE, WalError, WalRetentionAnchor,
+        WalRetentionBoundary, WorkloadClass, ZAddOutcome, append_catalog_object_entries,
         binary_relation_definition, catalog_definition_storage_value, catalog_dependency_prefix,
         catalog_name_identity, catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
@@ -24546,6 +30290,166 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     const EXTERNAL_LOCK_PROBE_PATH: &str = "HYPHAE_NATIVE_LOCK_PROBE_PATH";
+
+    pub(crate) fn engine_admission_test_policy() -> NativeGovernorPolicy {
+        let memory_bytes = 128 * 1_024 * 1_024;
+        NativeGovernorPolicy {
+            schema: "hyphae-native-governor-policy-v1".to_owned(),
+            mode: GovernorMode::Mixed,
+            hardware_fingerprint: "1".repeat(64),
+            calibration_cache_key: "2".repeat(64),
+            calibrated_worker_limit: 2,
+            reserved_system_threads: 1,
+            schedulable_compute_threads: 1,
+            io_slots: 1,
+            memory_bytes,
+            memory_headroom_percent: 15,
+            admission_queue_capacity: 64,
+            foreground_burst_limit: 16,
+            class_limits: [
+                WorkloadClass::ForegroundPoint,
+                WorkloadClass::ForegroundBounded,
+                WorkloadClass::Mutation,
+                WorkloadClass::Bulk,
+                WorkloadClass::Maintenance,
+                WorkloadClass::Recovery,
+                WorkloadClass::Administrative,
+            ]
+            .into_iter()
+            .map(|class| GovernorClassLimit {
+                class,
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes,
+            })
+            .collect(),
+        }
+    }
+
+    pub(crate) fn parallel_engine_admission_test_policy() -> NativeGovernorPolicy {
+        let mut policy = engine_admission_test_policy();
+        policy.calibrated_worker_limit = 4;
+        policy.reserved_system_threads = 0;
+        policy.schedulable_compute_threads = 4;
+        policy.io_slots = 4;
+        policy.admission_queue_capacity = 256;
+        for limit in &mut policy.class_limits {
+            limit.compute_threads = match limit.class {
+                WorkloadClass::ForegroundPoint => 1,
+                WorkloadClass::Mutation => 2,
+                _ => 4,
+            };
+            limit.io_slots = 4;
+        }
+        policy
+    }
+
+    #[test]
+    fn lexical_batch_merge_preserves_order_and_fails_closed_on_cardinality()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ordered = vec![
+            super::LexicalPostingBatch {
+                term_index: 0,
+                live_postings: 1,
+                contributions: vec![(b"a".to_vec(), 1.0)],
+            },
+            super::LexicalPostingBatch {
+                term_index: 1,
+                live_postings: 1,
+                contributions: vec![(b"a".to_vec(), 2.0), (b"b".to_vec(), 2.5)],
+            },
+        ];
+        assert_eq!(
+            super::finalize_lexical_batches(ordered, &[1, 1], 2)?,
+            [
+                super::MatchHit {
+                    document_id: b"a".to_vec(),
+                    score: 3.0,
+                },
+                super::MatchHit {
+                    document_id: b"b".to_vec(),
+                    score: 2.5,
+                },
+            ]
+        );
+        assert!(matches!(
+            super::finalize_lexical_batches(
+                vec![super::LexicalPostingBatch {
+                    term_index: 0,
+                    live_postings: 1,
+                    contributions: Vec::new(),
+                }],
+                &[2],
+                1,
+            ),
+            Err(NativeRuntimeError::InvalidSearchTree)
+        ));
+        assert!(matches!(
+            super::finalize_lexical_batches(
+                vec![
+                    super::LexicalPostingBatch {
+                        term_index: 1,
+                        live_postings: 1,
+                        contributions: Vec::new(),
+                    },
+                    super::LexicalPostingBatch {
+                        term_index: 0,
+                        live_postings: 1,
+                        contributions: Vec::new(),
+                    },
+                ],
+                &[1, 1],
+                1,
+            ),
+            Err(NativeRuntimeError::InvalidSearchTree)
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn portable_execution_profile(policy: &NativeGovernorPolicy) -> HardwareProfile {
+        HardwareProfile {
+            schema: "hyphae-native-hardware-profile-v1".to_owned(),
+            fingerprint: policy.hardware_fingerprint.clone(),
+            cpu: HardwareCpu {
+                architecture: std::env::consts::ARCH.to_owned(),
+                logical_processors_available: usize::try_from(policy.schedulable_compute_threads)
+                    .unwrap_or(1),
+                physical_cores_visible: None,
+                smt_threads_per_core: None,
+                sockets_visible: None,
+                numa_nodes_visible: None,
+                affinity: "unknown".to_owned(),
+                quota_millicores: None,
+                instruction_sets: Vec::new(),
+                caches: Vec::new(),
+                processor_topology: Vec::new(),
+                frequency_governors: Vec::new(),
+            },
+            memory: HardwareMemory {
+                total_bytes: Some(1 << 30),
+                available_bytes: Some(1 << 30),
+                page_size_bytes: Some(4_096),
+                huge_page_size_bytes: None,
+                huge_pages_total: None,
+                numa_nodes: Vec::new(),
+            },
+            storage: HardwareStorage {
+                path: "/tmp".to_owned(),
+                filesystem: None,
+                device: None,
+                mount_options: Vec::new(),
+                rotational: None,
+                queue_depth: None,
+                discard_max_bytes: None,
+            },
+            operating_system: HardwareOperatingSystem {
+                family: std::env::consts::OS.to_owned(),
+                kernel_release: "test".to_owned(),
+                virtualization: "none".to_owned(),
+                local_transports: Vec::new(),
+            },
+        }
+    }
 
     struct TestSchedulerClock(AtomicI64);
 
@@ -24683,6 +30587,264 @@ mod tests {
         assert_eq!(fields[2], "epoch=1");
         assert_eq!(database.directory_identity().directory_id(), directory_id);
         assert_eq!(database.directory_identity().history_epoch(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn installed_governor_admits_real_engine_surfaces_and_releases_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor(Arc::clone(&governor));
+        assert!(
+            database
+                .resource_governor()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &governor))
+        );
+
+        let point_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::FOREGROUND_POINT_MEMORY_BYTES,
+        };
+        let held_point = governor.try_admit(WorkloadClass::ForegroundPoint, point_request)?;
+        assert!(matches!(
+            database.get_latest_structure(b"governed", 0),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        drop(held_point);
+        assert_eq!(database.get_latest_structure(b"governed", 0)?, None);
+
+        let bounded_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::FOREGROUND_BOUNDED_MEMORY_BYTES,
+        };
+        let held_bounded = governor.try_admit(WorkloadClass::ForegroundBounded, bounded_request)?;
+        assert!(matches!(
+            database.prepare_sql_latest("SELECT id FROM missing WHERE id = $1"),
+            Err(SqlError::Runtime(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            )))
+        ));
+        assert!(matches!(
+            database.search_vector_exact_latest(
+                ObjectId::new(777)?,
+                &Vector::new([1.0, 0.0, 0.0])?,
+                1,
+            ),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        let hybrid_query = Vector::new([1.0, 0.0, 0.0])?;
+        let hybrid_request = NativeHybridRequest {
+            lexical_index: ObjectId::new(776)?,
+            lexical_query: "governed",
+            lexical_limit: 1,
+            vector_index: ObjectId::new(777)?,
+            vector_query: &hybrid_query,
+            vector_branch: NativeVectorBranch::Exact,
+            vector_limit: 1,
+            fusion: NativeHybridFusion {
+                lexical_weight: 1,
+                vector_weight: 1,
+                limit: 1,
+            },
+        };
+        assert!(matches!(
+            database.retrieve_hybrid_latest(0, &hybrid_request),
+            Err(super::NativeHybridError::Runtime(
+                NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+                )
+            ))
+        ));
+        drop(held_bounded);
+
+        database.clear_resource_governor();
+        assert!(database.resource_governor().is_none());
+        drop(database);
+        assert!(
+            NativeDatabase::open(directory.path())?
+                .resource_governor()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn database_queue_waits_for_real_point_capacity_and_times_out_cleanly()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1));
+        let point_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::FOREGROUND_POINT_MEMORY_BYTES,
+        };
+        let held = governor.try_admit_owned(WorkloadClass::ForegroundPoint, point_request)?;
+        let release_governor = Arc::clone(&governor);
+        let release = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while release_governor.queued_requests() == 0 {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::other("database request did not queue"));
+                }
+                std::thread::yield_now();
+            }
+            drop(held);
+            Ok(())
+        });
+        assert_eq!(database.get_latest_structure(b"queued", 0)?, None);
+        release
+            .join()
+            .map_err(|_| std::io::Error::other("release thread panicked"))??;
+        assert_eq!(governor.queued_requests(), 0);
+
+        database
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_millis(1));
+        let held = governor.try_admit_owned(WorkloadClass::ForegroundPoint, point_request)?;
+        assert!(matches!(
+            database.get_latest_structure(b"timeout", 0),
+            Err(NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::TimedOut
+            ))
+        ));
+        drop(held);
+        assert_eq!(governor.queued_requests(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_governor_admission_tracks_batch_clones_and_maintenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor(Arc::clone(&governor));
+
+        let mutation_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::MUTATION_MEMORY_BYTES,
+        };
+        let transaction = database.begin(0, DurabilityClass::Memory)?;
+        assert!(matches!(
+            governor.try_admit(WorkloadClass::Mutation, mutation_request),
+            Err(GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity)
+        ));
+        transaction.rollback();
+        assert!(
+            governor
+                .try_admit(WorkloadClass::Mutation, mutation_request)
+                .is_ok()
+        );
+
+        let batch = database.begin_optimistic_delta(0, DurabilityClass::Memory)?;
+        let cloned_batch = batch.clone();
+        drop(batch);
+        assert!(matches!(
+            governor.try_admit(WorkloadClass::Mutation, mutation_request),
+            Err(GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity)
+        ));
+        drop(cloned_batch);
+        assert!(
+            governor
+                .try_admit(WorkloadClass::Mutation, mutation_request)
+                .is_ok()
+        );
+
+        let maintenance_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::MAINTENANCE_MEMORY_BYTES,
+        };
+        let held_maintenance =
+            governor.try_admit(WorkloadClass::Maintenance, maintenance_request)?;
+        assert!(matches!(
+            database.expire_due_structures(0, 1, DurabilityClass::Memory),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        drop(held_maintenance);
+        assert_eq!(
+            database
+                .expire_due_structures(0, 1, DurabilityClass::Memory)?
+                .expired_keys,
+            0
+        );
+
+        let administrative_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::ADMINISTRATIVE_MEMORY_BYTES,
+        };
+        let held_administrative =
+            governor.try_admit(WorkloadClass::Administrative, administrative_request)?;
+        assert!(matches!(
+            database.checkpoint(),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        assert!(matches!(
+            database.truncate_wal_at_retention_checkpoint(),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        drop(held_administrative);
+        assert!(matches!(
+            database.checkpoint(),
+            Err(NativeRuntimeError::NoCommittedState)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn governed_open_admits_recovery_before_touching_durable_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        drop(NativeDatabase::create(directory.path())?);
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        let recovery_request = GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: super::RECOVERY_MEMORY_BYTES,
+        };
+        let held_recovery = governor.try_admit(WorkloadClass::Recovery, recovery_request)?;
+        assert!(matches!(
+            NativeDatabase::open_with_resource_governor(
+                directory.path(),
+                Arc::clone(&governor),
+                Duration::ZERO,
+            ),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        drop(held_recovery);
+
+        let reopened = NativeDatabase::open_with_resource_governor(
+            directory.path(),
+            Arc::clone(&governor),
+            Duration::ZERO,
+        )?;
+        assert!(
+            reopened
+                .resource_governor()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &governor))
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
         Ok(())
     }
 
@@ -26874,6 +33036,55 @@ mod tests {
             );
         }
 
+        let serial_segmented =
+            database.match_latest_text_profiled(index, "rust engine common", 128)?;
+        assert_eq!(
+            serial_segmented.hits,
+            historical.match_text(index, "rust engine common", 128)?
+        );
+        assert_eq!(serial_segmented.snapshot_csn, Some(Csn::new(1)?));
+        assert_eq!(serial_segmented.planned_terms, 3);
+        assert!(serial_segmented.planned_segments > 1);
+        assert!(serial_segmented.planned_physical_entries >= 512 * 2);
+        assert_eq!(serial_segmented.planned_workers, 1);
+        assert_eq!(serial_segmented.worker_batches, 0);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel_segmented =
+            database.match_latest_text_profiled(index, "rust engine common", 128)?;
+        assert_eq!(parallel_segmented.hits, serial_segmented.hits);
+        assert_eq!(
+            parallel_segmented.planned_segments,
+            serial_segmented.planned_segments
+        );
+        assert!(parallel_segmented.planning.is_some());
+        let execution = parallel_segmented
+            .execution
+            .ok_or_else(|| std::io::Error::other("missing lexical execution admission"))?;
+        assert_eq!(
+            execution.request.compute_threads,
+            parallel_segmented.planned_workers
+        );
+        assert_eq!(
+            execution.request.io_slots,
+            parallel_segmented.planned_workers
+        );
+        assert_eq!(
+            u64::try_from(parallel_segmented.worker_batches)?,
+            parallel_segmented.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        database.clear_resource_governor();
+
         let mut later = database.begin(12, DurabilityClass::Strict)?;
         later.index_document(
             index,
@@ -27556,6 +33767,194 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delta_all_engine_v3_reuses_expired_collections_without_materialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(100)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                body TEXT NOT NULL
+            )",
+            &[],
+        )?;
+        seed.execute_sql("INSERT INTO events (id, body) VALUES (1, 'seed')", &[])?;
+        seed.set(b"existing-scalar".to_vec(), b"seed".to_vec(), None)?;
+        seed.create_hash(b"expired-hash".to_vec())?;
+        assert!(seed.expire_hash(b"expired-hash".to_vec(), 10)?);
+        seed.create_set(b"expired-set".to_vec())?;
+        assert!(seed.expire_set(b"expired-set".to_vec(), 10)?);
+        seed.create_list(b"expired-list".to_vec())?;
+        assert!(seed.expire_list(b"expired-list".to_vec(), 10)?);
+        seed.create_stream(b"expired-stream".to_vec())?;
+        assert!(seed.expire_stream(b"expired-stream".to_vec(), 10)?);
+        seed.create_sorted_set(b"expired-sorted".to_vec())?;
+        assert!(seed.expire_sorted_set(b"expired-sorted".to_vec(), 10)?);
+        seed.create_hash(b"live-hash".to_vec())?;
+        seed.create_set(b"live-set".to_vec())?;
+        seed.create_list(b"live-list".to_vec())?;
+        seed.create_stream(b"live-stream".to_vec())?;
+        seed.create_sorted_set(b"live-sorted".to_vec())?;
+        seed.create_search_index(index, "documents")?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+        let delta_commit = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let mut rejected = database.begin_optimistic_delta(10, DurabilityClass::Memory)?;
+            for key in [
+                b"live-hash".as_slice(),
+                b"live-set".as_slice(),
+                b"live-list".as_slice(),
+                b"live-stream".as_slice(),
+                b"live-sorted".as_slice(),
+            ] {
+                assert!(matches!(
+                    database.stage_delta_set(
+                        &mut rejected,
+                        key.to_vec(),
+                        b"wrong-kind".to_vec(),
+                        None,
+                    ),
+                    Err(NativeRuntimeError::StructureKindMismatch)
+                ));
+            }
+            assert_eq!(rejected.mutation_count(), 0);
+
+            let mut delta = database.begin_optimistic_delta(10, DurabilityClass::Strict)?;
+            database.stage_delta_sql_dml(
+                &mut delta,
+                "UPDATE events SET body = ? WHERE id = ?",
+                &[SqlValue::Text("v3".to_owned()), SqlValue::Signed(1)],
+            )?;
+            for key in [
+                b"missing".as_slice(),
+                b"existing-scalar".as_slice(),
+                b"expired-hash".as_slice(),
+                b"expired-set".as_slice(),
+                b"expired-list".as_slice(),
+                b"expired-stream".as_slice(),
+                b"expired-sorted".as_slice(),
+            ] {
+                database.stage_delta_set(
+                    &mut delta,
+                    key.to_vec(),
+                    [b"v3-".as_slice(), key].concat(),
+                    None,
+                )?;
+            }
+            database.stage_delta_index_document(
+                &mut delta,
+                index,
+                b"doc-1".to_vec(),
+                "native v3 delta".to_owned(),
+            )?;
+            Ok(database.commit_optimistic(delta)?)
+        })();
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+        let committed = delta_commit?;
+        assert!(committed.commit_csn.get() > 0);
+
+        drop(database);
+        let database = NativeDatabase::open(temporary.path())?;
+        for key in [
+            b"missing".as_slice(),
+            b"existing-scalar".as_slice(),
+            b"expired-hash".as_slice(),
+            b"expired-set".as_slice(),
+            b"expired-list".as_slice(),
+            b"expired-stream".as_slice(),
+            b"expired-sorted".as_slice(),
+        ] {
+            assert_eq!(
+                database.get_latest_structure(key, 10)?,
+                Some([b"v3-".as_slice(), key].concat())
+            );
+        }
+        assert_eq!(database.hlen_latest_hash(b"live-hash")?, 0);
+        assert_eq!(database.match_latest_text(index, "native", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_v3_scalar_conflicts_with_an_intervening_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"shared".to_vec(), b"seed".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut stale = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        database.stage_delta_set(&mut stale, b"shared".to_vec(), b"stale".to_vec(), None)?;
+        let mut winner = database.begin(2, DurabilityClass::Memory)?;
+        winner.set(b"shared".to_vec(), b"winner".to_vec(), None)?;
+        winner.commit()?;
+
+        assert!(matches!(
+            database.commit_optimistic(stale),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.get_latest_structure(b"shared", 2)?,
+            Some(b"winner".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_delta_v3_commit_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.set(b"shared".to_vec(), b"seed".to_vec(), None)?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+            super::FAIL_FULL_STATE_LOAD.set(true);
+            super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+            let interrupted = (|| -> Result<_, NativeRuntimeError> {
+                let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+                database.stage_delta_set(
+                    &mut delta,
+                    b"shared".to_vec(),
+                    b"delta".to_vec(),
+                    None,
+                )?;
+                database.commit_optimistic_with_interruption(delta, boundary)
+            })();
+            super::FAIL_FULL_STATE_LOAD.set(false);
+            super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+            assert!(matches!(
+                interrupted,
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let recovered = reopened
+                .get_latest_structure(b"shared", 2)?
+                .ok_or("delta V3 crash recovery lost the scalar")?;
+            if recovered != b"seed" && recovered != b"delta" {
+                return Err(
+                    format!("partial delta V3 state at {boundary:?}: {recovered:?}").into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn delta_latest_update_reads_only_the_version_chain_head()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -28227,6 +34626,47 @@ mod tests {
     }
 
     #[test]
+    fn sorted_set_member_changes_preserve_ttl_and_reopen_validity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_sorted_set(b"scores".to_vec())?;
+        seed.zadd(b"scores".to_vec(), 1.0, b"alice".to_vec())?;
+        seed.commit()?;
+
+        let mut add_after_expiry = database.begin(2, DurabilityClass::Strict)?;
+        assert!(add_after_expiry.expire_sorted_set(b"scores".to_vec(), 100)?);
+        assert_eq!(
+            add_after_expiry.zadd(b"scores".to_vec(), 2.0, b"bob".to_vec())?,
+            ZAddOutcome::Added
+        );
+        add_after_expiry.commit()?;
+        assert_eq!(
+            database.ttl_latest_sorted_set(b"scores", 3)?,
+            super::Ttl::RemainingMicros(97)
+        );
+
+        let mut remove_after_expiry = database.begin(3, DurabilityClass::Strict)?;
+        assert!(remove_after_expiry.zrem(b"scores".to_vec(), b"alice".to_vec())?);
+        remove_after_expiry.commit()?;
+        assert_eq!(database.zcard_latest_sorted_set_at(b"scores", 3)?, 1);
+        assert_eq!(
+            database.ttl_latest_sorted_set(b"scores", 3)?,
+            super::Ttl::RemainingMicros(97)
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.zcard_latest_sorted_set_at(b"scores", 3)?, 1);
+        assert_eq!(
+            reopened.ttl_latest_sorted_set(b"scores", 3)?,
+            super::Ttl::RemainingMicros(97)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sorted_set_ttl_is_exact_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
@@ -28627,6 +35067,141 @@ mod tests {
         let entries = reopened.xrange_latest_stream(b"events", 1, u64::MAX, 8)?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1[0].0, b"kind");
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_stream_range_uses_ordered_persistent_segments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin(1, DurabilityClass::Memory)?;
+        batch.create_stream(b"segmented-events".to_vec())?;
+        for index in 0..1_024_u32 {
+            assert_eq!(
+                batch.xadd(
+                    b"segmented-events".to_vec(),
+                    &[(b"sequence".to_vec(), index.to_be_bytes().to_vec())],
+                )?,
+                u64::from(index) + 1
+            );
+        }
+        batch.commit()?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        let serial =
+            database.xrange_latest_stream_at_profiled(b"segmented-events", 100, 900, 512, 2)?;
+        assert_eq!(serial.entries.len(), 512);
+        assert_eq!(serial.entries.first().map(|entry| entry.0), Some(100));
+        assert_eq!(serial.entries.last().map(|entry| entry.0), Some(611));
+        assert!(serial.planned_segments > 1);
+        assert_eq!(serial.planned_workers, 1);
+        assert_eq!(serial.worker_batches, 0);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel =
+            database.xrange_latest_stream_at_profiled(b"segmented-events", 100, 900, 512, 2)?;
+        assert_eq!(parallel.entries, serial.entries);
+        assert!(parallel.planning.is_some());
+        assert!(parallel.execution.is_some());
+        assert_eq!(
+            u64::try_from(parallel.worker_batches)?,
+            parallel.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_multilevel_stream_range_uses_ordered_persistent_segments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin(1, DurabilityClass::Memory)?;
+        batch.create_stream(b"segmented-events-v3".to_vec())?;
+        for index in 0..1_024_u32 {
+            assert_eq!(
+                batch.xadd(
+                    b"segmented-events-v3".to_vec(),
+                    &[(b"sequence".to_vec(), index.to_be_bytes().to_vec())],
+                )?,
+                u64::from(index) + 1
+            );
+        }
+        batch.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        assert!(database.latest_structure_tree_height()? >= 2);
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let policy = parallel_engine_admission_test_policy();
+            let profile = portable_execution_profile(&policy);
+            let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+            database.set_resource_governor(Arc::clone(&governor));
+            let serial = database.xrange_latest_stream_at_profiled(
+                b"segmented-events-v3",
+                100,
+                900,
+                512,
+                2,
+            )?;
+            assert_eq!(serial.entries.len(), 512);
+            assert_eq!(serial.entries.first().map(|entry| entry.0), Some(100));
+            assert_eq!(serial.entries.last().map(|entry| entry.0), Some(611));
+            assert!(serial.planned_segments > 1);
+            assert_eq!(serial.planned_workers, 1);
+            assert_eq!(serial.worker_batches, 0);
+
+            let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+            database.set_resource_governor_with_execution_pool(
+                Arc::clone(&governor),
+                execution_pool,
+                Duration::ZERO,
+            )?;
+            let parallel = database.xrange_latest_stream_at_profiled(
+                b"segmented-events-v3",
+                100,
+                900,
+                512,
+                2,
+            )?;
+            assert_eq!(parallel.entries, serial.entries);
+            assert!(parallel.planning.is_some());
+            assert!(parallel.execution.is_some());
+            assert!(parallel.planned_workers > 1);
+            assert_eq!(
+                u64::try_from(parallel.worker_batches)?,
+                parallel.planned_workers
+            );
+            assert_eq!(governor.usage_snapshot().compute_threads, 0);
+            assert_eq!(governor.usage_snapshot().io_slots, 0);
+            Ok(())
+        })();
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        result?;
+
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let reopened_result =
+            reopened.xrange_latest_stream_at_profiled(b"segmented-events-v3", 100, 900, 512, 2);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        let reopened_receipt = reopened_result?;
+        assert_eq!(reopened_receipt.entries.len(), 512);
+        assert!(reopened_receipt.planned_segments > 1);
         Ok(())
     }
 
@@ -30151,6 +36726,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn multilevel_hash_scan_prunes_skips_tombstones_and_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -30187,6 +36763,42 @@ mod tests {
             )?,
             expected
         );
+        let serial_segmented = database.hscan_latest_hash_at_profiled(
+            b"large-scan",
+            Some(1_023_u32.to_be_bytes().as_slice()),
+            512,
+            i64::MIN,
+        )?;
+        assert_eq!(serial_segmented.entries.len(), 512);
+        assert!(serial_segmented.planned_segments > 1);
+        assert_eq!(serial_segmented.planned_workers, 1);
+        assert_eq!(serial_segmented.worker_batches, 0);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel_segmented = database.hscan_latest_hash_at_profiled(
+            b"large-scan",
+            Some(1_023_u32.to_be_bytes().as_slice()),
+            512,
+            i64::MIN,
+        )?;
+        assert_eq!(parallel_segmented.entries, serial_segmented.entries);
+        assert!(parallel_segmented.planning.is_some());
+        assert!(parallel_segmented.execution.is_some());
+        assert_eq!(
+            u64::try_from(parallel_segmented.worker_batches)?,
+            parallel_segmented.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        database.clear_resource_governor();
 
         let root = database
             .coordinator
@@ -32155,6 +38767,285 @@ mod tests {
     }
 
     #[test]
+    fn sorted_set_score_segments_preserve_direction_ties_and_offset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_sorted_set(b"parallel-score-range".to_vec())?;
+        for index in 0..1_024_u32 {
+            seed.zadd(
+                b"parallel-score-range".to_vec(),
+                f64::from(index / 2),
+                index.to_be_bytes().to_vec(),
+            )?;
+        }
+        seed.commit()?;
+        let oracle = database.snapshot(101)?;
+        let serial_ascending = database.zrange_by_score_latest_sorted_set_profiled(
+            b"parallel-score-range",
+            Bound::Included(64.0),
+            Bound::Excluded(448.0),
+            17,
+            512,
+        )?;
+        assert_eq!(
+            serial_ascending.entries,
+            oracle.zrange_by_score(
+                b"parallel-score-range",
+                Bound::Included(64.0),
+                Bound::Excluded(448.0),
+                17,
+                512,
+            )?
+        );
+        assert!(serial_ascending.planned_segments > 1);
+        let serial_descending = database.zrevrange_by_score_latest_sorted_set_profiled(
+            b"parallel-score-range",
+            Bound::Included(64.0),
+            Bound::Excluded(448.0),
+            17,
+            512,
+        )?;
+        assert_eq!(
+            serial_descending.entries,
+            oracle.zrevrange_by_score(
+                b"parallel-score-range",
+                Bound::Included(64.0),
+                Bound::Excluded(448.0),
+                17,
+                512,
+            )?
+        );
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel = database.zrevrange_by_score_latest_sorted_set_profiled(
+            b"parallel-score-range",
+            Bound::Included(64.0),
+            Bound::Excluded(448.0),
+            17,
+            512,
+        )?;
+        assert_eq!(parallel.entries, serial_descending.entries);
+        assert!(parallel.planning.is_some());
+        assert!(parallel.execution.is_some());
+        assert_eq!(
+            u64::try_from(parallel.worker_batches)?,
+            parallel.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        database.clear_resource_governor();
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let v3_result = assert_sorted_set_score_segments_v3(
+            &mut database,
+            &oracle,
+            &policy,
+            &profile,
+            &governor,
+        );
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        v3_result?;
+        Ok(())
+    }
+
+    fn assert_sorted_set_score_segments_v3(
+        database: &mut NativeDatabase,
+        oracle: &super::NativeSnapshot,
+        policy: &NativeGovernorPolicy,
+        profile: &HardwareProfile,
+        governor: &Arc<NativeResourceGovernor>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database.set_resource_governor(Arc::clone(governor));
+        let ascending = database.zrange_by_score_latest_sorted_set_profiled(
+            b"parallel-score-range",
+            Bound::Included(64.0),
+            Bound::Excluded(448.0),
+            17,
+            512,
+        )?;
+        assert_eq!(
+            ascending.entries,
+            oracle.zrange_by_score(
+                b"parallel-score-range",
+                Bound::Included(64.0),
+                Bound::Excluded(448.0),
+                17,
+                512,
+            )?
+        );
+        assert!(ascending.planned_segments > 1);
+        assert_eq!(ascending.planned_workers, 1);
+        let execution_pool = Arc::new(NativeExecutionPool::new(profile, policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let descending = database.zrevrange_by_score_latest_sorted_set_profiled(
+            b"parallel-score-range",
+            Bound::Included(64.0),
+            Bound::Excluded(448.0),
+            17,
+            512,
+        )?;
+        assert_eq!(
+            descending.entries,
+            oracle.zrevrange_by_score(
+                b"parallel-score-range",
+                Bound::Included(64.0),
+                Bound::Excluded(448.0),
+                17,
+                512,
+            )?
+        );
+        assert!(descending.planned_workers > 1);
+        assert_eq!(
+            u64::try_from(descending.worker_batches)?,
+            descending.planned_workers
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_set_rank_segments_preserve_live_order_and_small_direct_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_sorted_set(b"parallel-rank-range".to_vec())?;
+        for index in 0..1_024_u32 {
+            seed.zadd(
+                b"parallel-rank-range".to_vec(),
+                f64::from(index / 2),
+                index.to_be_bytes().to_vec(),
+            )?;
+        }
+        seed.commit()?;
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        assert!(mutate.zrem(
+            b"parallel-rank-range".to_vec(),
+            17_u32.to_be_bytes().to_vec(),
+        )?);
+        assert!(mutate.zrem(
+            b"parallel-rank-range".to_vec(),
+            900_u32.to_be_bytes().to_vec(),
+        )?);
+        mutate.zadd(
+            b"parallel-rank-range".to_vec(),
+            -1.0,
+            512_u32.to_be_bytes().to_vec(),
+        )?;
+        mutate.commit()?;
+        let oracle = database.snapshot(103)?;
+
+        let small = database.zrange_latest_sorted_set_profiled(b"parallel-rank-range", 400, 410)?;
+        assert_eq!(
+            small.entries,
+            oracle.zrange(b"parallel-rank-range", 400, 410)?
+        );
+        assert_eq!(small.planned_segments, 0);
+
+        let serial =
+            database.zrevrange_latest_sorted_set_profiled(b"parallel-rank-range", 0, -1)?;
+        assert_eq!(
+            serial.entries,
+            oracle.zrevrange(b"parallel-rank-range", 0, -1)?
+        );
+        assert!(serial.planned_segments > 1);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel =
+            database.zrevrange_latest_sorted_set_profiled(b"parallel-rank-range", 0, -1)?;
+        assert_eq!(parallel.entries, serial.entries);
+        assert!(parallel.planning.is_some());
+        assert!(parallel.execution.is_some());
+        assert_eq!(
+            u64::try_from(parallel.worker_batches)?,
+            parallel.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        database.clear_resource_governor();
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let v3_result = assert_sorted_set_rank_segments_v3(
+            &mut database,
+            &oracle,
+            &policy,
+            &profile,
+            &governor,
+        );
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        v3_result?;
+        Ok(())
+    }
+
+    fn assert_sorted_set_rank_segments_v3(
+        database: &mut NativeDatabase,
+        oracle: &super::NativeSnapshot,
+        policy: &NativeGovernorPolicy,
+        profile: &HardwareProfile,
+        governor: &Arc<NativeResourceGovernor>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database.set_resource_governor(Arc::clone(governor));
+        let small = database.zrange_latest_sorted_set_profiled(b"parallel-rank-range", 400, 410)?;
+        assert_eq!(
+            small.entries,
+            oracle.zrange(b"parallel-rank-range", 400, 410)?
+        );
+        assert_eq!(small.planned_segments, 0);
+        let serial =
+            database.zrevrange_latest_sorted_set_profiled(b"parallel-rank-range", 0, -1)?;
+        assert_eq!(
+            serial.entries,
+            oracle.zrevrange(b"parallel-rank-range", 0, -1)?
+        );
+        assert!(serial.planned_segments > 1);
+        assert_eq!(serial.planned_workers, 1);
+        let execution_pool = Arc::new(NativeExecutionPool::new(profile, policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel =
+            database.zrevrange_latest_sorted_set_profiled(b"parallel-rank-range", 0, -1)?;
+        assert_eq!(parallel.entries, serial.entries);
+        assert!(parallel.planned_workers > 1);
+        assert_eq!(
+            u64::try_from(parallel.worker_batches)?,
+            parallel.planned_workers
+        );
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"parallel-rank-range", &512_u32.to_be_bytes())?,
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_sorted_sets_reject_nan_enforce_types_and_bound_identities()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -32586,6 +39477,111 @@ mod tests {
             reopened.lrange_latest_list(b"chunked", -1, -1)?,
             [126_u32.to_be_bytes().to_vec()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn list_range_segments_account_bytes_and_preserve_chunk_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(100, DurabilityClass::Memory)?;
+        seed.create_list(b"parallel-list".to_vec())?;
+        for index in 0..384_u32 {
+            let mut value = vec![u8::try_from(index % 251)?; 64];
+            value[..4].copy_from_slice(&index.to_be_bytes());
+            seed.rpush(b"parallel-list".to_vec(), value)?;
+        }
+        seed.commit()?;
+        let mut mutate = database.begin(102, DurabilityClass::Strict)?;
+        for _ in 0..8 {
+            assert!(mutate.lpop(b"parallel-list".to_vec())?.is_some());
+            assert!(mutate.rpop(b"parallel-list".to_vec())?.is_some());
+        }
+        mutate.commit()?;
+        let oracle = database.snapshot(103)?;
+
+        let small =
+            database.lrange_latest_list_at_profiled(b"parallel-list", 100, 110, i64::MIN)?;
+        assert_eq!(small.values, oracle.lrange(b"parallel-list", 100, 110)?);
+        assert_eq!(small.planned_segments, 0);
+
+        let serial = database.lrange_latest_list_at_profiled(b"parallel-list", 0, -1, i64::MIN)?;
+        assert_eq!(serial.values, oracle.lrange(b"parallel-list", 0, -1)?);
+        assert_eq!(serial.declared_length, 368);
+        assert!(serial.planned_segments > 1);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::ZERO,
+        )?;
+        let parallel =
+            database.lrange_latest_list_at_profiled(b"parallel-list", 0, -1, i64::MIN)?;
+        assert_eq!(parallel.values, serial.values);
+        assert!(parallel.planning.is_some());
+        assert!(parallel.execution.is_some());
+        assert_eq!(
+            u64::try_from(parallel.worker_batches)?,
+            parallel.planned_workers
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+
+        database.clear_resource_governor();
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let v3_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            database.set_resource_governor(Arc::clone(&governor));
+            let v3_small =
+                database.lrange_latest_list_at_profiled(b"parallel-list", 100, 110, i64::MIN)?;
+            assert_eq!(v3_small.values, serial.values[100..=110]);
+            assert_eq!(v3_small.planned_segments, 0);
+
+            let v3_serial =
+                database.lrange_latest_list_at_profiled(b"parallel-list", 0, -1, i64::MIN)?;
+            assert_eq!(v3_serial.values, serial.values);
+            assert_eq!(v3_serial.declared_length, 368);
+            assert!(v3_serial.planned_segments > 1);
+            assert_eq!(v3_serial.planned_workers, 1);
+            assert_eq!(v3_serial.worker_batches, 0);
+
+            let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+            database.set_resource_governor_with_execution_pool(
+                Arc::clone(&governor),
+                execution_pool,
+                Duration::ZERO,
+            )?;
+            let v3_parallel =
+                database.lrange_latest_list_at_profiled(b"parallel-list", 0, -1, i64::MIN)?;
+            assert_eq!(v3_parallel.values, v3_serial.values);
+            assert!(v3_parallel.planning.is_some());
+            assert!(v3_parallel.execution.is_some());
+            assert!(v3_parallel.planned_workers > 1);
+            assert_eq!(
+                u64::try_from(v3_parallel.worker_batches)?,
+                v3_parallel.planned_workers
+            );
+            Ok(())
+        })();
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        v3_result?;
+
+        drop(oracle);
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let reopened_result = reopened.lrange_latest_list(b"parallel-list", 0, -1);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        assert_eq!(reopened_result?, serial.values);
         Ok(())
     }
 
@@ -34004,6 +41000,129 @@ mod tests {
         Ok(())
     }
 
+    fn seed_multilevel_publication_fixture(
+        database: &mut NativeDatabase,
+    ) -> Result<(ObjectId, ObjectId), NativeRuntimeError> {
+        let table = ObjectId::new(80).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+        let search = ObjectId::new(81).map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_relation(table, "segmented_rows")?;
+        seed.create_set(b"segmented-members".to_vec())?;
+        seed.create_search_index(search, "segmented_search")?;
+        for index in 0..512_u32 {
+            let identity = index.to_be_bytes().to_vec();
+            seed.insert(
+                table,
+                identity.clone(),
+                format!("prior-{index}").into_bytes(),
+            )?;
+            seed.sadd_many(b"segmented-members".to_vec(), vec![identity.clone()])?;
+            let text = match index {
+                0 => "beforefirst",
+                511 => "beforelast",
+                _ => "unchanged",
+            };
+            seed.index_document(search, identity, text)?;
+        }
+        seed.commit()?;
+        if database.latest_relational_tree_height()? < 2
+            || database.latest_structure_tree_height()? < 2
+            || database.latest_search_tree_height()? < 2
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        Ok((table, search))
+    }
+
+    fn assert_multilevel_publication_state(
+        database: &NativeDatabase,
+        table: ObjectId,
+        search: ObjectId,
+        complete: bool,
+    ) -> Result<(), NativeRuntimeError> {
+        let first = database
+            .select_latest_relational(table, &0_u32.to_be_bytes())?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let last = database
+            .select_latest_relational(table, &511_u32.to_be_bytes())?
+            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+        let retired = database.sismember_latest_set_at(
+            b"segmented-members",
+            &0_u32.to_be_bytes(),
+            i64::MIN,
+        )?;
+        let added = database.sismember_latest_set_at(
+            b"segmented-members",
+            &9_999_u32.to_be_bytes(),
+            i64::MIN,
+        )?;
+        let before_hits = database.match_latest_text(search, "beforefirst beforelast", 4)?;
+        let after_hits = database.match_latest_text(search, "afterfirst afterlast", 4)?;
+        if complete {
+            assert_eq!(first, b"complete-first");
+            assert_eq!(last, b"complete-last");
+            assert!(!retired && added && before_hits.is_empty() && after_hits.len() == 2);
+        } else {
+            assert_eq!(first, b"prior-0");
+            assert_eq!(last, b"prior-511");
+            assert!(retired && !added && before_hits.len() == 2 && after_hits.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn multilevel_segment_roots_publish_atomically_at_every_crash_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let (table, search) = seed_multilevel_publication_fixture(&mut database)?;
+            let mut update = database.begin(12, DurabilityClass::Strict)?;
+            update.update(
+                table,
+                0_u32.to_be_bytes().to_vec(),
+                b"complete-first".to_vec(),
+            )?;
+            update.update(
+                table,
+                511_u32.to_be_bytes().to_vec(),
+                b"complete-last".to_vec(),
+            )?;
+            update.srem_many(
+                b"segmented-members".to_vec(),
+                vec![0_u32.to_be_bytes().to_vec()],
+            )?;
+            update.sadd_many(
+                b"segmented-members".to_vec(),
+                vec![9_999_u32.to_be_bytes().to_vec()],
+            )?;
+            update.replace_document(search, 0_u32.to_be_bytes().to_vec(), "afterfirst")?;
+            update.replace_document(search, 511_u32.to_be_bytes().to_vec(), "afterlast")?;
+            assert!(matches!(
+                update.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let csn = reopened
+                .recovery_report()
+                .visible_csn
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            assert!(matches!(csn.get(), 1 | 2));
+            assert_multilevel_publication_state(&reopened, table, search, csn.get() == 2)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn optimistic_commit_boundaries_recover_prior_or_complete_state()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -34411,6 +41530,163 @@ mod tests {
             Some(b"two".to_vec())
         );
         assert_eq!(reopened.get_latest_structure(b"too-late", 153)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_delta_v2_preserves_unchanged_roots_without_materialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut batch = database.begin_optimistic_delta(0, DurabilityClass::Group)?;
+        database.stage_delta_set(&mut batch, b"scalar".to_vec(), b"value".to_vec(), None)?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let report = database.commit_group(vec![batch]);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        let report = report?;
+
+        assert_eq!(report.accepted_commits, 1);
+        assert!(matches!(
+            report.outcomes.as_slice(),
+            [GroupCommitOutcome::Committed(_)]
+        ));
+        assert_eq!(
+            database.get_latest_structure(b"scalar", 0)?,
+            Some(b"value".to_vec())
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"scalar", 0)?,
+            Some(b"value".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_commit_delta_v3_avoids_complete_state_materialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"seed".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut first = database.begin_optimistic_delta(2, DurabilityClass::Group)?;
+        database.stage_delta_set(&mut first, b"first".to_vec(), b"one".to_vec(), None)?;
+        let mut second = database.begin_optimistic_delta(2, DurabilityClass::Group)?;
+        database.stage_delta_set(&mut second, b"second".to_vec(), b"two".to_vec(), None)?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let report = database.commit_group(vec![first, second]);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        let report = report?;
+        assert_eq!(report.accepted_commits, 2);
+        assert_eq!(report.page_synchronizations, 1);
+        assert_eq!(report.wal_synchronizations, 1);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, GroupCommitOutcome::Committed(_)))
+        );
+        assert_eq!(
+            database.get_latest_structure(b"first", 2)?,
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            database.get_latest_structure(b"second", 2)?,
+            Some(b"two".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_scheduler_reuses_published_v3_delta_roots_across_cohorts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"seed".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let scheduler = super::NativeCommitScheduler::start(
+            database,
+            super::GroupCommitConfig::new(2, Duration::from_millis(10), 4)?,
+        )?;
+        let clients = [scheduler.client(), scheduler.client()];
+
+        let mut prior_commit_csn = None;
+        for cohort in 0..3_u8 {
+            let mut batches = Vec::with_capacity(clients.len());
+            for (producer, client) in clients.iter().enumerate() {
+                let mut batch = client.begin_optimistic_delta(2, DurabilityClass::Group)?;
+                client.stage_delta_set(
+                    &mut batch,
+                    vec![cohort, u8::try_from(producer)?],
+                    b"value".to_vec(),
+                    None,
+                )?;
+                batches.push(batch);
+            }
+            let barrier = Barrier::new(clients.len());
+            let submitted = std::thread::scope(|scope| {
+                clients
+                    .iter()
+                    .zip(batches)
+                    .map(|(client, batch)| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            client.submit(batch)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(std::thread::ScopedJoinHandle::join)
+                    .collect::<Vec<_>>()
+            });
+            let receipts = submitted
+                .into_iter()
+                .map(|joined| -> Result<_, Box<dyn std::error::Error>> {
+                    let receipt =
+                        joined.map_err(|_| std::io::Error::other("delta submitter panicked"))??;
+                    Ok(receipt)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.durability_cohort_size == 2)
+            );
+            let current_commit_csn = receipts
+                .iter()
+                .map(|receipt| receipt.commit_csn)
+                .max()
+                .ok_or("empty delta cohort")?;
+            if let Some(prior) = prior_commit_csn {
+                assert!(current_commit_csn > prior);
+            }
+            prior_commit_csn = Some(current_commit_csn);
+        }
+        scheduler.shutdown()?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        for cohort in 0..3_u8 {
+            for producer in 0..2_u8 {
+                assert_eq!(
+                    reopened.get_latest_structure(&[cohort, producer], 2)?,
+                    Some(b"value".to_vec())
+                );
+            }
+        }
         Ok(())
     }
 
@@ -36795,6 +44071,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn latest_relational_scan_is_bounded_resumable_and_skips_tombstones()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -36851,11 +44128,63 @@ mod tests {
         );
         assert!(database.scan_latest_relational(table, None, 0)?.is_empty());
         let half_open = assert_latest_relational_range_contract(&database, table)?;
+        let segment_lower = 100_u32.to_be_bytes();
+        let segment_upper = 400_u32.to_be_bytes();
+        let segmented = database.scan_latest_relational_range_profiled(
+            table,
+            Bound::Included(segment_lower.as_slice()),
+            Bound::Excluded(segment_upper.as_slice()),
+            512,
+        )?;
+        assert_eq!(segmented.snapshot_csn, Some(Csn::new(2)?));
+        assert_eq!(segmented.rows.len(), 300);
+        assert!(segmented.planned_segments > 1);
+        assert!(segmented.planned_physical_entries >= segmented.rows.len());
+        assert!(segmented.planning.is_none());
+        assert!(segmented.execution.is_none());
+        assert_eq!(segmented.planned_workers, 1);
+        assert_eq!(segmented.worker_batches, 0);
+        assert_eq!(
+            segmented.rows.first().map(|row| row.primary_key.as_slice()),
+            Some(segment_lower.as_slice())
+        );
+        assert_eq!(
+            segmented.rows.last().map(|row| row.primary_key.as_slice()),
+            Some(399_u32.to_be_bytes().as_slice())
+        );
         assert!(matches!(
             database.scan_latest_relational(ObjectId::new(9_999)?, None, 1),
             Err(NativeRuntimeError::UnknownRelation { table: missing })
                 if missing == ObjectId::new(9_999)?
         ));
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let parallel = database.scan_latest_relational_range_profiled(
+            table,
+            Bound::Included(segment_lower.as_slice()),
+            Bound::Excluded(segment_upper.as_slice()),
+            512,
+        )?;
+        assert_eq!(parallel.rows, segmented.rows);
+        let expected_workers = u64::try_from(parallel.planned_segments)?.min(4);
+        assert_eq!(parallel.planned_workers, expected_workers);
+        assert_eq!(u64::try_from(parallel.worker_batches)?, expected_workers);
+        assert!(parallel.planning.is_some());
+        let execution = parallel
+            .execution
+            .ok_or_else(|| std::io::Error::other("missing segment execution admission"))?;
+        assert_eq!(execution.request.compute_threads, expected_workers);
+        assert_eq!(execution.request.io_slots, expected_workers);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
 
         drop(database);
         let reopened = NativeDatabase::open(temporary.path())?;
@@ -37033,6 +44362,356 @@ mod tests {
             reopened.execute_prepared_latest(&reopened_plan, &[])?,
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vectorized_sql_scan_matches_scalar_oracle_and_uses_governed_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_bounded_sql_scan(&mut database)?;
+        mutate_bounded_sql_scan(&mut database)?;
+        let query = "SELECT sequence, payload FROM events
+            WHERE tenant = ? AND payload != ?
+            ORDER BY tenant, sequence LIMIT 400";
+        let parameters = [SqlValue::Signed(1), SqlValue::Text("event-0256".to_owned())];
+        let materialized = database.snapshot(12)?;
+        let scalar_plan = materialized.prepare_sql(query)?;
+        let expected = materialized.execute_prepared(&scalar_plan, &parameters)?;
+        let SqlResult::Rows { rows, .. } = &expected else {
+            return Err("expected scalar rows".into());
+        };
+        assert_eq!(rows.len(), 400);
+
+        let physical_plan = database.prepare_sql_latest(query)?;
+        let serial = database.execute_prepared_latest_profiled(&physical_plan, &parameters)?;
+        assert_eq!(serial.result, expected);
+        assert_eq!(serial.path, super::NativeSqlExecutionPath::VectorizedSerial);
+        assert_eq!(serial.vector_batches, 1);
+        assert!(serial.candidate_rows >= 400);
+        assert_eq!(serial.planned_workers, 1);
+        assert_eq!(serial.worker_batches, 0);
+
+        let small_plan = database
+            .prepare_sql_latest("SELECT sequence FROM events ORDER BY tenant, sequence LIMIT 16")?;
+        let small = database.execute_prepared_latest_profiled(&small_plan, &[])?;
+        assert_eq!(small.path, super::NativeSqlExecutionPath::Direct);
+        assert_eq!(small.candidate_rows, 16);
+        assert_eq!(small.vector_batches, 0);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let parallel = database.execute_prepared_latest_profiled(&physical_plan, &parameters)?;
+        assert_eq!(parallel.result, expected);
+        assert_eq!(
+            parallel.path,
+            super::NativeSqlExecutionPath::VectorizedParallel
+        );
+        assert_eq!(parallel.vector_batches, serial.vector_batches);
+        assert_eq!(parallel.candidate_rows, serial.candidate_rows);
+        assert_eq!(parallel.planned_workers, 2);
+        assert_eq!(parallel.worker_batches, 2);
+        let execution = parallel
+            .execution
+            .ok_or_else(|| std::io::Error::other("missing SQL execution admission"))?;
+        assert_eq!(execution.class, WorkloadClass::ForegroundBounded);
+        assert_eq!(execution.request.compute_threads, 2);
+        assert_eq!(execution.request.io_slots, 2);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        Ok(())
+    }
+
+    const SECONDARY_INTERSECTION_QUERY: &str = "SELECT id FROM events
+        WHERE tenant = ? AND active = ?
+        ORDER BY id LIMIT 10";
+
+    fn secondary_intersection_parameters() -> [SqlValue; 2] {
+        [SqlValue::Text("alpha".to_owned()), SqlValue::Boolean(true)]
+    }
+
+    fn expected_secondary_intersection() -> SqlResult {
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: vec![
+                vec![SqlValue::Signed(1)],
+                vec![SqlValue::Signed(4)],
+                vec![SqlValue::Signed(5)],
+            ],
+        }
+    }
+
+    fn seed_secondary_intersection(
+        database: &mut NativeDatabase,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(20, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing events table".into());
+        };
+        for (id, tenant, active) in [
+            (1_i64, "alpha", true),
+            (2, "alpha", false),
+            (3, "beta", true),
+            (4, "alpha", true),
+            (5, "alpha", true),
+        ] {
+            seed.execute_sql(
+                "INSERT INTO events (id, tenant, active) VALUES (?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Text(tenant.to_owned()),
+                    SqlValue::Boolean(active),
+                ],
+            )?;
+        }
+        let SqlResult::Command {
+            object_id: Some(tenant_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?
+        else {
+            return Err("missing tenant index".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(active_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_active ON events (active)", &[])?
+        else {
+            return Err("missing active index".into());
+        };
+        assert_eq!(
+            seed.execute_sql(
+                SECONDARY_INTERSECTION_QUERY,
+                &secondary_intersection_parameters(),
+            )?,
+            expected_secondary_intersection()
+        );
+        assert_eq!(
+            seed.execute_sql(
+                "EXPLAIN SELECT id FROM events
+                 WHERE tenant = 'alpha' AND active = TRUE
+                 ORDER BY id LIMIT 10",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexIntersection(table={table},indexes=[{tenant_index},{active_index}],limit=10)",
+                ))]],
+            }
+        );
+        seed.commit()?;
+        Ok(table)
+    }
+
+    #[test]
+    fn secondary_index_intersection_matches_every_executor_and_prefers_composite_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let table = seed_secondary_intersection(&mut database)?;
+        let parameters = secondary_intersection_parameters();
+        let expected = expected_secondary_intersection();
+
+        let snapshot = database.snapshot(21)?;
+        let snapshot_plan = snapshot.prepare_sql(SECONDARY_INTERSECTION_QUERY)?;
+        assert_eq!(
+            snapshot.execute_prepared(&snapshot_plan, &parameters)?,
+            expected
+        );
+        let latest_plan = database.prepare_sql_latest(SECONDARY_INTERSECTION_QUERY)?;
+        let intersection = database.execute_prepared_latest_profiled(&latest_plan, &parameters)?;
+        assert_eq!(intersection.result, expected);
+        assert_eq!(
+            intersection.path,
+            super::NativeSqlExecutionPath::IndexIntersection
+        );
+        assert_eq!(intersection.candidate_rows, 3);
+        assert_eq!(intersection.index_stream_rows, 8);
+        assert_eq!(intersection.intersection_start_rows, 4);
+        assert_eq!(intersection.vector_batches, 0);
+        assert_eq!(
+            database.execute_prepared_latest(
+                &latest_plan,
+                &[SqlValue::Text("alpha".to_owned()), SqlValue::Null],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+
+        let mut composite = database.begin_sql(22, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(composite_index),
+            ..
+        } = composite.execute_sql(
+            "CREATE INDEX events_tenant_active ON events (tenant, active)",
+            &[],
+        )?
+        else {
+            return Err("missing composite index".into());
+        };
+        assert_eq!(
+            composite.execute_sql(
+                "EXPLAIN SELECT id FROM events
+                 WHERE tenant = 'alpha' AND active = TRUE
+                 ORDER BY id LIMIT 10",
+                &[],
+            )?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text(format!(
+                    "SecondaryIndexLookup(table={table},index={composite_index},limit=10)",
+                ))]],
+            }
+        );
+        composite.commit()?;
+        assert!(matches!(
+            database.execute_prepared_latest(&latest_plan, &parameters),
+            Err(SqlError::CatalogChanged)
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_plan = reopened.prepare_sql_latest(SECONDARY_INTERSECTION_QUERY)?;
+        assert_eq!(
+            reopened.execute_prepared_latest(&reopened_plan, &parameters)?,
+            expected
+        );
+        Ok(())
+    }
+
+    fn seed_skewed_secondary_indexes(
+        database: &mut NativeDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut seed = database.begin_sql(30, DurabilityClass::Strict)?;
+        seed.execute_sql(
+            "CREATE TABLE measurements (
+                id BIGINT PRIMARY KEY,
+                broad BOOLEAN NOT NULL,
+                medium BIGINT NOT NULL,
+                narrow BIGINT NOT NULL
+            )",
+            &[],
+        )?;
+        for id in 0_i64..384 {
+            seed.execute_sql(
+                "INSERT INTO measurements (id, broad, medium, narrow)
+                 VALUES (?, ?, ?, ?)",
+                &[
+                    SqlValue::Signed(id),
+                    SqlValue::Boolean(true),
+                    SqlValue::Signed(id % 8),
+                    SqlValue::Signed(id),
+                ],
+            )?;
+        }
+        seed.execute_sql("CREATE INDEX measure_broad ON measurements (broad)", &[])?;
+        seed.execute_sql("CREATE INDEX measure_medium ON measurements (medium)", &[])?;
+        seed.execute_sql("CREATE INDEX measure_narrow ON measurements (narrow)", &[])?;
+        seed.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn three_index_intersection_starts_from_a_selective_leaf_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_skewed_secondary_indexes(&mut database)?;
+        let query = "SELECT id FROM measurements
+            WHERE broad = ? AND medium = ? AND narrow = ?
+            ORDER BY id LIMIT 10";
+        let parameters = [
+            SqlValue::Boolean(true),
+            SqlValue::Signed(3),
+            SqlValue::Signed(211),
+        ];
+        let plan = database.prepare_sql_latest(query)?;
+        let receipt = database.execute_prepared_latest_profiled(&plan, &parameters)?;
+        assert_eq!(
+            receipt.path,
+            super::NativeSqlExecutionPath::IndexIntersection
+        );
+        assert_eq!(receipt.candidate_rows, 1);
+        assert_eq!(receipt.index_stream_rows, 433);
+        assert!(receipt.intersection_start_rows <= 48);
+        assert_eq!(
+            receipt.result,
+            SqlResult::Rows {
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![SqlValue::Signed(211)]],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_sql_cache_reuses_invalidates_and_bounds_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_secondary_intersection(&mut database)?;
+
+        let first = database.prepare_sql_latest(SECONDARY_INTERSECTION_QUERY)?;
+        let first_stats = database.sql_plan_cache_stats();
+        assert_eq!(first_stats.entries, 1);
+        assert_eq!(first_stats.hits, 0);
+        assert_eq!(first_stats.misses, 1);
+        assert_eq!(first_stats.catalog_invalidations, 0);
+        let second = database.prepare_sql_latest(SECONDARY_INTERSECTION_QUERY)?;
+        assert_eq!(second, first);
+        assert_eq!(database.sql_plan_cache_stats().hits, 1);
+
+        let mut ddl = database.begin_sql(21, DurabilityClass::Strict)?;
+        ddl.execute_sql("CREATE INDEX events_id_tenant ON events (id, tenant)", &[])?;
+        ddl.commit()?;
+        assert!(matches!(
+            database.execute_prepared_latest(&first, &secondary_intersection_parameters()),
+            Err(SqlError::CatalogChanged)
+        ));
+        let rebound = database.prepare_sql_latest(SECONDARY_INTERSECTION_QUERY)?;
+        assert_ne!(rebound.catalog_version(), first.catalog_version());
+        assert_eq!(
+            database.sql_plan_cache_stats(),
+            super::NativeSqlPlanCacheStats {
+                catalog_version: Some(rebound.catalog_version()),
+                entries: 1,
+                hits: 1,
+                misses: 2,
+                catalog_invalidations: 1,
+                capacity_evictions: 0,
+            }
+        );
+        {
+            let mut cache = database.sql_plan_cache();
+            for ordinal in 0..super::MAX_NATIVE_SQL_PLAN_CACHE_ENTRIES {
+                cache.insert(&format!("synthetic-plan-{ordinal}"), rebound.clone());
+            }
+        }
+        let capacity = database.sql_plan_cache_stats();
+        assert_eq!(capacity.entries, super::MAX_NATIVE_SQL_PLAN_CACHE_ENTRIES);
+        assert_eq!(capacity.capacity_evictions, 1);
         Ok(())
     }
 
@@ -39184,10 +46863,11 @@ mod tests {
             expected_medellin
         );
         let latest_plan = database.prepare_sql_latest(indexed_join_query())?;
-        assert_eq!(
-            database.execute_prepared_latest(&latest_plan, &mario)?,
-            expected_medellin
-        );
+        let point = database.execute_prepared_latest_profiled(&latest_plan, &mario)?;
+        assert_eq!(point.result, expected_medellin);
+        assert_eq!(point.path, super::NativeSqlExecutionPath::Direct);
+        assert_eq!(point.candidate_rows, 1);
+        assert_eq!(point.join_right_probes, 1);
         for email in [
             "two@hyphae.local",
             "three@hyphae.local",
@@ -39260,10 +46940,14 @@ mod tests {
             expected
         );
         let latest_plan = database.prepare_sql_latest(query)?;
+        let bounded = database.execute_prepared_latest_profiled(&latest_plan, &parameters)?;
+        assert_eq!(bounded.result, expected);
         assert_eq!(
-            database.execute_prepared_latest(&latest_plan, &parameters)?,
-            expected
+            bounded.path,
+            super::NativeSqlExecutionPath::IndexedNestedLoopJoin
         );
+        assert_eq!(bounded.candidate_rows, 4);
+        assert_eq!(bounded.join_right_probes, 4);
         drop(database);
 
         let reopened = NativeDatabase::open(temporary.path())?;
@@ -41010,6 +48694,264 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_ann_uses_only_governed_persistent_workers_and_matches_serial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(73)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "governed-exact",
+            4,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vectors(
+            index,
+            (1..=64_u16)
+                .map(|value| -> Result<_, Box<dyn std::error::Error>> {
+                    Ok((
+                        ObjectId::new(u128::from(value))?,
+                        Vector::new([
+                            f32::from(value),
+                            f32::from(value % 7),
+                            f32::from(value % 11),
+                            1.0,
+                        ])?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        create.commit()?;
+        let query = Vector::new([32.0, 4.0, 10.0, 1.0])?;
+        let serial_receipt = database.search_vector_exact_latest_profiled(index, &query, 12)?;
+        let serial = serial_receipt.hits;
+        assert_eq!(serial_receipt.planned_vectors, 64);
+        assert_eq!(serial_receipt.planned_batches, 1);
+        assert!(serial_receipt.planning.is_none());
+        assert!(serial_receipt.execution.is_none());
+        assert_eq!(serial_receipt.planned_compute_threads, 1);
+        assert_eq!(serial_receipt.worker_batches, 0);
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let completed_before = execution_pool.completed_jobs();
+        let parallel_receipt = database.search_vector_exact_latest_profiled(index, &query, 12)?;
+        let parallel = &parallel_receipt.hits;
+
+        assert_eq!(parallel, &serial);
+        assert_eq!(parallel_receipt.snapshot_csn, Some(Csn::new(1)?));
+        assert_eq!(
+            parallel_receipt.planned_compute_threads,
+            policy
+                .limit(WorkloadClass::ForegroundBounded)
+                .compute_threads
+        );
+        assert_eq!(
+            parallel_receipt.planned_memory_bytes,
+            super::exact_ann_memory_bytes(64, query.dimension())
+        );
+        assert_eq!(parallel_receipt.planned_vectors, 64);
+        assert_eq!(
+            u64::try_from(parallel_receipt.planned_batches)?,
+            parallel_receipt.planned_compute_threads
+        );
+        assert_eq!(
+            u64::try_from(parallel_receipt.worker_batches)?,
+            parallel_receipt.planned_compute_threads
+        );
+        let planning = parallel_receipt
+            .planning
+            .ok_or_else(|| std::io::Error::other("missing planning admission"))?;
+        assert_eq!(planning.class, WorkloadClass::ForegroundBounded);
+        assert_eq!(planning.request.compute_threads, 1);
+        assert_eq!(planning.queue_ticket, None);
+        let execution = parallel_receipt
+            .execution
+            .ok_or_else(|| std::io::Error::other("missing execution admission"))?;
+        assert_eq!(execution.class, WorkloadClass::ForegroundBounded);
+        assert_eq!(
+            execution.request.compute_threads,
+            parallel_receipt.planned_compute_threads
+        );
+        assert_eq!(
+            execution.request.memory_bytes,
+            parallel_receipt.planned_memory_bytes
+        );
+        assert_eq!(execution.queue_ticket, None);
+        assert_eq!(
+            execution_pool.completed_jobs() - completed_before,
+            policy
+                .limit(WorkloadClass::ForegroundBounded)
+                .compute_threads
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert!(database.execution_pool().is_some());
+
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::from_secs(1),
+        )?;
+        let held = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: policy
+                    .limit(WorkloadClass::ForegroundBounded)
+                    .compute_threads,
+                io_slots: 1,
+                memory_bytes: super::FOREGROUND_BOUNDED_MEMORY_BYTES,
+            },
+        )?;
+        let release_governor = Arc::clone(&governor);
+        let release = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while release_governor.queued_requests() == 0 {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::other(
+                        "exact ANN did not enter the governor queue",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            drop(held);
+            Ok(())
+        });
+        let queued_receipt = database.search_vector_exact_latest_profiled(index, &query, 12)?;
+        release
+            .join()
+            .map_err(|_| std::io::Error::other("release thread panicked"))??;
+        let queued_planning = queued_receipt
+            .planning
+            .ok_or_else(|| std::io::Error::other("missing queued planning admission"))?;
+        assert!(queued_planning.queue_ticket.is_some());
+        assert!(queued_planning.queue_time >= Duration::from_millis(1));
+        assert_eq!(queued_receipt.hits, serial);
+        assert_eq!(governor.queued_requests(), 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+
+        let mut constrained_policy = policy.clone();
+        constrained_policy.memory_bytes = super::FOREGROUND_BOUNDED_MEMORY_BYTES;
+        for limit in &mut constrained_policy.class_limits {
+            limit.memory_bytes = super::FOREGROUND_BOUNDED_MEMORY_BYTES;
+        }
+        let constrained_governor = Arc::new(NativeResourceGovernor::new(constrained_policy));
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&constrained_governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let completed_before_rejection = execution_pool.completed_jobs();
+        assert!(matches!(
+            database.search_vector_exact_latest(index, &query, 12),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ClassLimit
+            ))
+        ));
+        assert_eq!(execution_pool.completed_jobs(), completed_before_rejection);
+        assert_eq!(constrained_governor.usage_snapshot().compute_threads, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_hnsw_build_uses_governed_workers_without_publishing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let definition = VectorIndexDefinition::new(
+            ObjectId::new(74)?,
+            8,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(8, 48, 32, 64, 0x5041_5254)?,
+        )?;
+        let records = (1..=256_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: ObjectId::new(u128::from(value))?,
+                    creating_csn: Csn::new(u64::from(value))?,
+                    vector: Vector::new([
+                        f32::from(value),
+                        f32::from(value % 3),
+                        f32::from(value % 5),
+                        f32::from(value % 7),
+                        f32::from(value % 11),
+                        f32::from(value % 13),
+                        f32::from(value % 17),
+                        1.0,
+                    ])?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let physical_before = database.physical_observation()?;
+        let serial =
+            database.build_partitioned_hnsw_experimental(definition, records.clone(), 4)?;
+        assert_eq!(serial.planned_vectors, 256);
+        assert_eq!(serial.planned_partitions, 4);
+        assert_eq!(serial.planned_compute_threads, 1);
+        assert_eq!(serial.worker_batches, 1);
+        assert!(serial.execution.is_none());
+
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::ZERO,
+        )?;
+        let completed_before = execution_pool.completed_jobs();
+        let parallel = database.build_partitioned_hnsw_experimental(
+            definition,
+            records.into_iter().rev().collect(),
+            4,
+        )?;
+        assert_eq!(parallel.index, serial.index);
+        assert_eq!(parallel.planned_compute_threads, 4);
+        assert_eq!(parallel.worker_batches, 4);
+        assert_eq!(execution_pool.completed_jobs() - completed_before, 4);
+        assert_eq!(
+            parallel.planned_memory_bytes,
+            super::partitioned_hnsw_build_memory_bytes(256, definition)
+        );
+        let execution = parallel
+            .execution
+            .ok_or_else(|| std::io::Error::other("missing bulk admission"))?;
+        assert_eq!(execution.class, WorkloadClass::Bulk);
+        assert_eq!(execution.request.compute_threads, 4);
+        assert_eq!(execution.request.io_slots, 0);
+        assert_eq!(
+            execution.request.memory_bytes,
+            parallel.planned_memory_bytes
+        );
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(
+            physical_after.physical_page_reads,
+            physical_before.physical_page_reads
+        );
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert!(matches!(
+            database.build_partitioned_hnsw_experimental(definition, Vec::new(), 0),
+            Err(NativeRuntimeError::Ann(
+                hyphae_native_ann::AnnError::InvalidPartitionCount
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn initial_ann_base_admits_more_vectors_than_the_delta_ceiling()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -41046,6 +48988,60 @@ mod tests {
             reopened.observe_ann_index(index)?.base_vector_count,
             vector_count
         );
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_build_progress_is_monotonic_and_preserves_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(4)?;
+        let vectors = (1..=32_u16)
+            .map(|offset| {
+                Ok((
+                    ObjectId::new(u128::from(offset))?,
+                    Vector::new([1.0, f32::from(offset) / 32.0])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut progress = Vec::new();
+        let mut create = database.begin(10, DurabilityClass::Memory)?;
+        create.create_vector_index(
+            index,
+            "initial-progress",
+            2,
+            VectorMetric::Cosine,
+            ann_config()?,
+        )?;
+
+        assert_eq!(
+            create.upsert_vectors_with_progress(index, vectors, |value| {
+                progress.push(value);
+            })?,
+            32
+        );
+        assert_eq!(
+            progress
+                .first()
+                .map(|value| (value.completed(), value.total())),
+            Some((0, 32))
+        );
+        assert_eq!(
+            progress
+                .last()
+                .map(|value| (value.completed(), value.total())),
+            Some((32, 32))
+        );
+        assert!(progress.windows(2).all(|values| {
+            values[1].completed() == values[0].completed() + 1
+                && values[1].total() == values[0].total()
+        }));
+
+        create.commit()?;
+        let observed = database.observe_ann_index(index)?;
+        assert_eq!(observed.base_vector_count, 32);
+        assert_eq!(observed.effective_vector_count, 32);
         Ok(())
     }
 
@@ -41954,6 +49950,2888 @@ mod tests {
             database.commit_optimistic(field_expiry),
             Err(NativeRuntimeError::WriteConflict(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn structure_v2_to_v3_transform_is_deterministic_lossless_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let large_scalar = vec![0x5a; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"scalar".to_vec(), large_scalar.clone(), Some(10_000))?;
+        seed.set(b"dead-scalar".to_vec(), b"obsolete".to_vec(), Some(9_000))?;
+
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"live".to_vec(), b"value".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"leased".to_vec(), b"ttl".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"dead".to_vec(), b"obsolete".to_vec())?;
+        assert!(seed.expire_hash_field(b"hash".to_vec(), b"leased".to_vec(), 8_000,)?);
+        assert!(seed.expire_hash(b"hash".to_vec(), 20_000)?);
+
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"live".to_vec())?);
+        assert!(seed.sadd(b"set".to_vec(), b"dead".to_vec())?);
+        assert!(seed.expire_set(b"set".to_vec(), 21_000)?);
+
+        seed.create_list(b"list".to_vec())?;
+        for index in 0..70_u32 {
+            seed.rpush(b"list".to_vec(), index.to_be_bytes().to_vec())?;
+        }
+        assert!(seed.expire_list(b"list".to_vec(), 22_000)?);
+
+        seed.create_stream(b"stream".to_vec())?;
+        assert_eq!(
+            seed.xadd(
+                b"stream".to_vec(),
+                &[(b"kind".to_vec(), b"created".to_vec())],
+            )?,
+            1
+        );
+        assert_eq!(
+            seed.xadd(
+                b"stream".to_vec(),
+                &[(b"kind".to_vec(), b"updated".to_vec())],
+            )?,
+            2
+        );
+        assert!(seed.expire_stream(b"stream".to_vec(), 23_000)?);
+
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), -1.5, b"first".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), 2.25, b"dead".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert!(seed.expire_sorted_set(b"sorted".to_vec(), 24_000)?);
+        seed.commit()?;
+
+        let mut tombstone = database.begin(11, DurabilityClass::Strict)?;
+        assert!(tombstone.delete_structure(b"dead-scalar".to_vec())?);
+        assert!(tombstone.hdelete(b"hash".to_vec(), b"dead".to_vec())?);
+        assert!(tombstone.srem(b"set".to_vec(), b"dead".to_vec())?);
+        assert!(tombstone.zrem(b"sorted".to_vec(), b"dead".to_vec())?);
+        tombstone.commit()?;
+
+        let source_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let source_entries = BTree::from_root(source_root).scan(&database.pages)?;
+        let source_state =
+            super::load_structure_state_root(&database.pages, &database.blobs, source_root)
+                .map_err(|error| format!("valid V2 source load failed: {error:?}"))?;
+        assert_eq!(
+            source_state.entries.get(b"scalar".as_slice()),
+            Some(&super::StructureEntry {
+                value: large_scalar,
+                expires_at_micros: Some(10_000),
+            })
+        );
+        assert_eq!(source_state.lists[b"list".as_slice()].len(), 70);
+        assert!(
+            source_entries
+                .iter()
+                .any(|(_, encoded)| super::is_structure_tombstone(encoded))
+        );
+
+        let migration_transaction = TransactionId::new(500)?;
+        let first = super::structure_v3::migrate_v2_structure_tree_to_v3(
+            &mut database.pages,
+            &database.blobs,
+            BTree::from_root(source_root),
+            Csn::new(3)?,
+            migration_transaction,
+        )
+        .map_err(|error| format!("first V2 to V3 transform failed: {error:?}"))?;
+        let second = super::structure_v3::migrate_v2_structure_tree_to_v3(
+            &mut database.pages,
+            &database.blobs,
+            BTree::from_root(source_root),
+            Csn::new(4)?,
+            migration_transaction,
+        )?;
+        let different_identity = super::structure_v3::migrate_v2_structure_tree_to_v3(
+            &mut database.pages,
+            &database.blobs,
+            BTree::from_root(source_root),
+            Csn::new(5)?,
+            TransactionId::new(501)?,
+        )?;
+
+        let first_entries = first.scan(&database.pages)?;
+        assert_eq!(first_entries, second.scan(&database.pages)?);
+        assert_ne!(first_entries, different_identity.scan(&database.pages)?);
+        assert_eq!(
+            first_entries.first().map(|entry| entry.1.as_slice()),
+            Some(super::structure_v3::STRUCTURE_FORMAT_VALUE_V3.as_slice())
+        );
+        assert!(
+            first_entries
+                .iter()
+                .all(|(_, encoded)| !super::is_structure_tombstone(encoded))
+        );
+        assert_eq!(
+            super::structure_v3::load_structure_state_v3(&database.pages, &database.blobs, first,)?,
+            source_state
+        );
+        assert_eq!(
+            super::structure_v3::load_structure_state_v3(
+                &database.pages,
+                &database.blobs,
+                different_identity,
+            )?,
+            source_state
+        );
+        assert_eq!(
+            BTree::from_root(source_root).scan(&database.pages)?,
+            source_entries
+        );
+
+        let corrupt = BTree::from_root(source_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(6)?,
+                super::structure_set_member_key(b"orphan", b"member")?,
+                super::set_member_live_value(),
+            )?
+            .tree;
+        let pages_before_rejection = database.pages.page_count();
+        assert!(matches!(
+            super::structure_v3::migrate_v2_structure_tree_to_v3(
+                &mut database.pages,
+                &database.blobs,
+                corrupt,
+                Csn::new(7)?,
+                TransactionId::new(502)?,
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        assert_eq!(database.pages.page_count(), pages_before_rejection);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_structure_v3_migration_publishes_one_valid_writable_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), Some(100))?;
+        seed.set(b"dead".to_vec(), b"obsolete".to_vec(), None)?;
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"member".to_vec())?);
+        seed.commit()?;
+        let mut remove = database.begin(11, DurabilityClass::Strict)?;
+        assert!(remove.delete_structure(b"dead".to_vec())?);
+        remove.commit()?;
+
+        let source_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let source_entries = BTree::from_root(source_root).scan(&database.pages)?;
+        let source_state =
+            super::load_structure_state_root(&database.pages, &database.blobs, source_root)?;
+        let receipt = database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        assert_eq!(database.structure_format, super::StructureFormat::BTreeV3);
+        assert_eq!(receipt.source_entries, source_entries.len());
+        assert_eq!(
+            receipt.source_entries - receipt.target_entries,
+            receipt.dropped_tombstones
+        );
+        assert!(receipt.dropped_tombstones > 0);
+        assert!(receipt.pages_appended > 0);
+
+        let target_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_ne!(target_root, source_root);
+        assert_eq!(
+            super::load_structure_state_root(&database.pages, &database.blobs, target_root)?,
+            source_state
+        );
+        assert_eq!(
+            BTree::from_root(source_root).scan(&database.pages)?,
+            source_entries
+        );
+        let v3_compaction = database.compact_structure(DurabilityClass::Strict)?;
+        assert_eq!(v3_compaction.scanned_entries, receipt.target_entries);
+        assert_eq!(v3_compaction.retained_entries, receipt.target_entries);
+        assert_eq!(v3_compaction.dropped_tombstones, 0);
+        assert_eq!(v3_compaction.commit, None);
+        assert!(matches!(
+            database.migrate_structure_to_v3(DurabilityClass::Strict),
+            Err(NativeRuntimeError::StructureV3MigrationUnsupported)
+        ));
+
+        let mut update = database.begin(12, DurabilityClass::Strict)?;
+        assert!(update.delete_set(b"set".to_vec())?);
+        update.create_hash(b"allowed".to_vec())?;
+        assert_eq!(
+            update.hset(b"allowed".to_vec(), b"field".to_vec(), vec![6; 9_000],)?,
+            HashSetOutcome::Added
+        );
+        update.set(b"scalar-v3".to_vec(), vec![7; 9_000], None)?;
+        update.commit()?;
+        let updated_root = database
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let updated =
+            super::load_structure_state_root(&database.pages, &database.blobs, updated_root)?;
+        assert!(!updated.sets.contains_key(b"set".as_slice()));
+        assert_eq!(
+            updated.hashes[b"allowed".as_slice()][b"field".as_slice()],
+            vec![6; 9_000]
+        );
+        assert_eq!(
+            updated.entries[b"scalar-v3".as_slice()].value,
+            vec![7; 9_000]
+        );
+        assert_eq!(
+            BTree::from_root(source_root).scan(&database.pages)?,
+            source_entries
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root,)?,
+            updated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_member_and_list_boundary_mutations_preserve_logical_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let large = vec![0x5a; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"leased".to_vec(), large.clone())?;
+        seed.hset(b"hash".to_vec(), b"remove".to_vec(), b"old".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"keep".to_vec(), b"value".to_vec())?;
+        assert!(seed.expire_hash_field(b"hash".to_vec(), b"leased".to_vec(), 10_000)?);
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"remove".to_vec())?);
+        assert!(seed.sadd(b"set".to_vec(), b"remove-too".to_vec())?);
+        assert!(seed.sadd(b"set".to_vec(), b"keep".to_vec())?);
+        seed.create_list(b"list".to_vec())?;
+        seed.rpush(b"list".to_vec(), b"middle".to_vec())?;
+        seed.rpush(b"list".to_vec(), large.clone())?;
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), 1.0, b"remove".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), 2.0, b"keep".to_vec())?,
+            ZAddOutcome::Added
+        );
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let migrated_root = database
+            .coordinator
+            .snapshot(10)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+
+        let mut mutate = database.begin(11, DurabilityClass::Strict)?;
+        assert_eq!(
+            mutate.hdelete_many(
+                b"hash".to_vec(),
+                vec![b"missing".to_vec(), b"remove".to_vec(), b"leased".to_vec()],
+            )?,
+            2
+        );
+        assert_eq!(
+            mutate.srem_many(
+                b"set".to_vec(),
+                vec![
+                    b"remove-too".to_vec(),
+                    b"missing".to_vec(),
+                    b"remove".to_vec(),
+                ],
+            )?,
+            2
+        );
+        assert_eq!(mutate.lpush(b"list".to_vec(), b"head".to_vec())?, 3);
+        assert_eq!(mutate.lpop(b"list".to_vec())?, Some(b"head".to_vec()));
+        assert_eq!(mutate.rpop(b"list".to_vec())?, Some(large));
+        assert!(mutate.zrem(b"sorted".to_vec(), b"remove".to_vec())?);
+        mutate.commit()?;
+
+        let committed_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let state =
+            super::load_structure_state_root(&database.pages, &database.blobs, committed_root)?;
+        assert_eq!(state.hashes[b"hash".as_slice()].len(), 1);
+        assert!(state.hashes[b"hash".as_slice()].contains_key(b"keep".as_slice()));
+        assert_eq!(state.sets[b"set".as_slice()], [b"keep".to_vec()].into());
+        assert_eq!(
+            state.lists[b"list".as_slice()],
+            std::collections::VecDeque::from([b"middle".to_vec()])
+        );
+        assert_eq!(state.sorted_sets[b"sorted".as_slice()].len(), 1);
+        assert!(state.sorted_sets[b"sorted".as_slice()].contains_key(b"keep".as_slice()));
+        assert_eq!(
+            BTree::from_root(migrated_root).scan(&database.pages)?,
+            migrated_entries
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root)?,
+            state
+        );
+        Ok(())
+    }
+
+    fn stage_structure_v3_member_and_list_mutations(
+        database: &mut NativeDatabase,
+    ) -> Result<super::NativeTransaction<'_>, NativeRuntimeError> {
+        let mut mutate = database.begin(11, DurabilityClass::Strict)?;
+        assert!(mutate.hdelete(b"hash".to_vec(), b"remove".to_vec())?);
+        assert!(mutate.srem(b"set".to_vec(), b"remove".to_vec())?);
+        assert_eq!(mutate.lpush(b"list".to_vec(), b"head".to_vec())?, 3);
+        assert_eq!(mutate.lpop(b"list".to_vec())?, Some(b"head".to_vec()));
+        assert_eq!(mutate.rpop(b"list".to_vec())?, Some(b"tail".to_vec()));
+        assert!(mutate.zrem(b"sorted".to_vec(), b"remove".to_vec())?);
+        Ok(mutate)
+    }
+
+    fn assert_structure_v3_member_and_list_mutations(
+        database: &NativeDatabase,
+    ) -> Result<(), NativeRuntimeError> {
+        let snapshot = database.snapshot(11)?;
+        assert_eq!(snapshot.hget(b"hash", b"remove")?, None);
+        assert_eq!(snapshot.hget(b"hash", b"keep")?, Some(b"value".as_slice()));
+        assert!(!snapshot.sismember(b"set", b"remove")?);
+        assert!(snapshot.sismember(b"set", b"keep")?);
+        assert_eq!(snapshot.lrange(b"list", 0, -1)?, vec![b"middle".to_vec()]);
+        assert_eq!(snapshot.zscore(b"sorted", b"remove")?, None);
+        assert_eq!(snapshot.zscore(b"sorted", b"keep")?, Some(2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_member_mutation_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"hash".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"remove".to_vec(), b"old".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"keep".to_vec(), b"value".to_vec())?;
+            seed.create_set(b"set".to_vec())?;
+            assert!(seed.sadd(b"set".to_vec(), b"remove".to_vec())?);
+            assert!(seed.sadd(b"set".to_vec(), b"keep".to_vec())?);
+            seed.create_list(b"list".to_vec())?;
+            seed.rpush(b"list".to_vec(), b"middle".to_vec())?;
+            seed.rpush(b"list".to_vec(), b"tail".to_vec())?;
+            seed.create_sorted_set(b"sorted".to_vec())?;
+            seed.zadd(b"sorted".to_vec(), 1.0, b"remove".to_vec())?;
+            seed.zadd(b"sorted".to_vec(), 2.0, b"keep".to_vec())?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let migrated_root = database
+                .coordinator
+                .snapshot(10)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+            let prior =
+                super::load_structure_state_root(&database.pages, &database.blobs, migrated_root)?;
+
+            assert!(matches!(
+                stage_structure_v3_member_and_list_mutations(&mut database)?
+                    .commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                BTree::from_root(migrated_root).scan(&reopened.pages)?,
+                migrated_entries,
+                "historical V3 root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    let recovered_root = reopened
+                        .coordinator
+                        .snapshot(11)?
+                        .roots()
+                        .root(super::SLOT_STRUCTURE)
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                    assert_eq!(
+                        super::load_structure_state_root(
+                            &reopened.pages,
+                            &reopened.blobs,
+                            recovered_root,
+                        )?,
+                        prior,
+                        "partial prior state at {boundary:?}"
+                    );
+                    stage_structure_v3_member_and_list_mutations(&mut reopened)?.commit()?;
+                }
+                Some(3) => {}
+                recovered => {
+                    return Err(
+                        format!("unexpected recovered CSN {recovered:?} at {boundary:?}").into(),
+                    );
+                }
+            }
+            assert_structure_v3_member_and_list_mutations(&reopened)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_scalar_mutations_preserve_values_expiry_and_historical_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let original_large = vec![0x41; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+        let replacement_large = vec![0x42; super::STRUCTURE_INLINE_VALUE_LIMIT + 2_048];
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"large".to_vec(), original_large, Some(100))?;
+        seed.set(b"counter".to_vec(), b"41".to_vec(), Some(150))?;
+        seed.set(b"leased".to_vec(), b"value".to_vec(), None)?;
+        seed.set(b"deleted".to_vec(), b"obsolete".to_vec(), Some(120))?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let migrated_root = database
+            .coordinator
+            .snapshot(20)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+
+        let mut mutate = database.begin(20, DurabilityClass::Strict)?;
+        mutate.set(b"large".to_vec(), replacement_large.clone(), Some(200))?;
+        assert_eq!(mutate.increment_i64(b"counter".to_vec(), 1)?, 42);
+        assert!(mutate.expire_structure(b"leased".to_vec(), 300)?);
+        assert!(mutate.delete_structure(b"deleted".to_vec())?);
+        assert_eq!(
+            mutate.set_conditional(
+                b"new".to_vec(),
+                b"created".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            )?,
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            mutate.set_conditional(
+                b"large".to_vec(),
+                b"ignored".to_vec(),
+                None,
+                SetCondition::IfAbsent,
+            )?,
+            SetOutcome::NotApplied
+        );
+        mutate.commit()?;
+
+        let snapshot = database.snapshot(20)?;
+        assert_eq!(snapshot.get(b"large"), Some(replacement_large.as_slice()));
+        assert_eq!(snapshot.ttl(b"large"), super::Ttl::RemainingMicros(180));
+        assert_eq!(snapshot.get(b"counter"), Some(b"42".as_slice()));
+        assert_eq!(snapshot.ttl(b"counter"), super::Ttl::RemainingMicros(130));
+        assert_eq!(snapshot.ttl(b"leased"), super::Ttl::RemainingMicros(280));
+        assert_eq!(snapshot.get(b"deleted"), None);
+        assert_eq!(snapshot.get(b"new"), Some(b"created".as_slice()));
+        assert_eq!(
+            BTree::from_root(migrated_root).scan(&database.pages)?,
+            migrated_entries
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(20)?;
+        assert_eq!(snapshot.get(b"large"), Some(replacement_large.as_slice()));
+        assert_eq!(snapshot.get(b"counter"), Some(b"42".as_slice()));
+        assert_eq!(snapshot.get(b"deleted"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_reuse_retires_every_due_collection_family_in_v2_and_v3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for migrate_to_v3 in [false, true] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"hash".to_vec())?;
+            assert!(seed.expire_hash(b"hash".to_vec(), 50)?);
+            seed.create_set(b"set".to_vec())?;
+            assert!(seed.expire_set(b"set".to_vec(), 50)?);
+            seed.create_list(b"list".to_vec())?;
+            assert!(seed.expire_list(b"list".to_vec(), 50)?);
+            seed.create_stream(b"stream".to_vec())?;
+            assert!(seed.expire_stream(b"stream".to_vec(), 50)?);
+            seed.create_sorted_set(b"sorted".to_vec())?;
+            assert!(seed.expire_sorted_set(b"sorted".to_vec(), 50)?);
+            seed.commit()?;
+            if migrate_to_v3 {
+                database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            }
+
+            let mut reuse = database.begin(60, DurabilityClass::Strict)?;
+            for key in scalar_reuse_collection_keys() {
+                reuse.set(key.to_vec(), b"scalar".to_vec(), None)?;
+            }
+            reuse.commit().map_err(|error| {
+                format!("scalar reuse failed with migrate_to_v3={migrate_to_v3}: {error:?}")
+            })?;
+
+            let root = database
+                .coordinator
+                .snapshot(60)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let state = super::load_structure_state_root(&database.pages, &database.blobs, root)?;
+            assert_eq!(state.entries.len(), 5);
+            assert!(state.hashes.is_empty());
+            assert!(state.sets.is_empty());
+            assert!(state.lists.is_empty());
+            assert!(state.streams.is_empty());
+            assert!(state.sorted_sets.is_empty());
+            if migrate_to_v3 {
+                assert_eq!(
+                    BTree::from_root(root)
+                        .scan(&database.pages)?
+                        .iter()
+                        .filter(|(key, value)| {
+                            key.first() == Some(&super::structure_v3::STRUCTURE_RETIREMENT_PREFIX)
+                                && !super::is_structure_tombstone(value)
+                        })
+                        .count(),
+                    5
+                );
+            }
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let snapshot = reopened.snapshot(60)?;
+            for key in scalar_reuse_collection_keys() {
+                assert_eq!(snapshot.get(key), Some(b"scalar".as_slice()));
+            }
+        }
+        Ok(())
+    }
+
+    fn scalar_reuse_collection_keys() -> [&'static [u8]; 5] {
+        [b"hash", b"set", b"list", b"stream", b"sorted"]
+    }
+
+    fn stage_structure_v3_scalar_mutations<'database>(
+        database: &'database mut NativeDatabase,
+        replacement_large: &[u8],
+    ) -> Result<super::NativeTransaction<'database>, NativeRuntimeError> {
+        let mut mutate = database.begin(20, DurabilityClass::Strict)?;
+        mutate.set(b"large".to_vec(), replacement_large.to_vec(), Some(200))?;
+        assert!(mutate.expire_structure(b"leased".to_vec(), 300)?);
+        assert!(mutate.delete_structure(b"deleted".to_vec())?);
+        mutate.set(b"new".to_vec(), b"created".to_vec(), None)?;
+        Ok(mutate)
+    }
+
+    fn assert_structure_v3_scalar_mutations(
+        database: &NativeDatabase,
+        replacement_large: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let snapshot = database.snapshot(20)?;
+        assert_eq!(snapshot.get(b"large"), Some(replacement_large));
+        assert_eq!(snapshot.ttl(b"large"), super::Ttl::RemainingMicros(180));
+        assert_eq!(snapshot.ttl(b"leased"), super::Ttl::RemainingMicros(280));
+        assert_eq!(snapshot.get(b"deleted"), None);
+        assert_eq!(snapshot.get(b"new"), Some(b"created".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_scalar_mutation_boundary_recovers_prior_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let original_large = vec![0x31; super::STRUCTURE_INLINE_VALUE_LIMIT + 1_024];
+            let replacement_large = vec![0x32; super::STRUCTURE_INLINE_VALUE_LIMIT + 2_048];
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.set(b"large".to_vec(), original_large, Some(100))?;
+            seed.set(b"leased".to_vec(), b"value".to_vec(), None)?;
+            seed.set(b"deleted".to_vec(), b"obsolete".to_vec(), Some(120))?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let historical_root = database
+                .coordinator
+                .snapshot(20)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let historical_entries = BTree::from_root(historical_root).scan(&database.pages)?;
+            let prior = super::load_structure_state_root(
+                &database.pages,
+                &database.blobs,
+                historical_root,
+            )?;
+
+            assert!(matches!(
+                stage_structure_v3_scalar_mutations(&mut database, &replacement_large)?
+                    .commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                BTree::from_root(historical_root).scan(&reopened.pages)?,
+                historical_entries,
+                "historical V3 scalar root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    let recovered_root = reopened
+                        .coordinator
+                        .snapshot(20)?
+                        .roots()
+                        .root(super::SLOT_STRUCTURE)
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                    assert_eq!(
+                        super::load_structure_state_root(
+                            &reopened.pages,
+                            &reopened.blobs,
+                            recovered_root,
+                        )?,
+                        prior,
+                        "partial prior scalar state at {boundary:?}"
+                    );
+                    stage_structure_v3_scalar_mutations(&mut reopened, &replacement_large)?
+                        .commit()?;
+                }
+                Some(3) => {}
+                recovered => {
+                    return Err(format!(
+                        "unexpected recovered V3 scalar CSN {recovered:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            assert_structure_v3_scalar_mutations(&reopened, &replacement_large)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_scalar_conflicts_remain_first_committer_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"race".to_vec(), b"seed".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut first = database.begin_optimistic(20, DurabilityClass::Strict)?;
+        first.set(b"race".to_vec(), b"first".to_vec(), None)?;
+        let mut second = database.begin_optimistic(20, DurabilityClass::Strict)?;
+        second.set(b"race".to_vec(), b"second".to_vec(), None)?;
+        database.commit_optimistic(first)?;
+        assert!(matches!(
+            database.commit_optimistic(second),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
+        assert_eq!(
+            database.snapshot(20)?.get(b"race"),
+            Some(b"first".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_migration_boundary_recovers_v2_or_complete_v3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.set(b"scalar".to_vec(), b"value".to_vec(), Some(100))?;
+            seed.create_hash(b"hash".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+            seed.create_set(b"set".to_vec())?;
+            seed.sadd(b"set".to_vec(), b"member".to_vec())?;
+            seed.commit()?;
+            let source_root = database
+                .coordinator
+                .snapshot(10)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let source_state =
+                super::load_structure_state_root(&database.pages, &database.blobs, source_root)?;
+
+            assert!(matches!(
+                database.migrate_structure_to_v3_at(
+                    DurabilityClass::Strict,
+                    Some(boundary),
+                ),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            let recovered_root = reopened
+                .coordinator
+                .snapshot(11)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            assert_eq!(
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, recovered_root,)?,
+                source_state,
+                "logical state changed at {boundary:?}"
+            );
+            assert_eq!(
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, source_root,)?,
+                source_state,
+                "historical V2 root changed at {boundary:?}"
+            );
+            match reopened.structure_format {
+                super::StructureFormat::BTreeV2 => {
+                    let retry = reopened.migrate_structure_to_v3(DurabilityClass::Strict)?;
+                    assert!(retry.pages_appended > 0);
+                    assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+                }
+                super::StructureFormat::BTreeV3 => assert!(matches!(
+                    reopened.migrate_structure_to_v3(DurabilityClass::Strict),
+                    Err(NativeRuntimeError::StructureV3MigrationUnsupported)
+                )),
+                found => {
+                    return Err(format!(
+                        "migration recovered unsupported format {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            drop(reopened);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened.structure_format,
+                super::StructureFormat::BTreeV3,
+                "migration did not converge at {boundary:?}"
+            );
+            let final_root = reopened
+                .coordinator
+                .snapshot(11)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            assert_eq!(
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, final_root,)?,
+                source_state,
+                "retry changed logical state at {boundary:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn public_structure_v3_collection_deletes_publish_constant_retirements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"a".to_vec(), b"one".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"b".to_vec(), b"two".to_vec())?;
+        assert!(seed.expire_hash(b"hash".to_vec(), 10_000)?);
+        seed.create_set(b"set".to_vec())?;
+        for member in 0_u16..128 {
+            assert!(seed.sadd(b"set".to_vec(), member.to_be_bytes().to_vec())?);
+        }
+        assert!(seed.expire_set(b"set".to_vec(), 11_000)?);
+        seed.create_list(b"list".to_vec())?;
+        for value in 0_u16..70 {
+            seed.rpush(b"list".to_vec(), value.to_be_bytes().to_vec())?;
+        }
+        assert!(seed.expire_list(b"list".to_vec(), 12_000)?);
+        seed.create_stream(b"stream".to_vec())?;
+        for value in 0_u16..16 {
+            seed.xadd(
+                b"stream".to_vec(),
+                &[(b"value".to_vec(), value.to_be_bytes().to_vec())],
+            )?;
+        }
+        assert!(seed.expire_stream(b"stream".to_vec(), 13_000)?);
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        for member in 0_u16..32 {
+            assert_eq!(
+                seed.zadd(
+                    b"sorted".to_vec(),
+                    f64::from(member),
+                    member.to_be_bytes().to_vec(),
+                )?,
+                ZAddOutcome::Added
+            );
+        }
+        assert!(seed.expire_sorted_set(b"sorted".to_vec(), 14_000)?);
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let migrated_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+        let migrated_state =
+            super::load_structure_state_root(&database.pages, &database.blobs, migrated_root)?;
+        assert_eq!(migrated_state.sets[b"set".as_slice()].len(), 128);
+        assert_eq!(migrated_state.lists[b"list".as_slice()].len(), 70);
+
+        let mut retire = database.begin(12, DurabilityClass::Strict)?;
+        assert!(retire.delete_hash(b"hash".to_vec())?);
+        assert!(retire.delete_set(b"set".to_vec())?);
+        assert!(retire.delete_list(b"list".to_vec())?);
+        assert!(retire.delete_stream(b"stream".to_vec())?);
+        assert!(retire.delete_sorted_set(b"sorted".to_vec())?);
+        retire.commit()?;
+
+        let retired_root = database
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let retired_entries = BTree::from_root(retired_root).scan(&database.pages)?;
+        assert_eq!(retired_entries.len(), migrated_entries.len() + 5);
+        assert_eq!(
+            retired_entries
+                .iter()
+                .filter(|(key, value)| {
+                    key.first() == Some(&super::structure_v3::STRUCTURE_RETIREMENT_PREFIX)
+                        && !super::is_structure_tombstone(value)
+                })
+                .count(),
+            5
+        );
+        let retired_state =
+            super::load_structure_state_root(&database.pages, &database.blobs, retired_root)?;
+        assert!(!retired_state.hashes.contains_key(b"hash".as_slice()));
+        assert!(!retired_state.sets.contains_key(b"set".as_slice()));
+        assert!(!retired_state.lists.contains_key(b"list".as_slice()));
+        assert!(!retired_state.streams.contains_key(b"stream".as_slice()));
+        assert!(!retired_state.sorted_sets.contains_key(b"sorted".as_slice()));
+        assert_eq!(
+            BTree::from_root(migrated_root).scan(&database.pages)?,
+            migrated_entries
+        );
+
+        let compaction = database.compact_structure(DurabilityClass::Strict)?;
+        assert_eq!(compaction.dropped_tombstones, 10);
+        assert!(compaction.commit.is_some());
+        let compacted_root = database
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let compacted_entries = BTree::from_root(compacted_root).scan(&database.pages)?;
+        assert_eq!(
+            compacted_entries
+                .iter()
+                .filter(|(key, value)| {
+                    key.first() == Some(&super::structure_v3::STRUCTURE_RETIREMENT_PREFIX)
+                        && !super::is_structure_tombstone(value)
+                })
+                .count(),
+            5
+        );
+        assert_eq!(
+            super::load_structure_state_root(&database.pages, &database.blobs, compacted_root,)?,
+            retired_state
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(13)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root)?,
+            retired_state
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_retirement_boundary_recovers_live_or_fully_retired()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_set(b"set".to_vec())?;
+            for member in 0_u16..128 {
+                assert!(seed.sadd(b"set".to_vec(), member.to_be_bytes().to_vec())?);
+            }
+            assert!(seed.expire_set(b"set".to_vec(), 10_000)?);
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let migrated_root = database
+                .coordinator
+                .snapshot(11)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+
+            let mut retire = database.begin(12, DurabilityClass::Strict)?;
+            assert!(retire.delete_set(b"set".to_vec())?);
+            assert!(matches!(
+                retire.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+            let recovered_root = reopened
+                .coordinator
+                .snapshot(12)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let recovered_state =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, recovered_root)?;
+            assert_eq!(
+                BTree::from_root(migrated_root).scan(&reopened.pages)?,
+                migrated_entries,
+                "historical migrated root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    assert_eq!(recovered_state.sets[b"set".as_slice()].len(), 128);
+                    let mut retry = reopened.begin(12, DurabilityClass::Strict)?;
+                    assert!(retry.delete_set(b"set".to_vec())?);
+                    retry.commit()?;
+                }
+                Some(3) => {
+                    assert!(!recovered_state.sets.contains_key(b"set".as_slice()));
+                }
+                found => {
+                    return Err(format!(
+                        "unexpected recovered V3 retirement CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            drop(reopened);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let final_root = reopened
+                .coordinator
+                .snapshot(12)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let final_state =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, final_root)?;
+            assert!(
+                !final_state.sets.contains_key(b"set".as_slice()),
+                "retirement retry did not converge at {boundary:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn governed_structure_v3_cleanup_reclaims_all_families_in_bounded_steps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        assert!(matches!(
+            database.cleanup_structure_retirements(8, DurabilityClass::Strict),
+            Err(NativeRuntimeError::StructureV3RetirementUnsupported)
+        ));
+
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"a".to_vec())?;
+        seed.create_set(b"b".to_vec())?;
+        seed.create_list(b"c".to_vec())?;
+        seed.create_stream(b"d".to_vec())?;
+        seed.create_sorted_set(b"e".to_vec())?;
+        for item in 0_u16..9 {
+            let identity = item.to_be_bytes().to_vec();
+            seed.hset(b"a".to_vec(), identity.clone(), identity.clone())?;
+            assert!(seed.sadd(b"b".to_vec(), identity.clone())?);
+            seed.rpush(b"c".to_vec(), identity.clone())?;
+            seed.xadd(b"d".to_vec(), &[(b"value".to_vec(), identity.clone())])?;
+            assert_eq!(
+                seed.zadd(b"e".to_vec(), f64::from(item), identity)?,
+                ZAddOutcome::Added
+            );
+        }
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let mut retire = database.begin(11, DurabilityClass::Strict)?;
+        assert!(retire.delete_hash(b"a".to_vec())?);
+        assert!(retire.delete_set(b"b".to_vec())?);
+        assert!(retire.delete_list(b"c".to_vec())?);
+        assert!(retire.delete_stream(b"d".to_vec())?);
+        assert!(retire.delete_sorted_set(b"e".to_vec())?);
+        retire.commit()?;
+
+        for invalid in [0, 1, 1_025] {
+            assert!(matches!(
+                database.cleanup_structure_retirements(invalid, DurabilityClass::Strict),
+                Err(NativeRuntimeError::InvalidStructureRetirementLimit { requested })
+                    if requested == invalid
+            ));
+        }
+
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor(Arc::clone(&governor));
+        let held = governor.try_admit(
+            WorkloadClass::Maintenance,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: super::MAINTENANCE_MEMORY_BYTES,
+            },
+        )?;
+        assert!(matches!(
+            database.cleanup_structure_retirements(8, DurabilityClass::Strict),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        drop(held);
+
+        let mut observed_collections = Vec::<Vec<u8>>::new();
+        let mut previous_identity = None;
+        for step_index in 0..64 {
+            let receipt = database.cleanup_structure_retirements(8, DurabilityClass::Strict)?;
+            let Some(identity) = receipt.retirement else {
+                assert!(!receipt.more_retirements);
+                break;
+            };
+            assert!(receipt.processed_primary_entries <= 8);
+            let physical_children_per_primary =
+                usize::from(identity.collection_key.as_slice() == b"e") + 1;
+            assert_eq!(
+                receipt.physical_mutations,
+                receipt
+                    .processed_primary_entries
+                    .checked_mul(physical_children_per_primary)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?
+            );
+            assert!(receipt.pages_appended > 0);
+            assert!(receipt.commit.is_some());
+            let current_identity = (
+                identity.transaction_id,
+                identity.mutation_ordinal,
+                identity.collection_key.clone(),
+            );
+            if previous_identity.as_ref() != Some(&current_identity) {
+                observed_collections.push(identity.collection_key.clone());
+                previous_identity = Some(current_identity);
+            }
+            if !receipt.more_retirements {
+                assert!(!receipt.more_remaining);
+                break;
+            }
+            assert!(step_index < 63, "retirement cleanup did not converge");
+        }
+        assert_eq!(
+            observed_collections,
+            [b"a", b"b", b"c", b"d", b"e"].map(|key| key.to_vec())
+        );
+
+        let wal_bytes_before_noop = fs::metadata(temporary.path().join(super::WAL_FILE))?.len();
+        let pages_before_noop = database.pages.page_count();
+        let next_transaction_before_noop = database.next_transaction_id;
+        let noop = database.cleanup_structure_retirements(8, DurabilityClass::Strict)?;
+        assert_eq!(noop.retirement, None);
+        assert_eq!(noop.commit, None);
+        assert_eq!(noop.pages_appended, 0);
+        assert_eq!(database.pages.page_count(), pages_before_noop);
+        assert_eq!(
+            fs::metadata(temporary.path().join(super::WAL_FILE))?.len(),
+            wal_bytes_before_noop
+        );
+        assert_eq!(database.next_transaction_id, next_transaction_before_noop);
+
+        let compaction = database.compact_structure(DurabilityClass::Strict)?;
+        assert!(compaction.dropped_tombstones > 0);
+        assert!(compaction.commit.is_some());
+        let compacted_root = database
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            BTree::from_root(compacted_root).scan(&database.pages)?,
+            vec![(
+                super::STRUCTURE_FORMAT_KEY.to_vec(),
+                super::structure_v3::STRUCTURE_FORMAT_VALUE_V3.to_vec(),
+            )]
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_structure_v3_cleanup_boundary_recovers_prior_or_complete_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (completed_steps, before_remaining, after_remaining) in
+            [(1_usize, 5_u64, Some(1_u64)), (2, 1, None)]
+        {
+            for boundary in commit_crash_boundaries() {
+                let temporary = TestDirectory::new();
+                let mut database = NativeDatabase::create(temporary.path())?;
+                let mut seed = database.begin(10, DurabilityClass::Strict)?;
+                seed.create_set(b"set".to_vec())?;
+                for member in 0_u16..9 {
+                    assert!(seed.sadd(b"set".to_vec(), member.to_be_bytes().to_vec())?);
+                }
+                seed.commit()?;
+                database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+                let mut retire = database.begin(11, DurabilityClass::Strict)?;
+                assert!(retire.delete_set(b"set".to_vec())?);
+                retire.commit()?;
+                for _ in 0..completed_steps {
+                    assert!(
+                        database
+                            .cleanup_structure_retirements(4, DurabilityClass::Strict)?
+                            .commit
+                            .is_some()
+                    );
+                }
+                let prior_root = database
+                    .coordinator
+                    .snapshot(12)?
+                    .roots()
+                    .root(super::SLOT_STRUCTURE)
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                let prior_entries = BTree::from_root(prior_root).scan(&database.pages)?;
+
+                assert!(matches!(
+                    database.cleanup_structure_retirements_at(
+                        4,
+                        DurabilityClass::Strict,
+                        Some(boundary),
+                    ),
+                    Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+                ));
+                drop(database);
+
+                let mut reopened = NativeDatabase::open(temporary.path())?;
+                assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+                assert_eq!(
+                    BTree::from_root(prior_root).scan(&reopened.pages)?,
+                    prior_entries,
+                    "historical cleanup root changed at {boundary:?}"
+                );
+                let recovered_root = reopened
+                    .coordinator
+                    .snapshot(12)?
+                    .roots()
+                    .root(super::SLOT_STRUCTURE)
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                let recovered_tree = BTree::from_root(recovered_root);
+                let active = super::structure_v3::next_active_retirement_key_v3(
+                    &reopened.pages,
+                    &reopened.buffer_pool,
+                    recovered_tree,
+                )?;
+                let recovered_remaining = active
+                    .as_ref()
+                    .map(|retirement_key| {
+                        let encoded = recovered_tree
+                            .get(&reopened.pages, retirement_key)?
+                            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                        super::structure_v3::decode_retirement_record(&encoded)
+                            .map(|record| record.remaining_primary_entries)
+                            .map_err(|_| NativeRuntimeError::InvalidStructureTree)
+                    })
+                    .transpose()?;
+                assert!(
+                    recovered_remaining == Some(before_remaining)
+                        || recovered_remaining == after_remaining,
+                    "partial cleanup state at {boundary:?}: {recovered_remaining:?}"
+                );
+                let expected_before_csn = 3_u64
+                    .checked_add(u64::try_from(completed_steps)?)
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                assert!(matches!(
+                    reopened.recovery_report().visible_csn.map(Csn::get),
+                    Some(found) if found == expected_before_csn || found == expected_before_csn + 1
+                ));
+
+                for _ in 0..8 {
+                    let receipt =
+                        reopened.cleanup_structure_retirements(4, DurabilityClass::Strict)?;
+                    if receipt.retirement.is_none() {
+                        break;
+                    }
+                }
+                let final_root = reopened
+                    .coordinator
+                    .snapshot(12)?
+                    .roots()
+                    .root(super::SLOT_STRUCTURE)
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                assert!(
+                    super::structure_v3::next_active_retirement_key_v3(
+                        &reopened.pages,
+                        &reopened.buffer_pool,
+                        BTree::from_root(final_root),
+                    )?
+                    .is_none(),
+                    "cleanup retry did not converge at {boundary:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_compaction_mode_routes_one_validated_physical_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"live".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let snapshot = database.coordinator.snapshot(10)?;
+        let mut roots = super::roots_from_snapshot(snapshot.roots());
+        let current_root = roots[2].ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let expected =
+            super::load_structure_state_root(&database.pages, &database.blobs, current_root)?;
+        let forged = BTree::from_root(current_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(3)?,
+                super::structure_key(b"dead"),
+                super::structure_tombstone_value(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        roots[2] = Some(forged);
+        let batch = NativeWriteBatch {
+            snapshot,
+            state: super::MaterializedState::default(),
+            mutations: vec![Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::CompactStructure,
+                target: None,
+                key: Vec::new(),
+                value: Vec::new(),
+                expires_at_micros: None,
+            }],
+            dirty: [false, false, true, false],
+            durability: DurabilityClass::Strict,
+            structure_format: super::StructureFormat::BTreeV3,
+            search_format: database.search_format,
+            mode: super::NativeWriteBatchMode::PhysicalStructureCompaction,
+            delta: None,
+            ann_consolidation: None,
+            _resource_permit: None,
+        };
+        let compacted = super::commit_engine_roots(
+            &mut database.pages,
+            database.buffer_pool.as_ref(),
+            &database.blobs,
+            roots,
+            database.relational_format,
+            super::StructureFormat::BTreeV3,
+            database.search_format,
+            TransactionId::new(900)?,
+            Csn::new(4)?,
+            &batch,
+            &BTreeMap::new(),
+        )?[2]
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let entries = BTree::from_root(compacted).scan(&database.pages)?;
+        assert!(
+            !entries
+                .iter()
+                .any(|(_, encoded)| super::is_structure_tombstone(encoded))
+        );
+        assert_eq!(
+            super::load_structure_state_root(&database.pages, &database.blobs, compacted)?,
+            expected
+        );
+        Ok(())
+    }
+
+    fn assert_structure_v3_direct_scalar_and_hash_reads(
+        database: &NativeDatabase,
+        large_value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        assert_eq!(
+            database.get_latest_structure(b"scalar", 100)?,
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"scalar", 100)?,
+            super::Ttl::Persistent
+        );
+        assert_eq!(
+            database.hget_latest_hash_at(b"hash", b"inline", 100)?,
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            database.hget_latest_hash_at(b"hash", b"blob", 100)?,
+            Some(large_value.to_vec())
+        );
+        assert_eq!(
+            database.hget_latest_hash_at(b"hash", b"ephemeral", 150)?,
+            None
+        );
+        assert_eq!(database.hlen_latest_hash_at(b"hash", 100)?, 3);
+        assert_eq!(database.hlen_latest_hash_at(b"hash", 150)?, 2);
+        assert_eq!(database.hlen_latest_hash_at(b"persistent-hash", 100)?, 2);
+        assert_eq!(
+            database.hget_many_latest_hash_at(
+                b"hash",
+                &[b"inline".to_vec(), b"missing".to_vec(), b"inline".to_vec()],
+                100,
+            )?,
+            vec![Some(b"value".to_vec()), None, Some(b"value".to_vec())]
+        );
+        assert_eq!(
+            database.ttl_latest_hash(b"hash", 100)?,
+            super::Ttl::RemainingMicros(200)
+        );
+        assert_eq!(
+            database.ttl_latest_hash_field(b"hash", b"ephemeral", 100)?,
+            super::Ttl::RemainingMicros(50)
+        );
+        assert_eq!(
+            database.ttl_latest_hash_field(b"hash", b"ephemeral", 150)?,
+            super::Ttl::Missing
+        );
+        assert!(matches!(
+            database.hget_latest_hash_at(b"hash", b"inline", 300),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hlen_latest_hash_at(b"hash", 300),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert_eq!(database.ttl_latest_hash(b"hash", 300)?, super::Ttl::Missing);
+        Ok(())
+    }
+
+    fn assert_structure_v3_direct_collection_reads(
+        database: &NativeDatabase,
+    ) -> Result<(), NativeRuntimeError> {
+        assert!(database.sismember_latest_set_at(b"set", b"member", 100)?);
+        assert!(!database.sismember_latest_set_at(b"set", b"missing", 100)?);
+        assert_eq!(
+            database.smismember_latest_set_at(
+                b"set",
+                &[b"member".to_vec(), b"missing".to_vec(), b"member".to_vec()],
+                100,
+            )?,
+            vec![true, false, true]
+        );
+        assert_eq!(database.scard_latest_set_at(b"set", 100)?, 2);
+        assert_eq!(
+            database.ttl_latest_set(b"set", 100)?,
+            super::Ttl::RemainingMicros(200)
+        );
+        assert_eq!(database.llen_latest_list_at(b"list", 100)?, 2);
+        assert_eq!(
+            database.lrange_latest_list_at(b"list", 0, -1, 100)?,
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+        assert_eq!(
+            database.lrange_latest_list_at(b"list", -1, -1, 100)?,
+            vec![b"second".to_vec()]
+        );
+        assert!(
+            database
+                .lrange_latest_list_at(b"list", 1, 0, 100)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.ttl_latest_list(b"list", 100)?,
+            super::Ttl::RemainingMicros(200)
+        );
+        assert_eq!(
+            database.ttl_latest_stream(b"stream", 100)?,
+            super::Ttl::RemainingMicros(200)
+        );
+        assert_eq!(
+            database.xrange_latest_stream_at(b"stream", 1, u64::MAX, 8, 100)?,
+            vec![(1, vec![(b"field".to_vec(), b"value".to_vec())])]
+        );
+        assert!(
+            database
+                .xrange_latest_stream_at(b"stream", 1, u64::MAX, 0, 100)?
+                .is_empty()
+        );
+        assert_structure_v3_sorted_set_ranges(database)?;
+        assert_eq!(database.zcard_latest_sorted_set_at(b"sorted", 100)?, 2);
+        assert_eq!(
+            database.ttl_latest_sorted_set(b"sorted", 100)?,
+            super::Ttl::RemainingMicros(200)
+        );
+        assert!(matches!(
+            database.scard_latest_set_at(b"set", 300),
+            Err(NativeRuntimeError::UnknownStructureSet)
+        ));
+        assert!(matches!(
+            database.llen_latest_list_at(b"list", 300),
+            Err(NativeRuntimeError::UnknownStructureList)
+        ));
+        assert!(matches!(
+            database.lrange_latest_list_at(b"list", 0, -1, 300),
+            Err(NativeRuntimeError::UnknownStructureList)
+        ));
+        assert!(matches!(
+            database.zcard_latest_sorted_set_at(b"sorted", 300),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+        assert!(matches!(
+            database.xrange_latest_stream_at(b"stream", 1, u64::MAX, 8, 300),
+            Err(NativeRuntimeError::UnknownStructureStream)
+        ));
+        assert_eq!(database.ttl_latest_set(b"set", 300)?, super::Ttl::Missing);
+        assert_eq!(database.ttl_latest_list(b"list", 300)?, super::Ttl::Missing);
+        assert_eq!(
+            database.ttl_latest_stream(b"stream", 300)?,
+            super::Ttl::Missing
+        );
+        assert_eq!(
+            database.ttl_latest_sorted_set(b"sorted", 300)?,
+            super::Ttl::Missing
+        );
+        assert_structure_v3_collection_kind_and_missing_errors(database);
+        Ok(())
+    }
+
+    fn assert_structure_v3_collection_kind_and_missing_errors(database: &NativeDatabase) {
+        assert!(matches!(
+            database.hget_latest_hash_at(b"set", b"member", 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.hget_latest_hash_at(b"stream", b"field", 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.sismember_latest_set_at(b"hash", b"inline", 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.zscore_latest_sorted_set(b"scalar", b"member"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.llen_latest_list_at(b"missing", 100),
+            Err(NativeRuntimeError::UnknownStructureList)
+        ));
+        assert!(matches!(
+            database.hget_latest_hash_at(b"missing", b"field", 100),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.sismember_latest_set_at(b"missing", b"member", 100),
+            Err(NativeRuntimeError::UnknownStructureSet)
+        ));
+        assert!(matches!(
+            database.zscore_latest_sorted_set(b"missing", b"member"),
+            Err(NativeRuntimeError::UnknownStructureSortedSet)
+        ));
+    }
+
+    fn assert_structure_v3_sorted_set_ranges(
+        database: &NativeDatabase,
+    ) -> Result<(), NativeRuntimeError> {
+        assert_eq!(
+            database.zscore_latest_sorted_set(b"sorted", b"member")?,
+            Some(1.5)
+        );
+        assert_eq!(
+            database.zscore_latest_sorted_set(b"sorted", b"missing")?,
+            None
+        );
+        assert_eq!(
+            database.zrank_latest_sorted_set(b"sorted", b"member")?,
+            Some(0)
+        );
+        assert_eq!(
+            database.zrevrank_latest_sorted_set(b"sorted", b"member")?,
+            Some(1)
+        );
+        assert_eq!(
+            database.zrange_latest_sorted_set(b"sorted", 0, -1)?,
+            vec![
+                SortedSetEntry::new(b"member".to_vec(), 1.5)?,
+                SortedSetEntry::new(b"second".to_vec(), 2.5)?,
+            ]
+        );
+        assert_eq!(
+            database.zrevrange_latest_sorted_set(b"sorted", 0, -1)?,
+            vec![
+                SortedSetEntry::new(b"second".to_vec(), 2.5)?,
+                SortedSetEntry::new(b"member".to_vec(), 1.5)?,
+            ]
+        );
+        assert_eq!(
+            database.zrange_by_score_latest_sorted_set(
+                b"sorted",
+                Bound::Included(1.5),
+                Bound::Excluded(2.5),
+                0,
+                8,
+            )?,
+            vec![SortedSetEntry::new(b"member".to_vec(), 1.5)?]
+        );
+        assert_eq!(
+            database.zrevrange_by_score_latest_sorted_set(
+                b"sorted",
+                Bound::Unbounded,
+                Bound::Unbounded,
+                0,
+                1,
+            )?,
+            vec![SortedSetEntry::new(b"second".to_vec(), 2.5)?]
+        );
+        Ok(())
+    }
+
+    fn assert_structure_v3_direct_hash_and_set_ranges(
+        database: &NativeDatabase,
+        large_value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        assert_eq!(
+            database.hscan_latest_hash_at(b"hash", None, 2, 100)?,
+            vec![
+                HashFieldEntry::new(b"blob".to_vec(), large_value.to_vec()),
+                HashFieldEntry::new(b"ephemeral".to_vec(), b"temporary".to_vec()),
+            ]
+        );
+        assert_eq!(
+            database.hscan_latest_hash_at(b"hash", Some(b"blob"), 1, 100)?,
+            vec![HashFieldEntry::new(
+                b"ephemeral".to_vec(),
+                b"temporary".to_vec(),
+            )]
+        );
+        assert_eq!(
+            database.hscan_latest_hash_at(b"hash", None, 8, 150)?,
+            vec![
+                HashFieldEntry::new(b"blob".to_vec(), large_value.to_vec()),
+                HashFieldEntry::new(b"inline".to_vec(), b"value".to_vec()),
+            ]
+        );
+        assert!(
+            database
+                .hscan_latest_hash_at(b"hash", None, 0, 100)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash_at(b"hash", None, 2, 100)?,
+            vec![
+                HashFieldEntry::new(b"inline".to_vec(), b"value".to_vec()),
+                HashFieldEntry::new(b"ephemeral".to_vec(), b"temporary".to_vec()),
+            ]
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash_at(
+                b"hash",
+                Some(b"ephemeral".as_slice()),
+                1,
+                100,
+            )?,
+            vec![HashFieldEntry::new(b"blob".to_vec(), large_value.to_vec(),)]
+        );
+        assert_eq!(
+            database.hscan_reverse_latest_hash_at(b"hash", None, 8, 150)?,
+            vec![
+                HashFieldEntry::new(b"inline".to_vec(), b"value".to_vec()),
+                HashFieldEntry::new(b"blob".to_vec(), large_value.to_vec()),
+            ]
+        );
+        assert!(
+            database
+                .hscan_reverse_latest_hash_at(b"hash", None, 0, 100)?
+                .is_empty()
+        );
+        assert_eq!(
+            database.sscan_latest_set_at(b"set", None, 1, 100)?,
+            vec![b"member".to_vec()]
+        );
+        assert_eq!(
+            database.sscan_latest_set_at(b"set", Some(b"member"), 8, 100)?,
+            vec![b"second".to_vec()]
+        );
+        assert!(
+            database
+                .sscan_latest_set_at(b"set", None, 0, 100)?
+                .is_empty()
+        );
+        assert!(matches!(
+            database.hscan_latest_hash_at(b"hash", None, 8, 300),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_reverse_latest_hash_at(b"hash", None, 8, 300),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.sscan_latest_set_at(b"set", None, 8, 300),
+            Err(NativeRuntimeError::UnknownStructureSet)
+        ));
+        assert!(matches!(
+            database.hscan_latest_hash_at(b"set", None, 8, 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.hscan_reverse_latest_hash_at(b"set", None, 8, 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.sscan_latest_set_at(b"hash", None, 8, 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert_structure_v3_direct_hash_patterns(database, large_value)
+    }
+
+    fn assert_structure_v3_direct_hash_patterns(
+        database: &NativeDatabase,
+        large_value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let first_pattern = HashPatternScanRequest::try_new(b"*", None, 1, 1, 100)?;
+        let first_page = database.hscan_match_latest_hash_at(b"hash", &first_pattern, 100)?;
+        assert_eq!(
+            first_page.entries(),
+            &[HashFieldEntry::new(b"blob".to_vec(), large_value.to_vec())]
+        );
+        assert_eq!(first_page.continuation(), Some(b"blob".as_slice()));
+        assert_eq!(first_page.stop(), HashPatternScanStop::OutputLimit);
+        assert_eq!(first_page.visited(), 1);
+
+        let expired_pattern =
+            HashPatternScanRequest::try_new(b"*", Some(b"blob".to_vec()), 2, 1, 100)?;
+        let expired_page = database.hscan_match_latest_hash_at(b"hash", &expired_pattern, 150)?;
+        assert!(expired_page.entries().is_empty());
+        assert_eq!(expired_page.continuation(), Some(b"ephemeral".as_slice()));
+        assert_eq!(expired_page.stop(), HashPatternScanStop::VisitLimit);
+        assert_eq!(expired_page.visited(), 1);
+
+        let exact_pattern = HashPatternScanRequest::try_new(b"inline", None, 2, 2, 100)?;
+        let exact_page = database.hscan_match_latest_hash_at(b"hash", &exact_pattern, 150)?;
+        assert_eq!(
+            exact_page.entries(),
+            &[HashFieldEntry::new(b"inline".to_vec(), b"value".to_vec())]
+        );
+        assert_eq!(exact_page.continuation(), None);
+        assert_eq!(exact_page.stop(), HashPatternScanStop::Exhausted);
+        assert_eq!(exact_page.visited(), 1);
+        assert!(matches!(
+            database.hscan_match_latest_hash_at(b"hash", &first_pattern, 300),
+            Err(NativeRuntimeError::UnknownStructureHash)
+        ));
+        assert!(matches!(
+            database.hscan_match_latest_hash_at(b"set", &first_pattern, 100),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert_structure_v3_direct_hash_pattern_bounds(database)
+    }
+
+    fn assert_structure_v3_direct_hash_pattern_bounds(
+        database: &NativeDatabase,
+    ) -> Result<(), NativeRuntimeError> {
+        let prefix = HashPatternScanRequest::try_new(b"in*", None, 2, 2, 100)?;
+        let prefix_page = database.hscan_match_latest_hash_at(b"hash", &prefix, 150)?;
+        assert_eq!(
+            prefix_page.entries(),
+            &[HashFieldEntry::new(b"inline".to_vec(), b"value".to_vec())]
+        );
+        assert_eq!(prefix_page.stop(), HashPatternScanStop::Exhausted);
+        assert_eq!(prefix_page.visited(), 1);
+
+        for cursor in [b"a".to_vec(), b"inline".to_vec(), b"z".to_vec()] {
+            let request = HashPatternScanRequest::try_new(b"in*", Some(cursor.clone()), 2, 2, 100)?;
+            let page = database.hscan_match_latest_hash_at(b"hash", &request, 150)?;
+            if cursor.as_slice() < b"inline" {
+                assert_eq!(page.entries(), prefix_page.entries());
+                assert_eq!(page.visited(), 1);
+            } else {
+                assert!(page.entries().is_empty());
+                assert_eq!(page.visited(), 0);
+            }
+            assert_eq!(page.stop(), HashPatternScanStop::Exhausted);
+        }
+
+        let tombstone = HashPatternScanRequest::try_new(b"*", None, 1, 1, 100)?;
+        let page = database.hscan_match_latest_hash(b"tombstone-hash", &tombstone)?;
+        assert!(page.entries().is_empty());
+        assert_eq!(page.continuation(), Some(b"deleted".as_slice()));
+        assert_eq!(page.stop(), HashPatternScanStop::VisitLimit);
+        assert_eq!(page.visited(), 1);
+
+        let exhausted = HashPatternScanRequest::try_new(b"*aaaaab", None, 1, 2, 1)?;
+        assert!(matches!(
+            database.hscan_match_latest_hash(b"hash", &exhausted),
+            Err(NativeRuntimeError::HashPattern(
+                HashPatternError::MatchStepLimitExceeded { maximum: 1 }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_direct_points_cardinalities_and_ttls_avoid_materialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let large_value = vec![0x62; super::STRUCTURE_INLINE_VALUE_LIMIT + 1];
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut initialize = database.begin(1, DurabilityClass::Strict)?;
+        initialize.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        initialize.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"inline".to_vec(), b"value".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"blob".to_vec(), large_value.clone())?;
+        seed.hset(
+            b"hash".to_vec(),
+            b"ephemeral".to_vec(),
+            b"temporary".to_vec(),
+        )?;
+        assert!(seed.expire_hash_field(b"hash".to_vec(), b"ephemeral".to_vec(), 150)?);
+        assert!(seed.expire_hash(b"hash".to_vec(), 300)?);
+        seed.create_hash(b"persistent-hash".to_vec())?;
+        seed.hset(
+            b"persistent-hash".to_vec(),
+            b"first".to_vec(),
+            b"one".to_vec(),
+        )?;
+        seed.hset(
+            b"persistent-hash".to_vec(),
+            b"second".to_vec(),
+            b"two".to_vec(),
+        )?;
+        seed.create_hash(b"tombstone-hash".to_vec())?;
+        seed.hset(
+            b"tombstone-hash".to_vec(),
+            b"deleted".to_vec(),
+            b"value".to_vec(),
+        )?;
+        assert!(seed.hdelete(b"tombstone-hash".to_vec(), b"deleted".to_vec())?);
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"member".to_vec())?);
+        assert!(seed.sadd(b"set".to_vec(), b"second".to_vec())?);
+        assert!(seed.expire_set(b"set".to_vec(), 300)?);
+        seed.create_list(b"list".to_vec())?;
+        seed.rpush(b"list".to_vec(), b"first".to_vec())?;
+        seed.rpush(b"list".to_vec(), b"second".to_vec())?;
+        assert!(seed.expire_list(b"list".to_vec(), 300)?);
+        seed.create_stream(b"stream".to_vec())?;
+        seed.xadd(
+            b"stream".to_vec(),
+            &[(b"field".to_vec(), b"value".to_vec())],
+        )?;
+        assert!(seed.expire_stream(b"stream".to_vec(), 300)?);
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        seed.zadd(b"sorted".to_vec(), 1.5, b"member".to_vec())?;
+        seed.zadd(b"sorted".to_vec(), 2.5, b"second".to_vec())?;
+        assert!(seed.expire_sorted_set(b"sorted".to_vec(), 300)?);
+        seed.commit()?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let direct = assert_structure_v3_direct_scalar_and_hash_reads(&database, &large_value)
+            .and_then(|()| assert_structure_v3_direct_collection_reads(&database))
+            .and_then(|()| assert_structure_v3_direct_hash_and_set_ranges(&database, &large_value));
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        direct?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+        let direct = assert_structure_v3_direct_scalar_and_hash_reads(&reopened, &large_value)
+            .and_then(|()| assert_structure_v3_direct_collection_reads(&reopened))
+            .and_then(|()| assert_structure_v3_direct_hash_and_set_ranges(&reopened, &large_value));
+        super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        direct?;
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_scan_identities_fail_before_state_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut initialize = database.begin(1, DurabilityClass::Strict)?;
+        initialize.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        initialize.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let large_key_length = BTREE_MAX_KEY_SIZE - (1 + 4 + super::MAX_HASH_PATTERN_BYTES);
+        let large_set_key = vec![b's'; large_key_length];
+        let large_missing_key = vec![b'm'; large_key_length];
+        let mut seed = database.begin(2, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.create_set(b"sets".to_vec())?;
+        seed.create_set(large_set_key.clone())?;
+        seed.commit()?;
+
+        let exact = HashPatternScanRequest::try_new(
+            vec![b'a'; super::MAX_HASH_PATTERN_BYTES],
+            None,
+            1,
+            1,
+            8_192,
+        )?;
+        let mut prefix_source = vec![b'a'; super::MAX_HASH_PATTERN_BYTES - 1];
+        prefix_source.push(b'*');
+        let prefix = HashPatternScanRequest::try_new(prefix_source, None, 1, 1, 8_192)?;
+        for (key, request) in [
+            (large_missing_key.as_slice(), &exact),
+            (large_set_key.as_slice(), &exact),
+            (large_missing_key.as_slice(), &prefix),
+            (large_set_key.as_slice(), &prefix),
+        ] {
+            assert!(matches!(
+                database.hscan_match_latest_hash(key, request),
+                Err(NativeRuntimeError::StructureIdentityTooLarge)
+            ));
+        }
+
+        let cursor_length = BTREE_MAX_KEY_SIZE
+            - (1 + 4 + b"hash".len() + super::structure_v3::STRUCTURE_INCARNATION_BYTES)
+            + 1;
+        let oversized_cursor = vec![0_u8; cursor_length];
+        let any = HashPatternScanRequest::try_new(b"*", Some(oversized_cursor.clone()), 1, 1, 100)?;
+        for key in [b"hash".as_slice(), b"none".as_slice(), b"sets".as_slice()] {
+            assert!(matches!(
+                database.hscan_match_latest_hash(key, &any),
+                Err(NativeRuntimeError::StructureIdentityTooLarge)
+            ));
+            assert!(matches!(
+                database.hscan_latest_hash(key, Some(&oversized_cursor), 1),
+                Err(NativeRuntimeError::StructureIdentityTooLarge)
+            ));
+        }
+        assert!(matches!(
+            database.sscan_latest_set(b"sets", Some(&oversized_cursor), 1),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        assert!(matches!(
+            database.sscan_latest_set(b"hash", Some(&oversized_cursor), 1),
+            Err(NativeRuntimeError::StructureIdentityTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn public_structure_v3_create_recreate_and_supported_writes_are_lossless()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"old".to_vec(), b"value".to_vec())?;
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"old".to_vec())?);
+        seed.create_list(b"list".to_vec())?;
+        seed.rpush(b"list".to_vec(), b"old".to_vec())?;
+        seed.create_stream(b"stream".to_vec())?;
+        seed.xadd(b"stream".to_vec(), &[(b"field".to_vec(), b"old".to_vec())])?;
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), 1.0, b"old".to_vec())?,
+            ZAddOutcome::Added
+        );
+        seed.create_hash(b"cross".to_vec())?;
+        seed.hset(b"cross".to_vec(), b"old".to_vec(), b"value".to_vec())?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let migrated_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+        let large_hash_value = vec![0x48; 9_000];
+        let large_list_value = vec![0x4c; 9_000];
+        let mut replace = database.begin(12, DurabilityClass::Strict)?;
+        assert!(replace.delete_hash(b"hash".to_vec())?);
+        replace.create_hash(b"hash".to_vec())?;
+        assert_eq!(
+            replace.hset(b"hash".to_vec(), b"new".to_vec(), large_hash_value.clone(),)?,
+            HashSetOutcome::Added
+        );
+        assert_eq!(
+            replace.hset_many(
+                b"hash".to_vec(),
+                vec![
+                    (b"a".to_vec(), b"one".to_vec()),
+                    (b"b".to_vec(), b"two".to_vec()),
+                ],
+            )?,
+            2
+        );
+        assert_eq!(
+            replace.hincrement_i64(b"hash".to_vec(), b"counter".to_vec(), 7)?,
+            7
+        );
+        assert!(replace.delete_set(b"set".to_vec())?);
+        replace.create_set(b"set".to_vec())?;
+        assert!(replace.sadd(b"set".to_vec(), b"new".to_vec())?);
+        assert_eq!(
+            replace.sadd_many(b"set".to_vec(), vec![b"a".to_vec(), b"b".to_vec()],)?,
+            2
+        );
+        assert!(replace.delete_list(b"list".to_vec())?);
+        replace.create_list(b"list".to_vec())?;
+        assert_eq!(
+            replace.rpush(b"list".to_vec(), large_list_value.clone())?,
+            1
+        );
+        assert_eq!(replace.rpush(b"list".to_vec(), Vec::new())?, 2);
+        assert!(replace.delete_stream(b"stream".to_vec())?);
+        replace.create_stream(b"stream".to_vec())?;
+        assert_eq!(
+            replace.xadd(b"stream".to_vec(), &[(b"field".to_vec(), b"new".to_vec())],)?,
+            1
+        );
+        assert_eq!(
+            replace.xadd(
+                b"stream".to_vec(),
+                &[(b"field".to_vec(), b"newer".to_vec())],
+            )?,
+            2
+        );
+        assert!(replace.delete_sorted_set(b"sorted".to_vec())?);
+        replace.create_sorted_set(b"sorted".to_vec())?;
+        assert_eq!(
+            replace.zadd(b"sorted".to_vec(), 2.0, b"new".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert_eq!(
+            replace.zadd(b"sorted".to_vec(), 3.0, b"new".to_vec())?,
+            ZAddOutcome::Updated
+        );
+        assert_eq!(
+            replace.zadd(b"sorted".to_vec(), 4.0, b"other".to_vec())?,
+            ZAddOutcome::Added
+        );
+        assert!(replace.delete_hash(b"cross".to_vec())?);
+        replace.create_set(b"cross".to_vec())?;
+        assert!(replace.sadd(b"cross".to_vec(), b"new".to_vec())?);
+        replace.commit()?;
+
+        let replaced_root = database
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let replaced =
+            super::load_structure_state_root(&database.pages, &database.blobs, replaced_root)?;
+        assert_eq!(
+            replaced.hashes[b"hash".as_slice()][b"new".as_slice()],
+            large_hash_value
+        );
+        assert!(!replaced.hashes[b"hash".as_slice()].contains_key(b"old".as_slice()));
+        assert_eq!(
+            replaced.hashes[b"hash".as_slice()][b"counter".as_slice()],
+            b"7".to_vec()
+        );
+        assert_eq!(
+            replaced.sets[b"set".as_slice()],
+            BTreeSet::from([b"a".to_vec(), b"b".to_vec(), b"new".to_vec()])
+        );
+        assert_eq!(
+            replaced.lists[b"list".as_slice()],
+            std::collections::VecDeque::from([large_list_value, Vec::new()])
+        );
+        assert_eq!(
+            replaced.streams[b"stream".as_slice()][&1],
+            vec![(b"field".to_vec(), b"new".to_vec())]
+        );
+        assert_eq!(
+            replaced.streams[b"stream".as_slice()][&2],
+            vec![(b"field".to_vec(), b"newer".to_vec())]
+        );
+        assert_eq!(
+            replaced.sorted_sets[b"sorted".as_slice()][b"new".as_slice()],
+            super::canonical_sorted_set_score(3.0)?
+        );
+        assert_eq!(
+            replaced.sorted_sets[b"sorted".as_slice()][b"other".as_slice()],
+            super::canonical_sorted_set_score(4.0)?
+        );
+        assert!(!replaced.sorted_sets[b"sorted".as_slice()].contains_key(b"old".as_slice()));
+        assert!(!replaced.hashes.contains_key(b"cross".as_slice()));
+        assert_eq!(
+            replaced.sets[b"cross".as_slice()],
+            BTreeSet::from([b"new".to_vec()])
+        );
+        assert_eq!(
+            BTree::from_root(migrated_root).scan(&database.pages)?,
+            migrated_entries
+        );
+
+        drop(database);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(12)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root)?,
+            replaced
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_recreation_boundary_recovers_one_complete_incarnation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"hash".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"old".to_vec(), b"value".to_vec())?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let migrated_root = database
+                .coordinator
+                .snapshot(11)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+            let old_state =
+                super::load_structure_state_root(&database.pages, &database.blobs, migrated_root)?;
+            let new_value = vec![0x56; 9_000];
+
+            let mut replace = database.begin(12, DurabilityClass::Strict)?;
+            assert!(replace.delete_hash(b"hash".to_vec())?);
+            replace.create_hash(b"hash".to_vec())?;
+            assert_eq!(
+                replace.hset(b"hash".to_vec(), b"new".to_vec(), new_value.clone())?,
+                HashSetOutcome::Added
+            );
+            assert!(matches!(
+                replace.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+            assert_eq!(
+                BTree::from_root(migrated_root).scan(&reopened.pages)?,
+                migrated_entries,
+                "historical V3 root changed at {boundary:?}"
+            );
+            let recovered_root = reopened
+                .coordinator
+                .snapshot(12)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let recovered =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, recovered_root)?;
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    assert_eq!(recovered, old_state, "partial old state at {boundary:?}");
+                    let mut retry = reopened.begin(12, DurabilityClass::Strict)?;
+                    assert!(retry.delete_hash(b"hash".to_vec())?);
+                    retry.create_hash(b"hash".to_vec())?;
+                    assert_eq!(
+                        retry.hset(b"hash".to_vec(), b"new".to_vec(), new_value.clone(),)?,
+                        HashSetOutcome::Added
+                    );
+                    retry.commit()?;
+                }
+                Some(3) => {
+                    assert_eq!(
+                        recovered.hashes[b"hash".as_slice()][b"new".as_slice()],
+                        new_value,
+                        "partial new value at {boundary:?}"
+                    );
+                    assert!(!recovered.hashes[b"hash".as_slice()].contains_key(b"old".as_slice()));
+                }
+                found => {
+                    return Err(format!(
+                        "unexpected recovered V3 recreation CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            drop(reopened);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let final_root = reopened
+                .coordinator
+                .snapshot(12)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let final_state =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, final_root)?;
+            assert_eq!(
+                final_state.hashes[b"hash".as_slice()][b"new".as_slice()],
+                new_value,
+                "recreation retry did not converge at {boundary:?}"
+            );
+            assert!(!final_state.hashes[b"hash".as_slice()].contains_key(b"old".as_slice()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_group_commit_publishes_disjoint_collection_and_scalar_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_set(b"seed".to_vec())?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut first = database.begin_optimistic(11, DurabilityClass::Group)?;
+        first.create_hash(b"hash".to_vec())?;
+        assert_eq!(
+            first.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?,
+            HashSetOutcome::Added
+        );
+        first.set(b"scalar-a".to_vec(), b"one".to_vec(), Some(100))?;
+        let mut second = database.begin_optimistic(11, DurabilityClass::Group)?;
+        second.create_set(b"set".to_vec())?;
+        assert!(second.sadd(b"set".to_vec(), b"member".to_vec())?);
+        second.set(b"scalar-b".to_vec(), b"two".to_vec(), None)?;
+        let report = database.commit_group(vec![first, second])?;
+        assert_eq!(report.accepted_commits, 2);
+        assert_eq!(report.page_synchronizations, 1);
+        assert_eq!(report.wal_synchronizations, 1);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, GroupCommitOutcome::Committed(_)))
+        );
+
+        let current_root = database
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let current =
+            super::load_structure_state_root(&database.pages, &database.blobs, current_root)?;
+        assert_eq!(
+            current.hashes[b"hash".as_slice()][b"field".as_slice()],
+            b"value".to_vec()
+        );
+        assert_eq!(
+            current.sets[b"set".as_slice()],
+            BTreeSet::from([b"member".to_vec()])
+        );
+        assert_eq!(
+            current.entries[b"scalar-a".as_slice()].value,
+            b"one".to_vec()
+        );
+        assert_eq!(
+            current.entries[b"scalar-a".as_slice()].expires_at_micros,
+            Some(100)
+        );
+        assert_eq!(
+            current.entries[b"scalar-b".as_slice()].value,
+            b"two".to_vec()
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(11)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root)?,
+            current
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn structure_v3_ttl_and_due_cross_family_reuse_preserve_incarnation_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.sadd(b"set".to_vec(), b"member".to_vec())?);
+        seed.create_list(b"list".to_vec())?;
+        seed.rpush(b"list".to_vec(), b"value".to_vec())?;
+        seed.create_stream(b"stream".to_vec())?;
+        seed.xadd(
+            b"stream".to_vec(),
+            &[(b"field".to_vec(), b"value".to_vec())],
+        )?;
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        assert_eq!(
+            seed.zadd(b"sorted".to_vec(), 1.0, b"member".to_vec())?,
+            ZAddOutcome::Added
+        );
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut expire = database.begin(20, DurabilityClass::Strict)?;
+        assert!(expire.expire_hash(b"hash".to_vec(), 90)?);
+        assert!(expire.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 70)?);
+        assert!(expire.expire_set(b"set".to_vec(), 90)?);
+        assert!(expire.expire_list(b"list".to_vec(), 90)?);
+        assert!(expire.expire_stream(b"stream".to_vec(), 90)?);
+        assert!(expire.expire_sorted_set(b"sorted".to_vec(), 90)?);
+        expire.commit()?;
+        let mut renew = database.begin(30, DurabilityClass::Strict)?;
+        assert!(renew.expire_hash(b"hash".to_vec(), 100)?);
+        assert!(renew.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 80)?);
+        assert!(renew.expire_set(b"set".to_vec(), 100)?);
+        assert!(renew.expire_list(b"list".to_vec(), 100)?);
+        assert!(renew.expire_stream(b"stream".to_vec(), 100)?);
+        assert!(renew.expire_sorted_set(b"sorted".to_vec(), 100)?);
+        renew.commit()?;
+
+        let before_due = database.snapshot(50)?;
+        assert_eq!(
+            before_due.ttl_hash(b"hash"),
+            super::Ttl::RemainingMicros(50)
+        );
+        assert_eq!(
+            before_due.ttl_hash_field(b"hash", b"field"),
+            super::Ttl::RemainingMicros(30)
+        );
+        assert_eq!(before_due.ttl_set(b"set"), super::Ttl::RemainingMicros(50));
+        assert_eq!(
+            before_due.ttl_list(b"list"),
+            super::Ttl::RemainingMicros(50)
+        );
+        assert_eq!(
+            before_due.ttl_stream(b"stream"),
+            super::Ttl::RemainingMicros(50)
+        );
+        assert_eq!(
+            before_due.ttl_sorted_set(b"sorted"),
+            super::Ttl::RemainingMicros(50)
+        );
+        let field_due = database.snapshot(80)?;
+        assert_eq!(field_due.ttl_hash(b"hash"), super::Ttl::RemainingMicros(20));
+        assert_eq!(
+            field_due.ttl_hash_field(b"hash", b"field"),
+            super::Ttl::Missing
+        );
+        assert_eq!(field_due.hget(b"hash", b"field")?, None);
+        let expiry_root = database
+            .coordinator
+            .snapshot(80)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let expiry_entries = BTree::from_root(expiry_root).scan(&database.pages)?;
+
+        let mut reuse = database.begin(100, DurabilityClass::Strict)?;
+        reuse.create_set(b"hash".to_vec())?;
+        assert!(reuse.sadd(b"hash".to_vec(), b"new".to_vec())?);
+        reuse.create_list(b"set".to_vec())?;
+        assert_eq!(reuse.rpush(b"set".to_vec(), b"new".to_vec())?, 1);
+        reuse.create_stream(b"list".to_vec())?;
+        assert_eq!(
+            reuse.xadd(b"list".to_vec(), &[(b"field".to_vec(), b"new".to_vec())],)?,
+            1
+        );
+        reuse.create_sorted_set(b"stream".to_vec())?;
+        assert_eq!(
+            reuse.zadd(b"stream".to_vec(), 2.0, b"new".to_vec())?,
+            ZAddOutcome::Added
+        );
+        reuse.create_hash(b"sorted".to_vec())?;
+        assert_eq!(
+            reuse.hset(b"sorted".to_vec(), b"field".to_vec(), b"new".to_vec(),)?,
+            HashSetOutcome::Added
+        );
+        reuse.commit()?;
+
+        let reused_root = database
+            .coordinator
+            .snapshot(100)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let reused =
+            super::load_structure_state_root(&database.pages, &database.blobs, reused_root)?;
+        assert_eq!(
+            reused.sets[b"hash".as_slice()],
+            BTreeSet::from([b"new".to_vec()])
+        );
+        assert_eq!(
+            reused.lists[b"set".as_slice()],
+            std::collections::VecDeque::from([b"new".to_vec()])
+        );
+        assert_eq!(
+            reused.streams[b"list".as_slice()][&1],
+            vec![(b"field".to_vec(), b"new".to_vec())]
+        );
+        assert_eq!(
+            reused.sorted_sets[b"stream".as_slice()][b"new".as_slice()],
+            super::canonical_sorted_set_score(2.0)?
+        );
+        assert_eq!(
+            reused.hashes[b"sorted".as_slice()][b"field".as_slice()],
+            b"new".to_vec()
+        );
+        assert_eq!(
+            BTree::from_root(expiry_root).scan(&database.pages)?,
+            expiry_entries
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_root = reopened
+            .coordinator
+            .snapshot(100)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            super::load_structure_state_root(&reopened.pages, &reopened.blobs, reopened_root)?,
+            reused
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_ttl_boundary_recovers_persistent_or_complete_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"hash".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+            seed.create_set(b"set".to_vec())?;
+            seed.create_list(b"list".to_vec())?;
+            seed.create_stream(b"stream".to_vec())?;
+            seed.create_sorted_set(b"sorted".to_vec())?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let migrated_root = database
+                .coordinator
+                .snapshot(10)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let migrated_entries = BTree::from_root(migrated_root).scan(&database.pages)?;
+
+            let mut expire = database.begin(20, DurabilityClass::Strict)?;
+            assert!(expire.expire_hash(b"hash".to_vec(), 100)?);
+            assert!(expire.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 80)?);
+            assert!(expire.expire_set(b"set".to_vec(), 100)?);
+            assert!(expire.expire_list(b"list".to_vec(), 100)?);
+            assert!(expire.expire_stream(b"stream".to_vec(), 100)?);
+            assert!(expire.expire_sorted_set(b"sorted".to_vec(), 100)?);
+            assert!(matches!(
+                expire.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                BTree::from_root(migrated_root).scan(&reopened.pages)?,
+                migrated_entries,
+                "historical V3 root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    let prior = reopened.snapshot(50)?;
+                    assert_eq!(prior.ttl_hash(b"hash"), super::Ttl::Persistent);
+                    assert_eq!(
+                        prior.ttl_hash_field(b"hash", b"field"),
+                        super::Ttl::Persistent
+                    );
+                    let mut retry = reopened.begin(20, DurabilityClass::Strict)?;
+                    assert!(retry.expire_hash(b"hash".to_vec(), 100)?);
+                    assert!(retry.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 80,)?);
+                    assert!(retry.expire_set(b"set".to_vec(), 100)?);
+                    assert!(retry.expire_list(b"list".to_vec(), 100)?);
+                    assert!(retry.expire_stream(b"stream".to_vec(), 100)?);
+                    assert!(retry.expire_sorted_set(b"sorted".to_vec(), 100)?);
+                    retry.commit()?;
+                }
+                Some(3) => {
+                    let complete = reopened.snapshot(50)?;
+                    assert_eq!(
+                        complete.ttl_hash_field(b"hash", b"field"),
+                        super::Ttl::RemainingMicros(30)
+                    );
+                    for ttl in [
+                        complete.ttl_hash(b"hash"),
+                        complete.ttl_set(b"set"),
+                        complete.ttl_list(b"list"),
+                        complete.ttl_stream(b"stream"),
+                        complete.ttl_sorted_set(b"sorted"),
+                    ] {
+                        assert_eq!(ttl, super::Ttl::RemainingMicros(50));
+                    }
+                }
+                found => {
+                    return Err(format!(
+                        "unexpected recovered V3 TTL CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            drop(reopened);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            let complete = reopened.snapshot(50)?;
+            assert_eq!(
+                complete.ttl_hash_field(b"hash", b"field"),
+                super::Ttl::RemainingMicros(30)
+            );
+            for ttl in [
+                complete.ttl_hash(b"hash"),
+                complete.ttl_set(b"set"),
+                complete.ttl_list(b"list"),
+                complete.ttl_stream(b"stream"),
+                complete.ttl_sorted_set(b"sorted"),
+            ] {
+                assert_eq!(ttl, super::Ttl::RemainingMicros(50));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn governed_structure_v3_expiry_sweep_is_ordered_bounded_and_incremental()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), Some(100))?;
+        seed.create_hash(b"hash".to_vec())?;
+        seed.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+        assert!(seed.expire_hash(b"hash".to_vec(), 100)?);
+        assert!(seed.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 80)?);
+        seed.create_set(b"set".to_vec())?;
+        assert!(seed.expire_set(b"set".to_vec(), 100)?);
+        seed.create_list(b"list".to_vec())?;
+        assert!(seed.expire_list(b"list".to_vec(), 100)?);
+        seed.create_stream(b"stream".to_vec())?;
+        assert!(seed.expire_stream(b"stream".to_vec(), 100)?);
+        seed.create_sorted_set(b"sorted".to_vec())?;
+        assert!(seed.expire_sorted_set(b"sorted".to_vec(), 100)?);
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let indexed = database.coordinator.snapshot(80)?;
+        let (due, more_due) = database.due_structure_keys(&indexed, 80, 1)?;
+        assert_eq!(
+            due,
+            vec![super::DueStructureKey {
+                kind: super::DueStructureKind::HashField,
+                key: super::hash_field_identity(b"hash", b"field")?,
+            }]
+        );
+        assert!(!more_due);
+        let field = database.expire_due_structures(80, 1, DurabilityClass::Strict)?;
+        assert_eq!(field.expired_keys, 1);
+        assert!(!field.more_due);
+        assert!(field.commit.is_some());
+        let after_field = database.snapshot(80)?;
+        assert_eq!(
+            after_field.ttl_hash(b"hash"),
+            super::Ttl::RemainingMicros(20)
+        );
+        assert_eq!(
+            after_field.ttl_hash_field(b"hash", b"field"),
+            super::Ttl::Missing
+        );
+
+        let first = database.expire_due_structures(100, 3, DurabilityClass::Strict)?;
+        assert_eq!(first.expired_keys, 3);
+        assert!(first.more_due);
+        let second = database.expire_due_structures(100, 3, DurabilityClass::Strict)?;
+        assert_eq!(second.expired_keys, 3);
+        assert!(!second.more_due);
+        let empty = database.expire_due_structures(100, 3, DurabilityClass::Strict)?;
+        assert_eq!(empty.expired_keys, 0);
+        assert!(!empty.more_due);
+        assert_eq!(empty.commit, None);
+
+        let swept_root = database
+            .coordinator
+            .snapshot(100)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let swept = super::load_structure_state_root(&database.pages, &database.blobs, swept_root)?;
+        assert!(swept.entries.is_empty());
+        assert!(swept.hashes.is_empty());
+        assert!(swept.sets.is_empty());
+        assert!(swept.lists.is_empty());
+        assert!(swept.streams.is_empty());
+        assert!(swept.sorted_sets.is_empty());
+        let swept_tree = BTree::from_root(swept_root);
+        assert_eq!(
+            swept_tree
+                .scan(&database.pages)?
+                .iter()
+                .filter(|(key, value)| {
+                    key.first() == Some(&super::structure_v3::STRUCTURE_RETIREMENT_PREFIX)
+                        && !super::is_structure_tombstone(value)
+                })
+                .count(),
+            5
+        );
+
+        for _ in 0..16 {
+            if database
+                .cleanup_structure_retirements(4, DurabilityClass::Strict)?
+                .retirement
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            super::structure_v3::next_active_retirement_key_v3(
+                &database.pages,
+                &database.buffer_pool,
+                BTree::from_root(
+                    database
+                        .coordinator
+                        .snapshot(100)?
+                        .roots()
+                        .root(super::SLOT_STRUCTURE)
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                ),
+            )?
+            .is_none()
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.structure_format, super::StructureFormat::BTreeV3);
+        let current = reopened.snapshot(100)?;
+        assert_eq!(current.ttl(b"scalar"), super::Ttl::Missing);
+        assert_eq!(current.ttl_hash(b"hash"), super::Ttl::Missing);
+        assert_eq!(current.ttl_set(b"set"), super::Ttl::Missing);
+        assert_eq!(current.ttl_list(b"list"), super::Ttl::Missing);
+        assert_eq!(current.ttl_stream(b"stream"), super::Ttl::Missing);
+        assert_eq!(current.ttl_sorted_set(b"sorted"), super::Ttl::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_hash_field_sweep_boundary_recovers_due_or_complete_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_hash(b"hash".to_vec())?;
+            seed.hset(b"hash".to_vec(), b"field".to_vec(), b"value".to_vec())?;
+            assert!(seed.expire_hash_field(b"hash".to_vec(), b"field".to_vec(), 80)?);
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let historical_root = database
+                .coordinator
+                .snapshot(80)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let historical_entries = BTree::from_root(historical_root).scan(&database.pages)?;
+
+            assert!(matches!(
+                database.expire_due_structures_at(
+                    80,
+                    1,
+                    DurabilityClass::Strict,
+                    Some(boundary),
+                ),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                BTree::from_root(historical_root).scan(&reopened.pages)?,
+                historical_entries,
+                "historical V3 field-expiry root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    let retry = reopened.expire_due_structures(80, 1, DurabilityClass::Strict)?;
+                    assert_eq!(retry.expired_keys, 1);
+                    assert!(retry.commit.is_some());
+                }
+                Some(3) => {}
+                found => {
+                    return Err(format!(
+                        "unexpected recovered V3 field sweep CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            let current = reopened.coordinator.snapshot(80)?;
+            assert!(reopened.due_structure_keys(&current, 80, 1)?.0.is_empty());
+            let current_root = current
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let state =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, current_root)?;
+            assert!(state.hashes[b"hash".as_slice()].is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_structure_v3_collection_sweep_boundary_recovers_due_or_complete_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in commit_crash_boundaries() {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut seed = database.begin(10, DurabilityClass::Strict)?;
+            seed.create_set(b"set".to_vec())?;
+            assert!(seed.sadd(b"set".to_vec(), b"member".to_vec())?);
+            assert!(seed.expire_set(b"set".to_vec(), 100)?);
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+            let historical_root = database
+                .coordinator
+                .snapshot(100)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let historical_entries = BTree::from_root(historical_root).scan(&database.pages)?;
+
+            assert!(matches!(
+                database.expire_due_structures_at(
+                    100,
+                    1,
+                    DurabilityClass::Strict,
+                    Some(boundary),
+                ),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                BTree::from_root(historical_root).scan(&reopened.pages)?,
+                historical_entries,
+                "historical V3 collection-expiry root changed at {boundary:?}"
+            );
+            match reopened.recovery_report().visible_csn.map(Csn::get) {
+                Some(2) => {
+                    let retry = reopened.expire_due_structures(100, 1, DurabilityClass::Strict)?;
+                    assert_eq!(retry.expired_keys, 1);
+                    assert!(retry.commit.is_some());
+                }
+                Some(3) => {}
+                found => {
+                    return Err(format!(
+                        "unexpected recovered V3 collection sweep CSN {found:?} at {boundary:?}"
+                    )
+                    .into());
+                }
+            }
+            let current = reopened.coordinator.snapshot(100)?;
+            assert!(reopened.due_structure_keys(&current, 100, 1)?.0.is_empty());
+            let current_root = current
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let state =
+                super::load_structure_state_root(&reopened.pages, &reopened.blobs, current_root)?;
+            assert!(!state.sets.contains_key(b"set".as_slice()));
+            assert!(
+                super::structure_v3::next_active_retirement_key_v3(
+                    &reopened.pages,
+                    &reopened.buffer_pool,
+                    BTree::from_root(current_root),
+                )?
+                .is_some()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hystrbt3_roots_load_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        assert_eq!(database.structure_format, super::StructureFormat::BTreeV2);
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.set(b"source".to_vec(), b"v2".to_vec(), None)?;
+        seed.commit()?;
+        let source_roots = database.coordinator.snapshot(0)?.roots().clone();
+        let mut entries = vec![
+            (
+                super::STRUCTURE_FORMAT_KEY.to_vec(),
+                super::structure_v3::STRUCTURE_FORMAT_VALUE_V3.to_vec(),
+            ),
+            (
+                super::structure_expiry_key(50, b"scalar")?,
+                vec![super::STRUCTURE_EXPIRY_LIVE],
+            ),
+            (
+                super::structure_key(b"scalar"),
+                super::structure_storage_value(
+                    b"value",
+                    Some(50),
+                    &std::collections::BTreeMap::new(),
+                )?,
+            ),
+        ];
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let v3_tree = hyphae_native_btree::BTree::empty()
+            .upsert_sorted_batch(&mut database.pages, Csn::new(2)?, entries)?
+            .tree;
+        let v3_root = v3_tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let loaded = super::load_structure_state_root(&database.pages, &database.blobs, v3_root)?;
+        assert_eq!(
+            loaded.entries.get(b"scalar".as_slice()),
+            Some(&super::StructureEntry {
+                value: b"value".to_vec(),
+                expires_at_micros: Some(50),
+            })
+        );
+        let mut roots = source_roots
+            .iter_roots()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        roots.insert(super::SLOT_STRUCTURE, v3_root);
+        let v3_roots = hyphae_native_mvcc::RootSet::committed(
+            Csn::new(2)?,
+            source_roots.catalog_version(),
+            source_roots
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            roots,
+            source_roots.blob_generation(),
+        )?;
+        assert_eq!(
+            super::structure_format_for_root(&database.pages, &v3_roots)?,
+            super::StructureFormat::BTreeV3
+        );
+
+        let orphan = super::structure_v3::encode_collection_child_key(
+            super::STRUCTURE_SET_MEMBER_PREFIX,
+            b"orphan",
+            super::structure_v3::StructureIncarnation::from_mutation_index(
+                TransactionId::new(99)?,
+                0,
+            )?,
+            b"member",
+        )?;
+        let corrupt = v3_tree
+            .upsert(
+                &mut database.pages,
+                Csn::new(3)?,
+                orphan,
+                super::set_member_live_value(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        assert!(matches!(
+            super::load_structure_state_root(&database.pages, &database.blobs, corrupt),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
         Ok(())
     }
 }

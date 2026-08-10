@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Dedicated embedded G5 evidence for one relational/structure/lexical/ANN transaction.
 

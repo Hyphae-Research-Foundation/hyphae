@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";

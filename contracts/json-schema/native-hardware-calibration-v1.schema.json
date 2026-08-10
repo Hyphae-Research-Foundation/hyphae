@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-hardware-calibration-v1.schema.json",
+  "title": "Hyphae Native hardware calibration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "mode", "status", "accepted_for_scheduling", "cache_status", "elapsed_ms", "identity", "policy", "feature_detection", "measurements", "selected_kernels", "thread_scaling", "io_scaling", "coverage", "claims"],
+  "properties": {
+    "schema": {"const": "hyphae-native-hardware-calibration-v1"},
+    "mode": {"enum": ["quick", "thorough"]},
+    "status": {"enum": ["stable", "unstable", "rejected"]},
+    "accepted_for_scheduling": {"type": "boolean"},
+    "cache_status": {"enum": ["disabled", "hit", "miss"]},
+    "elapsed_ms": {"type": "integer", "minimum": 1},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hardware_fingerprint", "kernel_release", "filesystem", "compiler_identity", "hyphae_build_identity", "executable_blake3", "cache_key"],
+      "properties": {
+        "hardware_fingerprint": {"$ref": "#/$defs/digest"},
+        "kernel_release": {"type": "string", "minLength": 1},
+        "filesystem": {"$ref": "#/$defs/optional_string"},
+        "compiler_identity": {"type": "string", "minLength": 1},
+        "hyphae_build_identity": {"type": "string", "minLength": 1},
+        "executable_blake3": {"$ref": "#/$defs/digest"},
+        "cache_key": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_duration_ms", "maximum_duration_ms", "warmup_batches", "samples_per_measurement", "target_sample_duration_ms", "maximum_relative_mad_ppm", "maximum_relative_range_ppm"],
+      "properties": {
+        "minimum_duration_ms": {"type": "integer", "minimum": 1},
+        "maximum_duration_ms": {"type": "integer", "minimum": 1},
+        "warmup_batches": {"type": "integer", "minimum": 1},
+        "samples_per_measurement": {"type": "integer", "minimum": 3},
+        "target_sample_duration_ms": {"type": "integer", "minimum": 1},
+        "maximum_relative_mad_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "maximum_relative_range_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "feature_detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instruction_sets", "differential_tests_passed"],
+      "properties": {
+        "instruction_sets": {"$ref": "#/$defs/unique_strings"},
+        "differential_tests_passed": {"type": "boolean"}
+      }
+    },
+    "measurements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/measurement"}
+    },
+    "selected_kernels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["primitive", "input_size", "input_unit", "variant", "reason"],
+        "properties": {
+          "primitive": {"type": "string", "minLength": 1},
+          "input_size": {"type": "integer", "minimum": 1},
+          "input_unit": {"type": "string", "minLength": 1},
+          "variant": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "thread_scaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "physical_core_boundary", "logical_processor_boundary", "measured_thread_counts", "status", "physical_peak_threads", "physical_peak_bytes_per_second", "smt_peak_threads", "smt_peak_bytes_per_second", "smt_to_physical_throughput_ppm", "smt_recommended", "recommended_worker_count", "recommendation"],
+      "properties": {
+        "binding": {"enum": ["unbound", "linux-sched-affinity", "inconsistent"]},
+        "physical_core_boundary": {"type": "integer", "minimum": 1},
+        "logical_processor_boundary": {"type": "integer", "minimum": 1},
+        "measured_thread_counts": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+        "status": {"enum": ["stable", "unavailable"]},
+        "physical_peak_threads": {"type": ["integer", "null"], "minimum": 1},
+        "physical_peak_bytes_per_second": {"type": ["integer", "null"], "minimum": 1},
+        "smt_peak_threads": {"type": ["integer", "null"], "minimum": 1},
+        "smt_peak_bytes_per_second": {"type": ["integer", "null"], "minimum": 1},
+        "smt_to_physical_throughput_ppm": {"type": ["integer", "null"], "minimum": 0},
+        "smt_recommended": {"type": "boolean"},
+        "recommended_worker_count": {"type": ["integer", "null"], "minimum": 1},
+        "recommendation": {"type": "string", "minLength": 1}
+      }
+    },
+    "io_scaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "measured_queue_depths", "status", "peak_queue_depth", "peak_bytes_per_second", "recommended_io_slots", "recommendation"],
+      "properties": {
+        "binding": {"const": "buffered-sync-workers"},
+        "measured_queue_depths": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 64}},
+        "status": {"enum": ["stable", "unavailable"]},
+        "peak_queue_depth": {"type": ["integer", "null"], "minimum": 1, "maximum": 64},
+        "peak_bytes_per_second": {"type": ["integer", "null"], "minimum": 1},
+        "recommended_io_slots": {"type": ["integer", "null"], "minimum": 1, "maximum": 64},
+        "recommendation": {"type": "string", "minLength": 1}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measured", "unsupported"],
+      "properties": {
+        "measured": {"$ref": "#/$defs/unique_strings"},
+        "unsupported": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["primitive", "reason"],
+            "properties": {
+              "primitive": {"type": "string", "minLength": 1},
+              "reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "claims": {
+      "type": "array",
+      "maxItems": 0
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optional_string": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "unique_strings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primitive", "variant", "input_size", "input_unit", "bytes_per_operation", "operations_per_sample", "maximum_operations_per_sample", "sample_count", "statistics", "correctness", "status"],
+      "properties": {
+        "primitive": {"type": "string", "minLength": 1},
+        "variant": {"type": "string", "minLength": 1},
+        "input_size": {"type": "integer", "minimum": 1},
+        "input_unit": {"type": "string", "minLength": 1},
+        "bytes_per_operation": {"type": "integer", "minimum": 0},
+        "operations_per_sample": {"type": "integer", "minimum": 1},
+        "maximum_operations_per_sample": {"type": "integer", "minimum": 1},
+        "sample_count": {"type": "integer", "minimum": 3},
+        "statistics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unit", "minimum", "median", "maximum", "median_absolute_deviation", "relative_mad_ppm", "relative_range_ppm", "median_bytes_per_second"],
+          "properties": {
+            "unit": {"const": "picoseconds_per_operation"},
+            "minimum": {"type": "integer", "minimum": 1},
+            "median": {"type": "integer", "minimum": 1},
+            "maximum": {"type": "integer", "minimum": 1},
+            "median_absolute_deviation": {"type": "integer", "minimum": 0},
+            "relative_mad_ppm": {"type": "integer", "minimum": 0},
+            "relative_range_ppm": {"type": "integer", "minimum": 0},
+            "median_bytes_per_second": {"type": ["integer", "null"], "minimum": 1}
+          }
+        },
+        "correctness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "result_digest_blake3", "reference_digest_blake3"],
+          "properties": {
+            "status": {"enum": ["passed", "failed"]},
+            "result_digest_blake3": {"$ref": "#/$defs/digest"},
+            "reference_digest_blake3": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "status": {"enum": ["stable", "unstable", "rejected"]}
+      }
+    }
+  }
+}

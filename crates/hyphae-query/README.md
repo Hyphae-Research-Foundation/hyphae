@@ -27,5 +27,6 @@ binary key and its exact canonical document bytes, including nonmatches and
 records from every shard. Budget or timeout exhaustion returns an error rather
 than partial success.
 
-Apache-2.0. Source and security policy:
+Code is GPL-3.0-only; documentation is CC-BY-SA-4.0. Source and security
+policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

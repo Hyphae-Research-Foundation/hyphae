@@ -1,9 +1,9 @@
 # Hyphae marks and identity
 
 The Hyphae name, logotypes, symbol, visual identity, and brand assets are owned
-by Celiums Solutions LLC. They are not licensed under the Apache License 2.0
-that applies to the Hyphae source code unless Celiums Solutions LLC explicitly
-states otherwise in writing.
+by Celiums Solutions LLC. They are not licensed under GPL-3.0-only,
+CC-BY-SA-4.0, or any prior Hyphae source license unless Celiums Solutions LLC
+explicitly states otherwise in writing.
 
 You may use unmodified Hyphae assets to identify or link to the official
 project, discuss compatibility, or accurately describe software that consumes

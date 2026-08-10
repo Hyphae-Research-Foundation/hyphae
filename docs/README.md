@@ -23,6 +23,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Architecture overview](architecture/overview.md)
 - [Native local ecosystem target](architecture/native-local-ecosystem.md)
 - [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
+- [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
 
 ## Build and embed
 
@@ -119,6 +120,14 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Hybrid retrieval semantics v1](retrieval/hybrid-reference-semantics-v1.md)
 - [0.2 retrieval benchmark methodology](performance/retrieval-benchmark-0.2.md)
 - [Microsecond-first performance contract](performance/microsecond-first.md)
+- [Native performance evidence v1](performance/native-performance-evidence-v1.md)
+- [Native hardware profile v1](performance/native-hardware-profile-v1.md)
+- [Native hardware calibration v1](performance/native-hardware-calibration-v1.md)
+- [Native resource governor v1](performance/native-resource-governor-v1.md)
+- [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
+- [Native structure execution v1](performance/native-structure-execution-v1.md)
+- [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)
+- [Native SQL vector execution v1](performance/native-sql-vector-execution-v1.md)
 - [Result proof format v1](provenance/result-proof-v1.md)
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
 - [Baseline threat model](security/threat-model.md)
@@ -263,6 +272,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0021: Native cutover and format evolution](adr/0021-native-cutover-and-format-evolution.md)
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
+- [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
+- [ADR-0025: GPLv3 code and CC BY-SA documentation](adr/0025-gplv3-code-and-cc-by-sa-documentation.md)
 
 ## Documentation contract
 

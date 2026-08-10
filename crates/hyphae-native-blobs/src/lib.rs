@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Immutable content-addressed blob files and staged publication.
 
@@ -6,6 +6,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -67,6 +68,9 @@ pub enum BlobError {
     /// Two distinct digests map to the same stable blob identity.
     #[error("native blob identity collision")]
     IdentityCollision,
+    /// A read reference is absent from this handle's verified namespace snapshot.
+    #[error("native blob {0:?} is outside the captured blob namespace")]
+    ReferenceOutsideBoundary(BlobId),
     /// Blob generation cannot be represented as u64.
     #[error("native blob generation is exhausted")]
     GenerationExhausted,
@@ -192,7 +196,34 @@ pub struct BlobStore {
     reference_trace: Mutex<Option<BlobReferenceSet>>,
 }
 
+/// Shareable immutable view of one verified blob namespace snapshot.
+///
+/// The wrapper exposes no mutable publication or collection authority.
+#[derive(Debug)]
+pub struct BlobStoreReader(BlobStore);
+
+impl Deref for BlobStoreReader {
+    type Target = BlobStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl BlobStore {
+    /// Captures an immutable worker view of the current verified references.
+    pub fn read_handle(&self) -> BlobStoreReader {
+        BlobStoreReader(BlobStore {
+            blobs_directory: self.blobs_directory.clone(),
+            temporary_directory: self.temporary_directory.clone(),
+            blobs: self.blobs.clone(),
+            committed_generation_floor: self.committed_generation_floor,
+            generation: self.generation,
+            recovered_temporary_files: self.recovered_temporary_files,
+            reference_trace: Mutex::new(None),
+        })
+    }
+
     /// Creates the owned blob and temporary directories.
     ///
     /// # Errors
@@ -499,6 +530,9 @@ impl BlobStore {
     ///
     /// Returns an error for a missing file, corruption, or reference mismatch.
     pub fn read(&self, reference: BlobReference) -> Result<Vec<u8>, BlobError> {
+        if self.blobs.get(&reference.id) != Some(&reference) {
+            return Err(BlobError::ReferenceOutsideBoundary(reference.id));
+        }
         let path = self
             .blobs_directory
             .join(format!("{}.hyblob", digest_hex(reference.digest)));
@@ -865,6 +899,24 @@ mod tests {
         let reopened = BlobStore::open(temporary.path())?;
         assert_eq!(reopened.recovery()?.blob_count, 1);
         assert_eq!(reopened.read(reference)?, content);
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_read_handle_freezes_the_verified_blob_namespace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = BlobStore::create(temporary.path())?;
+        let first = store.put(b"first", false)?;
+        let reader = store.read_handle();
+        let second = store.put(b"second", false)?;
+
+        assert_eq!(reader.read(first)?, b"first");
+        assert!(matches!(
+            reader.read(second),
+            Err(BlobError::ReferenceOutsideBoundary(id)) if id == second.id
+        ));
+        assert_eq!(store.read(second)?, b"second");
         Ok(())
     }
 

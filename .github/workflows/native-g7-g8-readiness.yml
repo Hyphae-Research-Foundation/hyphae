@@ -47,7 +47,7 @@ on:
 
 concurrency:
   group: native-g7-g8-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -70,6 +70,10 @@ jobs:
           PYTHONPATH=. python -m unittest \
             tools.test_check_native_g7_g8_readiness \
             tools.test_check_native_g8_receipts \
+            tools.test_check_native_g7_i7i_preflight \
+            tools.test_check_native_performance_receipt \
+            tools.test_check_native_vector_bulk_bakeoff \
+            tools.test_run_native_performance_baseline \
             -v
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "${{ github.sha }}" \
@@ -86,6 +90,7 @@ jobs:
     name: G7 complete dedicated ${{ inputs.g7_platform }} matrix
     if: inputs.g7_mode == 'benchmark'
     runs-on: [self-hosted, hyphae-g7, dedicated, "${{ inputs.g7_platform }}"]
+    timeout-minutes: 720
     steps:
       - name: Check out exact commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,12 +104,82 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.13.7
+      - name: Discover and calibrate dedicated hardware
+        if: inputs.g7_mode == 'benchmark'
+        shell: bash
+        env:
+          HYPHAE_G7_DATA_ROOT: /mnt/hyphae-g7
+        run: |
+          set -euo pipefail
+          test -d "$HYPHAE_G7_DATA_ROOT"
+          test ! -L "$HYPHAE_G7_DATA_ROOT"
+          findmnt --target "$HYPHAE_G7_DATA_ROOT" --output SOURCE,FSTYPE,TARGET
+          cargo build -p hyphae-cli --locked --release
+          target/release/hyphae hardware discover \
+            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            > native-g7-hardware-profile.json
+          PYTHONPATH=. python tools/check_native_hardware_profile.py \
+            --profile native-g7-hardware-profile.json
+          PYTHONPATH=. python tools/check_native_g7_i7i_preflight.py \
+            --profile native-g7-hardware-profile.json \
+            --output native-g7-i7i-preflight-audit.json
+          DEVICE="$(python -c 'import json; print(json.load(open("native-g7-hardware-profile.json"))["storage"]["device"])')"
+          DEVICE_PATH="$(readlink -f "/sys/dev/block/$DEVICE")"
+          test -n "$DEVICE_PATH"
+          case "$(basename "$DEVICE_PATH")" in
+            nvme*n*) ;;
+            *) echo "G7 data root is not backed by an NVMe namespace" >&2; exit 1 ;;
+          esac
+          grep -q 'Amazon EC2 NVMe Instance Storage' "$DEVICE_PATH/device/model"
+          command -v perf
+          LC_ALL=C perf stat --no-big-num -x ';' \
+            -e cycles,cache-misses,minor-faults,major-faults \
+            -o native-g7-perf-preflight.csv -- \
+            python -c 'sum(index * index for index in range(1000000))'
+          python - <<'PY'
+          from pathlib import Path
+
+          expected = {"cycles", "cache-misses", "minor-faults", "major-faults"}
+          measured = {}
+          for line in Path("native-g7-perf-preflight.csv").read_text().splitlines():
+              fields = line.split(";")
+              if len(fields) < 3 or fields[2].strip() not in expected:
+                  continue
+              raw = fields[0].strip()
+              if raw.startswith("<"):
+                  raise SystemExit(f"perf event unavailable: {fields[2].strip()}={raw}")
+              measured[fields[2].strip()] = int(raw)
+          if set(measured) != expected or measured["cycles"] <= 0:
+              raise SystemExit(f"perf event preflight incomplete: {measured}")
+          PY
+          target/release/hyphae hardware calibrate \
+            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            --mode thorough \
+            --no-cache \
+            > native-g7-hardware-calibration.json
+          PYTHONPATH=. python tools/check_native_hardware_calibration.py \
+            --receipt native-g7-hardware-calibration.json
+          target/release/hyphae hardware governor-policy \
+            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            --calibration native-g7-hardware-calibration.json \
+            --mode mixed \
+            > native-g7-governor-policy.json
+          PYTHONPATH=. python tools/check_native_governor_policy.py \
+            --policy native-g7-governor-policy.json
+          target/release/hyphae hardware execution-topology \
+            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            --calibration native-g7-hardware-calibration.json \
+            --mode mixed \
+            > native-g7-execution-topology.json
+          PYTHONPATH=. python tools/check_native_execution_topology.py \
+            --topology native-g7-execution-topology.json
       - name: Run complete G7 matrix
         shell: bash
         env:
           HYPHAE_G7_BACKGROUND: "1"
           HYPHAE_G7_PERF: "1"
           HYPHAE_G7_HARDWARE_FILE: /etc/hyphae/g7-hardware.json
+          HYPHAE_G7_DATA_ROOT: /mnt/hyphae-g7
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
@@ -115,7 +190,9 @@ jobs:
             --background \
             --hardware-file "$HYPHAE_G7_HARDWARE_FILE" \
             --observations 1000000 \
-            --warmup 100000
+            --warmup 100000 \
+            --cell-timeout-seconds 7200 \
+            --matrix-timeout-seconds 39600
           PYTHONPATH=. python tools/check_native_g7_matrix.py \
             --matrix native-g7-matrix.json \
             --expected-commit "$SHA" \
@@ -127,7 +204,31 @@ jobs:
           path: |
             native-g7-matrix.json
             native-g7-matrix-audit.json
+            native-g7-matrix.progress.json
+            native-g7-matrix.runner-progress.json
+            native-g7-hardware-profile.json
+            native-g7-i7i-preflight-audit.json
+            native-g7-perf-preflight.csv
+            native-g7-hardware-calibration.json
+            native-g7-governor-policy.json
+            native-g7-execution-topology.json
           if-no-files-found: error
+          retention-days: 30
+      - name: Preserve G7 progress after failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-g7-progress-${{ inputs.g7_platform }}-${{ github.sha }}
+          path: |
+            native-g7-matrix.progress.json
+            native-g7-matrix.runner-progress.json
+            native-g7-hardware-profile.json
+            native-g7-i7i-preflight-audit.json
+            native-g7-perf-preflight.csv
+            native-g7-hardware-calibration.json
+            native-g7-governor-policy.json
+            native-g7-execution-topology.json
+          if-no-files-found: warn
           retention-days: 30
 
   g7-aggregate:

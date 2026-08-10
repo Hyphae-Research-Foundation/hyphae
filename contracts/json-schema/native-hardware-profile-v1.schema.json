@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-hardware-profile-v1.schema.json",
+  "title": "Hyphae Native hardware profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "fingerprint", "cpu", "memory", "storage", "operating_system"],
+  "properties": {
+    "schema": {"const": "hyphae-native-hardware-profile-v1"},
+    "fingerprint": {"$ref": "#/$defs/digest"},
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "logical_processors_available", "physical_cores_visible", "smt_threads_per_core", "sockets_visible", "numa_nodes_visible", "affinity", "quota_millicores", "instruction_sets", "caches", "processor_topology", "frequency_governors"],
+      "properties": {
+        "architecture": {"type": "string", "minLength": 1},
+        "logical_processors_available": {"type": "integer", "minimum": 1},
+        "physical_cores_visible": {"$ref": "#/$defs/optional_positive_integer"},
+        "smt_threads_per_core": {"$ref": "#/$defs/optional_positive_integer"},
+        "sockets_visible": {"$ref": "#/$defs/optional_positive_integer"},
+        "numa_nodes_visible": {"$ref": "#/$defs/optional_positive_integer"},
+        "affinity": {"type": "string", "minLength": 1},
+        "quota_millicores": {"$ref": "#/$defs/optional_positive_integer"},
+        "instruction_sets": {"$ref": "#/$defs/unique_strings"},
+        "frequency_governors": {"$ref": "#/$defs/unique_strings"},
+        "caches": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["level", "kind", "size_bytes", "line_size_bytes", "shared_cpu_list"],
+            "properties": {
+              "level": {"type": "integer", "minimum": 1},
+              "kind": {"type": "string", "minLength": 1},
+              "size_bytes": {"type": "integer", "minimum": 1},
+              "line_size_bytes": {"$ref": "#/$defs/optional_positive_integer"},
+              "shared_cpu_list": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "processor_topology": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["logical_id", "core_id", "socket_id", "numa_node_id", "thread_siblings"],
+            "properties": {
+              "logical_id": {"type": "integer", "minimum": 0},
+              "core_id": {"type": "integer", "minimum": 0},
+              "socket_id": {"type": "integer", "minimum": 0},
+              "numa_node_id": {"type": ["integer", "null"], "minimum": 0},
+              "thread_siblings": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_bytes", "available_bytes", "page_size_bytes", "huge_page_size_bytes", "huge_pages_total", "numa_nodes"],
+      "properties": {
+        "total_bytes": {"$ref": "#/$defs/optional_positive_integer"},
+        "available_bytes": {"$ref": "#/$defs/optional_nonnegative_integer"},
+        "page_size_bytes": {"$ref": "#/$defs/optional_positive_integer"},
+        "huge_page_size_bytes": {"$ref": "#/$defs/optional_positive_integer"},
+        "huge_pages_total": {"$ref": "#/$defs/optional_nonnegative_integer"},
+        "numa_nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "cpu_list", "total_bytes", "available_bytes"],
+            "properties": {
+              "id": {"type": "integer", "minimum": 0},
+              "cpu_list": {"type": "string", "minLength": 1},
+              "total_bytes": {"$ref": "#/$defs/optional_positive_integer"},
+              "available_bytes": {"$ref": "#/$defs/optional_nonnegative_integer"}
+            }
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "filesystem", "device", "mount_options", "rotational", "queue_depth", "discard_max_bytes"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "filesystem": {"$ref": "#/$defs/optional_string"},
+        "device": {"$ref": "#/$defs/optional_string"},
+        "mount_options": {"$ref": "#/$defs/unique_strings"},
+        "rotational": {"type": ["boolean", "null"]},
+        "queue_depth": {"$ref": "#/$defs/optional_nonnegative_integer"},
+        "discard_max_bytes": {"$ref": "#/$defs/optional_nonnegative_integer"}
+      }
+    },
+    "operating_system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "kernel_release", "virtualization", "local_transports"],
+      "properties": {
+        "family": {"type": "string", "minLength": 1},
+        "kernel_release": {"type": "string", "minLength": 1},
+        "virtualization": {"type": "string", "minLength": 1},
+        "local_transports": {"$ref": "#/$defs/unique_strings"}
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optional_string": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "optional_positive_integer": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "optional_nonnegative_integer": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+    "unique_strings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+  }
+}

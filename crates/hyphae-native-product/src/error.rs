@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Transport-independent product errors and engine-to-product mappings.
 
 use std::{fmt, io};
 
-use hyphae_native_runtime::{NativeDirectoryError, NativeRuntimeError, SqlError};
+use hyphae_native_runtime::{
+    MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeDirectoryError, NativeRuntimeError,
+    SqlError,
+};
 use hyphae_native_types::{ObjectId, TransactionId};
 
 /// Maximum bytes in a stable product error code or limit name.
@@ -657,6 +660,10 @@ pub enum ProductLimitKind {
     SqlParameters,
     /// Materialized SQL result rows.
     SqlResultRows,
+    /// Visible left candidates consumed by one bounded SQL join.
+    SqlJoinCandidates,
+    /// Physical candidates consumed by one bounded SQL scan.
+    SqlScanCandidates,
     /// Request payload bytes.
     RequestBytes,
     /// Response payload bytes.
@@ -680,6 +687,8 @@ impl ProductLimitKind {
             Self::SqlStatementBytes => "sql_statement_bytes",
             Self::SqlParameters => "sql_parameters",
             Self::SqlResultRows => "sql_result_rows",
+            Self::SqlJoinCandidates => "sql_join_candidates",
+            Self::SqlScanCandidates => "sql_scan_candidates",
             Self::RequestBytes => "request_bytes",
             Self::ResponseBytes => "response_bytes",
             Self::HashFieldBatchItems => "hash_field_batch_items",
@@ -701,6 +710,8 @@ impl ProductLimitKind {
             "sql_statement_bytes" => Self::SqlStatementBytes,
             "sql_parameters" => Self::SqlParameters,
             "sql_result_rows" => Self::SqlResultRows,
+            "sql_join_candidates" => Self::SqlJoinCandidates,
+            "sql_scan_candidates" => Self::SqlScanCandidates,
             "request_bytes" => Self::RequestBytes,
             "response_bytes" => Self::ResponseBytes,
             "hash_field_batch_items" => Self::HashFieldBatchItems,
@@ -815,6 +826,10 @@ pub enum ProductSqlSubcode {
     Hysql016,
     /// `HYSQL017`: unknown relation.
     Hysql017,
+    /// `HYSQL018`: bounded join candidate budget exhausted.
+    Hysql018,
+    /// `HYSQL019`: bounded scan candidate budget exhausted.
+    Hysql019,
 }
 
 impl ProductSqlSubcode {
@@ -838,6 +853,8 @@ impl ProductSqlSubcode {
             Self::Hysql015 => "HYSQL015",
             Self::Hysql016 => "HYSQL016",
             Self::Hysql017 => "HYSQL017",
+            Self::Hysql018 => "HYSQL018",
+            Self::Hysql019 => "HYSQL019",
         }
     }
 
@@ -860,6 +877,8 @@ impl ProductSqlSubcode {
             b"HYSQL015" => Some(Self::Hysql015),
             b"HYSQL016" => Some(Self::Hysql016),
             b"HYSQL017" => Some(Self::Hysql017),
+            b"HYSQL018" => Some(Self::Hysql018),
+            b"HYSQL019" => Some(Self::Hysql019),
             _ => None,
         }
     }
@@ -1512,6 +1531,24 @@ impl From<SqlError> for ProductError {
                 ProductErrorCode::SqlUnknownObject,
                 ProductSqlSubcode::Hysql017,
             ),
+            SqlError::JoinCandidateBudgetExceeded => {
+                Self::sql(ProductErrorCode::LimitExceeded, ProductSqlSubcode::Hysql018).with_limit(
+                    ProductLimit::new(
+                        ProductLimitKind::SqlJoinCandidates,
+                        usize_to_u64(MAX_SQL_JOIN_CANDIDATES),
+                        usize_to_u64(MAX_SQL_JOIN_CANDIDATES.saturating_add(1)),
+                    ),
+                )
+            }
+            SqlError::ScanCandidateBudgetExceeded => {
+                Self::sql(ProductErrorCode::LimitExceeded, ProductSqlSubcode::Hysql019).with_limit(
+                    ProductLimit::new(
+                        ProductLimitKind::SqlScanCandidates,
+                        usize_to_u64(MAX_SQL_SCAN_CANDIDATES),
+                        usize_to_u64(MAX_SQL_SCAN_CANDIDATES.saturating_add(1)),
+                    ),
+                )
+            }
             SqlError::Runtime(source) => source.into(),
         }
     }
@@ -1586,6 +1623,29 @@ mod tests {
         assert_eq!(
             error.details().sql_subcode(),
             Some(ProductSqlSubcode::Hysql016)
+        );
+
+        let bounded = ProductError::from(SqlError::JoinCandidateBudgetExceeded);
+        assert_eq!(bounded.code(), ProductErrorCode::LimitExceeded);
+        assert_eq!(bounded.category(), ProductErrorCategory::Limit);
+        assert_eq!(
+            bounded.details().sql_subcode(),
+            Some(ProductSqlSubcode::Hysql018)
+        );
+        assert_eq!(
+            bounded.limit().map(ProductLimit::kind),
+            Some(ProductLimitKind::SqlJoinCandidates)
+        );
+
+        let scan = ProductError::from(SqlError::ScanCandidateBudgetExceeded);
+        assert_eq!(scan.code(), ProductErrorCode::LimitExceeded);
+        assert_eq!(
+            scan.details().sql_subcode(),
+            Some(ProductSqlSubcode::Hysql019)
+        );
+        assert_eq!(
+            scan.limit().map(ProductLimit::kind),
+            Some(ProductLimitKind::SqlScanCandidates)
         );
     }
 

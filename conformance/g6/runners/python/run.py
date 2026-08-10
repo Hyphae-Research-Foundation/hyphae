@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Python SDK G6 lane runner over native-local or HTTP v2."""
 
 from __future__ import annotations

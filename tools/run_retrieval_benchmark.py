@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Build, run, and capture Hyphae 0.2 retrieval benchmark evidence."""
 
 from __future__ import annotations

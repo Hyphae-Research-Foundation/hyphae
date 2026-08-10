@@ -1,8 +1,9 @@
 # Packaging
 
 `package.py` produces a deterministic archive containing one native `hyphae`
-binary plus the license, readme, and third-party notices. It never bundles a
-database, cache, model, provider credential, or runtime installer.
+binary plus the GPLv3 code license, CC BY-SA documentation license, licensing
+scope policy, readme, and third-party notices. It never bundles a database,
+cache, model, provider credential, or runtime installer.
 
 ```bash
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \

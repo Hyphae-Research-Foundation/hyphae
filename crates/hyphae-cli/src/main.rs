@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Command-line entry point for the single native Hyphae executable.
 
@@ -54,9 +54,10 @@ use hyphae_native_product::{
     StructureKind, VerifyBackupRequest, capabilities, verify_backup,
 };
 use hyphae_native_runtime::{
+    CalibrationMode, CalibrationRequest, GovernorMode, HardwareCalibration, HardwareProfile,
     MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
     MigrationObject, MigrationProofAnchor, MigrationReceipt, MigrationSource, MigrationTarget,
-    MigrationVectorSpace,
+    MigrationVectorSpace, NativeExecutionTopology, NativeGovernorPolicy,
 };
 use hyphae_query::Value as LegacyValue;
 use hyphae_storage::{
@@ -194,6 +195,11 @@ enum Command {
         #[command(subcommand)]
         operation: ExplainCommand,
     },
+    /// Discover read-only hardware capabilities for Native scheduling.
+    Hardware {
+        #[command(subcommand)]
+        operation: HardwareCommand,
+    },
     /// Report current all-engine native status.
     Status(LocalDirectory),
     /// Capture bounded process-local native telemetry.
@@ -296,6 +302,87 @@ enum Command {
         #[arg(long, env = "HYPHAE_BEARER_TOKEN_FILE")]
         bearer_token_file: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HardwareCommand {
+    /// Emit a stable hardware fingerprint and current resource snapshot.
+    Discover {
+        /// Data path whose filesystem and block device should be resolved.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Measure bounded CPU, memory, engine, storage, and WAL primitives.
+    Calibrate {
+        /// Data path whose static hardware profile identifies the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        /// Calibration duration and sample policy.
+        #[arg(long, value_enum, default_value_t = HardwareCalibrationMode::Quick)]
+        mode: HardwareCalibrationMode,
+        /// Override the per-user immutable calibration cache directory.
+        #[arg(long, conflicts_with = "no_cache")]
+        cache_dir: Option<PathBuf>,
+        /// Run without reading or writing the calibration cache.
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// Derive an inspectable resource policy from one calibration receipt.
+    GovernorPolicy {
+        /// Data path whose current static profile must match the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        /// Hardware calibration receipt used as the decision evidence.
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Scheduler objective used for class limits.
+        #[arg(long, value_enum, default_value_t = HardwareGovernorMode::Mixed)]
+        mode: HardwareGovernorMode,
+    },
+    /// Derive inspectable persistent worker and NUMA placement.
+    ExecutionTopology {
+        /// Data path whose current static profile must match the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        /// Hardware calibration receipt used to derive the governor budget.
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Scheduler objective used for the worker budget.
+        #[arg(long, value_enum, default_value_t = HardwareGovernorMode::Mixed)]
+        mode: HardwareGovernorMode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareCalibrationMode {
+    Quick,
+    Thorough,
+}
+
+impl From<HardwareCalibrationMode> for CalibrationMode {
+    fn from(value: HardwareCalibrationMode) -> Self {
+        match value {
+            HardwareCalibrationMode::Quick => Self::Quick,
+            HardwareCalibrationMode::Thorough => Self::Thorough,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareGovernorMode {
+    Latency,
+    Bulk,
+    Mixed,
+}
+
+impl From<HardwareGovernorMode> for GovernorMode {
+    fn from(value: HardwareGovernorMode) -> Self {
+        match value {
+            HardwareGovernorMode::Latency => Self::Latency,
+            HardwareGovernorMode::Bulk => Self::Bulk,
+            HardwareGovernorMode::Mixed => Self::Mixed,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1195,6 +1282,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             transaction(&local, operation).map_err(Into::into)
         }
         Command::Explain { local, operation } => explain(&local, operation).map_err(Into::into),
+        Command::Hardware { operation } => hardware(operation).map_err(Into::into),
         Command::Status(local) => {
             dispatch(&local, ProductOperation::AdminStatus).map_err(Into::into)
         }
@@ -1296,6 +1384,92 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             bearer_token_file,
         } => compatibility(compatibility::run_mcp(&base_url, bearer_token_file.as_deref()).await),
     }
+}
+
+fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
+    match command {
+        HardwareCommand::Discover { data_dir } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            print_json(&serde_json::to_value(profile)?)
+        }
+        HardwareCommand::Calibrate {
+            data_dir,
+            mode,
+            cache_dir,
+            no_cache,
+        } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let request = CalibrationRequest::for_current_executable(
+                mode.into(),
+                env!("HYPHAE_RUSTC_IDENTITY"),
+                concat!("hyphae-cli/", env!("CARGO_PKG_VERSION")),
+            )
+            .map_err(|_| CliFailure::io())?;
+            let calibration = if no_cache {
+                HardwareCalibration::run(&profile, &request)
+            } else {
+                let cache_directory =
+                    cache_dir.map_or_else(default_hardware_cache_directory, Ok)?;
+                HardwareCalibration::run_cached(&profile, &request, cache_directory)
+            }
+            .map_err(|_| CliFailure::io())?;
+            print_json(&serde_json::to_value(calibration)?)
+        }
+        HardwareCommand::GovernorPolicy {
+            data_dir,
+            calibration,
+            mode,
+        } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let encoded = fs::read(calibration)?;
+            let calibration: HardwareCalibration =
+                serde_json::from_slice(&encoded).map_err(|_| CliFailure::invalid())?;
+            let policy = NativeGovernorPolicy::derive(&profile, &calibration, mode.into())
+                .map_err(|_| CliFailure::invalid())?;
+            print_json(&serde_json::to_value(policy)?)
+        }
+        HardwareCommand::ExecutionTopology {
+            data_dir,
+            calibration,
+            mode,
+        } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let encoded = fs::read(calibration)?;
+            let calibration: HardwareCalibration =
+                serde_json::from_slice(&encoded).map_err(|_| CliFailure::invalid())?;
+            let policy = NativeGovernorPolicy::derive(&profile, &calibration, mode.into())
+                .map_err(|_| CliFailure::invalid())?;
+            let topology = NativeExecutionTopology::derive(&profile, &policy)
+                .map_err(|_| CliFailure::invalid())?;
+            print_json(&serde_json::to_value(topology)?)
+        }
+    }
+}
+
+fn default_hardware_cache_directory() -> Result<PathBuf, CliFailure> {
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Caches"));
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        });
+
+    root.map(|root| root.join("hyphae").join("calibration"))
+        .ok_or_else(CliFailure::io)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4104,7 +4278,14 @@ fn print_error(failure: &CliFailure) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex, encode_hex, qualified_name};
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::{
+        Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode, decode_hex,
+        encode_hex, qualified_name,
+    };
 
     #[test]
     fn native_cli_hex_and_names_are_canonical() {
@@ -4119,5 +4300,74 @@ mod tests {
             Some("main.public.items")
         );
         assert!(qualified_name("items").is_err());
+    }
+
+    #[test]
+    fn hardware_discovery_does_not_require_a_data_directory() {
+        let cli = Cli::try_parse_from(["hyphae", "hardware", "discover"]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::Discover { data_dir: None }
+            })
+        ));
+    }
+
+    #[test]
+    fn hardware_calibration_defaults_to_quick_mode() {
+        let cli = Cli::try_parse_from(["hyphae", "hardware", "calibrate"]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::Calibrate {
+                    data_dir: None,
+                    mode: HardwareCalibrationMode::Quick,
+                    cache_dir: None,
+                    no_cache: false
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn hardware_governor_policy_defaults_to_mixed_mode() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "governor-policy",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::GovernorPolicy {
+                    data_dir: None,
+                    calibration,
+                    mode: HardwareGovernorMode::Mixed,
+                }
+            }) if calibration == Path::new("receipt.json")
+        ));
+    }
+
+    #[test]
+    fn hardware_execution_topology_defaults_to_mixed_mode() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "execution-topology",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::ExecutionTopology {
+                    data_dir: None,
+                    calibration,
+                    mode: HardwareGovernorMode::Mixed,
+                }
+            }) if calibration == Path::new("receipt.json")
+        ));
     }
 }

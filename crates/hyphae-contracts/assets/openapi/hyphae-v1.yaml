@@ -6,8 +6,8 @@ info:
     Stable version 1 HTTP contract for the autonomous Hyphae data engine.
     Hyphae remains fully usable without starting this optional server.
   license:
-    name: Apache-2.0
-    identifier: Apache-2.0
+    name: GPL-3.0-only
+    identifier: GPL-3.0-only
 x-hyphae-status: alpha
 x-hyphae-auth-policy: >-
   Health and capability routes are public. Data and witness routes require a

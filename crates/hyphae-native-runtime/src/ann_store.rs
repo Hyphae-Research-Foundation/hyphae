@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyphae_native_ann::{
-    AnnRecallRisk, AnnSearchResult, AnnSearchStrategy, GraphNodeRecord, HnswConfig, HnswIndex,
-    IndexSnapshot, Metric, SearchOptions, Vector, VectorHit, VectorIndexDefinition, VectorRecord,
+    AnnRecallRisk, AnnSearchResult, AnnSearchStrategy, GraphNodeRecord, HnswBuildProgress,
+    HnswConfig, HnswIndex, IndexSnapshot, Metric, SearchOptions, Vector, VectorHit,
+    VectorIndexDefinition, VectorRecord,
 };
 use hyphae_native_btree::BTree;
 use hyphae_native_catalog::{
@@ -14,10 +15,17 @@ use hyphae_native_pages::{PageKind, PageStore};
 use hyphae_native_types::{Csn, ObjectId, PageId};
 
 use crate::{
-    NativeRuntimeError,
+    NativeExecutionPool, NativeRuntimeError, OwnedGovernorPermit,
     model::CatalogState,
     wal_codec::{Mutation, Opcode},
 };
+
+pub(crate) struct ExactSearchExecution {
+    pub(crate) hits: Vec<VectorHit>,
+    pub(crate) planned_vectors: usize,
+    pub(crate) planned_batches: usize,
+    pub(crate) worker_batches: usize,
+}
 
 pub(crate) const ANN_INDEX_META_PREFIX: u8 = 5;
 pub(crate) const ANN_VECTOR_PREFIX: u8 = 6;
@@ -256,6 +264,115 @@ impl AnnIndexState {
         Ok(hits)
     }
 
+    fn search_exact_profiled(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+    ) -> Result<ExactSearchExecution, NativeRuntimeError> {
+        validate_vector(self.definition(), query)?;
+        let records = self
+            .effective_vectors()
+            .into_iter()
+            .filter(|record| allowlist.is_none_or(|ids| ids.contains(&record.object_id)))
+            .collect::<Vec<_>>();
+        let planned_vectors = records.len();
+        let mut hits = if k == 0 {
+            Vec::new()
+        } else {
+            records
+                .into_iter()
+                .map(|record| {
+                    Ok(VectorHit {
+                        object_id: record.object_id,
+                        distance: distance(self.definition().metric(), query, &record.vector)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, NativeRuntimeError>>()?
+        };
+        sort_hits(&mut hits);
+        hits.truncate(k);
+        Ok(ExactSearchExecution {
+            hits,
+            planned_vectors,
+            planned_batches: usize::from(planned_vectors > 0 && k > 0),
+            worker_batches: 0,
+        })
+    }
+
+    fn search_exact_parallel(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<ExactSearchExecution, NativeRuntimeError> {
+        validate_vector(self.definition(), query)?;
+        if k == 0 {
+            return Ok(ExactSearchExecution {
+                hits: Vec::new(),
+                planned_vectors: 0,
+                planned_batches: 0,
+                worker_batches: 0,
+            });
+        }
+        let records = self
+            .effective_vectors()
+            .into_iter()
+            .filter(|record| allowlist.is_none_or(|ids| ids.contains(&record.object_id)))
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(ExactSearchExecution {
+                hits: Vec::new(),
+                planned_vectors: 0,
+                planned_batches: 0,
+                worker_batches: 0,
+            });
+        }
+        let planned_vectors = records.len();
+        let batch_count = usize::try_from(permit.request().compute_threads)
+            .unwrap_or(usize::MAX)
+            .min(planned_vectors);
+        let records_per_batch = planned_vectors.div_ceil(batch_count);
+        let batches = records
+            .chunks(records_per_batch)
+            .map(<[VectorRecord]>::to_vec)
+            .collect::<Vec<_>>();
+        let planned_batches = batches.len();
+        let metric = self.definition().metric();
+        let query = query.clone();
+        let (batch_results, worker_batches) =
+            execution_pool.execute_ordered_profiled(permit, batches, move |records| {
+                let mut hits = records
+                    .into_iter()
+                    .map(|record| {
+                        Ok(VectorHit {
+                            object_id: record.object_id,
+                            distance: distance(metric, &query, &record.vector)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, NativeRuntimeError>>()?;
+                sort_hits(&mut hits);
+                hits.truncate(k);
+                Ok(hits)
+            })?;
+        let mut hits = batch_results
+            .into_iter()
+            .collect::<Result<Vec<_>, NativeRuntimeError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        sort_hits(&mut hits);
+        hits.truncate(k);
+        Ok(ExactSearchExecution {
+            hits,
+            planned_vectors,
+            planned_batches,
+            worker_batches,
+        })
+    }
+
     fn search(
         &self,
         query: &Vector,
@@ -445,6 +562,16 @@ impl AnnState {
         creating_csn: Csn,
         vectors: &[(ObjectId, Vector)],
     ) -> Result<(), NativeRuntimeError> {
+        self.upsert_initial_many_with_progress(index, creating_csn, vectors, |_| {})
+    }
+
+    pub(crate) fn upsert_initial_many_with_progress(
+        &mut self,
+        index: ObjectId,
+        creating_csn: Csn,
+        vectors: &[(ObjectId, Vector)],
+        progress: impl FnMut(HnswBuildProgress),
+    ) -> Result<(), NativeRuntimeError> {
         let current = self
             .indexes
             .get(&index)
@@ -474,7 +601,8 @@ impl AnnState {
                 },
             );
         }
-        let replacement = HnswIndex::build(current.definition(), records.into_values())?;
+        let replacement =
+            HnswIndex::build_with_progress(current.definition(), records.into_values(), progress)?;
         let current = self
             .indexes
             .get_mut(&index)
@@ -544,6 +672,34 @@ impl AnnState {
             .get(&index)
             .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
             .search_exact(query, k, Some(allowlist))
+    }
+
+    pub(crate) fn search_exact_parallel(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<ExactSearchExecution, NativeRuntimeError> {
+        self.indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+            .search_exact_parallel(query, k, allowlist, execution_pool, permit)
+    }
+
+    pub(crate) fn search_exact_profiled(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        k: usize,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+    ) -> Result<ExactSearchExecution, NativeRuntimeError> {
+        self.indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+            .search_exact_profiled(query, k, allowlist)
     }
 }
 

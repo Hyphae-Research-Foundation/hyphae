@@ -48,6 +48,19 @@ jobs:
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "$(git rev-parse HEAD)" \
             --output native-g7-g8-readiness-audit.json
+      - name: Verify Native performance evidence contract
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_hardware_profile \
+            tools.test_check_native_g7_i7i_preflight \
+            tools.test_check_native_hardware_calibration \
+            tools.test_check_native_execution_topology \
+            tools.test_check_native_governor_policy \
+            tools.test_check_native_performance_receipt \
+            tools.test_check_native_vector_bulk_bakeoff \
+            tools.test_run_native_g7 \
+            tools.test_run_native_performance_baseline \
+            -v
       - name: Verify G6 manifests
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
@@ -75,6 +88,20 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify Linux hardware discovery and calibration receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked -p hyphae-cli -- \
+            hardware discover --data-dir "$RUNNER_TEMP" \
+            > native-hardware-profile.json
+          PYTHONPATH=. python tools/check_native_hardware_profile.py \
+            --profile native-hardware-profile.json
+          cargo run --quiet --locked -p hyphae-cli -- \
+            hardware calibrate --data-dir "$RUNNER_TEMP" --no-cache \
+            > native-hardware-calibration.json
+          PYTHONPATH=. python tools/check_native_hardware_calibration.py \
+            --receipt native-hardware-calibration.json
 
   test:
     name: Test (${{ matrix.name }})

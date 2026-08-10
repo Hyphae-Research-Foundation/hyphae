@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Live command-line-client runner for the shared version 1 fixture."""
 
 from __future__ import annotations

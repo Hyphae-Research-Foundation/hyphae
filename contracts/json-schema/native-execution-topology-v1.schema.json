@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-execution-topology-v1.schema.json",
+  "title": "Hyphae Native persistent execution topology v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "hardware_fingerprint", "schedulable_compute_threads", "hard_affinity", "pools"],
+  "properties": {
+    "schema": {"const": "hyphae-native-execution-topology-v1"},
+    "hardware_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schedulable_compute_threads": {"type": "integer", "minimum": 1},
+    "hard_affinity": {"type": "boolean"},
+    "pools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/pool"}
+    }
+  },
+  "$defs": {
+    "nullable_id": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_index", "numa_node_id", "logical_processor_id", "socket_id", "core_id", "smt_rank"],
+      "properties": {
+        "worker_index": {"type": "integer", "minimum": 0},
+        "numa_node_id": {"$ref": "#/$defs/nullable_id"},
+        "logical_processor_id": {"$ref": "#/$defs/nullable_id"},
+        "socket_id": {"$ref": "#/$defs/nullable_id"},
+        "core_id": {"$ref": "#/$defs/nullable_id"},
+        "smt_rank": {"$ref": "#/$defs/nullable_id"}
+      }
+    },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["numa_node_id", "workers"],
+      "properties": {
+        "numa_node_id": {"$ref": "#/$defs/nullable_id"},
+        "workers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/worker"}
+        }
+      }
+    }
+  }
+}

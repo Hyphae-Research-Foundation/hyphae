@@ -11,7 +11,14 @@ documentation = "https://docs.rs/hyphae-native-catalog"
 readme = "README.md"
 description = "Immutable versioned catalog model for Hyphae's native engines."
 publish.workspace = true
-include = ["Cargo.toml", "README.md", "src/**"]
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "LICENSE-DOCUMENTATION",
+    "LICENSE-POLICY.md",
+    "README.md",
+    "src/**",
+]
 
 [dependencies]
 hyphae-native-types.workspace = true

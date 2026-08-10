@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Bounded multi-producer scheduler for native group durability.
 
@@ -616,6 +616,59 @@ impl NativeCommitClient {
             .map_err(GroupCommitSubmitError::runtime)
     }
 
+    /// Prepares one point-resolved all-engine delta batch without materializing
+    /// complete engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable after shutdown/failure, or a typed native snapshot
+    /// or physical-format error.
+    pub fn begin_optimistic_delta(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeWriteBatch, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?
+            .begin_optimistic_delta(logical_time_micros, durability)
+            .map_err(GroupCommitSubmitError::runtime)
+    }
+
+    /// Hydrates and stages one scalar SET in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable after shutdown/failure, or a typed structure or
+    /// physical corruption error.
+    pub fn stage_delta_set(
+        &self,
+        batch: &mut NativeWriteBatch,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?
+            .stage_delta_set(batch, key, value, expires_at_micros)
+            .map_err(GroupCommitSubmitError::runtime)
+    }
+
     /// Submits one detached `group` batch and waits for its own outcome.
     ///
     /// # Errors
@@ -871,6 +924,21 @@ impl NativeCommitScheduler {
     ) -> Result<NativeWriteBatch, GroupCommitSubmitError> {
         self.client
             .begin_optimistic(logical_time_micros, durability)
+    }
+
+    /// Prepares a detached delta batch through the scheduler's shared database
+    /// view without materializing complete engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`NativeCommitClient::begin_optimistic_delta`].
+    pub fn begin_optimistic_delta(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeWriteBatch, GroupCommitSubmitError> {
+        self.client
+            .begin_optimistic_delta(logical_time_micros, durability)
     }
 
     /// Submits one batch through the owned worker.

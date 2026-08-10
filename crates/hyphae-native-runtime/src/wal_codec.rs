@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use hyphae_native_types::{
     CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
@@ -80,6 +80,7 @@ pub(crate) enum Opcode {
     CompactSearch = 39,
     DropSecondaryIndex = 40,
     RenameTable = 41,
+    MigrateStructureV3 = 42,
     DropTable = 43,
     CreateStream = 44,
     AppendStreamEntry = 45,
@@ -89,6 +90,7 @@ pub(crate) enum Opcode {
     ExpireSortedSet = 49,
     ConsolidateAnn = 50,
     CreateCatalogObjectV2 = 51,
+    CleanupStructureRetirementV3 = 52,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -834,6 +836,12 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::CompactStructure as u8 => {
             (Opcode::CompactStructure, EngineKind::Structure)
         }
+        value if value == Opcode::MigrateStructureV3 as u8 => {
+            (Opcode::MigrateStructureV3, EngineKind::Structure)
+        }
+        value if value == Opcode::CleanupStructureRetirementV3 as u8 => {
+            (Opcode::CleanupStructureRetirementV3, EngineKind::Structure)
+        }
         value if value == Opcode::VacuumPageGeneration as u8 => {
             (Opcode::VacuumPageGeneration, EngineKind::Kernel)
         }
@@ -912,6 +920,16 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         key,
     )?;
     let value = &body[value_start..expected];
+    if opcode == Opcode::CleanupStructureRetirementV3 {
+        let entry_budget = u32::from_le_bytes(
+            value
+                .try_into()
+                .map_err(|_| WalSemanticError::InvalidBody)?,
+        );
+        if !(2..=1_024).contains(&entry_budget) {
+            return Err(WalSemanticError::InvalidBody);
+        }
+    }
     if opcode == Opcode::ConsolidateAnn && !valid_ann_consolidation(value) {
         return Err(WalSemanticError::InvalidBody);
     }
@@ -944,9 +962,18 @@ fn validate_mutation_shape(
         }
         return Ok(());
     }
+    if opcode == Opcode::CleanupStructureRetirementV3 {
+        if has_target || key.is_empty() || value_length != 4 || expires_at_micros.is_some() {
+            return Err(WalSemanticError::InvalidBody);
+        }
+        return Ok(());
+    }
     if matches!(
         opcode,
-        Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch
+        Opcode::CompactStructure
+            | Opcode::MigrateStructureV3
+            | Opcode::VacuumPageGeneration
+            | Opcode::CompactSearch
     ) {
         return validate_empty_maintenance_shape(has_target, value_length, expires_at_micros, key);
     }
@@ -1430,10 +1457,84 @@ mod tests {
             decode_opcode(41)?,
             (Opcode::RenameTable, EngineKind::Relational)
         );
-        assert!(matches!(
-            decode_opcode(42),
-            Err(WalSemanticError::InvalidBody)
-        ));
+        assert_eq!(
+            decode_opcode(42)?,
+            (Opcode::MigrateStructureV3, EngineKind::Structure)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_migration_opcode_is_append_only_and_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::MigrateStructureV3 as u8, 42);
+        let migration = structure_mutation(Opcode::MigrateStructureV3, b"", b"", None);
+        let encoded = migration.encode()?;
+        assert_eq!(encoded[8], 42);
+        assert_eq!(decode_mutation(EngineKind::Structure, &encoded)?, migration);
+        for invalid in [
+            validate_mutation_shape(Opcode::MigrateStructureV3, true, 0, None, b""),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 1, None, b""),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 0, None, b"key"),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 0, Some(1), b""),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_retirement_cleanup_opcode_is_append_only_and_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::CleanupStructureRetirementV3 as u8, 52);
+        let cleanup = structure_mutation(
+            Opcode::CleanupStructureRetirementV3,
+            b"retirement",
+            &16_u32.to_le_bytes(),
+            None,
+        );
+        let encoded = cleanup.encode()?;
+        assert_eq!(encoded[8], 52);
+        assert_eq!(decode_mutation(EngineKind::Structure, &encoded)?, cleanup);
+        for invalid in [
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                true,
+                4,
+                None,
+                b"retirement",
+            ),
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                false,
+                0,
+                None,
+                b"retirement",
+            ),
+            validate_mutation_shape(Opcode::CleanupStructureRetirementV3, false, 4, None, b""),
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                false,
+                4,
+                Some(1),
+                b"retirement",
+            ),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        for invalid_budget in [1_u32, 1_025] {
+            let invalid = structure_mutation(
+                Opcode::CleanupStructureRetirementV3,
+                b"retirement",
+                &invalid_budget.to_le_bytes(),
+                None,
+            )
+            .encode()?;
+            assert!(matches!(
+                decode_mutation(EngineKind::Structure, &invalid),
+                Err(WalSemanticError::InvalidBody)
+            ));
+        }
         Ok(())
     }
 

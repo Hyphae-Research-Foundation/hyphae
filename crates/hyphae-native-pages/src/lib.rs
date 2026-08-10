@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Native copy-on-write page codec, page file, and partitioned buffer pool.
 
@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
+    ops::Deref,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -347,6 +348,9 @@ pub enum PageStoreError {
     /// Page-ID space is exhausted.
     #[error("native page ID space is exhausted")]
     PageIdExhausted,
+    /// A read targets a page outside this handle's captured complete boundary.
+    #[error("native page {0} is outside the captured page-file boundary")]
+    PageOutsideBoundary(PageId),
 }
 
 /// Page store reopened after repairing only an incomplete final page.
@@ -366,6 +370,21 @@ pub struct PageStore {
     next_page_id: u64,
     physical_reads: AtomicU64,
     poisoned: bool,
+}
+
+/// Shareable immutable view of one open page-file generation.
+///
+/// This wrapper exposes only `&PageStore`, so execution workers cannot append,
+/// synchronize, truncate, or otherwise acquire mutable storage authority.
+#[derive(Debug)]
+pub struct PageStoreReader(PageStore);
+
+impl Deref for PageStoreReader {
+    type Target = PageStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl PageStore {
@@ -497,6 +516,24 @@ impl PageStore {
         self.physical_reads.load(Ordering::Relaxed)
     }
 
+    /// Duplicates the operating-system file handle as an immutable worker view.
+    ///
+    /// The reader captures the current generation and complete-page boundary.
+    /// Later appends by the sole writer remain outside that captured boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file handle cannot be duplicated.
+    pub fn read_handle(&self) -> Result<PageStoreReader, PageStoreError> {
+        Ok(PageStoreReader(PageStore {
+            file: self.file.try_clone()?,
+            generation: self.generation,
+            next_page_id: self.next_page_id,
+            physical_reads: AtomicU64::new(0),
+            poisoned: self.poisoned,
+        }))
+    }
+
     /// Appends one unpublished or committed copy-on-write page.
     ///
     /// # Errors
@@ -536,6 +573,9 @@ impl PageStore {
     ///
     /// Returns an error for I/O, truncation, corruption, or ID mismatch.
     pub fn read(&self, id: PageId) -> Result<Page, PageStoreError> {
+        if id.get() >= self.next_page_id {
+            return Err(PageStoreError::PageOutsideBoundary(id));
+        }
         let offset = id
             .get()
             .checked_sub(1)
@@ -849,6 +889,25 @@ mod tests {
         let store = PageStore::open(&path)?;
         assert_eq!(store.page_count(), 1);
         assert_eq!(store.read(first_id)?.payload(), b"root");
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_read_handle_freezes_the_complete_page_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let first = store.append(PageKind::HeapLeaf, None, None, b"first".to_vec())?;
+        let reader = store.read_handle()?;
+        let second = store.append(PageKind::HeapLeaf, None, None, b"second".to_vec())?;
+
+        assert_eq!(reader.page_count(), 1);
+        assert_eq!(reader.read(first)?.payload(), b"first");
+        assert!(matches!(
+            reader.read(second),
+            Err(PageStoreError::PageOutsideBoundary(page)) if page == second
+        ));
+        assert_eq!(store.read(second)?.payload(), b"second");
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Embedded deterministic RRF over one immutable native snapshot.
 
@@ -200,6 +200,7 @@ impl NativeDatabase {
         logical_time_micros: i64,
         request: &NativeHybridRequest<'_>,
     ) -> Result<NativeHybridReceipt, NativeHybridError> {
+        let _permit = self.admit_foreground_bounded()?;
         self.snapshot(logical_time_micros)?.retrieve_hybrid(request)
     }
 }

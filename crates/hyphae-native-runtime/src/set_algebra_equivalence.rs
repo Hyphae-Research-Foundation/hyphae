@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -75,6 +75,99 @@ fn set_algebra_matches_private_snapshot_physical_and_reopen() -> Result<(), Box<
     assert_members(
         reopened.set_algebra_latest_at(&union, 11)?.members(),
         &[b"", b"a", b"b", b"c", b"z", b"\xff"],
+    );
+    Ok(())
+}
+
+#[test]
+fn structure_v3_set_algebra_is_direct_bounded_and_reopen_safe() -> Result<(), Box<dyn Error>> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin(10, DurabilityClass::Strict)?;
+    for key in [b"left".as_slice(), b"right".as_slice(), b"third".as_slice()] {
+        seed.create_set(key.to_vec())?;
+    }
+    add_members(&mut seed, b"left", &[b"", b"a", b"c", b"\xff"])?;
+    add_members(&mut seed, b"right", &[b"a", b"b", b"\xff"])?;
+    add_members(&mut seed, b"third", &[b"a", b"z", b"\xff"])?;
+    seed.create_list(b"wrong-kind".to_vec())?;
+    seed.commit()?;
+    database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+    let union = request(
+        SetAlgebraOperation::Union,
+        &[b"left", b"right", b"third"],
+        16,
+        128,
+    )?;
+    let intersection = request(
+        SetAlgebraOperation::Intersection,
+        &[b"left", b"right", b"third"],
+        16,
+        128,
+    )?;
+    let difference = request(
+        SetAlgebraOperation::Difference,
+        &[b"left", b"right"],
+        16,
+        128,
+    )?;
+    let missing = request(SetAlgebraOperation::Union, &[b"left", b"missing"], 16, 128)?;
+    let wrong_kind = request(
+        SetAlgebraOperation::Intersection,
+        &[b"missing", b"wrong-kind"],
+        16,
+        128,
+    )?;
+    let output_exhausted = request(SetAlgebraOperation::Union, &[b"left"], 1, 128)?;
+    let visits_exhausted = request(SetAlgebraOperation::Union, &[b"left"], 16, 1)?;
+
+    crate::FAIL_FULL_STATE_LOAD.set(true);
+    crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        assert_members(
+            database.set_algebra_latest_at(&union, 11)?.members(),
+            &[b"", b"a", b"b", b"c", b"z", b"\xff"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&intersection, 11)?.members(),
+            &[b"a", b"\xff"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&difference, 11)?.members(),
+            &[b"", b"c"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&missing, 11)?.members(),
+            &[b"", b"a", b"c", b"\xff"],
+        );
+        assert!(matches!(
+            database.set_algebra_latest_at(&wrong_kind, 11),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.set_algebra_latest_at(&output_exhausted, 11),
+            Err(NativeRuntimeError::SetAlgebra(
+                SetAlgebraError::OutputLimitExceeded { maximum: 1 }
+            ))
+        ));
+        assert!(matches!(
+            database.set_algebra_latest_at(&visits_exhausted, 11),
+            Err(NativeRuntimeError::SetAlgebra(
+                SetAlgebraError::VisitLimitExceeded { maximum: 1 }
+            ))
+        ));
+        Ok(())
+    })();
+    crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+    crate::FAIL_FULL_STATE_LOAD.set(false);
+    result?;
+
+    drop(database);
+    let reopened = NativeDatabase::open(temporary.path())?;
+    assert_members(
+        reopened.set_algebra_latest_at(&intersection, 11)?.members(),
+        &[b"a", b"\xff"],
     );
     Ok(())
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
     cmp::Ordering,
@@ -19,9 +19,16 @@ use hyphae_native_types::{
 use thiserror::Error;
 
 use crate::{
-    NativeDatabase, NativeRuntimeError, NativeSnapshot, NativeWriteBatch,
-    model::SecondaryIndexLayout, qualified_name,
+    NativeDatabase, NativeEngineWorkReceipt, NativeRuntimeError, NativeSnapshot, NativeWriteBatch,
+    RelationalScanRow, governor::OwnedGovernorPermit, model::SecondaryIndexLayout, qualified_name,
 };
+
+pub(crate) const SQL_VECTOR_BATCH_ROWS: usize = 1_024;
+pub(crate) const SQL_VECTOR_PATH_THRESHOLD: usize = 256;
+/// Hard upper bound on visible left rows consumed by one bounded join.
+pub const MAX_SQL_JOIN_CANDIDATES: usize = 1_048_576;
+/// Hard upper bound on physical candidates consumed by one bounded SQL scan.
+pub const MAX_SQL_SCAN_CANDIDATES: usize = 1_048_576;
 
 /// Value accepted or returned by native SQL.
 pub type SqlValue = ScalarValue;
@@ -43,6 +50,79 @@ pub enum SqlResult {
         /// Rows in executor order.
         rows: Vec<Vec<SqlValue>>,
     },
+}
+
+/// Physical executor selected for one current-root prepared SQL operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSqlExecutionPath {
+    /// Point or small bounded work executed without batch setup.
+    Direct,
+    /// Exact ordered primary-key intersection across multiple native indexes.
+    IndexIntersection,
+    /// Bounded left rows drive exact primary/unique-index lookups on the right.
+    IndexedNestedLoopJoin,
+    /// Rows were decoded, filtered through a bitmap, and projected in bounded batches.
+    VectorizedSerial,
+    /// Vectorized batches were sourced from governed persistent-pool segment workers.
+    VectorizedParallel,
+}
+
+/// Execution evidence for one current-root prepared native SQL plan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSqlExecutionReceipt {
+    /// Immutable all-engine CSN used by the operation.
+    pub snapshot_csn: hyphae_native_types::Csn,
+    /// Catalog version against which the prepared plan was validated.
+    pub catalog_version: CatalogVersion,
+    /// Digest of the exact immutable root set used by execution.
+    pub root_digest: [u8; 32],
+    /// Selected physical executor.
+    pub path: NativeSqlExecutionPath,
+    /// Visible physical candidates decoded before residual filtering.
+    pub candidate_rows: usize,
+    /// Complete primary-key rows read from index streams before intersection.
+    pub index_stream_rows: usize,
+    /// Rows in the first stream used to start intersection.
+    pub intersection_start_rows: usize,
+    /// Right-side key probes attempted by an indexed join, including null probes.
+    pub join_right_probes: usize,
+    /// Bounded vector batches evaluated by the SQL operator.
+    pub vector_batches: usize,
+    /// Compute workers reserved by the outer governed request.
+    pub planned_workers: u64,
+    /// Persistent-pool batches that sourced candidates.
+    pub worker_batches: usize,
+    /// Admission and execution observation, absent without an installed governor.
+    pub execution: Option<NativeEngineWorkReceipt>,
+    /// Exact SQL result returned by the operation.
+    pub result: SqlResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SqlLatestExecutionProfile {
+    pub(crate) path: NativeSqlExecutionPath,
+    pub(crate) candidate_rows: usize,
+    pub(crate) index_stream_rows: usize,
+    pub(crate) intersection_start_rows: usize,
+    pub(crate) join_right_probes: usize,
+    pub(crate) vector_batches: usize,
+    pub(crate) planned_workers: u64,
+    pub(crate) worker_batches: usize,
+}
+
+impl Default for SqlLatestExecutionProfile {
+    fn default() -> Self {
+        Self {
+            path: NativeSqlExecutionPath::Direct,
+            candidate_rows: 0,
+            index_stream_rows: 0,
+            intersection_start_rows: 0,
+            join_right_probes: 0,
+            vector_batches: 0,
+            planned_workers: 1,
+            worker_batches: 0,
+        }
+    }
 }
 
 /// Native SQL lexer, parser, binder, or execution failure.
@@ -99,6 +179,12 @@ pub enum SqlError {
     /// A referenced relation does not exist in the bound catalog.
     #[error("HYSQL017 native SQL relation does not exist")]
     UnknownRelation,
+    /// A bounded join exhausted its explicit engine work ceiling.
+    #[error("HYSQL018 native SQL bounded join candidate budget exceeded")]
+    JoinCandidateBudgetExceeded,
+    /// A bounded scan exhausted its explicit engine work ceiling.
+    #[error("HYSQL019 native SQL bounded scan candidate budget exceeded")]
+    ScanCandidateBudgetExceeded,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -130,6 +216,20 @@ impl PreparedStatement {
     pub fn maximum_result_rows(&self) -> Option<usize> {
         self.plan.maximum_result_rows()
     }
+
+    pub(crate) fn parallel_scan_limit(&self) -> Option<usize> {
+        match &self.plan {
+            PreparedPlan::PrimaryKeyScan { limit, .. }
+            | PreparedPlan::PrimaryKeyPrefixScan { limit, .. }
+            | PreparedPlan::PrimaryKeyPrefixRangeScan { limit, .. }
+            | PreparedPlan::PrimaryKeyRangeScan { limit, .. }
+                if *limit > SQL_VECTOR_PATH_THRESHOLD =>
+            {
+                Some(*limit)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +252,17 @@ enum PreparedPlan {
         index_definition: Box<SecondaryIndexDefinition>,
         projection: Vec<usize>,
         key: KeyBinding,
+        filter: BoundFilterExpression,
+        parameter_count: usize,
+        residual: bool,
+        output_columns: Vec<String>,
+        limit: Option<usize>,
+    },
+    SecondaryIndexIntersection {
+        table: ObjectId,
+        relation: Box<RelationDefinition>,
+        indexes: Vec<BoundSecondaryIndexLookup>,
+        projection: Vec<usize>,
         filter: BoundFilterExpression,
         parameter_count: usize,
         residual: bool,
@@ -232,6 +343,15 @@ enum PreparedPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundSecondaryIndexLookup {
+    index: ObjectId,
+    definition: Box<SecondaryIndexDefinition>,
+    key: KeyBinding,
+}
+
+type BoundSecondaryIndexKey = (ObjectId, Vec<u8>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum JoinLeftAccess {
     PrimaryKey {
         key: KeyBinding,
@@ -279,6 +399,9 @@ impl PreparedPlan {
             | Self::SecondaryIndexLookup {
                 parameter_count, ..
             }
+            | Self::SecondaryIndexIntersection {
+                parameter_count, ..
+            }
             | Self::SecondaryIndexRangeScan {
                 parameter_count, ..
             }
@@ -314,6 +437,7 @@ impl PreparedPlan {
                     *limit
                 }
             }
+            Self::SecondaryIndexIntersection { limit, .. } => *limit,
             Self::SecondaryIndexRangeScan { limit, .. }
             | Self::PrimaryKeyScan { limit, .. }
             | Self::PrimaryKeyPrefixScan { limit, .. }
@@ -338,6 +462,12 @@ impl PreparedPlan {
                 ..
             }
             | Self::SecondaryIndexLookup {
+                relation,
+                projection,
+                output_columns,
+                ..
+            }
+            | Self::SecondaryIndexIntersection {
                 relation,
                 projection,
                 output_columns,
@@ -759,6 +889,10 @@ enum SelectAccess {
         key: KeyBinding,
         limit: Option<usize>,
     },
+    SecondaryIndexIntersection {
+        indexes: Vec<(ObjectId, KeyBinding)>,
+        limit: Option<usize>,
+    },
     SecondaryIndexRangeScan {
         index: ObjectId,
         range: SecondaryIndexRange,
@@ -876,6 +1010,28 @@ fn prepare_select_plan(
             output_columns: bound.output_columns,
             limit,
         },
+        SelectAccess::SecondaryIndexIntersection { indexes, limit } => {
+            PreparedPlan::SecondaryIndexIntersection {
+                table: bound.table,
+                relation: Box::new(relation),
+                indexes: indexes
+                    .into_iter()
+                    .map(|(index, key)| {
+                        Ok(BoundSecondaryIndexLookup {
+                            index,
+                            definition: Box::new(secondary_index_by_id(catalog, index)?.clone()),
+                            key,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, SqlError>>()?,
+                projection: bound.projection,
+                filter: bound.filter.ok_or(SqlError::InvalidSyntax)?,
+                parameter_count: bound.parameter_count,
+                residual: bound.residual,
+                output_columns: bound.output_columns,
+                limit,
+            }
+        }
         SelectAccess::SecondaryIndexRangeScan {
             index,
             range,
@@ -966,9 +1122,19 @@ pub(crate) fn execute_prepared_latest(
     snapshot: &Snapshot,
     prepared: &PreparedStatement,
     parameters: &[SqlValue],
-) -> Result<SqlResult, SqlError> {
+    permit: Option<&OwnedGovernorPermit>,
+) -> Result<(SqlResult, SqlLatestExecutionProfile), SqlError> {
     ensure_catalog_version(snapshot.catalog_version, prepared)?;
-    execute_bound_latest(database, snapshot, &prepared.plan, parameters)
+    let mut profile = SqlLatestExecutionProfile::default();
+    let result = execute_bound_latest(
+        database,
+        snapshot,
+        &prepared.plan,
+        parameters,
+        permit,
+        &mut profile,
+    )?;
+    Ok((result, profile))
 }
 
 pub(crate) fn execute_prepared_binary<'snapshot>(
@@ -994,6 +1160,7 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         }
         PreparedPlan::PrimaryKeyLookup { .. }
         | PreparedPlan::SecondaryIndexLookup { .. }
+        | PreparedPlan::SecondaryIndexIntersection { .. }
         | PreparedPlan::SecondaryIndexRangeScan { .. }
         | PreparedPlan::PrimaryKeyScan { .. }
         | PreparedPlan::PrimaryKeyPrefixScan { .. }
@@ -1543,6 +1710,9 @@ fn execute_bound_snapshot(
         PreparedPlan::SecondaryIndexLookup { .. } => {
             execute_secondary_index_snapshot(snapshot, plan, parameters)
         }
+        PreparedPlan::SecondaryIndexIntersection { .. } => {
+            execute_secondary_index_intersection_snapshot(snapshot, plan, parameters)
+        }
         PreparedPlan::SecondaryIndexRangeScan { .. } => {
             execute_secondary_index_range_snapshot(snapshot, plan, parameters)
         }
@@ -1567,6 +1737,8 @@ fn execute_bound_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     match plan {
         PreparedPlan::PrimaryKeyLookup {
@@ -1611,25 +1783,30 @@ fn execute_bound_latest(
             })
         }
         PreparedPlan::SecondaryIndexLookup { .. } => {
-            execute_secondary_index_latest(database, snapshot, plan, parameters)
+            execute_secondary_index_latest(database, snapshot, plan, parameters, profile)
+        }
+        PreparedPlan::SecondaryIndexIntersection { .. } => {
+            execute_secondary_index_intersection_latest(
+                database, snapshot, plan, parameters, profile,
+            )
         }
         PreparedPlan::SecondaryIndexRangeScan { .. } => {
-            execute_secondary_index_range_latest(database, snapshot, plan, parameters)
+            execute_secondary_index_range_latest(database, snapshot, plan, parameters, profile)
         }
         PreparedPlan::PrimaryKeyScan { .. } => {
-            execute_latest_scan(database, snapshot, plan, parameters)
+            execute_latest_scan(database, snapshot, plan, parameters, permit, profile)
         }
         PreparedPlan::PrimaryKeyPrefixScan { .. } => {
-            execute_latest_prefix_scan(database, snapshot, plan, parameters)
+            execute_latest_prefix_scan(database, snapshot, plan, parameters, permit, profile)
         }
         PreparedPlan::PrimaryKeyPrefixRangeScan { .. } => {
-            execute_latest_prefix_range_scan(database, snapshot, plan, parameters)
+            execute_latest_prefix_range_scan(database, snapshot, plan, parameters, permit, profile)
         }
         PreparedPlan::PrimaryKeyRangeScan { .. } => {
-            execute_latest_range_scan(database, snapshot, plan, parameters)
+            execute_latest_range_scan(database, snapshot, plan, parameters, permit, profile)
         }
         PreparedPlan::IndexedInnerJoin { .. } => {
-            execute_indexed_join_latest(database, snapshot, plan, parameters)
+            execute_indexed_join_latest(database, snapshot, plan, parameters, profile)
         }
     }
 }
@@ -1674,7 +1851,9 @@ fn execute_secondary_index_snapshot(
         if limit.is_none() {
             rows.reserve(primary_keys.len());
         }
+        let mut candidates = 0;
         for primary_key in primary_keys {
+            consume_scan_candidates(&mut candidates, 1)?;
             let stored = snapshot
                 .select(*table, primary_key)
                 .ok_or(SqlError::InvalidStoredRow)?;
@@ -1702,6 +1881,7 @@ fn execute_secondary_index_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::SecondaryIndexLookup {
         table,
@@ -1729,12 +1909,15 @@ fn execute_secondary_index_latest(
     if *limit == Some(0) {
         return Ok(rows_result(output_columns, rows));
     }
+    let mut candidates = 0;
     database
         .visit_secondary_index_at(
             snapshot,
             *index,
             &index_key,
             |matched_table, primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if matched_table != *table {
                     return Err(SqlError::InvalidCatalogObject);
                 }
@@ -1756,6 +1939,245 @@ fn execute_secondary_index_latest(
             },
         )
         .map_err(map_relational_visit_error)?;
+    Ok(rows_result(output_columns, rows))
+}
+
+fn execute_secondary_index_intersection_snapshot(
+    snapshot: &NativeSnapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::SecondaryIndexIntersection {
+        table,
+        relation,
+        indexes,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    if *limit == Some(0) {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let Some(bound_keys) = bind_secondary_intersection_keys(relation, indexes, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    let mut candidates = None;
+    let mut index_stream_rows = 0;
+    for (index, key) in bound_keys {
+        let primary_keys = snapshot
+            .state
+            .relational
+            .secondary_index_lookup(index, &key)
+            .map_err(NativeRuntimeError::from)?
+            .map_or_else(Vec::new, |keys| keys.iter().cloned().collect());
+        consume_scan_candidates(&mut index_stream_rows, primary_keys.len())?;
+        candidates = Some(match candidates {
+            Some(current) => intersect_ordered_primary_keys(current, &primary_keys),
+            None => primary_keys,
+        });
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            break;
+        }
+    }
+    materialize_intersection_rows(
+        candidates.unwrap_or_default(),
+        projection,
+        filter,
+        parameters,
+        *limit,
+        output_columns,
+        |primary_key| {
+            snapshot
+                .select(*table, primary_key)
+                .ok_or(SqlError::InvalidStoredRow)
+        },
+        relation,
+    )
+}
+
+fn execute_secondary_index_intersection_latest(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    plan: &PreparedPlan,
+    parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
+) -> Result<SqlResult, SqlError> {
+    let PreparedPlan::SecondaryIndexIntersection {
+        table,
+        relation,
+        indexes,
+        projection,
+        filter,
+        parameter_count,
+        output_columns,
+        limit,
+        ..
+    } = plan
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    validate_filter_parameters(relation, Some(filter), *parameter_count, parameters)?;
+    if *limit == Some(0) {
+        return Ok(empty_rows_result(output_columns));
+    }
+    let Some(bound_keys) = bind_secondary_intersection_keys(relation, indexes, parameters)? else {
+        return Ok(empty_rows_result(output_columns));
+    };
+    let bound_keys = order_latest_intersection_keys(database, snapshot, bound_keys)?;
+    let mut candidates = None;
+    for (position, (index, key)) in bound_keys.into_iter().enumerate() {
+        let primary_keys = database
+            .select_secondary_index_at(snapshot, index, &key)?
+            .into_iter()
+            .map(|row| {
+                if row.table == *table {
+                    Ok(row.primary_key)
+                } else {
+                    Err(SqlError::InvalidCatalogObject)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        consume_scan_candidates(&mut profile.index_stream_rows, primary_keys.len())?;
+        if position == 0 {
+            profile.intersection_start_rows = primary_keys.len();
+        }
+        candidates = Some(match candidates {
+            Some(current) => intersect_ordered_primary_keys(current, &primary_keys),
+            None => primary_keys,
+        });
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            break;
+        }
+    }
+    let candidates = candidates.unwrap_or_default();
+    profile.path = NativeSqlExecutionPath::IndexIntersection;
+    profile.candidate_rows = candidates.len();
+    let mut rows = Vec::with_capacity(limit.unwrap_or(candidates.len()).min(candidates.len()));
+    for primary_key in candidates {
+        let stored = database
+            .select_relational_at(snapshot, *table, &primary_key)?
+            .ok_or(SqlError::InvalidStoredRow)?;
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            false,
+            &primary_key,
+            &stored,
+            Some(filter),
+            parameters,
+        )? {
+            rows.push(row);
+            if limit.is_some_and(|limit| rows.len() == limit) {
+                break;
+            }
+        }
+    }
+    Ok(rows_result(output_columns, rows))
+}
+
+fn order_latest_intersection_keys(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    bound_keys: Vec<BoundSecondaryIndexKey>,
+) -> Result<Vec<BoundSecondaryIndexKey>, SqlError> {
+    if bound_keys.len() < 3 {
+        return Ok(bound_keys);
+    }
+    let mut estimated = bound_keys
+        .into_iter()
+        .map(|(index, key)| {
+            database
+                .estimate_secondary_index_rows_at(snapshot, index, &key)
+                .map(|rows| (rows, index, key))
+                .map_err(SqlError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    estimated.sort_by(|(left_rows, left_index, _), (right_rows, right_index, _)| {
+        left_rows
+            .cmp(right_rows)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    Ok(estimated
+        .into_iter()
+        .map(|(_, index, key)| (index, key))
+        .collect())
+}
+
+fn bind_secondary_intersection_keys(
+    relation: &RelationDefinition,
+    indexes: &[BoundSecondaryIndexLookup],
+    parameters: &[SqlValue],
+) -> Result<Option<Vec<BoundSecondaryIndexKey>>, SqlError> {
+    let mut bound = Vec::with_capacity(indexes.len());
+    for lookup in indexes {
+        let Some(key) = bind_secondary_index_key_binding(
+            relation,
+            &lookup.definition,
+            &lookup.key,
+            parameters,
+        )?
+        else {
+            return Ok(None);
+        };
+        bound.push((lookup.index, key));
+    }
+    Ok(Some(bound))
+}
+
+fn intersect_ordered_primary_keys(mut left: Vec<Vec<u8>>, right: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut output = Vec::with_capacity(left.len().min(right.len()));
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            Ordering::Less => left_index += 1,
+            Ordering::Greater => right_index += 1,
+            Ordering::Equal => {
+                output.push(std::mem::take(&mut left[left_index]));
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_intersection_rows<'row>(
+    candidates: Vec<Vec<u8>>,
+    projection: &[usize],
+    filter: &BoundFilterExpression,
+    parameters: &[SqlValue],
+    limit: Option<usize>,
+    output_columns: &[String],
+    mut lookup: impl FnMut(&[u8]) -> Result<&'row [u8], SqlError>,
+    relation: &RelationDefinition,
+) -> Result<SqlResult, SqlError> {
+    let mut rows = Vec::with_capacity(limit.unwrap_or(candidates.len()).min(candidates.len()));
+    for primary_key in candidates {
+        let stored = lookup(&primary_key)?;
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            false,
+            &primary_key,
+            stored,
+            Some(filter),
+            parameters,
+        )? {
+            rows.push(row);
+            if limit.is_some_and(|limit| rows.len() == limit) {
+                break;
+            }
+        }
+    }
     Ok(rows_result(output_columns, rows))
 }
 
@@ -1802,8 +2224,10 @@ fn execute_secondary_index_range_snapshot(
     let index_columns = secondary_index_column_indices(relation, index_definition)?;
     let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
         for primary_key in primary_keys {
+            consume_scan_candidates(&mut candidates, 1)?;
             let stored = snapshot
                 .select(*table, primary_key)
                 .ok_or(SqlError::InvalidStoredRow)?;
@@ -1827,6 +2251,7 @@ fn execute_secondary_index_range_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::SecondaryIndexRangeScan {
         table,
@@ -1857,6 +2282,7 @@ fn execute_secondary_index_range_latest(
     let index_columns = secondary_index_column_indices(relation, index_definition)?;
     let row_filter = if *residual { Some(filter) } else { None };
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_secondary_index_range_at(
             snapshot,
@@ -1864,6 +2290,8 @@ fn execute_secondary_index_range_latest(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |matched_table, index_key, primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if matched_table != *table {
                     return Err(SqlError::InvalidCatalogObject);
                 }
@@ -1952,6 +2380,7 @@ fn execute_indexed_join_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::IndexedInnerJoin {
         left_table,
@@ -1976,6 +2405,7 @@ fn execute_indexed_join_latest(
         parameters,
     )?;
     if let JoinLeftAccess::BoundedPrimaryKeyScan { range, limit } = left_access {
+        profile.path = NativeSqlExecutionPath::IndexedNestedLoopJoin;
         return execute_bounded_join_latest(
             database,
             snapshot,
@@ -1983,15 +2413,18 @@ fn execute_indexed_join_latest(
             range.as_ref(),
             *limit,
             parameters,
+            profile,
         );
     }
     if matches!(left_access, JoinLeftAccess::BoundedSecondaryIndex { .. }) {
+        profile.path = NativeSqlExecutionPath::IndexedNestedLoopJoin;
         return execute_bounded_secondary_join_latest(
             database,
             snapshot,
             plan,
             left_access,
             parameters,
+            profile,
         );
     }
     let left = latest_join_left(
@@ -2002,6 +2435,7 @@ fn execute_indexed_join_latest(
         left_access,
         parameters,
     )?;
+    profile.candidate_rows = usize::from(left.is_some());
     materialize_indexed_join(
         &JoinMaterialization {
             left_relation,
@@ -2013,6 +2447,7 @@ fn execute_indexed_join_latest(
         },
         left,
         |value| {
+            profile.join_right_probes = profile.join_right_probes.saturating_add(1);
             latest_join_right(
                 database,
                 snapshot,
@@ -2163,6 +2598,7 @@ fn execute_bounded_join_latest(
     range: Option<&PrimaryKeyRange>,
     limit: usize,
     parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::IndexedInnerJoin {
         left_table,
@@ -2192,6 +2628,7 @@ fn execute_bounded_join_latest(
         parameters,
     };
     let mut rows = Vec::with_capacity(limit.min(256));
+    let mut candidates = 0;
     database
         .visit_relational_range_at(
             snapshot,
@@ -2199,7 +2636,10 @@ fn execute_bounded_join_latest(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                consume_join_candidate(&mut candidates)?;
+                profile.candidate_rows = candidates;
                 if let Some(row) = materialize_join_row(&context, primary_key, stored, |value| {
+                    profile.join_right_probes = profile.join_right_probes.saturating_add(1);
                     latest_join_right(
                         database,
                         snapshot,
@@ -2339,7 +2779,9 @@ fn execute_bounded_secondary_join_snapshot(
         parameters,
     };
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for primary_key in primary_keys {
+        consume_join_candidate(&mut candidates)?;
         let stored = snapshot
             .select(*left_table, primary_key)
             .ok_or(SqlError::InvalidStoredRow)?;
@@ -2371,6 +2813,7 @@ fn execute_bounded_secondary_join_latest(
     plan: &PreparedPlan,
     access: &JoinLeftAccess,
     parameters: &[SqlValue],
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let JoinLeftAccess::BoundedSecondaryIndex {
         index,
@@ -2413,16 +2856,20 @@ fn execute_bounded_secondary_join_latest(
         parameters,
     };
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_secondary_index_at(
             snapshot,
             *index,
             &index_key,
             |matched_table, primary_key, stored| {
+                consume_join_candidate(&mut candidates)?;
+                profile.candidate_rows = candidates;
                 if matched_table != *left_table {
                     return Err(SqlError::InvalidCatalogObject);
                 }
                 if let Some(row) = materialize_join_row(&context, primary_key, stored, |value| {
+                    profile.join_right_probes = profile.join_right_probes.saturating_add(1);
                     latest_join_right(
                         database,
                         snapshot,
@@ -2506,7 +2953,9 @@ fn execute_bounded_secondary_join_transaction(
         parameters,
     };
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for primary_key in primary_keys {
+        consume_join_candidate(&mut candidates)?;
         let stored = transaction
             .select(*left_table, primary_key)
             .ok_or(SqlError::InvalidStoredRow)?;
@@ -2550,7 +2999,9 @@ fn collect_bounded_join<'row>(
     mut right_lookup: impl FnMut(&[SqlValue]) -> Result<JoinInputRow, SqlError>,
 ) -> Result<SqlResult, SqlError> {
     let mut rows = Vec::with_capacity(limit.min(256));
+    let mut candidates = 0;
     for (primary_key, stored) in stored_rows {
+        consume_join_candidate(&mut candidates)?;
         if let Some(row) = materialize_join_row(context, primary_key, stored, &mut right_lookup)? {
             rows.push(row);
             if rows.len() == limit {
@@ -2562,6 +3013,25 @@ fn collect_bounded_join<'row>(
         columns: context.output_columns.to_vec(),
         rows,
     })
+}
+
+fn consume_join_candidate(candidates: &mut usize) -> Result<(), SqlError> {
+    if *candidates >= MAX_SQL_JOIN_CANDIDATES {
+        return Err(SqlError::JoinCandidateBudgetExceeded);
+    }
+    *candidates += 1;
+    Ok(())
+}
+
+fn consume_scan_candidates(candidates: &mut usize, amount: usize) -> Result<(), SqlError> {
+    let next = candidates
+        .checked_add(amount)
+        .ok_or(SqlError::ScanCandidateBudgetExceeded)?;
+    if next > MAX_SQL_SCAN_CANDIDATES {
+        return Err(SqlError::ScanCandidateBudgetExceeded);
+    }
+    *candidates = next;
+    Ok(())
 }
 
 type JoinInputRow = Option<(Vec<u8>, Vec<u8>)>;
@@ -2991,7 +3461,9 @@ fn execute_snapshot_scan(
         });
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for (primary_key, stored) in stored_rows {
+        consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
             projection,
@@ -3018,6 +3490,8 @@ fn execute_latest_scan(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyScan {
         table,
@@ -3041,7 +3515,29 @@ fn execute_latest_scan(
             rows: Vec::new(),
         });
     }
+    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+        let rows = execute_latest_vectorized_range(
+            database,
+            snapshot,
+            *table,
+            relation,
+            projection,
+            *legacy_binary,
+            filter.as_ref(),
+            parameters,
+            Bound::Unbounded,
+            &Bound::Unbounded,
+            *limit,
+            permit,
+            profile,
+        )?;
+        return Ok(SqlResult::Rows {
+            columns: output_columns.clone(),
+            rows,
+        });
+    }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_relational_range_at(
             snapshot,
@@ -3049,6 +3545,8 @@ fn execute_latest_scan(
             Bound::Unbounded,
             Bound::Unbounded,
             |primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
                     relation,
                     projection,
@@ -3110,7 +3608,9 @@ fn execute_snapshot_prefix_scan(
         .get(table)
         .ok_or(SqlError::InvalidStoredRow)?;
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for (primary_key, stored) in stored_rows.range(bounds) {
+        consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
             projection,
@@ -3134,6 +3634,8 @@ fn execute_latest_prefix_scan(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyPrefixScan {
         table,
@@ -3157,7 +3659,26 @@ fn execute_latest_prefix_scan(
     if *limit == 0 {
         return Ok(empty_rows_result(output_columns));
     }
+    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+        let rows = execute_latest_vectorized_range(
+            database,
+            snapshot,
+            *table,
+            relation,
+            projection,
+            false,
+            Some(filter),
+            parameters,
+            lower,
+            &upper,
+            *limit,
+            permit,
+            profile,
+        )?;
+        return Ok(rows_result(output_columns, rows));
+    }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_relational_range_at(
             snapshot,
@@ -3165,6 +3686,8 @@ fn execute_latest_prefix_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
                     relation,
                     projection,
@@ -3219,7 +3742,9 @@ fn execute_snapshot_prefix_range_scan(
         .get(table)
         .ok_or(SqlError::InvalidStoredRow)?;
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for (primary_key, stored) in stored_rows.range((lower, upper)) {
+        consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
             projection,
@@ -3243,6 +3768,8 @@ fn execute_latest_prefix_range_scan(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyPrefixRangeScan {
         table,
@@ -3265,7 +3792,26 @@ fn execute_latest_prefix_range_scan(
     if key_range_is_empty(&lower, &upper) || *limit == 0 {
         return Ok(empty_rows_result(output_columns));
     }
+    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+        let rows = execute_latest_vectorized_range(
+            database,
+            snapshot,
+            *table,
+            relation,
+            projection,
+            false,
+            Some(filter),
+            parameters,
+            lower,
+            &upper,
+            *limit,
+            permit,
+            profile,
+        )?;
+        return Ok(rows_result(output_columns, rows));
+    }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_relational_range_at(
             snapshot,
@@ -3273,6 +3819,8 @@ fn execute_latest_prefix_range_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
                     relation,
                     projection,
@@ -3329,7 +3877,9 @@ fn execute_snapshot_range_scan(
         });
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     for (primary_key, stored) in stored_rows.range((lower, upper)) {
+        consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
             projection,
@@ -3356,6 +3906,8 @@ fn execute_latest_range_scan(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyRangeScan {
         table,
@@ -3393,7 +3945,29 @@ fn execute_latest_range_scan(
             rows: Vec::new(),
         });
     }
+    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+        let rows = execute_latest_vectorized_range(
+            database,
+            snapshot,
+            *table,
+            relation,
+            projection,
+            *legacy_binary,
+            Some(filter),
+            parameters,
+            lower,
+            &upper,
+            *limit,
+            permit,
+            profile,
+        )?;
+        return Ok(SqlResult::Rows {
+            columns: output_columns.clone(),
+            rows,
+        });
+    }
     let mut rows = Vec::with_capacity((*limit).min(256));
+    let mut candidates = 0;
     database
         .visit_relational_range_at(
             snapshot,
@@ -3401,6 +3975,8 @@ fn execute_latest_range_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                consume_scan_candidates(&mut candidates, 1)?;
+                profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
                     relation,
                     projection,
@@ -3515,6 +4091,9 @@ fn execute_explain(
                 )
             },
         ),
+        SelectAccess::SecondaryIndexIntersection { indexes, limit } => {
+            explain_secondary_index_intersection(bound.table, bound.residual, &indexes, limit)
+        }
         SelectAccess::SecondaryIndexRangeScan {
             index,
             range,
@@ -3570,6 +4149,33 @@ fn execute_explain(
         columns: vec!["plan".to_owned()],
         rows: vec![vec![SqlValue::Text(plan)]],
     })
+}
+
+fn explain_secondary_index_intersection(
+    table: ObjectId,
+    residual: bool,
+    indexes: &[(ObjectId, KeyBinding)],
+    limit: Option<usize>,
+) -> String {
+    let identities = indexes
+        .iter()
+        .map(|(index, _)| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    limit.map_or_else(
+        || {
+            format!(
+                "SecondaryIndexIntersection(table={table},indexes=[{identities}]{}",
+                explain_suffix(residual)
+            )
+        },
+        |limit| {
+            format!(
+                "SecondaryIndexIntersection(table={table},indexes=[{identities}],limit={limit}{}",
+                explain_suffix(residual)
+            )
+        },
+    )
 }
 
 fn explain_secondary_index_range(
@@ -4216,6 +4822,9 @@ fn execute_select(
         SelectAccess::SecondaryIndex { index, key, limit } => {
             context.secondary_index_rows(index, &key, limit)?
         }
+        SelectAccess::SecondaryIndexIntersection { indexes, limit } => {
+            context.secondary_index_intersection_rows(&indexes, limit)?
+        }
         SelectAccess::SecondaryIndexRangeScan {
             index,
             range,
@@ -4325,7 +4934,9 @@ impl TransactionSelectContext<'_> {
             return Ok(Vec::new());
         };
         let mut rows = Vec::with_capacity(primary_keys.len());
+        let mut candidates = 0;
         for primary_key in primary_keys {
+            consume_scan_candidates(&mut candidates, 1)?;
             let stored = self
                 .transaction
                 .select(self.table, primary_key)
@@ -4335,6 +4946,68 @@ impl TransactionSelectContext<'_> {
                 self.projection,
                 false,
                 primary_key,
+                stored,
+                self.filter,
+                self.parameters,
+            )? {
+                rows.push(row);
+                if limit.is_some_and(|limit| rows.len() == limit) {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn secondary_index_intersection_rows(
+        &self,
+        indexes: &[(ObjectId, KeyBinding)],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut candidates = None;
+        let mut index_stream_rows = 0;
+        for (index, binding) in indexes {
+            let definition = secondary_index_by_id(&self.transaction.state.catalog, *index)?;
+            let Some(index_key) = bind_secondary_index_key_binding(
+                self.definition,
+                definition,
+                binding,
+                self.parameters,
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let primary_keys = self
+                .transaction
+                .state
+                .relational
+                .secondary_index_lookup(*index, &index_key)
+                .map_err(NativeRuntimeError::from)?
+                .map_or_else(Vec::new, |keys| keys.iter().cloned().collect());
+            consume_scan_candidates(&mut index_stream_rows, primary_keys.len())?;
+            candidates = Some(match candidates {
+                Some(current) => intersect_ordered_primary_keys(current, &primary_keys),
+                None => primary_keys,
+            });
+            if candidates.as_ref().is_some_and(Vec::is_empty) {
+                break;
+            }
+        }
+        let candidates = candidates.unwrap_or_default();
+        let mut rows = Vec::with_capacity(limit.unwrap_or(candidates.len()).min(candidates.len()));
+        for primary_key in candidates {
+            let stored = self
+                .transaction
+                .select(self.table, &primary_key)
+                .ok_or(SqlError::InvalidStoredRow)?;
+            if let Some(row) = materialize_filtered_row(
+                self.definition,
+                self.projection,
+                false,
+                &primary_key,
                 stored,
                 self.filter,
                 self.parameters,
@@ -4378,8 +5051,10 @@ impl TransactionSelectContext<'_> {
         let index_columns = secondary_index_column_indices(self.definition, definition)?;
         let row_filter = if self.residual { self.filter } else { None };
         let mut rows = Vec::with_capacity(limit.min(256));
+        let mut candidates = 0;
         for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
             for primary_key in primary_keys {
+                consume_scan_candidates(&mut candidates, 1)?;
                 let stored = self
                     .transaction
                     .select(self.table, primary_key)
@@ -4501,7 +5176,9 @@ impl TransactionSelectContext<'_> {
         legacy_binary: bool,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
         let mut rows = Vec::with_capacity(limit.min(256));
+        let mut candidates = 0;
         for (primary_key, stored) in stored_rows {
+            consume_scan_candidates(&mut candidates, 1)?;
             if let Some(row) = materialize_filtered_row(
                 self.definition,
                 self.projection,
@@ -4589,19 +5266,15 @@ fn bind_select_access(
         }
         let used_terms = key.columns.len();
         (SelectAccess::PrimaryKey { key, legacy_binary }, used_terms)
-    } else if let Some((index, key)) =
-        find_secondary_equality_key(catalog, table, definition, &comparisons)?
-    {
-        validate_primary_key_order(definition, query.order_by, &expected_primary_key)?;
-        let used_terms = key.columns.len();
-        (
-            SelectAccess::SecondaryIndex {
-                index,
-                key,
-                limit: query.limit,
-            },
-            used_terms,
-        )
+    } else if let Some(access) = bind_secondary_equality_access(
+        catalog,
+        table,
+        definition,
+        &comparisons,
+        query,
+        &expected_primary_key,
+    )? {
+        access
     } else if let Some((range, range_terms)) =
         bind_primary_key_range_shape(&comparisons, &expected_primary_key, query.parameter_count)?
     {
@@ -4652,6 +5325,41 @@ fn bind_select_access(
         )?
     };
     Ok((access, used_terms))
+}
+
+fn bind_secondary_equality_access(
+    catalog: &crate::model::CatalogState,
+    table: ObjectId,
+    definition: &RelationDefinition,
+    comparisons: &[&BoundFilterExpression],
+    query: SelectQuery<'_>,
+    primary_key: &[usize],
+) -> Result<Option<(SelectAccess, usize)>, SqlError> {
+    let Some(indexes) = find_secondary_equality_keys(catalog, table, definition, comparisons)?
+    else {
+        return Ok(None);
+    };
+    validate_primary_key_order(definition, query.order_by, primary_key)?;
+    let used_terms = indexes.iter().map(|(_, key)| key.columns.len()).sum();
+    if indexes.len() == 1 {
+        let (index, key) = indexes.into_iter().next().ok_or(SqlError::NoAccessPath)?;
+        Ok(Some((
+            SelectAccess::SecondaryIndex {
+                index,
+                key,
+                limit: query.limit,
+            },
+            used_terms,
+        )))
+    } else {
+        Ok(Some((
+            SelectAccess::SecondaryIndexIntersection {
+                indexes,
+                limit: query.limit,
+            },
+            used_terms,
+        )))
+    }
 }
 
 fn bind_primary_scan_fallback(
@@ -4818,6 +5526,7 @@ fn bind_join_left_access(
             limit,
         },
         SelectAccess::PrimaryKey { .. }
+        | SelectAccess::SecondaryIndexIntersection { .. }
         | SelectAccess::SecondaryIndexRangeScan { .. }
         | SelectAccess::PrimaryKeyScan { .. }
         | SelectAccess::PrimaryKeyRangeScan { .. } => return Err(SqlError::NoAccessPath),
@@ -5291,12 +6000,13 @@ fn bind_primary_key_prefix_range_access(
     )))
 }
 
-fn find_secondary_equality_key(
+fn find_secondary_equality_keys(
     catalog: &crate::model::CatalogState,
     table: ObjectId,
     definition: &RelationDefinition,
     comparisons: &[&BoundFilterExpression],
-) -> Result<Option<(ObjectId, KeyBinding)>, SqlError> {
+) -> Result<Option<Vec<(ObjectId, KeyBinding)>>, SqlError> {
+    let mut candidates = Vec::new();
     for (id, object) in &catalog.objects {
         let CatalogObject::SecondaryIndex(index) = object else {
             continue;
@@ -5306,10 +6016,26 @@ fn find_secondary_equality_key(
         }
         let columns = secondary_index_column_indices(definition, index)?;
         if let Some(key) = find_equality_key(comparisons, &columns) {
-            return Ok(Some((*id, key)));
+            candidates.push((*id, key));
         }
     }
-    Ok(None)
+    candidates.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .columns
+            .len()
+            .cmp(&left.columns.len())
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let mut covered = BTreeSet::new();
+    let mut selected = Vec::new();
+    for (index, key) in candidates {
+        if key.columns.iter().any(|column| covered.contains(column)) {
+            continue;
+        }
+        covered.extend(key.columns.iter().copied());
+        selected.push((index, key));
+    }
+    Ok((!selected.is_empty()).then_some(selected))
 }
 
 fn ordered_secondary_index_columns(
@@ -6657,6 +7383,147 @@ fn key_contains_null(key: &KeyBinding, parameters: &[SqlValue]) -> Result<bool, 
     })
 }
 
+#[repr(C, align(64))]
+struct SqlSelectionBitmap {
+    words: [u64; SQL_VECTOR_BATCH_ROWS / u64::BITS as usize],
+    len: usize,
+}
+
+impl SqlSelectionBitmap {
+    fn empty(len: usize) -> Self {
+        debug_assert!(len <= SQL_VECTOR_BATCH_ROWS);
+        Self {
+            words: [0; SQL_VECTOR_BATCH_ROWS / u64::BITS as usize],
+            len,
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        debug_assert!(index < self.len);
+        self.words[index / u64::BITS as usize] |= 1_u64 << (index % u64::BITS as usize);
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        index < self.len
+            && self.words[index / u64::BITS as usize] & (1_u64 << (index % u64::BITS as usize)) != 0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_latest_vectorized_range(
+    database: &NativeDatabase,
+    snapshot: &Snapshot,
+    table: ObjectId,
+    definition: &RelationDefinition,
+    projection: &[usize],
+    legacy_binary: bool,
+    filter: Option<&BoundFilterExpression>,
+    parameters: &[SqlValue],
+    mut lower: Bound<Vec<u8>>,
+    upper: &Bound<Vec<u8>>,
+    limit: usize,
+    permit: Option<&OwnedGovernorPermit>,
+    profile: &mut SqlLatestExecutionProfile,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let mut rows = Vec::with_capacity(limit.min(SQL_VECTOR_BATCH_ROWS));
+    while rows.len() < limit {
+        let (candidates, planned_workers, worker_batches) = database
+            .scan_relational_range_at_governed(
+                snapshot,
+                table,
+                crate::bound_as_slice(&lower),
+                crate::bound_as_slice(upper),
+                SQL_VECTOR_BATCH_ROWS,
+                permit,
+            )?;
+        if candidates.is_empty() {
+            break;
+        }
+        let candidate_count = candidates.len();
+        consume_scan_candidates(&mut profile.candidate_rows, candidate_count)?;
+        let next_lower = candidates
+            .last()
+            .map(|candidate| Bound::Excluded(candidate.primary_key.clone()))
+            .ok_or(SqlError::InvalidStoredRow)?;
+        let batch = materialize_vector_batch(
+            definition,
+            projection,
+            legacy_binary,
+            &candidates,
+            filter,
+            parameters,
+        )?;
+        profile.path = if worker_batches > 0 {
+            NativeSqlExecutionPath::VectorizedParallel
+        } else if profile.path == NativeSqlExecutionPath::Direct {
+            NativeSqlExecutionPath::VectorizedSerial
+        } else {
+            profile.path
+        };
+        profile.vector_batches = profile.vector_batches.saturating_add(1);
+        profile.planned_workers = profile.planned_workers.max(planned_workers);
+        profile.worker_batches = profile.worker_batches.saturating_add(worker_batches);
+        rows.extend(batch.into_iter().take(limit - rows.len()));
+        if candidate_count < SQL_VECTOR_BATCH_ROWS {
+            break;
+        }
+        lower = next_lower;
+    }
+    Ok(rows)
+}
+
+fn materialize_vector_batch(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    legacy_binary: bool,
+    candidates: &[RelationalScanRow],
+    filter: Option<&BoundFilterExpression>,
+    parameters: &[SqlValue],
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    debug_assert!(candidates.len() <= SQL_VECTOR_BATCH_ROWS);
+    let decoded = candidates
+        .iter()
+        .map(|candidate| {
+            decode_complete_row(
+                definition,
+                legacy_binary,
+                &candidate.primary_key,
+                &candidate.row,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut selected = SqlSelectionBitmap::empty(decoded.len());
+    for (index, values) in decoded.iter().enumerate() {
+        let matches = match filter {
+            Some(expression) => {
+                evaluate_filter(definition, expression, values, parameters)? == TruthValue::True
+            }
+            None => true,
+        };
+        if matches {
+            selected.select(index);
+        }
+    }
+    let mut rows = Vec::with_capacity(decoded.len());
+    for (index, values) in decoded.into_iter().enumerate() {
+        if !selected.contains(index) {
+            continue;
+        }
+        rows.push(
+            projection
+                .iter()
+                .map(|column| {
+                    values
+                        .get(*column)
+                        .cloned()
+                        .ok_or(SqlError::InvalidStoredRow)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(rows)
+}
+
 fn materialize_filtered_row(
     definition: &RelationDefinition,
     projection: &[usize],
@@ -7816,10 +8683,35 @@ mod tests {
     use hyphae_native_types::{DecimalType, IntegerWidth, LogicalType};
 
     use super::{
-        ColumnOperand, ComparisonOperator, FilterExpression, ParsedJoinEquality, Projection,
+        ColumnOperand, ComparisonOperator, FilterExpression, MAX_SQL_JOIN_CANDIDATES,
+        MAX_SQL_SCAN_CANDIDATES, ParsedJoinEquality, Projection, SQL_VECTOR_BATCH_ROWS,
         ScalarOperand, SqlError, Statement, TruthValue, binary_prefix_successor,
-        key_range_is_empty, parse,
+        consume_join_candidate, consume_scan_candidates, key_range_is_empty, parse,
     };
+
+    #[test]
+    fn join_candidate_budget_accepts_the_boundary_and_then_fails_closed() {
+        let mut candidates = MAX_SQL_JOIN_CANDIDATES - 1;
+        assert!(consume_join_candidate(&mut candidates).is_ok());
+        assert_eq!(candidates, MAX_SQL_JOIN_CANDIDATES);
+        assert!(matches!(
+            consume_join_candidate(&mut candidates),
+            Err(SqlError::JoinCandidateBudgetExceeded)
+        ));
+        assert_eq!(candidates, MAX_SQL_JOIN_CANDIDATES);
+    }
+
+    #[test]
+    fn scan_candidate_budget_accepts_batches_and_fails_without_advancing() {
+        let mut candidates = MAX_SQL_SCAN_CANDIDATES - SQL_VECTOR_BATCH_ROWS;
+        assert!(consume_scan_candidates(&mut candidates, SQL_VECTOR_BATCH_ROWS).is_ok());
+        assert_eq!(candidates, MAX_SQL_SCAN_CANDIDATES);
+        assert!(matches!(
+            consume_scan_candidates(&mut candidates, 1),
+            Err(SqlError::ScanCandidateBudgetExceeded)
+        ));
+        assert_eq!(candidates, MAX_SQL_SCAN_CANDIDATES);
+    }
 
     #[test]
     fn legacy_binary_grammar_remains_accepted() -> Result<(), Box<dyn std::error::Error>> {

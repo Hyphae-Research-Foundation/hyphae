@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Immutable copy-on-write B+tree over verified Hyphae native pages.
 
@@ -98,6 +98,9 @@ pub enum BTreeError {
     /// A reachable node was created after the root's visible commit.
     #[error("native B+tree contains a node from a future commit")]
     FuturePage,
+    /// A planned leaf segment belongs to another immutable tree root.
+    #[error("native B+tree segment belongs to another immutable root")]
+    ForeignSegment,
 }
 
 /// Result of one copy-on-write B+tree mutation.
@@ -126,6 +129,43 @@ pub struct BTree {
     root: Option<PageId>,
 }
 
+/// One immutable leaf segment selected by a bounded B+tree plan.
+///
+/// Construction is private so callers cannot invent a page/range identity.
+/// The originating root is retained and checked again before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BTreeSegment {
+    root: PageId,
+    page: PageId,
+    minimum: Vec<u8>,
+    maximum: Vec<u8>,
+    entry_count: usize,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+}
+
+impl BTreeSegment {
+    /// Immutable leaf-page identity.
+    pub const fn page_id(&self) -> PageId {
+        self.page
+    }
+
+    /// First canonical key physically stored in this leaf.
+    pub fn minimum_key(&self) -> &[u8] {
+        &self.minimum
+    }
+
+    /// Last canonical key physically stored in this leaf.
+    pub fn maximum_key(&self) -> &[u8] {
+        &self.maximum
+    }
+
+    /// Complete physical entries in the leaf before query-bound filtering.
+    pub const fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+}
+
 impl BTree {
     /// Creates an empty tree without a physical root page.
     pub const fn empty() -> Self {
@@ -140,6 +180,90 @@ impl BTree {
     /// Returns the immutable physical root, or `None` for an empty tree.
     pub const fn root(self) -> Option<PageId> {
         self.root
+    }
+
+    /// Plans immutable leaf segments intersecting one canonical key range.
+    ///
+    /// Internal separator ranges prune unreachable subtrees before their leaf
+    /// pages are read. Returned segments remain in canonical key order and
+    /// retain the exact query bounds for independent execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt reached pages, cycles, or excessive tree
+    /// height.
+    pub fn plan_range_segments(
+        self,
+        store: &PageStore,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Vec<BTreeSegment>, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(Vec::new());
+        };
+        if range_is_empty(lower, upper) {
+            return Ok(Vec::new());
+        }
+        let mut segments = Vec::new();
+        let mut visited = BTreeSet::new();
+        plan_range_segments_node(
+            store,
+            root,
+            root,
+            lower,
+            upper,
+            0,
+            &mut visited,
+            &mut segments,
+        )?;
+        Ok(segments)
+    }
+
+    /// Executes one previously planned leaf segment.
+    ///
+    /// The page is revalidated against its planned range and summary before
+    /// returning only entries inside the original query bounds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a segment from another root and any changed, missing, corrupt,
+    /// or non-leaf page.
+    pub fn scan_planned_segment(
+        self,
+        store: &PageStore,
+        segment: &BTreeSegment,
+    ) -> Result<Vec<KeyValue>, BTreeError> {
+        if self.root != Some(segment.root) {
+            return Err(BTreeError::ForeignSegment);
+        }
+        let Node::Leaf(entries) = read_node(store, segment.page)? else {
+            return Err(BTreeError::WrongPageKind);
+        };
+        let minimum = entries
+            .first()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        let maximum = entries
+            .last()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        if minimum != segment.minimum
+            || maximum != segment.maximum
+            || entries.len() != segment.entry_count
+        {
+            return Err(BTreeError::InvalidSeparator);
+        }
+        let lower = borrowed_bound(&segment.lower);
+        let upper = borrowed_bound(&segment.upper);
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                key_satisfies_lower(&entry.key, lower) && key_satisfies_upper(&entry.key, upper)
+            })
+            .map(|entry| (entry.key, entry.value))
+            .collect())
     }
 
     /// Verifies the complete tree and returns its node height.
@@ -1440,6 +1564,105 @@ fn scan_node(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_range_segments_node(
+    store: &PageStore,
+    root: PageId,
+    page_id: PageId,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    output: &mut Vec<BTreeSegment>,
+) -> Result<(), BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    match read_node(store, page_id)? {
+        Node::Leaf(entries) => {
+            let minimum = entries.first().ok_or(BTreeError::InvalidCount)?.key.clone();
+            let maximum = entries.last().ok_or(BTreeError::InvalidCount)?.key.clone();
+            if segment_intersects_bounds(&minimum, &maximum, lower, upper) {
+                output.push(BTreeSegment {
+                    root,
+                    page: page_id,
+                    minimum,
+                    maximum,
+                    entry_count: entries.len(),
+                    lower: owned_bound(lower),
+                    upper: owned_bound(upper),
+                });
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                if child_intersects_bounds(child_lower, child_upper, lower, upper) {
+                    plan_range_segments_node(
+                        store,
+                        root,
+                        child,
+                        lower,
+                        upper,
+                        depth + 1,
+                        visited,
+                        output,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn owned_bound(bound: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.to_vec()),
+        Bound::Excluded(value) => Bound::Excluded(value.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn borrowed_bound(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.as_slice()),
+        Bound::Excluded(value) => Bound::Excluded(value.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn range_is_empty(lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+    match (lower, upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
+    }
+}
+
+fn segment_intersects_bounds(
+    minimum: &[u8],
+    maximum: &[u8],
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> bool {
+    let ends_after_lower = match lower {
+        Bound::Included(bound) => maximum >= bound,
+        Bound::Excluded(bound) => maximum > bound,
+        Bound::Unbounded => true,
+    };
+    let starts_before_upper = match upper {
+        Bound::Included(bound) => minimum <= bound,
+        Bound::Excluded(bound) => minimum < bound,
+        Bound::Unbounded => true,
+    };
+    ends_after_lower && starts_before_upper
+}
+
 fn scan_prefix_node(
     store: &PageStore,
     page_id: PageId,
@@ -1948,6 +2171,80 @@ mod tests {
             tree.scan_prefix_cached(&store, &pool, &[2])?,
             tree.scan_prefix(&store, &[2])?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_leaf_segments_plan_prune_execute_and_bind_their_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let entries = (0..2_048_u32)
+            .map(|index| {
+                (
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 251).unwrap_or(u8::MAX); 96],
+                )
+            })
+            .collect::<Vec<_>>();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?
+            .tree;
+        assert!(tree.height(&store)? >= 2);
+
+        let all = tree.plan_range_segments(&store, Bound::Unbounded, Bound::Unbounded)?;
+        let lower = 700_u32.to_be_bytes();
+        let upper = 1_400_u32.to_be_bytes();
+        let planned = tree.plan_range_segments(
+            &store,
+            Bound::Included(lower.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+        )?;
+        assert!(!planned.is_empty());
+        assert!(planned.len() < all.len());
+        assert!(
+            planned
+                .windows(2)
+                .all(|pair| pair[0].maximum_key() < pair[1].minimum_key())
+        );
+        assert!(planned.iter().all(|segment| segment.entry_count() > 0));
+
+        let observed = planned
+            .iter()
+            .map(|segment| tree.scan_planned_segment(&store, segment))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected = tree
+            .scan(&store)?
+            .into_iter()
+            .filter(|(key, _)| {
+                key.as_slice() >= lower.as_slice() && key.as_slice() < upper.as_slice()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        assert!(
+            tree.plan_range_segments(
+                &store,
+                Bound::Excluded(upper.as_slice()),
+                Bound::Included(lower.as_slice()),
+            )?
+            .is_empty()
+        );
+
+        let newer = tree
+            .upsert(
+                &mut store,
+                Csn::new(2)?,
+                2_048_u32.to_be_bytes().to_vec(),
+                b"new-root".to_vec(),
+            )?
+            .tree;
+        assert!(matches!(
+            newer.scan_planned_segment(&store, &planned[0]),
+            Err(BTreeError::ForeignSegment)
+        ));
         Ok(())
     }
 

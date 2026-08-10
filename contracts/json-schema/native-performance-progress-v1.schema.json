@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-performance-progress-v1.schema.json",
+  "title": "Hyphae Native performance progress v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "source_commit",
+    "source_tree",
+    "dataset_digest",
+    "operation",
+    "stage",
+    "sequence",
+    "completed_units",
+    "total_units",
+    "unit",
+    "elapsed_nanos",
+    "status",
+    "checkpoint_digest"
+  ],
+  "properties": {
+    "schema": {"const": "hyphae-native-performance-progress-v1"},
+    "source_commit": {"$ref": "#/$defs/sha1"},
+    "source_tree": {"$ref": "#/$defs/sha1"},
+    "dataset_digest": {"$ref": "#/$defs/sha256"},
+    "operation": {"type": "string", "minLength": 1},
+    "stage": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 1},
+    "completed_units": {"type": "integer", "minimum": 0},
+    "total_units": {"type": "integer", "minimum": 1},
+    "unit": {"type": "string", "minLength": 1},
+    "elapsed_nanos": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["running", "completed"]},
+    "checkpoint_digest": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/sha256"}
+      ]
+    }
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

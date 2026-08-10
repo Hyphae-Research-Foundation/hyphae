@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Curated embedded administration and typed explain models.
 
@@ -667,8 +667,9 @@ impl EmbeddedAdmin<'_> {
         let snapshot = self
             .product
             .database
-            .snapshot(request.logical_time_micros)
+            .catalog_snapshot()
             .map_err(ProductError::from)?;
+        let snapshot = snapshot.identity();
         let physical = self
             .product
             .database
@@ -683,10 +684,10 @@ impl EmbeddedAdmin<'_> {
                     .directory_identity()
                     .lineage()
                     .encode(),
-                visible_csn: snapshot.visible_csn(),
-                catalog_version: snapshot.catalog_version(),
-                root_digest: snapshot.root_digest(),
-                logical_time_micros: snapshot.logical_time_micros(),
+                visible_csn: snapshot.visible_csn,
+                catalog_version: snapshot.catalog_version,
+                root_digest: snapshot.root_digest,
+                logical_time_micros: request.logical_time_micros,
             },
             snapshot_pin_count: self.product.database.snapshot_pin_count(),
             physical: physical.into(),

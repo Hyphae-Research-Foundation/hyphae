@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Verify the crates.io release graph and every generated package's assets."""
 
 from __future__ import annotations
@@ -165,6 +166,15 @@ def main() -> int:
             ).splitlines()
             if line.strip()
         }
+        for required_license in (
+            "LICENSE",
+            "LICENSE-DOCUMENTATION",
+            "LICENSE-POLICY.md",
+        ):
+            if required_license not in packaged:
+                failures.append(
+                    f"{crate}: package is missing {required_license}"
+                )
 
         for relative_source in sorted(path for path in packaged if path.endswith(".rs")):
             source = crate_root / relative_source

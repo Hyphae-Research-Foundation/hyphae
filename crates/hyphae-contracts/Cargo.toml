@@ -13,7 +13,15 @@ categories.workspace = true
 description = "Versioned OpenAPI and JSON Schema models for Hyphae HTTP APIs."
 documentation = "https://docs.rs/hyphae-contracts"
 publish.workspace = true
-include = ["src/**", "assets/**", "examples/**", "README.md"]
+include = [
+    "assets/**",
+    "examples/**",
+    "LICENSE",
+    "LICENSE-DOCUMENTATION",
+    "LICENSE-POLICY.md",
+    "README.md",
+    "src/**",
+]
 
 [dependencies]
 hyphae-query.workspace = true

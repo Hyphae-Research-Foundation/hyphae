@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-only
 
 """Fail-closed validation for one controlled Native G7 receipt."""
 
@@ -178,6 +178,16 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
                 raise GateFailure(f"G7 latency field is invalid: {name}.{field}")
         if not isinstance(cell.get("throughput_per_second"), (int, float)) or cell["throughput_per_second"] <= 0:
             raise GateFailure(f"G7 throughput is invalid: {name}")
+        materialization = cell.get("materialization")
+        if (
+            not isinstance(materialization, dict)
+            or set(materialization)
+            != {"full_state_loads", "full_catalog_loads", "provider"}
+            or materialization.get("full_state_loads") != 0
+            or materialization.get("full_catalog_loads") != 0
+            or materialization.get("provider") != "process-interval-atomic-counters"
+        ):
+            raise GateFailure(f"G7 hot path materialized complete state: {name}")
         if (
             payload["state"] == "warm"
             and payload["concurrency"] == 1
