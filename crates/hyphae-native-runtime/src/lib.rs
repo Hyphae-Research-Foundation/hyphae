@@ -5417,6 +5417,7 @@ impl NativeDatabase {
         &self,
         root: PageId,
         plan: &ann_store::ConsolidationPlan,
+        candidate_memory_is_accounted: bool,
     ) -> Result<
         (
             Option<DatabaseGovernorPermit>,
@@ -5443,12 +5444,14 @@ impl NativeDatabase {
                 || ControlFlow::Continue(()),
             )?;
         drop(planning_permit);
+        let candidate_memory_bytes = if candidate_memory_is_accounted {
+            0
+        } else {
+            partitioned_hnsw_build_memory_bytes(plan.effective_vector_count(), definition)
+        };
         let memory_bytes = load_plan
             .hydration_memory_bytes()
-            .saturating_add(partitioned_hnsw_build_memory_bytes(
-                plan.effective_vector_count(),
-                definition,
-            ))
+            .saturating_add(candidate_memory_bytes)
             .saturating_add(
                 u64::try_from(structural_plan.structural_peak_memory_bytes()).unwrap_or(u64::MAX),
             );
@@ -5460,6 +5463,16 @@ impl NativeDatabase {
             plan,
         )?;
         Ok((permit, consumed_delta_records, structural_plan))
+    }
+
+    fn ann_consolidation_candidate_memory_is_accounted(
+        &self,
+        permit: Option<&OwnedGovernorPermit>,
+    ) -> bool {
+        self.resource_governor
+            .as_ref()
+            .zip(permit)
+            .is_some_and(|(governor, permit)| permit.is_admitted_by(governor))
     }
 
     fn admit_administrative_owned(
@@ -8557,7 +8570,7 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
-        let _resource_permit = plan.resource_permit.clone();
+        let retained_resource_permit = plan.resource_permit.clone();
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
@@ -8582,8 +8595,14 @@ impl NativeDatabase {
         let root = roots
             .root(SLOT_SEARCH)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let (_publication_permit, consumed_delta_records, structural_plan) =
-            self.admit_ann_consolidation_publication(root, &plan.inner)?;
+        let candidate_memory_is_accounted =
+            self.ann_consolidation_candidate_memory_is_accounted(retained_resource_permit.as_ref());
+        let (_publication_permit, consumed_delta_records, structural_plan) = self
+            .admit_ann_consolidation_publication(
+                root,
+                &plan.inner,
+                candidate_memory_is_accounted,
+            )?;
         let previous_base_identity = plan.inner.base_identity();
         let index_id = plan.inner.index();
         let replacement_base_identity = plan.inner.replacement_identity();
@@ -54232,7 +54251,7 @@ mod tests {
         let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
         database.set_resource_governor_with_execution_pool(
             Arc::clone(&governor),
-            execution_pool,
+            Arc::clone(&execution_pool),
             Duration::from_secs(5),
         )?;
         let reopened_observation = database.observe_ann_index(index)?;
@@ -54262,8 +54281,8 @@ mod tests {
                 .any(|hit| hit.object_id == inserted)
         );
         let consolidation = database.plan_ann_consolidation(index, 256, 8)?;
-        let retained_memory = super::partitioned_hnsw_build_memory_bytes(
-            256,
+        let expected_retained_memory = super::partitioned_hnsw_build_memory_bytes(
+            consolidation.effective_vector_count(),
             VectorIndexDefinition::new(
                 index,
                 8,
@@ -54271,14 +54290,70 @@ mod tests {
                 HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?,
             )?,
         );
-        let expected_memory = retained_memory
-            .saturating_add(retained_memory.saturating_sub(super::MAINTENANCE_MEMORY_BYTES));
-        assert_eq!(governor.usage_snapshot().memory_bytes, expected_memory);
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            expected_retained_memory
+        );
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
         let cloned = consolidation.clone();
-        assert_eq!(governor.usage_snapshot().memory_bytes, expected_memory);
-        drop(cloned);
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            expected_retained_memory
+        );
+        let physical_before_rejection = database.physical_observation()?;
+        let observation_before_rejection = database.observe_ann_index(index)?;
+        let mut replacement_policy = policy.clone();
+        replacement_policy.memory_bytes = expected_retained_memory;
+        for limit in &mut replacement_policy.class_limits {
+            limit.memory_bytes = expected_retained_memory;
+        }
+        let replacement_profile = portable_execution_profile(&replacement_policy);
+        let replacement_governor =
+            Arc::new(NativeResourceGovernor::new(replacement_policy.clone()));
+        let replacement_pool = Arc::new(NativeExecutionPool::new(
+            &replacement_profile,
+            &replacement_policy,
+        )?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&replacement_governor),
+            replacement_pool,
+            Duration::ZERO,
+        )?;
+        assert!(matches!(
+            database.consolidate_ann(cloned, DurabilityClass::Strict),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ClassLimit
+            ))
+        ));
+        assert_eq!(replacement_governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(replacement_governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(replacement_governor.usage_snapshot().io_slots, 0);
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            expected_retained_memory
+        );
+        assert_eq!(
+            database.physical_observation()?.page_count,
+            physical_before_rejection.page_count
+        );
+        assert_eq!(
+            database.physical_observation()?.wal_bytes,
+            physical_before_rejection.wal_bytes
+        );
+        assert_eq!(
+            database.observe_ann_index(index)?,
+            observation_before_rejection
+        );
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            execution_pool,
+            Duration::from_secs(5),
+        )?;
+        assert_eq!(
+            governor.usage_snapshot().memory_bytes,
+            expected_retained_memory
+        );
         let consolidated = database.consolidate_ann(consolidation, DurabilityClass::Strict)?;
         assert_eq!(governor.usage_snapshot().memory_bytes, 0);
         assert_eq!(consolidated.consumed_delta_records, 2);
@@ -54878,24 +54953,68 @@ mod tests {
         assert_eq!(with_delta.exact_delta_candidates, 1);
 
         let consolidation = reopened.plan_ann_consolidation(index, 256, 4)?;
-        reopened.consolidate_ann(consolidation, DurabilityClass::Memory)?;
-        let fallback = without_full_state_or_catalog_materialization(|| {
-            reopened.search_ann_selected_latest(index, &query, options, 3)
+        let captured_base_identity = consolidation.base_identity();
+        let captured_view_identity = consolidation.captured_view_identity();
+        let captured_delta_count = consolidation.captured_delta_count();
+        let effective_vector_count = consolidation.effective_vector_count();
+        let replacement_identity = consolidation.replacement_identity();
+        assert_eq!(captured_base_identity, selected.base_build_identity);
+        assert_eq!(captured_view_identity, with_delta.view_identity);
+        assert_eq!(captured_delta_count, 1);
+        assert_eq!(effective_vector_count, 129);
+        let consolidation_receipt =
+            reopened.consolidate_ann(consolidation, DurabilityClass::Memory)?;
+        assert_eq!(
+            consolidation_receipt.previous_base_identity,
+            captured_base_identity
+        );
+        assert_eq!(
+            consolidation_receipt.replacement_base_identity,
+            replacement_identity
+        );
+        assert_eq!(consolidation_receipt.consumed_delta_records, 1);
+        assert_eq!(consolidation_receipt.preserved_later_delta_records, 0);
+        assert_eq!(consolidation_receipt.effective_vector_count, 129);
+
+        let consolidated = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &delta_query, options, 3)
         })?;
         assert_eq!(
-            fallback.routing_mode,
-            super::AnnPartitionRoutingMode::SingleGenerationFallback
+            consolidated.routing_mode,
+            super::AnnPartitionRoutingMode::SelectedPartitions
         );
-        assert_eq!(fallback.selected_partitions, vec![0]);
-        assert_eq!(fallback.total_partitions, 1);
+        assert_eq!(consolidated.selected_partitions.len(), 3);
+        assert_eq!(consolidated.total_partitions, 4);
         assert_eq!(
-            fallback.routing_outcome,
-            super::AnnPartitionRoutingOutcome::SingleGenerationFallback
+            consolidated.routing_outcome,
+            super::AnnPartitionRoutingOutcome::SelectedCertified
         );
-        assert_eq!(fallback.base_build_identity, fallback.view_identity);
+        assert_eq!(consolidated.base_build_identity, replacement_identity);
+        assert_eq!(consolidated.view_identity, replacement_identity);
+        assert_eq!(consolidated.search.build_identity, replacement_identity);
+        assert_eq!(consolidated.exact_delta_candidates, 0);
+        assert_eq!(consolidated.search.hits[0].object_id, inserted);
+
+        let default_after_consolidation =
+            reopened.search_ann_latest(index, &delta_query, options)?;
+        let full_after_consolidation = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &delta_query, options, 4)
+        })?;
+        assert_full_fanout_routing_receipt(&full_after_consolidation, &default_after_consolidation);
+
+        drop(reopened);
+        let reopened = NativeDatabase::open(temporary.path())?;
         assert_eq!(
-            fallback.search,
-            reopened.search_ann_latest(index, &query, options)?
+            without_full_state_or_catalog_materialization(|| {
+                reopened.search_ann_selected_latest(index, &delta_query, options, 3)
+            })?,
+            consolidated
+        );
+        assert_eq!(
+            without_full_state_or_catalog_materialization(|| {
+                reopened.search_ann_selected_latest(index, &delta_query, options, 4)
+            })?,
+            full_after_consolidation
         );
         Ok(())
     }

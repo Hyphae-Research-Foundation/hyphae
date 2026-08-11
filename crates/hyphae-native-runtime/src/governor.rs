@@ -887,6 +887,10 @@ impl OwnedGovernorPermit {
         Arc::ptr_eq(&self.allocation, &other.allocation)
     }
 
+    pub(crate) fn is_admitted_by(&self, governor: &Arc<NativeResourceGovernor>) -> bool {
+        Arc::ptr_eq(&self.allocation.governor, governor)
+    }
+
     /// Returns the class owning this allocation.
     pub fn class(&self) -> WorkloadClass {
         self.allocation.class
