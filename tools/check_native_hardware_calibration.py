@@ -15,6 +15,11 @@ SCHEMA = "hyphae-native-hardware-calibration-v1"
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 SMT_RECOMMENDATION_RATIO_PPM = 1_050_000
 IO_RECOMMENDATION_FLOOR_PPM = 950_000
+SCHEDULER_MEASUREMENT_PRIMITIVES = {
+    "numa-memory-read",
+    "queue-depth-random-read",
+    "thread-scaling-memory-scan",
+}
 NUMA_VARIANT = re.compile(
     r"^linux-first-touch-node-(?P<source>[0-9]+)-read-node-(?P<reader>[0-9]+)-cpu-(?P<cpu>[0-9]+)$"
 )
@@ -518,10 +523,14 @@ def validate_receipt(receipt: Any) -> None:
         fail("differential_tests_passed disagrees with measurements")
 
     timing_valid = policy["minimum_duration_ms"] <= elapsed_ms <= policy["maximum_duration_ms"]
-    all_stable = all(item["status"] == "stable" for item in measurements)
-    accepted = all_correct and timing_valid and all_stable
+    scheduling_inputs_stable = all(
+        item["status"] == "stable"
+        for item in measurements
+        if item["primitive"] in SCHEDULER_MEASUREMENT_PRIMITIVES
+    )
+    accepted = all_correct and timing_valid and scheduling_inputs_stable
     if root["accepted_for_scheduling"] is not accepted:
-        fail("accepted_for_scheduling disagrees with correctness, timing, or variance")
+        fail("accepted_for_scheduling disagrees with correctness, timing, or scheduler variance")
     if root["cache_status"] == "hit" and not accepted:
         fail("a cache hit must be accepted for scheduling")
     expected_root_status = "stable" if accepted else ("rejected" if not all_correct or not timing_valid else "unstable")
@@ -546,7 +555,15 @@ def validate_receipt(receipt: Any) -> None:
         )
         require_string(selection["reason"], f"selected_kernels[{index}].reason")
         selected_keys.append(key)
-    expected_selections = set(keys) if accepted else set()
+    expected_selections = (
+        {
+            key
+            for key, measurement in zip(keys, measurements, strict=True)
+            if measurement["status"] == "stable"
+        }
+        if accepted
+        else set()
+    )
     if set(selected_keys) != expected_selections or len(selected_keys) != len(expected_selections):
         fail("selected_kernels must exactly match accepted stable measurements")
 

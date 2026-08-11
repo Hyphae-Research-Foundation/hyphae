@@ -398,7 +398,7 @@ pub struct HardwareCalibration {
     pub mode: CalibrationMode,
     /// `stable`, `unstable`, or `rejected`.
     pub status: String,
-    /// Whether all measured samples may influence scheduler decisions.
+    /// Whether correctness, timing, and scheduler-input stability allow use.
     pub accepted_for_scheduling: bool,
     /// Whether this result was measured directly or reused from exact cache.
     pub cache_status: CalibrationCacheStatus,
@@ -2243,13 +2243,12 @@ fn finish_calibration(
         .all(|measurement| measurement.correctness.status == "passed");
     let timing_inside_policy =
         elapsed_ms >= policy.minimum_duration_ms && elapsed_ms <= policy.maximum_duration_ms;
-    let all_stable = measurements
-        .iter()
-        .all(|measurement| measurement.status == "stable");
-    let accepted_for_scheduling = differential_tests_passed && timing_inside_policy && all_stable;
+    let scheduling_inputs_stable = scheduling_measurements_are_stable(&measurements);
+    let accepted_for_scheduling =
+        differential_tests_passed && timing_inside_policy && scheduling_inputs_stable;
     let status = if !differential_tests_passed || !timing_inside_policy {
         "rejected"
-    } else if all_stable {
+    } else if scheduling_inputs_stable {
         "stable"
     } else {
         "unstable"
@@ -2417,17 +2416,17 @@ impl HardwareCalibration {
             && self.feature_detection.differential_tests_passed
             && !self.measurements.is_empty()
             && self.measurements.iter().all(|measurement| {
-                measurement.status == "stable"
-                    && measurement.correctness.status == "passed"
+                measurement.correctness.status == "passed"
                     && measurement.correctness.result_digest_blake3
                         == measurement.correctness.reference_digest_blake3
             })
+            && scheduling_measurements_are_stable(&self.measurements)
             && self.thread_scaling.status == "stable"
             && self.thread_scaling.recommended_worker_count.is_some()
             && self.io_scaling.status == "stable"
             && self.io_scaling.recommended_io_slots.is_some()
             && reusable_numa_coverage(&self.measurements, &self.coverage)
-            && selections_match_measurements(&self.selected_kernels, &self.measurements)
+            && selections_match_stable_measurements(&self.selected_kernels, &self.measurements)
             && self.claims.is_empty()
     }
 }
@@ -2479,12 +2478,16 @@ fn parse_numa_measurement_variant(variant: &str) -> Option<(u32, u32)> {
     Some((source.parse().ok()?, reader.parse().ok()?))
 }
 
-fn selections_match_measurements(
+fn selections_match_stable_measurements(
     selections: &[SelectedCalibrationKernel],
     measurements: &[CalibrationMeasurement],
 ) -> bool {
-    selections.len() == measurements.len()
-        && measurements.iter().all(|measurement| {
+    let stable_measurements = measurements
+        .iter()
+        .filter(|measurement| measurement.status == "stable")
+        .collect::<Vec<_>>();
+    selections.len() == stable_measurements.len()
+        && stable_measurements.iter().all(|measurement| {
             selections.iter().any(|selection| {
                 selection.primitive == measurement.primitive
                     && selection.variant == measurement.variant
@@ -2492,6 +2495,20 @@ fn selections_match_measurements(
                     && selection.input_unit == measurement.input_unit
             })
         })
+}
+
+fn scheduling_measurements_are_stable(measurements: &[CalibrationMeasurement]) -> bool {
+    measurements
+        .iter()
+        .filter(|measurement| measurement_influences_scheduling(measurement))
+        .all(|measurement| measurement.status == "stable")
+}
+
+fn measurement_influences_scheduling(measurement: &CalibrationMeasurement) -> bool {
+    matches!(
+        measurement.primitive.as_str(),
+        "thread-scaling-memory-scan" | "queue-depth-random-read" | "numa-memory-read"
+    )
 }
 
 fn unsupported_coverage() -> Vec<UnsupportedCalibration> {
@@ -2891,6 +2908,32 @@ mod tests {
             target_sample_duration_ms: 1,
             maximum_relative_mad_ppm: 1_000_000,
             maximum_relative_range_ppm: 1_000_000,
+        }
+    }
+
+    fn measurement_with_status(primitive: &str, status: &str) -> CalibrationMeasurement {
+        let mut measurement = measure_u64(
+            &MeasurementSpec::new(primitive, "test-variant", 1, "items", 8),
+            test_policy(),
+            || 1,
+            1,
+        );
+        measurement.status = status.to_owned();
+        measurement
+    }
+
+    #[test]
+    fn scheduler_acceptance_ignores_only_non_topology_variance() {
+        let diagnostic = measurement_with_status("native-wal-group-flush", "unstable");
+        assert!(scheduling_measurements_are_stable(&[diagnostic]));
+
+        for primitive in [
+            "thread-scaling-memory-scan",
+            "queue-depth-random-read",
+            "numa-memory-read",
+        ] {
+            let scheduler_input = measurement_with_status(primitive, "unstable");
+            assert!(!scheduling_measurements_are_stable(&[scheduler_input]));
         }
     }
 

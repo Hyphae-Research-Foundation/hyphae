@@ -125,9 +125,72 @@ class CalibrationCheckerTests(unittest.TestCase):
     def test_accepts_semantically_consistent_receipt(self) -> None:
         validate_receipt(valid_receipt())
 
+    def test_accepts_unstable_durability_diagnostic_for_scheduling(self) -> None:
+        receipt = valid_receipt()
+        diagnostic = copy.deepcopy(receipt["measurements"][0])
+        diagnostic.update(
+            {
+                "primitive": "native-wal-group-flush",
+                "variant": "native-eight-record-group-sync-data",
+                "input_size": 8,
+                "input_unit": "records",
+                "bytes_per_operation": 65_536,
+                "operations_per_sample": 1,
+                "maximum_operations_per_sample": 1,
+                "status": "unstable",
+            }
+        )
+        diagnostic["statistics"].update(
+            {
+                "minimum": 100_000,
+                "median": 200_000,
+                "maximum": 900_000,
+                "median_absolute_deviation": 100_000,
+                "relative_mad_ppm": 500_000,
+                "relative_range_ppm": 4_000_000,
+                "median_bytes_per_second": 327_680_000,
+            }
+        )
+        receipt["measurements"].append(diagnostic)
+        receipt["coverage"]["measured"].append("native-wal-group-flush")
+        receipt["coverage"]["measured"].sort()
+
+        validate_receipt(receipt)
+
+    def test_rejects_unstable_scheduler_input(self) -> None:
+        receipt = valid_receipt()
+        scheduler_input = copy.deepcopy(receipt["measurements"][0])
+        scheduler_input.update(
+            {
+                "primitive": "queue-depth-random-read",
+                "variant": "persistent-sync-workers-buffered-4k",
+                "input_size": 16,
+                "input_unit": "outstanding-reads",
+                "status": "unstable",
+            }
+        )
+        scheduler_input["statistics"].update(
+            {
+                "minimum": 100,
+                "median": 200,
+                "maximum": 900,
+                "median_absolute_deviation": 100,
+                "relative_mad_ppm": 500_000,
+                "relative_range_ppm": 4_000_000,
+            }
+        )
+        receipt["measurements"].append(scheduler_input)
+        receipt["coverage"]["measured"].append("queue-depth-random-read")
+        receipt["coverage"]["measured"].sort()
+
+        with self.assertRaisesRegex(CalibrationValidationError, "scheduler variance"):
+            validate_receipt(receipt)
+
     def test_rejects_selection_when_receipt_is_unstable(self) -> None:
         receipt = valid_receipt()
         measurement = receipt["measurements"][0]
+        measurement["primitive"] = "thread-scaling-memory-scan"
+        receipt["coverage"]["measured"] = ["thread-scaling-memory-scan"]
         measurement["statistics"]["relative_range_ppm"] = 600_000
         measurement["status"] = "unstable"
         receipt["status"] = "unstable"
