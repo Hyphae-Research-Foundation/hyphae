@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Assemble seven exact-SHA hosted artifacts into a G1 evidence map."""
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 import { ClientError, ProductError, productError, type RequestOptions, type Response, type Transport } from "./models.js";
 import {

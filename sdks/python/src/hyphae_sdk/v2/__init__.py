@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 from .client import HyphaeClient, Transport
 from .generated import *  # noqa: F403

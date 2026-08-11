@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Build a semantic G2 prepared-plan/EXPLAIN receipt from exact test logs."""
 

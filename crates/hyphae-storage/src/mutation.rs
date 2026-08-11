@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use hyphae_core::{
     Q15Vector, VectorMetric, VectorSpaceDefinition, VectorSpaceName, VectorValueError,

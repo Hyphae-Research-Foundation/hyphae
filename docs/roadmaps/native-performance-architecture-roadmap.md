@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
+
 # Native hardware-aware performance roadmap
 
 Status: active engineering program; no performance closure claimed
@@ -14,18 +16,21 @@ measurement contract.
 |---|---|---|
 | P0 evidence | Versioned receipt, progress, and suite contracts; external required-cell authority; embedded structure baseline; ANN kernel-to-publication progress | implemented, no G7 claim |
 | P1 discovery | Read-only embedded API and `hyphae hardware discover`; Linux per-processor core/socket/NUMA/SMT placement plus macOS and Windows fingerprint adapters | in progress |
-| P1 calibration | Versioned CPU/memory/engine/storage/WAL receipt, Native B+tree, posting, filesystem sync, block-framed WAL, Linux hard-affinity scaling, representative local/remote NUMA reads, and controlled I/O-depth cells | in progress |
+| P1 calibration | Versioned CPU/memory/engine/storage/WAL receipt, Native B+tree, posting, filesystem sync, block-framed WAL, Linux hard-affinity scaling, and controlled I/O-depth cells; multi-NUMA residency is explicitly unsupported until an exact safe VMA provider exists | in progress |
 | P2 governor | Versioned hardware-derived policy plus rollback-safe global/class CPU, I/O, and memory admission; RAII cancellation and parent-only nested subdivision | persistent physical-core-first NUMA queues and governed exact-ANN batches now complement routed reads/mutations/hybrid/maintenance/recovery/backup/WAL retention; exact ANN has target-query workspace accounting and component receipts, and worker completion is published before caller notification; index-scoped/all-engine hydration accounting, pool connections beyond exact ANN, calibrated cross-node stealing, broader receipts, proof routing, and measured interference pending |
 | P3 segmented substrate | Immutable B+tree leaf planning with root-bound range/cardinality summaries, snapshot-frozen readers, and governed parallel relational, hash, set, stream, sorted-set score/rank, list, BM25, and contiguous exact-vector batches; directional/tie order is deterministic; multi-root recovery and deterministic maintained/compaction amplification bounds are proven | in progress; richer SQL/structure/lexical/vector pruning summaries plus dedicated-hardware pruning and foreground-interference receipts pending |
 | P4 vector execution | Deterministic recursively projected balanced plans with one projection evaluation per vector/split, centroid/radius/projection summaries, explicit selected-partition routing, pre-plan `Bulk` admission, cancelable planning/child ingestion, governed persistent-pool child builds without a second corpus copy, canonical exact/approximate merge, aggregate identities, an ownership-transferred HYANNM04 partitioned base, append-only WAL publication, exact stale-plan checks, prior-or-complete recovery, retained-child ownership, online delta/consolidation lifecycle, and process-local plus durable receipts are implemented | in progress; bounded cross-links, accepted pruning policy, competing algorithms, resumable build checkpoints, full lifecycle/interference matrix, allocation/RSS proof, and bare-metal quality/build evidence pending |
 | P5 SQL execution | Direct small-query path, catalog-version-bound 256-entry prepared plan/expression cache, exact ordered multi-index intersection with root-bound leaf-summary ordering for 3+ streams, governed 1,024-row decode/filter/project batches, indexed nested-loop join/probe receipts, independent fail-closed 1,048,576-candidate ceilings for scans and joins, a 64-byte-aligned selection bitmap, and a CSN/root-bound execution receipt | in progress; allocation proof, SIMD/columnar kernels, persisted fine-grained statistics and stale controls, aggregation/sort, hash/merge join alternatives and adaptive choice, spill, reusable cross-engine masks, adversarial budget matrices, and dedicated-hardware evidence pending |
-| P6 structure execution | Direct governed points; immutable segmented hash/set/list/stream/sorted-set ranges; bounded hash/set batches, set algebra, and expiry sweeps; per-field/member optimistic conflicts; componentized commit/group durability receipts; HYSTRBT3 incarnation/key/typed-family metadata/retirement codecs; explicit lossless V2-to-V3 WAL migration and V3 backup/restore; public constant-cardinality deletion for all five collection families; public V3 scalar set/conditional/increment/expire/delete plus five-family due-key reuse; public incarnation-aware create/recreate plus hash set/batch/increment/delete, set add/batch/remove, list head/tail push and pop, stream append, sorted-set add/rescore/remove, collection/Hash-field TTL mutation, and ordered bounded active-expiry paths; all 30 current-root logical structure commands (52 public Rust methods), including Hash scans/patterns, Set algebra/scans, List/Stream ranges, and Sorted Set rank/rank-range/score-range paths, now execute directly or through governed immutable V3 segments without complete structure-state materialization; scalar all-engine delta commits hydrate only point metadata under HYSTRBT3, preserve conflict/recovery semantics, and enter group durability without loading complete engine state; governor-admitted, shared-buffer-pool reclamation in at most 1,024-entry steps with progress/no-op receipts; V3 compaction that preserves active retirements; and delete, recreate, scalar/member/list-boundary mutation, direct-read/range, TTL, expiry-sweep, partial-cleanup, terminal-cleanup, migration, backup/restore, corruption, and reopen matrices | in progress; retained snapshots, legacy public transactions, and collection-valued delta mutations still materialize complete state or lack a physical checked surface; page-generation and broader backup interruption matrices; million-member and allocation proof; SIMD kernels; hot-key and concurrent lifecycle scaling; and dedicated-hardware evidence pending |
-| P7–P8 | Cross-engine fusion through durability and maintenance convergence | pending |
+| P6 structure execution | Direct governed points; immutable segmented hash/set/list/stream/sorted-set ranges; bounded hash/set batches, set algebra, and expiry sweeps; per-field/member optimistic conflicts; componentized commit/group durability receipts; HYSTRBT3 incarnation/key/typed-family metadata/retirement codecs; explicit lossless V2-to-V3 WAL migration and V3 backup/restore; public constant-cardinality deletion for all five collection families; public V3 scalar set/conditional/increment/expire/delete plus five-family due-key reuse; public incarnation-aware create/recreate plus hash set/batch/increment/delete, set add/batch/remove, list head/tail push and pop, stream append, sorted-set add/rescore/remove, collection/Hash-field TTL mutation, and ordered bounded active-expiry paths; all 30 current-root logical structure commands (52 public Rust methods), including Hash scans/patterns, Set algebra/scans, List/Stream ranges, and Sorted Set rank/rank-range/score-range paths, now execute directly or through governed immutable V3 segments without complete structure-state materialization; scalar all-engine delta commits resolve only point metadata and both HYSTRBT2/HYSTRBT3 scalar replacement avoid the old durable payload; exact-field V3 Hash delta HSET/HDEL/HINCRBY and exact value/field-TTL read-your-writes hydrate only the addressed field, while whole-Hash TTL resolves exact typed V3 point metadata and remains unchanged by field writes; one conservative batch-wide retained-memory ledger bounds point-resolved SQL/scalar/lexical/Hash deltas beneath the 32 MiB mutation allocation while preserving an 8 MiB Hash sub-budget; SQL delta requires HYCAT006 and rejects relations with inbound or outbound foreign keys; batches are linear and bound to their exact live database handle; governor-admitted, shared-buffer-pool reclamation in at most 1,024-entry steps with progress/no-op receipts; V3 compaction that preserves active retirements; and delete, recreate, scalar/member/list-boundary mutation, direct-read/range, TTL, expiry-sweep, partial-cleanup, terminal-cleanup, migration, backup/restore, corruption, and reopen matrices | in progress; the delta ledger is conservative rather than allocation-exact; aggregate/scanning delta reads, foreign-key validation, remaining collection-valued delta mutations, plan-sized legacy Product materialized candidates, and other legacy public transactions remain unsupported or retain complete-state work; page-generation and broader backup interruption matrices; million-member and allocation/RSS proof; SIMD kernels; hot-key and concurrent lifecycle scaling; and dedicated-hardware evidence pending |
+| P7 cross-engine fusion | Common-snapshot lexical/vector retrieval and canonical reciprocal-rank fusion already execute without an internal protocol hop | in progress; shared SQL/structure masks, concurrent branch scheduling, one arena/deadline/cancellation budget, bounded streaming merge, and exact same-snapshot G7 evidence pending |
+| P8 storage/background | Group-commit cohort/outcome receipts, bounded WAL replay, crash matrices, governed compaction/vacuum/backup/expiry/ANN consolidation, and interruptible ANN publication are implemented | in progress; full optimized-publication crash coverage, device-calibrated cohort policy, asynchronous portable I/O boundary, comprehensive background progress, and paired interference/recovery evidence pending |
 
 P1 discovery still requires Windows affinity/NUMA/cache and storage-queue
 enrichment. Linux calibration now has active, fail-closed aligned `O_DIRECT`,
-hard-affinity worker scaling, and representative first-touch local/remote NUMA
-adapters. Multi-node bare-metal qualification, safe SIMD, platform async I/O,
+hard-affinity worker scaling. First-touch affinity alone is not residency proof,
+so multi-node memory calibration and cross-node stealing remain explicitly
+`unsupported`/`disabled`. Multi-node bare-metal qualification, a safe exact-VMA
+residency adapter, safe SIMD, platform async I/O,
 and equivalent affinity/NUMA adapters elsewhere remain pending. The portable
 fallback and current receipt report unknown or unsupported properties
 explicitly.
@@ -288,9 +293,18 @@ capacity, and latency evidence remains a separate gate and cannot be inferred
 from those local tests.
 
 Durable default search currently performs full partition fanout and canonical
-top-k merge. The experimental selected-partition route provides bounded
-oversampling and canonical merge, but it cannot become the default until its
-pruning and reranking policy satisfies the accepted recall gate.
+top-k merge. The experimental routed path uses certified metric lower bounds,
+canonical merge, and explicit full-fanout fallback when its preferred budget
+cannot prove an omission safe. It cannot become the default until its pruning
+and reranking policy satisfies the accepted recall gate. Its checked request,
+receipt, fallback, and lifecycle boundary are specified in
+[`native-ann-durable-routing-v1.md`](../performance/native-ann-durable-routing-v1.md).
+The next hot-loop vertical is frozen by
+[`native-ann-read-view-v1.md`](../performance/native-ann-read-view-v1.md): one
+governed index-scoped hydration produces an owned immutable view whose retained
+memory stays admitted, while each query admits CPU and scratch independently.
+Opening and hydration remain outside the query histogram. This is a planned
+contract and does not close P4 or G7.
 
 ### Gate P4
 
@@ -480,19 +494,34 @@ elapsed time, but not the evidence required at each gate.
 
 ## Immediate next actions
 
-1. Preserve the v1.0.1 dedicated G7 run as an immutable baseline; do not use it
-   to tune thresholds after observing the result.
-2. Land only the already-proven vector norm/exact-scan optimization after its
-   full workspace funnel; do not present it as the parallel-build solution.
-3. Add the P0 receipt schema and a progress record for corpus construction.
-4. Implement read-only hardware discovery and the quick calibration harness.
-5. Run physical-core and SMT scaling curves on the i7i host before selecting
-   worker counts or NUMA placement.
-6. Freeze representative SQL, structure, lexical, vector, and mixed corpora.
-7. Prototype epoch HNSW, partitioned HNSW, and Vamana/DiskANN behind one
-   experimental bulk-builder interface.
-8. Select the first production strategy from correctness, recall, build time,
-   query latency, memory, recovery, and determinism evidence together.
+1. Retain the composite exact-source scheduler authority preflight that binds
+   profile, calibration, governor policy, execution topology, clean source
+   tree, and calibrated executable before any dedicated benchmark.
+2. Separate durable ANN logical partition count from execution worker count;
+   prove one aggregate identity with 1, 8, 32, and maximum calibrated workers.
+3. Qualify selected-partition durable ANN routing against the exact oracle with
+   a per-query recall floor, bounded oversampling, and an explicit full-fanout
+   fallback before sending the million-vector corpus to AWS again.
+4. Implement the contract-first
+   [`NativeAnnReadView`](../performance/native-ann-read-view-v1.md): retain one
+   owned index-scoped hydration per captured root, charge its memory through
+   the last handle, and prove that query observations perform no restore or
+   physical read.
+5. Freeze representative SQL, structure, lexical, vector, and mixed corpora;
+   retain the conservative 32 MiB batch-wide SQL/scalar/lexical/Hash delta
+   ledger and its 8 MiB Hash sub-budget, then extend checked physical accounting
+   to the remaining collection families and the nominal legacy Product
+   materialized candidate. Do not call the current upper bound
+   allocation-exact or close P6 from the point-resolved slice alone.
+6. Keep cross-NUMA stealing disabled while page residency is unsupported;
+   accept it only from a complete exact-residency directed matrix, then prove
+   foreground priority and maintenance progress under the derived policy.
+   Multi-worker G7 evidence must not claim page-home or NUMA locality meanwhile.
+7. Continue the epoch-HNSW and Vamana/DiskANN bake-off behind the same durable
+   build/quality/recovery contract; do not select from build throughput alone.
+8. Run physical-core/SMT/interference curves and the canonical G7 matrix on
+   dedicated AWS bare metal only after the exact tested SHA passes every local
+   functional and authority gate.
 
 No provisional benchmark or optimized vertical closes G7 by itself. Closure
 requires all required product cells and independent receipt validation on the

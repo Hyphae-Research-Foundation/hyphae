@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Fail-closed validation for the independent G7/G8 evidence authorities."""
 
@@ -25,6 +25,48 @@ def load(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise GateFailure(f"{path} must contain an object")
     return value
+
+
+def validate_g7_execution_workflow(workflow: str) -> None:
+    qualification_marker = "\n  g7_qualification:\n"
+    matrix_marker = "\n  g7-matrix:\n"
+    aggregate_marker = "\n  g7-aggregate:\n"
+    try:
+        qualification_start = workflow.index(qualification_marker)
+        matrix_start = workflow.index(matrix_marker)
+        aggregate_start = workflow.index(aggregate_marker)
+    except ValueError as error:
+        raise GateFailure("G7 workflow lacks a separate pre-execution qualification job") from error
+    if not qualification_start < matrix_start < aggregate_start:
+        raise GateFailure("G7 qualification must precede dedicated execution")
+    qualification = workflow[qualification_start:matrix_start]
+    matrix = workflow[matrix_start:aggregate_start]
+    for required in (
+        "needs: [authority]",
+        "runs-on: ubuntu-24.04",
+        "needs.authority.result == 'success'",
+        "tools/run_native_ann_durable_qualification.py",
+        '--expected-commit "${{ github.sha }}"',
+    ):
+        if required not in qualification:
+            raise GateFailure("G7 qualification is not a clean exact-SHA hosted prerequisite")
+    for required in (
+        "needs: [authority, g7_qualification]",
+        "runs-on: [self-hosted, hyphae-g7, dedicated",
+        "needs.authority.result == 'success'",
+        "needs.g7_qualification.result == 'success'",
+    ):
+        if required not in matrix:
+            raise GateFailure("dedicated G7 execution is not gated by successful qualification")
+    lowered = workflow.lower()
+    for forbidden in (
+        "aws ec2 run-instances",
+        "aws cloudformation deploy",
+        "terraform apply",
+        "pulumi up",
+    ):
+        if forbidden in lowered:
+            raise GateFailure("G7 readiness workflow must not provision infrastructure")
 
 
 def validate(root: Path, expected_commit: str) -> dict[str, Any]:
@@ -107,6 +149,11 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
     for forbidden in ("native-g7-aggregate.json", "check_native_g7_matrix.py"):
         if forbidden in closure_workflow:
             raise GateFailure("G8 closure workflow must remain independent from G7")
+    validate_g7_execution_workflow(
+        (root / ".github/workflows/native-g7-g8-readiness.yml").read_text(
+            encoding="utf-8"
+        )
+    )
     return {
         "schema": "hyphae-native-g7-g8-readiness-audit-v1",
         "status": "passed",

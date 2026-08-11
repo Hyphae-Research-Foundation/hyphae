@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{
     collections::BTreeSet,
@@ -432,7 +432,7 @@ fn assert_parallel_set_scan_matches(
     );
     assert_eq!(governor.usage_snapshot().compute_threads, 0);
     assert_eq!(governor.usage_snapshot().io_slots, 0);
-    database.clear_resource_governor();
+    database.clear_resource_governor()?;
     Ok(())
 }
 

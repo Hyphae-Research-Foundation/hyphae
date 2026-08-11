@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Product principals, authorization, sessions, and prepared handles.
 
@@ -21,7 +21,7 @@ pub const DEFAULT_PRODUCT_TRANSACTION_STATUSES: usize = 1_024;
 /// Default simultaneous explicit all-engine transactions in one session.
 pub const DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS: usize = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ActiveProductTransaction {
     pub(crate) batch: NativeWriteBatch,
     pub(crate) staged_operations: usize,

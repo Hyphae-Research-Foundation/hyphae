@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Generates the canonical retrieval and proof vectors checked into
 //! `compatibility/v2/retrieval-golden-v1.json`.

@@ -1,24 +1,34 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    ops::ControlFlow,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use hyphae_native_ann::{
-    AnnRecallRisk, AnnSearchResult, AnnSearchStrategy, GraphNodeRecord, HnswBuildProgress,
-    HnswConfig, HnswIndex, IndexSnapshot, Metric, PartitionedHnswIndex, PartitionedIndexSnapshot,
-    SearchOptions, Vector, VectorHit, VectorIndexDefinition, VectorRecord,
+    AnnError, AnnRecallRisk, AnnSearchResult, AnnSearchStrategy, GraphNodeRecord,
+    HnswBuildProgress, HnswConfig, HnswIndex, HnswPartitionPlan, IndexSnapshot, MAX_HNSW_LEVEL,
+    Metric, PartitionedAnnChildSearchResult, PartitionedAnnRoutingOutcome,
+    PartitionedAnnSearchPlan, PartitionedHnswIndex, PartitionedIndexSnapshot, SearchOptions,
+    Vector, VectorHit, VectorIndexDefinition, VectorRecord,
 };
-use hyphae_native_btree::BTree;
+use hyphae_native_btree::{
+    BTree, BTreeError, KeyValue, PrefixReplacementBatch, PrefixReplacementStructuralLimits,
+    PrefixReplacementStructuralPlan,
+};
 use hyphae_native_catalog::{
     CatalogObject, IncrementalVectorLifecycle, SearchCollectionDefinition, VectorMetric,
 };
-use hyphae_native_pages::{PAGE_PAYLOAD_SIZE, PageKind, PageStore};
+use hyphae_native_pages::{BufferPool, PAGE_PAYLOAD_SIZE, PageKind, PageStore, UnpublishedTail};
 use hyphae_native_types::{Csn, ObjectId, PageId};
 
 use crate::{
-    NativeExecutionPool, NativeRuntimeError, OwnedGovernorPermit,
+    GovernorCancellation, GovernorQueueError, NativeExecutionPool, NativeRuntimeError,
+    OwnedGovernorPermit,
     model::CatalogState,
     wal_codec::{Mutation, Opcode},
 };
@@ -28,6 +38,29 @@ pub(crate) struct ExactSearchExecution {
     pub(crate) planned_vectors: usize,
     pub(crate) planned_batches: usize,
     pub(crate) worker_batches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnnRoutingExecutionMode {
+    SelectedPartitions,
+    FullFanout,
+    FullFanoutBudgetFallback,
+    SingleGenerationFallback,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnnRoutedSearchExecution {
+    pub(crate) result: AnnSearchResult,
+    pub(crate) base_build_identity: [u8; 32],
+    pub(crate) view_identity: [u8; 32],
+    pub(crate) exact_delta_candidates: usize,
+    pub(crate) selected_partitions: Vec<usize>,
+    pub(crate) total_partitions: usize,
+    pub(crate) routing_mode: AnnRoutingExecutionMode,
+    pub(crate) next_partition_lower_bound: Option<f64>,
+    pub(crate) execution_workers: usize,
+    pub(crate) execution_worker_batches: usize,
+    pub(crate) execution_waves: usize,
 }
 
 pub(crate) const ANN_INDEX_META_PREFIX: u8 = 5;
@@ -70,9 +103,25 @@ const ANN_BASE_SINGLE: u8 = 1;
 const ANN_BASE_PARTITIONED: u8 = 2;
 const PRIVATE_MUTATION_CSN: u64 = u64::MAX;
 
+static ANN_INDEX_SCOPED_RESTORES_PROCESS: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(test)]
 thread_local! {
     static ANN_BASE_SNAPSHOT_EXPORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANN_INDEX_SCOPED_RESTORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANN_INDEX_SCOPED_PEAK_PHYSICAL_ENTRIES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static ANN_SEARCH_CANCEL_POINT: std::cell::Cell<Option<AnnSearchCancellationPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnnSearchCancellationPoint {
+    AfterFirstWave,
+    AfterFallbackWave,
+    BeforeDeltaMerge,
 }
 
 pub(crate) const DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE: IncrementalVectorLifecycle =
@@ -87,13 +136,57 @@ pub(crate) fn maximum_initial_ann_bulk_partitions(retain_generations: u16) -> us
         .saturating_sub(BTREE_LEAF_HEADER_SIZE)
         .saturating_sub(BTREE_LEAF_ENTRY_HEADER_SIZE)
         .saturating_sub(ANN_INDEX_META_KEY_SIZE);
-    let later_retained_single_bytes = usize::from(retain_generations.saturating_sub(1))
-        .saturating_mul(ANN_INDEX_META_V4_RETAINED_HEADER_SIZE + ANN_INDEX_META_V4_CHILD_SIZE);
-    let fixed_bytes = ANN_INDEX_META_V4_HEADER_SIZE
-        + ANN_INDEX_META_V4_CHILD_SIZE
-        + ANN_INDEX_META_V4_RETAINED_HEADER_SIZE
-        + later_retained_single_bytes;
-    metadata_value_limit.saturating_sub(fixed_bytes) / ANN_INDEX_META_V4_CHILD_SIZE
+    let retained_generations = usize::from(retain_generations);
+    let fixed_bytes = ANN_INDEX_META_V4_HEADER_SIZE.saturating_add(
+        retained_generations.saturating_mul(ANN_INDEX_META_V4_RETAINED_HEADER_SIZE),
+    );
+    let child_copies = retained_generations.saturating_add(1);
+    metadata_value_limit.saturating_sub(fixed_bytes)
+        / child_copies.saturating_mul(ANN_INDEX_META_V4_CHILD_SIZE)
+}
+
+fn maximum_consolidation_replacement_partitions(
+    selected_children: usize,
+    retained_children: impl IntoIterator<Item = usize>,
+    retain_generations: u16,
+    selected_base_is_empty: bool,
+) -> usize {
+    let mut future_retained = retained_children.into_iter().collect::<Vec<_>>();
+    if !selected_base_is_empty {
+        future_retained.push(selected_children);
+    }
+    let retain = usize::from(retain_generations);
+    if future_retained.len() > retain {
+        future_retained.drain(..future_retained.len() - retain);
+    }
+    let metadata_value_limit = PAGE_PAYLOAD_SIZE
+        .saturating_sub(BTREE_LEAF_HEADER_SIZE)
+        .saturating_sub(BTREE_LEAF_ENTRY_HEADER_SIZE)
+        .saturating_sub(ANN_INDEX_META_KEY_SIZE);
+    let retained_bytes = future_retained
+        .into_iter()
+        .fold(0_usize, |bytes, children| {
+            bytes.saturating_add(
+                ANN_INDEX_META_V4_RETAINED_HEADER_SIZE
+                    .saturating_add(children.saturating_mul(ANN_INDEX_META_V4_CHILD_SIZE)),
+            )
+        });
+    metadata_value_limit
+        .saturating_sub(ANN_INDEX_META_V4_HEADER_SIZE)
+        .saturating_sub(retained_bytes)
+        / ANN_INDEX_META_V4_CHILD_SIZE
+}
+
+fn consolidation_replacement_partitions(
+    base_is_partitioned: bool,
+    selected_children: usize,
+    effective_vectors: usize,
+) -> usize {
+    if base_is_partitioned && effective_vectors != 0 {
+        selected_children.min(effective_vectors)
+    } else {
+        1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -265,6 +358,59 @@ impl AnnBase {
         }
     }
 
+    fn search_routed(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+        if maximum_partitions == 0 {
+            return Err(AnnError::InvalidPartitionCount.into());
+        }
+        match self {
+            Self::Single(index) => Ok(AnnRoutedSearchExecution {
+                result: index.search(query, options)?,
+                base_build_identity: index.build_identity(),
+                view_identity: index.build_identity(),
+                exact_delta_candidates: 0,
+                selected_partitions: vec![0],
+                total_partitions: 1,
+                routing_mode: AnnRoutingExecutionMode::SingleGenerationFallback,
+                next_partition_lower_bound: None,
+                execution_workers: 1,
+                execution_worker_batches: 1,
+                execution_waves: 1,
+            }),
+            Self::Partitioned(index) => {
+                let selected = index.search_routed(query, options, maximum_partitions)?;
+                let routing_mode = match selected.outcome {
+                    PartitionedAnnRoutingOutcome::SelectedCertified => {
+                        AnnRoutingExecutionMode::SelectedPartitions
+                    }
+                    PartitionedAnnRoutingOutcome::FullFanoutRequested => {
+                        AnnRoutingExecutionMode::FullFanout
+                    }
+                    PartitionedAnnRoutingOutcome::FullFanoutBudgetFallback => {
+                        AnnRoutingExecutionMode::FullFanoutBudgetFallback
+                    }
+                };
+                Ok(AnnRoutedSearchExecution {
+                    result: selected.result,
+                    base_build_identity: index.build_identity(),
+                    view_identity: index.build_identity(),
+                    exact_delta_candidates: 0,
+                    selected_partitions: selected.selected_partitions,
+                    total_partitions: selected.total_partitions,
+                    routing_mode,
+                    next_partition_lower_bound: selected.next_partition_lower_bound,
+                    execution_workers: 1,
+                    execution_worker_batches: 1,
+                    execution_waves: 1,
+                })
+            }
+        }
+    }
+
     fn retention_descriptor(&self) -> RetainedGeneration {
         RetainedGeneration {
             build_identity: self.build_identity(),
@@ -378,6 +524,60 @@ impl AnnIndexState {
             }
         }
         vectors.into_values().collect()
+    }
+
+    fn effective_vectors_with_cancellation(
+        &self,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Vec<VectorRecord>, NativeRuntimeError> {
+        self.effective_vectors_with_control(|| reject_cancelled_ann_search(cancellation))
+    }
+
+    fn effective_vectors_with_control(
+        &self,
+        mut check: impl FnMut() -> Result<(), NativeRuntimeError>,
+    ) -> Result<Vec<VectorRecord>, NativeRuntimeError> {
+        check()?;
+        let mut vectors = BTreeMap::new();
+        self.base.try_for_each_vector_record(
+            |object_id, creating_csn, vector| -> Result<(), NativeRuntimeError> {
+                check()?;
+                #[cfg(test)]
+                ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS.set(
+                    ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS
+                        .get()
+                        .saturating_add(1),
+                );
+                vectors.insert(
+                    object_id,
+                    VectorRecord {
+                        object_id,
+                        creating_csn,
+                        vector: vector.clone(),
+                    },
+                );
+                Ok(())
+            },
+        )?;
+        for (object_id, delta) in &self.deltas {
+            check()?;
+            #[cfg(test)]
+            ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS.set(
+                ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS
+                    .get()
+                    .saturating_add(1),
+            );
+            match delta {
+                DeltaRecord::Upsert { record, .. } => {
+                    vectors.insert(*object_id, record.clone());
+                }
+                DeltaRecord::Tombstone { .. } => {
+                    vectors.remove(object_id);
+                }
+            }
+        }
+        check()?;
+        Ok(vectors.into_values().collect())
     }
 
     fn upsert(
@@ -664,6 +864,140 @@ impl AnnIndexState {
                 );
             }
         };
+        self.merge_delta_search_result(query, options, allowlist, base_result)
+    }
+
+    fn search_selected(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+        let mut execution = self
+            .base
+            .search_routed(query, options, maximum_partitions)?;
+        let exact_delta_candidates = self
+            .deltas
+            .values()
+            .filter(|delta| matches!(delta, DeltaRecord::Upsert { .. }))
+            .count();
+        execution.result =
+            self.merge_delta_search_result(query, options, None, execution.result)?;
+        execution.base_build_identity = self.base.build_identity();
+        execution.view_identity = self.view_identity;
+        execution.exact_delta_candidates = exact_delta_candidates;
+        Ok(execution)
+    }
+
+    fn search_selected_parallel(
+        self: Arc<Self>,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+        execution_pool: &NativeExecutionPool,
+        permit: &OwnedGovernorPermit,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+        reject_cancelled_ann_search(cancellation)?;
+        let routing_plan = match &self.base {
+            AnnBase::Single(_) => {
+                return self.search_selected(query, options, maximum_partitions);
+            }
+            AnnBase::Partitioned(index) => {
+                index.plan_routed_search(query, options, maximum_partitions)?
+            }
+        };
+        let state = self;
+        let routing_plan = Arc::new(routing_plan);
+        let (mut children, first_workers) = execute_routed_wave(
+            &state,
+            &routing_plan,
+            0..routing_plan.preferred_partitions(),
+            execution_pool,
+            permit,
+            cancellation,
+        )?;
+        cancel_ann_search_at_test_point(AnnSearchCancellationPoint::AfterFirstWave, cancellation);
+        reject_cancelled_ann_search(cancellation)?;
+        let mut worker_batches = first_workers;
+        let mut execution_workers = first_workers;
+        let mut execution_waves = 1;
+        let routed = match partitioned_base(&state)?.merge_routed_search(&routing_plan, &children) {
+            Ok(result) => result,
+            Err(AnnError::RoutingBudgetInsufficient) => {
+                reject_cancelled_ann_search(cancellation)?;
+                let (remaining, fallback_workers) = execute_routed_wave(
+                    &state,
+                    &routing_plan,
+                    routing_plan.preferred_partitions()..routing_plan.total_partitions(),
+                    execution_pool,
+                    permit,
+                    cancellation,
+                )?;
+                cancel_ann_search_at_test_point(
+                    AnnSearchCancellationPoint::AfterFallbackWave,
+                    cancellation,
+                );
+                reject_cancelled_ann_search(cancellation)?;
+                children.extend(remaining);
+                worker_batches = worker_batches.saturating_add(fallback_workers);
+                execution_workers = execution_workers.max(fallback_workers);
+                execution_waves = 2;
+                reject_cancelled_ann_search(cancellation)?;
+                partitioned_base(&state)?.merge_routed_search(&routing_plan, &children)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let exact_delta_candidates = state
+            .deltas
+            .values()
+            .filter(|delta| matches!(delta, DeltaRecord::Upsert { .. }))
+            .count();
+        let routing_mode = routing_execution_mode(routed.outcome);
+        let mut result = routed.result;
+        cancel_ann_search_at_test_point(AnnSearchCancellationPoint::BeforeDeltaMerge, cancellation);
+        reject_cancelled_ann_search(cancellation)?;
+        result = state.merge_delta_search_result_controlled(
+            query,
+            options,
+            None,
+            result,
+            cancellation,
+        )?;
+        Ok(AnnRoutedSearchExecution {
+            result,
+            base_build_identity: state.base.build_identity(),
+            view_identity: state.view_identity,
+            exact_delta_candidates,
+            selected_partitions: routed.selected_partitions,
+            total_partitions: routed.total_partitions,
+            routing_mode,
+            next_partition_lower_bound: routed.next_partition_lower_bound,
+            execution_workers,
+            execution_worker_batches: worker_batches,
+            execution_waves,
+        })
+    }
+
+    fn merge_delta_search_result(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+        base_result: AnnSearchResult,
+    ) -> Result<AnnSearchResult, NativeRuntimeError> {
+        self.merge_delta_search_result_controlled(query, options, allowlist, base_result, None)
+    }
+
+    fn merge_delta_search_result_controlled(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: Option<&BTreeSet<ObjectId>>,
+        base_result: AnnSearchResult,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<AnnSearchResult, NativeRuntimeError> {
+        reject_cancelled_ann_search(cancellation)?;
         let overridden = self.deltas.keys().copied().collect::<BTreeSet<_>>();
         let mut hits = base_result
             .hits
@@ -672,6 +1006,7 @@ impl AnnIndexState {
             .collect::<Vec<_>>();
         let mut exact_delta_candidates = 0_usize;
         for (object_id, delta) in &self.deltas {
+            reject_cancelled_ann_search(cancellation)?;
             let DeltaRecord::Upsert { record, .. } = delta else {
                 continue;
             };
@@ -686,6 +1021,7 @@ impl AnnIndexState {
                 distance: distance(self.definition().metric(), query, &record.vector)?,
             });
         }
+        reject_cancelled_ann_search(cancellation)?;
         sort_hits(&mut hits);
         hits.truncate(options.k());
         Ok(AnnSearchResult {
@@ -729,6 +1065,92 @@ impl AnnIndexState {
             hits,
         })
     }
+}
+
+fn routing_execution_mode(outcome: PartitionedAnnRoutingOutcome) -> AnnRoutingExecutionMode {
+    match outcome {
+        PartitionedAnnRoutingOutcome::SelectedCertified => {
+            AnnRoutingExecutionMode::SelectedPartitions
+        }
+        PartitionedAnnRoutingOutcome::FullFanoutRequested => AnnRoutingExecutionMode::FullFanout,
+        PartitionedAnnRoutingOutcome::FullFanoutBudgetFallback => {
+            AnnRoutingExecutionMode::FullFanoutBudgetFallback
+        }
+    }
+}
+
+fn partitioned_base(state: &AnnIndexState) -> Result<&PartitionedHnswIndex, NativeRuntimeError> {
+    match &state.base {
+        AnnBase::Partitioned(index) => Ok(index),
+        AnnBase::Single(_) => Err(NativeRuntimeError::InvalidAnnTree),
+    }
+}
+
+fn execute_routed_wave(
+    state: &Arc<AnnIndexState>,
+    plan: &Arc<PartitionedAnnSearchPlan>,
+    positions: std::ops::Range<usize>,
+    execution_pool: &NativeExecutionPool,
+    permit: &OwnedGovernorPermit,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<(Vec<PartitionedAnnChildSearchResult>, usize), NativeRuntimeError> {
+    reject_cancelled_ann_search(cancellation)?;
+    let work = positions.collect::<Vec<_>>();
+    if work.is_empty() {
+        return Err(AnnError::InvalidPartitionCount.into());
+    }
+    let state = Arc::clone(state);
+    let plan = Arc::clone(plan);
+    let cancellation = cancellation.cloned();
+    let (children, worker_batches) = execution_pool.execute_ordered_profiled(
+        permit,
+        work,
+        move |position| -> Result<PartitionedAnnChildSearchResult, NativeRuntimeError> {
+            reject_cancelled_ann_search(cancellation.as_ref())?;
+            Ok(partitioned_base(&state)?.search_planned_partition(&plan, position)?)
+        },
+    )?;
+    Ok((
+        children
+            .into_iter()
+            .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
+        worker_batches,
+    ))
+}
+
+fn reject_cancelled_ann_search(
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<(), NativeRuntimeError> {
+    if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+        Err(GovernorQueueError::Cancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn cancel_ann_search_at_test_point(
+    point: AnnSearchCancellationPoint,
+    cancellation: Option<&GovernorCancellation>,
+) {
+    if ANN_SEARCH_CANCEL_POINT.get() == Some(point) {
+        ANN_SEARCH_CANCEL_POINT.set(None);
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn cancel_ann_search_at_test_point(
+    _point: AnnSearchCancellationPoint,
+    _cancellation: Option<&GovernorCancellation>,
+) {
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_next_search_at_for_test(point: AnnSearchCancellationPoint) {
+    ANN_SEARCH_CANCEL_POINT.set(Some(point));
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -915,6 +1337,19 @@ impl AnnState {
             .search(query, options, None)
     }
 
+    pub(crate) fn search_selected(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+        self.indexes
+            .get(&index)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+            .search_selected(query, options, maximum_partitions)
+    }
+
     pub(crate) fn search_exact(
         &self,
         index: ObjectId,
@@ -1083,7 +1518,71 @@ pub(crate) struct ConsolidationPlan {
     base_identity: [u8; 32],
     captured_view_identity: [u8; 32],
     captured_deltas: BTreeMap<ObjectId, u64>,
-    replacement: Arc<IndexSnapshot>,
+    replacement: Arc<ConsolidationReplacement>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ConsolidationBuildExecution<'a> {
+    pub(crate) pool: Option<&'a NativeExecutionPool>,
+    pub(crate) permit: Option<&'a OwnedGovernorPermit>,
+    pub(crate) cancellation: Option<&'a GovernorCancellation>,
+}
+
+#[derive(Clone, Debug)]
+enum ConsolidationReplacement {
+    Single(IndexSnapshot),
+    Partitioned(PartitionedIndexSnapshot),
+}
+
+impl ConsolidationReplacement {
+    fn definition(&self) -> VectorIndexDefinition {
+        match self {
+            Self::Single(snapshot) => snapshot.definition,
+            Self::Partitioned(snapshot) => snapshot.definition,
+        }
+    }
+
+    fn build_identity(&self) -> [u8; 32] {
+        match self {
+            Self::Single(snapshot) => snapshot.build_identity,
+            Self::Partitioned(snapshot) => snapshot.build_identity,
+        }
+    }
+
+    fn input_identity(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Single(_) => None,
+            Self::Partitioned(snapshot) => Some(snapshot.input_identity),
+        }
+    }
+
+    fn snapshots(&self) -> &[IndexSnapshot] {
+        match self {
+            Self::Single(snapshot) => std::slice::from_ref(snapshot),
+            Self::Partitioned(snapshot) => &snapshot.partitions,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.snapshots()
+            .iter()
+            .map(|snapshot| snapshot.vectors.len())
+            .sum()
+    }
+
+    fn base_kind(&self) -> PersistedBaseKind {
+        match self {
+            Self::Single(_) => PersistedBaseKind::Single,
+            Self::Partitioned(_) => PersistedBaseKind::Partitioned,
+        }
+    }
+
+    fn child_descriptors(&self) -> Vec<PersistedChildDescriptor> {
+        self.snapshots()
+            .iter()
+            .map(PersistedChildDescriptor::from_snapshot)
+            .collect()
+    }
 }
 
 impl ConsolidationPlan {
@@ -1099,17 +1598,48 @@ impl ConsolidationPlan {
         self.captured_view_identity
     }
 
+    pub(crate) fn definition(&self) -> VectorIndexDefinition {
+        self.replacement.definition()
+    }
+
     pub(crate) fn captured_delta_count(&self) -> usize {
         self.captured_deltas.len()
     }
 
     pub(crate) fn effective_vector_count(&self) -> usize {
-        self.replacement.vectors.len()
+        self.replacement.len()
     }
 
     pub(crate) fn replacement_identity(&self) -> [u8; 32] {
-        self.replacement.build_identity
+        self.replacement.build_identity()
     }
+}
+
+pub(crate) fn consolidation_prefix_replacement_limits(
+    load_plan: &AnnIndexLoadPlan,
+    plan: &ConsolidationPlan,
+) -> Result<PrefixReplacementStructuralLimits, NativeRuntimeError> {
+    let candidate_entries =
+        plan.replacement
+            .snapshots()
+            .iter()
+            .try_fold(0_usize, |total, snapshot| {
+                let graph_entries = snapshot.nodes.iter().try_fold(0_usize, |nodes, node| {
+                    nodes
+                        .checked_add(node.neighbors.len())
+                        .ok_or(NativeRuntimeError::InvalidAnnTree)
+                })?;
+                total
+                    .checked_add(snapshot.vectors.len())
+                    .and_then(|entries| entries.checked_add(graph_entries))
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)
+            })?;
+    let maximum_entries = 2_usize
+        .checked_add(load_plan.planned_physical_entries())
+        .and_then(|entries| entries.checked_add(candidate_entries))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    PrefixReplacementStructuralLimits::new(maximum_entries, ANN_GRAPH_LAYER_KEY_SIZE)
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1132,6 +1662,131 @@ pub(crate) struct MaintenanceStatus {
     pub(crate) delta_records: usize,
     pub(crate) delta_bytes: usize,
     pub(crate) due: bool,
+}
+
+/// Immutable authority for loading one ANN index from one committed search root.
+///
+/// Planning decodes only the target metadata. The potentially large physical
+/// generation is not materialized until the caller has admitted
+/// [`Self::hydration_memory_bytes`].
+pub(crate) struct AnnIndexLoadPlan {
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    encoded_metadata: Vec<u8>,
+    hydration_memory_bytes: u64,
+    physical_limits: AnnPhysicalLimits,
+}
+
+impl AnnIndexLoadPlan {
+    pub(crate) const fn hydration_memory_bytes(&self) -> u64 {
+        self.hydration_memory_bytes
+    }
+
+    pub(crate) fn planned_physical_entries(&self) -> usize {
+        self.physical_limits.total_entries()
+    }
+
+    pub(crate) fn planned_physical_bytes(&self) -> u64 {
+        self.physical_limits.total_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_entry_limit(&self) -> usize {
+        self.physical_limits.total_entries()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AnnPhysicalRangeLimit {
+    entries: usize,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AnnPhysicalLimits {
+    vectors: AnnPhysicalRangeLimit,
+    graph_layers: AnnPhysicalRangeLimit,
+    deltas: AnnPhysicalRangeLimit,
+}
+
+impl AnnPhysicalLimits {
+    fn total_entries(self) -> usize {
+        self.vectors
+            .entries
+            .saturating_add(self.graph_layers.entries)
+            .saturating_add(self.deltas.entries)
+    }
+
+    fn total_bytes(self) -> u64 {
+        self.vectors
+            .bytes
+            .saturating_add(self.graph_layers.bytes)
+            .saturating_add(self.deltas.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnnOwnedBaseKind {
+    Single,
+    Partitioned,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnnOwnedReadAuthority {
+    pub(crate) definition_digest: [u8; 32],
+    pub(crate) dimension: u16,
+    pub(crate) base_kind: AnnOwnedBaseKind,
+    pub(crate) child_identities: Vec<[u8; 32]>,
+    pub(crate) base_build_identity: [u8; 32],
+    pub(crate) view_identity: [u8; 32],
+    pub(crate) logical_partitions: usize,
+    pub(crate) base_vector_count: usize,
+    pub(crate) delta_records: usize,
+    pub(crate) delta_bytes: usize,
+    pub(crate) next_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnnOwnedReadState {
+    state: Arc<AnnIndexState>,
+    authority: AnnOwnedReadAuthority,
+}
+
+impl AnnOwnedReadState {
+    pub(crate) fn authority(&self) -> &AnnOwnedReadAuthority {
+        &self.authority
+    }
+
+    pub(crate) fn search_selected_parallel(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        maximum_partitions: usize,
+        execution: AnnParallelSearchExecution<'_>,
+    ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+        Arc::clone(&self.state).search_selected_parallel(
+            query,
+            options,
+            maximum_partitions,
+            execution.pool,
+            execution.permit,
+            execution.cancellation,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnnHydrationObservation {
+    pub(crate) physical_entries: usize,
+    pub(crate) physical_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnnParallelSearchExecution<'a> {
+    pub(crate) pool: &'a NativeExecutionPool,
+    pub(crate) permit: &'a OwnedGovernorPermit,
+    pub(crate) cancellation: Option<&'a GovernorCancellation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1167,13 +1822,6 @@ pub(crate) fn definition_from_search(
         metric,
         config,
     )?)
-}
-
-pub(crate) fn definition_for_index(
-    catalog: &CatalogState,
-    index: ObjectId,
-) -> Result<VectorIndexDefinition, NativeRuntimeError> {
-    catalog_ann_definition(catalog, index)
 }
 
 pub(crate) fn encode_vector_mutation(vector: &Vector) -> Vec<u8> {
@@ -1567,6 +2215,481 @@ pub(crate) fn load(
     load_from_tree(pages, root, catalog, true)
 }
 
+/// Plans a bounded load of exactly one ANN index without restoring HNSW.
+///
+/// The returned memory bound includes current and retained physical
+/// generations because target validation is fail-closed for every identity
+/// owned by the target metadata.
+pub(crate) fn plan_index_load(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+) -> Result<AnnIndexLoadPlan, NativeRuntimeError> {
+    plan_index_load_with_cancellation(pages, buffer_pool, root, index, definition, None)
+}
+
+pub(crate) fn plan_index_load_with_cancellation(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<AnnIndexLoadPlan, NativeRuntimeError> {
+    reject_cancelled_ann_search(cancellation)?;
+    if definition.index_id() != index
+        || !matches!(
+            pages.read(root)?.kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        )
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    reject_cancelled_ann_search(cancellation)?;
+    let tree = BTree::from_root(root);
+    let marker = tree
+        .get_cached_pinned(pages, buffer_pool, crate::SEARCH_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if marker.bytes() != crate::SEARCH_FORMAT_VALUE_V1
+        && marker.bytes() != crate::SEARCH_FORMAT_VALUE_V2
+        && marker.bytes() != crate::SEARCH_FORMAT_VALUE_V3
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    reject_cancelled_ann_search(cancellation)?;
+    let encoded_metadata = tree
+        .get_cached_pinned(pages, buffer_pool, &meta_key(index))?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?
+        .bytes()
+        .to_vec();
+    reject_cancelled_ann_search(cancellation)?;
+    let metadata = decode_metadata(&encoded_metadata)?;
+    let physical_limits = index_physical_limits(definition, &metadata)?;
+    let hydration_memory_bytes = index_hydration_memory_bytes(definition, &metadata)?;
+    Ok(AnnIndexLoadPlan {
+        root,
+        index,
+        definition,
+        encoded_metadata,
+        hydration_memory_bytes,
+        physical_limits,
+    })
+}
+
+/// Restores and queries the exact index bound by `plan`.
+///
+/// Callers must hold the governor admission described by the plan before
+/// entering this function.
+#[cfg(test)]
+pub(crate) fn search_selected_planned(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    query: &Vector,
+    options: SearchOptions,
+    maximum_partitions: usize,
+) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+    search_selected_planned_with_cancellation(
+        pages,
+        buffer_pool,
+        plan,
+        query,
+        options,
+        maximum_partitions,
+        None,
+    )
+}
+
+pub(crate) fn search_selected_planned_with_cancellation(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    query: &Vector,
+    options: SearchOptions,
+    maximum_partitions: usize,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+    let state = load_planned_index(pages, buffer_pool, plan, cancellation)?;
+    reject_cancelled_ann_search(cancellation)?;
+    state.search_selected(query, options, maximum_partitions)
+}
+
+pub(crate) fn search_selected_planned_parallel(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    query: &Vector,
+    options: SearchOptions,
+    maximum_partitions: usize,
+    execution: AnnParallelSearchExecution<'_>,
+) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
+    reject_cancelled_ann_search(execution.cancellation)?;
+    let state = load_planned_index(pages, buffer_pool, plan, execution.cancellation)?;
+    Arc::new(state).search_selected_parallel(
+        query,
+        options,
+        maximum_partitions,
+        execution.pool,
+        execution.permit,
+        execution.cancellation,
+    )
+}
+
+pub(crate) fn hydrate_owned_read_state(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<(AnnOwnedReadState, AnnHydrationObservation), NativeRuntimeError> {
+    let (state, entries) = load_planned_index_with_entries(pages, buffer_pool, plan, cancellation)?;
+    reject_cancelled_ann_search(cancellation)?;
+    let physical_bytes = entries.iter().try_fold(0_u64, |total, (key, value)| {
+        let entry_bytes = u64::try_from(key.len().saturating_add(value.len()))
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+        total
+            .checked_add(entry_bytes)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)
+    })?;
+    let child_identities = state
+        .base
+        .child_descriptors()
+        .into_iter()
+        .map(|child| child.build_identity)
+        .collect::<Vec<_>>();
+    let logical_partitions = child_identities.len().max(1);
+    let authority = AnnOwnedReadAuthority {
+        definition_digest: state.definition().digest(),
+        dimension: state.definition().dimension(),
+        base_kind: if state.base.is_partitioned() {
+            AnnOwnedBaseKind::Partitioned
+        } else {
+            AnnOwnedBaseKind::Single
+        },
+        child_identities,
+        base_build_identity: state.base.build_identity(),
+        view_identity: state.view_identity,
+        logical_partitions,
+        base_vector_count: state.base.len(),
+        delta_records: state.deltas.len(),
+        delta_bytes: state.delta_bytes(),
+        next_sequence: state.next_sequence,
+    };
+    Ok((
+        AnnOwnedReadState {
+            state: Arc::new(state),
+            authority,
+        },
+        AnnHydrationObservation {
+            physical_entries: entries.len(),
+            physical_bytes,
+        },
+    ))
+}
+
+fn load_planned_index(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<AnnIndexState, NativeRuntimeError> {
+    load_planned_index_with_entries(pages, buffer_pool, plan, cancellation).map(|(state, _)| state)
+}
+
+fn load_planned_index_with_entries(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<(AnnIndexState, Vec<KeyValue>), NativeRuntimeError> {
+    let tree = BTree::from_root(plan.root);
+    let encoded_metadata = tree
+        .get(pages, &meta_key(plan.index))?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if encoded_metadata != plan.encoded_metadata {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let mut metadata = decode_metadata(&encoded_metadata)?;
+    let entries = scan_index_physical_entries(
+        tree,
+        pages,
+        buffer_pool,
+        plan.index,
+        plan.physical_limits,
+        cancellation,
+    )?;
+    enrich_target_legacy_retained_generations(
+        &entries,
+        plan.index,
+        plan.definition,
+        &mut metadata,
+    )?;
+    validate_target_physical_entries(&entries, plan.index, plan.definition, &metadata)?;
+    #[cfg(test)]
+    ANN_INDEX_SCOPED_RESTORES.set(ANN_INDEX_SCOPED_RESTORES.get().saturating_add(1));
+    ANN_INDEX_SCOPED_RESTORES_PROCESS.fetch_add(1, Ordering::Relaxed);
+    let state = restore_index_with_definition_controlled(
+        &entries,
+        plan.index,
+        plan.definition,
+        metadata,
+        cancellation,
+    )?;
+    Ok((state, entries))
+}
+
+fn scan_index_physical_entries(
+    tree: BTree,
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    index: ObjectId,
+    limits: AnnPhysicalLimits,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<Vec<KeyValue>, NativeRuntimeError> {
+    let mut entries = Vec::new();
+    for (prefix, limit) in [
+        (ANN_VECTOR_PREFIX, limits.vectors),
+        (ANN_GRAPH_LAYER_PREFIX, limits.graph_layers),
+        (ANN_DELTA_PREFIX, limits.deltas),
+    ] {
+        visit_bounded_physical_range(
+            tree,
+            pages,
+            buffer_pool,
+            &object_prefix(prefix, index),
+            limit,
+            cancellation,
+            &mut entries,
+        )?;
+    }
+    if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(entries)
+}
+
+fn visit_bounded_physical_range(
+    tree: BTree,
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    prefix: &[u8],
+    limit: AnnPhysicalRangeLimit,
+    cancellation: Option<&GovernorCancellation>,
+    entries: &mut Vec<KeyValue>,
+) -> Result<(), NativeRuntimeError> {
+    enum Stop {
+        Limit,
+        Cancelled,
+    }
+
+    let starting_entries = entries.len();
+    let mut visited_entries = 0_usize;
+    let mut visited_bytes = 0_u64;
+    let mut stop = None;
+    let outcome = tree.visit_prefix_cached(pages, buffer_pool, prefix, None, |key, value| {
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            stop = Some(Stop::Cancelled);
+            return ControlFlow::Break(());
+        }
+        let Some(next_entries) = visited_entries.checked_add(1) else {
+            stop = Some(Stop::Limit);
+            return ControlFlow::Break(());
+        };
+        let encoded_bytes =
+            u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX);
+        let Some(next_bytes) = visited_bytes.checked_add(encoded_bytes) else {
+            stop = Some(Stop::Limit);
+            return ControlFlow::Break(());
+        };
+        if next_entries > limit.entries || next_bytes > limit.bytes {
+            stop = Some(Stop::Limit);
+            return ControlFlow::Break(());
+        }
+        visited_entries = next_entries;
+        visited_bytes = next_bytes;
+        entries.push((key.to_vec(), value.to_vec()));
+        #[cfg(test)]
+        ANN_INDEX_SCOPED_PEAK_PHYSICAL_ENTRIES.set(
+            ANN_INDEX_SCOPED_PEAK_PHYSICAL_ENTRIES
+                .get()
+                .max(entries.len()),
+        );
+        ControlFlow::Continue(())
+    })?;
+    match (outcome, stop) {
+        (ControlFlow::Continue(()), None) => Ok(()),
+        (ControlFlow::Break(()), Some(Stop::Cancelled)) => {
+            entries.truncate(starting_entries);
+            Err(GovernorQueueError::Cancelled.into())
+        }
+        (ControlFlow::Break(()), Some(Stop::Limit)) => {
+            entries.truncate(starting_entries);
+            Err(NativeRuntimeError::InvalidAnnTree)
+        }
+        _ => Err(NativeRuntimeError::InvalidAnnTree),
+    }
+}
+
+fn index_hydration_memory_bytes(
+    definition: VectorIndexDefinition,
+    metadata: &PersistedIndexMetadata,
+) -> Result<u64, NativeRuntimeError> {
+    const FIXED_BYTES: u64 = 2 * 1_024 * 1_024;
+    const VECTOR_RECORD_OVERHEAD_BYTES: u64 = 256;
+    const GRAPH_NODE_OVERHEAD_BYTES: u64 = 256;
+    const EDGE_COPIES: u64 = 2;
+
+    let (vectors, graph_layer_nodes) = index_physical_cardinality_bounds(metadata)?;
+    let vector_bytes = u64::from(definition.dimension())
+        .checked_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(u64::MAX))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(VECTOR_RECORD_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(vectors))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let graph_bytes = u64::from(definition.config().m())
+        .checked_mul(u64::try_from(std::mem::size_of::<ObjectId>()).unwrap_or(u64::MAX))
+        .and_then(|bytes| bytes.checked_mul(EDGE_COPIES))
+        .and_then(|bytes| bytes.checked_add(GRAPH_NODE_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(graph_layer_nodes))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    FIXED_BYTES
+        .checked_add(vector_bytes)
+        .and_then(|bytes| bytes.checked_add(graph_bytes))
+        .and_then(|bytes| bytes.checked_add(metadata.delta_bytes.saturating_mul(2)))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)
+}
+
+fn index_physical_cardinality_bounds(
+    metadata: &PersistedIndexMetadata,
+) -> Result<(u64, u64), NativeRuntimeError> {
+    let legacy_retained_vector_bound = metadata.vector_count.saturating_add(
+        u64::from(metadata.lifecycle.delta_max_entries)
+            .saturating_mul(u64::try_from(metadata.retained_generations.len()).unwrap_or(u64::MAX)),
+    );
+    let retained_vectors = metadata
+        .retained_generations
+        .iter()
+        .flat_map(|generation| &generation.children)
+        .try_fold(0_u64, |count, child| {
+            count.checked_add(if child.complete {
+                child.vector_count
+            } else {
+                legacy_retained_vector_bound
+            })
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let graph_layer_nodes = metadata
+        .children
+        .iter()
+        .chain(
+            metadata
+                .retained_generations
+                .iter()
+                .flat_map(|generation| &generation.children),
+        )
+        .try_fold(0_u64, |count, child| {
+            let graph_node_count = if child.complete {
+                child.graph_node_count
+            } else {
+                legacy_retained_vector_bound
+            };
+            let max_level = if child.complete {
+                child.max_level
+            } else {
+                MAX_HNSW_LEVEL
+            };
+            graph_node_count
+                .checked_mul(u64::from(max_level).saturating_add(1))
+                .and_then(|layer_nodes| count.checked_add(layer_nodes))
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let vectors = metadata
+        .vector_count
+        .checked_add(retained_vectors)
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    Ok((vectors, graph_layer_nodes))
+}
+
+fn index_physical_limits(
+    definition: VectorIndexDefinition,
+    metadata: &PersistedIndexMetadata,
+) -> Result<AnnPhysicalLimits, NativeRuntimeError> {
+    let (vector_entries, graph_entries) = index_physical_cardinality_bounds(metadata)?;
+    let vector_record_bytes = u64::try_from(ANN_GENERATION_KEY_SIZE)
+        .unwrap_or(u64::MAX)
+        .checked_add(u64::try_from(ANN_VECTOR_HEADER_SIZE).unwrap_or(u64::MAX))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::from(definition.dimension())
+                    .saturating_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(u64::MAX)),
+            )
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let graph_record_bytes = u64::try_from(ANN_GRAPH_LAYER_KEY_SIZE)
+        .unwrap_or(u64::MAX)
+        .checked_add(u64::try_from(ANN_GRAPH_LAYER_HEADER_SIZE).unwrap_or(u64::MAX))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::from(definition.config().m())
+                    .saturating_mul(2)
+                    .saturating_mul(
+                        u64::try_from(std::mem::size_of::<ObjectId>()).unwrap_or(u64::MAX),
+                    ),
+            )
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let delta_entries =
+        usize::try_from(metadata.delta_count).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    Ok(AnnPhysicalLimits {
+        vectors: AnnPhysicalRangeLimit {
+            entries: usize::try_from(vector_entries)
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            bytes: vector_entries
+                .checked_mul(vector_record_bytes)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        },
+        graph_layers: AnnPhysicalRangeLimit {
+            entries: usize::try_from(graph_entries)
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            bytes: graph_entries
+                .checked_mul(graph_record_bytes)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        },
+        deltas: AnnPhysicalRangeLimit {
+            entries: delta_entries,
+            bytes: metadata
+                .delta_bytes
+                .checked_add(
+                    metadata
+                        .delta_count
+                        .saturating_mul(u64::try_from(ANN_DELTA_KEY_SIZE).unwrap_or(u64::MAX)),
+                )
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn reset_index_scoped_restore_count_for_test() {
+    ANN_INDEX_SCOPED_RESTORES.set(0);
+    ANN_INDEX_SCOPED_PEAK_PHYSICAL_ENTRIES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn index_scoped_restore_count_for_test() -> usize {
+    ANN_INDEX_SCOPED_RESTORES.get()
+}
+
+pub(crate) fn process_index_scoped_restore_count() -> u64 {
+    ANN_INDEX_SCOPED_RESTORES_PROCESS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn index_scoped_peak_physical_entries_for_test() -> usize {
+    ANN_INDEX_SCOPED_PEAK_PHYSICAL_ENTRIES.get()
+}
+
 fn load_from_tree(
     pages: &PageStore,
     root: Option<PageId>,
@@ -1653,6 +2776,38 @@ fn enrich_legacy_retained_generations(
     Ok(())
 }
 
+fn enrich_target_legacy_retained_generations(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    metadata: &mut PersistedIndexMetadata,
+) -> Result<(), NativeRuntimeError> {
+    if !metadata
+        .retained_generations
+        .iter()
+        .flat_map(|generation| &generation.children)
+        .any(|child| !child.complete)
+    {
+        return Ok(());
+    }
+    let physical_entries = PhysicalEntryIndex::build(entries)?;
+    for child in metadata
+        .retained_generations
+        .iter_mut()
+        .flat_map(|generation| &mut generation.children)
+        .filter(|child| !child.complete)
+    {
+        *child = restore_legacy_retained_descriptor(
+            entries,
+            &physical_entries,
+            index,
+            definition,
+            child.build_identity,
+        )?;
+    }
+    Ok(())
+}
+
 fn restore_legacy_retained_descriptor(
     entries: &[(Vec<u8>, Vec<u8>)],
     physical_entries: &PhysicalEntryIndex,
@@ -1735,12 +2890,32 @@ fn restore_index(
     metadata: PersistedIndexMetadata,
 ) -> Result<AnnIndexState, NativeRuntimeError> {
     let definition = catalog_ann_definition(catalog, index)?;
+    restore_index_with_definition(entries, index, definition, metadata)
+}
+
+fn restore_index_with_definition(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    metadata: PersistedIndexMetadata,
+) -> Result<AnnIndexState, NativeRuntimeError> {
+    restore_index_with_definition_controlled(entries, index, definition, metadata, None)
+}
+
+fn restore_index_with_definition_controlled(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    metadata: PersistedIndexMetadata,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<AnnIndexState, NativeRuntimeError> {
     let delta_prefix = object_prefix(ANN_DELTA_PREFIX, index);
     let current_identities = metadata.current_child_identities();
     let retained_identities = metadata.retained_child_identities();
     let mut children = BTreeMap::<[u8; 32], RestoredChildEntries>::new();
     let mut deltas = BTreeMap::new();
     for (key, value) in entries {
+        reject_cancelled_ann_search(cancellation)?;
         match key.first().copied() {
             Some(ANN_VECTOR_PREFIX) => {
                 let (found_index, build_identity, object_id) = decode_vector_key(key)?;
@@ -1789,7 +2964,7 @@ fn restore_index(
         }
     }
     validate_restored_deltas(&metadata, &deltas)?;
-    let base = restore_base(&metadata, definition, children)?;
+    let base = restore_base_with_cancellation(&metadata, definition, children, cancellation)?;
     let mut restored = AnnIndexState {
         base,
         deltas,
@@ -1971,13 +3146,24 @@ impl PhysicalEntryIndex {
     }
 }
 
+#[cfg(test)]
 fn restore_base(
     metadata: &PersistedIndexMetadata,
     definition: VectorIndexDefinition,
+    entries: BTreeMap<[u8; 32], RestoredChildEntries>,
+) -> Result<AnnBase, NativeRuntimeError> {
+    restore_base_with_cancellation(metadata, definition, entries, None)
+}
+
+fn restore_base_with_cancellation(
+    metadata: &PersistedIndexMetadata,
+    definition: VectorIndexDefinition,
     mut entries: BTreeMap<[u8; 32], RestoredChildEntries>,
+    cancellation: Option<&GovernorCancellation>,
 ) -> Result<AnnBase, NativeRuntimeError> {
     let mut snapshots = Vec::with_capacity(metadata.children.len());
     for descriptor in &metadata.children {
+        reject_cancelled_ann_search(cancellation)?;
         let child = entries
             .remove(&descriptor.build_identity)
             .unwrap_or_default();
@@ -1993,8 +3179,10 @@ fn restore_base(
                 return Err(NativeRuntimeError::InvalidAnnTree);
             }
             AnnBase::Single(
-                HnswIndex::restore_owned(snapshot)
-                    .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+                HnswIndex::restore_owned_with_control(snapshot, || {
+                    ann_restore_control(cancellation)
+                })
+                .map_err(|error| map_ann_restore_error(&error, cancellation))?,
             )
         }
         PersistedBaseKind::Partitioned => {
@@ -2002,13 +3190,16 @@ fn restore_base(
                 .input_identity
                 .ok_or(NativeRuntimeError::InvalidAnnTree)?;
             AnnBase::Partitioned(
-                PartitionedHnswIndex::restore_snapshot(PartitionedIndexSnapshot {
-                    definition,
-                    input_identity,
-                    build_identity: metadata.build_identity,
-                    partitions: snapshots,
-                })
-                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+                PartitionedHnswIndex::restore_snapshot_with_control(
+                    PartitionedIndexSnapshot {
+                        definition,
+                        input_identity,
+                        build_identity: metadata.build_identity,
+                        partitions: snapshots,
+                    },
+                    || ann_restore_control(cancellation),
+                )
+                .map_err(|error| map_ann_restore_error(&error, cancellation))?,
             )
         }
     };
@@ -2019,6 +3210,27 @@ fn restore_base(
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     Ok(base)
+}
+
+fn ann_restore_control(cancellation: Option<&GovernorCancellation>) -> ControlFlow<()> {
+    if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    }
+}
+
+fn map_ann_restore_error(
+    error: &AnnError,
+    cancellation: Option<&GovernorCancellation>,
+) -> NativeRuntimeError {
+    if *error == AnnError::BuildCancelled
+        && cancellation.is_some_and(GovernorCancellation::is_cancelled)
+    {
+        GovernorQueueError::Cancelled.into()
+    } else {
+        NativeRuntimeError::InvalidAnnTree
+    }
 }
 
 fn restore_child_snapshot(
@@ -2068,11 +3280,11 @@ fn validate_restored_deltas(
 
 pub(crate) fn plan_consolidation(
     pages: &PageStore,
-    root: PageId,
-    catalog: &CatalogState,
-    index: ObjectId,
+    buffer_pool: &BufferPool,
+    load_plan: &AnnIndexLoadPlan,
     max_vectors: usize,
     max_delta_records: usize,
+    execution: ConsolidationBuildExecution<'_>,
 ) -> Result<ConsolidationPlan, NativeRuntimeError> {
     if max_vectors == 0
         || max_vectors > MAX_ANN_CONSOLIDATION_VECTORS
@@ -2081,11 +3293,8 @@ pub(crate) fn plan_consolidation(
     {
         return Err(NativeRuntimeError::InvalidAnnConsolidationLimit);
     }
-    let state = load_from_tree(pages, Some(root), catalog, true)?;
-    let current = state
-        .indexes
-        .get(&index)
-        .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+    reject_cancelled_ann_search(execution.cancellation)?;
+    let current = load_planned_index(pages, buffer_pool, load_plan, execution.cancellation)?;
     if max_delta_records
         > usize::try_from(current.lifecycle.delta_max_entries).unwrap_or(usize::MAX)
     {
@@ -2098,13 +3307,56 @@ pub(crate) fn plan_consolidation(
     if effective_vector_count > max_vectors || current.deltas.len() > max_delta_records {
         return Err(NativeRuntimeError::AnnConsolidationLimitExceeded);
     }
-    let vectors = current.effective_vectors();
+    let vectors = current.effective_vectors_with_cancellation(execution.cancellation)?;
     if vectors.len() != effective_vector_count {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
-    let replacement = Arc::new(HnswIndex::build(current.definition(), vectors)?.into_snapshot());
+    let selected_children = current.base.child_descriptors().len();
+    let partition_count = consolidation_replacement_partitions(
+        current.base.is_partitioned(),
+        selected_children,
+        effective_vector_count,
+    );
+    let maximum_partitions = maximum_consolidation_replacement_partitions(
+        selected_children,
+        current
+            .retained_generations
+            .iter()
+            .map(|generation| generation.children.len()),
+        current.lifecycle.retain_generations,
+        current.base.len() == 0,
+    );
+    if partition_count > maximum_partitions {
+        return Err(NativeRuntimeError::AnnConsolidationLimitExceeded);
+    }
+    reject_cancelled_ann_search(execution.cancellation)?;
+    let replacement = if current.base.is_partitioned() && !vectors.is_empty() {
+        ConsolidationReplacement::Partitioned(build_partitioned_consolidation(
+            current.definition(),
+            vectors,
+            partition_count,
+            execution.pool,
+            execution.permit,
+            execution.cancellation,
+        )?)
+    } else {
+        let cancellation = execution.cancellation.cloned();
+        ConsolidationReplacement::Single(
+            HnswIndex::build_owned_cancellable(current.definition(), vectors, move || {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(GovernorCancellation::is_cancelled)
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })?
+            .into_snapshot(),
+        )
+    };
     Ok(ConsolidationPlan {
-        index,
+        index: load_plan.index,
         base_identity: current.base.build_identity(),
         captured_view_identity: current.view_identity,
         captured_deltas: current
@@ -2112,8 +3364,87 @@ pub(crate) fn plan_consolidation(
             .iter()
             .map(|(object_id, delta)| (*object_id, delta.sequence()))
             .collect(),
-        replacement,
+        replacement: Arc::new(replacement),
     })
+}
+
+fn build_partitioned_consolidation(
+    definition: VectorIndexDefinition,
+    vectors: Vec<VectorRecord>,
+    partition_count: usize,
+    execution_pool: Option<&NativeExecutionPool>,
+    permit: Option<&OwnedGovernorPermit>,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<PartitionedIndexSnapshot, NativeRuntimeError> {
+    let cancellation_for_plan = cancellation.cloned();
+    let plan =
+        HnswPartitionPlan::build_cancellable(definition, vectors, partition_count, move || {
+            if cancellation_for_plan
+                .as_ref()
+                .is_some_and(GovernorCancellation::is_cancelled)
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+    let input_identity = plan.input_identity();
+    let partitions = plan.into_partitions();
+    let children = if let (Some(execution_pool), Some(permit)) = (execution_pool, permit)
+        && permit.request().compute_threads > 1
+        && partitions.len() > 1
+    {
+        let cancellation = cancellation.cloned();
+        let (children, _) =
+            execution_pool.execute_ordered_profiled(permit, partitions, move |partition| {
+                let cancellation = cancellation.clone();
+                HnswIndex::build_owned_cancellable(definition, partition, move || {
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(GovernorCancellation::is_cancelled)
+                    {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+            })?;
+        children.into_iter().collect::<Result<Vec<_>, _>>()?
+    } else {
+        partitions
+            .into_iter()
+            .map(|partition| {
+                let cancellation = cancellation.cloned();
+                HnswIndex::build_owned_cancellable(definition, partition, move || {
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(GovernorCancellation::is_cancelled)
+                    {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let cancellation_for_assembly = cancellation.cloned();
+    Ok(PartitionedHnswIndex::from_governed_partitions_cancellable(
+        definition,
+        input_identity,
+        children,
+        move || {
+            if cancellation_for_assembly
+                .as_ref()
+                .is_some_and(GovernorCancellation::is_cancelled)
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    )?
+    .into_snapshot())
 }
 
 pub(crate) fn encode_consolidation_mutation(plan: &ConsolidationPlan) -> Vec<u8> {
@@ -2121,7 +3452,7 @@ pub(crate) fn encode_consolidation_mutation(plan: &ConsolidationPlan) -> Vec<u8>
     encoded.extend_from_slice(b"HYANNC01");
     encoded.extend_from_slice(&plan.base_identity);
     encoded.extend_from_slice(&plan.captured_view_identity);
-    encoded.extend_from_slice(&plan.replacement.build_identity);
+    encoded.extend_from_slice(&plan.replacement.build_identity());
     encoded.extend_from_slice(
         &u64::try_from(plan.captured_deltas.len())
             .unwrap_or(u64::MAX)
@@ -2132,18 +3463,18 @@ pub(crate) fn encode_consolidation_mutation(plan: &ConsolidationPlan) -> Vec<u8>
 
 pub(crate) fn consolidate_tree(
     pages: &mut PageStore,
+    buffer_pool: &BufferPool,
     root: Option<PageId>,
     creating_csn: Csn,
-    catalog: &CatalogState,
     plan: &ConsolidationPlan,
+    structural_plan: &PrefixReplacementStructuralPlan,
 ) -> Result<BTree, NativeRuntimeError> {
     let root = root.ok_or(NativeRuntimeError::InvalidAnnTree)?;
     let tree = BTree::from_root(root);
-    let mut state = load_from_tree(pages, Some(root), catalog, true)?;
-    let current = state
-        .indexes
-        .get_mut(&plan.index)
-        .ok_or(NativeRuntimeError::UnknownVectorIndex { index: plan.index })?;
+    let definition = plan.definition();
+    let load_plan = plan_index_load(pages, buffer_pool, root, plan.index, definition)?;
+    let (mut current, physical_entries) =
+        load_planned_index_with_entries(pages, buffer_pool, &load_plan, None)?;
     if current.base.build_identity() != plan.base_identity {
         return Err(NativeRuntimeError::AnnConsolidationStale);
     }
@@ -2158,7 +3489,7 @@ pub(crate) fn consolidate_tree(
     }
     let previous = current.base.retention_descriptor();
     if current.base.len() != 0
-        && previous.build_identity != plan.replacement.build_identity
+        && previous.build_identity != plan.replacement.build_identity()
         && !current
             .retained_generations
             .iter()
@@ -2174,51 +3505,214 @@ pub(crate) fn consolidate_tree(
     }
     current.validate_delta_bounds()?;
     let replacement_view_identity = calculate_view_identity(
-        plan.replacement.build_identity,
+        plan.replacement.build_identity(),
         current.next_sequence,
         &current.deltas,
     );
 
-    let mut entries = tree.scan(pages)?;
-    let replacement_identity = plan.replacement.build_identity;
-    entries.retain(|(key, _)| {
-        if !ann_key_targets_index(key, plan.index) {
-            return true;
+    let physical = prepare_consolidation_physical_replacement(
+        pages,
+        tree,
+        &current,
+        physical_entries,
+        plan,
+        replacement_view_identity,
+    )?;
+    let mut unpublished = pages.begin_unpublished_tail()?;
+    let mutation = tree.replace_prefixes_sorted_batch_in_unpublished_tail_with_control(
+        &mut unpublished,
+        structural_plan,
+        PrefixReplacementBatch {
+            creating_csn,
+            prefixes: &physical.prefixes,
+            expected_keys: &physical.expected_keys,
+            replacements: physical.replacements,
+        },
+        || ControlFlow::Continue(()),
+    );
+    let replacement = match mutation {
+        Ok(result) => result.tree,
+        Err(error) => {
+            unpublished.rollback()?;
+            return Err(match error {
+                BTreeError::PrefixContentsChanged => NativeRuntimeError::AnnConsolidationStale,
+                BTreeError::Cancelled => NativeRuntimeError::InvalidAnnTree,
+                error => error.into(),
+            });
         }
-        ann_generation_identity(key).is_some_and(|identity| {
-            identity != replacement_identity
-                && current.retained_generations.iter().any(|generation| {
-                    generation
-                        .children
-                        .iter()
-                        .any(|child| child.build_identity == identity)
-                })
-        })
-    });
-    if let Some((_, marker)) = entries
-        .iter_mut()
-        .find(|(key, _)| key.as_slice() == crate::SEARCH_FORMAT_KEY)
-    {
-        *marker = crate::SEARCH_FORMAT_VALUE_V3.to_vec();
+    };
+    if let Err(error) = validate_consolidated_tree_unpublished(
+        &unpublished,
+        replacement,
+        plan,
+        replacement_view_identity,
+        &current.deltas,
+    ) {
+        unpublished.rollback()?;
+        return Err(error);
     }
-    let mut replacement_entries = BTreeMap::new();
-    replacement_entries.insert(
+    unpublished.finalize();
+    Ok(replacement)
+}
+
+struct ConsolidationPhysicalReplacement {
+    prefixes: Vec<Vec<u8>>,
+    expected_keys: Vec<Vec<u8>>,
+    replacements: Vec<KeyValue>,
+}
+
+fn prepare_consolidation_physical_replacement(
+    pages: &PageStore,
+    tree: BTree,
+    current: &AnnIndexState,
+    physical_entries: Vec<KeyValue>,
+    plan: &ConsolidationPlan,
+    replacement_view_identity: [u8; 32],
+) -> Result<ConsolidationPhysicalReplacement, NativeRuntimeError> {
+    let marker = tree
+        .get(pages, crate::SEARCH_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let mut replacements = BTreeMap::new();
+    replacements.insert(
+        crate::SEARCH_FORMAT_KEY.to_vec(),
+        crate::SEARCH_FORMAT_VALUE_V3.to_vec(),
+    );
+    replacements.insert(
         meta_key(plan.index),
         encode_consolidated_metadata(current, &plan.replacement, replacement_view_identity)?,
     );
-    append_generation_entries(&mut replacement_entries, &plan.replacement)?;
-    for (object_id, delta) in &current.deltas {
-        replacement_entries.insert(delta_key(plan.index, *object_id), encode_delta(delta)?);
+    for snapshot in plan.replacement.snapshots() {
+        append_generation_entries(&mut replacements, snapshot)?;
     }
-    entries.extend(replacement_entries);
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut expected_keys = Vec::with_capacity(physical_entries.len().saturating_add(2));
+    expected_keys.push(crate::SEARCH_FORMAT_KEY.to_vec());
+    expected_keys.push(meta_key(plan.index));
+    for (key, value) in physical_entries {
+        expected_keys.push(key.clone());
+        if ann_generation_identity(&key).is_some_and(|identity| {
+            current.retained_generations.iter().any(|generation| {
+                generation
+                    .children
+                    .iter()
+                    .any(|child| child.build_identity == identity)
+            })
+        }) {
+            replacements.insert(key, value);
+        }
+    }
+    for (object_id, delta) in &current.deltas {
+        replacements.insert(delta_key(plan.index, *object_id), encode_delta(delta)?);
+    }
+    if marker != crate::SEARCH_FORMAT_VALUE_V1
+        && marker != crate::SEARCH_FORMAT_VALUE_V2
+        && marker != crate::SEARCH_FORMAT_VALUE_V3
+        || expected_keys.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(ConsolidationPhysicalReplacement {
+        prefixes: vec![
+            crate::SEARCH_FORMAT_KEY.to_vec(),
+            object_prefix(ANN_INDEX_META_PREFIX, plan.index),
+            object_prefix(ANN_VECTOR_PREFIX, plan.index),
+            object_prefix(ANN_GRAPH_LAYER_PREFIX, plan.index),
+            object_prefix(ANN_DELTA_PREFIX, plan.index),
+        ],
+        expected_keys,
+        replacements: replacements.into_iter().collect(),
+    })
+}
+
+fn validate_consolidated_tree_unpublished(
+    unpublished: &UnpublishedTail<'_>,
+    tree: BTree,
+    plan: &ConsolidationPlan,
+    expected_view_identity: [u8; 32],
+    expected_deltas: &BTreeMap<ObjectId, DeltaRecord>,
+) -> Result<(), NativeRuntimeError> {
+    let definition = plan.definition();
+    let marker = tree
+        .get_unpublished(unpublished, crate::SEARCH_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if marker != crate::SEARCH_FORMAT_VALUE_V1
+        && marker != crate::SEARCH_FORMAT_VALUE_V2
+        && marker != crate::SEARCH_FORMAT_VALUE_V3
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let encoded_metadata = tree
+        .get_unpublished(unpublished, &meta_key(plan.index))?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let metadata = decode_metadata(&encoded_metadata)?;
+    let limits = index_physical_limits(definition, &metadata)?;
+    let entries = scan_index_physical_entries_unpublished(tree, unpublished, plan.index, limits)?;
+    validate_target_physical_entries(&entries, plan.index, definition, &metadata)?;
+    let current =
+        restore_index_with_definition_controlled(&entries, plan.index, definition, metadata, None)?;
+    if current.base.build_identity() != plan.replacement.build_identity()
+        || current.base.definition() != plan.replacement.definition()
+        || current.base.len() != plan.replacement.len()
+        || current.base.input_identity() != plan.replacement.input_identity()
+        || current.base.is_partitioned()
+            != matches!(
+                plan.replacement.as_ref(),
+                ConsolidationReplacement::Partitioned(_)
+            )
+        || current.view_identity != expected_view_identity
+        || current.deltas != *expected_deltas
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(())
+}
+
+fn scan_index_physical_entries_unpublished(
+    tree: BTree,
+    unpublished: &UnpublishedTail<'_>,
+    index: ObjectId,
+    limits: AnnPhysicalLimits,
+) -> Result<Vec<KeyValue>, NativeRuntimeError> {
+    let mut entries = Vec::new();
+    for (prefix, limit) in [
+        (ANN_VECTOR_PREFIX, limits.vectors),
+        (ANN_GRAPH_LAYER_PREFIX, limits.graph_layers),
+        (ANN_DELTA_PREFIX, limits.deltas),
+    ] {
+        let mut visited_entries = 0_usize;
+        let mut visited_bytes = 0_u64;
+        let mut exceeded = false;
+        let outcome = tree.visit_prefix_unpublished(
+            unpublished,
+            &object_prefix(prefix, index),
+            |key, value| {
+                let Some(next_entries) = visited_entries.checked_add(1) else {
+                    exceeded = true;
+                    return ControlFlow::Break(());
+                };
+                let encoded_bytes =
+                    u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX);
+                let Some(next_bytes) = visited_bytes.checked_add(encoded_bytes) else {
+                    exceeded = true;
+                    return ControlFlow::Break(());
+                };
+                if next_entries > limit.entries || next_bytes > limit.bytes {
+                    exceeded = true;
+                    return ControlFlow::Break(());
+                }
+                visited_entries = next_entries;
+                visited_bytes = next_bytes;
+                entries.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            },
+        )?;
+        if exceeded || matches!(outcome, ControlFlow::Break(())) {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
     if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
-    let replacement = BTree::empty()
-        .upsert_sorted_batch(pages, creating_csn, entries)?
-        .tree;
-    Ok(replacement)
+    Ok(entries)
 }
 
 pub(crate) fn observe(
@@ -2233,6 +3727,46 @@ pub(crate) fn observe(
         .get(&index)
         .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
     let entries = BTree::from_root(root).scan(pages)?;
+    Ok(index_observation(current, &entries, index))
+}
+
+pub(crate) fn inspect_consolidation_publication(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    load_plan: &AnnIndexLoadPlan,
+    plan: &ConsolidationPlan,
+) -> Result<(IndexObservation, usize), NativeRuntimeError> {
+    let (current, entries) = load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
+    if current.base.build_identity() != plan.base_identity {
+        return Err(NativeRuntimeError::AnnConsolidationStale);
+    }
+    let consumed = plan
+        .captured_deltas
+        .iter()
+        .filter(|(object_id, captured_sequence)| {
+            current
+                .deltas
+                .get(object_id)
+                .is_some_and(|delta| delta.sequence() == **captured_sequence)
+        })
+        .count();
+    Ok((index_observation(&current, &entries, plan.index), consumed))
+}
+
+pub(crate) fn observe_planned_index(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    load_plan: &AnnIndexLoadPlan,
+) -> Result<IndexObservation, NativeRuntimeError> {
+    let (current, entries) = load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
+    Ok(index_observation(&current, &entries, load_plan.index))
+}
+
+fn index_observation(
+    current: &AnnIndexState,
+    entries: &[KeyValue],
+    index: ObjectId,
+) -> IndexObservation {
     let selected_identities = current
         .base
         .retention_descriptor()
@@ -2252,7 +3786,7 @@ pub(crate) fn observe(
         })
         .count();
     let selected_generation_records = entries
-        .into_iter()
+        .iter()
         .filter(|(key, _)| match key.first().copied() {
             Some(ANN_VECTOR_PREFIX) => {
                 decode_vector_key(key).is_ok_and(|(found_index, build_identity, _)| {
@@ -2267,7 +3801,7 @@ pub(crate) fn observe(
             _ => false,
         })
         .count();
-    Ok(IndexObservation {
+    IndexObservation {
         base_identity: current.base.build_identity(),
         view_identity: current.view_identity,
         base_vector_count: current.base.len(),
@@ -2278,32 +3812,60 @@ pub(crate) fn observe(
         selected_generation_records,
         lifecycle: current.lifecycle,
         maintenance_due: maintenance_due(current),
-    })
+    }
 }
 
 pub(crate) fn maintenance_status(
     pages: &PageStore,
-    root: PageId,
-    catalog: &CatalogState,
-    index: ObjectId,
+    buffer_pool: &BufferPool,
+    plan: &AnnIndexLoadPlan,
 ) -> Result<MaintenanceStatus, NativeRuntimeError> {
-    let state = load_from_tree(pages, Some(root), catalog, true)?;
-    let current = state
-        .indexes
-        .get(&index)
-        .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+    let metadata = decode_metadata(&plan.encoded_metadata)?;
+    let mut entries = Vec::new();
+    visit_bounded_physical_range(
+        BTree::from_root(plan.root),
+        pages,
+        buffer_pool,
+        &object_prefix(ANN_DELTA_PREFIX, plan.index),
+        plan.physical_limits.deltas,
+        None,
+        &mut entries,
+    )?;
+    let mut deltas = BTreeMap::new();
+    for (key, value) in entries {
+        let (found_index, object_id) = decode_delta_key(&key)?;
+        if found_index != plan.index
+            || deltas
+                .insert(object_id, decode_delta(&value, object_id, plan.definition)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    validate_restored_deltas(&metadata, &deltas)?;
+    if deltas
+        .values()
+        .map(DeltaRecord::sequence)
+        .max()
+        .is_some_and(|maximum| maximum >= metadata.next_sequence)
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
     Ok(MaintenanceStatus {
-        lifecycle: current.lifecycle,
-        delta_records: current.deltas.len(),
-        delta_bytes: current.delta_bytes(),
-        due: maintenance_due(current),
+        lifecycle: metadata.lifecycle,
+        delta_records: deltas.len(),
+        delta_bytes: deltas.values().map(DeltaRecord::encoded_len).sum(),
+        due: maintenance_due_counts(metadata.lifecycle, deltas.len()),
     })
 }
 
 fn maintenance_due(state: &AnnIndexState) -> bool {
-    state.deltas.len() >= usize::from(state.lifecycle.consolidate_after_deltas)
-        || state.deltas.len()
-            >= usize::try_from(state.lifecycle.delta_max_entries).unwrap_or(usize::MAX)
+    maintenance_due_counts(state.lifecycle, state.deltas.len())
+}
+
+fn maintenance_due_counts(lifecycle: IncrementalVectorLifecycle, delta_records: usize) -> bool {
+    delta_records >= usize::from(lifecycle.consolidate_after_deltas)
+        || delta_records >= usize::try_from(lifecycle.delta_max_entries).unwrap_or(usize::MAX)
 }
 
 fn validate_physical_entries(
@@ -2384,6 +3946,85 @@ fn validate_physical_entries(
                 .ok_or(NativeRuntimeError::InvalidAnnTree)?;
             validate_retained_child_entries(child, summary)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_target_physical_entries(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    metadata: &PersistedIndexMetadata,
+) -> Result<(), NativeRuntimeError> {
+    let mut generations = BTreeMap::<[u8; 32], PhysicalGenerationSummary>::new();
+    let mut delta_count = 0_u64;
+    let mut delta_bytes = 0_u64;
+    for (key, value) in entries {
+        match key.first().copied() {
+            Some(ANN_VECTOR_PREFIX) => {
+                let (found_index, build_identity, object_id) = decode_vector_key(key)?;
+                if found_index != index || !metadata.owns_physical_identity(build_identity) {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                decode_vector_record(value, object_id, definition)?;
+                if !generations
+                    .entry(build_identity)
+                    .or_default()
+                    .vector_ids
+                    .insert(object_id)
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+            }
+            Some(ANN_GRAPH_LAYER_PREFIX) => {
+                let (found_index, build_identity, object_id, layer) = decode_graph_layer_key(key)?;
+                if found_index != index || !metadata.owns_physical_identity(build_identity) {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                decode_graph_layer(value)?;
+                if !generations
+                    .entry(build_identity)
+                    .or_default()
+                    .graph_layers
+                    .entry(object_id)
+                    .or_default()
+                    .insert(layer)
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+            }
+            Some(ANN_DELTA_PREFIX) => {
+                let (found_index, object_id) = decode_delta_key(key)?;
+                if found_index != index {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                let delta = decode_delta(value, object_id, definition)?;
+                delta_count = delta_count
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+                delta_bytes = delta_bytes
+                    .checked_add(
+                        u64::try_from(delta.encoded_len())
+                            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+                    )
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            }
+            _ => return Err(NativeRuntimeError::InvalidAnnTree),
+        }
+    }
+    if delta_count != metadata.delta_count || delta_bytes != metadata.delta_bytes {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    for child in metadata
+        .retained_generations
+        .iter()
+        .flat_map(|generation| &generation.children)
+        .filter(|child| child.complete)
+    {
+        let summary = generations
+            .get(&child.build_identity)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        validate_retained_child_entries(child, summary)?;
     }
     Ok(())
 }
@@ -2503,7 +4144,7 @@ fn append_base_generation_entries(
     Ok(())
 }
 
-fn meta_key(index: ObjectId) -> Vec<u8> {
+pub(crate) fn meta_key(index: ObjectId) -> Vec<u8> {
     object_prefix(ANN_INDEX_META_PREFIX, index)
 }
 
@@ -2680,7 +4321,7 @@ fn encode_initial_bulk_metadata(
 
 fn encode_consolidated_metadata(
     current: &AnnIndexState,
-    replacement: &IndexSnapshot,
+    replacement: &ConsolidationReplacement,
     view_identity: [u8; 32],
 ) -> Result<Vec<u8>, NativeRuntimeError> {
     current
@@ -2689,7 +4330,7 @@ fn encode_consolidated_metadata(
         .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
     if current.next_sequence == 0
         || view_identity == [0; 32]
-        || replacement.definition != current.definition()
+        || replacement.definition() != current.definition()
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
@@ -2698,7 +4339,10 @@ fn encode_consolidated_metadata(
     if usize::from(retained_count) > usize::from(current.lifecycle.retain_generations) {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
-    validate_retained_generations(&current.retained_generations, replacement.build_identity)?;
+    validate_retained_generations(&current.retained_generations, replacement.build_identity())?;
+    let children = replacement.child_descriptors();
+    let child_count =
+        u16::try_from(children.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
     let retained_size = current
         .retained_generations
         .iter()
@@ -2714,24 +4358,31 @@ fn encode_consolidated_metadata(
         })
         .ok_or(NativeRuntimeError::InvalidAnnTree)?;
     let capacity = ANN_INDEX_META_V4_HEADER_SIZE
-        .checked_add(ANN_INDEX_META_V4_CHILD_SIZE)
+        .checked_add(
+            children
+                .len()
+                .checked_mul(ANN_INDEX_META_V4_CHILD_SIZE)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        )
         .and_then(|size| size.checked_add(retained_size))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let vector_count = children
+        .iter()
+        .try_fold(0_u64, |count, child| count.checked_add(child.vector_count))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let graph_node_count = children
+        .iter()
+        .try_fold(0_u64, |count, child| {
+            count.checked_add(child.graph_node_count)
+        })
         .ok_or(NativeRuntimeError::InvalidAnnTree)?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(ANN_INDEX_META_MAGIC_V4);
-    encoded.extend_from_slice(&replacement.build_identity);
+    encoded.extend_from_slice(&replacement.build_identity());
     encoded.extend_from_slice(&view_identity);
-    encoded.extend_from_slice(&[0; 32]);
-    encoded.extend_from_slice(
-        &u64::try_from(replacement.vectors.len())
-            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
-            .to_le_bytes(),
-    );
-    encoded.extend_from_slice(
-        &u64::try_from(replacement.nodes.len())
-            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
-            .to_le_bytes(),
-    );
+    encoded.extend_from_slice(&replacement.input_identity().unwrap_or([0; 32]));
+    encoded.extend_from_slice(&vector_count.to_le_bytes());
+    encoded.extend_from_slice(&graph_node_count.to_le_bytes());
     encoded.extend_from_slice(
         &u64::try_from(current.deltas.len())
             .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
@@ -2746,11 +4397,17 @@ fn encode_consolidated_metadata(
     encoded.extend_from_slice(&current.lifecycle.delta_max_entries.to_le_bytes());
     encoded.extend_from_slice(&current.lifecycle.consolidate_after_deltas.to_le_bytes());
     encoded.extend_from_slice(&current.lifecycle.retain_generations.to_le_bytes());
-    encoded.extend_from_slice(&[ANN_BASE_SINGLE, 0]);
-    encoded.extend_from_slice(&1_u16.to_le_bytes());
+    encoded.push(match replacement.base_kind() {
+        PersistedBaseKind::Single => ANN_BASE_SINGLE,
+        PersistedBaseKind::Partitioned => ANN_BASE_PARTITIONED,
+    });
+    encoded.push(0);
+    encoded.extend_from_slice(&child_count.to_le_bytes());
     encoded.extend_from_slice(&retained_count.to_le_bytes());
     encoded.extend_from_slice(&[0; 2]);
-    encode_child_descriptor(&mut encoded, replacement)?;
+    for child in &children {
+        encode_persisted_child_descriptor(&mut encoded, child)?;
+    }
     for generation in &current.retained_generations {
         let child_count = u16::try_from(generation.children.len())
             .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
@@ -3808,9 +5465,62 @@ mod tests {
 
     #[test]
     fn durable_partition_limit_accounts_for_every_retained_generation() {
-        assert_eq!(maximum_initial_ann_bulk_partitions(1), 221);
-        assert_eq!(maximum_initial_ann_bulk_partitions(2), 220);
-        assert_eq!(maximum_initial_ann_bulk_partitions(64), 123);
+        assert_eq!(maximum_initial_ann_bulk_partitions(1), 111);
+        assert_eq!(maximum_initial_ann_bulk_partitions(2), 74);
+        assert_eq!(maximum_initial_ann_bulk_partitions(64), 2);
+        assert_eq!(
+            maximum_consolidation_replacement_partitions(111, [], 1, false),
+            111
+        );
+        assert_eq!(
+            maximum_consolidation_replacement_partitions(74, [74], 2, false),
+            74
+        );
+        assert_eq!(
+            maximum_consolidation_replacement_partitions(2, [2; 63], 64, false),
+            59
+        );
+    }
+
+    #[test]
+    fn consolidation_partition_count_is_bounded_by_effective_membership() {
+        let selected_children = 221;
+        assert_eq!(
+            consolidation_replacement_partitions(true, selected_children, 1),
+            1
+        );
+        assert_eq!(
+            consolidation_replacement_partitions(true, selected_children, 2),
+            2
+        );
+        assert_eq!(
+            consolidation_replacement_partitions(true, selected_children, selected_children - 1),
+            selected_children - 1
+        );
+    }
+
+    #[test]
+    fn effective_vector_capture_cancels_between_records_without_returning_partial_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = partitioned_state()?;
+        ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS.set(0);
+        let mut checks = 0_usize;
+        let result = state.effective_vectors_with_control(|| {
+            checks = checks.saturating_add(1);
+            if checks == 4 {
+                Err(GovernorQueueError::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::Cancelled
+            ))
+        ));
+        assert_eq!(ANN_CONSOLIDATION_EFFECTIVE_VECTOR_VISITS.get(), 2);
+        Ok(())
     }
 
     #[test]
@@ -3972,6 +5682,7 @@ mod tests {
             state.next_sequence,
             &state.deltas,
         );
+        let replacement = ConsolidationReplacement::Single(replacement);
         let encoded =
             encode_consolidated_metadata(&state, &replacement, replacement_view_identity)?;
         assert_eq!(decode_metadata(&encoded)?.children.len(), 1);

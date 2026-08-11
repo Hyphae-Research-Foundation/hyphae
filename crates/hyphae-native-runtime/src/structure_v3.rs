@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Canonical physical codecs for the incarnation-fenced `HYSTRBT3` layout.
 //!
@@ -5671,16 +5671,21 @@ pub(super) struct DeltaScalarStateV3 {
     pub(super) collection: Option<CollectionStateV3>,
 }
 
-pub(super) fn delta_scalar_state_latest_at_v3(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DeltaScalarEnvelopeStateV3 {
+    pub(super) scalar: Option<DeltaHashFieldValueV3>,
+    pub(super) collection: Option<CollectionStateV3>,
+}
+
+pub(super) fn delta_scalar_envelope_latest_at_v3(
     pages: &PageStore,
-    blobs: &BlobStore,
     pool: &BufferPool,
     tree: BTree,
     key: &[u8],
-) -> Result<DeltaScalarStateV3, NativeRuntimeError> {
+) -> Result<DeltaScalarEnvelopeStateV3, NativeRuntimeError> {
     let scalar = tree
         .get_cached_pinned(pages, pool, &structure_key(key))?
-        .map(|encoded| decode_structure_value(encoded.bytes(), blobs))
+        .map(|encoded| decode_delta_hash_field_value_v3(encoded.bytes()))
         .transpose()?
         .flatten();
     let mut collection = None;
@@ -5700,7 +5705,253 @@ pub(super) fn delta_scalar_state_latest_at_v3(
     if scalar.is_some() && collection.is_some() {
         return Err(NativeRuntimeError::InvalidStructureTree);
     }
-    Ok(DeltaScalarStateV3 { scalar, collection })
+    Ok(DeltaScalarEnvelopeStateV3 { scalar, collection })
+}
+
+pub(super) fn delta_scalar_state_latest_at_v3(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+) -> Result<DeltaScalarStateV3, NativeRuntimeError> {
+    let envelope = delta_scalar_envelope_latest_at_v3(pages, pool, tree, key)?;
+    let scalar = envelope
+        .scalar
+        .map(|scalar| decode_structure_value(&scalar.encoded, blobs))
+        .transpose()?
+        .flatten();
+    Ok(DeltaScalarStateV3 {
+        scalar,
+        collection: envelope.collection,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DeltaHashFieldValueV3 {
+    pub(super) encoded: Vec<u8>,
+    pub(super) expires_at_micros: Option<i64>,
+    pub(super) logical_value_bytes: u64,
+    pub(super) blob_reference: Option<BlobReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DeltaHashFieldStateV3 {
+    pub(super) incarnation: StructureIncarnation,
+    pub(super) field_count: u64,
+    pub(super) field_expiry_count: u64,
+    pub(super) expires_at_micros: Option<i64>,
+    pub(super) field: Option<DeltaHashFieldValueV3>,
+}
+
+fn exact_delta_hash_metadata_latest_at_v3(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+) -> Result<Option<HashMetadataStateV3>, NativeRuntimeError> {
+    let state = tree
+        .get_cached_pinned(pages, pool, &structure_hash_meta_key(key))?
+        .map(|encoded| decode_live_hash_metadata_v3(encoded.bytes()))
+        .transpose()?
+        .flatten();
+    let other_kind_count = exact_non_hash_structure_kind_count_v3(pages, pool, tree, key)?;
+    let Some(state) = state else {
+        return match other_kind_count {
+            0 => Ok(None),
+            1 => Err(NativeRuntimeError::StructureKindMismatch),
+            _ => Err(NativeRuntimeError::InvalidStructureTree),
+        };
+    };
+    if other_kind_count != 0 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    validate_collection_expiry_backlink_v3(
+        pages,
+        pool,
+        tree,
+        key,
+        state.incarnation,
+        state.expires_at_micros,
+        STRUCTURE_HASH_EXPIRY_LIVE,
+    )?;
+    Ok(Some(state))
+}
+
+pub(super) fn delta_hash_ttl_latest_at_v3(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+    logical_time_micros: i64,
+) -> Result<Ttl, NativeRuntimeError> {
+    let Some(state) = exact_delta_hash_metadata_latest_at_v3(pages, pool, tree, key)? else {
+        return Ok(Ttl::Missing);
+    };
+    Ok(match state.expires_at_micros {
+        None => Ttl::Persistent,
+        Some(expiry) if expiry > logical_time_micros => {
+            Ttl::RemainingMicros(expiry.saturating_sub(logical_time_micros))
+        }
+        Some(_) => Ttl::Missing,
+    })
+}
+
+/// Reads one hash metadata record and one incarnation-fenced field envelope.
+///
+/// Blob payloads remain unresolved so the caller can admit their declared
+/// logical bytes before reading them. A due field is returned with its raw TTL
+/// instead of being filtered; later delta semantics decide whether it is
+/// visible, added, or eligible for TTL cleanup.
+pub(super) fn delta_hash_field_state_latest_at_v3(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+    field_identity: &[u8],
+) -> Result<Option<DeltaHashFieldStateV3>, NativeRuntimeError> {
+    let Some(state) = exact_delta_hash_metadata_latest_at_v3(pages, pool, tree, key)? else {
+        return Ok(None);
+    };
+    let field_key = encode_collection_child_key(
+        STRUCTURE_HASH_FIELD_PREFIX,
+        key,
+        state.incarnation,
+        field_identity,
+    )
+    .map_err(map_codec_error)?;
+    let field = tree
+        .get_cached_pinned(pages, pool, &field_key)?
+        .map(|encoded| decode_delta_hash_field_value_v3(encoded.bytes()))
+        .transpose()?
+        .flatten();
+    if field.is_some() && state.field_count == 0 {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if state.field_count > 0
+        && state.field_expiry_count == state.field_count
+        && field
+            .as_ref()
+            .is_some_and(|field| field.expires_at_micros.is_none())
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if let Some(field_expiry) = field.as_ref().and_then(|field| field.expires_at_micros) {
+        if state.field_expiry_count == 0 {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let expiry_key = encode_collection_expiry_key(
+            crate::STRUCTURE_HASH_FIELD_EXPIRY_PREFIX,
+            field_expiry,
+            key,
+            state.incarnation,
+            field_identity,
+        )
+        .map_err(map_codec_error)?;
+        if tree
+            .get_cached_pinned(pages, pool, &expiry_key)?
+            .is_none_or(|marker| marker.bytes() != [STRUCTURE_HASH_FIELD_EXPIRY_LIVE])
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    Ok(Some(DeltaHashFieldStateV3 {
+        incarnation: state.incarnation,
+        field_count: state.field_count,
+        field_expiry_count: state.field_expiry_count,
+        expires_at_micros: state.expires_at_micros,
+        field,
+    }))
+}
+
+fn exact_non_hash_structure_kind_count_v3(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+) -> Result<usize, NativeRuntimeError> {
+    let scalar = tree
+        .get_cached_pinned(pages, pool, &structure_key(key))?
+        .map(|encoded| decode_delta_hash_field_value_v3(encoded.bytes()))
+        .transpose()?
+        .flatten()
+        .is_some();
+    let mut count = usize::from(scalar);
+    for family in [
+        StructureCollectionFamily::Set,
+        StructureCollectionFamily::List,
+        StructureCollectionFamily::SortedSet,
+        StructureCollectionFamily::Stream,
+    ] {
+        if live_collection_state_v3(pages, pool, tree, key, family)?.is_some() {
+            count = count
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        }
+    }
+    Ok(count)
+}
+
+fn validate_collection_expiry_backlink_v3(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+    incarnation: StructureIncarnation,
+    expires_at_micros: Option<i64>,
+    marker: u8,
+) -> Result<(), NativeRuntimeError> {
+    let Some(expiry) = expires_at_micros else {
+        return Ok(());
+    };
+    let expiry_key = encode_collection_expiry_key(
+        crate::STRUCTURE_EXPIRY_PREFIX,
+        expiry,
+        key,
+        incarnation,
+        &[],
+    )
+    .map_err(map_codec_error)?;
+    if tree
+        .get_cached_pinned(pages, pool, &expiry_key)?
+        .is_none_or(|encoded| encoded.bytes() != [marker])
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+fn decode_delta_hash_field_value_v3(
+    encoded: &[u8],
+) -> Result<Option<DeltaHashFieldValueV3>, NativeRuntimeError> {
+    if is_structure_tombstone(encoded) {
+        return Ok(None);
+    }
+    let expires_at_micros = structure_value_expiry(encoded)?;
+    let payload = &encoded[crate::STRUCTURE_VALUE_HEADER_SIZE..];
+    let (logical_value_bytes, blob_reference) = match encoded[9] {
+        crate::STRUCTURE_VALUE_INLINE => (
+            u64::try_from(payload.len()).map_err(|_| NativeRuntimeError::InvalidStructureTree)?,
+            None,
+        ),
+        crate::STRUCTURE_VALUE_BLOB => {
+            let reference = BlobReference::decode(payload)
+                .map_err(|_| NativeRuntimeError::InvalidStructureTree)?;
+            if reference.logical_length <= crate::STRUCTURE_INLINE_VALUE_LIMIT as u64
+                || reference.logical_length > hyphae_native_blobs::MAX_BLOB_SIZE as u64
+            {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            (reference.logical_length, Some(reference))
+        }
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    };
+    Ok(Some(DeltaHashFieldValueV3 {
+        encoded: encoded.to_vec(),
+        expires_at_micros,
+        logical_value_bytes,
+        blob_reference,
+    }))
 }
 
 fn live_collection_state_v3(
@@ -10494,6 +10745,353 @@ mod tests {
         ));
         assert_eq!(pages.page_count(), pages_before_owned);
         assert_eq!(tree.scan(&pages)?, entries_before_owned);
+        Ok(())
+    }
+
+    struct FullLoadFailureGuard;
+
+    impl FullLoadFailureGuard {
+        fn install() -> Self {
+            crate::FAIL_FULL_STATE_LOAD.set(true);
+            crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+            crate::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+            Self
+        }
+    }
+
+    impl Drop for FullLoadFailureGuard {
+        fn drop(&mut self) {
+            crate::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+            crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+            crate::FAIL_FULL_STATE_LOAD.set(false);
+        }
+    }
+
+    fn empty_structure_v3_tree(pages: &mut PageStore) -> Result<BTree, Box<dyn Error>> {
+        Ok(BTree::empty()
+            .upsert(
+                pages,
+                Csn::new(1)?,
+                crate::STRUCTURE_FORMAT_KEY.to_vec(),
+                STRUCTURE_FORMAT_VALUE_V3.to_vec(),
+            )?
+            .tree)
+    }
+
+    #[test]
+    fn delta_hash_field_point_preserves_raw_visibility_due_and_missing_state()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
+        let incarnation = StructureIncarnation::from_mutation_index(TransactionId::new(901)?, 0)?;
+        let tree = empty_structure_v3_tree(&mut pages)?;
+        let tree = create_hash_v3_in_tree(&mut pages, tree, Csn::new(2)?, b"record", incarnation)?;
+        let (tree, inserted) = put_hash_field_v3_in_tree(
+            &mut pages,
+            tree,
+            Csn::new(3)?,
+            HashFieldWriteV3 {
+                key: b"record",
+                field: b"visible",
+                value: b"value",
+                expires_at_micros: None,
+            },
+            &BTreeMap::new(),
+        )?;
+        assert!(inserted);
+        let (tree, inserted) = put_hash_field_v3_in_tree(
+            &mut pages,
+            tree,
+            Csn::new(4)?,
+            HashFieldWriteV3 {
+                key: b"record",
+                field: b"due",
+                value: b"stale",
+                expires_at_micros: Some(50),
+            },
+            &BTreeMap::new(),
+        )?;
+        assert!(inserted);
+
+        let retired_incarnation =
+            StructureIncarnation::from_mutation_index(TransactionId::new(900)?, 0)?;
+        let stale_field_key = encode_collection_child_key(
+            STRUCTURE_HASH_FIELD_PREFIX,
+            b"record",
+            retired_incarnation,
+            b"stale-only",
+        )?;
+        let tree = tree
+            .upsert(
+                &mut pages,
+                Csn::new(5)?,
+                stale_field_key,
+                structure_storage_value(b"retired", None, &BTreeMap::new())?,
+            )?
+            .tree;
+
+        let _guards = FullLoadFailureGuard::install();
+        let visible =
+            delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"visible")?
+                .ok_or("missing hash")?;
+        assert_eq!(visible.incarnation, incarnation);
+        assert_eq!(visible.field_count, 2);
+        assert_eq!(visible.field_expiry_count, 1);
+        assert_eq!(visible.expires_at_micros, None);
+        let visible_field = visible.field.ok_or("missing visible field")?;
+        assert_eq!(visible_field.expires_at_micros, None);
+        assert_eq!(visible_field.logical_value_bytes, 5);
+        assert_eq!(visible_field.blob_reference, None);
+
+        let due = delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"due")?
+            .ok_or("missing hash")?
+            .field
+            .ok_or("missing due field")?;
+        assert_eq!(due.expires_at_micros, Some(50));
+        assert_eq!(due.logical_value_bytes, 5);
+
+        assert!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"missing",)?
+                .ok_or("missing hash")?
+                .field
+                .is_none()
+        );
+        assert!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"stale-only",)?
+                .ok_or("missing hash")?
+                .field
+                .is_none()
+        );
+        assert!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"missing", b"field",)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_field_point_rejects_wrong_kind_malformed_and_missing_backlinks()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
+        let incarnation = StructureIncarnation::from_mutation_index(TransactionId::new(902)?, 0)?;
+        let tree = empty_structure_v3_tree(&mut pages)?;
+        let wrong_kind =
+            create_set_v3_in_tree(&mut pages, tree, Csn::new(2)?, b"wrong", incarnation)?;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, wrong_kind, b"wrong", b"field",),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+
+        let hash =
+            create_hash_v3_in_tree(&mut pages, wrong_kind, Csn::new(3)?, b"record", incarnation)?;
+        let (hash, inserted) = put_hash_field_v3_in_tree(
+            &mut pages,
+            hash,
+            Csn::new(4)?,
+            HashFieldWriteV3 {
+                key: b"record",
+                field: b"leased",
+                value: b"value",
+                expires_at_micros: Some(50),
+            },
+            &BTreeMap::new(),
+        )?;
+        assert!(inserted);
+        let field_expiry_key = encode_collection_expiry_key(
+            crate::STRUCTURE_HASH_FIELD_EXPIRY_PREFIX,
+            50,
+            b"record",
+            incarnation,
+            b"leased",
+        )?;
+        let missing_field_backlink = hash
+            .upsert(
+                &mut pages,
+                Csn::new(5)?,
+                field_expiry_key,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            )?
+            .tree;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(
+                &pages,
+                &pool,
+                missing_field_backlink,
+                b"record",
+                b"leased",
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let malformed = hash
+            .upsert(
+                &mut pages,
+                Csn::new(6)?,
+                structure_hash_meta_key(b"record"),
+                b"malformed".to_vec(),
+            )?
+            .tree;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, malformed, b"record", b"leased",),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let expiring_hash = expire_collection_v3_in_tree(
+            &mut pages,
+            hash,
+            Csn::new(7)?,
+            b"record",
+            StructureCollectionFamily::Hash,
+            100,
+        )?;
+        let hash_expiry_key = encode_collection_expiry_key(
+            crate::STRUCTURE_EXPIRY_PREFIX,
+            100,
+            b"record",
+            incarnation,
+            &[],
+        )?;
+        let missing_hash_backlink = expiring_hash
+            .upsert(
+                &mut pages,
+                Csn::new(8)?,
+                hash_expiry_key,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            )?
+            .tree;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(
+                &pages,
+                &pool,
+                missing_hash_backlink,
+                b"record",
+                b"leased",
+            ),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_field_point_rejects_persistent_field_when_all_fields_claim_expiry()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
+        let incarnation = StructureIncarnation::from_mutation_index(TransactionId::new(904)?, 0)?;
+        let tree = empty_structure_v3_tree(&mut pages)?;
+        let tree = create_hash_v3_in_tree(&mut pages, tree, Csn::new(2)?, b"record", incarnation)?;
+        let (tree, inserted) = put_hash_field_v3_in_tree(
+            &mut pages,
+            tree,
+            Csn::new(3)?,
+            HashFieldWriteV3 {
+                key: b"record",
+                field: b"persistent",
+                value: b"value",
+                expires_at_micros: None,
+            },
+            &BTreeMap::new(),
+        )?;
+        assert!(inserted);
+        let impossible_metadata =
+            encode_typed_collection_metadata(&TypedCollectionMetadataV3::Live {
+                incarnation,
+                state: CollectionStateV3::Hash {
+                    field_count: 1,
+                    field_expiry_count: 1,
+                    expires_at_micros: None,
+                },
+            })?;
+        let tree = tree
+            .upsert(
+                &mut pages,
+                Csn::new(4)?,
+                structure_hash_meta_key(b"record"),
+                impossible_metadata,
+            )?
+            .tree;
+
+        let _guards = FullLoadFailureGuard::install();
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"persistent",),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_field_point_preserves_blob_reference_without_reading_payload()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut blobs = BlobStore::create(temporary.path())?;
+        let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
+        let incarnation = StructureIncarnation::from_mutation_index(TransactionId::new(903)?, 0)?;
+        let large = vec![0x5a; crate::STRUCTURE_INLINE_VALUE_LIMIT + 1];
+        let reference = blobs.put(&large, false)?;
+        let references = BTreeMap::from([(*blake3::hash(&large).as_bytes(), reference)]);
+        let tree = empty_structure_v3_tree(&mut pages)?;
+        let tree = create_hash_v3_in_tree(&mut pages, tree, Csn::new(2)?, b"record", incarnation)?;
+        let (tree, inserted) = put_hash_field_v3_in_tree(
+            &mut pages,
+            tree,
+            Csn::new(3)?,
+            HashFieldWriteV3 {
+                key: b"record",
+                field: b"large",
+                value: &large,
+                expires_at_micros: None,
+            },
+            &references,
+        )?;
+        assert!(inserted);
+
+        let raw = delta_hash_field_state_latest_at_v3(&pages, &pool, tree, b"record", b"large")?
+            .ok_or("missing hash")?
+            .field
+            .ok_or("missing blob field")?;
+        assert_eq!(raw.blob_reference, Some(reference));
+        assert_eq!(raw.logical_value_bytes, u64::try_from(large.len())?);
+        assert_eq!(
+            decode_structure_value(&raw.encoded, &blobs)?
+                .ok_or("blob envelope decoded as tombstone")?
+                .value,
+            large
+        );
+
+        let mut malformed_blob = raw.encoded.clone();
+        malformed_blob
+            [crate::STRUCTURE_VALUE_HEADER_SIZE + 16..crate::STRUCTURE_VALUE_HEADER_SIZE + 24]
+            .copy_from_slice(&1_u64.to_le_bytes());
+        let field_key = encode_collection_child_key(
+            STRUCTURE_HASH_FIELD_PREFIX,
+            b"record",
+            incarnation,
+            b"large",
+        )?;
+        let malformed_tree = tree
+            .upsert(&mut pages, Csn::new(4)?, field_key.clone(), malformed_blob)?
+            .tree;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, malformed_tree, b"record", b"large",),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+
+        let mut malformed_reference = raw.encoded;
+        malformed_reference
+            [crate::STRUCTURE_VALUE_HEADER_SIZE..crate::STRUCTURE_VALUE_HEADER_SIZE + 16]
+            .fill(0);
+        let malformed_tree = tree
+            .upsert(&mut pages, Csn::new(5)?, field_key, malformed_reference)?
+            .tree;
+        assert!(matches!(
+            delta_hash_field_state_latest_at_v3(&pages, &pool, malformed_tree, b"record", b"large",),
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
@@ -18,8 +18,8 @@ use crate::{
     LocalTransactionRollbackReceipt, LocalTransactionSqlDmlRequest, LocalTransactionStageReceipt,
     LocalTransactionStructureSetRequest, LocalTransportError, LocalTtlValue,
     MAX_LOCAL_PREPARED_STATEMENTS, MAX_LOCAL_SQL_COLUMNS, MAX_LOCAL_SQL_PARAMETERS,
-    MAX_LOCAL_SQL_ROWS, MAX_LOCAL_TRANSACTION_OPERATIONS, NativeDatabase, NativeRuntimeError,
-    NativeSchedulerClock, NativeWriteBatch, PreparedStatement, SqlError, SqlResult, Ttl,
+    MAX_LOCAL_SQL_ROWS, MAX_LOCAL_TRANSACTION_OPERATIONS, NativeDatabase, NativeDeltaWriteBatch,
+    NativeRuntimeError, NativeSchedulerClock, PreparedStatement, SqlError, SqlResult, Ttl,
     UdsFrameConnection, decode_local_search_match, decode_local_sql_execute,
     decode_local_sql_prepare, decode_local_structure_request, decode_local_transaction_begin,
     decode_local_transaction_commit, decode_local_transaction_delete_document,
@@ -61,7 +61,7 @@ struct RetainedSqlPlan {
 
 struct ActiveLocalTransaction {
     handle: NonZeroU64,
-    batch: NativeWriteBatch,
+    batch: NativeDeltaWriteBatch,
     durability: DurabilityClass,
     logical_time_micros: i64,
     staged_operations: u64,

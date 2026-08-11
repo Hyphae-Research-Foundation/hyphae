@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Run the complete controlled G7 state/concurrency matrix for one platform."""
 
@@ -25,9 +25,11 @@ if os.name == "posix":
 
 try:
     from tools.prepare_native_g7_macos_template import prepare as prepare_macos_template
+    from tools.check_native_g7_receipt import validate_ann_read_view_cell
     from tools.check_native_performance_receipt import validate_progress
 except ModuleNotFoundError:
     from prepare_native_g7_macos_template import prepare as prepare_macos_template
+    from check_native_g7_receipt import validate_ann_read_view_cell
     from check_native_performance_receipt import validate_progress
 
 
@@ -36,7 +38,10 @@ STATES = ("warm",)
 CONCURRENCIES = (1, 8, 32)
 BACKGROUND_MODES = ("control", "interference")
 ACTIVE_PROCESS: subprocess.Popen[str] | None = None
-MAX_INITIAL_ANN_BULK_PARTITIONS = 221
+MAX_INITIAL_ANN_BULK_PARTITIONS = 111
+G7_LOGICAL_ANN_PARTITIONS = 64
+G7_PREFERRED_ANN_PARTITIONS = 32
+G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
 
 
 class ProgressWatchdog:
@@ -622,7 +627,7 @@ def validate_initial_ann_bulk_evidence(
     evidence: object, expected_commit: str
 ) -> None:
     fields = {
-        "schema", "source_commit", "dataset_digest", "builder", "input_identity",
+        "schema", "source_commit", "dataset_digest", "builder", "partition_policy", "input_identity",
         "aggregate_identity", "planned_vectors", "planned_partitions", "planned_workers",
         "planned_memory_bytes", "worker_batches", "total_time_nanos",
         "hardware_profile_fingerprint", "governor_policy_schema", "governor_mode",
@@ -635,6 +640,7 @@ def validate_initial_ann_bulk_evidence(
         evidence["schema"] != "hyphae-native-g7-initial-ann-bulk-v1"
         or evidence["source_commit"] != expected_commit
         or evidence["builder"] != "partitioned-hnsw-v1"
+        or evidence["partition_policy"] != G7_ANN_PARTITION_POLICY
         or evidence["governor_mode"] not in {"bulk", "mixed"}
         or not isinstance(evidence["hard_affinity"], bool)
     ):
@@ -657,13 +663,20 @@ def validate_initial_ann_bulk_evidence(
             raise RuntimeError(f"G7 initial ANN bulk {name} is invalid")
     if evidence["planned_partitions"] > evidence["planned_vectors"]:
         raise RuntimeError("G7 initial ANN bulk partition plan exceeds its vectors")
+    if evidence["planned_partitions"] != min(
+        G7_LOGICAL_ANN_PARTITIONS, evidence["planned_vectors"]
+    ):
+        raise RuntimeError("G7 initial ANN bulk partition plan depends on hardware")
     if evidence["planned_partitions"] > MAX_INITIAL_ANN_BULK_PARTITIONS:
         raise RuntimeError("G7 initial ANN bulk exceeds its durable partition limit")
-    if evidence["topology_workers"] > MAX_INITIAL_ANN_BULK_PARTITIONS:
-        raise RuntimeError("G7 execution topology exceeds the durable ANN partition limit")
     if evidence["planned_workers"] > evidence["topology_workers"]:
         raise RuntimeError("G7 initial ANN bulk worker plan exceeds its topology")
-    if evidence["topology_workers"] > 1 and evidence["planned_workers"] <= 1:
+    if evidence["planned_workers"] > evidence["planned_partitions"]:
+        raise RuntimeError("G7 initial ANN bulk worker plan exceeds logical partitions")
+    if (
+        min(evidence["topology_workers"], evidence["planned_partitions"]) > 1
+        and evidence["planned_workers"] <= 1
+    ):
         raise RuntimeError("G7 initial ANN bulk ignored its multi-worker topology")
     if evidence["planned_workers"] > 1 and evidence["worker_batches"] <= 1:
         raise RuntimeError("G7 initial ANN bulk did not prove parallel worker batches")
@@ -706,6 +719,68 @@ def validate_initial_ann_bulk_evidence(
         )
     ):
         raise RuntimeError("G7 initial ANN bulk governor execution evidence mismatch")
+
+
+def validate_execution_authority_evidence(
+    evidence: object,
+    *,
+    calibration_executable_blake3: str,
+    topology_digest: str,
+    background: bool,
+) -> None:
+    fields = {
+        "status", "topology_digest", "runner_executable_blake3",
+        "calibration_executable_blake3", "installations", "installed_surfaces",
+        "registered_pools", "local_dispatches", "stolen_dispatches",
+        "completed_jobs", "numa_steal_status",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        raise RuntimeError("G7 execution authority evidence fields mismatch")
+    if evidence["status"] != "measured":
+        raise RuntimeError("G7 execution authority was not measured")
+    if (
+        evidence["runner_executable_blake3"] != calibration_executable_blake3
+        or evidence["calibration_executable_blake3"] != calibration_executable_blake3
+    ):
+        raise RuntimeError("G7 execution authority targets another runner executable")
+    if evidence["topology_digest"] != topology_digest:
+        raise RuntimeError("G7 execution authority targets another topology")
+    if evidence["numa_steal_status"] not in {"calibrated", "disabled", "not-applicable"}:
+        raise RuntimeError("G7 execution authority has an invalid NUMA steal status")
+    surfaces = evidence["installed_surfaces"]
+    if not isinstance(surfaces, list) or surfaces != sorted(set(surfaces)):
+        raise RuntimeError("G7 execution authority surfaces are not canonical")
+    required = {
+        "search-fixture", "embedded-structure", "embedded-sql",
+        "local-structure-seed", "local-structure-migration",
+        "local-structure-daemon", "local-sql-daemon", "indexed-sql",
+        "join-sql", "group-commit", "physical-observation",
+    }
+    if background:
+        required.add("background-maintenance")
+    allowed = required | {"search-seed-builder"}
+    if not required.issubset(surfaces) or not set(surfaces).issubset(allowed):
+        raise RuntimeError("G7 execution authority omitted or invented a measured surface")
+    if (
+        evidence["installations"] != len(surfaces)
+        or evidence["registered_pools"] != 1
+    ):
+        raise RuntimeError("G7 execution authority installation counts mismatch")
+    counters = [
+        evidence["local_dispatches"], evidence["stolen_dispatches"],
+        evidence["completed_jobs"],
+    ]
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in counters
+    ):
+        raise RuntimeError("G7 execution authority counters are invalid")
+    if evidence["completed_jobs"] != (
+        evidence["local_dispatches"] + evidence["stolen_dispatches"]
+    ):
+        raise RuntimeError("G7 execution authority dispatch counters do not reconcile")
+    if evidence["numa_steal_status"] != "calibrated" and evidence["stolen_dispatches"] != 0:
+        raise RuntimeError("G7 execution authority stole work while NUMA stealing was disabled")
 
 
 def load_contract_path(path: Path, label: str) -> dict[str, object]:
@@ -830,6 +905,7 @@ def main() -> int:
     parser.add_argument("--hardware-file", type=Path)
     parser.add_argument("--hardware-profile", type=Path)
     parser.add_argument("--governor-policy", type=Path)
+    parser.add_argument("--hardware-calibration", type=Path)
     parser.add_argument("--execution-topology", type=Path)
     parser.add_argument("--cell-timeout-seconds", type=int, default=7_200)
     parser.add_argument("--matrix-timeout-seconds", type=int, default=39_600)
@@ -871,6 +947,11 @@ def main() -> int:
             "HYPHAE_G7_HARDWARE_PROFILE_FILE",
         ),
         (
+            "hardware calibration",
+            arguments.hardware_calibration,
+            "HYPHAE_G7_HARDWARE_CALIBRATION_FILE",
+        ),
+        (
             "governor policy",
             arguments.governor_policy,
             "HYPHAE_G7_GOVERNOR_POLICY_FILE",
@@ -882,6 +963,7 @@ def main() -> int:
         ),
     )
     contract_paths: dict[str, Path] = {}
+    contract_values: dict[str, dict[str, object]] = {}
     for label, argument_path, environment_name in contract_arguments:
         path = argument_path or (
             Path(os.environ[environment_name])
@@ -889,7 +971,7 @@ def main() -> int:
         )
         if path is None:
             raise RuntimeError(f"G7 runner requires --{label.replace(' ', '-')}")
-        load_contract_path(path, label)
+        contract_values[environment_name] = load_contract_path(path, label)
         contract_paths[environment_name] = path.resolve()
     binary = ROOT / "conformance" / "g7" / "runners" / "rust" / "target" / "release" / "hyphae-native-g7-runner"
     if os.name == "nt":
@@ -1055,6 +1137,28 @@ def main() -> int:
                 receipt["build"] = build
                 validate_initial_ann_bulk_evidence(
                     receipt.get("initial_ann_bulk"), arguments.source_commit
+                )
+                receipt_cells = receipt.get("cells")
+                if not isinstance(receipt_cells, dict):
+                    raise RuntimeError("G7 runner omitted its measured cells")
+                validate_ann_read_view_cell(
+                    receipt_cells.get("ann-top10-recall-095"),
+                    receipt["initial_ann_bulk"],
+                    receipt["dataset"]["observations"],
+                )
+                calibration_identity = contract_values[
+                    "HYPHAE_G7_HARDWARE_CALIBRATION_FILE"
+                ].get("identity")
+                if not isinstance(calibration_identity, dict):
+                    raise RuntimeError("G7 hardware calibration omitted its identity")
+                calibration_executable = calibration_identity.get("executable_blake3")
+                if not isinstance(calibration_executable, str):
+                    raise RuntimeError("G7 hardware calibration omitted its executable digest")
+                validate_execution_authority_evidence(
+                    receipt.get("execution_authority"),
+                    calibration_executable_blake3=calibration_executable,
+                    topology_digest=receipt["initial_ann_bulk"]["topology_digest"],
+                    background=background_mode == "interference",
                 )
                 if (
                     receipt["initial_ann_bulk"]["dataset_digest"]

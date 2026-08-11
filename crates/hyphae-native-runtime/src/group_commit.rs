@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bounded multi-producer scheduler for native group durability.
 
@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::CommitBoundary;
 use crate::{
     CommitReceipt, GroupCommitOutcome, MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE,
-    NativeDatabase, NativeRuntimeError, NativeWriteBatch,
+    NativeCommitBatch, NativeDatabase, NativeDeltaWriteBatch, NativeRuntimeError, NativeWriteBatch,
 };
 
 const DEFAULT_GROUP_COMMIT_BATCH_SIZE: usize = 32;
@@ -627,7 +627,7 @@ impl NativeCommitClient {
         &self,
         logical_time_micros: i64,
         durability: DurabilityClass,
-    ) -> Result<NativeWriteBatch, GroupCommitSubmitError> {
+    ) -> Result<NativeDeltaWriteBatch, GroupCommitSubmitError> {
         if !self.accepting()? {
             return Err(GroupCommitSubmitError::Unavailable);
         }
@@ -650,7 +650,7 @@ impl NativeCommitClient {
     /// physical corruption error.
     pub fn stage_delta_set(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         key: Vec<u8>,
         value: Vec<u8>,
         expires_at_micros: Option<i64>,
@@ -677,9 +677,15 @@ impl NativeCommitClient {
     /// admission/persistence failure.
     pub fn submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, NativeCommitControl::new(), None, false, false)
+        self.submit_inner(
+            batch.into().into_inner(),
+            NativeCommitControl::new(),
+            None,
+            false,
+            false,
+        )
     }
 
     /// Attempts immediate bounded admission and waits for a definite outcome.
@@ -690,9 +696,15 @@ impl NativeCommitClient {
     /// bounded queue has no slot, or the same errors as [`Self::submit`].
     pub fn try_submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, NativeCommitControl::new(), None, true, false)
+        self.submit_inner(
+            batch.into().into_inner(),
+            NativeCommitControl::new(),
+            None,
+            true,
+            false,
+        )
     }
 
     /// Submits with exact queued cancellation and an optional queue deadline.
@@ -706,11 +718,17 @@ impl NativeCommitClient {
     /// or the same unavailable/runtime failures as [`Self::submit`].
     pub fn submit_controlled(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         control: NativeCommitControl,
         queue_deadline: Option<Instant>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, control, queue_deadline, false, true)
+        self.submit_inner(
+            batch.into().into_inner(),
+            control,
+            queue_deadline,
+            false,
+            true,
+        )
     }
 
     fn submit_inner(
@@ -936,7 +954,7 @@ impl NativeCommitScheduler {
         &self,
         logical_time_micros: i64,
         durability: DurabilityClass,
-    ) -> Result<NativeWriteBatch, GroupCommitSubmitError> {
+    ) -> Result<NativeDeltaWriteBatch, GroupCommitSubmitError> {
         self.client
             .begin_optimistic_delta(logical_time_micros, durability)
     }
@@ -948,7 +966,7 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::submit`].
     pub fn submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
         self.client.submit(batch)
     }
@@ -960,7 +978,7 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::try_submit`].
     pub fn try_submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
         self.client.try_submit(batch)
     }
@@ -972,7 +990,7 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::submit_controlled`].
     pub fn submit_controlled(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         control: NativeCommitControl,
         queue_deadline: Option<Instant>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {

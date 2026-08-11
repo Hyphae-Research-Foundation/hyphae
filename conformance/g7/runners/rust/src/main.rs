@@ -1,14 +1,15 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Controlled Native G7 benchmark runner.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     hint::black_box,
+    io::Read,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Barrier, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,7 +24,8 @@ use hyphae_native_product::{
     ProductPrincipal, ProductRequestContext, ProductSession, ProductSessionId,
 };
 use hyphae_native_runtime::{
-    AnnSearchOptions, HardwareProfile, HnswConfig, InitialAnnBulkBuildEvidence,
+    AnnPartitionRoutingOutcome, AnnSearchOptions, CalibrationMode, CalibrationRequest,
+    HardwareCalibration, HardwareProfile, HnswConfig, InitialAnnBulkBuildEvidence,
     InitialAnnBulkBuilder, InitialAnnBulkProgress, InitialAnnBulkProgressStage,
     MAX_INITIAL_ANN_BULK_PARTITIONS, NativeCommitScheduler, NativeDatabase, NativeExecutionPool,
     NativeExecutionTopology, NativeGovernorPolicy, NativeResourceGovernor, NativeSnapshot, Vector,
@@ -43,8 +45,11 @@ const STRUCTURE_KEYS: usize = 2_048;
 const SQL_KEYS: usize = 128;
 const CLOSURE_SEARCH_DOCUMENTS: usize = 1_000_000;
 const CLOSURE_VECTOR_DIMENSION: u16 = 384;
+const CLOSURE_ANN_LOGICAL_PARTITIONS: usize = 64;
+const ANN_PARTITION_POLICY: &str = "g7-fixed-64-logical-partitions-v1";
 const K: usize = 10;
 const ANN_QUERY_BREADTH: usize = 64;
+const G7_PREFERRED_ANN_PARTITIONS: usize = 32;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
 const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
@@ -63,20 +68,26 @@ struct Stats {
 
 struct SearchFixture {
     database: NativeDatabase,
-    snapshot: NativeSnapshot,
+    ann_view: Mutex<Option<hyphae_native_runtime::NativeAnnReadView>>,
+    ann_view_open: hyphae_native_runtime::NativeAnnReadViewOpenReceipt,
     lexical_index: ObjectId,
     vector_index: ObjectId,
+    foreground_compute_threads: u64,
     query: Vector,
     options: AnnSearchOptions,
-    recall_at_10: f64,
     initial_ann_bulk: serde_json::Value,
 }
 
 struct ExecutionAuthority {
     profile: HardwareProfile,
+    calibration: HardwareCalibration,
     policy: NativeGovernorPolicy,
     topology: NativeExecutionTopology,
     topology_digest: String,
+    executable_blake3: String,
+    installations: Mutex<BTreeSet<String>>,
+    governor: Arc<NativeResourceGovernor>,
+    execution_pool: Arc<NativeExecutionPool>,
 }
 
 struct AnnProgressSink {
@@ -118,7 +129,11 @@ impl AnnProgressSink {
         }))
     }
 
-    fn begin_build(&mut self, authority: &ExecutionAuthority) -> std::io::Result<()> {
+    fn begin_build(
+        &mut self,
+        authority: &ExecutionAuthority,
+        logical_partitions: usize,
+    ) -> std::io::Result<()> {
         self.write(AnnProgressUpdate {
             operation: "ann-bulk-build",
             stage: "ann-private-build",
@@ -127,7 +142,8 @@ impl AnnProgressSink {
             checkpoint_digest: None,
             details: Some(json!({
                 "builder": "partitioned-hnsw-v1",
-                "requested_partitions": authority.topology.worker_count(),
+                "partition_policy": ANN_PARTITION_POLICY,
+                "requested_partitions": logical_partitions,
                 "topology_workers": authority.topology.worker_count(),
                 "topology_digest": authority.topology_digest,
                 "planned_workers": null,
@@ -264,6 +280,13 @@ impl ExecutionAuthority {
         let policy: NativeGovernorPolicy =
             serde_json::from_value(read_required_json("HYPHAE_G7_GOVERNOR_POLICY_FILE")?)
                 .map_err(|error| format!("invalid G7 governor policy: {error}"))?;
+        let calibration: HardwareCalibration =
+            serde_json::from_value(read_required_json("HYPHAE_G7_HARDWARE_CALIBRATION_FILE")?)
+                .map_err(|error| format!("invalid G7 hardware calibration: {error}"))?;
+        let executable_blake3 = current_executable_blake3()?;
+        if calibration.identity.executable_blake3 != executable_blake3 {
+            return Err("G7 calibration targets another executable, not the exact runner".into());
+        }
         let expected_topology = read_required_json("HYPHAE_G7_EXECUTION_TOPOLOGY_FILE")?;
         let profile = HardwareProfile::discover(data_path)
             .map_err(|error| format!("G7 hardware discovery failed: {error}"))?;
@@ -274,8 +297,9 @@ impl ExecutionAuthority {
         if policy.hardware_fingerprint != profile.fingerprint {
             return Err("G7 governor policy targets another hardware profile".into());
         }
-        let topology = NativeExecutionTopology::derive(&profile, &policy)
-            .map_err(|error| format!("G7 execution topology derivation failed: {error}"))?;
+        let topology =
+            NativeExecutionTopology::derive_with_calibration(&profile, &policy, &calibration)
+                .map_err(|error| format!("G7 execution topology derivation failed: {error}"))?;
         let actual_topology = serde_json::to_value(&topology)?;
         if actual_topology != expected_topology {
             return Err("live G7 execution topology differs from the supplied topology".into());
@@ -283,58 +307,114 @@ impl ExecutionAuthority {
         if topology.worker_count() == 0 {
             return Err("G7 execution topology has no workers".into());
         }
-        if topology.worker_count() > MAX_INITIAL_ANN_BULK_PARTITIONS {
-            return Err(format!(
-                "G7 execution topology has {} workers but durable ANN supports at most {} partitions",
-                topology.worker_count(),
-                MAX_INITIAL_ANN_BULK_PARTITIONS,
-            )
-            .into());
-        }
         let topology_digest = blake3::hash(&serde_json::to_vec(&actual_topology)?)
             .to_hex()
             .to_string();
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(
+            NativeExecutionPool::new_with_calibration(&profile, &policy, &calibration)
+                .map_err(|error| format!("G7 execution pool creation failed: {error}"))?,
+        );
+        if execution_pool.topology() != &topology {
+            return Err("G7 shared execution pool differs from canonical topology".into());
+        }
         Ok(Self {
             profile,
+            calibration,
             policy,
             topology,
             topology_digest,
+            executable_blake3,
+            installations: Mutex::new(BTreeSet::new()),
+            governor,
+            execution_pool,
         })
     }
 
-    fn install(&self, database: &mut NativeDatabase) -> Result<(), Box<dyn Error>> {
-        let governor = Arc::new(NativeResourceGovernor::new(self.policy.clone()));
-        let execution_pool = Arc::new(
-            NativeExecutionPool::new(&self.profile, &self.policy)
-                .map_err(|error| format!("G7 execution pool creation failed: {error}"))?,
-        );
+    fn install(&self, database: &mut NativeDatabase, surface: &str) -> Result<(), Box<dyn Error>> {
         database
             .set_resource_governor_with_execution_pool(
-                Arc::clone(&governor),
-                Arc::clone(&execution_pool),
+                Arc::clone(&self.governor),
+                Arc::clone(&self.execution_pool),
                 Duration::ZERO,
             )
             .map_err(|error| format!("G7 execution authority install failed: {error}"))?;
         if database.resource_governor().is_none() || database.execution_pool().is_none() {
             return Err("G7 database did not retain its execution authority".into());
         }
+        self.record_installation(surface)?;
         Ok(())
+    }
+
+    fn install_product(
+        &self,
+        product: &mut NativeProduct,
+        surface: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        product.set_resource_governor_with_execution_pool(
+            Arc::clone(&self.governor),
+            Arc::clone(&self.execution_pool),
+            Duration::ZERO,
+        )?;
+        if !product.has_execution_authority() {
+            return Err("G7 product did not retain its execution authority".into());
+        }
+        self.record_installation(surface)
+    }
+
+    fn record_installation(&self, surface: &str) -> Result<(), Box<dyn Error>> {
+        if !self
+            .installations
+            .lock()
+            .map_err(|_| "G7 execution installation registry synchronization failed")?
+            .insert(surface.to_owned())
+        {
+            return Err(format!("G7 execution authority surface repeated: {surface}").into());
+        }
+        Ok(())
+    }
+
+    fn observation(&self) -> Result<serde_json::Value, Box<dyn Error>> {
+        let installations = self
+            .installations
+            .lock()
+            .map_err(|_| "G7 execution installation registry synchronization failed")?;
+        let local_dispatches = self.execution_pool.local_dispatches();
+        let stolen_dispatches = self.execution_pool.stolen_dispatches();
+        let completed_jobs = self.execution_pool.completed_jobs();
+        Ok(json!({
+            "status": "measured",
+            "topology_digest": self.topology_digest,
+            "runner_executable_blake3": self.executable_blake3,
+            "calibration_executable_blake3": self.calibration.identity.executable_blake3,
+            "installations": installations.len(),
+            "installed_surfaces": installations.iter().collect::<Vec<_>>(),
+            "registered_pools": 1,
+            "local_dispatches": local_dispatches,
+            "stolen_dispatches": stolen_dispatches,
+            "completed_jobs": completed_jobs,
+            "numa_steal_status": serde_json::to_value(&self.topology)?["numa_steal_policy"]["status"],
+        }))
     }
 }
 
 impl SearchFixture {
-    fn open_or_create(root: &Path, source_commit: &str) -> Result<Self, Box<dyn Error>> {
+    fn open_or_create(
+        root: &Path,
+        source_commit: &str,
+        authority: &ExecutionAuthority,
+    ) -> Result<Self, Box<dyn Error>> {
         let path = search_seed_path(root, source_commit)?;
-        let authority = ExecutionAuthority::from_environment(&path)?;
         let created = !path.is_dir();
         if !path.is_dir() {
-            publish_search_seed(&path, source_commit, &authority)?;
+            publish_search_seed(&path, source_commit, authority)?;
         }
-        let database =
+        let mut database =
             NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
+        authority.install(&mut database, "search-fixture")?;
         let lexical_index = ObjectId::new(7)?;
         let vector_index = ObjectId::new(8)?;
-        let initial_ann_bulk = load_initial_ann_bulk_evidence(&path, source_commit, &authority)?;
+        let initial_ann_bulk = load_initial_ann_bulk_evidence(&path, source_commit, authority)?;
         let observed = database.observe_ann_index(vector_index)?;
         let aggregate_identity = required_json_string(&initial_ann_bulk, "aggregate_identity")?;
         let observed_identity = blake3::Hash::from_bytes(observed.base_identity)
@@ -355,35 +435,28 @@ impl SearchFixture {
         vector_index: ObjectId,
         initial_ann_bulk: serde_json::Value,
     ) -> Result<Self, Box<dyn Error>> {
-        let snapshot = database.snapshot(0)?;
         let query = Vector::new({
             let mut values = vec![0.0; vector_dimension() as usize];
             values[0] = 1.0;
             values
         })?;
         let options = AnnSearchOptions::new(K, ANN_QUERY_BREADTH, Some(K))?;
-        let exact_ids = snapshot
-            .search_vector_exact(vector_index, &query, K)?
-            .into_iter()
-            .map(|hit| hit.object_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let approximate = snapshot.search_ann(vector_index, &query, options)?;
-        let recalled = approximate
-            .hits
-            .iter()
-            .filter(|hit| exact_ids.contains(&hit.object_id))
-            .count();
-        if recalled * 20 < K * 19 {
-            return Err("ANN recall below G7 floor".into());
-        }
+        let foreground_compute_threads = database
+            .resource_governor()
+            .ok_or("search fixture has no resource governor")?
+            .policy()
+            .limit(WorkloadClass::ForegroundBounded)
+            .compute_threads;
+        let (ann_view, ann_view_open) = database.open_ann_read_view(vector_index)?;
         Ok(Self {
             database,
-            snapshot,
+            ann_view: Mutex::new(Some(ann_view)),
+            ann_view_open,
             lexical_index,
             vector_index,
+            foreground_compute_threads,
             query,
             options,
-            recall_at_10: recalled as f64 / K as f64,
             initial_ann_bulk,
         })
     }
@@ -413,7 +486,7 @@ fn seed_search_database(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut database =
         NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
-    authority.install(&mut database)?;
+    authority.install(&mut database, "search-seed-builder")?;
     let lexical_index = ObjectId::new(7)?;
     let vector_index = ObjectId::new(8)?;
     let document_count = search_documents();
@@ -430,10 +503,14 @@ fn seed_search_database(
         ann_lifecycle(),
     )?;
     seed.commit()?;
+    let logical_partitions = logical_ann_partitions(document_count);
+    if logical_partitions > MAX_INITIAL_ANN_BULK_PARTITIONS {
+        return Err("G7 logical ANN partition policy exceeds the durable format".into());
+    }
     if let Some(sink) = &progress {
         sink.lock()
             .map_err(|_| "G7 ANN progress sink synchronization failed")?
-            .begin_build(authority)?;
+            .begin_build(authority, logical_partitions)?;
     }
     let vectors = (0..document_count)
         .map(|id| vector_fixture(id, document_count))
@@ -444,7 +521,7 @@ fn seed_search_database(
     let plan = database.plan_initial_ann_bulk_with_progress(
         vector_index,
         vectors,
-        authority.topology.worker_count(),
+        logical_partitions,
         move |update| {
             let Some(sink) = &callback_sink else {
                 return;
@@ -469,7 +546,7 @@ fn seed_search_database(
         return Err(error.into());
     }
     let build = plan.build_evidence();
-    validate_initial_ann_bulk_build(build, authority)?;
+    validate_initial_ann_bulk_build(build, authority, logical_partitions)?;
     let evidence = initial_ann_bulk_evidence(source_commit, build, authority)?;
     if let Some(sink) = &progress {
         sink.lock()
@@ -531,12 +608,13 @@ fn seed_search_database(
 fn validate_initial_ann_bulk_build(
     build: InitialAnnBulkBuildEvidence,
     authority: &ExecutionAuthority,
+    logical_partitions: usize,
 ) -> Result<(), Box<dyn Error>> {
     if build.builder != InitialAnnBulkBuilder::PartitionedHnswV1 {
         return Err("G7 initial ANN bulk selected an unexpected builder".into());
     }
     if build.planned_vectors != search_documents()
-        || build.planned_partitions != authority.topology.worker_count()
+        || build.planned_partitions != logical_partitions
         || build.planned_compute_threads == 0
         || build.planned_compute_threads as usize > authority.topology.worker_count()
         || build.planned_memory_bytes == 0
@@ -544,7 +622,10 @@ fn validate_initial_ann_bulk_build(
     {
         return Err("G7 initial ANN bulk returned incomplete resource evidence".into());
     }
-    if authority.topology.worker_count() > 1 && build.planned_compute_threads <= 1 {
+    if authority.topology.worker_count() > 1
+        && logical_partitions > 1
+        && build.planned_compute_threads <= 1
+    {
         return Err("G7 initial ANN bulk ignored a multi-worker execution topology".into());
     }
     if build.planned_compute_threads > 1 && build.worker_batches <= 1 {
@@ -611,6 +692,7 @@ fn initial_ann_bulk_evidence(
         "source_commit": source_commit,
         "dataset_digest": dataset_digest(source_commit).to_hex().to_string(),
         "builder": "partitioned-hnsw-v1",
+        "partition_policy": ANN_PARTITION_POLICY,
         "input_identity": blake3::Hash::from_bytes(build.input_identity).to_hex().to_string(),
         "aggregate_identity": blake3::Hash::from_bytes(build.build_identity).to_hex().to_string(),
         "planned_vectors": build.planned_vectors,
@@ -754,18 +836,65 @@ struct CounterValue {
     reason: Option<&'static str>,
 }
 
+fn current_executable_blake3() -> Result<String, Box<dyn Error>> {
+    let path = std::env::current_exe()?;
+    let mut executable = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let count = executable.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn run_hardware_calibration(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let data_path = arguments
+        .first()
+        .map(PathBuf::from)
+        .ok_or("G7 runner hardware calibration requires one data path")?;
+    let mode = match arguments.get(1).map(String::as_str) {
+        Some("quick") => CalibrationMode::Quick,
+        Some("thorough") => CalibrationMode::Thorough,
+        _ => return Err("G7 runner hardware calibration mode must be quick or thorough".into()),
+    };
+    let profile = HardwareProfile::discover(&data_path)?;
+    let request = CalibrationRequest::for_current_executable(
+        mode,
+        env!("HYPHAE_RUSTC_IDENTITY"),
+        concat!("hyphae-native-g7-runner/", env!("CARGO_PKG_VERSION")),
+    )?;
+    let calibration = HardwareCalibration::run(&profile, &request)?;
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &calibration)?;
+    println!();
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let allocation_start = GLOBAL_ALLOCATOR.stats();
-    let source_commit = std::env::args()
-        .nth(1)
-        .ok_or("missing exact source commit")?;
-    let platform = std::env::args()
-        .nth(2)
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("--hardware-calibrate") {
+        return run_hardware_calibration(&arguments[1..]);
+    }
+    let source_commit = arguments
+        .first()
+        .ok_or("missing exact source commit")?
+        .clone();
+    let platform = arguments
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| std::env::consts::OS.to_owned());
-    let state = std::env::args().nth(3).unwrap_or_else(|| "warm".to_owned());
-    let concurrency = std::env::args()
-        .nth(4)
+    let state = arguments
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "warm".to_owned());
+    let concurrency = arguments
+        .get(3)
+        .cloned()
         .unwrap_or_else(|| "1".to_owned())
         .parse::<usize>()?;
     let observations = std::env::var("HYPHAE_G7_OBSERVATIONS")
@@ -782,15 +911,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("state must be warm/cold and concurrency must be 1, 8, or 32".into());
     }
     let root = temporary_root(&state, concurrency)?;
-    let search = SearchFixture::open_or_create(&root, &source_commit)?;
+    let authority = Arc::new(ExecutionAuthority::from_environment(&search_seed_path(
+        &root,
+        &source_commit,
+    )?)?);
+    let search = SearchFixture::open_or_create(&root, &source_commit, &authority)?;
     let background_enabled =
         std::env::var("HYPHAE_G7_BACKGROUND").is_ok_and(|value| value == "1" || value == "true");
     let background_stop = Arc::new(AtomicBool::new(false));
     let background_thread = background_enabled.then(|| {
         let stop = Arc::clone(&background_stop);
+        let authority = Arc::clone(&authority);
         let path = root.join("background-maintenance");
         thread::spawn(move || -> Result<u64, String> {
             let mut database = NativeDatabase::create(path).map_err(|error| error.to_string())?;
+            authority
+                .install(&mut database, "background-maintenance")
+                .map_err(|error| error.to_string())?;
             let mut operations = 0_u64;
             while !stop.load(Ordering::Relaxed) {
                 let mut batch = database
@@ -859,35 +996,77 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     cells.insert(
         "embedded-structure-point-get",
-        run_embedded_structure(&root, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("embedded structure: {error}"))?,
+        run_embedded_structure(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .map_err(|error| format!("embedded structure: {error}"))?,
     );
     cells.insert(
         "embedded-prepared-sql-primary-key",
-        run_embedded_sql(&root, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("embedded sql: {error}"))?,
+        run_embedded_sql(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .map_err(|error| format!("embedded sql: {error}"))?,
     );
     cells.insert(
         "local-structure-point-get",
-        run_local_structure(&root, state == "warm", concurrency, observations, warmup)
-            .await
-            .map_err(|error| format!("local structure: {error}"))?,
+        run_local_structure(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .await
+        .map_err(|error| format!("local structure: {error}"))?,
     );
     cells.insert(
         "local-prepared-sql-primary-key",
-        run_local_sql(&root, state == "warm", concurrency, observations, warmup)
-            .await
-            .map_err(|error| format!("local sql: {error}"))?,
+        run_local_sql(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .await
+        .map_err(|error| format!("local sql: {error}"))?,
     );
     cells.insert(
         "indexed-sql-bounded-read",
-        run_indexed_sql(&root, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("indexed sql: {error}"))?,
+        run_indexed_sql(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .map_err(|error| format!("indexed sql: {error}"))?,
     );
     cells.insert(
         "two-index-join-bounded-read",
-        run_join_sql(&root, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("two-index join: {error}"))?,
+        run_join_sql(
+            &root,
+            &authority,
+            state == "warm",
+            concurrency,
+            observations,
+            warmup,
+        )
+        .map_err(|error| format!("two-index join: {error}"))?,
     );
     cells.insert(
         "bm25-top10",
@@ -911,10 +1090,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     cells.insert(
         "strict-group-commit",
-        run_commit(&root, concurrency, observations)?,
+        run_commit(&root, &authority, concurrency, observations)?,
     );
     receipt["cells"] = serde_json::to_value(cells)?;
-    receipt["physical_observation"] = physical_observation(&root)?;
+    receipt["physical_observation"] = physical_observation(&root, &authority)?;
     receipt["counters"] = counters_process(&root)?;
     let allocation_change = GLOBAL_ALLOCATOR.stats() - allocation_start;
     receipt["counters"]["allocations"] = counter_json(CounterValue {
@@ -939,6 +1118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|error| format!("background maintenance failed: {error}"))?;
         receipt["background_interference"]["operations"] = json!(operations);
     }
+    receipt["execution_authority"] = authority.observation()?;
     fs::remove_dir_all(&root)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
@@ -1029,6 +1209,10 @@ fn search_documents() -> usize {
 fn vector_dimension() -> u16 {
     static VALUE: OnceLock<u16> = OnceLock::new();
     *VALUE.get_or_init(|| smoke_override("HYPHAE_G7_VECTOR_DIMENSION", CLOSURE_VECTOR_DIMENSION))
+}
+
+fn logical_ann_partitions(vector_count: usize) -> usize {
+    CLOSURE_ANN_LOGICAL_PARTITIONS.min(vector_count).max(1)
 }
 
 fn smoke_override<T>(name: &str, closure_value: T) -> T
@@ -1134,6 +1318,7 @@ fn counter_json(counter: CounterValue) -> serde_json::Value {
 
 fn run_embedded_structure(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1143,6 +1328,7 @@ fn run_embedded_structure(
     let path = root.join("structure");
     let mut database =
         NativeDatabase::create(&path).map_err(|error| format!("structure seed: {error}"))?;
+    authority.install(&mut database, "embedded-structure")?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     for index in 0..STRUCTURE_KEYS {
         seed.set(index.to_be_bytes().to_vec(), vec![0xa5; 64], None)?;
@@ -1169,6 +1355,7 @@ fn run_embedded_structure(
 
 fn run_embedded_sql(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1178,6 +1365,7 @@ fn run_embedded_sql(
     let path = root.join("sql");
     let mut database = NativeDatabase::create(&path)
         .map_err(|error| format!("sql seed {}: {error}", path.display()))?;
+    authority.install(&mut database, "embedded-sql")?;
     let mut seed = database.begin_sql(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.execute_sql(
         "CREATE TABLE g7_items (id BIGINT PRIMARY KEY, payload BINARY NOT NULL)",
@@ -1216,6 +1404,7 @@ fn run_embedded_sql(
 
 async fn run_local_structure(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1225,6 +1414,7 @@ async fn run_local_structure(
     let path = root.join("local-structure");
     let mut product =
         NativeProduct::create(&path).map_err(|error| format!("local structure seed: {error}"))?;
+    authority.install_product(&mut product, "local-structure-seed")?;
     let mut session = product_session();
     let mut context = product_context(&session, 1);
     context.durability = ProductDurabilityPolicy::MEMORY;
@@ -1241,10 +1431,12 @@ async fn run_local_structure(
     drop(product);
     let mut database = NativeDatabase::open(&path)
         .map_err(|error| format!("local structure migration open: {error}"))?;
+    authority.install(&mut database, "local-structure-migration")?;
     database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
     drop(database);
-    let product = NativeProduct::open(&path)
+    let mut product = NativeProduct::open(&path)
         .map_err(|error| format!("local structure reopen after migration: {error}"))?;
+    authority.install_product(&mut product, "local-structure-daemon")?;
     let endpoint = short_endpoint("structure");
     let daemon = NativeDaemon::start(
         product,
@@ -1287,6 +1479,7 @@ async fn run_local_structure(
 
 async fn run_local_sql(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1296,6 +1489,7 @@ async fn run_local_sql(
     let path = root.join("local-sql");
     let mut product =
         NativeProduct::create(&path).map_err(|error| format!("local sql seed: {error}"))?;
+    authority.install_product(&mut product, "local-sql-daemon")?;
     seed_product_sql(&mut product)?;
     let endpoint = short_endpoint("sql");
     let daemon = NativeDaemon::start(
@@ -1360,6 +1554,7 @@ async fn run_local_sql(
 
 fn run_indexed_sql(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1368,6 +1563,7 @@ fn run_indexed_sql(
     fs::create_dir_all(root)?;
     let path = root.join("indexed");
     let mut database = NativeDatabase::create(&path)?;
+    authority.install(&mut database, "indexed-sql")?;
     let mut seed = database.begin_sql(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.execute_sql(
         "CREATE TABLE g7_indexed (id BIGINT PRIMARY KEY, email TEXT NOT NULL, payload BINARY NOT NULL)",
@@ -1416,6 +1612,7 @@ fn run_indexed_sql(
 
 fn run_join_sql(
     root: &Path,
+    authority: &ExecutionAuthority,
     warm: bool,
     concurrency: usize,
     observations: usize,
@@ -1423,6 +1620,7 @@ fn run_join_sql(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let path = root.join("join");
     let mut database = NativeDatabase::create(&path)?;
+    authority.install(&mut database, "join-sql")?;
     let mut seed = database.begin_sql(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.execute_sql(
         "CREATE TABLE g7_profiles (id BIGINT PRIMARY KEY, city TEXT NOT NULL)",
@@ -1515,12 +1713,13 @@ fn run_hybrid(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let snapshot = fixture.database.snapshot(0)?;
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         for _ in 0..warmup {
             black_box(hybrid_query(
                 &fixture.database,
-                &fixture.snapshot,
+                &snapshot,
                 fixture.lexical_index,
                 fixture.vector_index,
                 &fixture.query,
@@ -1531,7 +1730,7 @@ fn run_hybrid(
     let stats = measure_concurrent(concurrency, observations, &|| {
         if hybrid_query(
             &fixture.database,
-            &fixture.snapshot,
+            &snapshot,
             fixture.lexical_index,
             fixture.vector_index,
             &fixture.query,
@@ -1746,27 +1945,213 @@ fn run_ann(
     observations: usize,
     warmup: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let view = fixture
+        .ann_view
+        .lock()
+        .map_err(|_| "ANN read-view fixture lock poisoned")?
+        .take()
+        .ok_or("ANN read view was already consumed")?;
+    let offered_concurrency = u64::try_from(concurrency).map_err(|_| "invalid ANN concurrency")?;
+    let query_workers = fixture
+        .foreground_compute_threads
+        .checked_div(offered_concurrency.max(1))
+        .unwrap_or(0)
+        .max(1);
+    let query_queue_wait = Duration::from_secs(60);
+    let preferred_partitions = G7_PREFERRED_ANN_PARTITIONS
+        .min(fixture.ann_view_open.logical_partitions)
+        .max(1);
     let materialization = NativeDatabase::process_materialization_observation();
+    let execution_workers_max = AtomicU64::new(0);
+    let worker_batches_max = AtomicU64::new(0);
+    let execution_waves_max = AtomicU64::new(0);
+    let selected_certified = AtomicU64::new(0);
+    let full_fanout_requested = AtomicU64::new(0);
+    let budget_fallback = AtomicU64::new(0);
+    let single_generation_fallback = AtomicU64::new(0);
+    let lower_bound_present = AtomicU64::new(0);
+    let physical_before = fixture.database.physical_observation()?;
+    let restores_before = NativeDatabase::process_ann_index_restore_count();
     if warm {
-        for _ in 0..warmup {
-            black_box(fixture.snapshot.search_ann(
-                fixture.vector_index,
+        if warmup > 0 {
+            let first = view.search_selected_with_worker_budget(
                 &fixture.query,
                 fixture.options,
+                preferred_partitions,
+                query_workers,
+                query_queue_wait,
+            )?;
+            validate_g7_ann_selected_route(&first.search, preferred_partitions)?;
+            black_box(first);
+        }
+        for _ in 1..warmup {
+            black_box(view.search_selected_with_worker_budget(
+                &fixture.query,
+                fixture.options,
+                preferred_partitions,
+                query_workers,
+                query_queue_wait,
             )?);
         }
     }
     let stats = measure_concurrent(concurrency, observations, &|| {
-        black_box(fixture.snapshot.search_ann(
-            fixture.vector_index,
+        let receipt = view.search_selected_with_worker_budget(
             &fixture.query,
             fixture.options,
-        )?);
+            preferred_partitions,
+            query_workers,
+            query_queue_wait,
+        )?;
+        if receipt.hydration_performed
+            || receipt.physical_page_reads != 0
+            || receipt.restore_count != 0
+        {
+            return Err("ANN read-view query crossed the hydration boundary".into());
+        }
+        validate_g7_ann_selected_route(&receipt.search, preferred_partitions)?;
+        execution_workers_max.fetch_max(
+            u64::try_from(receipt.search.execution_workers).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        worker_batches_max.fetch_max(
+            u64::try_from(receipt.search.execution_worker_batches).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        execution_waves_max.fetch_max(
+            u64::try_from(receipt.search.execution_waves).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        match receipt.search.routing_outcome {
+            AnnPartitionRoutingOutcome::SelectedCertified => {
+                selected_certified.fetch_add(1, Ordering::Relaxed);
+            }
+            AnnPartitionRoutingOutcome::FullFanoutRequested => {
+                full_fanout_requested.fetch_add(1, Ordering::Relaxed);
+            }
+            AnnPartitionRoutingOutcome::FullFanoutBudgetFallback => {
+                budget_fallback.fetch_add(1, Ordering::Relaxed);
+            }
+            AnnPartitionRoutingOutcome::SingleGenerationFallback => {
+                single_generation_fallback.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if receipt.search.next_partition_lower_bound.is_some() {
+            lower_bound_present.fetch_add(1, Ordering::Relaxed);
+        }
+        black_box(receipt);
         Ok::<(), Box<dyn Error>>(())
     })?;
+    let physical_after = fixture.database.physical_observation()?;
+    let restores_after = NativeDatabase::process_ann_index_restore_count();
+    let interval_page_reads = physical_after
+        .physical_page_reads
+        .saturating_sub(physical_before.physical_page_reads);
+    let interval_restores = restores_after.saturating_sub(restores_before);
+    if interval_page_reads != 0 || interval_restores != 0 {
+        return Err("ANN read-view interval crossed the hydration boundary".into());
+    }
+    // Keep correctness outside the measured interval so a cold cell's first
+    // ANN search is one of its observations rather than fixture validation.
+    let correctness = view.search_selected_with_worker_budget(
+        &fixture.query,
+        fixture.options,
+        preferred_partitions,
+        query_workers,
+        query_queue_wait,
+    )?;
+    if correctness.hydration_performed
+        || correctness.physical_page_reads != 0
+        || correctness.restore_count != 0
+    {
+        return Err("ANN read-view correctness query crossed the hydration boundary".into());
+    }
+    validate_g7_ann_selected_route(&correctness.search, preferred_partitions)?;
+    let expected_ids = (1..=K)
+        .map(|id| ObjectId::new(id as u128))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let recalled = correctness
+        .search
+        .search
+        .hits
+        .iter()
+        .filter(|hit| expected_ids.contains(&hit.object_id))
+        .count();
+    if recalled * 20 < K * 19 {
+        return Err("ANN recall below G7 floor".into());
+    }
     let mut output = stats_with_materialization(stats, materialization)?;
-    output["recall_at_10"] = json!(fixture.recall_at_10);
+    output["recall_at_10"] = json!(recalled as f64 / K as f64);
+    output["per_query_worker_limit"] = json!(query_workers);
+    output["query_queue_wait_millis"] = json!(query_queue_wait.as_millis());
+    output["preferred_partition_budget"] = json!(preferred_partitions);
+    output["post_open_hydration_performed"] = json!(correctness.hydration_performed);
+    output["post_open_physical_page_reads"] = json!(correctness.physical_page_reads);
+    output["post_open_restore_count"] = json!(correctness.restore_count);
+    output["ann_read_view_query_interval"] = json!({
+        "physical_page_reads": interval_page_reads,
+        "index_scoped_restores": interval_restores,
+        "provider": "database-page-counter-plus-process-ann-restore-counter",
+    });
+    output["ann_routing_interval"] = json!({
+        "observations": observations,
+        "execution_workers_max": execution_workers_max.load(Ordering::Relaxed),
+        "execution_worker_batches_max": worker_batches_max.load(Ordering::Relaxed),
+        "execution_waves_max": execution_waves_max.load(Ordering::Relaxed),
+        "selected_certified": selected_certified.load(Ordering::Relaxed),
+        "full_fanout_requested": full_fanout_requested.load(Ordering::Relaxed),
+        "full_fanout_budget_fallback": budget_fallback.load(Ordering::Relaxed),
+        "single_generation_fallback": single_generation_fallback.load(Ordering::Relaxed),
+        "next_partition_lower_bound_present": lower_bound_present.load(Ordering::Relaxed),
+    });
+    output["ann_read_view_open"] = json!({
+        "root_identity": blake3::Hash::from_bytes(fixture.ann_view_open.root_identity)
+            .to_hex()
+            .to_string(),
+        "base_build_identity": blake3::Hash::from_bytes(
+            fixture.ann_view_open.base_build_identity,
+        )
+        .to_hex()
+        .to_string(),
+        "view_identity": blake3::Hash::from_bytes(fixture.ann_view_open.view_identity)
+            .to_hex()
+            .to_string(),
+        "logical_partitions": fixture.ann_view_open.logical_partitions,
+        "planned_physical_entries": fixture.ann_view_open.planned_physical_entries,
+        "planned_physical_bytes": fixture.ann_view_open.planned_physical_bytes,
+        "observed_physical_entries": fixture.ann_view_open.observed_physical_entries,
+        "observed_physical_bytes": fixture.ann_view_open.observed_physical_bytes,
+        "planned_peak_memory_bytes": fixture.ann_view_open.planned_peak_memory_bytes,
+        "retained_memory_bytes": fixture.ann_view_open.retained_memory_bytes,
+        "hydration_restore_count": fixture.ann_view_open.hydration_restore_count,
+        "process_physical_page_read_delta": fixture
+            .ann_view_open
+            .process_physical_page_read_delta,
+        "governor_generation": fixture.ann_view_open.governor_generation,
+        "routing_policy_identity": blake3::Hash::from_bytes(
+            fixture.ann_view_open.routing_policy_identity,
+        )
+        .to_hex()
+        .to_string(),
+    });
+    drop(view);
     Ok(output)
+}
+
+fn validate_g7_ann_selected_route(
+    receipt: &hyphae_native_runtime::AnnSelectedSearchReceipt,
+    preferred_partitions: usize,
+) -> Result<(), Box<dyn Error>> {
+    if receipt.requested_maximum_partitions != preferred_partitions
+        || receipt.routing_outcome != AnnPartitionRoutingOutcome::SelectedCertified
+        || receipt.selected_partitions.len() > preferred_partitions
+        || receipt.execution_workers == 0
+        || receipt.execution_worker_batches == 0
+        || receipt.execution_waves != 1
+        || receipt.next_partition_lower_bound.is_none()
+    {
+        return Err("G7 ANN route was not selected-certified within the preferred budget".into());
+    }
+    Ok(())
 }
 
 fn vector_fixture(id: usize, document_count: usize) -> Result<(ObjectId, Vector), Box<dyn Error>> {
@@ -1786,6 +2171,7 @@ const fn ann_lifecycle() -> IncrementalVectorLifecycle {
 
 fn run_commit(
     root: &Path,
+    authority: &ExecutionAuthority,
     concurrency: usize,
     observations: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -1793,6 +2179,7 @@ fn run_commit(
     let group_path = root.join("group");
     let mut database =
         NativeDatabase::create(&group_path).map_err(|error| format!("group seed: {error}"))?;
+    authority.install(&mut database, "group-commit")?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
     seed.commit()?;
@@ -1956,8 +2343,12 @@ fn stats_with_materialization(
     Ok(value)
 }
 
-fn physical_observation(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
-    let database = NativeDatabase::open(root.join("structure"))?;
+fn physical_observation(
+    root: &Path,
+    authority: &ExecutionAuthority,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut database = NativeDatabase::open(root.join("structure"))?;
+    authority.install(&mut database, "physical-observation")?;
     let observation = database.physical_observation()?;
     Ok(json!({
         "page_count": observation.page_count,
@@ -1966,4 +2357,27 @@ fn physical_observation(root: &Path) -> Result<serde_json::Value, Box<dyn Error>
         "process_full_state_loads": observation.process_full_state_loads,
         "process_full_catalog_loads": observation.process_full_catalog_loads,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_ann_partition_policy_is_corpus_bound_not_hardware_bound() {
+        assert_eq!(logical_ann_partitions(1), 1);
+        assert_eq!(logical_ann_partitions(63), 63);
+        assert_eq!(logical_ann_partitions(64), 64);
+        assert_eq!(logical_ann_partitions(1_000_000), 64);
+        assert_eq!(ANN_PARTITION_POLICY, "g7-fixed-64-logical-partitions-v1");
+    }
+
+    #[test]
+    fn current_executable_digest_hashes_the_exact_runner() -> Result<(), Box<dyn Error>> {
+        let expected = blake3::hash(&fs::read(std::env::current_exe()?)?)
+            .to_hex()
+            .to_string();
+        assert_eq!(current_executable_blake3()?, expected);
+        Ok(())
+    }
 }

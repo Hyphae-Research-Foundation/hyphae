@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from tools.run_native_g7 import (
     ProgressWatchdog,
     parse_macos_counter_export,
     validate_completed_ann_progress,
+    validate_execution_authority_evidence,
     validate_initial_ann_bulk_evidence,
     write_matrix_progress,
 )
@@ -28,10 +29,11 @@ class NativeG7ControllerTests(unittest.TestCase):
             "source_commit": cls.SOURCE_COMMIT,
             "dataset_digest": "3" * 64,
             "builder": "partitioned-hnsw-v1",
+            "partition_policy": "g7-fixed-64-logical-partitions-v1",
             "input_identity": "4" * 64,
             "aggregate_identity": "5" * 64,
             "planned_vectors": 1_000_000,
-            "planned_partitions": 48,
+            "planned_partitions": 64,
             "planned_workers": 44,
             "planned_memory_bytes": 4_000_000_000,
             "worker_batches": 48,
@@ -54,6 +56,77 @@ class NativeG7ControllerTests(unittest.TestCase):
                 "execution_time_nanos": 1,
             },
         }
+
+    @staticmethod
+    def execution_authority(*, background: bool = False) -> dict[str, object]:
+        surfaces = {
+            "search-fixture", "embedded-structure", "embedded-sql",
+            "local-structure-seed", "local-structure-migration",
+            "local-structure-daemon", "local-sql-daemon", "indexed-sql",
+            "join-sql", "group-commit", "physical-observation",
+        }
+        if background:
+            surfaces.add("background-maintenance")
+        return {
+            "status": "measured",
+            "topology_digest": "9" * 64,
+            "runner_executable_blake3": "8" * 64,
+            "calibration_executable_blake3": "8" * 64,
+            "installations": len(surfaces),
+            "installed_surfaces": sorted(surfaces),
+            "registered_pools": 1,
+            "local_dispatches": 9,
+            "stolen_dispatches": 0,
+            "completed_jobs": 9,
+            "numa_steal_status": "disabled",
+        }
+
+    def test_execution_authority_requires_exact_runner_and_every_surface(self) -> None:
+        evidence = self.execution_authority(background=True)
+        validate_execution_authority_evidence(
+            evidence,
+            calibration_executable_blake3="8" * 64,
+            topology_digest="9" * 64,
+            background=True,
+        )
+        evidence["installed_surfaces"].remove("local-sql-daemon")
+        with self.assertRaisesRegex(RuntimeError, "omitted"):
+            validate_execution_authority_evidence(
+                evidence,
+                calibration_executable_blake3="8" * 64,
+                topology_digest="9" * 64,
+                background=True,
+            )
+
+    def test_execution_authority_rejects_cli_calibration_and_counter_drift(self) -> None:
+        evidence = self.execution_authority()
+        evidence["runner_executable_blake3"] = "7" * 64
+        with self.assertRaisesRegex(RuntimeError, "another runner"):
+            validate_execution_authority_evidence(
+                evidence,
+                calibration_executable_blake3="8" * 64,
+                topology_digest="9" * 64,
+                background=False,
+            )
+        evidence = self.execution_authority()
+        evidence["completed_jobs"] += 1
+        with self.assertRaisesRegex(RuntimeError, "reconcile"):
+            validate_execution_authority_evidence(
+                evidence,
+                calibration_executable_blake3="8" * 64,
+                topology_digest="9" * 64,
+                background=False,
+            )
+        evidence = self.execution_authority()
+        evidence["local_dispatches"] = 7
+        evidence["stolen_dispatches"] = 2
+        with self.assertRaisesRegex(RuntimeError, "disabled"):
+            validate_execution_authority_evidence(
+                evidence,
+                calibration_executable_blake3="8" * 64,
+                topology_digest="9" * 64,
+                background=False,
+            )
 
     @classmethod
     def completed_progress(cls) -> dict[str, object]:
@@ -104,6 +177,18 @@ class NativeG7ControllerTests(unittest.TestCase):
     def test_accepts_durably_published_ann_progress(self) -> None:
         validate_completed_ann_progress(self.completed_progress(), self.SOURCE_COMMIT)
 
+    def test_progress_schema_covers_runner_details_and_eta(self) -> None:
+        schema_path = Path(__file__).parents[1] / "contracts" / "json-schema" / (
+            "native-performance-progress-v1.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertIn("details", schema["required"])
+        self.assertEqual(schema["properties"]["details"]["required"], ["eta"])
+        self.assertEqual(
+            set(schema["$defs"]["eta"]["required"]),
+            {"status", "estimated_remaining_nanos"},
+        )
+
     def test_rejects_progress_that_stops_before_publication(self) -> None:
         progress = self.completed_progress()
         progress["stage"] = "ann-publication"
@@ -147,10 +232,17 @@ class NativeG7ControllerTests(unittest.TestCase):
 
     def test_rejects_bulk_above_durable_partition_limit(self) -> None:
         evidence = self.initial_ann_bulk()
-        evidence["planned_partitions"] = 222
-        evidence["topology_workers"] = 222
-        with self.assertRaisesRegex(RuntimeError, "partition limit"):
+        evidence["planned_partitions"] = 112
+        with self.assertRaisesRegex(RuntimeError, "depends on hardware"):
             validate_initial_ann_bulk_evidence(evidence, self.SOURCE_COMMIT)
+
+    def test_accepts_more_topology_workers_than_logical_partitions(self) -> None:
+        evidence = self.initial_ann_bulk()
+        evidence["topology_workers"] = 256
+        evidence["planned_workers"] = 64
+        evidence["worker_batches"] = 64
+        evidence["governor_execution"]["compute_threads"] = 64
+        validate_initial_ann_bulk_evidence(evidence, self.SOURCE_COMMIT)
 
     def test_rejects_progress_details_for_another_dataset(self) -> None:
         progress = self.completed_progress()

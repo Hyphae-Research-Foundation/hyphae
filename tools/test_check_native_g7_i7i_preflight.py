@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Tests for the dedicated AWS i7i.metal-24xl G7 preflight."""
 
 from __future__ import annotations

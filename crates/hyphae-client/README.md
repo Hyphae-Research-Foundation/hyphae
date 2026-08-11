@@ -25,6 +25,6 @@ operations over canonical HTTP `/v2/execute` product envelopes and exact
 types and preserves typed product errors, deadlines, cancellation, and
 transaction outcome state.
 
-Code is GPL-3.0-only; documentation is CC-BY-SA-4.0. Source, examples, and
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source, examples, and
 security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

@@ -1,7 +1,7 @@
 # Packaging
 
 `package.py` produces a deterministic archive containing one native `hyphae`
-binary plus the GPLv3 code license, CC BY-SA documentation license, licensing
+binary plus the AGPLv3 code license, CC BY-SA documentation license, licensing
 scope policy, readme, and third-party notices. It never bundles a database,
 cache, model, provider credential, or runtime installer.
 

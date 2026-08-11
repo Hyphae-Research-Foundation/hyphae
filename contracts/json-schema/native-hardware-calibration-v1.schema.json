@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/contracts/json-schema/native-hardware-calibration-v1.schema.json",
   "title": "Hyphae Native hardware calibration v1",
   "type": "object",

@@ -2,6 +2,9 @@
 
 This directory is the canonical human documentation for shipped Hyphae
 behavior.
+Its prose, specifications, and diagrams are licensed under
+[`CC-BY-SA-4.0`](../LICENSE-DOCUMENTATION), subject to the trademark and
+third-party boundaries in [`LICENSE-POLICY.md`](../LICENSE-POLICY.md).
 Public wire behavior is normative in `contracts/`; durable encodings and
 reference semantics are normative in the versioned specification documents
 linked below. Tests and checked-in compatibility fixtures enforce both.
@@ -124,10 +127,15 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native hardware profile v1](performance/native-hardware-profile-v1.md)
 - [Native hardware calibration v1](performance/native-hardware-calibration-v1.md)
 - [Native resource governor v1](performance/native-resource-governor-v1.md)
+- [Native scheduler authority v1](performance/native-scheduler-authority-v1.md)
 - [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
 - [Native structure execution v1](performance/native-structure-execution-v1.md)
 - [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)
 - [Native ANN initial bulk publication v1](performance/native-ann-initial-bulk-publication-v1.md)
+- [Native ANN durable routing v1](performance/native-ann-durable-routing-v1.md)
+- [Native ANN retained read view v1](performance/native-ann-read-view-v1.md)
+- Native ANN durable local qualification v1:
+  [contract](performance/native-ann-durable-qualification-v1.md)
 - [Native SQL vector execution v1](performance/native-sql-vector-execution-v1.md)
 - [Result proof format v1](provenance/result-proof-v1.md)
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
@@ -274,7 +282,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
 - [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
-- [ADR-0025: GPLv3 code and CC BY-SA documentation](adr/0025-gplv3-code-and-cc-by-sa-documentation.md)
+- [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
 
 ## Documentation contract
 

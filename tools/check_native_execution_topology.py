@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Fail-closed semantic checker for Native execution topology v1."""
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ ROOT_KEYS = {
     "schedulable_compute_threads",
     "hard_affinity",
     "pools",
+    "numa_steal_policy",
 }
 POOL_KEYS = {"numa_node_id", "workers"}
 WORKER_KEYS = {
@@ -126,6 +127,104 @@ def validate_topology(value: Any) -> None:
     for ranks in physical_ranks.values():
         if ranks != set(range(max(ranks) + 1)):
             fail("SMT ranks for one physical core must be contiguous from zero")
+    validate_numa_steal_policy(root["numa_steal_policy"], pools)
+
+
+def validate_numa_steal_policy(value: Any, topology_pools: list[dict[str, Any]]) -> None:
+    policy = require_object(
+        value,
+        "numa_steal_policy",
+        {
+            "schema",
+            "calibration_cache_key",
+            "status",
+            "working_set_bytes",
+            "foreground_burst_limit",
+            "pools",
+        },
+    )
+    if policy["schema"] != "hyphae-native-numa-steal-policy-v1":
+        fail("NUMA steal policy schema is invalid")
+    cache_key = policy["calibration_cache_key"]
+    if not isinstance(cache_key, str) or DIGEST.fullmatch(cache_key) is None:
+        fail("NUMA steal policy calibration cache key must be one lowercase digest")
+    if policy["working_set_bytes"] != 8 * 1024 * 1024:
+        fail("NUMA steal policy working set differs from calibration v1")
+    if policy["foreground_burst_limit"] != 16:
+        fail("NUMA steal policy foreground burst limit must be 16")
+    rows = policy["pools"]
+    if not isinstance(rows, list) or len(rows) != len(topology_pools):
+        fail("NUMA steal policy must contain one row per execution pool")
+    topology_nodes = [pool["numa_node_id"] for pool in topology_pools]
+    for offset, (row_value, node) in enumerate(zip(rows, topology_nodes)):
+        row = require_object(
+            row_value,
+            f"numa_steal_policy.pools[{offset}]",
+            {"worker_numa_node_id", "steal_targets"},
+        )
+        if row["worker_numa_node_id"] != node:
+            fail("NUMA steal policy pool order differs from execution topology")
+        targets = row["steal_targets"]
+        if not isinstance(targets, list):
+            fail("NUMA steal targets must be an array")
+        parsed: list[tuple[int, int]] = []
+        for target_offset, target_value in enumerate(targets):
+            target = require_object(
+                target_value,
+                f"numa_steal_policy.pools[{offset}].steal_targets[{target_offset}]",
+                {
+                    "home_numa_node_id",
+                    "remote_to_local_latency_ppm",
+                    "steal_after_nanoseconds",
+                },
+            )
+            home = require_id(
+                target["home_numa_node_id"],
+                "home_numa_node_id",
+                nullable=False,
+            )
+            ratio = require_id(
+                target["remote_to_local_latency_ppm"],
+                "remote_to_local_latency_ppm",
+                nullable=False,
+            )
+            delay = require_id(
+                target["steal_after_nanoseconds"],
+                "steal_after_nanoseconds",
+                nullable=False,
+            )
+            if home == node:
+                fail("NUMA steal policy cannot target its local pool")
+            parsed.append((delay, home))
+            if ratio == 0:
+                fail("NUMA remote/local latency ratio must be positive")
+            if policy["status"] == "calibrated" and (ratio <= 1_000_000 or delay == 0):
+                fail("calibrated NUMA stealing requires one positive measured threshold")
+        if parsed != sorted(set(parsed)):
+            fail("NUMA steal targets must be unique and ordered by threshold then node")
+        if len({home for _, home in parsed}) != len(parsed):
+            fail("NUMA steal targets repeat one home node")
+
+    status = policy["status"]
+    all_targets_empty = all(not row["steal_targets"] for row in rows)
+    if len(topology_nodes) == 1:
+        if status != "not-applicable" or not all_targets_empty:
+            fail("single-pool topology requires not-applicable NUMA stealing")
+    elif status == "disabled":
+        if not all_targets_empty:
+            fail("disabled NUMA stealing cannot contain targets")
+    elif status == "calibrated":
+        if any(node is None for node in topology_nodes):
+            fail("calibrated NUMA stealing requires physical node identity")
+        expected = [set(topology_nodes) - {node} for node in topology_nodes]
+        actual = [
+            {target["home_numa_node_id"] for target in row["steal_targets"]}
+            for row in rows
+        ]
+        if actual != expected:
+            fail("calibrated NUMA stealing must cover every directed remote target")
+    else:
+        fail("multi-pool NUMA steal policy status is invalid")
 
 
 def main() -> int:

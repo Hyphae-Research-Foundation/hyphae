@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Tests for the Native hardware calibration semantic checker."""
 
 from __future__ import annotations
@@ -187,13 +187,15 @@ class CalibrationCheckerTests(unittest.TestCase):
         with self.assertRaisesRegex(CalibrationValidationError, "status must be unavailable"):
             validate_receipt(receipt)
 
-    def test_accepts_one_canonical_local_remote_numa_pair(self) -> None:
+    def test_accepts_complete_directed_numa_matrix(self) -> None:
         receipt = valid_receipt()
         template = receipt["measurements"][0]
         cells = []
         for variant in (
             "linux-first-touch-node-0-read-node-0-cpu-0",
             "linux-first-touch-node-0-read-node-1-cpu-48",
+            "linux-first-touch-node-1-read-node-0-cpu-0",
+            "linux-first-touch-node-1-read-node-1-cpu-48",
         ):
             cell = copy.deepcopy(template)
             cell.update(
@@ -222,29 +224,41 @@ class CalibrationCheckerTests(unittest.TestCase):
             for item in receipt["coverage"]["unsupported"]
             if item["primitive"] != "numa-local-remote-memory"
         ]
-        validate_receipt(receipt)
+        with self.assertRaisesRegex(CalibrationValidationError, "page-residency"):
+            validate_receipt(receipt)
+        receipt["measurements"][-1]["statistics"]["unit"] = "nanoseconds"
+        with self.assertRaisesRegex(CalibrationValidationError, "unit is not canonical"):
+            validate_receipt(receipt)
 
-    def test_rejects_numa_cells_without_a_remote_reader(self) -> None:
+    def test_rejects_incomplete_directed_numa_matrix(self) -> None:
         receipt = valid_receipt()
         template = receipt["measurements"][0]
-        for cpu in (0, 1):
+        for source, reader, cpu in ((0, 0, 0), (0, 1, 48), (1, 1, 48)):
             cell = copy.deepcopy(template)
             cell.update(
                 {
                     "primitive": "numa-memory-read",
-                    "variant": f"linux-first-touch-node-0-read-node-0-cpu-{cpu}",
+                    "variant": (
+                        f"linux-first-touch-node-{source}-read-node-{reader}-cpu-{cpu}"
+                    ),
                     "input_size": 8 * 1024 * 1024,
                     "input_unit": "working-set-bytes",
                     "bytes_per_operation": 8 * 1024 * 1024,
                 }
             )
-            cell["statistics"]["relative_range_ppm"] = 600_000
-            cell["status"] = "unstable"
             receipt["measurements"].append(cell)
-        receipt["accepted_for_scheduling"] = False
-        receipt["status"] = "unstable"
-        receipt["selected_kernels"] = []
-        with self.assertRaisesRegex(CalibrationValidationError, "local and one remote"):
+            receipt["selected_kernels"].append(
+                {
+                    "primitive": cell["primitive"],
+                    "input_size": cell["input_size"],
+                    "input_unit": cell["input_unit"],
+                    "variant": cell["variant"],
+                    "reason": "candidate passed correctness and variance policy",
+                }
+            )
+        receipt["coverage"]["measured"] = ["numa-memory-read", "vector-dot"]
+        receipt["coverage"]["unsupported"] = []
+        with self.assertRaisesRegex(CalibrationValidationError, "complete directed"):
             validate_receipt(receipt)
 
 

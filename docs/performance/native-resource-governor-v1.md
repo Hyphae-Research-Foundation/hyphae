@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
+
 # Native resource governor v1
 
 Status: admission foundation and first engine routing implemented; P2 remains open
@@ -116,13 +118,34 @@ same class capacity externally, prove that real SQL/structure/ANN entry points
 reject, then prove permit drop restores service.
 
 Serialized and detached optimistic write transactions acquire an owned
-mutation permit before snapshot materialization. The permit is retained by the
-`NativeWriteBatch` through staging, queueing, group or individual commit,
-explicit rollback, or ordinary drop. Cloning a batch clones a handle to the
-same allocation rather than acquiring another allocation; tokens return only
-after the final clone drops. This prevents work from escaping admission merely
-because its lifetime extends beyond `NativeDatabase::begin`. Owned and borrowed
-permits share the same counters and nested-subdivision rule.
+mutation permit before snapshot materialization or point staging. The permit
+is retained by `NativeWriteBatch` or `NativeDeltaWriteBatch` through staging,
+queueing, group or individual commit, explicit rollback, or ordinary drop.
+Both authorities are linear and have no public clone operation. Detached
+commit consumes them through the opaque `NativeCommitBatch` envelope, which
+does not expose either authority again. A detached batch is bound to the exact
+live database handle that acquired its lease. A foreign, peer, dropped-owner,
+or reopened handle cannot stage or publish it, even when it names the same
+directory.
+
+Point-resolved all-engine delta batches maintain a conservative aggregate
+retained-memory ledger for their in-scope SQL, scalar, lexical, and exact-field
+V3 Hash state. The checked parent is the batch's admitted mutation memory,
+bounded above by the fixed 32 MiB mutation request. Hash-field state also has
+an 8 MiB sub-budget inside that aggregate limit. The model charges retained
+capacities plus conservative container and mutation overheads, replays at
+commit, and fails closed before publication. It is deliberately not described
+as allocation-exact or RSS-exact.
+
+The legacy Product rollback seam creates an opaque materialized candidate that
+shares the source's primary permit internally and holds a separate memory-only
+reservation for the deep copy. Successful handoff must consume the exact
+source lineage before releasing that temporary memory; failure drops the
+candidate and leaves the source unchanged. This legacy reservation is nominal,
+not derived from the materialized state's retained size or the transaction
+plan, and remains P6 debt. Point-resolved delta, maintenance, and ANN batches
+cannot use it. Owned and borrowed permits share the same counters and
+nested-subdivision rule.
 
 Expiry sweep, structure compaction, lexical-search compaction, ANN consolidation
 planning, and ANN consolidation publication hold maintenance permits across
@@ -156,8 +179,22 @@ affinity to their declared processor cannot be installed. Platforms without
 complete placement use one explicit unbound portable pool rather than
 inventing NUMA identity.
 
-`NativeExecutionPool` owns persistent workers and one FIFO per NUMA node.
-Workers consume their local queue first and may steal only when it is empty.
+`NativeExecutionPool` owns persistent workers and one queue per NUMA node.
+Every job retains its governor workload class and enqueue instant. Local work
+is eligible immediately. Cross-node work is eligible only after the directed
+threshold embedded in `numa_steal_policy`: the ceiling, in nanoseconds, of the
+measured remote-minus-local median for the frozen 8 MiB first-touch scan. The
+threshold is therefore a direct calibration consequence, not a hand-tuned
+constant. Missing or incomplete multi-node calibration disables cross-node
+stealing; single-pool and portable placement record `not-applicable`.
+
+Eligible foreground point/mutation work precedes bounded foreground work,
+which precedes background work. Aging applies at both boundaries: after
+`foreground_burst_limit` high-priority dispatches while bounded foreground is
+waiting, bounded work is forced; after the same number of foreground
+dispatches while background is waiting, background progress is forced.
+Workers use the original enqueue instant, so new arrivals cannot reset a
+remote maintenance deadline.
 Every submitted deterministic batch owns an `OwnedNestedGovernorPermit`; all
 child permits are reserved before the first job is dispatched, so partial
 admission never launches partial work. Panicking operations are contained,
@@ -203,13 +240,16 @@ family connected to the persistent executor.
 
 ## Open P2 work
 
-This slice does not claim P2 closure. The remaining work is to route any proof
-and long-running administrative surfaces outside this crate through the same
-authority; replace fixed arena envelopes with request-plan memory accounting;
-extend engine work receipts beyond exact ANN and relational ranges; connect the
-pool to bulk build, additional SQL, structures, and lexical operators; derive a calibrated cross-node steal
-threshold; and run measured interference and physical-core/SMT scaling
-matrices.
+This slice does not claim P2 closure. The composite checker now validates
+profile, calibration, policy, topology, exact source, and executable identity
+as one scheduler authority. Remaining work is to route proof and other
+long-running surfaces through it; replace remaining fixed arena and
+all-engine hydration envelopes with request-plan or complete-footprint memory
+accounting; extend receipts to lexical, hybrid, and additional SQL operators;
+connect calibrated NUMA placement to every production data-home planner; and run measured interference
+and physical-core/SMT scaling matrices. Initial ANN bulk construction and the
+current segmented SQL/structure ranges already use the persistent pool and are
+not pending connections.
 Deterministic concurrency 1/8/32/64, queue saturation, cancellation, foreground
 preference, and forced background-progress tests now cover the in-process
 admission invariant, but they are not a substitute for bare-metal latency

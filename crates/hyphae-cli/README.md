@@ -25,6 +25,6 @@ past their limit, and rejected when a regular file's observed length changes.
 The remote CLI's 4 MiB request and 32 MiB proof JSON ceilings are fixed; it
 does not negotiate larger custom-server values from capabilities.
 
-Code is GPL-3.0-only; documentation is CC-BY-SA-4.0. Quickstart, release
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Quickstart, release
 verification, and security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

@@ -16,7 +16,7 @@ allow = [
     # Mozilla/CCADB root-certificate data bundled by webpki-roots.
     "CDLA-Permissive-2.0",
     # Hyphae workspace packages.
-    "GPL-3.0-only",
+    "AGPL-3.0-only",
     "ISC",
     "MIT",
     "MPL-2.0",

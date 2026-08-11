@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/contracts/json-schema/native-performance-progress-v1.schema.json",
   "title": "Hyphae Native performance progress v1",
   "type": "object",
@@ -17,7 +18,8 @@
     "unit",
     "elapsed_nanos",
     "status",
-    "checkpoint_digest"
+    "checkpoint_digest",
+    "details"
   ],
   "properties": {
     "schema": {"const": "hyphae-native-performance-progress-v1"},
@@ -37,10 +39,32 @@
         {"type": "null"},
         {"$ref": "#/$defs/sha256"}
       ]
+    },
+    "details": {
+      "type": "object",
+      "required": ["eta"],
+      "properties": {
+        "eta": {"$ref": "#/$defs/eta"}
+      },
+      "additionalProperties": true
     }
   },
   "$defs": {
     "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "eta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "estimated_remaining_nanos"],
+      "properties": {
+        "status": {"enum": ["pending", "estimated", "completed"]},
+        "estimated_remaining_nanos": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 0}
+          ]
+        }
+      }
+    }
   }
 }

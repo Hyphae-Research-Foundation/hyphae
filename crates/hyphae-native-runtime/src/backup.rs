@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bounded, offline backup and restore for the native data directory.
 
@@ -1146,7 +1146,7 @@ mod tests {
         let governor = Arc::new(NativeResourceGovernor::new(
             crate::tests::engine_admission_test_policy(),
         ));
-        database.set_resource_governor(Arc::clone(&governor));
+        database.set_resource_governor(Arc::clone(&governor))?;
         let held = governor.try_admit(
             WorkloadClass::Administrative,
             GovernorRequest {

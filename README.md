@@ -16,7 +16,7 @@
   <a href="https://docs.rs/hyphae-engine"><img alt="docs.rs" src="https://img.shields.io/docsrs/hyphae-engine?logo=docs.rs"></a>
   <a href="https://github.com/celiumsai/hyphae/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/celiumsai/hyphae?logo=github"></a>
   <a href="https://hyphae.dev"><img alt="Website" src="https://img.shields.io/badge/website-hyphae.dev-8FCBC6"></a>
-  <a href="LICENSE-POLICY.md"><img alt="License" src="https://img.shields.io/badge/code-GPL--3.0--only-C86F4A"></a>
+  <a href="LICENSE-POLICY.md"><img alt="License" src="https://img.shields.io/badge/code-AGPL--3.0--only-C86F4A"></a>
   <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
 </p>
 
@@ -253,7 +253,7 @@ this project.
 
 ## License
 
-Software is licensed under [GPL-3.0-only](LICENSE); documentation is licensed
+Software is licensed under [AGPL-3.0-only](LICENSE); documentation is licensed
 under [CC-BY-SA-4.0](LICENSE-DOCUMENTATION). See the
 [licensing policy](LICENSE-POLICY.md), [NOTICE](NOTICE), and
 [third-party notices](THIRD_PARTY_NOTICES.md). Releases through `v1.0.1`

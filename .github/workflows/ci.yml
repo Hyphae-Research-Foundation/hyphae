@@ -47,7 +47,7 @@ jobs:
           PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "$(git rev-parse HEAD)" \
-            --output native-g7-g8-readiness-audit.json
+            --output "$RUNNER_TEMP/native-g7-g8-readiness-audit.json"
       - name: Verify Native performance evidence contract
         run: |
           PYTHONPATH=. python -m unittest \
@@ -56,8 +56,11 @@ jobs:
             tools.test_check_native_hardware_calibration \
             tools.test_check_native_execution_topology \
             tools.test_check_native_governor_policy \
+            tools.test_check_native_scheduler_authority \
             tools.test_check_native_performance_receipt \
             tools.test_check_native_vector_bulk_bakeoff \
+            tools.test_check_native_ann_durable_qualification \
+            tools.test_run_native_ann_durable_qualification \
             tools.test_run_native_g7 \
             tools.test_run_native_performance_baseline \
             -v
@@ -80,6 +83,11 @@ jobs:
           components: clippy,rustfmt
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Verify local durable ANN qualification
+        run: |
+          PYTHONPATH=. python tools/run_native_ann_durable_qualification.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --output-dir "$RUNNER_TEMP/native-ann-durable-qualification"
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy

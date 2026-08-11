@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 from .client import ApiResponse, HyphaeApiError, HyphaeClient, HyphaeClientError
 from .generated import *  # noqa: F403

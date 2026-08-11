@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Fail when optional integrations cross Hyphae's public boundary."""
 
 from __future__ import annotations

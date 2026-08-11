@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 import copy
 import unittest
@@ -23,6 +23,62 @@ def receipt() -> dict:
             "provider": "process-interval-atomic-counters",
         },
     }
+    cells = {
+        name: dict(cell)
+        for name in {
+            "embedded-structure-point-get",
+            "embedded-prepared-sql-primary-key",
+            "local-structure-point-get",
+            "local-prepared-sql-primary-key",
+            "indexed-sql-bounded-read",
+            "two-index-join-bounded-read",
+            "bm25-top10",
+            "filtered-bm25-top10",
+            "ann-top10-recall-095",
+            "hybrid-top10",
+            "strict-group-commit",
+        }
+    }
+    cells["ann-top10-recall-095"].update({
+        "per_query_worker_limit": 44,
+        "query_queue_wait_millis": 60_000,
+        "preferred_partition_budget": 32,
+        "ann_routing_interval": {
+            "observations": 1_000_000,
+            "execution_workers_max": 8,
+            "execution_worker_batches_max": 32,
+            "execution_waves_max": 1,
+            "selected_certified": 1_000_000,
+            "full_fanout_requested": 0,
+            "full_fanout_budget_fallback": 0,
+            "single_generation_fallback": 0,
+            "next_partition_lower_bound_present": 1_000_000,
+        },
+        "post_open_hydration_performed": False,
+        "post_open_physical_page_reads": 0,
+        "post_open_restore_count": 0,
+        "ann_read_view_query_interval": {
+            "physical_page_reads": 0,
+            "index_scoped_restores": 0,
+            "provider": "database-page-counter-plus-process-ann-restore-counter",
+        },
+        "ann_read_view_open": {
+            "root_identity": "5" * 64,
+            "base_build_identity": "6" * 64,
+            "view_identity": "7" * 64,
+            "routing_policy_identity": "8" * 64,
+            "logical_partitions": 64,
+            "planned_physical_entries": 1_000_000,
+            "planned_physical_bytes": 1_000_000_000,
+            "observed_physical_entries": 1_000_000,
+            "observed_physical_bytes": 1_000_000_000,
+            "planned_peak_memory_bytes": 2_000_000_000,
+            "retained_memory_bytes": 1_000_000_000,
+            "hydration_restore_count": 1,
+            "process_physical_page_read_delta": 1_000,
+            "governor_generation": 1,
+        },
+    })
     return {
         "schema": "hyphae-native-g7-receipt-v3",
         "gate": "G7",
@@ -79,10 +135,11 @@ def receipt() -> dict:
             "source_commit": "a" * 40,
             "dataset_digest": "b" * 64,
             "builder": "partitioned-hnsw-v1",
+            "partition_policy": "g7-fixed-64-logical-partitions-v1",
             "input_identity": "1" * 64,
             "aggregate_identity": "2" * 64,
             "planned_vectors": 1_000_000,
-            "planned_partitions": 48,
+            "planned_partitions": 64,
             "planned_workers": 44,
             "planned_memory_bytes": 4_000_000_000,
             "worker_batches": 48,
@@ -118,19 +175,7 @@ def receipt() -> dict:
             "background_services": "disabled",
             "virtualization": "none",
         },
-        "cells": {name: dict(cell) for name in {
-            "embedded-structure-point-get",
-            "embedded-prepared-sql-primary-key",
-            "local-structure-point-get",
-            "local-prepared-sql-primary-key",
-            "indexed-sql-bounded-read",
-            "two-index-join-bounded-read",
-            "bm25-top10",
-            "filtered-bm25-top10",
-            "ann-top10-recall-095",
-            "hybrid-top10",
-            "strict-group-commit",
-        }},
+        "cells": cells,
         "counters": {
             name: {
                 "status": "measured",
@@ -187,6 +232,50 @@ class G7ReceiptTests(unittest.TestCase):
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
 
+    def test_ann_cell_requires_durable_read_view_and_worker_budget(self) -> None:
+        payload = receipt()
+        del payload["cells"]["ann-top10-recall-095"]["ann_read_view_open"]
+        with self.assertRaisesRegex(GateFailure, "read-view open receipt"):
+            validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["ann-top10-recall-095"]["per_query_worker_limit"] = 0
+        with self.assertRaisesRegex(GateFailure, "per-query worker limit"):
+            validate(payload, "a" * 40)
+
+    def test_ann_cell_rejects_any_post_open_storage_or_restore_work(self) -> None:
+        for field, value in (
+            ("post_open_hydration_performed", True),
+            ("post_open_physical_page_reads", 1),
+            ("post_open_restore_count", 1),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["ann-top10-recall-095"][field] = value
+                with self.assertRaisesRegex(GateFailure, "after read-view open"):
+                    validate(payload, "a" * 40)
+
+    def test_ann_cell_rejects_fallback_full_fanout_and_incomplete_aggregation(self) -> None:
+        for field, value in (
+            ("full_fanout_budget_fallback", 1),
+            ("full_fanout_requested", 1),
+            ("selected_certified", 999_999),
+            ("execution_waves_max", 2),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["ann-top10-recall-095"]["ann_routing_interval"][field] = value
+                with self.assertRaisesRegex(GateFailure, "selected-certified"):
+                    validate(payload, "a" * 40)
+
+    def test_ann_cell_rejects_claimed_hydration_without_measured_restore(self) -> None:
+        payload = receipt()
+        payload["cells"]["ann-top10-recall-095"]["ann_read_view_open"][
+            "hydration_restore_count"
+        ] = 0
+        with self.assertRaisesRegex(GateFailure, "contradicts"):
+            validate(payload, "a" * 40)
+
     def test_initial_bulk_accepts_compute_only_governor_request(self) -> None:
         payload = receipt()
         self.assertEqual(payload["initial_ann_bulk"]["governor_execution"]["io_slots"], 0)
@@ -240,10 +329,18 @@ class G7ReceiptTests(unittest.TestCase):
 
     def test_initial_bulk_rejects_unrepresentable_partition_count(self) -> None:
         payload = receipt()
-        payload["initial_ann_bulk"]["planned_partitions"] = 222
-        payload["initial_ann_bulk"]["topology_workers"] = 222
+        payload["initial_ann_bulk"]["planned_partitions"] = 112
         with self.assertRaisesRegex(GateFailure, "parallel construction"):
             validate(payload, "a" * 40)
+
+    def test_large_topology_does_not_change_logical_partition_layout(self) -> None:
+        payload = receipt()
+        bulk = payload["initial_ann_bulk"]
+        bulk["topology_workers"] = 256
+        bulk["planned_workers"] = 64
+        bulk["worker_batches"] = 64
+        bulk["governor_execution"]["compute_threads"] = 64
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
 
     def test_valid_dedicated_darwin_receipt(self) -> None:
         payload = receipt()

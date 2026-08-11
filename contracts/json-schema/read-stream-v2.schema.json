@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/contracts/read-stream-v2.schema.json",
   "title": "NativeReadStreamRecordV2",
   "description": "One NDJSON record. Data records are provisional until the mandatory completion record arrives.",

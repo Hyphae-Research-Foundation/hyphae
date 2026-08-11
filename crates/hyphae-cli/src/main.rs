@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Command-line entry point for the single native Hyphae executable.
 
@@ -1443,8 +1443,9 @@ fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
                 serde_json::from_slice(&encoded).map_err(|_| CliFailure::invalid())?;
             let policy = NativeGovernorPolicy::derive(&profile, &calibration, mode.into())
                 .map_err(|_| CliFailure::invalid())?;
-            let topology = NativeExecutionTopology::derive(&profile, &policy)
-                .map_err(|_| CliFailure::invalid())?;
+            let topology =
+                NativeExecutionTopology::derive_with_calibration(&profile, &policy, &calibration)
+                    .map_err(|_| CliFailure::invalid())?;
             print_json(&serde_json::to_value(topology)?)
         }
     }

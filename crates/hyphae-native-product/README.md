@@ -7,4 +7,4 @@ This crate exposes bounded SQL, structure, search, catalog, administration,
 backup, doctor, telemetry, and proof operations without requiring a transport
 or external service.
 
-Code is GPL-3.0-only; documentation is CC-BY-SA-4.0.
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0.

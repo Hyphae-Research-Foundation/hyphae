@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Dedicated embedded G5 evidence for one relational/structure/lexical/ANN transaction.
 

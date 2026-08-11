@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bounded active calibration for hardware-aware Native kernel selection.
 
@@ -512,7 +512,13 @@ impl HardwareCalibration {
         measure_vector_primitives(&mut measurements, policy);
         measure_byte_primitives(&mut measurements, policy);
         measure_memory_primitives(&mut measurements, policy);
-        measure_numa_memory(profile, &mut measurements, &mut unsupported, policy);
+        measure_numa_memory(
+            profile,
+            &mut measurements,
+            &mut unsupported,
+            policy,
+            started,
+        );
         measure_engine_primitives(&mut measurements, policy)?;
         measure_thread_scaling(profile, &mut measurements, &mut unsupported, policy)?;
         measure_storage_primitives(profile, &mut measurements, &mut unsupported, policy)?;
@@ -672,15 +678,22 @@ fn measure_numa_memory(
     measurements: &mut Vec<CalibrationMeasurement>,
     unsupported: &mut Vec<UnsupportedCalibration>,
     policy: CalibrationPolicy,
+    calibration_started: Instant,
 ) {
     #[cfg(target_os = "linux")]
     {
-        measure_linux_numa_memory(profile, measurements, unsupported, policy);
+        measure_linux_numa_memory(
+            profile,
+            measurements,
+            unsupported,
+            policy,
+            calibration_started,
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (profile, measurements, policy);
+        let _ = (profile, measurements, policy, calibration_started);
         unsupported.push(UnsupportedCalibration {
             primitive: "numa-local-remote-memory".to_owned(),
             reason: "the current operating system has no safe NUMA affinity adapter".to_owned(),
@@ -694,94 +707,126 @@ fn measure_linux_numa_memory(
     measurements: &mut Vec<CalibrationMeasurement>,
     unsupported: &mut Vec<UnsupportedCalibration>,
     policy: CalibrationPolicy,
+    calibration_started: Instant,
 ) {
     const WORKING_SET_BYTES: usize = 8 * 1_024 * 1_024;
-    let Some((source_node, source_cpu, remote_node, remote_cpu)) =
-        representative_numa_pair(profile)
-    else {
+    let nodes = representative_numa_nodes(profile);
+    if nodes.len() < 2 {
         unsupported.push(UnsupportedCalibration {
             primitive: "numa-local-remote-memory".to_owned(),
             reason: "fewer than two process-visible NUMA nodes expose usable processors".to_owned(),
         });
         return;
+    }
+
+    let Some(_residency_provider) = safe_numa_residency_provider() else {
+        unsupported.push(UnsupportedCalibration {
+            primitive: "numa-local-remote-memory".to_owned(),
+            reason: "page residency cannot be proven by the current safe Linux adapter; first-touch timing alone is not scheduling evidence".to_owned(),
+        });
+        return;
+    };
+    let Some(deadline) = numa_calibration_deadline(calibration_started, policy.maximum_duration_ms)
+    else {
+        unsupported.push(UnsupportedCalibration {
+            primitive: "numa-local-remote-memory".to_owned(),
+            reason: "NUMA calibration deadline overflowed before the directed matrix".to_owned(),
+        });
+        return;
     };
 
-    let input = match first_touch_input(source_cpu, WORKING_SET_BYTES) {
-        Ok(input) => input,
-        Err(reason) => {
+    let mut matrix = Vec::with_capacity(nodes.len().saturating_mul(nodes.len()));
+    for (source_node, source_cpu) in &nodes {
+        if numa_deadline_reached(deadline, Instant::now()) {
             unsupported.push(UnsupportedCalibration {
                 primitive: "numa-local-remote-memory".to_owned(),
-                reason,
+                reason: "NUMA calibration reached its cooperative deadline before completing the directed matrix".to_owned(),
             });
             return;
         }
-    };
-    let expected = sequential_sum_reference(&input);
-    let local = match CalibrationPinnedMemoryReader::create(source_cpu, Arc::clone(&input)) {
-        Ok(reader) => reader,
-        Err(reason) => {
-            unsupported.push(UnsupportedCalibration {
-                primitive: "numa-local-remote-memory".to_owned(),
-                reason,
-            });
-            return;
+        let input = match first_touch_input(*source_cpu, WORKING_SET_BYTES) {
+            Ok(input) => input,
+            Err(reason) => {
+                unsupported.push(UnsupportedCalibration {
+                    primitive: "numa-local-remote-memory".to_owned(),
+                    reason,
+                });
+                return;
+            }
+        };
+        let expected = sequential_sum_reference(&input);
+        for (reader_node, reader_cpu) in &nodes {
+            if numa_deadline_reached(deadline, Instant::now()) {
+                unsupported.push(UnsupportedCalibration {
+                    primitive: "numa-local-remote-memory".to_owned(),
+                    reason: "NUMA calibration reached its cooperative deadline before completing the directed matrix".to_owned(),
+                });
+                return;
+            }
+            let reader =
+                match CalibrationPinnedMemoryReader::create(*reader_cpu, Arc::clone(&input)) {
+                    Ok(reader) => reader,
+                    Err(reason) => {
+                        unsupported.push(UnsupportedCalibration {
+                            primitive: "numa-local-remote-memory".to_owned(),
+                            reason,
+                        });
+                        return;
+                    }
+                };
+            let variant = format!(
+                "linux-first-touch-node-{source_node}-read-node-{reader_node}-cpu-{reader_cpu}"
+            );
+            matrix.push(measure_u64(
+                &MeasurementSpec::new(
+                    "numa-memory-read",
+                    &variant,
+                    WORKING_SET_BYTES,
+                    "working-set-bytes",
+                    WORKING_SET_BYTES,
+                )
+                .with_operation_cap(64),
+                policy,
+                || reader.execute(),
+                expected,
+            ));
         }
-    };
-    let remote = match CalibrationPinnedMemoryReader::create(remote_cpu, Arc::clone(&input)) {
-        Ok(reader) => reader,
-        Err(reason) => {
-            unsupported.push(UnsupportedCalibration {
-                primitive: "numa-local-remote-memory".to_owned(),
-                reason,
-            });
-            return;
-        }
-    };
-
-    let local_variant =
-        format!("linux-first-touch-node-{source_node}-read-node-{source_node}-cpu-{source_cpu}");
-    measurements.push(measure_u64(
-        &MeasurementSpec::new(
-            "numa-memory-read",
-            &local_variant,
-            WORKING_SET_BYTES,
-            "working-set-bytes",
-            WORKING_SET_BYTES,
-        )
-        .with_operation_cap(64),
-        policy,
-        || local.execute(),
-        expected,
-    ));
-    let remote_variant =
-        format!("linux-first-touch-node-{source_node}-read-node-{remote_node}-cpu-{remote_cpu}");
-    measurements.push(measure_u64(
-        &MeasurementSpec::new(
-            "numa-memory-read",
-            &remote_variant,
-            WORKING_SET_BYTES,
-            "working-set-bytes",
-            WORKING_SET_BYTES,
-        )
-        .with_operation_cap(64),
-        policy,
-        || remote.execute(),
-        expected,
-    ));
+    }
+    measurements.extend(matrix);
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn representative_numa_pair(profile: &HardwareProfile) -> Option<(u32, usize, u32, usize)> {
-    let mut nodes = profile.memory.numa_nodes.iter().filter_map(|node| {
-        let cpu = crate::hardware::parse_cpu_list(&node.cpu_list)
-            .into_iter()
-            .next()
-            .and_then(|cpu| usize::try_from(cpu).ok())?;
-        Some((node.id, cpu))
-    });
-    let (source_node, source_cpu) = nodes.next()?;
-    let (remote_node, remote_cpu) = nodes.find(|(node, _)| *node != source_node)?;
-    Some((source_node, source_cpu, remote_node, remote_cpu))
+fn numa_calibration_deadline(started: Instant, maximum_duration_ms: u64) -> Option<Instant> {
+    started.checked_add(Duration::from_millis(maximum_duration_ms))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn numa_deadline_reached(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn safe_numa_residency_provider() -> Option<&'static str> {
+    // Affinity proves where the touching thread ran, not where Linux retained
+    // every page. Until a safe provider can bind and audit the exact mapping,
+    // the scheduler must not consume first-touch timing as NUMA authority.
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn representative_numa_nodes(profile: &HardwareProfile) -> Vec<(u32, usize)> {
+    profile
+        .memory
+        .numa_nodes
+        .iter()
+        .filter_map(|node| {
+            let cpu = crate::hardware::parse_cpu_list(&node.cpu_list)
+                .into_iter()
+                .next()
+                .and_then(|cpu| usize::try_from(cpu).ok())?;
+            Some((node.id, cpu))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -2381,9 +2426,57 @@ impl HardwareCalibration {
             && self.thread_scaling.recommended_worker_count.is_some()
             && self.io_scaling.status == "stable"
             && self.io_scaling.recommended_io_slots.is_some()
+            && reusable_numa_coverage(&self.measurements, &self.coverage)
             && selections_match_measurements(&self.selected_kernels, &self.measurements)
             && self.claims.is_empty()
     }
+}
+
+fn reusable_numa_coverage(
+    measurements: &[CalibrationMeasurement],
+    coverage: &CalibrationCoverage,
+) -> bool {
+    let cells = measurements
+        .iter()
+        .filter(|measurement| measurement.primitive == "numa-memory-read")
+        .collect::<Vec<_>>();
+    let unsupported = coverage
+        .unsupported
+        .iter()
+        .any(|entry| entry.primitive == "numa-local-remote-memory");
+    if cells.is_empty() {
+        return unsupported;
+    }
+    if unsupported {
+        return false;
+    }
+    let pairs = cells
+        .iter()
+        .filter_map(|measurement| parse_numa_measurement_variant(&measurement.variant))
+        .collect::<BTreeSet<_>>();
+    if pairs.len() != cells.len() {
+        return false;
+    }
+    let sources = pairs
+        .iter()
+        .map(|(source, _)| *source)
+        .collect::<BTreeSet<_>>();
+    let readers = pairs
+        .iter()
+        .map(|(_, reader)| *reader)
+        .collect::<BTreeSet<_>>();
+    let Some(expected_cells) = sources.len().checked_mul(sources.len()) else {
+        return false;
+    };
+    sources.len() >= 2 && sources == readers && pairs.len() == expected_cells
+}
+
+fn parse_numa_measurement_variant(variant: &str) -> Option<(u32, u32)> {
+    let rest = variant.strip_prefix("linux-first-touch-node-")?;
+    let (source, rest) = rest.split_once("-read-node-")?;
+    let (reader, cpu) = rest.split_once("-cpu-")?;
+    let _cpu = cpu.parse::<u32>().ok()?;
+    Some((source.parse().ok()?, reader.parse().ok()?))
 }
 
 fn selections_match_measurements(
@@ -2842,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn representative_numa_pair_uses_distinct_visible_nodes() -> Result<(), Box<dyn StdError>> {
+    fn representative_numa_nodes_cover_every_visible_node() -> Result<(), Box<dyn StdError>> {
         let directory = std::env::temp_dir().join(format!(
             "hyphae-calibration-numa-pair-{}",
             std::process::id()
@@ -2863,11 +2956,26 @@ mod tests {
                 available_bytes: Some(512),
             },
         ];
-        assert_eq!(representative_numa_pair(&profile), Some((2, 8, 7, 32)));
+        assert_eq!(representative_numa_nodes(&profile), vec![(2, 8), (7, 32)]);
         profile.memory.numa_nodes.truncate(1);
-        assert_eq!(representative_numa_pair(&profile), None);
+        assert_eq!(representative_numa_nodes(&profile), vec![(2, 8)]);
         fs::remove_dir_all(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn numa_deadline_is_checked_at_every_directed_cell_boundary() -> Result<(), Box<dyn StdError>> {
+        let started = Instant::now();
+        let deadline = numa_calibration_deadline(started, 1)
+            .ok_or_else(|| io::Error::other("test deadline overflow"))?;
+        assert!(!numa_deadline_reached(deadline, started));
+        assert!(numa_deadline_reached(deadline, deadline));
+        Ok(())
+    }
+
+    #[test]
+    fn first_touch_affinity_is_not_accepted_as_residency_evidence() {
+        assert_eq!(safe_numa_residency_provider(), None);
     }
 
     #[test]
@@ -2970,6 +3078,38 @@ mod tests {
         Ok(())
     }
 
+    fn assert_mandatory_calibration_coverage(receipt: &HardwareCalibration) {
+        for primitive in [
+            "btree-page-lookup",
+            "posting-decode",
+            "bitmap-intersection",
+            "arena-allocation",
+            "channel-handoff",
+            "buffered-append",
+            "data-sync-append",
+            "full-sync-append",
+            "random-page-read",
+            "native-wal-append",
+            "native-wal-group-flush",
+            "thread-scaling-memory-scan",
+            "queue-depth-random-read",
+        ] {
+            assert!(
+                receipt
+                    .measurements
+                    .iter()
+                    .any(|measurement| measurement.primitive == primitive)
+            );
+            assert!(
+                receipt
+                    .coverage
+                    .unsupported
+                    .iter()
+                    .all(|entry| entry.primitive != primitive)
+            );
+        }
+    }
+
     #[test]
     fn short_calibration_is_schema_shaped_and_claim_free() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -3002,7 +3142,15 @@ mod tests {
             .iter()
             .filter(|measurement| measurement.primitive == "numa-memory-read")
             .count();
-        assert!(matches!(numa_measurements, 0 | 2));
+        assert!(
+            numa_measurements == 0
+                || numa_measurements
+                    == profile
+                        .memory
+                        .numa_nodes
+                        .len()
+                        .saturating_mul(profile.memory.numa_nodes.len())
+        );
         assert!(matches!(direct_measurements, 0 | 2));
         assert_eq!(
             receipt.measurements.len(),
@@ -3042,35 +3190,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.primitive == "thread-affinity-and-numa-scaling")
         );
-        for primitive in [
-            "btree-page-lookup",
-            "posting-decode",
-            "bitmap-intersection",
-            "arena-allocation",
-            "channel-handoff",
-            "buffered-append",
-            "data-sync-append",
-            "full-sync-append",
-            "random-page-read",
-            "native-wal-append",
-            "native-wal-group-flush",
-            "thread-scaling-memory-scan",
-            "queue-depth-random-read",
-        ] {
-            assert!(
-                receipt
-                    .measurements
-                    .iter()
-                    .any(|measurement| measurement.primitive == primitive)
-            );
-            assert!(
-                receipt
-                    .coverage
-                    .unsupported
-                    .iter()
-                    .all(|entry| entry.primitive != primitive)
-            );
-        }
+        assert_mandatory_calibration_coverage(&receipt);
         fs::remove_dir_all(directory)?;
         Ok(())
     }

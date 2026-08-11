@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Fail-closed validation for one controlled Native G7 receipt."""
 
@@ -14,7 +14,10 @@ from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-MAX_INITIAL_ANN_BULK_PARTITIONS = 221
+MAX_INITIAL_ANN_BULK_PARTITIONS = 111
+G7_LOGICAL_ANN_PARTITIONS = 64
+G7_PREFERRED_ANN_PARTITIONS = 32
+G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
 CELLS = {
     "embedded-structure-point-get",
     "embedded-prepared-sql-primary-key",
@@ -203,6 +206,11 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
     ann_recall = cells["ann-top10-recall-095"].get("recall_at_10")
     if not isinstance(ann_recall, (int, float)) or ann_recall < 0.95:
         raise GateFailure("G7 ANN recall floor was not met")
+    validate_ann_read_view_cell(
+        cells["ann-top10-recall-095"],
+        payload["initial_ann_bulk"],
+        payload["dataset"]["observations"],
+    )
     counters = payload["counters"]
     if set(counters) != COUNTERS:
         raise GateFailure("G7 counters are incomplete")
@@ -245,9 +253,103 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
     }
 
 
+def validate_ann_read_view_cell(
+    cell: Any,
+    initial_bulk: dict[str, Any],
+    expected_observations: int,
+) -> None:
+    if not isinstance(cell, dict):
+        raise GateFailure("G7 ANN cell is not an evidence object")
+    worker_limit = cell.get("per_query_worker_limit")
+    if (
+        not isinstance(worker_limit, int)
+        or isinstance(worker_limit, bool)
+        or worker_limit <= 0
+        or worker_limit
+        > min(G7_LOGICAL_ANN_PARTITIONS, initial_bulk["topology_workers"])
+    ):
+        raise GateFailure("G7 ANN cell omitted its governed per-query worker limit")
+    queue_wait = cell.get("query_queue_wait_millis")
+    if (
+        not isinstance(queue_wait, int)
+        or isinstance(queue_wait, bool)
+        or queue_wait <= 0
+    ):
+        raise GateFailure("G7 ANN cell omitted its bounded queue wait")
+    view = cell.get("ann_read_view_open")
+    fields = {
+        "root_identity", "base_build_identity", "view_identity", "routing_policy_identity",
+        "logical_partitions", "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "planned_peak_memory_bytes", "retained_memory_bytes",
+        "hydration_restore_count", "process_physical_page_read_delta",
+        "governor_generation",
+    }
+    if not isinstance(view, dict) or set(view) != fields:
+        raise GateFailure("G7 ANN cell omitted its durable read-view open receipt")
+    for name in (
+        "root_identity", "base_build_identity", "view_identity", "routing_policy_identity",
+    ):
+        if not isinstance(view[name], str) or HEX64.fullmatch(view[name]) is None:
+            raise GateFailure(f"G7 ANN read-view identity is invalid: {name}")
+    for name in (
+        "logical_partitions", "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "planned_peak_memory_bytes", "retained_memory_bytes", "governor_generation",
+    ):
+        value = view[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise GateFailure(f"G7 ANN read-view resource is invalid: {name}")
+    for name in ("hydration_restore_count", "process_physical_page_read_delta"):
+        value = view[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise GateFailure(f"G7 ANN read-view open counter is invalid: {name}")
+    if (
+        view["logical_partitions"] != initial_bulk["planned_partitions"]
+        or view["hydration_restore_count"] != 1
+        or view["observed_physical_entries"] > view["planned_physical_entries"]
+        or view["observed_physical_bytes"] > view["planned_physical_bytes"]
+        or view["retained_memory_bytes"] > view["planned_peak_memory_bytes"]
+    ):
+        raise GateFailure("G7 ANN read-view open receipt contradicts its durable plan")
+    if cell.get("ann_read_view_query_interval") != {
+        "physical_page_reads": 0,
+        "index_scoped_restores": 0,
+        "provider": "database-page-counter-plus-process-ann-restore-counter",
+    }:
+        raise GateFailure("G7 ANN read view crossed its hydration boundary")
+    if (
+        cell.get("post_open_hydration_performed") is not False
+        or cell.get("post_open_physical_page_reads") != 0
+        or cell.get("post_open_restore_count") != 0
+    ):
+        raise GateFailure("G7 ANN cell performed storage or restore work after read-view open")
+    routing = cell.get("ann_routing_interval")
+    observations = routing.get("observations") if isinstance(routing, dict) else None
+    if (
+        cell.get("preferred_partition_budget") != G7_PREFERRED_ANN_PARTITIONS
+        or not isinstance(observations, int)
+        or isinstance(observations, bool)
+        or observations != expected_observations
+        or routing.get("selected_certified") != observations
+        or routing.get("full_fanout_requested") != 0
+        or routing.get("full_fanout_budget_fallback") != 0
+        or routing.get("single_generation_fallback") != 0
+        or routing.get("next_partition_lower_bound_present") != observations
+        or not isinstance(routing.get("execution_workers_max"), int)
+        or routing["execution_workers_max"] <= 0
+        or routing["execution_workers_max"] > worker_limit
+        or not isinstance(routing.get("execution_worker_batches_max"), int)
+        or routing["execution_worker_batches_max"] <= 0
+        or routing["execution_worker_batches_max"] > G7_PREFERRED_ANN_PARTITIONS
+        or routing.get("execution_waves_max") != 1
+    ):
+        raise GateFailure("G7 ANN routing interval was not selected-certified")
+
+
 def validate_initial_ann_bulk(evidence: Any, receipt: dict[str, Any]) -> None:
     fields = {
-        "schema", "source_commit", "dataset_digest", "builder", "input_identity",
+        "schema", "source_commit", "dataset_digest", "builder", "partition_policy", "input_identity",
         "aggregate_identity", "planned_vectors", "planned_partitions", "planned_workers",
         "planned_memory_bytes", "worker_batches", "total_time_nanos",
         "hardware_profile_fingerprint", "governor_policy_schema", "governor_mode",
@@ -261,6 +363,7 @@ def validate_initial_ann_bulk(evidence: Any, receipt: dict[str, Any]) -> None:
         or evidence["source_commit"] != receipt["source_commit"]
         or evidence["dataset_digest"] != receipt["dataset"]["digest"]
         or evidence["builder"] != "partitioned-hnsw-v1"
+        or evidence["partition_policy"] != G7_ANN_PARTITION_POLICY
         or evidence["governor_mode"] not in {"bulk", "mixed"}
         or not isinstance(evidence["governor_policy_schema"], str)
         or not evidence["governor_policy_schema"]
@@ -283,12 +386,14 @@ def validate_initial_ann_bulk(evidence: Any, receipt: dict[str, Any]) -> None:
             raise GateFailure(f"G7 initial ANN bulk resource is invalid: {name}")
     if (
         evidence["planned_vectors"] != receipt["dataset"]["vector_count"]
+        or evidence["planned_partitions"]
+        != min(G7_LOGICAL_ANN_PARTITIONS, evidence["planned_vectors"])
         or evidence["planned_partitions"] > evidence["planned_vectors"]
         or evidence["planned_partitions"] > MAX_INITIAL_ANN_BULK_PARTITIONS
-        or evidence["topology_workers"] > MAX_INITIAL_ANN_BULK_PARTITIONS
         or evidence["planned_workers"] > evidence["topology_workers"]
+        or evidence["planned_workers"] > evidence["planned_partitions"]
         or (
-            evidence["topology_workers"] > 1
+            min(evidence["topology_workers"], evidence["planned_partitions"]) > 1
             and evidence["planned_workers"] <= 1
         )
         or (

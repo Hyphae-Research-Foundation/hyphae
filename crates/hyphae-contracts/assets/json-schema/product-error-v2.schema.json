@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/contracts/product-error-v2.schema.json",
   "title": "ProductErrorV2",
   "description": "JSON representation with exact field parity to the Native ProductError contract.",

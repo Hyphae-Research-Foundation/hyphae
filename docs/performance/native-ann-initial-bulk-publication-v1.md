@@ -25,11 +25,11 @@ generation.
 
 The input batch must contain unique object IDs and vectors admitted by the
 catalog-bound definition. An empty input or zero requested partitions is
-rejected. The initial V4 lifecycle admits at most 221 effective child
+rejected. The initial V4 lifecycle admits at most 111 effective child
 partitions when one generation is retained. The runtime derives a lower limit
-from the catalog-bound retention policy (220 for two and 123 for 64 retained
-generations), reserving space for the initial partitioned generation, later
-single generations, and the current consolidated base. A larger effective
+from the catalog-bound retention policy (74 for two and 2 for 64 retained
+generations), reserving metadata space for both the selected generation and
+every retained generation across the first consolidation. A larger effective
 request fails before planning or governor work, rather than producing a
 candidate that cannot complete its durable lifecycle.
 

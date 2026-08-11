@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
 name: Native G7 G8 Readiness Spine
 
 on:
@@ -74,8 +76,11 @@ jobs:
             tools.test_check_native_g7_receipt \
             tools.test_check_native_g7_matrix \
             tools.test_check_native_performance_receipt \
+            tools.test_check_native_scheduler_authority \
             tools.test_run_native_g7 \
             tools.test_check_native_vector_bulk_bakeoff \
+            tools.test_check_native_ann_durable_qualification \
+            tools.test_run_native_ann_durable_qualification \
             tools.test_run_native_performance_baseline \
             -v
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
@@ -89,9 +94,44 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  g7_qualification:
+    name: Qualify durable ANN before dedicated execution
+    if: inputs.g7_mode == 'benchmark' && needs.authority.result == 'success'
+    needs: [authority]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+      - name: Run exact-source durable ANN qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python tools/run_native_ann_durable_qualification.py \
+            --expected-commit "${{ github.sha }}" \
+            --output-dir "$RUNNER_TEMP/native-ann-durable-qualification"
+      - name: Upload local durable ANN qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-ann-durable-local-${{ github.sha }}
+          path: ${{ runner.temp }}/native-ann-durable-qualification
+          if-no-files-found: warn
+          retention-days: 14
+
   g7-matrix:
     name: G7 complete dedicated ${{ inputs.g7_platform }} matrix
-    if: inputs.g7_mode == 'benchmark'
+    if: inputs.g7_mode == 'benchmark' && needs.authority.result == 'success' && needs.g7_qualification.result == 'success'
+    needs: [authority, g7_qualification]
     runs-on: [self-hosted, hyphae-g7, dedicated, "${{ inputs.g7_platform }}"]
     timeout-minutes: 720
     steps:
@@ -107,6 +147,8 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.13.7
+      - name: Install pinned scheduler authority digest tool
+        run: python -m pip install blake3==1.0.9
       - name: Discover and calibrate dedicated hardware
         if: inputs.g7_mode == 'benchmark'
         shell: bash
@@ -158,10 +200,10 @@ jobs:
           if set(measured) != expected or measured["cycles"] <= 0:
               raise SystemExit(f"perf event preflight incomplete: {measured}")
           PY
-          target/release/hyphae hardware calibrate \
-            --data-dir "$HYPHAE_G7_DATA_ROOT" \
-            --mode thorough \
-            --no-cache \
+          cargo build --manifest-path conformance/g7/runners/rust/Cargo.toml --locked --release
+          G7_RUNNER="conformance/g7/runners/rust/target/release/hyphae-native-g7-runner"
+          test -x "$G7_RUNNER"
+          "$G7_RUNNER" --hardware-calibrate "$HYPHAE_G7_DATA_ROOT" thorough \
             > "$EVIDENCE_DIR/native-g7-hardware-calibration.json"
           PYTHONPATH=. python tools/check_native_hardware_calibration.py \
             --receipt "$EVIDENCE_DIR/native-g7-hardware-calibration.json"
@@ -179,6 +221,15 @@ jobs:
             > "$EVIDENCE_DIR/native-g7-execution-topology.json"
           PYTHONPATH=. python tools/check_native_execution_topology.py \
             --topology "$EVIDENCE_DIR/native-g7-execution-topology.json"
+          PYTHONPATH=. python tools/check_native_scheduler_authority.py \
+            --profile "$EVIDENCE_DIR/native-g7-hardware-profile.json" \
+            --calibration "$EVIDENCE_DIR/native-g7-hardware-calibration.json" \
+            --policy "$EVIDENCE_DIR/native-g7-governor-policy.json" \
+            --topology "$EVIDENCE_DIR/native-g7-execution-topology.json" \
+            --mode mixed \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --executable "$G7_RUNNER" \
+            --output "$EVIDENCE_DIR/native-g7-scheduler-authority.json"
       - name: Run complete G7 matrix
         shell: bash
         env:
@@ -197,6 +248,7 @@ jobs:
             --background \
             --hardware-file "$HYPHAE_G7_HARDWARE_FILE" \
             --hardware-profile "$EVIDENCE_DIR/native-g7-hardware-profile.json" \
+            --hardware-calibration "$EVIDENCE_DIR/native-g7-hardware-calibration.json" \
             --governor-policy "$EVIDENCE_DIR/native-g7-governor-policy.json" \
             --execution-topology "$EVIDENCE_DIR/native-g7-execution-topology.json" \
             --observations 1000000 \

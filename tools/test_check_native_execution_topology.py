@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Tests for the Native execution topology semantic checker."""
 
 from __future__ import annotations
 
 import copy
+import json
 import unittest
+from pathlib import Path
 
 from tools.check_native_execution_topology import (
     ExecutionTopologyValidationError,
     validate_topology,
 )
+
+
+SCHEMA_PATH = Path("contracts/json-schema/native-execution-topology-v1.schema.json")
 
 
 def worker(index: int, node: int, logical: int, core: int) -> dict:
@@ -34,12 +39,40 @@ def valid_topology() -> dict:
             {"numa_node_id": 0, "workers": [worker(0, 0, 0, 0), worker(1, 0, 2, 1)]},
             {"numa_node_id": 1, "workers": [worker(2, 1, 4, 0), worker(3, 1, 6, 1)]},
         ],
+        "numa_steal_policy": {
+            "schema": "hyphae-native-numa-steal-policy-v1",
+            "calibration_cache_key": "2" * 64,
+            "status": "calibrated",
+            "working_set_bytes": 8 * 1024 * 1024,
+            "foreground_burst_limit": 16,
+            "pools": [
+                {
+                    "worker_numa_node_id": 0,
+                    "steal_targets": [{
+                        "home_numa_node_id": 1,
+                        "remote_to_local_latency_ppm": 2_000_000,
+                        "steal_after_nanoseconds": 1_000,
+                    }],
+                },
+                {
+                    "worker_numa_node_id": 1,
+                    "steal_targets": [{
+                        "home_numa_node_id": 0,
+                        "remote_to_local_latency_ppm": 2_000_000,
+                        "steal_after_nanoseconds": 1_000,
+                    }],
+                },
+            ],
+        },
     }
 
 
 class ExecutionTopologyCheckerTests(unittest.TestCase):
     def test_accepts_physical_and_portable_topologies(self) -> None:
-        validate_topology(valid_topology())
+        physical = valid_topology()
+        validate_topology(physical)
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(set(physical), set(schema["required"]))
         portable = valid_topology()
         portable["hard_affinity"] = False
         portable["pools"] = [{
@@ -56,6 +89,10 @@ class ExecutionTopologyCheckerTests(unittest.TestCase):
                 for index in range(4)
             ],
         }]
+        portable["numa_steal_policy"].update({
+            "status": "not-applicable",
+            "pools": [{"worker_numa_node_id": None, "steal_targets": []}],
+        })
         validate_topology(portable)
 
     def test_rejects_worker_gaps_and_cross_node_placement(self) -> None:
@@ -92,6 +129,17 @@ class ExecutionTopologyCheckerTests(unittest.TestCase):
         topology = valid_topology()
         topology["pools"][0]["workers"][0]["smt_rank"] = 1
         with self.assertRaisesRegex(ExecutionTopologyValidationError, "SMT ranks"):
+            validate_topology(topology)
+
+    def test_rejects_incomplete_or_misordered_numa_steal_targets(self) -> None:
+        topology = valid_topology()
+        topology["numa_steal_policy"]["pools"][0]["steal_targets"] = []
+        with self.assertRaisesRegex(ExecutionTopologyValidationError, "every directed"):
+            validate_topology(topology)
+
+        topology = valid_topology()
+        topology["numa_steal_policy"]["pools"][0]["worker_numa_node_id"] = 1
+        with self.assertRaisesRegex(ExecutionTopologyValidationError, "pool order"):
             validate_topology(topology)
 
 

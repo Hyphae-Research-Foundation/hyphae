@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-scheduler-authority-v1.schema.json",
+  "title": "Hyphae Native scheduler authority v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "source_commit",
+    "source_tree",
+    "executable_blake3",
+    "mode",
+    "hardware_fingerprint",
+    "calibration_cache_key",
+    "input_canonical_sha256",
+    "calibrated_worker_limit",
+    "schedulable_compute_threads",
+    "io_slots",
+    "memory_bytes",
+    "numa_pools",
+    "hard_affinity",
+    "numa_steal_policy_schema",
+    "numa_steal_status",
+    "numa_steal_thresholds",
+    "status",
+    "claims"
+  ],
+  "properties": {
+    "schema": {"const": "hyphae-native-scheduler-authority-v1"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "executable_blake3": {"$ref": "#/$defs/blake3"},
+    "mode": {"enum": ["latency", "bulk", "mixed"]},
+    "hardware_fingerprint": {"$ref": "#/$defs/blake3"},
+    "calibration_cache_key": {"$ref": "#/$defs/blake3"},
+    "input_canonical_sha256": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "calibration", "policy", "topology"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/sha256"},
+        "calibration": {"$ref": "#/$defs/sha256"},
+        "policy": {"$ref": "#/$defs/sha256"},
+        "topology": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "calibrated_worker_limit": {"type": "integer", "minimum": 1},
+    "schedulable_compute_threads": {"type": "integer", "minimum": 1},
+    "io_slots": {"type": "integer", "minimum": 1, "maximum": 64},
+    "memory_bytes": {"type": "integer", "minimum": 1},
+    "numa_pools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {"type": "integer", "minimum": 0},
+          {"type": "null"}
+        ]
+      }
+    },
+    "hard_affinity": {"type": "boolean"},
+    "numa_steal_policy_schema": {"const": "hyphae-native-numa-steal-policy-v1"},
+    "numa_steal_status": {"enum": ["not-applicable", "disabled", "calibrated"]},
+    "numa_steal_thresholds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["worker_numa_node_id", "home_numa_node_id", "remote_to_local_latency_ppm", "steal_after_nanoseconds"],
+        "properties": {
+          "worker_numa_node_id": {"type": "integer", "minimum": 0},
+          "home_numa_node_id": {"type": "integer", "minimum": 0},
+          "remote_to_local_latency_ppm": {"type": "integer", "minimum": 1},
+          "steal_after_nanoseconds": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "status": {"const": "verified"},
+    "claims": {"type": "array", "maxItems": 0}
+  },
+  "$defs": {
+    "blake3": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

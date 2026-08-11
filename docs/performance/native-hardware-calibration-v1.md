@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
+
 # Native hardware calibration v1
 
 Status: CPU, memory, engine, storage, and WAL quick/thorough slice implemented;
@@ -50,8 +52,7 @@ entries fail closed and are never overwritten silently. `cache_status` reports
 ## Measurements and rejection
 
 The active CPU, memory, engine, storage, and WAL slice measures 39 fixed cells,
-a topology-derived thread-scaling curve, the controlled I/O-depth curve, and
-two additional NUMA cells when at least two Linux nodes are process-visible:
+a topology-derived thread-scaling curve, and the controlled I/O-depth curve:
 
 - portable `f64` dot product, squared L2, and cosine at 8, 128, 384, and 1,536
   dimensions;
@@ -79,14 +80,15 @@ two additional NUMA cells when at least two Linux nodes are process-visible:
 - a persistent-worker memory-scan curve at powers of two, the effective
   physical-core boundary, and the effective logical-processor boundary.
 
-On multi-node Linux, an 8 MiB fixture is allocated and first-touched by a
-worker pinned to the representative source node. One pinned reader on that
-node and one pinned reader on a distinct visible node then scan the identical
-immutable bytes. Both cells carry canonical source-node, reader-node, and CPU
-identity in their variant. The checker requires exactly one local and one
-remote cell, the frozen working-set size, exact byte accounting, and one shared
-first-touch node. A single-node machine or affinity failure records the NUMA
-surface as explicitly unsupported instead of fabricating locality.
+First-touch plus CPU affinity does not prove where Linux retained every page.
+The current safe adapter therefore records multi-node NUMA memory calibration
+as explicitly unsupported and emits no timing cells. A future adapter may emit
+the complete directed `N x N` matrix only after proving the exact isolated VMA
+residency before and after every cell. The checker already requires identical
+source and reader sets, every directed pair exactly once, canonical picoseconds
+per operation, the frozen working set, and exact byte accounting. Measurement
+is atomic: any residency, affinity, or cooperative-deadline failure discards
+the whole matrix. Unsupported NUMA evidence disables cross-node stealing.
 
 The scaling curve respects the process affinity and cgroup CPU quota reported
 by the static profile. It tests the physical range first and adds an SMT range

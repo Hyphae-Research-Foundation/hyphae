@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 /** Parse Hyphae JSON without rounding integer tokens outside JavaScript's safe range. */
 export function parseHyphaeJson(encoded: string): unknown {

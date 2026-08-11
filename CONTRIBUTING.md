@@ -49,6 +49,6 @@ documentation, compatibility, and release procedures.
 
 Contributors must have authority to submit their work. Unless explicitly
 accepted under different terms, submitted software, tests, machine-readable
-contracts, and tooling are licensed under `GPL-3.0-only`; submitted
+contracts, and tooling are licensed under `AGPL-3.0-only`; submitted
 documentation is licensed under `CC-BY-SA-4.0`. See
 [LICENSE-POLICY.md](LICENSE-POLICY.md) for the complete scope.

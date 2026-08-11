@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Bounded synchronous client for the public Hyphae v1 HTTP API."""
 
 from __future__ import annotations

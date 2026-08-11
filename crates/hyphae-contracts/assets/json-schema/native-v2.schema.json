@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/contracts/native-v2.schema.json",
   "title": "NativeRequestV2",
   "description": "One transport-independent Hyphae Native v2 operation and execution context.",

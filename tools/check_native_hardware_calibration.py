@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 """Fail-closed semantic checker for Native hardware calibration v1."""
 
 from __future__ import annotations
@@ -408,16 +408,16 @@ def validate_io_scaling(value: Any, measurements: list[dict[str, Any]]) -> None:
             fail(f"io_scaling.{field} disagrees with the measured curve")
 
 
-def validate_numa_measurements(measurements: list[dict[str, Any]]) -> bool:
+def validate_numa_measurements(
+    measurements: list[dict[str, Any]],
+) -> dict[tuple[int, int], dict[str, Any]] | None:
     cells = [
         measurement
         for measurement in measurements
         if measurement["primitive"] == "numa-memory-read"
     ]
     if not cells:
-        return False
-    if len(cells) != 2:
-        fail("NUMA calibration must contain exactly one local and one remote cell")
+        return None
     parsed: list[tuple[dict[str, Any], re.Match[str]]] = []
     for cell in cells:
         match = NUMA_VARIANT.fullmatch(cell["variant"])
@@ -429,15 +429,32 @@ def validate_numa_measurements(measurements: list[dict[str, Any]]) -> bool:
             fail("NUMA calibration working set differs from the frozen v1 size")
         if cell["bytes_per_operation"] != cell["input_size"]:
             fail("NUMA calibration byte accounting differs from its working set")
+        if cell["statistics"]["unit"] != "picoseconds_per_operation":
+            fail("NUMA calibration timing unit is not picoseconds_per_operation")
         parsed.append((cell, match))
     source_nodes = {int(match.group("source")) for _, match in parsed}
-    if len(source_nodes) != 1:
-        fail("NUMA local and remote cells do not share one first-touch node")
-    source = next(iter(source_nodes))
-    readers = [int(match.group("reader")) for _, match in parsed]
-    if readers.count(source) != 1 or sum(reader != source for reader in readers) != 1:
-        fail("NUMA calibration must distinguish one local and one remote reader")
-    return True
+    reader_nodes = {int(match.group("reader")) for _, match in parsed}
+    if len(source_nodes) < 2 or source_nodes != reader_nodes:
+        fail("NUMA calibration must cover the same two or more source and reader nodes")
+    expected_pairs = {
+        (source, reader) for source in source_nodes for reader in reader_nodes
+    }
+    matrix: dict[tuple[int, int], dict[str, Any]] = {}
+    reader_cpus: dict[int, int] = {}
+    for cell, match in parsed:
+        source = int(match.group("source"))
+        reader = int(match.group("reader"))
+        cpu = int(match.group("cpu"))
+        pair = (source, reader)
+        if pair in matrix:
+            fail("NUMA calibration repeats one directed source/reader cell")
+        if reader in reader_cpus and reader_cpus[reader] != cpu:
+            fail("NUMA calibration uses inconsistent representative CPUs for one reader node")
+        reader_cpus[reader] = cpu
+        matrix[pair] = cell
+    if set(matrix) != expected_pairs:
+        fail("NUMA calibration must contain the complete directed node matrix")
+    fail("NUMA calibration v1 has no safe exact page-residency evidence")
 
 
 def validate_receipt(receipt: Any) -> None:
@@ -535,7 +552,7 @@ def validate_receipt(receipt: Any) -> None:
 
     validate_thread_scaling(root["thread_scaling"], measurements)
     validate_io_scaling(root["io_scaling"], measurements)
-    numa_measured = validate_numa_measurements(measurements)
+    numa_matrix = validate_numa_measurements(measurements)
 
     coverage = require_object(root["coverage"], "coverage", {"measured", "unsupported"})
     measured = coverage["measured"]
@@ -556,7 +573,7 @@ def validate_receipt(receipt: Any) -> None:
     if set(unsupported_names) & set(measured):
         fail("coverage cannot report the same primitive as measured and unsupported")
     numa_unsupported = "numa-local-remote-memory" in unsupported_names
-    if numa_measured == numa_unsupported:
+    if (numa_matrix is not None) == numa_unsupported:
         fail("NUMA calibration must be either measured or explicitly unsupported")
     if root["claims"] != []:
         fail("calibration receipts cannot carry performance claims")

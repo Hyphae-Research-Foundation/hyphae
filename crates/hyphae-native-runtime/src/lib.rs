@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! First executable convergence slice for Hyphae's native local data engine.
 //!
@@ -115,7 +115,8 @@ pub use hash_pattern::{
 };
 pub use hyphae_native_ann::{
     AnnRecallRisk, AnnSearchStrategy, HnswBuildProgress, HnswConfig, HnswPartitionPlan,
-    HnswPartitionSummary, Metric as VectorMetric, PartitionedAnnSearchResult, PartitionedHnswIndex,
+    HnswPartitionSummary, Metric as VectorMetric, PartitionedAnnRoutedSearchResult,
+    PartitionedAnnRoutingOutcome, PartitionedAnnSearchResult, PartitionedHnswIndex,
     PartitionedIndexSnapshot, SearchOptions as AnnSearchOptions, Vector, VectorHit,
     VectorIndexDefinition, VectorRecord,
 };
@@ -219,7 +220,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -228,7 +229,9 @@ use directory::NativeDirectoryGuard;
 use hyphae_native_blobs::{
     BlobError, BlobInventory, BlobRecovery, BlobReferenceSet, BlobStore, StagedBlob,
 };
-use hyphae_native_btree::{BTREE_MAX_KEY_SIZE, BTree, BTreeError, BTreeSegment};
+use hyphae_native_btree::{
+    BTREE_MAX_KEY_SIZE, BTree, BTreeError, BTreeSegment, PrefixReplacementStructuralPlan,
+};
 use hyphae_native_catalog::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, CatalogObjectKind,
     ColumnCheckOperator, ColumnDefinition, DependencyDirection, DependencyEdge, DependencyKind,
@@ -321,6 +324,20 @@ const STRUCTURE_SEGMENT_SCAN_THRESHOLD: usize = 256;
 const SEARCH_SEGMENT_SCAN_THRESHOLD: u64 = 256;
 const SEGMENT_RESULT_OVERHEAD_BYTES: u64 = 128;
 const MUTATION_MEMORY_BYTES: u64 = 32 * 1_024 * 1_024;
+// Hash deltas retain at most this sub-budget inside the batch-wide 32 MiB
+// ledger. Every delta engine and conservative operation peak is admitted and
+// replayed against the parent allocation independently of this sub-budget.
+const DELTA_HASH_MEMORY_BUDGET: u64 = 8 * 1_024 * 1_024;
+const DELTA_HASH_OVERLAY_ENTRY_OVERHEAD: u64 = 256;
+const DELTA_HASH_MUTATION_OVERHEAD: u64 = 192;
+const DELTA_TREE_ENTRY_OVERHEAD: u64 = 256;
+const DELTA_ENGINE_CONTAINER_OVERHEAD: u64 = 4 * 1_024;
+const DELTA_MUTATION_OVERHEAD: u64 = 192;
+// Delta catalog hydration intentionally uses a coarse structural ceiling.
+// Every retained decoded byte, Vec slot, String allocation, enum payload, and
+// tree node must fit inside this 512:1 envelope; definitions above roughly
+// 64 KiB therefore fail before decode under the 32 MiB parent allocation.
+const DELTA_CATALOG_DECODE_EXPANSION_BOUND: u64 = 512;
 const MAINTENANCE_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
 const RECOVERY_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
 const ADMINISTRATIVE_MEMORY_BYTES: u64 = 64 * 1_024 * 1_024;
@@ -735,6 +752,37 @@ pub enum NativeRuntimeError {
         /// Stable search-index identity requested by the caller.
         index: ObjectId,
     },
+    /// An owned ANN read view requires one governor and matching worker pool.
+    #[error("native ANN read view requires an installed governor and execution pool")]
+    AnnReadViewExecutionAuthorityRequired,
+    /// Governor replacement/removal is forbidden while owned ANN views live.
+    #[error("native database has {count} outstanding ANN read view(s)")]
+    OutstandingAnnReadViews {
+        /// Distinct live owned view states; handle clones share one state.
+        count: u64,
+    },
+    /// Governor replacement/removal is forbidden while detached writes live.
+    #[error("native database has {count} outstanding detached write batch(es)")]
+    OutstandingWriteBatches {
+        /// Distinct live batch lineages; legacy rollback candidates share one.
+        count: u64,
+    },
+    /// The database handle that owned an ANN read view has been dropped.
+    #[error("native ANN read view owner database is closed")]
+    AnnReadViewDatabaseClosed,
+    /// Query scratch planning exceeded the representable memory domain.
+    #[error("native ANN read view query scratch bound overflowed")]
+    AnnReadViewQueryMemoryOverflow,
+    /// One explicit per-query worker budget is zero or above class authority.
+    #[error(
+        "native ANN read view worker limit {requested} is outside the admitted maximum {maximum}"
+    )]
+    InvalidAnnReadViewWorkerLimit {
+        /// Worker count requested for one query.
+        requested: u64,
+        /// Foreground class and execution-pool ceiling.
+        maximum: u64,
+    },
     /// A detached write mutation cannot be reapplied to the admitted base.
     #[error("native optimistic write batch contains an invalid mutation")]
     InvalidPreparedMutation,
@@ -1047,7 +1095,10 @@ fn page_store_error_is_corruption(source: &PageStoreError) -> bool {
                 | hyphae_native_pages::PageError::DigestMismatch
         ),
         PageStoreError::InvalidFileLength { .. } | PageStoreError::PageOutsideBoundary(_) => true,
-        PageStoreError::Io(_) | PageStoreError::Poisoned | PageStoreError::PageIdExhausted => false,
+        PageStoreError::Io(_)
+        | PageStoreError::Poisoned
+        | PageStoreError::PageIdExhausted
+        | PageStoreError::InvalidRollbackBoundary { .. } => false,
     }
 }
 
@@ -1089,7 +1140,9 @@ fn btree_error_is_corruption(source: &BTreeError) -> bool {
         | BTreeError::EntryTooLarge
         | BTreeError::NoValidSplit
         | BTreeError::DuplicateKey
-        | BTreeError::ForeignSegment => false,
+        | BTreeError::ForeignSegment
+        | BTreeError::Cancelled
+        | BTreeError::PrefixContentsChanged => false,
     }
 }
 
@@ -2106,6 +2159,36 @@ struct DueStructureKey {
     key: Vec<u8>,
 }
 
+fn due_structure_mutation(due: DueStructureKey) -> Mutation {
+    Mutation {
+        engine: EngineKind::Structure,
+        opcode: match due.kind {
+            DueStructureKind::Scalar => Opcode::DeleteValue,
+            DueStructureKind::Hash => Opcode::DeleteHash,
+            DueStructureKind::Set => Opcode::DeleteSet,
+            DueStructureKind::List => Opcode::DeleteList,
+            DueStructureKind::Stream => Opcode::DeleteStream,
+            DueStructureKind::SortedSet => Opcode::DeleteSortedSet,
+            DueStructureKind::HashField => Opcode::DeleteHashField,
+        },
+        target: None,
+        key: due.key,
+        value: Vec::new(),
+        expires_at_micros: None,
+    }
+}
+
+fn structure_compaction_mutation() -> Mutation {
+    Mutation {
+        engine: EngineKind::Structure,
+        opcode: Opcode::CompactStructure,
+        target: None,
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_micros: None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OrderedDueStructure {
     expiry: i64,
@@ -2414,9 +2497,9 @@ pub struct InitialAnnBulkPublishReceipt {
     pub commit: CommitReceipt,
 }
 
-/// Maximum child generations that remain representable after one retained V4
-/// generation is created by the ordinary consolidation lifecycle.
-pub const MAX_INITIAL_ANN_BULK_PARTITIONS: usize = 221;
+/// Maximum initial child count that remains representable across the complete
+/// V4 retention lifecycle (the exact per-index cap may be lower).
+pub const MAX_INITIAL_ANN_BULK_PARTITIONS: usize = 111;
 
 fn report_initial_ann_bulk_progress(
     progress: Option<&(dyn Fn(InitialAnnBulkProgress) + Send + Sync)>,
@@ -2724,6 +2807,165 @@ pub struct AnnSearchReceipt {
     pub visited_nodes: usize,
     /// Ordered vector hits.
     pub hits: Vec<VectorHit>,
+}
+
+/// Stable identifier for metric-bound adaptive partition routing.
+pub const ANN_PARTITION_ROUTING_POLICY_V1: &str = "metric-bound-adaptive-v1";
+
+/// Durable partition-routing mode used by one explicit ANN request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnPartitionRoutingMode {
+    /// A strict subset of the durable child partitions was searched.
+    SelectedPartitions,
+    /// Every durable child partition was searched.
+    FullFanout,
+    /// The selected base is one non-partitioned generation.
+    SingleGenerationFallback,
+}
+
+/// Certified outcome of one durable partition-routing decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnPartitionRoutingOutcome {
+    /// Metric bounds certified that every omitted child cannot improve top-k.
+    SelectedCertified,
+    /// The caller budget requested every durable child.
+    FullFanoutRequested,
+    /// The preferred budget could not certify pruning, so every child ran.
+    FullFanoutBudgetFallback,
+    /// The selected base is one non-partitioned generation.
+    SingleGenerationFallback,
+}
+
+/// Runtime receipt for one explicitly routed approximate ANN query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnSelectedSearchReceipt {
+    /// Ordinary ANN execution and ordered hits.
+    pub search: AnnSearchReceipt,
+    /// Durable identity of the selected base generation.
+    pub base_build_identity: [u8; 32],
+    /// Base-plus-delta identity queried by this execution.
+    pub view_identity: [u8; 32],
+    /// Delta upserts ranked exactly alongside approximate base candidates.
+    pub exact_delta_candidates: usize,
+    /// Non-zero caller bound on child partitions searched.
+    pub requested_maximum_partitions: usize,
+    /// Child partition indexes in deterministic routing-score order.
+    pub selected_partitions: Vec<usize>,
+    /// Complete child count in the selected durable base generation.
+    pub total_partitions: usize,
+    /// Honest selected, full-fanout, or single-generation execution mode.
+    pub routing_mode: AnnPartitionRoutingMode,
+    /// Certified adaptive-routing outcome.
+    pub routing_outcome: AnnPartitionRoutingOutcome,
+    /// Bound for the first omitted partition before certification or fallback.
+    pub next_partition_lower_bound: Option<f64>,
+    /// Stable routing-policy identity for evidence aggregation.
+    pub routing_policy: &'static str,
+    /// Workers that executed child graph searches in this implementation.
+    pub execution_workers: usize,
+    /// Persistent-pool worker batches scheduled across all routing waves.
+    pub execution_worker_batches: usize,
+    /// One certified/requested wave or two waves after adaptive widening.
+    pub execution_waves: usize,
+}
+
+/// Durable base shape retained by one owned ANN read view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAnnReadBaseKind {
+    /// One non-partitioned HNSW generation.
+    Single,
+    /// One canonically ordered partitioned HNSW generation.
+    Partitioned,
+}
+
+/// One-time hydration evidence for an owned ANN read view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeAnnReadViewOpenReceipt {
+    /// Stable data-directory lineage that owns the view.
+    pub directory_identity: NativeDirectoryIdentity,
+    /// Latest commit visible to the captured root.
+    pub snapshot_csn: Option<Csn>,
+    /// Catalog version bound to the captured root.
+    pub catalog_version: CatalogVersion,
+    /// Digest of the complete captured root set.
+    pub root_identity: [u8; 32],
+    /// Exact catalog root used for the definition lookup.
+    pub catalog_root: PageId,
+    /// Exact search root used for target hydration.
+    pub search_root: PageId,
+    /// Stable catalog identity of the hydrated index.
+    pub index_id: ObjectId,
+    /// Canonical vector-index definition digest.
+    pub definition_identity: [u8; 32],
+    /// Durable single or partitioned base shape.
+    pub base_kind: NativeAnnReadBaseKind,
+    /// Ordered durable child generation identities.
+    pub child_identities: Vec<[u8; 32]>,
+    /// Aggregate durable base identity.
+    pub base_build_identity: [u8; 32],
+    /// Exact base-plus-delta view identity.
+    pub view_identity: [u8; 32],
+    /// Durable child count used by routed queries.
+    pub logical_partitions: usize,
+    /// Vectors retained in the durable base.
+    pub base_vector_count: usize,
+    /// Effective object-keyed delta records.
+    pub delta_records: usize,
+    /// Encoded bytes retained by the delta overlay.
+    pub delta_bytes: usize,
+    /// Next durable delta sequence.
+    pub next_sequence: u64,
+    /// Conservative target-prefix entry ceiling.
+    pub planned_physical_entries: usize,
+    /// Conservative target-prefix encoded-byte ceiling.
+    pub planned_physical_bytes: u64,
+    /// Target entries observed during hydration.
+    pub observed_physical_entries: usize,
+    /// Target key/value bytes observed during hydration.
+    pub observed_physical_bytes: u64,
+    /// Peak bytes admitted before the target scan.
+    pub planned_peak_memory_bytes: u64,
+    /// Memory-only allocation retained by the owned view.
+    pub retained_memory_bytes: u64,
+    /// Complete target restores performed by this open.
+    pub hydration_restore_count: u64,
+    /// Process-counter delta around hydration; concurrent readers may add to it.
+    pub process_physical_page_read_delta: u64,
+    /// Digest of the immutable governor policy.
+    pub governor_policy_identity: [u8; 32],
+    /// Process-local governor generation bound to the view.
+    pub governor_generation: u64,
+    /// Digest of the routed-search policy contract used by this view.
+    pub routing_policy_identity: [u8; 32],
+    /// Admission and execution evidence for hydration.
+    pub hydration: NativeEngineWorkReceipt,
+}
+
+/// Per-query evidence that excludes the view's one-time physical hydration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeAnnReadViewQueryReceipt {
+    /// Routed ANN result and durable routing evidence.
+    pub search: AnnSelectedSearchReceipt,
+    /// Captured root identity, unchanged across view queries.
+    pub root_identity: [u8; 32],
+    /// Captured base-plus-delta identity.
+    pub view_identity: [u8; 32],
+    /// Digest of the governor policy charged by this query.
+    pub governor_policy_identity: [u8; 32],
+    /// Process-local governor generation charged by this query.
+    pub governor_generation: u64,
+    /// Per-query CPU and scratch-memory admission evidence.
+    pub execution: NativeEngineWorkReceipt,
+    /// Scratch-memory ceiling reserved for this query.
+    pub query_scratch_bytes: u64,
+    /// Explicit or default worker ceiling requested by this query.
+    pub requested_worker_limit: u64,
+    /// Always false: hydration is exclusive to view open.
+    pub hydration_performed: bool,
+    /// Always zero: an owned-view query cannot touch pages.
+    pub physical_page_reads: u64,
+    /// Always zero: an owned-view query cannot restore HNSW.
+    pub restore_count: u64,
 }
 
 /// Admission and component timing for one completed native engine scope.
@@ -3730,6 +3972,36 @@ impl NativeSnapshot {
         Ok(ann_search_receipt(index, self.metadata.visible_csn, result))
     }
 
+    /// Routes an approximate ANN query to an explicit durable partition bound.
+    ///
+    /// The ordinary search surface remains full fanout. A single-generation
+    /// base reports an explicit fallback instead of claiming partition
+    /// pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero partition bound, unknown ANN index, invalid
+    /// query vector, or query breadth outside the catalog definition.
+    pub fn search_ann_selected(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnSelectedSearchReceipt, NativeRuntimeError> {
+        validate_ann_partition_bound(maximum_partitions)?;
+        let execution =
+            self.state
+                .ann
+                .search_selected(index, query, options, maximum_partitions)?;
+        Ok(ann_selected_search_receipt(
+            index,
+            self.metadata.visible_csn,
+            maximum_partitions,
+            execution,
+        ))
+    }
+
     /// Executes filter-aware traversal or adaptive exact scoring through a
     /// stable-object-ID allowlist on this immutable snapshot.
     ///
@@ -3850,6 +4122,112 @@ fn ann_search_receipt(
         visited_nodes: result.visited_nodes,
         hits: result.hits,
     }
+}
+
+fn ann_selected_search_receipt(
+    index_id: ObjectId,
+    snapshot_csn: Option<Csn>,
+    requested_maximum_partitions: usize,
+    execution: ann_store::AnnRoutedSearchExecution,
+) -> AnnSelectedSearchReceipt {
+    let (routing_mode, routing_outcome) = match execution.routing_mode {
+        ann_store::AnnRoutingExecutionMode::SelectedPartitions => (
+            AnnPartitionRoutingMode::SelectedPartitions,
+            AnnPartitionRoutingOutcome::SelectedCertified,
+        ),
+        ann_store::AnnRoutingExecutionMode::FullFanout => (
+            AnnPartitionRoutingMode::FullFanout,
+            AnnPartitionRoutingOutcome::FullFanoutRequested,
+        ),
+        ann_store::AnnRoutingExecutionMode::FullFanoutBudgetFallback => (
+            AnnPartitionRoutingMode::FullFanout,
+            AnnPartitionRoutingOutcome::FullFanoutBudgetFallback,
+        ),
+        ann_store::AnnRoutingExecutionMode::SingleGenerationFallback => (
+            AnnPartitionRoutingMode::SingleGenerationFallback,
+            AnnPartitionRoutingOutcome::SingleGenerationFallback,
+        ),
+    };
+    AnnSelectedSearchReceipt {
+        search: ann_search_receipt(index_id, snapshot_csn, execution.result),
+        base_build_identity: execution.base_build_identity,
+        view_identity: execution.view_identity,
+        exact_delta_candidates: execution.exact_delta_candidates,
+        requested_maximum_partitions,
+        selected_partitions: execution.selected_partitions,
+        total_partitions: execution.total_partitions,
+        routing_mode,
+        routing_outcome,
+        next_partition_lower_bound: execution.next_partition_lower_bound,
+        routing_policy: ANN_PARTITION_ROUTING_POLICY_V1,
+        execution_workers: execution.execution_workers,
+        execution_worker_batches: execution.execution_worker_batches,
+        execution_waves: execution.execution_waves,
+    }
+}
+
+fn validate_ann_partition_bound(maximum_partitions: usize) -> Result<(), NativeRuntimeError> {
+    if maximum_partitions == 0 {
+        return Err(hyphae_native_ann::AnnError::InvalidPartitionCount.into());
+    }
+    Ok(())
+}
+
+fn ann_read_view_query_scratch_bytes(
+    dimension: u16,
+    logical_partitions: usize,
+    base_vector_count: usize,
+    delta_records: usize,
+    options: AnnSearchOptions,
+    compute_threads: u64,
+) -> Result<u64, NativeRuntimeError> {
+    const FIXED_QUERY_BYTES: u64 = 64 * 1_024;
+    const CANDIDATE_BYTES: u64 = 256;
+    // HNSW's two ordered visited sets can grow to the full selected corpus in
+    // the worst case; account that independently of ef_search.
+    const VISITED_VECTOR_BYTES: u64 = 512;
+    const DELTA_MERGE_BYTES: u64 = 64;
+    let partitions = u64::try_from(logical_partitions)
+        .map_err(|_| NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let ef_search = u64::try_from(options.ef_search())
+        .map_err(|_| NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let dimension_bytes = u64::from(dimension)
+        .checked_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(4))
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let workers = compute_threads.min(partitions).max(1);
+    let visited_vectors = u64::try_from(base_vector_count)
+        .map_err(|_| NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?
+        .checked_mul(VISITED_VECTOR_BYTES)
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let retained_child_results = partitions
+        .checked_mul(ef_search)
+        .and_then(|value| value.checked_mul(CANDIDATE_BYTES))
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let concurrent_search = workers
+        .checked_mul(
+            ef_search
+                .checked_mul(CANDIDATE_BYTES)
+                .and_then(|value| value.checked_add(dimension_bytes))
+                .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?,
+        )
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    let delta_merge = u64::try_from(delta_records)
+        .map_err(|_| NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?
+        .checked_mul(DELTA_MERGE_BYTES)
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)?;
+    FIXED_QUERY_BYTES
+        .checked_add(dimension_bytes)
+        .and_then(|value| value.checked_add(visited_vectors))
+        .and_then(|value| value.checked_add(retained_child_results))
+        .and_then(|value| value.checked_add(concurrent_search))
+        .and_then(|value| value.checked_add(delta_merge))
+        .ok_or(NativeRuntimeError::AnnReadViewQueryMemoryOverflow)
+}
+
+fn governor_policy_identity(policy: &NativeGovernorPolicy) -> Result<[u8; 32], NativeRuntimeError> {
+    let canonical =
+        serde_json::to_vec(policy).map_err(|error| NativeRuntimeError::Model(error.to_string()))?;
+    Ok(*blake3::hash(&canonical).as_bytes())
 }
 
 fn snapshot_pin_receipt(pin: &SnapshotPin) -> SnapshotPinReceipt {
@@ -4004,6 +4382,222 @@ struct NativeSqlPlanCache {
     capacity_evictions: u64,
 }
 
+/// Owned immutable authority for repeatable index-scoped ANN queries.
+#[derive(Clone, Debug)]
+pub struct NativeAnnReadView {
+    inner: Arc<NativeAnnReadViewInner>,
+}
+
+#[derive(Debug)]
+struct NativeAnnReadViewInner {
+    index: ObjectId,
+    snapshot_csn: Option<Csn>,
+    root_identity: [u8; 32],
+    dimension: u16,
+    state: ann_store::AnnOwnedReadState,
+    governor: Arc<NativeResourceGovernor>,
+    execution_pool: Arc<NativeExecutionPool>,
+    resource_queue_wait: Duration,
+    governor_policy_identity: [u8; 32],
+    governor_generation: u64,
+    _memory_permit: OwnedGovernorPermit,
+    live_views: Arc<AtomicU64>,
+    database_live: Arc<AtomicBool>,
+    open_receipt: NativeAnnReadViewOpenReceipt,
+}
+
+struct NativeAnnReadViewOpenContext<'a> {
+    index: ObjectId,
+    snapshot_csn: Option<Csn>,
+    roots: &'a RootSet,
+    catalog_root: PageId,
+    search_root: PageId,
+    load_plan: &'a ann_store::AnnIndexLoadPlan,
+    authority: &'a ann_store::AnnOwnedReadAuthority,
+    observation: ann_store::AnnHydrationObservation,
+    planned_peak_memory_bytes: u64,
+    retained_memory_bytes: u64,
+    process_physical_page_read_delta: u64,
+    hydration_restore_count: u64,
+    policy_identity: [u8; 32],
+    hydration: NativeEngineWorkReceipt,
+}
+
+impl Drop for NativeAnnReadViewInner {
+    fn drop(&mut self) {
+        let previous = self.live_views.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+impl NativeAnnReadView {
+    /// Returns the immutable authority and one-time hydration evidence.
+    pub fn open_receipt(&self) -> &NativeAnnReadViewOpenReceipt {
+        &self.inner.open_receipt
+    }
+
+    /// Executes one routed query without reading durable storage again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query breadth, resource rejection, or ANN
+    /// validation/search failure.
+    pub fn search_selected(
+        &self,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
+        self.search_selected_with_control(
+            query,
+            options,
+            maximum_partitions,
+            None,
+            self.inner.resource_queue_wait,
+            None,
+        )
+    }
+
+    /// Executes one routed query with an explicit per-query worker budget and
+    /// bounded queue wait.
+    ///
+    /// This lets a caller offering concurrent queries divide the immutable
+    /// foreground class budget across them without changing logical routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `maximum_workers` is zero or exceeds the view's
+    /// foreground execution authority, or for the same failures as
+    /// [`Self::search_selected`].
+    pub fn search_selected_with_worker_budget(
+        &self,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+        maximum_workers: u64,
+        maximum_wait: Duration,
+    ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
+        self.search_selected_with_control(
+            query,
+            options,
+            maximum_partitions,
+            Some(maximum_workers),
+            maximum_wait,
+            None,
+        )
+    }
+
+    /// Executes one routed query with cooperative cancellation.
+    ///
+    /// Cancellation releases only this query admission and leaves the owned
+    /// view valid for later calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_selected`] and a cancelled
+    /// queue error when the supplied token is cancelled.
+    pub fn search_selected_with_cancellation(
+        &self,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+        cancellation: &GovernorCancellation,
+    ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
+        self.search_selected_with_control(
+            query,
+            options,
+            maximum_partitions,
+            None,
+            self.inner.resource_queue_wait,
+            Some(cancellation),
+        )
+    }
+
+    fn search_selected_with_control(
+        &self,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+        requested_worker_limit: Option<u64>,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
+        validate_ann_partition_bound(maximum_partitions)?;
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(GovernorQueueError::Cancelled.into());
+        }
+        if !self.inner.database_live.load(Ordering::Acquire) {
+            return Err(NativeRuntimeError::AnnReadViewDatabaseClosed);
+        }
+        let maximum_compute_threads = self
+            .inner
+            .governor
+            .policy()
+            .limit(WorkloadClass::ForegroundBounded)
+            .compute_threads
+            .min(
+                u64::try_from(self.inner.execution_pool.topology().worker_count())
+                    .unwrap_or(u64::MAX),
+            )
+            .max(1);
+        let compute_threads = requested_worker_limit.unwrap_or(maximum_compute_threads);
+        if compute_threads == 0 || compute_threads > maximum_compute_threads {
+            return Err(NativeRuntimeError::InvalidAnnReadViewWorkerLimit {
+                requested: compute_threads,
+                maximum: maximum_compute_threads,
+            });
+        }
+        let query_scratch_bytes = ann_read_view_query_scratch_bytes(
+            self.inner.dimension,
+            self.inner.open_receipt.logical_partitions,
+            self.inner.open_receipt.base_vector_count,
+            self.inner.open_receipt.delta_records,
+            options,
+            compute_threads,
+        )?;
+        let permit = admit_governor_work(
+            &self.inner.governor,
+            maximum_wait,
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads,
+                io_slots: 0,
+                memory_bytes: query_scratch_bytes,
+            },
+            cancellation,
+        )?;
+        let execution = self.inner.state.search_selected_parallel(
+            query,
+            options,
+            maximum_partitions,
+            ann_store::AnnParallelSearchExecution {
+                pool: &self.inner.execution_pool,
+                permit: permit.permit(),
+                cancellation,
+            },
+        )?;
+        let search = ann_selected_search_receipt(
+            self.inner.index,
+            self.inner.snapshot_csn,
+            maximum_partitions,
+            execution,
+        );
+        Ok(NativeAnnReadViewQueryReceipt {
+            view_identity: self.inner.open_receipt.view_identity,
+            root_identity: self.inner.root_identity,
+            governor_policy_identity: self.inner.governor_policy_identity,
+            governor_generation: self.inner.governor_generation,
+            execution: permit.finish(),
+            query_scratch_bytes,
+            requested_worker_limit: compute_threads,
+            hydration_performed: false,
+            physical_page_reads: 0,
+            restore_count: 0,
+            search,
+        })
+    }
+}
+
 impl NativeSqlPlanCache {
     fn align_catalog(&mut self, catalog_version: CatalogVersion) {
         if self.catalog_version == Some(catalog_version) {
@@ -4087,8 +4681,18 @@ pub struct NativeDatabase {
     resource_governor: Option<Arc<NativeResourceGovernor>>,
     execution_pool: Option<Arc<NativeExecutionPool>>,
     resource_queue_wait: Duration,
+    ann_read_views: Arc<AtomicU64>,
+    active_write_batches: Arc<AtomicU64>,
+    database_live: Arc<AtomicBool>,
+    governor_generation: u64,
     sql_plan_cache: Mutex<NativeSqlPlanCache>,
     directory_guard: NativeDirectoryGuard,
+}
+
+impl Drop for NativeDatabase {
+    fn drop(&mut self) {
+        self.database_live.store(false, Ordering::Release);
+    }
 }
 
 impl NativeDatabase {
@@ -4193,6 +4797,10 @@ impl NativeDatabase {
             resource_governor: None,
             execution_pool: None,
             resource_queue_wait: Duration::ZERO,
+            ann_read_views: Arc::new(AtomicU64::new(0)),
+            active_write_batches: Arc::new(AtomicU64::new(0)),
+            database_live: Arc::new(AtomicBool::new(true)),
+            governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
             directory_guard,
         })
@@ -4325,10 +4933,8 @@ impl NativeDatabase {
             page_generation_path(path, active_page_generation),
             active_page_generation,
         )?;
-        let buffer_pool = default_buffer_pool()?;
         let conflicts = replay_conflicts(commits)?;
-        let root_validation_started = Instant::now();
-        let (committed_roots, latest_root) = recover_committed_roots(
+        let (committed_roots, latest_root, root_validation_time) = recover_committed_roots_timed(
             commits,
             &wal_state.opened_wal.recovery,
             &RetainedPageState {
@@ -4340,10 +4946,8 @@ impl NativeDatabase {
             },
             wal_state.base_root.take(),
         )?;
-        let root_validation_time = root_validation_started.elapsed();
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
-        let coordinator = restore_commit_coordinator(latest_root)?;
         let metadata = wal_recovery_metadata_for_open(path, retention_anchor, &wal_state)?;
         let recovered = finish_open_recovery(
             path,
@@ -4379,13 +4983,13 @@ impl NativeDatabase {
         Ok(Self {
             data_directory: path.to_path_buf(),
             pages: opened_pages.store,
-            buffer_pool,
+            buffer_pool: default_buffer_pool()?,
             blobs,
             wal: wal_state.opened_wal.wal,
             wal_retention: wal_state.wal_retention,
             manifests: wal_state.manifests,
             snapshot_pins,
-            coordinator,
+            coordinator: restore_commit_coordinator(latest_root)?,
             conflicts,
             relational_format,
             structure_format,
@@ -4400,6 +5004,10 @@ impl NativeDatabase {
             resource_governor: None,
             execution_pool: None,
             resource_queue_wait: Duration::ZERO,
+            ann_read_views: Arc::new(AtomicU64::new(0)),
+            active_write_batches: Arc::new(AtomicU64::new(0)),
+            database_live: Arc::new(AtomicBool::new(true)),
+            governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
             directory_guard,
         })
@@ -4436,24 +5044,43 @@ impl NativeDatabase {
     /// The caller must derive and verify the immutable policy before opening
     /// traffic. The governor has no durable state and is deliberately not
     /// reconstructed from the data directory.
-    pub fn set_resource_governor(&mut self, governor: Arc<NativeResourceGovernor>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an outstanding-authority error while an ANN view or detached
+    /// write batch is live.
+    pub fn set_resource_governor(
+        &mut self,
+        governor: Arc<NativeResourceGovernor>,
+    ) -> Result<(), NativeRuntimeError> {
+        self.reject_governor_reconfiguration()?;
         self.resource_governor = Some(governor);
         self.execution_pool = None;
         self.resource_queue_wait = Duration::ZERO;
+        self.governor_generation = self.governor_generation.saturating_add(1);
+        Ok(())
     }
 
     /// Installs process-local admission with one maximum synchronous wait.
     ///
     /// A zero wait preserves fail-fast admission. A positive wait uses the
     /// policy-bounded priority queue for every routed database operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an outstanding-authority error while an ANN view or detached
+    /// write batch is live.
     pub fn set_resource_governor_with_queue_wait(
         &mut self,
         governor: Arc<NativeResourceGovernor>,
         maximum_wait: Duration,
-    ) {
+    ) -> Result<(), NativeRuntimeError> {
+        self.reject_governor_reconfiguration()?;
         self.resource_governor = Some(governor);
         self.execution_pool = None;
         self.resource_queue_wait = maximum_wait;
+        self.governor_generation = self.governor_generation.saturating_add(1);
+        Ok(())
     }
 
     /// Installs one verified governor and its matching persistent worker pool.
@@ -4461,25 +5088,105 @@ impl NativeDatabase {
     /// # Errors
     ///
     /// Rejects a pool derived from another hardware fingerprint or worker
-    /// budget without changing the current database execution configuration.
+    /// budget, or a live ANN view/detached batch, without changing the current
+    /// database execution configuration.
     pub fn set_resource_governor_with_execution_pool(
         &mut self,
         governor: Arc<NativeResourceGovernor>,
         execution_pool: Arc<NativeExecutionPool>,
         maximum_wait: Duration,
-    ) -> Result<(), NativeExecutionError> {
+    ) -> Result<(), NativeRuntimeError> {
+        self.reject_governor_reconfiguration()?;
         execution_pool.validate_policy(governor.policy())?;
         self.resource_governor = Some(governor);
         self.execution_pool = Some(execution_pool);
         self.resource_queue_wait = maximum_wait;
+        self.governor_generation = self.governor_generation.saturating_add(1);
         Ok(())
     }
 
     /// Removes process-local admission without changing durable state.
-    pub fn clear_resource_governor(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an outstanding-authority error while an ANN view or detached
+    /// write batch is live.
+    pub fn clear_resource_governor(&mut self) -> Result<(), NativeRuntimeError> {
+        self.reject_governor_reconfiguration()?;
         self.resource_governor = None;
         self.execution_pool = None;
         self.resource_queue_wait = Duration::ZERO;
+        self.governor_generation = self.governor_generation.saturating_add(1);
+        Ok(())
+    }
+
+    fn reject_governor_reconfiguration(&self) -> Result<(), NativeRuntimeError> {
+        let view_count = self.ann_read_views.load(Ordering::Acquire);
+        if view_count != 0 {
+            return Err(NativeRuntimeError::OutstandingAnnReadViews { count: view_count });
+        }
+        let batch_count = self.active_write_batches.load(Ordering::Acquire);
+        if batch_count != 0 {
+            return Err(NativeRuntimeError::OutstandingWriteBatches { count: batch_count });
+        }
+        Ok(())
+    }
+
+    fn acquire_write_batch_lease(&self) -> Arc<NativeWriteBatchLease> {
+        self.active_write_batches.fetch_add(1, Ordering::AcqRel);
+        Arc::new(NativeWriteBatchLease {
+            active_batches: Arc::clone(&self.active_write_batches),
+            owner_live: Arc::clone(&self.database_live),
+        })
+    }
+
+    fn owns_detached_batch(&self, batch: &NativeWriteBatch) -> bool {
+        batch.lineage.as_ref().is_some_and(|lease| {
+            Arc::ptr_eq(&lease.active_batches, &self.active_write_batches)
+                && Arc::ptr_eq(&lease.owner_live, &self.database_live)
+                && lease.owner_live.load(Ordering::Acquire)
+        })
+    }
+
+    fn ann_read_view_open_receipt(
+        &self,
+        context: &NativeAnnReadViewOpenContext<'_>,
+    ) -> NativeAnnReadViewOpenReceipt {
+        NativeAnnReadViewOpenReceipt {
+            directory_identity: self.directory_identity().clone(),
+            snapshot_csn: context.snapshot_csn,
+            catalog_version: context.roots.catalog_version(),
+            root_identity: context.roots.digest(),
+            catalog_root: context.catalog_root,
+            search_root: context.search_root,
+            index_id: context.index,
+            definition_identity: context.authority.definition_digest,
+            base_kind: match context.authority.base_kind {
+                ann_store::AnnOwnedBaseKind::Single => NativeAnnReadBaseKind::Single,
+                ann_store::AnnOwnedBaseKind::Partitioned => NativeAnnReadBaseKind::Partitioned,
+            },
+            child_identities: context.authority.child_identities.clone(),
+            base_build_identity: context.authority.base_build_identity,
+            view_identity: context.authority.view_identity,
+            logical_partitions: context.authority.logical_partitions,
+            base_vector_count: context.authority.base_vector_count,
+            delta_records: context.authority.delta_records,
+            delta_bytes: context.authority.delta_bytes,
+            next_sequence: context.authority.next_sequence,
+            planned_physical_entries: context.load_plan.planned_physical_entries(),
+            planned_physical_bytes: context.load_plan.planned_physical_bytes(),
+            observed_physical_entries: context.observation.physical_entries,
+            observed_physical_bytes: context.observation.physical_bytes,
+            planned_peak_memory_bytes: context.planned_peak_memory_bytes,
+            retained_memory_bytes: context.retained_memory_bytes,
+            hydration_restore_count: context.hydration_restore_count,
+            process_physical_page_read_delta: context.process_physical_page_read_delta,
+            governor_policy_identity: context.policy_identity,
+            governor_generation: self.governor_generation,
+            routing_policy_identity: *blake3::hash(ANN_PARTITION_ROUTING_POLICY_V1.as_bytes())
+                .as_bytes(),
+            hydration: context.hydration,
+        }
     }
 
     /// Returns the currently installed process-local admission authority.
@@ -4506,19 +5213,35 @@ impl NativeDatabase {
     fn admit_foreground_bounded(
         &self,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
-        self.admit_database_work(
+        self.admit_foreground_bounded_with_cancellation(None)
+    }
+
+    fn admit_foreground_bounded_with_cancellation(
+        &self,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work_with_cancellation(
             WorkloadClass::ForegroundBounded,
             GovernorRequest {
                 compute_threads: 1,
                 io_slots: 1,
                 memory_bytes: FOREGROUND_BOUNDED_MEMORY_BYTES,
             },
+            cancellation,
         )
     }
 
     fn admit_parallel_foreground_bounded(
         &self,
         memory_bytes: u64,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_parallel_foreground_bounded_with_cancellation(memory_bytes, None)
+    }
+
+    fn admit_parallel_foreground_bounded_with_cancellation(
+        &self,
+        memory_bytes: u64,
+        cancellation: Option<&GovernorCancellation>,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
         let compute_threads = self
             .resource_governor
@@ -4534,13 +5257,14 @@ impl NativeDatabase {
                     )
                     .max(1)
             });
-        self.admit_database_work(
+        self.admit_database_work_with_cancellation(
             WorkloadClass::ForegroundBounded,
             GovernorRequest {
                 compute_threads,
                 io_slots: 1,
                 memory_bytes,
             },
+            cancellation,
         )
     }
 
@@ -4609,6 +5333,39 @@ impl NativeDatabase {
         .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
     }
 
+    fn admit_parallel_maintenance(
+        &self,
+        memory_bytes: u64,
+        maximum_workers: usize,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let worker_limit = u64::try_from(maximum_workers).unwrap_or(u64::MAX).max(1);
+        let compute_threads = self
+            .resource_governor
+            .as_ref()
+            .zip(self.execution_pool.as_ref())
+            .map_or(1, |(governor, execution_pool)| {
+                governor
+                    .policy()
+                    .limit(WorkloadClass::Maintenance)
+                    .compute_threads
+                    .min(
+                        u64::try_from(execution_pool.topology().worker_count()).unwrap_or(u64::MAX),
+                    )
+                    .min(worker_limit)
+                    .max(1)
+            });
+        self.admit_database_work_with_cancellation(
+            WorkloadClass::Maintenance,
+            GovernorRequest {
+                compute_threads,
+                io_slots: 0,
+                memory_bytes,
+            },
+            cancellation,
+        )
+    }
+
     fn admit_parallel_bulk(
         &self,
         memory_bytes: u64,
@@ -4644,15 +5401,65 @@ impl NativeDatabase {
 
     fn admit_initial_ann_publication(
         &self,
+        memory_bytes: u64,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
         self.admit_database_work(
             WorkloadClass::Mutation,
             GovernorRequest {
                 compute_threads: 1,
                 io_slots: 1,
-                memory_bytes: 0,
+                memory_bytes,
             },
         )
+    }
+
+    fn admit_ann_consolidation_publication(
+        &self,
+        root: PageId,
+        plan: &ann_store::ConsolidationPlan,
+    ) -> Result<
+        (
+            Option<DatabaseGovernorPermit>,
+            usize,
+            PrefixReplacementStructuralPlan,
+        ),
+        NativeRuntimeError,
+    > {
+        let planning_permit = self.admit_foreground_bounded()?;
+        let definition = plan.definition();
+        let load_plan = ann_store::plan_index_load(
+            &self.pages,
+            &self.buffer_pool,
+            root,
+            plan.index(),
+            definition,
+        )?;
+        let structural_limits =
+            ann_store::consolidation_prefix_replacement_limits(&load_plan, plan)?;
+        let structural_plan = BTree::from_root(root)
+            .plan_prefixes_sorted_batch_replacement_with_limits_and_control(
+                &self.pages,
+                structural_limits,
+                || ControlFlow::Continue(()),
+            )?;
+        drop(planning_permit);
+        let memory_bytes = load_plan
+            .hydration_memory_bytes()
+            .saturating_add(partitioned_hnsw_build_memory_bytes(
+                plan.effective_vector_count(),
+                definition,
+            ))
+            .saturating_add(
+                u64::try_from(structural_plan.structural_peak_memory_bytes()).unwrap_or(u64::MAX),
+            );
+        let permit = self.admit_initial_ann_publication(memory_bytes)?;
+        let (_, consumed_delta_records) = ann_store::inspect_consolidation_publication(
+            &self.pages,
+            &self.buffer_pool,
+            &load_plan,
+            plan,
+        )?;
+        Ok((permit, consumed_delta_records, structural_plan))
     }
 
     fn admit_administrative_owned(
@@ -5150,6 +5957,16 @@ impl NativeDatabase {
         }
     }
 
+    fn require_delta_catalog_v6(&self, root: PageId) -> Result<(), NativeRuntimeError> {
+        self.require_catalog_v6(root).map_err(|error| {
+            if matches!(error, NativeRuntimeError::CatalogV2Unavailable) {
+                NativeRuntimeError::InvalidPreparedMutation
+            } else {
+                error
+            }
+        })
+    }
+
     fn logical_catalog_object_at_root(
         &self,
         root: PageId,
@@ -5240,70 +6057,148 @@ impl NativeDatabase {
         Ok(Some(object))
     }
 
-    fn catalog_secondary_indexes_at_root(
+    fn delta_catalog_object_at_root(
         &self,
+        batch: &NativeWriteBatch,
         root: PageId,
-        relation: ObjectId,
-    ) -> Result<Vec<CatalogObject>, NativeRuntimeError> {
+        id: ObjectId,
+        already_planned_bytes: u64,
+    ) -> Result<Option<(CatalogObject, u64)>, NativeRuntimeError> {
         let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
-        if frame.page().kind() == PageKind::CatalogRoot {
-            return Ok(load_catalog_state_root(&self.pages, &self.blobs, root)?
-                .objects
-                .into_values()
-                .filter(|object| {
-                    matches!(
-                        object,
-                        CatalogObject::SecondaryIndex(definition)
-                            if definition.relation == relation
-                    )
-                })
-                .collect());
-        }
         if !matches!(
             frame.page().kind(),
             PageKind::BTreeLeaf | PageKind::BTreeInternal
         ) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let Some(stored) = BTree::from_root(root).get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &catalog_object_key(id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let envelope = decode_delta_catalog_definition(stored.bytes())?;
+        let retained_bytes = delta_catalog_definition_charge(envelope.logical_bytes());
+        Self::ensure_delta_memory_growth(
+            batch,
+            already_planned_bytes.saturating_add(retained_bytes),
+        )?;
+        let definition = envelope.materialize(&self.blobs)?;
+        if definition.starts_with(b"HYCOBJ02") {
+            return Ok(None);
+        }
+        let object = CatalogObject::decode_definition(&definition)?;
+        if object.header().id != id {
             return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        Ok(Some((object, retained_bytes)))
+    }
+
+    fn delta_catalog_object_named_at_root(
+        &self,
+        batch: &NativeWriteBatch,
+        root: PageId,
+        name: &QualifiedName,
+    ) -> Result<Option<(CatalogObject, u64)>, NativeRuntimeError> {
+        let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
+        if !matches!(
+            frame.page().kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let name_key = catalog_name_key_from_qualified(name)?;
+        let tree = BTree::from_root(root);
+        let Some(encoded_id) = tree.get_cached_pinned(&self.pages, &self.buffer_pool, &name_key)?
+        else {
+            return Ok(None);
+        };
+        let id = decode_catalog_name_value(encoded_id.bytes())?;
+        let object = self
+            .delta_catalog_object_at_root(batch, root, id, 0)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if catalog_name_key(object.0.header())? != name_key {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        Ok(Some(object))
+    }
+
+    fn delta_catalog_secondary_indexes_at_root(
+        &self,
+        batch: &NativeWriteBatch,
+        root: PageId,
+        relation: ObjectId,
+        relation_bytes: u64,
+    ) -> Result<Vec<(CatalogObject, u64)>, NativeRuntimeError> {
+        let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
+        if !matches!(
+            frame.page().kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        ) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let tree = BTree::from_root(root);
         let marker = tree
             .get_cached_pinned(&self.pages, &self.buffer_pool, CATALOG_FORMAT_KEY)?
             .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
-        if marker.bytes() == CATALOG_FORMAT_VALUE_V3 {
-            return Ok(load_catalog_state_root(&self.pages, &self.blobs, root)?
-                .objects
-                .into_values()
-                .filter(|object| {
-                    matches!(
-                        object,
-                        CatalogObject::SecondaryIndex(definition)
-                            if definition.relation == relation
-                    )
-                })
-                .collect());
+        if !matches!(
+            marker.bytes(),
+            CATALOG_FORMAT_VALUE_V4 | CATALOG_FORMAT_VALUE_V5 | CATALOG_FORMAT_VALUE_V6
+        ) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
-        if marker.bytes() != CATALOG_FORMAT_VALUE_V4
-            && marker.bytes() != CATALOG_FORMAT_VALUE_V5
-            && marker.bytes() != CATALOG_FORMAT_VALUE_V6
-        {
-            return Err(NativeRuntimeError::InvalidCatalogTree);
-        }
-
         let prefix = catalog_relation_index_prefix(relation);
-        let dependencies = tree.scan_prefix_cached(&self.pages, &self.buffer_pool, &prefix)?;
-        let mut indexes = Vec::with_capacity(dependencies.len());
-        for (key, value) in dependencies {
-            if key.len() != 33 || !value.is_empty() {
-                return Err(NativeRuntimeError::InvalidCatalogTree);
-            }
-            let index = ObjectId::new(u128::from_be_bytes(
-                key[17..]
+        let mut count = 0_usize;
+        let mut failure = None;
+        let _ = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            None,
+            |key, value| {
+                if key.len() != 33 || !value.is_empty() {
+                    failure = Some(NativeRuntimeError::InvalidCatalogTree);
+                    return ControlFlow::Break(());
+                }
+                count = count.saturating_add(1);
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let identities_bytes = u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(DELTA_TREE_ENTRY_OVERHEAD.saturating_add(
+                u64::try_from(std::mem::size_of::<ObjectId>()).unwrap_or(u64::MAX),
+            ));
+        Self::ensure_delta_memory_growth(batch, relation_bytes.saturating_add(identities_bytes))?;
+        let mut identities = Vec::with_capacity(count);
+        let _ =
+            tree.visit_prefix_cached(&self.pages, &self.buffer_pool, &prefix, None, |key, _| {
+                let decoded = key[17..]
                     .try_into()
-                    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
-            ))
-            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
-            let object = self
-                .catalog_object_at_root(root, index)?
+                    .map(u128::from_be_bytes)
+                    .map_err(|_| ())
+                    .and_then(|encoded| ObjectId::new(encoded).map_err(|_| ()));
+                if let Ok(index) = decoded {
+                    identities.push(index);
+                } else {
+                    failure = Some(NativeRuntimeError::InvalidCatalogTree);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            })?;
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let mut planned_bytes = relation_bytes.saturating_add(identities_bytes);
+        let mut indexes = Vec::with_capacity(count);
+        for index in identities {
+            let (object, retained_bytes) = self
+                .delta_catalog_object_at_root(batch, root, index, planned_bytes)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
             if !matches!(
                 &object,
@@ -5312,9 +6207,86 @@ impl NativeDatabase {
             ) {
                 return Err(NativeRuntimeError::InvalidCatalogTree);
             }
-            indexes.push(object);
+            planned_bytes = planned_bytes.saturating_add(retained_bytes);
+            indexes.push((object, retained_bytes));
         }
         Ok(indexes)
+    }
+
+    fn require_delta_relation_without_foreign_keys(
+        &self,
+        batch: &NativeWriteBatch,
+        root: PageId,
+        relation: ObjectId,
+    ) -> Result<(), NativeRuntimeError> {
+        let Some(CatalogObject::Relation(definition)) = batch.state.catalog.object(relation) else {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        };
+        if !definition.foreign_keys.is_empty() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let tree = BTree::from_root(root);
+        let prefix = catalog_dependency_prefix(relation, DependencyDirection::Incoming);
+        let mut count = 0_usize;
+        let mut failure = None;
+        let _ = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            None,
+            |key, value| {
+                match decode_catalog_dependency_entry(key, value, DependencyDirection::Incoming) {
+                    Ok(_) => count = count.saturating_add(1),
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let identities_bytes = u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(DELTA_TREE_ENTRY_OVERHEAD.saturating_add(
+                u64::try_from(std::mem::size_of::<ObjectId>()).unwrap_or(u64::MAX),
+            ));
+        Self::ensure_delta_memory_growth(batch, identities_bytes)?;
+        let mut adjacent = Vec::with_capacity(count);
+        let _ = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &prefix,
+            None,
+            |key, value| {
+                match decode_catalog_dependency_entry(key, value, DependencyDirection::Incoming) {
+                    Ok((_, object)) => adjacent.push(object),
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let mut planned = identities_bytes;
+        for object in adjacent {
+            let Some((object, retained_bytes)) =
+                self.delta_catalog_object_at_root(batch, root, object, planned)?
+            else {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            };
+            planned = planned.saturating_add(retained_bytes);
+            if matches!(object, CatalogObject::Relation(_)) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+        }
+        Ok(())
     }
 
     fn catalog_object_at_root(
@@ -5712,6 +6684,70 @@ impl NativeDatabase {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    fn select_delta_relational_value_at(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        primary_key: &[u8],
+    ) -> Result<Option<DeltaRelationalValue>, NativeRuntimeError> {
+        let Some(root) = snapshot.roots().root(SLOT_RELATIONAL) else {
+            return Ok(None);
+        };
+        let Some(encoded) = BTree::from_root(root).get_cached_pinned(
+            &self.pages,
+            &self.buffer_pool,
+            &relational_row_key(table, primary_key),
+        )?
+        else {
+            return Ok(None);
+        };
+        match self.relational_format {
+            RelationalFormat::InlineRowV1 => {
+                let row = RowRecordView::decode(encoded.bytes())?;
+                if row.row_id() != relational_row_id(table, primary_key)?
+                    || !row.is_visible_at(snapshot.visible_csn)
+                {
+                    return Ok(None);
+                }
+                decode_delta_relational_row_value(row, primary_key)
+            }
+            RelationalFormat::VersionChainV2 => {
+                let mut page_id = RowVersionPointer::decode(encoded.bytes())?.page_id;
+                let mut stack_visited = [0_u64; 64];
+                let mut overflow_visited = None;
+                let mut depth = 0_usize;
+                let mut newer_begin = None;
+                loop {
+                    track_version_page(page_id, depth, &mut stack_visited, &mut overflow_visited)?;
+                    let frame = self.buffer_pool.get_or_load(&self.pages, page_id)?;
+                    let page = frame.page();
+                    if page.kind() != PageKind::VersionChain {
+                        return Err(NativeRuntimeError::InvalidRelationalTree);
+                    }
+                    let row = RowRecordView::decode(page.payload())?;
+                    validate_version_page(
+                        page,
+                        row,
+                        table,
+                        primary_key,
+                        snapshot.visible_csn,
+                        newer_begin,
+                    )?;
+                    if row.is_visible_at(snapshot.visible_csn) {
+                        return decode_delta_relational_row_value(row, primary_key);
+                    }
+                    newer_begin = Some(row.begin_csn());
+                    page_id = page
+                        .next()
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+                }
+            }
+        }
     }
 
     fn ordered_secondary_indexes_at(
@@ -6646,25 +7682,8 @@ impl NativeDatabase {
             if root_transaction.base_roots() != snapshot.roots() {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
-            let mutations = due_keys
-                .into_iter()
-                .map(|due| Mutation {
-                    engine: EngineKind::Structure,
-                    opcode: match due.kind {
-                        DueStructureKind::Scalar => Opcode::DeleteValue,
-                        DueStructureKind::Hash => Opcode::DeleteHash,
-                        DueStructureKind::Set => Opcode::DeleteSet,
-                        DueStructureKind::List => Opcode::DeleteList,
-                        DueStructureKind::Stream => Opcode::DeleteStream,
-                        DueStructureKind::SortedSet => Opcode::DeleteSortedSet,
-                        DueStructureKind::HashField => Opcode::DeleteHashField,
-                    },
-                    target: None,
-                    key: due.key,
-                    value: Vec::new(),
-                    expires_at_micros: None,
-                })
-                .collect();
+            let mutations = due_keys.into_iter().map(due_structure_mutation).collect();
+            let directory_identity = self.directory_identity().clone();
             NativeTransaction {
                 pages: &mut self.pages,
                 buffer_pool: self.buffer_pool.clone(),
@@ -6682,6 +7701,8 @@ impl NativeDatabase {
                 transaction_receipts: &mut self.transaction_receipts,
                 resolution: None,
                 batch: NativeWriteBatch {
+                    lineage: None,
+                    directory_identity,
                     snapshot,
                     state: MaterializedState::default(),
                     mutations,
@@ -6690,10 +7711,12 @@ impl NativeDatabase {
                     structure_format: self.structure_format,
                     search_format: self.search_format,
                     mode: NativeWriteBatchMode::PhysicalStructureExpiry,
+                    delta_stage_active: false,
                     delta: None,
                     ann_consolidation: None,
+                    ann_consolidation_structure: None,
                     ann_initial_bulk: None,
-                    _resource_permit: None,
+                    resource_permit: None,
                 },
             }
         } else {
@@ -6782,6 +7805,7 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let pages_before = self.pages.page_count();
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -6799,25 +7823,22 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
                 state: MaterializedState::default(),
-                mutations: vec![Mutation {
-                    engine: EngineKind::Structure,
-                    opcode: Opcode::CompactStructure,
-                    target: None,
-                    key: Vec::new(),
-                    value: Vec::new(),
-                    expires_at_micros: None,
-                }],
+                mutations: vec![structure_compaction_mutation()],
                 dirty: [false, false, true, false],
                 durability,
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalStructureCompaction,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: None,
+                ann_consolidation_structure: None,
                 ann_initial_bulk: None,
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = commit_transaction_at(transaction, interruption)?;
@@ -6892,6 +7913,7 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let pages_before = self.pages.page_count();
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -6909,6 +7931,8 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
                 state: MaterializedState::default(),
                 mutations: vec![Mutation {
@@ -6924,10 +7948,12 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalStructureMigrationV3,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: None,
+                ann_consolidation_structure: None,
                 ann_initial_bulk: None,
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = commit_transaction_at(transaction, interruption)?;
@@ -7044,6 +8070,7 @@ impl NativeDatabase {
             .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?
             .to_le_bytes()
             .to_vec();
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -7061,6 +8088,8 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
                 state: MaterializedState::default(),
                 mutations: vec![Mutation {
@@ -7076,10 +8105,12 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalStructureRetirementV3,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: None,
+                ann_consolidation_structure: None,
                 ann_initial_bulk: None,
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = commit_transaction_at(transaction, interruption)?;
@@ -7220,6 +8251,7 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let pages_before = self.pages.page_count();
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -7237,6 +8269,8 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
                 state: MaterializedState::default(),
                 mutations: vec![Mutation {
@@ -7252,10 +8286,12 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalSearchCompaction,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: None,
+                ann_consolidation_structure: None,
                 ann_initial_bulk: None,
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = match interruption {
@@ -7299,6 +8335,40 @@ impl NativeDatabase {
         max_vectors: usize,
         max_delta_records: usize,
     ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
+        self.plan_ann_consolidation_with_control(index, max_vectors, max_delta_records, None)
+    }
+
+    /// Captures and builds one bounded replacement ANN base with cooperative
+    /// cancellation across partition planning, child construction, and final
+    /// candidate assembly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::plan_ann_consolidation`], plus
+    /// [`hyphae_native_ann::AnnError::BuildCancelled`] when cancellation is
+    /// observed before a complete candidate is retained.
+    pub fn plan_ann_consolidation_with_cancellation(
+        &self,
+        index: ObjectId,
+        max_vectors: usize,
+        max_delta_records: usize,
+        cancellation: &GovernorCancellation,
+    ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
+        self.plan_ann_consolidation_with_control(
+            index,
+            max_vectors,
+            max_delta_records,
+            Some(cancellation),
+        )
+    }
+
+    fn plan_ann_consolidation_with_control(
+        &self,
+        index: ObjectId,
+        max_vectors: usize,
+        max_delta_records: usize,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<AnnConsolidationPlan, NativeRuntimeError> {
         if max_vectors == 0
             || max_vectors > ann_store::MAX_ANN_CONSOLIDATION_VECTORS
             || max_delta_records == 0
@@ -7306,32 +8376,71 @@ impl NativeDatabase {
         {
             return Err(NativeRuntimeError::InvalidAnnConsolidationLimit);
         }
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(hyphae_native_ann::AnnError::BuildCancelled.into());
+        }
         let snapshot = self.coordinator.snapshot(0)?;
-        let root = snapshot
-            .roots()
+        let roots = snapshot.roots();
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, index)?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex { index });
+        };
+        let definition = ann_store::definition_from_search(&search_definition)?;
+        let root = roots
             .root(SLOT_SEARCH)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
-        let definition = ann_store::definition_for_index(&catalog, index)?;
+        let load_plan = ann_store::plan_index_load_with_cancellation(
+            &self.pages,
+            &self.buffer_pool,
+            root,
+            index,
+            definition,
+            cancellation,
+        )?;
         let retained_memory_bytes = partitioned_hnsw_build_memory_bytes(max_vectors, definition);
-        let peak_memory_bytes = retained_memory_bytes
-            .saturating_add(retained_memory_bytes.saturating_sub(MAINTENANCE_MEMORY_BYTES));
-        let permit = self.admit_maintenance_owned_with_memory(peak_memory_bytes)?;
+        let peak_memory_bytes = load_plan
+            .hydration_memory_bytes()
+            .saturating_add(retained_memory_bytes);
+        let permit = self.admit_parallel_maintenance(
+            peak_memory_bytes,
+            max_vectors.min(MAX_INITIAL_ANN_BULK_PARTITIONS),
+            cancellation,
+        )?;
         let inner = ann_store::plan_consolidation(
             &self.pages,
-            root,
-            &catalog,
-            index,
+            &self.buffer_pool,
+            &load_plan,
             max_vectors,
             max_delta_records,
-        )?;
+            ann_store::ConsolidationBuildExecution {
+                pool: self.execution_pool.as_deref(),
+                permit: permit.as_ref().map(DatabaseGovernorPermit::permit),
+                cancellation,
+            },
+        )
+        .map_err(|error| {
+            if cancellation.is_some_and(GovernorCancellation::is_cancelled)
+                && matches!(
+                    &error,
+                    NativeRuntimeError::ResourceQueue(GovernorQueueError::Cancelled)
+                )
+            {
+                hyphae_native_ann::AnnError::BuildCancelled.into()
+            } else {
+                error
+            }
+        })?;
+        let retained_memory_bytes =
+            partitioned_hnsw_build_memory_bytes(inner.effective_vector_count(), definition);
         let resource_permit = permit
             .map(|permit| {
-                permit.shrink_to(GovernorRequest {
-                    compute_threads: 0,
-                    io_slots: 0,
-                    memory_bytes: peak_memory_bytes,
-                })
+                permit
+                    .retain_memory(retained_memory_bytes)
+                    .map(DatabaseGovernorPermit::into_owned)
             })
             .transpose()?;
         Ok(AnnConsolidationPlan {
@@ -7349,13 +8458,29 @@ impl NativeDatabase {
         &self,
         index: ObjectId,
     ) -> Result<AnnMaintenanceStatus, NativeRuntimeError> {
+        let _permit = self.admit_foreground_bounded()?;
         let snapshot = self.coordinator.snapshot(0)?;
-        let root = snapshot
-            .roots()
+        let roots = snapshot.roots();
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, index)?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex { index });
+        };
+        let definition = ann_store::definition_from_search(&search_definition)?;
+        let search_root = roots
             .root(SLOT_SEARCH)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
-        let status = ann_store::maintenance_status(&self.pages, root, &catalog, index)?;
+        let plan = ann_store::plan_index_load(
+            &self.pages,
+            &self.buffer_pool,
+            search_root,
+            index,
+            definition,
+        )?;
+        let status = ann_store::maintenance_status(&self.pages, &self.buffer_pool, &plan)?;
         Ok(AnnMaintenanceStatus {
             index_id: index,
             lifecycle: status.lifecycle,
@@ -7433,24 +8558,35 @@ impl NativeDatabase {
         interruption: Option<CommitBoundary>,
     ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
         let _resource_permit = plan.resource_permit.clone();
-        let _publication_permit = self.admit_initial_ann_publication()?;
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
         let snapshot = self.coordinator.snapshot(0)?;
-        let root = snapshot
-            .roots()
-            .root(SLOT_SEARCH)
-            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
-        let before = ann_store::observe(&self.pages, root, &catalog, plan.inner.index())?;
-        if before.base_identity != plan.inner.base_identity() {
+        let roots = snapshot.roots();
+        let catalog_root =
+            roots
+                .root(SLOT_CATALOG)
+                .ok_or(NativeRuntimeError::UnknownVectorIndex {
+                    index: plan.inner.index(),
+                })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, plan.inner.index())?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex {
+                index: plan.inner.index(),
+            });
+        };
+        if ann_store::definition_from_search(&search_definition)? != plan.inner.definition() {
             return Err(NativeRuntimeError::AnnConsolidationStale);
         }
+        let root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let (_publication_permit, consumed_delta_records, structural_plan) =
+            self.admit_ann_consolidation_publication(root, &plan.inner)?;
         let previous_base_identity = plan.inner.base_identity();
         let index_id = plan.inner.index();
         let replacement_base_identity = plan.inner.replacement_identity();
-        let consumed_delta_records = plan.inner.captured_delta_count();
         let effective_vector_count = plan.inner.effective_vector_count();
         let mutation_value = ann_store::encode_consolidation_mutation(&plan.inner);
         let transaction_id = TransactionId::new(self.next_transaction_id)
@@ -7459,6 +8595,7 @@ impl NativeDatabase {
         if root_transaction.base_roots() != snapshot.roots() {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -7476,11 +8613,10 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
-                state: MaterializedState {
-                    catalog,
-                    ..MaterializedState::default()
-                },
+                state: MaterializedState::default(),
                 mutations: vec![Mutation {
                     engine: EngineKind::Search,
                     opcode: Opcode::ConsolidateAnn,
@@ -7494,23 +8630,19 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalAnnConsolidation,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: Some(plan.inner),
+                ann_consolidation_structure: Some(structural_plan),
                 ann_initial_bulk: None,
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = match interruption {
             Some(boundary) => transaction.commit_with_interruption(boundary)?,
             None => transaction.commit()?,
         };
-        let current = self.coordinator.snapshot(0)?;
-        let current_root = current
-            .roots()
-            .root(SLOT_SEARCH)
-            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let current_catalog = load_catalog_state(&self.pages, &self.blobs, current.roots())?;
-        let after = ann_store::observe(&self.pages, current_root, &current_catalog, index_id)?;
+        let after = self.observe_target_ann_index_unadmitted(index_id)?;
         Ok(AnnConsolidationReceipt {
             previous_base_identity,
             replacement_base_identity,
@@ -7519,6 +8651,34 @@ impl NativeDatabase {
             preserved_later_delta_records: after.delta_records,
             commit,
         })
+    }
+
+    fn observe_target_ann_index_unadmitted(
+        &self,
+        index: ObjectId,
+    ) -> Result<ann_store::IndexObservation, NativeRuntimeError> {
+        let current = self.coordinator.snapshot(0)?;
+        let roots = current.roots();
+        let search_root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, index)?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex { index });
+        };
+        let definition = ann_store::definition_from_search(&search_definition)?;
+        let plan = ann_store::plan_index_load(
+            &self.pages,
+            &self.buffer_pool,
+            search_root,
+            index,
+            definition,
+        )?;
+        ann_store::observe_planned_index(&self.pages, &self.buffer_pool, &plan)
     }
 
     /// Returns the selected ANN generation and base-plus-delta physical counts.
@@ -13196,6 +14356,257 @@ impl NativeDatabase {
         Ok(ann_search_receipt(index, snapshot.visible_csn, result))
     }
 
+    /// Hydrates one exact current-root ANN index into an owned reusable view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a partial view when execution authority is
+    /// absent, admission is rejected, cancellation is observed, or the target
+    /// catalog/search authority is invalid.
+    pub fn open_ann_read_view(
+        &self,
+        index: ObjectId,
+    ) -> Result<(NativeAnnReadView, NativeAnnReadViewOpenReceipt), NativeRuntimeError> {
+        self.open_ann_read_view_with_optional_cancellation(index, None)
+    }
+
+    /// Hydrates one exact current-root ANN index with cooperative cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open_ann_read_view`] and a
+    /// cancelled queue error when cancellation is observed.
+    pub fn open_ann_read_view_with_cancellation(
+        &self,
+        index: ObjectId,
+        cancellation: &GovernorCancellation,
+    ) -> Result<(NativeAnnReadView, NativeAnnReadViewOpenReceipt), NativeRuntimeError> {
+        self.open_ann_read_view_with_optional_cancellation(index, Some(cancellation))
+    }
+
+    fn open_ann_read_view_with_optional_cancellation(
+        &self,
+        index: ObjectId,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<(NativeAnnReadView, NativeAnnReadViewOpenReceipt), NativeRuntimeError> {
+        let (governor, execution_pool) = self
+            .resource_governor
+            .as_ref()
+            .zip(self.execution_pool.as_ref())
+            .ok_or(NativeRuntimeError::AnnReadViewExecutionAuthorityRequired)?;
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(GovernorQueueError::Cancelled.into());
+        }
+        let planning = self
+            .admit_foreground_bounded_with_cancellation(cancellation)?
+            .ok_or(NativeRuntimeError::AnnReadViewExecutionAuthorityRequired)?;
+        let snapshot = self.coordinator.snapshot(0)?;
+        let roots = snapshot.roots();
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, index)?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex { index });
+        };
+        let definition = ann_store::definition_from_search(&search_definition)?;
+        let search_root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let load_plan = ann_store::plan_index_load_with_cancellation(
+            &self.pages,
+            &self.buffer_pool,
+            search_root,
+            index,
+            definition,
+            cancellation,
+        )?;
+        let _planning_evidence = planning.finish();
+        let retained_memory_bytes = load_plan.hydration_memory_bytes().max(1);
+        let planned_peak_memory_bytes =
+            FOREGROUND_BOUNDED_MEMORY_BYTES.saturating_add(load_plan.hydration_memory_bytes());
+        let hydration = self
+            .admit_parallel_foreground_bounded_with_cancellation(
+                planned_peak_memory_bytes,
+                cancellation,
+            )?
+            .ok_or(NativeRuntimeError::AnnReadViewExecutionAuthorityRequired)?;
+        let reads_before = self.pages.physical_read_count();
+        let restores_before = ann_store::process_index_scoped_restore_count();
+        let (state, observation) = ann_store::hydrate_owned_read_state(
+            &self.pages,
+            &self.buffer_pool,
+            &load_plan,
+            cancellation,
+        )?;
+        let reads_after = self.pages.physical_read_count();
+        let restores_after = ann_store::process_index_scoped_restore_count();
+        let hydration_evidence = hydration.evidence();
+        let memory_permit = hydration.retain_memory(retained_memory_bytes)?.into_owned();
+        let authority = state.authority();
+        let policy_identity = governor_policy_identity(governor.policy())?;
+        let receipt = self.ann_read_view_open_receipt(&NativeAnnReadViewOpenContext {
+            index,
+            snapshot_csn: snapshot.visible_csn,
+            roots,
+            catalog_root,
+            search_root,
+            load_plan: &load_plan,
+            authority,
+            observation,
+            planned_peak_memory_bytes,
+            retained_memory_bytes,
+            process_physical_page_read_delta: reads_after.saturating_sub(reads_before),
+            hydration_restore_count: restores_after.saturating_sub(restores_before),
+            policy_identity,
+            hydration: hydration_evidence,
+        });
+        self.ann_read_views.fetch_add(1, Ordering::AcqRel);
+        let view = NativeAnnReadView {
+            inner: Arc::new(NativeAnnReadViewInner {
+                index,
+                snapshot_csn: snapshot.visible_csn,
+                root_identity: roots.digest(),
+                dimension: authority.dimension,
+                state,
+                governor: Arc::clone(governor),
+                execution_pool: Arc::clone(execution_pool),
+                resource_queue_wait: self.resource_queue_wait,
+                governor_policy_identity: policy_identity,
+                governor_generation: self.governor_generation,
+                _memory_permit: memory_permit,
+                live_views: Arc::clone(&self.ann_read_views),
+                database_live: Arc::clone(&self.database_live),
+                open_receipt: receipt.clone(),
+            }),
+        };
+        Ok((view, receipt))
+    }
+
+    /// Routes an approximate vector query against the current root to an
+    /// explicit durable partition bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero partition bound, unknown ANN index, invalid
+    /// query, malformed state, or query breadth outside the catalog
+    /// definition.
+    pub fn search_ann_selected_latest(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnSelectedSearchReceipt, NativeRuntimeError> {
+        self.search_ann_selected_latest_inner(index, query, options, maximum_partitions, None)
+    }
+
+    /// Routes one current-root ANN query with cooperative admission and
+    /// partition-wave cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation failures as [`Self::search_ann_selected_latest`]
+    /// and `GovernorQueueError::Cancelled` when cancellation is observed
+    /// during physical hydration, restore validation, or child execution.
+    pub fn search_ann_selected_latest_with_cancellation(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+        cancellation: &GovernorCancellation,
+    ) -> Result<AnnSelectedSearchReceipt, NativeRuntimeError> {
+        self.search_ann_selected_latest_inner(
+            index,
+            query,
+            options,
+            maximum_partitions,
+            Some(cancellation),
+        )
+    }
+
+    fn search_ann_selected_latest_inner(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<AnnSelectedSearchReceipt, NativeRuntimeError> {
+        validate_ann_partition_bound(maximum_partitions)?;
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(GovernorQueueError::Cancelled.into());
+        }
+        let planning_permit = self.admit_foreground_bounded_with_cancellation(cancellation)?;
+        let snapshot = self.coordinator.snapshot(0)?;
+        let catalog_root = snapshot
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        let Some(CatalogObject::Search(search_definition)) =
+            self.catalog_object_at_root(catalog_root, index)?
+        else {
+            return Err(NativeRuntimeError::UnknownVectorIndex { index });
+        };
+        let definition = ann_store::definition_from_search(&search_definition)?;
+        let search_root = snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let plan = ann_store::plan_index_load(
+            &self.pages,
+            &self.buffer_pool,
+            search_root,
+            index,
+            definition,
+        )?;
+        drop(planning_permit);
+        let planned_memory_bytes =
+            FOREGROUND_BOUNDED_MEMORY_BYTES.saturating_add(plan.hydration_memory_bytes());
+        let execution_permit = self.admit_parallel_foreground_bounded_with_cancellation(
+            planned_memory_bytes,
+            cancellation,
+        )?;
+        let execution = if let (Some(execution_pool), Some(execution_permit)) =
+            (self.execution_pool.as_deref(), execution_permit.as_ref())
+        {
+            ann_store::search_selected_planned_parallel(
+                &self.pages,
+                &self.buffer_pool,
+                &plan,
+                query,
+                options,
+                maximum_partitions,
+                ann_store::AnnParallelSearchExecution {
+                    pool: execution_pool,
+                    permit: execution_permit.permit(),
+                    cancellation,
+                },
+            )?
+        } else {
+            if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+                return Err(GovernorQueueError::Cancelled.into());
+            }
+            ann_store::search_selected_planned_with_cancellation(
+                &self.pages,
+                &self.buffer_pool,
+                &plan,
+                query,
+                options,
+                maximum_partitions,
+                cancellation,
+            )?
+        };
+        Ok(ann_selected_search_receipt(
+            index,
+            snapshot.visible_csn,
+            maximum_partitions,
+            execution,
+        ))
+    }
+
     /// Executes filter-aware ANN traversal or adaptive exact filtering
     /// against the current committed root set.
     ///
@@ -13599,7 +15010,8 @@ impl NativeDatabase {
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<InitialAnnBulkPublishReceipt, NativeRuntimeError> {
-        let publication_permit = self.admit_initial_ann_publication()?;
+        let publication_permit =
+            self.admit_initial_ann_publication(FOREGROUND_BOUNDED_MEMORY_BYTES)?;
         if self.search_format != SearchFormat::InvertedBTreeV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
@@ -13649,6 +15061,7 @@ impl NativeDatabase {
             &expected_roots,
             candidate_csn,
         )?;
+        let directory_identity = self.directory_identity().clone();
         let transaction = NativeTransaction {
             pages: &mut self.pages,
             buffer_pool: self.buffer_pool.clone(),
@@ -13666,6 +15079,8 @@ impl NativeDatabase {
             transaction_receipts: &mut self.transaction_receipts,
             resolution: None,
             batch: NativeWriteBatch {
+                lineage: None,
+                directory_identity,
                 snapshot,
                 state: MaterializedState {
                     catalog,
@@ -13684,15 +15099,25 @@ impl NativeDatabase {
                 structure_format: self.structure_format,
                 search_format: self.search_format,
                 mode: NativeWriteBatchMode::PhysicalInitialAnnBulkPublication,
+                delta_stage_active: false,
                 delta: None,
                 ann_consolidation: None,
+                ann_consolidation_structure: None,
                 ann_initial_bulk: Some(publication),
-                _resource_permit: None,
+                resource_permit: None,
             },
         };
         let commit = commit_transaction_at(transaction, interruption)?;
-        let observed = self.observe_ann_index_unadmitted(index_id)?;
-        validate_published_initial_ann(observed, build)?;
+        self.finish_initial_ann_bulk_publication(index_id, build, commit)
+    }
+
+    fn finish_initial_ann_bulk_publication(
+        &self,
+        index_id: ObjectId,
+        build: InitialAnnBulkBuildEvidence,
+        commit: CommitReceipt,
+    ) -> Result<InitialAnnBulkPublishReceipt, NativeRuntimeError> {
+        validate_published_initial_ann(self.observe_ann_index_unadmitted(index_id)?, build)?;
         Ok(InitialAnnBulkPublishReceipt {
             index_id,
             build,
@@ -13830,6 +15255,14 @@ impl NativeDatabase {
         }
     }
 
+    /// Returns the process-wide count of completed index-scoped ANN restores.
+    ///
+    /// Subtract observations around a query interval to verify that an owned
+    /// ANN read view did not cross its one-time hydration boundary.
+    pub fn process_ann_index_restore_count() -> u64 {
+        ann_store::process_index_scoped_restore_count()
+    }
+
     /// Prepares one detached optimistic write transaction.
     ///
     /// Preparation captures and materializes an immutable snapshot without
@@ -13849,6 +15282,8 @@ impl NativeDatabase {
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         Ok(NativeWriteBatch {
+            lineage: Some(self.acquire_write_batch_lease()),
+            directory_identity: self.directory_identity().clone(),
             snapshot,
             state,
             mutations: Vec::new(),
@@ -13857,10 +15292,66 @@ impl NativeDatabase {
             structure_format: self.structure_format,
             search_format: self.search_format,
             mode: NativeWriteBatchMode::Materialized,
+            delta_stage_active: false,
             delta: None,
             ann_consolidation: None,
+            ann_consolidation_structure: None,
             ann_initial_bulk: None,
-            _resource_permit: resource_permit,
+            resource_permit,
+        })
+    }
+
+    /// Clones one legacy materialized private write set into a temporary
+    /// rollback candidate.
+    ///
+    /// This is the rollback-candidate seam for legacy product transactions.
+    /// The deep copy shares the source's primary mutation authority and holds
+    /// a separate memory-only reservation until the caller immediately
+    /// replaces the source. This compatibility seam does not claim plan-sized
+    /// accounting. Point-resolved delta, maintenance, and ANN publication
+    /// batches remain deliberately linear and cannot be cloned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch is not a materialized write set from
+    /// this exact data directory and physical format, or when a second
+    /// memory reservation is unavailable.
+    pub fn clone_legacy_materialized_write_batch(
+        &self,
+        batch: &NativeWriteBatch,
+    ) -> Result<LegacyMaterializedWriteBatchCandidate, NativeRuntimeError> {
+        if batch.mode != NativeWriteBatchMode::Materialized
+            || batch.directory_identity != *self.directory_identity()
+            || !self.owns_detached_batch(batch)
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let root_formats = formats_for_latest_root(
+            &self.pages,
+            (!root_set_is_pristine(batch.snapshot.roots())).then_some(batch.snapshot.roots()),
+        )?;
+        if root_formats
+            != (
+                self.relational_format,
+                self.structure_format,
+                self.search_format,
+            )
+            || batch.structure_format != self.structure_format
+            || batch.search_format != self.search_format
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let copy_memory_permit = self.admit_database_work(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 0,
+                io_slots: 0,
+                memory_bytes: MUTATION_MEMORY_BYTES,
+            },
+        )?;
+        Ok(LegacyMaterializedWriteBatchCandidate {
+            batch: batch.clone_with_resource_permit(batch.resource_permit.clone()),
+            copy_memory_permit: copy_memory_permit.map(DatabaseGovernorPermit::into_owned),
         })
     }
 
@@ -13871,6 +15362,38 @@ impl NativeDatabase {
     /// document identities are resolved by the corresponding `stage_delta_*`
     /// operation.
     ///
+    /// Materialized reads are deliberately absent from the returned delta
+    /// authority. Using the default private state as a read surface would
+    /// report false absence for durable values that have not been hydrated.
+    ///
+    /// ```compile_fail
+    /// use hyphae_native_runtime::NativeDatabase;
+    /// use hyphae_native_types::DurabilityClass;
+    ///
+    /// fn false_absence(database: &NativeDatabase) {
+    ///     let delta = database
+    ///         .begin_optimistic_delta(0, DurabilityClass::Memory)
+    ///         .unwrap();
+    ///     let _ = delta.get(b"durable-key");
+    /// }
+    /// ```
+    ///
+    /// Direct materialized mutation is also absent. Delta mutation must pass
+    /// through a `NativeDatabase::stage_delta_*` entrypoint so point hydration,
+    /// retained-memory admission, and rollback remain one operation.
+    ///
+    /// ```compile_fail
+    /// use hyphae_native_runtime::NativeDatabase;
+    /// use hyphae_native_types::DurabilityClass;
+    ///
+    /// fn bypass_staging(database: &NativeDatabase) {
+    ///     let mut delta = database
+    ///         .begin_optimistic_delta(0, DurabilityClass::Memory)
+    ///         .unwrap();
+    ///     delta.set(b"key".to_vec(), b"value".to_vec(), None).unwrap();
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error for unsupported legacy physical formats, snapshot,
@@ -13879,7 +15402,7 @@ impl NativeDatabase {
         &self,
         logical_time_micros: i64,
         durability: DurabilityClass,
-    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+    ) -> Result<NativeDeltaWriteBatch, NativeRuntimeError> {
         let resource_permit = self.admit_mutation_owned()?;
         if self.relational_format != RelationalFormat::VersionChainV2
             || !matches!(
@@ -13891,19 +15414,25 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
-        Ok(NativeWriteBatch {
-            snapshot,
-            state: MaterializedState::default(),
-            mutations: Vec::new(),
-            dirty: [false; 4],
-            durability,
-            structure_format: self.structure_format,
-            search_format: self.search_format,
-            mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
-            delta: Some(DeltaOverlay::default()),
-            ann_consolidation: None,
-            ann_initial_bulk: None,
-            _resource_permit: resource_permit,
+        Ok(NativeDeltaWriteBatch {
+            inner: NativeWriteBatch {
+                lineage: Some(self.acquire_write_batch_lease()),
+                directory_identity: self.directory_identity().clone(),
+                snapshot,
+                state: MaterializedState::default(),
+                mutations: Vec::new(),
+                dirty: [false; 4],
+                durability,
+                structure_format: self.structure_format,
+                search_format: self.search_format,
+                mode: NativeWriteBatchMode::PhysicalAllEngineDelta,
+                delta_stage_active: false,
+                delta: Some(DeltaOverlay::default()),
+                ann_consolidation: None,
+                ann_consolidation_structure: None,
+                ann_initial_bulk: None,
+                resource_permit,
+            },
         })
     }
 
@@ -13915,32 +15444,100 @@ impl NativeDatabase {
     /// point-read corruption, or native relational semantics.
     pub fn stage_delta_sql_dml(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         statement: &str,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
+        let batch = &mut batch.inner;
         self.require_delta_batch(batch).map_err(SqlError::from)?;
+        let input_bytes = parameters.iter().fold(0_u64, |bytes, parameter| {
+            bytes.saturating_add(retained_scalar_value_capacity(parameter))
+        });
+        Self::ensure_delta_memory_growth(
+            batch,
+            input_bytes
+                .saturating_mul(2)
+                .saturating_add(DELTA_ENGINE_CONTAINER_OVERHEAD),
+        )
+        .map_err(SqlError::from)?;
         let dml = sql::TransactionDml::parse(statement)?;
-        self.hydrate_delta_relation(batch, dml.relation_name()?)
+        let relation_rollback = self
+            .hydrate_delta_relation(batch, dml.relation_name()?)
             .map_err(SqlError::from)?;
-        let (table, primary_key) = dml.primary_key(batch, parameters)?;
-        self.hydrate_delta_relational_row(batch, table, &primary_key)
-            .map_err(SqlError::from)?;
-        let candidate = dml.candidate_row(batch, parameters)?;
-        let unique_probes = candidate
-            .as_deref()
-            .map(|row| self.validate_delta_unique_projections(batch, table, &primary_key, row))
-            .transpose()
-            .map_err(sql::map_runtime_error)?
-            .unwrap_or_default();
-        let result = dml.execute(batch, parameters)?;
-        batch
-            .delta
-            .as_mut()
-            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-            .unique_probes
-            .extend(unique_probes);
-        Ok(result)
+        let mut row_rollback = None;
+        let mut row_identity = None;
+        let staged = (|| {
+            let (table, primary_key) = dml.primary_key(batch, parameters)?;
+            let catalog_root = batch
+                .snapshot
+                .roots()
+                .root(SLOT_CATALOG)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            self.require_delta_relation_without_foreign_keys(batch, catalog_root, table)
+                .map_err(SqlError::from)?;
+            row_rollback = self
+                .hydrate_delta_relational_row(batch, table, &primary_key)
+                .map_err(SqlError::from)?;
+            row_identity = Some((table, primary_key.clone()));
+            Self::refresh_delta_memory_ledger(batch).map_err(SqlError::from)?;
+            let candidate = dml.candidate_row(batch, parameters)?;
+            let candidate_charge = delta_sql_candidate_charge(
+                batch,
+                table,
+                primary_key.capacity(),
+                candidate.as_ref().map_or(0, Vec::capacity),
+            );
+            Self::ensure_delta_memory_growth(batch, candidate_charge).map_err(SqlError::from)?;
+            let unique_probes = candidate
+                .as_deref()
+                .map(|row| self.validate_delta_unique_projections(batch, table, &primary_key, row))
+                .transpose()
+                .map_err(sql::map_runtime_error)?
+                .unwrap_or_default();
+            let result = batch.with_delta_stage(|batch| dml.execute(batch, parameters))?;
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .unique_probes
+                .extend(unique_probes);
+            Self::refresh_delta_memory_ledger(batch).map_err(SqlError::from)?;
+            Ok(result)
+        })();
+        if staged.is_err() {
+            if let Some(previous) = row_rollback {
+                batch.state.relational = previous;
+                if let Some(identity) = row_identity {
+                    batch
+                        .delta
+                        .as_mut()
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+                        .map_err(SqlError::from)?
+                        .relational_rows
+                        .remove(&identity);
+                }
+            }
+            if let Some(previous) = relation_rollback {
+                let delta = batch
+                    .delta
+                    .as_mut()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+                    .map_err(SqlError::from)?;
+                for id in previous.catalog_object_ids {
+                    delta.catalog_object_memory_bytes.remove(&id);
+                }
+                batch.state.catalog = previous.catalog;
+                batch.state.relational = previous.relational;
+            }
+            let retained = replay_delta_retained_memory_bytes(batch);
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+                .map_err(SqlError::from)?
+                .retained_memory_bytes = retained;
+        }
+        staged
     }
 
     /// Stages one scalar `SET` in a delta batch.
@@ -13951,14 +15548,415 @@ impl NativeDatabase {
     /// collection-owned key, or invalid structure identity.
     pub fn stage_delta_set(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         key: Vec<u8>,
         value: Vec<u8>,
         expires_at_micros: Option<i64>,
     ) -> Result<(), NativeRuntimeError> {
+        let batch = &mut batch.inner;
         self.require_delta_batch(batch)?;
+        let candidate_charge =
+            delta_payload_retained_charge(key.capacity(), value.capacity(), 3, 2)
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let was_loaded = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_scalars
+            .contains(&key);
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
         self.hydrate_delta_scalar(batch, &key)?;
-        batch.set(key, value, expires_at_micros)
+        let hydration_key = key.clone();
+        let staged = (|| {
+            Self::refresh_delta_memory_ledger(batch)?;
+            let reuse_charge = Self::delta_expired_collection_reuse_charge(batch, &key);
+            let staged_mutations = 1 + usize::from(reuse_charge != 0);
+            let complete_candidate_charge =
+                delta_payload_retained_charge(key.capacity(), value.capacity(), 3, 2)
+                    .saturating_add(reuse_charge)
+                    .saturating_add(delta_mutation_vector_growth_for(batch, staged_mutations));
+            Self::ensure_delta_memory_growth(batch, complete_candidate_charge)?;
+            batch.with_delta_stage(|batch| batch.set(key, value, expires_at_micros))?;
+            Self::refresh_delta_memory_ledger(batch)
+        })();
+        if staged.is_err() {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            if !was_loaded {
+                Self::restore_delta_scalar_hydration(batch, &hydration_key)?;
+            }
+        }
+        staged
+    }
+
+    /// Stages one exact-field `HSET` without materializing the hash.
+    ///
+    /// The existing field payload remains unresolved: only its physical
+    /// envelope and TTL authority are inspected to distinguish `Added` from
+    /// `Updated`. Hash-delta identities, overlay envelopes, and mutations are
+    /// charged to an aggregate 8 MiB sub-budget inside the fixed mutation
+    /// allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta or non-V3 batch, invalid identities,
+    /// another structure kind, a missing or expired hash, or corruption.
+    pub fn stage_delta_hset(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<HashSetOutcome, NativeRuntimeError> {
+        let key = key.into().into_boxed_slice().into_vec();
+        let field = field.into().into_boxed_slice().into_vec();
+        let value = value.into_boxed_slice().into_vec();
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        let identity_capacity = key.capacity().saturating_add(field.capacity());
+        let candidate_charge =
+            delta_payload_retained_charge(identity_capacity, value.capacity(), 3, 1)
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let identity = (key.clone(), field.clone());
+        let rollback = Self::capture_delta_hash_stage_rollback(batch, &identity)?;
+        let staged = (|| {
+            self.hydrate_delta_hash_field(batch, &key, &field)?;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            let added = matches!(
+                batch
+                    .delta
+                    .as_ref()
+                    .and_then(|delta| delta.structure_hash_fields.get(&identity)),
+                Some(DeltaHashFieldOverlay::Missing | DeltaHashFieldOverlay::Deleted(_))
+            );
+            let mutation_index = batch.mutations.len();
+            let mutation = Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::SetHashField,
+                target: None,
+                key: hash_field_identity(&key, &field)?,
+                value,
+                expires_at_micros: None,
+            };
+            let overlay = DeltaHashFieldOverlay::Staged(mutation_index);
+            let accounted_bytes = Self::delta_hash_accounting_after_replacement(
+                batch,
+                &identity,
+                &overlay,
+                Some(&mutation),
+            )?;
+            batch.mutations.push(mutation);
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            delta
+                .structure_hash_fields
+                .insert(identity.clone(), overlay);
+            delta.structure_hash_memory_bytes = accounted_bytes;
+            batch.dirty[2] = true;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Ok(if added {
+                HashSetOutcome::Added
+            } else {
+                HashSetOutcome::Updated
+            })
+        })();
+        if staged.is_err() {
+            Self::restore_delta_hash_stage_rollback(batch, &identity, rollback)?;
+        }
+        staged
+    }
+
+    /// Stages one exact-field `HDEL` without reading the old field payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta or non-V3 batch, invalid identities,
+    /// another structure kind, a missing or expired hash, or corruption.
+    pub fn stage_delta_hdelete(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into().into_boxed_slice().into_vec();
+        let field = field.into().into_boxed_slice().into_vec();
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        let identity_capacity = key.capacity().saturating_add(field.capacity());
+        let candidate_charge = delta_payload_retained_charge(identity_capacity, 0, 3, 0)
+            .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let identity = (key.clone(), field.clone());
+        let rollback = Self::capture_delta_hash_stage_rollback(batch, &identity)?;
+        let staged = (|| {
+            self.hydrate_delta_hash_field(batch, &key, &field)?;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            match batch
+                .delta
+                .as_ref()
+                .and_then(|delta| delta.structure_hash_fields.get(&identity))
+            {
+                Some(DeltaHashFieldOverlay::Missing) => {
+                    let removed = batch
+                        .delta
+                        .as_mut()
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                        .structure_hash_fields
+                        .remove(&identity)
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    let released = Self::delta_hash_overlay_charge(&identity, &removed)?;
+                    let delta = batch
+                        .delta
+                        .as_mut()
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    delta.structure_hash_memory_bytes = delta
+                        .structure_hash_memory_bytes
+                        .checked_sub(released)
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    Self::refresh_delta_memory_ledger(batch)?;
+                    return Ok(false);
+                }
+                Some(DeltaHashFieldOverlay::Deleted(_)) => return Ok(false),
+                Some(DeltaHashFieldOverlay::Durable(_) | DeltaHashFieldOverlay::Staged(_)) => {}
+                None => return Err(NativeRuntimeError::InvalidPreparedMutation),
+            }
+            let mutation_index = batch.mutations.len();
+            let mutation = Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::DeleteHashField,
+                target: None,
+                key: hash_field_identity(&key, &field)?,
+                value: Vec::new(),
+                expires_at_micros: None,
+            };
+            let overlay = DeltaHashFieldOverlay::Deleted(mutation_index);
+            let accounted_bytes = Self::delta_hash_accounting_after_replacement(
+                batch,
+                &identity,
+                &overlay,
+                Some(&mutation),
+            )?;
+            batch.mutations.push(mutation);
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            delta
+                .structure_hash_fields
+                .insert(identity.clone(), overlay);
+            delta.structure_hash_memory_bytes = accounted_bytes;
+            batch.dirty[2] = true;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Ok(true)
+        })();
+        if staged.is_err() {
+            Self::restore_delta_hash_stage_rollback(batch, &identity, rollback)?;
+        }
+        staged
+    }
+
+    /// Stages one exact-field signed `HINCRBY` without materializing the hash.
+    ///
+    /// A durable blob payload is admitted from its verified logical length
+    /// before it is read. Retained hash-delta values plus that transient read
+    /// must fit the 8 MiB hash-delta budget. Missing or expired fields start at
+    /// zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta or non-V3 batch, invalid identities,
+    /// another structure kind, a missing or expired hash, resource rejection,
+    /// noncanonical integer bytes, signed overflow, or corruption.
+    pub fn stage_delta_hincrement(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        increment: i64,
+    ) -> Result<i64, NativeRuntimeError> {
+        let key = key.into().into_boxed_slice().into_vec();
+        let field = field.into().into_boxed_slice().into_vec();
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        let identity_capacity = key.capacity().saturating_add(field.capacity());
+        let candidate_charge = delta_payload_retained_charge(identity_capacity, 32, 3, 1)
+            .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let identity = (key.clone(), field.clone());
+        let previous_overlay = batch
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.structure_hash_fields.get(&identity))
+            .cloned();
+        let previous_hash_memory = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_memory_bytes;
+        let previous_retained_memory = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
+        let staged = (|| {
+            self.hydrate_delta_hash_field(batch, &key, &field)?;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            let base = self.delta_hash_field_integer(batch, &identity)?;
+            let value = base
+                .checked_add(increment)
+                .ok_or(NativeRuntimeError::StructureIntegerOverflow)?;
+            let mutation_index = batch.mutations.len();
+            let mutation = Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::SetHashField,
+                target: None,
+                key: hash_field_identity(&key, &field)?,
+                value: value.to_string().into_bytes(),
+                expires_at_micros: None,
+            };
+            let overlay = DeltaHashFieldOverlay::Staged(mutation_index);
+            let accounted_bytes = Self::delta_hash_accounting_after_replacement(
+                batch,
+                &identity,
+                &overlay,
+                Some(&mutation),
+            )?;
+            batch.mutations.push(mutation);
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            delta
+                .structure_hash_fields
+                .insert(identity.clone(), overlay);
+            delta.structure_hash_memory_bytes = accounted_bytes;
+            batch.dirty[2] = true;
+            Self::refresh_delta_memory_ledger(batch)?;
+            Ok(value)
+        })();
+        if staged.is_err() {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            if let Some(previous) = previous_overlay {
+                delta.structure_hash_fields.insert(identity, previous);
+            } else {
+                delta.structure_hash_fields.remove(&identity);
+            }
+            delta.structure_hash_memory_bytes = previous_hash_memory;
+            delta.retained_memory_bytes = previous_retained_memory;
+        }
+        staged
+    }
+
+    /// Reads one exact hash field through a point-resolved delta overlay.
+    ///
+    /// This is the only hash read-your-writes surface for delta batches;
+    /// aggregate length and scan operations intentionally remain unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the same identity, shape, resource, blob, and
+    /// corruption failures as the corresponding staged mutation.
+    pub fn delta_hget(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: &[u8],
+        field: &[u8],
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        let batch = &mut batch.inner;
+        self.hydrate_delta_hash_field(batch, key, field)?;
+        Self::refresh_delta_memory_ledger(batch)?;
+        self.delta_hash_field_value(batch, &(key.to_vec(), field.to_vec()))
+    }
+
+    /// Returns one exact hash family's TTL from V3 point metadata.
+    ///
+    /// Field writes do not change the whole-hash expiry, so staged `HSET` and
+    /// `HINCRBY` operations preserve the TTL returned by this method. No
+    /// partial materialized hash map is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign, stale, non-delta, or non-V3 batch,
+    /// another structure kind, an invalid physical identity, or corruption.
+    pub fn delta_ttl_hash(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: &[u8],
+    ) -> Result<Ttl, NativeRuntimeError> {
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        if self.structure_format != StructureFormat::BTreeV3 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        structure_v3::delta_hash_ttl_latest_at_v3(
+            &self.pages,
+            &self.buffer_pool,
+            BTree::from_root(root),
+            key,
+            batch.snapshot.logical_time_micros,
+        )
+    }
+
+    /// Returns one exact hash field's TTL through a point-resolved delta
+    /// overlay.
+    ///
+    /// `HSET` and `HINCRBY` clear a field TTL; `HDEL`, missing, and due fields
+    /// return [`Ttl::Missing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta or non-V3 batch, invalid identity,
+    /// another structure kind, a missing or expired hash, or corruption.
+    pub fn delta_ttl_hash_field(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: &[u8],
+        field: &[u8],
+    ) -> Result<Ttl, NativeRuntimeError> {
+        let batch = &mut batch.inner;
+        self.hydrate_delta_hash_field(batch, key, field)?;
+        Self::refresh_delta_memory_ledger(batch)?;
+        let overlay = batch
+            .delta
+            .as_ref()
+            .and_then(|delta| {
+                delta
+                    .structure_hash_fields
+                    .get(&(key.to_vec(), field.to_vec()))
+            })
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        Ok(match overlay {
+            DeltaHashFieldOverlay::Missing | DeltaHashFieldOverlay::Deleted(_) => Ttl::Missing,
+            DeltaHashFieldOverlay::Staged(_) => Ttl::Persistent,
+            DeltaHashFieldOverlay::Durable(field) => match field.expires_at_micros {
+                None => Ttl::Persistent,
+                Some(expiry) => Ttl::RemainingMicros(
+                    expiry
+                        .checked_sub(batch.snapshot.logical_time_micros)
+                        .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+                ),
+            },
+        })
     }
 
     /// Stages one immutable lexical document in a delta batch.
@@ -13969,14 +15967,34 @@ impl NativeDatabase {
     /// document identity, invalid identity bounds, or physical corruption.
     pub fn stage_delta_index_document(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         index: ObjectId,
         document_id: Vec<u8>,
         text: String,
     ) -> Result<(), NativeRuntimeError> {
+        let batch = &mut batch.inner;
         self.require_delta_batch(batch)?;
-        self.hydrate_delta_search_document(batch, index, &document_id)?;
-        batch.index_document(index, document_id, text)
+        let candidate_charge =
+            delta_payload_retained_charge(document_id.capacity(), text.capacity(), 3, 2)
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
+        let rollback = self.hydrate_delta_search_document(batch, index, &document_id)?;
+        let staged = (|| {
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            batch.with_delta_stage(|batch| batch.index_document(index, document_id, text))?;
+            Self::refresh_delta_memory_ledger(batch)
+        })();
+        if staged.is_err() {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            if let Some(rollback) = rollback {
+                Self::restore_delta_search_hydration(batch, rollback)?;
+            }
+        }
+        staged
     }
 
     /// Stages replacement of one exact lexical document in a delta batch.
@@ -13987,14 +16005,34 @@ impl NativeDatabase {
     /// invalid identity bounds, or physical corruption.
     pub fn stage_delta_replace_document(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         index: ObjectId,
         document_id: Vec<u8>,
         text: String,
     ) -> Result<(), NativeRuntimeError> {
+        let batch = &mut batch.inner;
         self.require_delta_batch(batch)?;
-        self.hydrate_delta_search_document(batch, index, &document_id)?;
-        batch.replace_document(index, document_id, text)
+        let candidate_charge =
+            delta_payload_retained_charge(document_id.capacity(), text.capacity(), 3, 2)
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
+        let rollback = self.hydrate_delta_search_document(batch, index, &document_id)?;
+        let staged = (|| {
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            batch.with_delta_stage(|batch| batch.replace_document(index, document_id, text))?;
+            Self::refresh_delta_memory_ledger(batch)
+        })();
+        if staged.is_err() {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            if let Some(rollback) = rollback {
+                Self::restore_delta_search_hydration(batch, rollback)?;
+            }
+        }
+        staged
     }
 
     /// Stages deletion of one exact lexical document in a delta batch.
@@ -14005,17 +16043,38 @@ impl NativeDatabase {
     /// invalid identity bounds, or physical corruption.
     pub fn stage_delta_delete_document(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         index: ObjectId,
         document_id: Vec<u8>,
     ) -> Result<(), NativeRuntimeError> {
+        let batch = &mut batch.inner;
         self.require_delta_batch(batch)?;
-        self.hydrate_delta_search_document(batch, index, &document_id)?;
-        batch.delete_document(index, document_id)
+        let candidate_charge = delta_payload_retained_charge(document_id.capacity(), 0, 3, 0)
+            .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
+        let rollback = self.hydrate_delta_search_document(batch, index, &document_id)?;
+        let staged = (|| {
+            Self::refresh_delta_memory_ledger(batch)?;
+            Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+            batch.with_delta_stage(|batch| batch.delete_document(index, document_id))?;
+            Self::refresh_delta_memory_ledger(batch)
+        })();
+        if staged.is_err() {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            if let Some(rollback) = rollback {
+                Self::restore_delta_search_hydration(batch, rollback)?;
+            }
+        }
+        staged
     }
 
     fn require_delta_batch(&self, batch: &NativeWriteBatch) -> Result<(), NativeRuntimeError> {
-        if batch.mode != NativeWriteBatchMode::PhysicalAllEngineDelta
+        if batch.directory_identity != *self.directory_identity()
+            || !self.owns_detached_batch(batch)
+            || batch.mode != NativeWriteBatchMode::PhysicalAllEngineDelta
             || batch.delta.is_none()
             || batch.structure_format != self.structure_format
             || batch.search_format != self.search_format
@@ -14025,108 +16084,269 @@ impl NativeDatabase {
         Ok(())
     }
 
+    fn delta_memory_capacity(batch: &NativeWriteBatch) -> u64 {
+        batch
+            .resource_permit
+            .as_ref()
+            .map_or(MUTATION_MEMORY_BYTES, |permit| {
+                permit.request().memory_bytes
+            })
+            .min(MUTATION_MEMORY_BYTES)
+    }
+
+    fn ensure_delta_memory_growth(
+        batch: &NativeWriteBatch,
+        additional_bytes: u64,
+    ) -> Result<(), NativeRuntimeError> {
+        let retained = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+        if retained.saturating_add(additional_bytes) > Self::delta_memory_capacity(batch) {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        Ok(())
+    }
+
+    fn refresh_delta_memory_ledger(batch: &mut NativeWriteBatch) -> Result<(), NativeRuntimeError> {
+        let retained = replay_delta_retained_memory_bytes(batch);
+        if retained > Self::delta_memory_capacity(batch) {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes = retained;
+        Ok(())
+    }
+
+    fn delta_expired_collection_reuse_charge(batch: &NativeWriteBatch, key: &[u8]) -> u64 {
+        let logical_time = batch.snapshot.logical_time_micros;
+        let structures = &batch.state.structures;
+        let expired = [
+            structures.hash_expiries.get(key),
+            structures.set_expiries.get(key),
+            structures.list_expiries.get(key),
+            structures.stream_expiries.get(key),
+            structures.sorted_set_expiries.get(key),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|expiry| *expiry <= logical_time);
+        if expired {
+            DELTA_MUTATION_OVERHEAD.saturating_add(u64::try_from(key.len()).unwrap_or(u64::MAX))
+        } else {
+            0
+        }
+    }
+
+    fn restore_delta_search_hydration(
+        batch: &mut NativeWriteBatch,
+        rollback: DeltaSearchHydrationRollback,
+    ) -> Result<(), NativeRuntimeError> {
+        batch.state.catalog = rollback.catalog;
+        batch.state.search = rollback.search;
+        {
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            delta.search_documents.remove(&rollback.identity);
+            if let Some(index) = rollback.added_catalog_object {
+                delta.catalog_object_memory_bytes.remove(&index);
+            }
+        }
+        let retained = replay_delta_retained_memory_bytes(batch);
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes = retained;
+        Ok(())
+    }
+
+    fn restore_delta_scalar_hydration(
+        batch: &mut NativeWriteBatch,
+        key: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let structures = &mut batch.state.structures;
+        structures.entries.remove(key);
+        structures.hashes.remove(key);
+        structures.hash_expiries.remove(key);
+        structures.sets.remove(key);
+        structures.set_expiries.remove(key);
+        structures.lists.remove(key);
+        structures.list_expiries.remove(key);
+        structures.sorted_sets.remove(key);
+        structures.sorted_set_expiries.remove(key);
+        structures.streams.remove(key);
+        structures.stream_expiries.remove(key);
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_scalars
+            .remove(key);
+        let retained = replay_delta_retained_memory_bytes(batch);
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes = retained;
+        Ok(())
+    }
+
     fn hydrate_delta_relation(
         &self,
         batch: &mut NativeWriteBatch,
         name: &str,
-    ) -> Result<(), NativeRuntimeError> {
+    ) -> Result<Option<DeltaRelationHydrationRollback>, NativeRuntimeError> {
         if batch
             .state
             .catalog
             .id_named(name, EngineKind::Relational)
             .is_ok()
         {
-            return Ok(());
+            return Ok(None);
         }
         let catalog_root = batch
             .snapshot
             .roots()
             .root(SLOT_CATALOG)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let qualified = qualified_name(name)?;
-        let relation = self
-            .catalog_object_named_at_root(catalog_root, &qualified)?
+        self.require_delta_catalog_v6(catalog_root)?;
+        let (relation, relation_memory_bytes) = self
+            .delta_catalog_object_named_at_root(batch, catalog_root, &qualified_name(name)?)?
             .ok_or(ModelError::UnknownObject)?;
-        let CatalogObject::Relation(definition) = &relation else {
-            return Err(NativeRuntimeError::InvalidCatalogTree);
+        let table = match &relation {
+            CatalogObject::Relation(definition) if definition.foreign_keys.is_empty() => {
+                definition.header.id
+            }
+            CatalogObject::Relation(_) => return Err(NativeRuntimeError::InvalidPreparedMutation),
+            _ => return Err(NativeRuntimeError::InvalidCatalogTree),
         };
-        let table = definition.header.id;
-        batch.state.catalog.create(relation)?;
-        batch.state.relational.create_table(table)?;
-
-        for index in self.catalog_secondary_indexes_at_root(catalog_root, table)? {
-            let CatalogObject::SecondaryIndex(definition) = &index else {
-                return Err(NativeRuntimeError::InvalidCatalogTree);
-            };
-            batch.state.catalog.create(index.clone())?;
-            batch.state.relational.create_secondary_index(
-                definition.header.id,
-                definition.relation,
-                definition.unique,
-                definition.nulls_distinct,
-            )?;
-            self.hydrate_delta_secondary_index_metadata(batch, definition)?;
-        }
-        Ok(())
+        let indexes = self.delta_catalog_secondary_indexes_at_root(
+            batch,
+            catalog_root,
+            table,
+            relation_memory_bytes,
+        )?;
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let candidate_bytes = retained_catalog_bytes(&batch.state.catalog, delta)
+            .saturating_add(retained_relational_bytes(&batch.state.relational))
+            .saturating_add(relation_memory_bytes)
+            .saturating_add(indexes.iter().fold(0_u64, |bytes, (_, retained_bytes)| {
+                bytes.saturating_add(*retained_bytes)
+            }))
+            .saturating_add(
+                u64::try_from(indexes.len().saturating_add(1))
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(DELTA_ENGINE_CONTAINER_OVERHEAD),
+            );
+        Self::ensure_delta_memory_growth(batch, candidate_bytes)?;
+        let mut catalog = batch.state.catalog.clone();
+        let mut relational = batch.state.relational.clone();
+        catalog.create(relation)?;
+        relational.create_table(table)?;
+        let mut catalog_memory = Vec::with_capacity(indexes.len().saturating_add(1));
+        catalog_memory.push((table, relation_memory_bytes));
+        self.hydrate_delta_secondary_indexes(
+            batch,
+            indexes,
+            &mut catalog,
+            &mut relational,
+            &mut catalog_memory,
+        )?;
+        let previous_catalog = std::mem::replace(&mut batch.state.catalog, catalog);
+        let previous_relational = std::mem::replace(&mut batch.state.relational, relational);
+        let catalog_object_ids = catalog_memory.iter().map(|(id, _)| *id).collect();
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .catalog_object_memory_bytes
+            .extend(catalog_memory);
+        Ok(Some(DeltaRelationHydrationRollback {
+            catalog: previous_catalog,
+            relational: previous_relational,
+            catalog_object_ids,
+        }))
     }
 
-    fn hydrate_delta_secondary_index_metadata(
+    fn hydrate_delta_secondary_indexes(
         &self,
-        batch: &mut NativeWriteBatch,
-        definition: &SecondaryIndexDefinition,
+        batch: &NativeWriteBatch,
+        indexes: Vec<(CatalogObject, u64)>,
+        catalog: &mut CatalogState,
+        relational: &mut RelationState,
+        catalog_memory: &mut Vec<(ObjectId, u64)>,
     ) -> Result<(), NativeRuntimeError> {
         let root = batch
             .snapshot
             .roots()
             .root(SLOT_RELATIONAL)
             .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-        let encoded = BTree::from_root(root)
-            .get_cached_pinned(
-                &self.pages,
-                &self.buffer_pool,
-                &relational_secondary_index_key(definition.header.id),
-            )?
-            .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
-        let (relation, unique, nulls_distinct, layout) =
-            decode_secondary_index_metadata(encoded.bytes())?;
-        if relation != definition.relation
-            || unique != definition.unique
-            || nulls_distinct != definition.nulls_distinct
-        {
-            return Err(NativeRuntimeError::InvalidRelationalTree);
+        for (index, retained_bytes) in indexes {
+            let CatalogObject::SecondaryIndex(definition) = &index else {
+                return Err(NativeRuntimeError::InvalidCatalogTree);
+            };
+            let index_id = definition.header.id;
+            let relation_id = definition.relation;
+            let unique = definition.unique;
+            let nulls_distinct = definition.nulls_distinct;
+            catalog.create(index)?;
+            relational.create_secondary_index(index_id, relation_id, unique, nulls_distinct)?;
+            let encoded = BTree::from_root(root)
+                .get_cached_pinned(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &relational_secondary_index_key(index_id),
+                )?
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?;
+            let (stored_relation, stored_unique, stored_nulls_distinct, layout) =
+                decode_secondary_index_metadata(encoded.bytes())?;
+            if stored_relation != relation_id
+                || stored_unique != unique
+                || stored_nulls_distinct != nulls_distinct
+            {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            }
+            relational
+                .indexes
+                .get_mut(&index_id)
+                .ok_or(NativeRuntimeError::InvalidRelationalTree)?
+                .layout = layout;
+            catalog_memory.push((index_id, retained_bytes));
         }
-        batch
-            .state
-            .relational
-            .indexes
-            .get_mut(&definition.header.id)
-            .ok_or(NativeRuntimeError::InvalidRelationalTree)?
-            .layout = layout;
         Ok(())
     }
 
-    fn hydrate_delta_search_index(
+    fn delta_search_index_candidate(
         &self,
-        batch: &mut NativeWriteBatch,
+        batch: &NativeWriteBatch,
         index: ObjectId,
-    ) -> Result<(), NativeRuntimeError> {
+    ) -> Result<Option<(CatalogObject, u64)>, NativeRuntimeError> {
         if batch.state.catalog.object(index).is_some() {
-            return Ok(());
+            batch.state.catalog.require(index, EngineKind::Search)?;
+            return Ok(None);
         }
         let root = batch
             .snapshot
             .roots()
             .root(SLOT_CATALOG)
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-        let object = self
-            .catalog_object_at_root(root, index)?
+        let candidate = self
+            .delta_catalog_object_at_root(batch, root, index, 0)?
             .ok_or(ModelError::UnknownObject)?;
-        if !matches!(object, CatalogObject::Search(_)) {
+        if !matches!(candidate.0, CatalogObject::Search(_)) {
             return Err(NativeRuntimeError::InvalidCatalogTree);
         }
-        batch.state.catalog.create(object)?;
-        batch.state.search.create_index(index)?;
-        Ok(())
+        Ok(Some(candidate))
     }
 
     fn hydrate_delta_search_document(
@@ -14134,7 +16354,7 @@ impl NativeDatabase {
         batch: &mut NativeWriteBatch,
         index: ObjectId,
         document_id: &[u8],
-    ) -> Result<(), NativeRuntimeError> {
+    ) -> Result<Option<DeltaSearchHydrationRollback>, NativeRuntimeError> {
         let identity = (index, document_id.to_vec());
         if batch
             .delta
@@ -14143,10 +16363,9 @@ impl NativeDatabase {
             .search_documents
             .contains(&identity)
         {
-            return Ok(());
+            return Ok(None);
         }
-        self.hydrate_delta_search_index(batch, index)?;
-        batch.state.catalog.require(index, EngineKind::Search)?;
+        let index_candidate = self.delta_search_index_candidate(batch, index)?;
         let root = batch
             .snapshot
             .roots()
@@ -14155,28 +16374,87 @@ impl NativeDatabase {
         let tree = BTree::from_root(root);
         let format = physical_search_format(&self.pages, tree)?;
         let document_key = search_document_key(index, document_id)?;
-        if let Some(encoded) =
-            tree.get_cached_pinned(&self.pages, &self.buffer_pool, &document_key)?
+        let encoded = tree.get_cached_pinned(&self.pages, &self.buffer_pool, &document_key)?;
+        let mut hydration_charge = delta_payload_retained_charge(document_id.len(), 0, 2, 0);
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        hydration_charge = hydration_charge
+            .saturating_add(retained_catalog_bytes(&batch.state.catalog, delta))
+            .saturating_add(retained_search_bytes(&batch.state.search));
+        if let Some((_, retained_bytes)) = index_candidate.as_ref() {
+            hydration_charge = hydration_charge
+                .saturating_add(*retained_bytes)
+                .saturating_add(DELTA_ENGINE_CONTAINER_OVERHEAD);
+        }
+        if let Some(encoded) = encoded.as_ref()
+            && !is_search_document_tombstone(encoded.bytes())
         {
+            let (_, storage, payload) = decode_search_document_header(encoded.bytes())?;
+            let logical_bytes = match storage {
+                SEARCH_DOCUMENT_INLINE if payload.len() <= SEARCH_INLINE_VALUE_LIMIT => {
+                    u64::try_from(payload.len()).unwrap_or(u64::MAX)
+                }
+                SEARCH_DOCUMENT_BLOB
+                    if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE =>
+                {
+                    let reference = BlobReference::decode(payload)?;
+                    if reference.logical_length <= SEARCH_INLINE_VALUE_LIMIT as u64 {
+                        return Err(NativeRuntimeError::InvalidSearchTree);
+                    }
+                    reference.logical_length
+                }
+                _ => return Err(NativeRuntimeError::InvalidSearchTree),
+            };
+            hydration_charge = hydration_charge.saturating_add(logical_bytes);
+        }
+        Self::ensure_delta_memory_growth(batch, hydration_charge)?;
+        let document = if let Some(encoded) = encoded {
             if is_search_document_tombstone(encoded.bytes()) {
                 if !format.admits_tombstones() {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
+                None
             } else {
                 let (text, _) = decode_search_document(encoded.bytes(), &self.blobs)?;
-                batch
-                    .state
-                    .search
-                    .index_document(index, document_id.to_vec(), text)?;
+                Some(text)
             }
+        } else {
+            None
+        };
+        let mut catalog = batch.state.catalog.clone();
+        let mut search = batch.state.search.clone();
+        let added_catalog_object = index_candidate.as_ref().map(|_| index);
+        if let Some((object, _)) = index_candidate.as_ref() {
+            catalog.create(object.clone())?;
+            search.create_index(index)?;
+        }
+        if let Some(text) = document {
+            search.index_document(index, document_id.to_vec(), text)?;
+        }
+        let previous_catalog = std::mem::replace(&mut batch.state.catalog, catalog);
+        let previous_search = std::mem::replace(&mut batch.state.search, search);
+        if let Some((_, retained_bytes)) = index_candidate {
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .catalog_object_memory_bytes
+                .insert(index, retained_bytes);
         }
         batch
             .delta
             .as_mut()
             .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
             .search_documents
-            .insert(identity);
-        Ok(())
+            .insert(identity.clone());
+        Ok(Some(DeltaSearchHydrationRollback {
+            catalog: previous_catalog,
+            search: previous_search,
+            identity,
+            added_catalog_object,
+        }))
     }
 
     fn hydrate_delta_relational_row(
@@ -14184,7 +16462,7 @@ impl NativeDatabase {
         batch: &mut NativeWriteBatch,
         table: ObjectId,
         primary_key: &[u8],
-    ) -> Result<(), NativeRuntimeError> {
+    ) -> Result<Option<RelationState>, NativeRuntimeError> {
         let identity = (table, primary_key.to_vec());
         let already_loaded = batch
             .delta
@@ -14193,33 +16471,61 @@ impl NativeDatabase {
             .relational_rows
             .contains(&identity);
         if already_loaded {
-            return Ok(());
+            return Ok(None);
         }
-        if let Some(row) = self.select_relational_at(&batch.snapshot, table, primary_key)? {
+        let durable = self.select_delta_relational_value_at(&batch.snapshot, table, primary_key)?;
+        let secondary_indexes = batch
+            .state
+            .relational
+            .indexes
+            .values()
+            .filter(|index| index.relation == table)
+            .count();
+        let durable_bytes = durable
+            .as_ref()
+            .map_or(0, DeltaRelationalValue::logical_bytes);
+        let hydration_charge = retained_relational_bytes(&batch.state.relational).saturating_add(
+            delta_payload_retained_charge(
+                primary_key.len(),
+                usize::try_from(durable_bytes).unwrap_or(usize::MAX),
+                u64::try_from(secondary_indexes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(2)
+                    .saturating_add(2),
+                u64::try_from(secondary_indexes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            ),
+        );
+        Self::ensure_delta_memory_growth(batch, hydration_charge)?;
+        let mut relational = batch.state.relational.clone();
+        if let Some(row) = durable
+            .map(|value| value.materialize(&self.blobs))
+            .transpose()?
+        {
             let projections = secondary_index_projections(&batch.state.catalog, table, &row)?;
             for projection in projections {
-                batch.state.relational.insert_secondary_index(
+                relational.insert_secondary_index(
                     projection.index,
                     projection.key,
                     primary_key.to_vec(),
                     projection.contains_null,
                 )?;
             }
-            batch
-                .state
-                .relational
+            relational
                 .tables
                 .get_mut(&table)
                 .ok_or(NativeRuntimeError::InvalidRelationalTree)?
                 .insert(primary_key.to_vec(), row);
         }
+        let previous_relational = std::mem::replace(&mut batch.state.relational, relational);
         batch
             .delta
             .as_mut()
             .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
             .relational_rows
             .insert(identity);
-        Ok(())
+        Ok(Some(previous_relational))
     }
 
     fn validate_delta_unique_projections(
@@ -14308,36 +16614,31 @@ impl NativeDatabase {
         let tree = BTree::from_root(root);
         match self.structure_format {
             StructureFormat::BTreeV2 => {
-                let collection_kinds = u8::from(self.hydrate_delta_hash(batch, key, tree)?)
-                    + u8::from(self.hydrate_delta_set(batch, key, tree)?)
-                    + u8::from(self.hydrate_delta_list(batch, key, tree)?)
-                    + u8::from(self.hydrate_delta_stream(batch, key, tree)?)
-                    + u8::from(self.hydrate_delta_sorted_set(batch, key, tree)?);
-                if collection_kinds > 1 {
-                    return Err(NativeRuntimeError::InvalidStructureTree);
-                }
+                let collection = self.delta_collection_marker_v2(tree, key)?;
                 if let Some(encoded) =
                     tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_key(key))?
-                    && let Some(entry) = decode_structure_value(encoded.bytes(), &self.blobs)?
                 {
-                    if collection_kinds != 0 {
+                    let scalar = decode_delta_structure_value(encoded.bytes())?;
+                    if scalar.is_some() && collection.is_some() {
                         return Err(NativeRuntimeError::InvalidStructureTree);
                     }
-                    batch.state.structures.entries.insert(key.to_vec(), entry);
+                }
+                if let Some(collection) = collection {
+                    Self::insert_delta_collection_marker_v2(batch, key, collection);
                 }
             }
             StructureFormat::BTreeV3 => {
-                let hydrated = structure_v3::delta_scalar_state_latest_at_v3(
+                let hydrated = structure_v3::delta_scalar_envelope_latest_at_v3(
                     &self.pages,
-                    &self.blobs,
                     &self.buffer_pool,
                     tree,
                     key,
                 )?;
-                if let Some(entry) = hydrated.scalar {
-                    batch.state.structures.entries.insert(key.to_vec(), entry);
-                }
-                if let Some(collection) = hydrated.collection {
+                let structure_v3::DeltaScalarEnvelopeStateV3 {
+                    scalar: _,
+                    collection,
+                } = hydrated;
+                if let Some(collection) = collection {
                     Self::insert_delta_collection_state_v3(batch, key, collection);
                 }
             }
@@ -14354,163 +16655,398 @@ impl NativeDatabase {
         Ok(())
     }
 
-    fn hydrate_delta_hash(
+    fn hydrate_delta_hash_field(
         &self,
         batch: &mut NativeWriteBatch,
         key: &[u8],
-        tree: BTree,
-    ) -> Result<bool, NativeRuntimeError> {
-        let Some(encoded) = tree.get_cached_pinned(
+        field: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        self.require_delta_batch(batch)?;
+        if self.structure_format != StructureFormat::BTreeV3 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        validate_hash_field_identity(key, field)?;
+        let identity = (key.to_vec(), field.to_vec());
+        if batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_fields
+            .contains_key(&identity)
+        {
+            return Ok(());
+        }
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let state = structure_v3::delta_hash_field_state_latest_at_v3(
             &self.pages,
             &self.buffer_pool,
-            &structure_hash_meta_key(key),
+            BTree::from_root(root),
+            key,
+            field,
         )?
-        else {
-            return Ok(false);
-        };
-        let Some(metadata) = decode_live_hash_metadata(encoded.bytes())? else {
-            return Ok(false);
-        };
-        batch
-            .state
-            .structures
-            .hashes
-            .insert(key.to_vec(), BTreeMap::new());
-        if let Some(expiry) = metadata.expires_at_micros {
-            batch
-                .state
-                .structures
-                .hash_expiries
-                .insert(key.to_vec(), expiry);
+        .ok_or(NativeRuntimeError::UnknownStructureHash)?;
+        if state
+            .expires_at_micros
+            .is_some_and(|expiry| expiry <= batch.snapshot.logical_time_micros)
+        {
+            return Err(NativeRuntimeError::UnknownStructureHash);
         }
-        Ok(true)
+        let overlay = state.field.map_or(DeltaHashFieldOverlay::Missing, |field| {
+            if field
+                .expires_at_micros
+                .is_some_and(|expiry| expiry <= batch.snapshot.logical_time_micros)
+            {
+                DeltaHashFieldOverlay::Missing
+            } else {
+                DeltaHashFieldOverlay::Durable(field)
+            }
+        });
+        let accounted_bytes =
+            Self::delta_hash_accounting_after_replacement(batch, &identity, &overlay, None)?;
+        let delta = batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        delta.structure_hash_fields.insert(identity, overlay);
+        delta.structure_hash_memory_bytes = accounted_bytes;
+        Ok(())
     }
 
-    fn hydrate_delta_set(
+    fn delta_hash_field_integer(
         &self,
+        batch: &NativeWriteBatch,
+        identity: &(Vec<u8>, Vec<u8>),
+    ) -> Result<i64, NativeRuntimeError> {
+        self.delta_hash_field_value(batch, identity)?
+            .as_deref()
+            .map_or(Ok(0), parse_canonical_i64)
+    }
+
+    fn delta_hash_field_value(
+        &self,
+        batch: &NativeWriteBatch,
+        identity: &(Vec<u8>, Vec<u8>),
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        let overlay = batch
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.structure_hash_fields.get(identity))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        match overlay {
+            DeltaHashFieldOverlay::Missing | DeltaHashFieldOverlay::Deleted(_) => Ok(None),
+            DeltaHashFieldOverlay::Staged(mutation_index) => {
+                let mutation = batch
+                    .mutations
+                    .get(*mutation_index)
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                if mutation.opcode != Opcode::SetHashField {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                Ok(Some(mutation.value.clone()))
+            }
+            DeltaHashFieldOverlay::Durable(field) => {
+                if let Some(reference) = field.blob_reference {
+                    let delta = batch
+                        .delta
+                        .as_ref()
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    let hash_read_bytes = delta
+                        .structure_hash_memory_bytes
+                        .checked_add(field.logical_value_bytes)
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    let total_read_bytes = delta
+                        .retained_memory_bytes
+                        .checked_add(field.logical_value_bytes)
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+                    if hash_read_bytes > Self::delta_hash_memory_capacity(batch)
+                        || total_read_bytes > Self::delta_memory_capacity(batch)
+                    {
+                        return Err(GovernorAdmissionError::ParentCapacity.into());
+                    }
+                    let _read_permit = batch
+                        .resource_permit
+                        .as_ref()
+                        .map(|permit| {
+                            permit.try_subdivide(GovernorRequest {
+                                compute_threads: 0,
+                                io_slots: 0,
+                                memory_bytes: total_read_bytes,
+                            })
+                        })
+                        .transpose()?;
+                    let value = self.blobs.read(reference)?;
+                    Ok(Some(value))
+                } else {
+                    let value = field
+                        .encoded
+                        .get(STRUCTURE_VALUE_HEADER_SIZE..)
+                        .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                    Ok(Some(value.to_vec()))
+                }
+            }
+        }
+    }
+
+    fn capture_delta_hash_stage_rollback(
+        batch: &NativeWriteBatch,
+        identity: &(Vec<u8>, Vec<u8>),
+    ) -> Result<DeltaHashStageRollback, NativeRuntimeError> {
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        Ok(DeltaHashStageRollback {
+            previous_overlay: delta.structure_hash_fields.get(identity).cloned(),
+            previous_hash_memory: delta.structure_hash_memory_bytes,
+            previous_retained_memory: delta.retained_memory_bytes,
+            mutation_count: batch.mutations.len(),
+            dirty: batch.dirty,
+        })
+    }
+
+    fn restore_delta_hash_stage_rollback(
         batch: &mut NativeWriteBatch,
-        key: &[u8],
+        identity: &(Vec<u8>, Vec<u8>),
+        rollback: DeltaHashStageRollback,
+    ) -> Result<(), NativeRuntimeError> {
+        batch.mutations.truncate(rollback.mutation_count);
+        batch.dirty = rollback.dirty;
+        let delta = batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        if let Some(previous) = rollback.previous_overlay {
+            delta
+                .structure_hash_fields
+                .insert(identity.clone(), previous);
+        } else {
+            delta.structure_hash_fields.remove(identity);
+        }
+        delta.structure_hash_memory_bytes = rollback.previous_hash_memory;
+        delta.retained_memory_bytes = rollback.previous_retained_memory;
+        Ok(())
+    }
+
+    fn delta_hash_accounting_after_replacement(
+        batch: &NativeWriteBatch,
+        identity: &(Vec<u8>, Vec<u8>),
+        replacement: &DeltaHashFieldOverlay,
+        mutation: Option<&Mutation>,
+    ) -> Result<u64, NativeRuntimeError> {
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let replaced_bytes = delta
+            .structure_hash_fields
+            .get(identity)
+            .map(|overlay| Self::delta_hash_overlay_charge(identity, overlay))
+            .transpose()?
+            .unwrap_or(0);
+        let replacement_bytes = Self::delta_hash_overlay_charge(identity, replacement)?;
+        let mutation_bytes = mutation
+            .map(Self::delta_hash_mutation_charge)
+            .transpose()?
+            .unwrap_or(0);
+        let accounted_after = delta
+            .structure_hash_memory_bytes
+            .checked_sub(replaced_bytes)
+            .and_then(|bytes| bytes.checked_add(replacement_bytes))
+            .and_then(|bytes| bytes.checked_add(mutation_bytes))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        if accounted_after > Self::delta_hash_memory_capacity(batch) {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        let non_hash_bytes = delta
+            .retained_memory_bytes
+            .saturating_sub(delta.structure_hash_memory_bytes);
+        if non_hash_bytes.saturating_add(accounted_after) > Self::delta_memory_capacity(batch) {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        Ok(accounted_after)
+    }
+
+    fn delta_hash_overlay_charge(
+        identity: &(Vec<u8>, Vec<u8>),
+        overlay: &DeltaHashFieldOverlay,
+    ) -> Result<u64, NativeRuntimeError> {
+        let identity_bytes = identity
+            .0
+            .capacity()
+            .checked_add(identity.1.capacity())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let payload_bytes = match overlay {
+            DeltaHashFieldOverlay::Durable(field) => u64::try_from(field.encoded.capacity())
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+            DeltaHashFieldOverlay::Missing
+            | DeltaHashFieldOverlay::Staged(_)
+            | DeltaHashFieldOverlay::Deleted(_) => 0,
+        };
+        DELTA_HASH_OVERLAY_ENTRY_OVERHEAD
+            .checked_add(identity_bytes)
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+    }
+
+    fn delta_hash_mutation_charge(mutation: &Mutation) -> Result<u64, NativeRuntimeError> {
+        let retained_bytes = mutation
+            .key
+            .capacity()
+            .checked_add(mutation.value.capacity())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        DELTA_HASH_MUTATION_OVERHEAD
+            .checked_add(retained_bytes)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+    }
+
+    fn delta_hash_memory_capacity(batch: &NativeWriteBatch) -> u64 {
+        batch
+            .resource_permit
+            .as_ref()
+            .map_or(DELTA_HASH_MEMORY_BUDGET, |permit| {
+                permit.request().memory_bytes
+            })
+            .min(DELTA_HASH_MEMORY_BUDGET)
+    }
+
+    fn delta_collection_marker_v2(
+        &self,
         tree: BTree,
-    ) -> Result<bool, NativeRuntimeError> {
-        let Some(encoded) =
+        key: &[u8],
+    ) -> Result<Option<DeltaCollectionMarkerV2>, NativeRuntimeError> {
+        let mut found = None;
+        let candidates = [
+            tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_hash_meta_key(key),
+            )?
+            .map(|encoded| {
+                decode_live_hash_metadata(encoded.bytes()).map(|metadata| {
+                    metadata
+                        .map(|metadata| DeltaCollectionMarkerV2::Hash(metadata.expires_at_micros))
+                })
+            })
+            .transpose()?
+            .flatten(),
             tree.get_cached_pinned(&self.pages, &self.buffer_pool, &structure_set_meta_key(key))?
-        else {
-            return Ok(false);
-        };
-        let Some(metadata) = decode_live_set_metadata(encoded.bytes())? else {
-            return Ok(false);
-        };
-        batch
-            .state
-            .structures
-            .sets
-            .insert(key.to_vec(), BTreeSet::new());
-        if let Some(expiry) = metadata.expires_at_micros {
-            batch
-                .state
-                .structures
-                .set_expiries
-                .insert(key.to_vec(), expiry);
+                .map(|encoded| {
+                    decode_live_set_metadata(encoded.bytes()).map(|metadata| {
+                        metadata.map(|metadata| {
+                            DeltaCollectionMarkerV2::Set(metadata.expires_at_micros)
+                        })
+                    })
+                })
+                .transpose()?
+                .flatten(),
+            tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_list_meta_key(key)?,
+            )?
+            .map(|encoded| {
+                decode_live_list_metadata(encoded.bytes()).map(|metadata| {
+                    metadata
+                        .map(|metadata| DeltaCollectionMarkerV2::List(metadata.expires_at_micros))
+                })
+            })
+            .transpose()?
+            .flatten(),
+            tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_sorted_set_meta_key(key)?,
+            )?
+            .map(|encoded| {
+                if is_structure_tombstone(encoded.bytes()) {
+                    Ok(None)
+                } else {
+                    decode_sorted_set_metadata_state(encoded.bytes())
+                        .map(|(_, expiry)| Some(DeltaCollectionMarkerV2::SortedSet(expiry)))
+                }
+            })
+            .transpose()?
+            .flatten(),
+            tree.get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &structure_stream_meta_key(key)?,
+            )?
+            .map(|encoded| {
+                if is_structure_tombstone(encoded.bytes()) {
+                    Ok(None)
+                } else {
+                    decode_stream_metadata(encoded.bytes())
+                        .map(|(_, expiry)| Some(DeltaCollectionMarkerV2::Stream(expiry)))
+                }
+            })
+            .transpose()?
+            .flatten(),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if found.replace(candidate).is_some() {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
         }
-        Ok(true)
+        Ok(found)
     }
 
-    fn hydrate_delta_list(
-        &self,
+    fn insert_delta_collection_marker_v2(
         batch: &mut NativeWriteBatch,
         key: &[u8],
-        tree: BTree,
-    ) -> Result<bool, NativeRuntimeError> {
-        let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_list_meta_key(key)?,
-        )?
-        else {
-            return Ok(false);
+        marker: DeltaCollectionMarkerV2,
+    ) {
+        let (expiry, expiries) = match marker {
+            DeltaCollectionMarkerV2::Hash(expiry) => {
+                batch
+                    .state
+                    .structures
+                    .hashes
+                    .insert(key.to_vec(), BTreeMap::new());
+                (expiry, &mut batch.state.structures.hash_expiries)
+            }
+            DeltaCollectionMarkerV2::Set(expiry) => {
+                batch
+                    .state
+                    .structures
+                    .sets
+                    .insert(key.to_vec(), BTreeSet::new());
+                (expiry, &mut batch.state.structures.set_expiries)
+            }
+            DeltaCollectionMarkerV2::List(expiry) => {
+                batch
+                    .state
+                    .structures
+                    .lists
+                    .insert(key.to_vec(), VecDeque::new());
+                (expiry, &mut batch.state.structures.list_expiries)
+            }
+            DeltaCollectionMarkerV2::SortedSet(expiry) => {
+                batch
+                    .state
+                    .structures
+                    .sorted_sets
+                    .insert(key.to_vec(), BTreeMap::new());
+                (expiry, &mut batch.state.structures.sorted_set_expiries)
+            }
+            DeltaCollectionMarkerV2::Stream(expiry) => {
+                batch
+                    .state
+                    .structures
+                    .streams
+                    .insert(key.to_vec(), BTreeMap::new());
+                (expiry, &mut batch.state.structures.stream_expiries)
+            }
         };
-        let Some(metadata) = decode_live_list_metadata(encoded.bytes())? else {
-            return Ok(false);
-        };
-        batch
-            .state
-            .structures
-            .lists
-            .insert(key.to_vec(), VecDeque::new());
-        if let Some(expiry) = metadata.expires_at_micros {
-            batch
-                .state
-                .structures
-                .list_expiries
-                .insert(key.to_vec(), expiry);
-        }
-        Ok(true)
-    }
-
-    fn hydrate_delta_sorted_set(
-        &self,
-        batch: &mut NativeWriteBatch,
-        key: &[u8],
-        tree: BTree,
-    ) -> Result<bool, NativeRuntimeError> {
-        let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_sorted_set_meta_key(key)?,
-        )?
-        else {
-            return Ok(false);
-        };
-        if is_structure_tombstone(encoded.bytes()) {
-            return Ok(false);
-        }
-        let (_, expiry) = decode_sorted_set_metadata_state(encoded.bytes())?;
-        batch
-            .state
-            .structures
-            .sorted_sets
-            .insert(key.to_vec(), BTreeMap::new());
         if let Some(expiry) = expiry {
-            batch
-                .state
-                .structures
-                .sorted_set_expiries
-                .insert(key.to_vec(), expiry);
+            expiries.insert(key.to_vec(), expiry);
         }
-        Ok(true)
-    }
-
-    fn hydrate_delta_stream(
-        &self,
-        batch: &mut NativeWriteBatch,
-        key: &[u8],
-        tree: BTree,
-    ) -> Result<bool, NativeRuntimeError> {
-        let Some(encoded) = tree.get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &structure_stream_meta_key(key)?,
-        )?
-        else {
-            return Ok(false);
-        };
-        if is_structure_tombstone(encoded.bytes()) {
-            return Ok(false);
-        }
-        let (_, expiry) = decode_stream_metadata(encoded.bytes())?;
-        batch
-            .state
-            .structures
-            .streams
-            .insert(key.to_vec(), BTreeMap::new());
-        if let Some(expiry) = expiry {
-            batch
-                .state
-                .structures
-                .stream_expiries
-                .insert(key.to_vec(), expiry);
-        }
-        Ok(true)
     }
 
     fn insert_delta_collection_state_v3(
@@ -14647,9 +17183,9 @@ impl NativeDatabase {
     /// semantics, persistence, synchronization, codec, or MVCC publication.
     pub fn commit_optimistic(
         &mut self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_optimistic_at(batch, None)
+        self.commit_optimistic_at(batch.into().into_inner(), None)
     }
 
     /// Commits a detached batch with an authorization-bound resolution record
@@ -14661,10 +17197,16 @@ impl NativeDatabase {
     /// any validation, persistence, synchronization, or publication failure.
     pub fn commit_optimistic_resolved(
         &mut self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         principal_hash: [u8; 32],
         idempotency_token: [u8; 32],
     ) -> Result<(DurableTransactionResolution, CommitReceipt), ResolvedCommitError> {
+        let batch = batch.into().into_inner();
+        self.validate_optimistic_batch_preflight(&batch)
+            .map_err(|source| ResolvedCommitError {
+                resolution: Box::new(None),
+                source: Box::new(source),
+            })?;
         let resolution = self
             .reserve_optimistic_resolution(principal_hash, idempotency_token)
             .map_err(|error| {
@@ -14696,11 +17238,17 @@ impl NativeDatabase {
     /// the injected interruption or another commit failure.
     pub fn commit_optimistic_resolved_with_interruption(
         &mut self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         principal_hash: [u8; 32],
         idempotency_token: [u8; 32],
         boundary: CommitBoundary,
     ) -> Result<(DurableTransactionResolution, CommitReceipt), ResolvedCommitError> {
+        let batch = batch.into().into_inner();
+        self.validate_optimistic_batch_preflight(&batch)
+            .map_err(|source| ResolvedCommitError {
+                resolution: Box::new(None),
+                source: Box::new(source),
+            })?;
         let resolution = self
             .reserve_optimistic_resolution(principal_hash, idempotency_token)
             .map_err(|error| {
@@ -14806,10 +17354,10 @@ impl NativeDatabase {
     /// or the same errors as [`Self::commit_optimistic`].
     pub fn commit_optimistic_with_interruption(
         &mut self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         boundary: CommitBoundary,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_optimistic_at(batch, Some(boundary))
+        self.commit_optimistic_at(batch.into().into_inner(), Some(boundary))
     }
 
     fn commit_optimistic_at(
@@ -14834,15 +17382,7 @@ impl NativeDatabase {
         interruption: Option<CommitBoundary>,
         resolution_binding: Option<([u8; 32], [u8; 32], DurableTransactionResolution)>,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
-        if !matches!(
-            batch.mode,
-            NativeWriteBatchMode::Materialized | NativeWriteBatchMode::PhysicalAllEngineDelta
-        ) {
-            return Err(NativeRuntimeError::InvalidPreparedMutation);
-        }
-        if batch.mutations.is_empty() {
-            return Err(WalSemanticError::InvalidSequence.into());
-        }
+        self.validate_optimistic_batch_preflight(&batch)?;
         let conflict_read_csn = batch.snapshot.visible_csn;
         let logical_time_micros = batch.snapshot.logical_time_micros;
         let root_transaction = self.coordinator.begin_write()?;
@@ -14902,6 +17442,36 @@ impl NativeDatabase {
         transaction.commit_report_at(interruption)
     }
 
+    fn validate_optimistic_batch_preflight(
+        &self,
+        batch: &NativeWriteBatch,
+    ) -> Result<(), NativeRuntimeError> {
+        if batch.directory_identity != *self.directory_identity()
+            || !self.owns_detached_batch(batch)
+            || batch.structure_format != self.structure_format
+            || batch.search_format != self.search_format
+            || !matches!(
+                batch.mode,
+                NativeWriteBatchMode::Materialized | NativeWriteBatchMode::PhysicalAllEngineDelta
+            )
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        if batch.mutations.is_empty() {
+            return Err(WalSemanticError::InvalidSequence.into());
+        }
+        if batch.mode == NativeWriteBatchMode::PhysicalAllEngineDelta {
+            validate_delta_write_batch_shape(
+                batch,
+                &roots_from_snapshot(batch.snapshot.roots()),
+                self.structure_format,
+                self.search_format,
+            )?;
+        }
+        reject_unsupported_v3_structure_mutations(self.structure_format, batch)?;
+        Ok(())
+    }
+
     /// Commits independent group-durability batches with one page and WAL sync.
     ///
     /// Semantic admission failures are returned in their original request
@@ -14913,11 +17483,20 @@ impl NativeDatabase {
     ///
     /// Returns an error for an empty or oversized cohort, persistence,
     /// synchronization, WAL, page, blob, or MVCC publication failure.
-    pub fn commit_group(
+    pub fn commit_group<Batch>(
         &mut self,
-        batches: Vec<NativeWriteBatch>,
-    ) -> Result<GroupCommitReport, NativeRuntimeError> {
-        self.commit_group_at(batches, None)
+        batches: Vec<Batch>,
+    ) -> Result<GroupCommitReport, NativeRuntimeError>
+    where
+        Batch: Into<NativeCommitBatch>,
+    {
+        self.commit_group_at(
+            batches
+                .into_iter()
+                .map(|batch| batch.into().into_inner())
+                .collect(),
+            None,
+        )
     }
 
     /// Executes one group cohort with a deterministic crash interruption.
@@ -14929,12 +17508,21 @@ impl NativeDatabase {
     ///
     /// Returns [`NativeRuntimeError::InjectedGroupCrash`] at the requested
     /// boundary, or the same errors as [`Self::commit_group`].
-    pub fn commit_group_with_interruption(
+    pub fn commit_group_with_interruption<Batch>(
         &mut self,
-        batches: Vec<NativeWriteBatch>,
+        batches: Vec<Batch>,
         boundary: GroupCommitBoundary,
-    ) -> Result<GroupCommitReport, NativeRuntimeError> {
-        self.commit_group_at(batches, Some(boundary))
+    ) -> Result<GroupCommitReport, NativeRuntimeError>
+    where
+        Batch: Into<NativeCommitBatch>,
+    {
+        self.commit_group_at(
+            batches
+                .into_iter()
+                .map(|batch| batch.into().into_inner())
+                .collect(),
+            Some(boundary),
+        )
     }
 
     fn commit_group_at(
@@ -14946,6 +17534,12 @@ impl NativeDatabase {
             return Err(NativeRuntimeError::InvalidGroupCommitBatchSize {
                 requested: batches.len(),
             });
+        }
+        if batches.iter().any(|batch| {
+            batch.directory_identity != *self.directory_identity()
+                || !self.owns_detached_batch(batch)
+        }) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let execution_started = Instant::now();
 
@@ -15877,10 +18471,362 @@ fn read_list_range_from_tail(
 
 #[derive(Clone, Debug, Default)]
 struct DeltaOverlay {
+    catalog_object_memory_bytes: BTreeMap<ObjectId, u64>,
     relational_rows: BTreeSet<(ObjectId, Vec<u8>)>,
     structure_scalars: BTreeSet<Vec<u8>>,
+    structure_hash_fields: BTreeMap<(Vec<u8>, Vec<u8>), DeltaHashFieldOverlay>,
+    structure_hash_memory_bytes: u64,
+    retained_memory_bytes: u64,
     search_documents: BTreeSet<(ObjectId, Vec<u8>)>,
     unique_probes: BTreeSet<DeltaUniqueProbe>,
+}
+
+struct DeltaRelationHydrationRollback {
+    catalog: CatalogState,
+    relational: RelationState,
+    catalog_object_ids: Vec<ObjectId>,
+}
+
+struct DeltaSearchHydrationRollback {
+    catalog: CatalogState,
+    search: SearchState,
+    identity: (ObjectId, Vec<u8>),
+    added_catalog_object: Option<ObjectId>,
+}
+
+struct DeltaHashStageRollback {
+    previous_overlay: Option<DeltaHashFieldOverlay>,
+    previous_hash_memory: u64,
+    previous_retained_memory: u64,
+    mutation_count: usize,
+    dirty: [bool; 4],
+}
+
+#[derive(Clone, Debug)]
+enum DeltaHashFieldOverlay {
+    Missing,
+    Durable(structure_v3::DeltaHashFieldValueV3),
+    Staged(usize),
+    Deleted(usize),
+}
+
+fn retained_vec_bytes(value: &Vec<u8>) -> u64 {
+    u64::try_from(value.capacity()).unwrap_or(u64::MAX)
+}
+
+fn retained_string_bytes(value: &String) -> u64 {
+    u64::try_from(value.capacity()).unwrap_or(u64::MAX)
+}
+
+fn delta_catalog_definition_charge(logical_bytes: u64) -> u64 {
+    DELTA_ENGINE_CONTAINER_OVERHEAD
+        .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+        .saturating_add(logical_bytes.saturating_mul(DELTA_CATALOG_DECODE_EXPANSION_BOUND))
+}
+
+fn retained_catalog_bytes(state: &CatalogState, delta: &DeltaOverlay) -> u64 {
+    if !state.logical_objects.is_empty()
+        || state.objects.len() != delta.catalog_object_memory_bytes.len()
+        || state
+            .objects
+            .keys()
+            .ne(delta.catalog_object_memory_bytes.keys())
+    {
+        return u64::MAX;
+    }
+    delta
+        .catalog_object_memory_bytes
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn retained_relational_bytes(state: &RelationState) -> u64 {
+    let mut bytes = u64::try_from(state.tables.len().saturating_add(state.indexes.len()))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(DELTA_ENGINE_CONTAINER_OVERHEAD);
+    for rows in state.tables.values() {
+        for (primary_key, row) in rows {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(primary_key))
+                .saturating_add(retained_vec_bytes(row));
+        }
+    }
+    for index in state.indexes.values() {
+        for (index_key, primary_keys) in &index.entries {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(index_key));
+            for primary_key in primary_keys {
+                bytes = bytes
+                    .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                    .saturating_add(retained_vec_bytes(primary_key));
+            }
+        }
+    }
+    bytes
+}
+
+fn retained_structure_bytes(state: &StructureState) -> u64 {
+    let mut bytes = 0_u64;
+    for (key, entry) in &state.entries {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key))
+            .saturating_add(retained_vec_bytes(&entry.value));
+    }
+    for (key, fields) in &state.hashes {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+        for (field, value) in fields {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(field))
+                .saturating_add(retained_vec_bytes(value));
+        }
+    }
+    for (key, members) in &state.sets {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+        for member in members {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(member));
+        }
+    }
+    for (key, elements) in &state.lists {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+        for element in elements {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(element));
+        }
+    }
+    for (key, members) in &state.sorted_sets {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+        for member in members.keys() {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(member));
+        }
+    }
+    for (key, entries) in &state.streams {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+        for fields in entries.values() {
+            for (field, value) in fields {
+                bytes = bytes
+                    .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                    .saturating_add(retained_vec_bytes(field))
+                    .saturating_add(retained_vec_bytes(value));
+            }
+        }
+    }
+    for key in state
+        .hash_expiries
+        .keys()
+        .chain(state.set_expiries.keys())
+        .chain(state.list_expiries.keys())
+        .chain(state.sorted_set_expiries.keys())
+        .chain(state.stream_expiries.keys())
+    {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+    }
+    for (key, field) in state.hash_field_expiries.keys() {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key))
+            .saturating_add(retained_vec_bytes(field));
+    }
+    bytes
+}
+
+fn retained_search_bytes(state: &SearchState) -> u64 {
+    let mut bytes = u64::try_from(state.indexes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(DELTA_ENGINE_CONTAINER_OVERHEAD);
+    for documents in state.indexes.values() {
+        for (document_id, text) in documents {
+            bytes = bytes
+                .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+                .saturating_add(retained_vec_bytes(document_id))
+                .saturating_add(retained_string_bytes(text));
+        }
+    }
+    bytes
+}
+
+fn retained_delta_overlay_bytes(delta: &DeltaOverlay) -> u64 {
+    let mut bytes = delta.structure_hash_memory_bytes;
+    for (_, primary_key) in &delta.relational_rows {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(primary_key));
+    }
+    for key in &delta.structure_scalars {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(key));
+    }
+    for (_, document_id) in &delta.search_documents {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(document_id));
+    }
+    for probe in &delta.unique_probes {
+        bytes = bytes
+            .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
+            .saturating_add(retained_vec_bytes(&probe.key));
+    }
+    bytes
+}
+
+fn retained_non_hash_mutation_bytes(mutations: &Vec<Mutation>) -> u64 {
+    let vector_bytes = u64::try_from(mutations.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<Mutation>()).unwrap_or(u64::MAX));
+    mutations.iter().fold(vector_bytes, |bytes, mutation| {
+        if mutation.engine == EngineKind::Structure
+            && matches!(
+                mutation.opcode,
+                Opcode::SetHashField | Opcode::DeleteHashField
+            )
+        {
+            bytes
+        } else {
+            bytes
+                .saturating_add(DELTA_MUTATION_OVERHEAD)
+                .saturating_add(retained_vec_bytes(&mutation.key))
+                .saturating_add(retained_vec_bytes(&mutation.value))
+        }
+    })
+}
+
+fn replay_delta_retained_memory_bytes(batch: &NativeWriteBatch) -> u64 {
+    let Some(delta) = batch.delta.as_ref() else {
+        return u64::MAX;
+    };
+    retained_catalog_bytes(&batch.state.catalog, delta)
+        .saturating_add(retained_relational_bytes(&batch.state.relational))
+        .saturating_add(retained_structure_bytes(&batch.state.structures))
+        .saturating_add(retained_search_bytes(&batch.state.search))
+        .saturating_add(retained_delta_overlay_bytes(delta))
+        .saturating_add(retained_non_hash_mutation_bytes(&batch.mutations))
+}
+
+fn retained_scalar_value_capacity(value: &SqlValue) -> u64 {
+    match value {
+        ScalarValue::Text(value) | ScalarValue::Json(value) => retained_string_bytes(value),
+        ScalarValue::Binary(value) => retained_vec_bytes(value),
+        ScalarValue::Array(values) => values.iter().fold(
+            u64::try_from(values.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(std::mem::size_of::<ScalarValue>()).unwrap_or(u64::MAX),
+                ),
+            |bytes, value| bytes.saturating_add(retained_scalar_value_capacity(value)),
+        ),
+        ScalarValue::Map(entries) => entries.iter().fold(
+            u64::try_from(entries.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(std::mem::size_of::<(ScalarValue, ScalarValue)>())
+                        .unwrap_or(u64::MAX),
+                ),
+            |bytes, (key, value)| {
+                bytes
+                    .saturating_add(retained_scalar_value_capacity(key))
+                    .saturating_add(retained_scalar_value_capacity(value))
+            },
+        ),
+        ScalarValue::Vector(values) => u64::try_from(values.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4),
+        _ => u64::try_from(std::mem::size_of::<ScalarValue>()).unwrap_or(u64::MAX),
+    }
+}
+
+fn delta_payload_retained_charge(
+    key_capacity: usize,
+    value_capacity: usize,
+    key_copies: u64,
+    value_copies: u64,
+) -> u64 {
+    DELTA_ENGINE_CONTAINER_OVERHEAD
+        .saturating_add(
+            u64::try_from(key_capacity)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(key_copies),
+        )
+        .saturating_add(
+            u64::try_from(value_capacity)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(value_copies),
+        )
+        .saturating_add(DELTA_TREE_ENTRY_OVERHEAD.saturating_mul(4))
+        .saturating_add(DELTA_MUTATION_OVERHEAD)
+}
+
+fn delta_sql_candidate_charge(
+    batch: &NativeWriteBatch,
+    table: ObjectId,
+    primary_key_capacity: usize,
+    candidate_capacity: usize,
+) -> u64 {
+    let secondary_indexes = batch
+        .state
+        .relational
+        .indexes
+        .values()
+        .filter(|index| index.relation == table)
+        .count();
+    let key_copies = u64::try_from(secondary_indexes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_add(3);
+    let value_copies = u64::try_from(secondary_indexes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
+    delta_payload_retained_charge(
+        primary_key_capacity,
+        candidate_capacity,
+        key_copies,
+        value_copies,
+    )
+    .saturating_add(retained_relational_bytes(&batch.state.relational))
+    .saturating_add(delta_mutation_vector_growth(batch))
+}
+
+fn delta_mutation_vector_growth_for(batch: &NativeWriteBatch, additional: usize) -> u64 {
+    let required = batch.mutations.len().saturating_add(additional);
+    if required <= batch.mutations.capacity() {
+        return 0;
+    }
+    let current = batch.mutations.capacity();
+    let mut next = current.max(4);
+    while next < required {
+        next = next.saturating_mul(2);
+        if next == usize::MAX {
+            break;
+        }
+    }
+    u64::try_from(next.saturating_sub(current))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<Mutation>()).unwrap_or(u64::MAX))
+}
+
+fn delta_mutation_vector_growth(batch: &NativeWriteBatch) -> u64 {
+    delta_mutation_vector_growth_for(batch, 1)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -15898,12 +18844,37 @@ struct InitialAnnBulkPublication {
     candidate: PartitionedIndexSnapshot,
 }
 
+#[derive(Debug)]
+struct NativeWriteBatchLease {
+    active_batches: Arc<AtomicU64>,
+    owner_live: Arc<AtomicBool>,
+}
+
+impl Drop for NativeWriteBatchLease {
+    fn drop(&mut self) {
+        let previous = self.active_batches.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
 /// Detached private write set over one immutable all-engine snapshot.
 ///
 /// A batch owns no file handle and holds no writer guard. It may be prepared
 /// concurrently and later submitted to [`NativeDatabase::commit_optimistic`].
-#[derive(Clone, Debug)]
+/// Batches are deliberately linear and cannot duplicate retained values under
+/// one governor allocation.
+///
+/// ```compile_fail
+/// use hyphae_native_runtime::NativeWriteBatch;
+///
+/// fn duplicate(batch: &NativeWriteBatch) {
+///     let _duplicate = (*batch).clone();
+/// }
+/// ```
+#[derive(Debug)]
 pub struct NativeWriteBatch {
+    lineage: Option<Arc<NativeWriteBatchLease>>,
+    directory_identity: NativeDirectoryIdentity,
     snapshot: Snapshot,
     state: MaterializedState,
     mutations: Vec<Mutation>,
@@ -15912,10 +18883,154 @@ pub struct NativeWriteBatch {
     structure_format: StructureFormat,
     search_format: SearchFormat,
     mode: NativeWriteBatchMode,
+    delta_stage_active: bool,
     delta: Option<DeltaOverlay>,
     ann_consolidation: Option<ann_store::ConsolidationPlan>,
+    ann_consolidation_structure: Option<PrefixReplacementStructuralPlan>,
     ann_initial_bulk: Option<InitialAnnBulkPublication>,
-    _resource_permit: Option<OwnedGovernorPermit>,
+    resource_permit: Option<OwnedGovernorPermit>,
+}
+
+/// Detached point-resolved write set with no materialized read surface.
+///
+/// Delta batches deliberately do not dereference or convert back to
+/// [`NativeWriteBatch`]. They expose only snapshot metadata and lifecycle;
+/// point hydration and mutation remain owned by the corresponding
+/// `NativeDatabase::stage_delta_*` and `NativeDatabase::delta_*` methods.
+///
+/// ```compile_fail
+/// use hyphae_native_runtime::{NativeDeltaWriteBatch, NativeWriteBatch};
+///
+/// fn require_materialized(_: &NativeWriteBatch) {}
+///
+/// fn cannot_dereference(delta: &NativeDeltaWriteBatch) {
+///     require_materialized(delta);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use hyphae_native_runtime::{NativeDeltaWriteBatch, NativeWriteBatch};
+///
+/// fn cannot_convert(delta: NativeDeltaWriteBatch) -> NativeWriteBatch {
+///     delta.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct NativeDeltaWriteBatch {
+    inner: NativeWriteBatch,
+}
+
+impl NativeDeltaWriteBatch {
+    /// Returns the number of physical mutations currently retained by this batch.
+    pub fn mutation_count(&self) -> usize {
+        self.inner.mutation_count()
+    }
+
+    /// Returns the deterministic logical time fixed when this batch began.
+    pub const fn logical_time_micros(&self) -> i64 {
+        self.inner.logical_time_micros()
+    }
+
+    /// Returns the snapshot CSN captured before private preparation.
+    pub fn read_csn(&self) -> Option<Csn> {
+        self.inner.read_csn()
+    }
+
+    /// Explicitly discards this detached delta batch.
+    pub fn rollback(self) {
+        drop(self);
+    }
+}
+
+/// Opaque consumed authority accepted by detached commit entrypoints.
+///
+/// This envelope preserves one commit surface for materialized and delta
+/// batches without exposing delta internals. Homogeneous groups convert
+/// implicitly; callers form a mixed group by converting each member into this
+/// type explicitly.
+#[derive(Debug)]
+pub struct NativeCommitBatch {
+    inner: NativeWriteBatch,
+}
+
+impl NativeCommitBatch {
+    fn into_inner(self) -> NativeWriteBatch {
+        self.inner
+    }
+}
+
+impl From<NativeWriteBatch> for NativeCommitBatch {
+    fn from(batch: NativeWriteBatch) -> Self {
+        Self { inner: batch }
+    }
+}
+
+impl From<NativeDeltaWriteBatch> for NativeCommitBatch {
+    fn from(batch: NativeDeltaWriteBatch) -> Self {
+        Self { inner: batch.inner }
+    }
+}
+
+/// Temporary deep-copy candidate for one legacy materialized write batch.
+///
+/// The candidate shares the original batch's primary mutation authority and
+/// retains a separate memory-only admission until [`Self::finish`] transfers
+/// it into the caller's immediate replacement step.
+#[derive(Debug)]
+pub struct LegacyMaterializedWriteBatchCandidate {
+    batch: NativeWriteBatch,
+    copy_memory_permit: Option<OwnedGovernorPermit>,
+}
+
+impl LegacyMaterializedWriteBatchCandidate {
+    /// Releases the temporary copy allocation and returns the replacement.
+    ///
+    /// The caller must immediately replace and drop the source batch so only
+    /// one deep materialized state remains under the shared primary permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `source` is not the exact batch lineage and
+    /// primary governor allocation from which this candidate was copied.
+    pub fn finish(
+        mut self,
+        source: NativeWriteBatch,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let same_primary_allocation = match (
+            self.batch.resource_permit.as_ref(),
+            source.resource_permit.as_ref(),
+        ) {
+            (Some(candidate), Some(source)) => candidate.shares_allocation_with(source),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        let same_lineage = self
+            .batch
+            .lineage
+            .as_ref()
+            .zip(source.lineage.as_ref())
+            .is_some_and(|(candidate, source)| Arc::ptr_eq(candidate, source));
+        if !same_lineage || !same_primary_allocation {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        drop(source);
+        self.copy_memory_permit.take();
+        Ok(self.batch)
+    }
+}
+
+impl Deref for LegacyMaterializedWriteBatchCandidate {
+    type Target = NativeWriteBatch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.batch
+    }
+}
+
+impl DerefMut for LegacyMaterializedWriteBatchCandidate {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.batch
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16149,6 +19264,53 @@ impl DerefMut for NativeTransaction<'_> {
 }
 
 impl NativeWriteBatch {
+    fn require_materialized_mutation_entry(&self) -> Result<(), NativeRuntimeError> {
+        if self.mode == NativeWriteBatchMode::PhysicalAllEngineDelta && !self.delta_stage_active {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        Ok(())
+    }
+
+    fn with_delta_stage<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        debug_assert_eq!(self.mode, NativeWriteBatchMode::PhysicalAllEngineDelta);
+        debug_assert!(!self.delta_stage_active);
+        self.delta_stage_active = true;
+        let result = operation(self);
+        self.delta_stage_active = false;
+        result
+    }
+
+    fn require_materialized_hash_read(&self) -> Result<(), NativeRuntimeError> {
+        if self.mode != NativeWriteBatchMode::Materialized {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        Ok(())
+    }
+
+    fn clone_with_resource_permit(&self, resource_permit: Option<OwnedGovernorPermit>) -> Self {
+        Self {
+            lineage: self.lineage.clone(),
+            directory_identity: self.directory_identity.clone(),
+            snapshot: self.snapshot.clone(),
+            state: self.state.clone(),
+            mutations: self.mutations.clone(),
+            dirty: self.dirty,
+            durability: self.durability,
+            structure_format: self.structure_format,
+            search_format: self.search_format,
+            mode: self.mode,
+            delta_stage_active: self.delta_stage_active,
+            delta: self.delta.clone(),
+            ann_consolidation: self.ann_consolidation.clone(),
+            ann_consolidation_structure: self.ann_consolidation_structure.clone(),
+            ann_initial_bulk: self.ann_initial_bulk.clone(),
+            resource_permit,
+        }
+    }
+
     /// Returns the next catalog identity owned by this transaction's private
     /// catalog state.
     ///
@@ -16198,6 +19360,8 @@ impl NativeWriteBatch {
         statement: &str,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
+        self.require_materialized_mutation_entry()
+            .map_err(SqlError::from)?;
         sql::execute_transaction(self, statement, parameters)
     }
 
@@ -16212,6 +19376,8 @@ impl NativeWriteBatch {
         statement: &str,
         parameters: &[SqlValue],
     ) -> Result<SqlResult, SqlError> {
+        self.require_materialized_mutation_entry()
+            .map_err(SqlError::from)?;
         sql::execute_transaction_dml(self, statement, parameters)
     }
 
@@ -16221,6 +19387,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for invalid names or duplicate catalog identity/name.
     pub fn create_relation(&mut self, id: ObjectId, name: &str) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.create_relation_definition(binary_relation_definition(id, name)?)
     }
 
@@ -16238,6 +19405,7 @@ impl NativeWriteBatch {
         &mut self,
         object: LogicalCatalogObject,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let id = object.id();
         let encoded_definition = object.encode_definition_v2()?;
         let name_identity = catalog_name_identity_from_qualified(object.name())?;
@@ -16337,6 +19505,7 @@ impl NativeWriteBatch {
         primary_key: impl Into<Vec<u8>>,
         row: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
@@ -16376,6 +19545,7 @@ impl NativeWriteBatch {
         primary_key: impl Into<Vec<u8>>,
         row: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
@@ -16415,6 +19585,7 @@ impl NativeWriteBatch {
         table: ObjectId,
         primary_key: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let old_row = self
@@ -16456,6 +19627,7 @@ impl NativeWriteBatch {
         value: impl Into<Vec<u8>>,
         expires_at_micros: Option<i64>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let outcome = self.set_conditional(key, value, expires_at_micros, SetCondition::Always)?;
         debug_assert_eq!(outcome, SetOutcome::Applied);
         Ok(())
@@ -16477,6 +19649,7 @@ impl NativeWriteBatch {
         expires_at_micros: Option<i64>,
         condition: SetCondition,
     ) -> Result<SetOutcome, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let key = key.into();
         let value = value.into();
         if self.private_collection_is_visible(&key) {
@@ -16532,6 +19705,7 @@ impl NativeWriteBatch {
         &mut self,
         key: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let key = key.into();
         if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
@@ -16779,6 +19953,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let key = key.into();
         if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
@@ -16825,6 +20000,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         delta: i64,
     ) -> Result<i64, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let key = key.into();
         if self.private_collection_is_visible(&key) {
             return Err(NativeRuntimeError::StructureKindMismatch);
@@ -16858,7 +20034,10 @@ impl NativeWriteBatch {
             .get(key, self.snapshot.logical_time_micros)
     }
 
-    /// Returns one hash family's TTL state through private writes.
+    /// Returns one hash family's TTL state through materialized private writes.
+    ///
+    /// This infallible legacy method is not a delta read surface. Delta callers
+    /// must use [`NativeDatabase::delta_ttl_hash`].
     pub fn ttl_hash(&self, key: &[u8]) -> Ttl {
         match self
             .state
@@ -16897,7 +20076,10 @@ impl NativeWriteBatch {
         }
     }
 
-    /// Returns one hash field's TTL state through private writes.
+    /// Returns one hash field's TTL state through materialized private writes.
+    ///
+    /// This infallible legacy method is not a delta read surface. Delta callers
+    /// must use [`NativeDatabase::delta_ttl_hash_field`].
     pub fn ttl_hash_field(&self, key: &[u8], field: &[u8]) -> Ttl {
         match self.state.structures.ttl_hash_field_micros(
             key,
@@ -16918,6 +20100,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing scalar/hash key.
     pub fn create_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -16958,6 +20141,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17013,6 +20197,7 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17065,6 +20250,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_hash(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -17108,6 +20294,7 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<HashSetOutcome, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17172,6 +20359,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         updates: Vec<HashFieldUpdate>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17221,6 +20409,7 @@ impl NativeWriteBatch {
         field: impl Into<Vec<u8>>,
         delta: i64,
     ) -> Result<i64, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17249,12 +20438,15 @@ impl NativeWriteBatch {
         Ok(value)
     }
 
-    /// Reads one field from an existing native hash.
+    /// Reads one field from a materialized native hash.
+    ///
+    /// Delta callers must use [`NativeDatabase::delta_hget`].
     ///
     /// # Errors
     ///
-    /// Returns an error for a scalar key or a missing hash.
+    /// Returns an error for a delta batch, scalar key, or missing hash.
     pub fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<&[u8]>, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         validate_hash_field_identity(key, field)?;
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
@@ -17276,19 +20468,20 @@ impl NativeWriteBatch {
             .hget_at(key, field, self.snapshot.logical_time_micros))
     }
 
-    /// Reads bounded private hash fields in caller order.
+    /// Reads bounded materialized private hash fields in caller order.
     ///
     /// Duplicate fields preserve duplicate output positions.
     ///
     /// # Errors
     ///
-    /// Returns an error for an oversized batch, invalid identity, another
-    /// structure kind, or a missing or expired hash.
+    /// Returns an error for a delta batch, oversized batch, invalid identity,
+    /// another structure kind, or a missing or expired hash.
     pub fn hget_many(
         &self,
         key: &[u8],
         fields: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         validate_hash_field_positions(key, fields)?;
         self.require_private_hash(key)?;
         self.state
@@ -17307,6 +20500,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         field: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17372,6 +20566,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         fields: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17417,12 +20612,14 @@ impl NativeWriteBatch {
         Ok(deleted)
     }
 
-    /// Returns the current private field count for an existing native hash.
+    /// Returns the current materialized field count for an existing native
+    /// hash.
     ///
     /// # Errors
     ///
-    /// Returns an error for a scalar key or a missing hash.
+    /// Returns an error for a delta batch, scalar key, or missing hash.
     pub fn hlen(&self, key: &[u8]) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
@@ -17436,20 +20633,23 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
-    /// Scans one bounded ascending range of fields through private writes.
+    /// Scans one bounded ascending range of fields through materialized
+    /// private writes.
     ///
     /// `start_after` is an exclusive exact-field cursor. A zero `limit`
     /// validates the hash and returns no entries.
     ///
     /// # Errors
     ///
-    /// Returns an error for another structure kind or a missing hash.
+    /// Returns an error for a delta batch, another structure kind, or a missing
+    /// hash.
     pub fn hscan(
         &self,
         key: &[u8],
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
             || self.state.structures.lists.contains_key(key)
@@ -17464,21 +20664,23 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
-    /// Scans one bounded descending range of fields through private writes.
+    /// Scans one bounded descending range of fields through materialized
+    /// private writes.
     ///
     /// `start_before` is an exclusive exact-field cursor. A zero `limit`
     /// validates the hash and returns no entries.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid cursor identity, another structure
-    /// kind, or a missing or expired hash.
+    /// Returns an error for a delta batch, invalid cursor identity, another
+    /// structure kind, or a missing or expired hash.
     pub fn hscan_reverse(
         &self,
         key: &[u8],
         start_before: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<HashFieldEntry>, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         if let Some(cursor) = start_before {
             validate_hash_field_identity(key, cursor)?;
         }
@@ -17496,17 +20698,19 @@ impl NativeWriteBatch {
             .ok_or(NativeRuntimeError::UnknownStructureHash)
     }
 
-    /// Scans one bounded binary-glob page through private hash writes.
+    /// Scans one bounded binary-glob page through materialized private hash
+    /// writes.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid cursor identity, exhausted matcher
-    /// budget, another structure kind, or a missing or expired hash.
+    /// Returns an error for a delta batch, invalid cursor identity, exhausted
+    /// matcher budget, another structure kind, or a missing or expired hash.
     pub fn hscan_match(
         &self,
         key: &[u8],
         request: &HashPatternScanRequest,
     ) -> Result<HashPatternScanPage, NativeRuntimeError> {
+        self.require_materialized_hash_read()?;
         validate_hash_pattern_identity(key, request)?;
         if self.state.structures.entries.contains_key(key)
             || self.state.structures.sets.contains_key(key)
@@ -17543,6 +20747,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17583,6 +20788,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17633,6 +20839,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_set(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -17678,6 +20885,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17728,6 +20936,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         members: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17828,6 +21037,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17878,6 +21088,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         members: Vec<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -17989,6 +21200,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or an existing structure key.
     pub fn create_list(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18030,6 +21242,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18084,6 +21297,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage or another live structure kind.
     pub fn delete_list(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -18127,6 +21341,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.push_list(key.into(), value.into(), Opcode::PushListHead)
     }
 
@@ -18140,6 +21355,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.push_list(key.into(), value.into(), Opcode::PushListTail)
     }
 
@@ -18195,6 +21411,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage, another family, or a missing list.
     pub fn lpop(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.pop_list(key.into(), Opcode::PopListHead)
     }
 
@@ -18204,6 +21421,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage, another family, or a missing list.
     pub fn rpop(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.pop_list(key.into(), Opcode::PopListTail)
     }
 
@@ -18303,6 +21521,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage, an oversized key, or an existing key.
     pub fn create_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18341,6 +21560,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         fields: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<u64, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let key = key.into();
         let id = self
             .state
@@ -18388,6 +21608,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18416,6 +21637,7 @@ impl NativeWriteBatch {
     ///
     /// Returns an error for legacy storage.
     pub fn delete_stream(&mut self, key: impl Into<Vec<u8>>) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -18442,6 +21664,7 @@ impl NativeWriteBatch {
     /// Returns an error for legacy storage, an oversized key, or an existing
     /// structure key.
     pub fn create_sorted_set(&mut self, key: impl Into<Vec<u8>>) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18480,6 +21703,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         expires_at_micros: i64,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18515,6 +21739,7 @@ impl NativeWriteBatch {
         &mut self,
         key: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.structure_format.supports_collection_retirement() {
             return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
         }
@@ -18546,6 +21771,7 @@ impl NativeWriteBatch {
         score: f64,
         member: impl Into<Vec<u8>>,
     ) -> Result<ZAddOutcome, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18618,6 +21844,7 @@ impl NativeWriteBatch {
         key: impl Into<Vec<u8>>,
         member: impl Into<Vec<u8>>,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self
             .structure_format
             .supports_materialized_collection_writes()
@@ -18797,6 +22024,7 @@ impl NativeWriteBatch {
         id: ObjectId,
         name: &str,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let object = CatalogObject::Search(text_search_definition(id, name)?);
         let encoded_definition = object.encode_definition()?;
         let name_identity = catalog_name_identity(object.header())?;
@@ -18827,6 +22055,7 @@ impl NativeWriteBatch {
         document_id: impl Into<Vec<u8>>,
         text: impl Into<String>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(index, EngineKind::Search)?;
         let document_id = document_id.into();
         let text = text.into();
@@ -18858,6 +22087,7 @@ impl NativeWriteBatch {
         document_id: impl Into<Vec<u8>>,
         text: impl Into<String>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(index, EngineKind::Search)?;
         let document_id = document_id.into();
         let text = text.into();
@@ -18888,6 +22118,7 @@ impl NativeWriteBatch {
         index: ObjectId,
         document_id: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.state.catalog.require(index, EngineKind::Search)?;
         let document_id = document_id.into();
         validate_search_document_identity(&document_id, "")?;
@@ -18938,6 +22169,7 @@ impl NativeWriteBatch {
         metric: VectorMetric,
         config: HnswConfig,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.create_vector_index_with_lifecycle(
             id,
             name,
@@ -18963,6 +22195,7 @@ impl NativeWriteBatch {
         config: HnswConfig,
         lifecycle: IncrementalVectorLifecycle,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if self.search_format == SearchFormat::InlineStateV1 {
             return Err(NativeRuntimeError::InvalidAnnTree);
         }
@@ -19000,6 +22233,7 @@ impl NativeWriteBatch {
         object_id: ObjectId,
         vector: Vector,
     ) -> Result<(), NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let encoded = ann_store::encode_vector_mutation(&vector);
         self.state
             .ann
@@ -19031,6 +22265,7 @@ impl NativeWriteBatch {
         index: ObjectId,
         vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         self.upsert_vectors_with_progress(index, vectors, |_| {})
     }
 
@@ -19049,6 +22284,7 @@ impl NativeWriteBatch {
         vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
         progress: impl FnMut(HnswBuildProgress),
     ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         let vectors = vectors.into_iter().collect::<Vec<_>>();
         if vectors.is_empty() {
             return Ok(0);
@@ -19101,6 +22337,7 @@ impl NativeWriteBatch {
         index: ObjectId,
         object_id: ObjectId,
     ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
         if !self.state.ann.delete(index, object_id)? {
             return Ok(false);
         }
@@ -19130,6 +22367,33 @@ impl NativeWriteBatch {
     ) -> Result<AnnSearchReceipt, NativeRuntimeError> {
         let result = self.state.ann.search(index, query, options)?;
         Ok(ann_search_receipt(index, self.snapshot.visible_csn, result))
+    }
+
+    /// Routes an approximate vector query over snapshot plus private writes to
+    /// an explicit durable partition bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero partition bound, unknown ANN index, or
+    /// invalid query options.
+    pub fn search_ann_selected(
+        &self,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        maximum_partitions: usize,
+    ) -> Result<AnnSelectedSearchReceipt, NativeRuntimeError> {
+        validate_ann_partition_bound(maximum_partitions)?;
+        let execution =
+            self.state
+                .ann
+                .search_selected(index, query, options, maximum_partitions)?;
+        Ok(ann_selected_search_receipt(
+            index,
+            self.snapshot.visible_csn,
+            maximum_partitions,
+            execution,
+        ))
     }
 
     /// Executes filter-aware ANN traversal or adaptive exact filtering
@@ -21143,11 +24407,13 @@ fn commit_engine_roots(
                 format: search_format,
                 mode: batch.mode,
                 blobs,
+                buffer_pool,
                 catalog: &batch.state.catalog,
                 state: &batch.state.search,
                 mutations: &batch.mutations,
                 blob_references,
                 ann_consolidation: batch.ann_consolidation.as_ref(),
+                ann_consolidation_structure: batch.ann_consolidation_structure.as_ref(),
                 ann_initial_bulk: batch.ann_initial_bulk.as_ref(),
             },
         )?;
@@ -22300,6 +25566,7 @@ fn validate_delta_write_batch_shape(
     ) && batch.structure_format == structure_format
         && search_format == SearchFormat::InvertedBTreeV1
         && batch.search_format == SearchFormat::InvertedBTreeV1;
+    let valid_stage_boundary = !batch.delta_stage_active;
     let Some(delta) = batch.delta.as_ref() else {
         return Err(NativeRuntimeError::InvalidPreparedMutation);
     };
@@ -22322,8 +25589,7 @@ fn validate_delta_write_batch_shape(
                 }
                 EngineKind::Structure => {
                     expected_dirty[2] = true;
-                    mutation.target.is_none()
-                        && delta.structure_scalars.contains(&mutation.key)
+                    let scalar_shape = delta.structure_scalars.contains(&mutation.key)
                         && match mutation.opcode {
                             Opcode::SetValue => true,
                             Opcode::DeleteHash
@@ -22334,7 +25600,19 @@ fn validate_delta_write_batch_shape(
                                 mutation.value.is_empty() && mutation.expires_at_micros.is_none()
                             }
                             _ => false,
-                        }
+                        };
+                    let hash_field_shape =
+                        matches!(
+                            mutation.opcode,
+                            Opcode::SetHashField | Opcode::DeleteHashField
+                        ) && decode_hash_field_identity(&mutation.key).is_ok_and(|(key, field)| {
+                            delta
+                                .structure_hash_fields
+                                .contains_key(&(key.to_vec(), field.to_vec()))
+                        }) && mutation.expires_at_micros.is_none()
+                            && (mutation.opcode != Opcode::DeleteHashField
+                                || mutation.value.is_empty());
+                    mutation.target.is_none() && (scalar_shape || hash_field_shape)
                 }
                 EngineKind::Search => {
                     expected_dirty[3] = true;
@@ -22357,10 +25635,17 @@ fn validate_delta_write_batch_shape(
                 Some(CatalogObject::SecondaryIndex(definition)) if definition.unique
             )
     });
+    let valid_hash_overlay = validate_delta_hash_overlay_shape(batch, delta)?;
+    let replayed_memory_bytes = replay_delta_retained_memory_bytes(batch);
+    let valid_memory_ledger = replayed_memory_bytes == delta.retained_memory_bytes
+        && replayed_memory_bytes <= NativeDatabase::delta_memory_capacity(batch);
     if valid_roots
         && valid_formats
+        && valid_stage_boundary
         && valid_mutations
         && valid_unique_probes
+        && valid_hash_overlay
+        && valid_memory_ledger
         && batch.dirty == expected_dirty
         && !batch.dirty[0]
         && batch.state.ann == ann_store::AnnState::default()
@@ -22371,6 +25656,69 @@ fn validate_delta_write_batch_shape(
     } else {
         Err(NativeRuntimeError::InvalidPreparedMutation)
     }
+}
+
+fn validate_delta_hash_overlay_shape(
+    batch: &NativeWriteBatch,
+    delta: &DeltaOverlay,
+) -> Result<bool, NativeRuntimeError> {
+    let mut latest_mutations = BTreeMap::new();
+    let mut accounted_bytes = 0_u64;
+    for (mutation_index, mutation) in batch.mutations.iter().enumerate() {
+        if mutation.engine != EngineKind::Structure
+            || !matches!(
+                mutation.opcode,
+                Opcode::SetHashField | Opcode::DeleteHashField
+            )
+        {
+            continue;
+        }
+        let (key, field) = decode_hash_field_identity(&mutation.key)?;
+        let identity = (key.to_vec(), field.to_vec());
+        latest_mutations.insert(identity, mutation_index);
+        accounted_bytes = accounted_bytes
+            .checked_add(NativeDatabase::delta_hash_mutation_charge(mutation)?)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    }
+
+    for (identity, overlay) in &delta.structure_hash_fields {
+        accounted_bytes = accounted_bytes
+            .checked_add(NativeDatabase::delta_hash_overlay_charge(
+                identity, overlay,
+            )?)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let expected = match overlay {
+            DeltaHashFieldOverlay::Missing | DeltaHashFieldOverlay::Durable(_) => None,
+            DeltaHashFieldOverlay::Staged(index) => Some((*index, Opcode::SetHashField)),
+            DeltaHashFieldOverlay::Deleted(index) => Some((*index, Opcode::DeleteHashField)),
+        };
+        match expected {
+            None if latest_mutations.contains_key(identity) => return Ok(false),
+            None => {}
+            Some((index, opcode)) => {
+                let Some(mutation) = batch.mutations.get(index) else {
+                    return Ok(false);
+                };
+                let identity_matches =
+                    decode_hash_field_identity(&mutation.key).is_ok_and(|(key, field)| {
+                        key == identity.0.as_slice() && field == identity.1.as_slice()
+                    });
+                if mutation.engine != EngineKind::Structure
+                    || mutation.opcode != opcode
+                    || !identity_matches
+                    || latest_mutations.get(identity) != Some(&index)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    Ok(latest_mutations
+        .keys()
+        .all(|identity| delta.structure_hash_fields.contains_key(identity))
+        && accounted_bytes == delta.structure_hash_memory_bytes
+        && accounted_bytes <= NativeDatabase::delta_hash_memory_capacity(batch))
 }
 
 fn stage_large_values(
@@ -22746,6 +26094,54 @@ fn decode_structure_value(
         value,
         expires_at_micros,
     }))
+}
+
+#[derive(Clone, Copy)]
+enum DeltaCollectionMarkerV2 {
+    Hash(Option<i64>),
+    Set(Option<i64>),
+    List(Option<i64>),
+    SortedSet(Option<i64>),
+    Stream(Option<i64>),
+}
+
+fn decode_delta_structure_value(encoded: &[u8]) -> Result<Option<()>, NativeRuntimeError> {
+    if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        || !matches!(
+            encoded[8],
+            0 | STRUCTURE_VALUE_HAS_EXPIRY | STRUCTURE_VALUE_TOMBSTONE
+        )
+        || encoded[10..16] != [0; 6]
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    if encoded[8] == STRUCTURE_VALUE_TOMBSTONE {
+        return is_structure_tombstone(encoded)
+            .then_some(None)
+            .ok_or(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut expiry_bytes = [0_u8; 8];
+    expiry_bytes.copy_from_slice(&encoded[16..24]);
+    let raw_expiry = i64::from_le_bytes(expiry_bytes);
+    if encoded[8] == STRUCTURE_VALUE_HAS_EXPIRY {
+        let _ = raw_expiry;
+    } else if raw_expiry == 0 {
+    } else {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let payload = &encoded[STRUCTURE_VALUE_HEADER_SIZE..];
+    match encoded[9] {
+        STRUCTURE_VALUE_INLINE if payload.len() <= STRUCTURE_INLINE_VALUE_LIMIT => {}
+        STRUCTURE_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= STRUCTURE_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+        }
+        _ => return Err(NativeRuntimeError::InvalidStructureTree),
+    }
+    Ok(Some(()))
 }
 
 fn wal_mutations(
@@ -27300,11 +30696,13 @@ struct SearchMutationContext<'a> {
     format: SearchFormat,
     mode: NativeWriteBatchMode,
     blobs: &'a BlobStore,
+    buffer_pool: &'a BufferPool,
     catalog: &'a CatalogState,
     state: &'a SearchState,
     mutations: &'a [Mutation],
     blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
     ann_consolidation: Option<&'a ann_store::ConsolidationPlan>,
+    ann_consolidation_structure: Option<&'a PrefixReplacementStructuralPlan>,
     ann_initial_bulk: Option<&'a InitialAnnBulkPublication>,
 }
 
@@ -27341,12 +30739,20 @@ fn search_root_after_mutations(
         let plan = context
             .ann_consolidation
             .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
-        let replacement =
-            ann_store::consolidate_tree(pages, root, creating_csn, context.catalog, plan)?;
+        let structural_plan = context
+            .ann_consolidation_structure
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let replacement = ann_store::consolidate_tree(
+            pages,
+            context.buffer_pool,
+            root,
+            creating_csn,
+            plan,
+            structural_plan,
+        )?;
         let replacement_root = replacement
             .root()
             .ok_or(NativeRuntimeError::InvalidAnnTree)?;
-        load_search_state_root(pages, context.blobs, replacement_root)?;
         return Ok(Some(replacement_root));
     }
     if context.mode == NativeWriteBatchMode::PhysicalSearchCompaction {
@@ -28420,6 +31826,86 @@ fn decode_relational_row_value(
     }
 }
 
+enum DeltaRelationalValue {
+    Inline(Vec<u8>),
+    Blob(BlobReference),
+}
+
+enum DeltaCatalogDefinition<'definition> {
+    Inline(&'definition [u8]),
+    Blob(BlobReference),
+}
+
+impl DeltaCatalogDefinition<'_> {
+    fn logical_bytes(&self) -> u64 {
+        match self {
+            Self::Inline(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            Self::Blob(reference) => reference.logical_length,
+        }
+    }
+
+    fn materialize(self, blobs: &BlobStore) -> Result<Vec<u8>, NativeRuntimeError> {
+        match self {
+            Self::Inline(value) => Ok(value.to_vec()),
+            Self::Blob(reference) => Ok(blobs.read(reference)?),
+        }
+    }
+}
+
+impl DeltaRelationalValue {
+    fn logical_bytes(&self) -> u64 {
+        match self {
+            Self::Inline(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            Self::Blob(reference) => reference.logical_length,
+        }
+    }
+
+    fn materialize(self, blobs: &BlobStore) -> Result<Vec<u8>, NativeRuntimeError> {
+        match self {
+            Self::Inline(value) => Ok(value),
+            Self::Blob(reference) => Ok(blobs.read(reference)?),
+        }
+    }
+}
+
+fn decode_delta_relational_row_value(
+    row: RowRecordView<'_>,
+    primary_key: &[u8],
+) -> Result<Option<DeltaRelationalValue>, NativeRuntimeError> {
+    if row.is_tombstone() {
+        return Ok(None);
+    }
+    if row.column_count() != 2 {
+        return Err(NativeRuntimeError::InvalidRelationalTree);
+    }
+    match (row.value(0), row.value(1)) {
+        (
+            Some(ColumnValueRef::Bytes(encoded_primary_key)),
+            Some(ColumnValueRef::Bytes(stored_value)),
+        ) if encoded_primary_key == primary_key => {
+            let Some((&storage, value)) = stored_value.split_first() else {
+                return Err(NativeRuntimeError::InvalidRelationalTree);
+            };
+            match storage {
+                RELATIONAL_VALUE_INLINE if value.len() <= RELATIONAL_INLINE_VALUE_LIMIT => {
+                    Ok(Some(DeltaRelationalValue::Inline(value.to_vec())))
+                }
+                RELATIONAL_VALUE_BLOB
+                    if value.len() == hyphae_native_records::BLOB_REFERENCE_SIZE =>
+                {
+                    let reference = BlobReference::decode(value)?;
+                    if reference.logical_length <= RELATIONAL_INLINE_VALUE_LIMIT as u64 {
+                        return Err(NativeRuntimeError::InvalidRelationalTree);
+                    }
+                    Ok(Some(DeltaRelationalValue::Blob(reference)))
+                }
+                _ => Err(NativeRuntimeError::InvalidRelationalTree),
+            }
+        }
+        _ => Err(NativeRuntimeError::InvalidRelationalTree),
+    }
+}
+
 struct RelationalReadContext<'a> {
     pages: &'a PageStore,
     pool: &'a BufferPool,
@@ -29084,6 +32570,19 @@ fn recover_wal_and_close_dangling(
     Ok(recovered)
 }
 
+type CommittedRootsRecovery = (BTreeMap<Csn, RootSet>, Option<RootSet>, Duration);
+
+fn recover_committed_roots_timed(
+    commits: &[wal_codec::RecoveredCommit],
+    wal_recovery: &WalRecovery,
+    storage: &RetainedPageState<'_>,
+    base_root: Option<RootSet>,
+) -> Result<CommittedRootsRecovery, NativeRuntimeError> {
+    let started = Instant::now();
+    let (committed, latest) = recover_committed_roots(commits, wal_recovery, storage, base_root)?;
+    Ok((committed, latest, started.elapsed()))
+}
+
 fn recover_committed_roots(
     commits: &[wal_codec::RecoveredCommit],
     wal_recovery: &WalRecovery,
@@ -29572,6 +33071,33 @@ fn decode_catalog_definition_storage_value(
                 return Err(NativeRuntimeError::InvalidCatalogTree);
             }
             Ok(blobs.read(reference)?)
+        }
+        _ => Err(NativeRuntimeError::InvalidCatalogTree),
+    }
+}
+
+fn decode_delta_catalog_definition(
+    encoded: &[u8],
+) -> Result<DeltaCatalogDefinition<'_>, NativeRuntimeError> {
+    if encoded.len() < CATALOG_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(CATALOG_VALUE_MAGIC.as_slice())
+        || encoded[9..CATALOG_VALUE_HEADER_SIZE]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let payload = &encoded[CATALOG_VALUE_HEADER_SIZE..];
+    match encoded[8] {
+        CATALOG_VALUE_INLINE if payload.len() <= CATALOG_INLINE_VALUE_LIMIT => {
+            Ok(DeltaCatalogDefinition::Inline(payload))
+        }
+        CATALOG_VALUE_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= CATALOG_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidCatalogTree);
+            }
+            Ok(DeltaCatalogDefinition::Blob(reference))
         }
         _ => Err(NativeRuntimeError::InvalidCatalogTree),
     }
@@ -31024,8 +34550,8 @@ mod tests {
         CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
         CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
         DefinitionVersion, DependencyDirection, DependencyEdge, DependencyKind,
-        LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition, StructureDefinition,
-        StructureKind, StructureOwnership,
+        IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition,
+        StructureDefinition, StructureKind, StructureOwnership,
     };
     use hyphae_native_mvcc::WriteKey;
     use hyphae_native_pages::PageKind;
@@ -31050,17 +34576,18 @@ mod tests {
         GroupCommitSubmitError, HardwareCpu, HardwareMemory, HardwareOperatingSystem,
         HardwareProfile, HardwareStorage, HashFieldEntry, HashPatternError, HashPatternScanPage,
         HashPatternScanRequest, HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError,
-        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDirectoryError,
-        NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion, NativeHybridRequest,
-        NativeResourceGovernor, NativeRuntimeError, NativeSchedulerClock, NativeTransaction,
-        NativeVectorBranch, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
-        PromotionBoundary, QualifiedName, RelationDefinition, RelationalScanRow, RootManifest,
-        SLOT_CATALOG, SetCondition, SetOutcome, SnapshotPinBoundary, SnapshotPinError,
-        SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue, VacuumBoundary, Vector,
-        VectorIndexDefinition, VectorMetric, VectorRecord, WAL_FILE, WalError, WalRetentionAnchor,
-        WalRetentionBoundary, WorkloadClass, ZAddOutcome, append_catalog_object_entries,
-        binary_relation_definition, catalog_definition_storage_value, catalog_dependency_prefix,
-        catalog_name_identity, catalog_name_key, catalog_object_key, catalog_relation_index_key,
+        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase,
+        NativeDeltaWriteBatch, NativeDirectoryError, NativeExecutionPool, NativeGovernorPolicy,
+        NativeHybridFusion, NativeHybridRequest, NativeResourceGovernor, NativeRuntimeError,
+        NativeSchedulerClock, NativeTransaction, NativeVectorBranch, NativeWriteBatch,
+        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
+        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
+        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric,
+        VectorRecord, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass,
+        ZAddOutcome, append_catalog_object_entries, binary_relation_definition,
+        catalog_definition_storage_value, catalog_dependency_prefix, catalog_name_identity,
+        catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
         decode_catalog_definition_storage_value, decode_catalog_dependency_entry,
         decode_logical_catalog_definition, page_generation_path,
@@ -31122,6 +34649,30 @@ mod tests {
             limit.io_slots = 4;
         }
         policy
+    }
+
+    fn routed_ann_admission_test_policy(workers: u64) -> NativeGovernorPolicy {
+        let mut policy = engine_admission_test_policy();
+        policy.calibrated_worker_limit = workers;
+        policy.reserved_system_threads = 0;
+        policy.schedulable_compute_threads = workers;
+        policy.io_slots = workers;
+        for limit in &mut policy.class_limits {
+            limit.compute_threads = workers;
+            limit.io_slots = workers;
+        }
+        policy
+    }
+
+    fn without_full_state_or_catalog_materialization<T>(
+        operation: impl FnOnce() -> Result<T, NativeRuntimeError>,
+    ) -> Result<T, NativeRuntimeError> {
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+        let result = operation();
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        result
     }
 
     #[test]
@@ -31376,7 +34927,7 @@ mod tests {
         let directory = TestDirectory::new();
         let mut database = NativeDatabase::create(directory.path())?;
         let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
-        database.set_resource_governor(Arc::clone(&governor));
+        database.set_resource_governor(Arc::clone(&governor))?;
         assert!(
             database
                 .resource_governor()
@@ -31445,7 +34996,7 @@ mod tests {
         ));
         drop(held_bounded);
 
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
         assert!(database.resource_governor().is_none());
         drop(database);
         assert!(
@@ -31463,7 +35014,7 @@ mod tests {
         let mut database = NativeDatabase::create(directory.path())?;
         let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
         database
-            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1));
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1))?;
         let point_request = GovernorRequest {
             compute_threads: 1,
             io_slots: 1,
@@ -31488,8 +35039,10 @@ mod tests {
             .map_err(|_| std::io::Error::other("release thread panicked"))??;
         assert_eq!(governor.queued_requests(), 0);
 
-        database
-            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_millis(1));
+        database.set_resource_governor_with_queue_wait(
+            Arc::clone(&governor),
+            Duration::from_millis(1),
+        )?;
         let held = governor.try_admit_owned(WorkloadClass::ForegroundPoint, point_request)?;
         assert!(matches!(
             database.get_latest_structure(b"timeout", 0),
@@ -31503,12 +35056,97 @@ mod tests {
     }
 
     #[test]
-    fn owned_governor_admission_tracks_batch_clones_and_maintenance()
+    fn detached_write_leases_block_every_governor_reconfiguration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let first_governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        let second_governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+
+        let ungoverned = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        assert!(matches!(
+            database.set_resource_governor(Arc::clone(&first_governor)),
+            Err(NativeRuntimeError::OutstandingWriteBatches { count: 1 })
+        ));
+        drop(ungoverned);
+        database.set_resource_governor(Arc::clone(&first_governor))?;
+
+        let source = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        let candidate = database.clone_legacy_materialized_write_batch(&source)?;
+        assert!(matches!(
+            database.set_resource_governor(Arc::clone(&second_governor)),
+            Err(NativeRuntimeError::OutstandingWriteBatches { count: 1 })
+        ));
+        drop(candidate);
+        drop(source);
+        database.set_resource_governor(Arc::clone(&second_governor))?;
+
+        let delta = database.begin_optimistic_delta(0, DurabilityClass::Memory)?;
+        assert!(matches!(
+            database.clear_resource_governor(),
+            Err(NativeRuntimeError::OutstandingWriteBatches { count: 1 })
+        ));
+        drop(delta);
+        database.clear_resource_governor()?;
+
+        let stale_directory = TestDirectory::new();
+        let (stale_singleton, stale_resolved, stale_group) = {
+            let stale_database = NativeDatabase::create(stale_directory.path())?;
+            let mut batches = Vec::new();
+            for (key, durability) in [
+                (b"stale-singleton".as_slice(), DurabilityClass::Memory),
+                (b"stale-resolved".as_slice(), DurabilityClass::Strict),
+                (b"stale-group".as_slice(), DurabilityClass::Group),
+            ] {
+                let mut batch = stale_database.begin_optimistic_delta(0, durability)?;
+                stale_database.stage_delta_set(
+                    &mut batch,
+                    key.to_vec(),
+                    b"value".to_vec(),
+                    None,
+                )?;
+                batches.push(batch);
+            }
+            let [singleton, resolved, group] = batches
+                .try_into()
+                .map_err(|_| "unexpected stale batch count")?;
+            (singleton, resolved, group)
+        };
+        let mut reopened = NativeDatabase::open(stale_directory.path())?;
+        reopened.set_resource_governor(Arc::new(NativeResourceGovernor::new(
+            engine_admission_test_policy(),
+        )))?;
+        let before = reopened.physical_observation()?;
+        assert!(matches!(
+            reopened.commit_optimistic(stale_singleton),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(reopened.physical_observation()?, before);
+        let resolved_error = reopened
+            .commit_optimistic_resolved(stale_resolved, [9; 32], [10; 32])
+            .err()
+            .ok_or("stale resolved batch unexpectedly committed")?;
+        assert_eq!(resolved_error.resolution(), None);
+        assert!(matches!(
+            resolved_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(reopened.physical_observation()?, before);
+        assert!(matches!(
+            reopened.commit_group(vec![stale_group]),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(reopened.physical_observation()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_governor_admission_tracks_legacy_batch_forks_and_maintenance()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = TestDirectory::new();
         let mut database = NativeDatabase::create(directory.path())?;
         let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
-        database.set_resource_governor(Arc::clone(&governor));
+        database.set_resource_governor(Arc::clone(&governor))?;
 
         let mutation_request = GovernorRequest {
             compute_threads: 1,
@@ -31527,14 +35165,14 @@ mod tests {
                 .is_ok()
         );
 
-        let batch = database.begin_optimistic_delta(0, DurabilityClass::Memory)?;
-        let cloned_batch = batch.clone();
-        drop(batch);
+        let batch = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        let fork = database.clone_legacy_materialized_write_batch(&batch)?;
         assert!(matches!(
             governor.try_admit(WorkloadClass::Mutation, mutation_request),
             Err(GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity)
         ));
-        drop(cloned_batch);
+        drop(fork);
+        drop(batch);
         assert!(
             governor
                 .try_admit(WorkloadClass::Mutation, mutation_request)
@@ -31587,6 +35225,68 @@ mod tests {
             Err(NativeRuntimeError::NoCommittedState)
         ));
 
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_materialized_fork_reserves_only_copy_memory_and_preserves_source_on_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let mut tight_policy = engine_admission_test_policy();
+        tight_policy.memory_bytes = super::MUTATION_MEMORY_BYTES;
+        for limit in &mut tight_policy.class_limits {
+            limit.memory_bytes = limit.memory_bytes.min(super::MUTATION_MEMORY_BYTES);
+        }
+        let governor = Arc::new(NativeResourceGovernor::new(tight_policy));
+        database.set_resource_governor(governor)?;
+
+        let mut source = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        assert!(matches!(
+            database.clone_legacy_materialized_write_batch(&source),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+            ))
+        ));
+        assert_eq!(source.mutation_count(), 0);
+        source.set(b"preserved".to_vec(), b"value".to_vec(), None)?;
+        database.commit_optimistic(source)?;
+        assert_eq!(
+            database.get_latest_structure(b"preserved", 0)?,
+            Some(b"value".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_materialized_fork_finish_consumes_the_exact_source_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+
+        let mut source = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        let candidate = database.clone_legacy_materialized_write_batch(&source)?;
+        let foreign_source = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        assert!(matches!(
+            candidate.finish(foreign_source),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        source.set(b"original".to_vec(), b"preserved".to_vec(), None)?;
+        database.commit_optimistic(source)?;
+
+        let source = database.begin_optimistic(1, DurabilityClass::Memory)?;
+        let mut candidate = database.clone_legacy_materialized_write_batch(&source)?;
+        candidate.set(b"replacement".to_vec(), b"committed".to_vec(), None)?;
+        let replacement = candidate.finish(source)?;
+        database.commit_optimistic(replacement)?;
+        assert_eq!(
+            database.get_latest_structure(b"original", 1)?,
+            Some(b"preserved".to_vec())
+        );
+        assert_eq!(
+            database.get_latest_structure(b"replacement", 1)?,
+            Some(b"committed".to_vec())
+        );
         Ok(())
     }
 
@@ -32432,6 +36132,10 @@ mod tests {
                 super::load_catalog_state_root(&database.pages, &database.blobs, compatible_root,)?,
                 current
             );
+            assert!(matches!(
+                database.require_delta_catalog_v6(compatible_root),
+                Err(NativeRuntimeError::InvalidPreparedMutation)
+            ));
         }
         Ok(())
     }
@@ -33607,6 +37311,25 @@ mod tests {
         }
     }
 
+    struct FullLoadFailureGuard;
+
+    impl FullLoadFailureGuard {
+        fn install() -> Self {
+            super::FAIL_FULL_STATE_LOAD.set(true);
+            super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+            super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+            Self
+        }
+    }
+
+    impl Drop for FullLoadFailureGuard {
+        fn drop(&mut self) {
+            super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+            super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+            super::FAIL_FULL_STATE_LOAD.set(false);
+        }
+    }
+
     fn assert_external_lock_probe(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let output = Command::new(std::env::current_exe()?)
             .arg("--exact")
@@ -33863,7 +37586,7 @@ mod tests {
         );
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
 
         let mut later = database.begin(12, DurabilityClass::Strict)?;
         later.index_document(
@@ -34484,6 +38207,155 @@ mod tests {
     }
 
     #[test]
+    fn delta_internal_materialized_guards_fail_closed_without_changing_the_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        let initial_state = delta.inner.state.clone();
+        let initial_dirty = delta.inner.dirty;
+        let initial_retained_memory = delta
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+
+        assert!(matches!(
+            delta
+                .inner
+                .execute_sql("CREATE TABLE forbidden (id BIGINT PRIMARY KEY)", &[]),
+            Err(SqlError::Runtime(
+                NativeRuntimeError::InvalidPreparedMutation
+            ))
+        ));
+        assert!(matches!(
+            delta.inner.create_hash(b"forbidden-hash".to_vec()),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.expire_hash(b"forbidden-hash".to_vec(), 100),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.hset(
+                b"forbidden-hash".to_vec(),
+                b"field".to_vec(),
+                b"value".to_vec(),
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta
+                .inner
+                .create_search_index(ObjectId::new(101)?, "forbidden_search"),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.create_vector_index(
+                ObjectId::new(102)?,
+                "forbidden_vectors",
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.upsert_vector(
+                ObjectId::new(102)?,
+                ObjectId::new(1)?,
+                Vector::new([1.0, 0.0])?,
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta
+                .inner
+                .delete_vector(ObjectId::new(102)?, ObjectId::new(1)?),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+
+        assert_eq!(delta.inner.state, initial_state);
+        assert_eq!(delta.inner.dirty, initial_dirty);
+        assert_eq!(delta.mutation_count(), 0);
+        assert_eq!(
+            delta
+                .inner
+                .delta
+                .as_ref()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .retained_memory_bytes,
+            initial_retained_memory
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_whole_hash_ttl_is_exact_and_survives_field_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"leased".to_vec())?;
+        seed.hset(b"leased".to_vec(), b"counter".to_vec(), b"40".to_vec())?;
+        assert!(seed.expire_hash(b"leased".to_vec(), 100)?);
+        seed.create_hash(b"persistent".to_vec())?;
+        seed.create_hash(b"due".to_vec())?;
+        assert!(seed.expire_hash(b"due".to_vec(), 10)?);
+        seed.set(b"scalar".to_vec(), b"value".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let _full_load_guard = FullLoadFailureGuard::install();
+        let mut delta = database.begin_optimistic_delta(10, DurabilityClass::Memory)?;
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"leased")?,
+            super::Ttl::RemainingMicros(90)
+        );
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"persistent")?,
+            super::Ttl::Persistent
+        );
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"due")?,
+            super::Ttl::Missing
+        );
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"missing")?,
+            super::Ttl::Missing
+        );
+        assert!(matches!(
+            database.delta_ttl_hash(&mut delta, b"scalar"),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        database.stage_delta_hset(
+            &mut delta,
+            b"leased".to_vec(),
+            b"field".to_vec(),
+            b"value".to_vec(),
+        )?;
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"leased")?,
+            super::Ttl::RemainingMicros(90)
+        );
+        assert_eq!(
+            database.stage_delta_hincrement(
+                &mut delta,
+                b"leased".to_vec(),
+                b"counter".to_vec(),
+                2,
+            )?,
+            42
+        );
+        assert_eq!(
+            database.delta_ttl_hash(&mut delta, b"leased")?,
+            super::Ttl::RemainingMicros(90)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn delta_all_engine_hot_path_does_not_materialize_complete_engine_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -34660,6 +38532,611 @@ mod tests {
         }
         assert_eq!(database.hlen_latest_hash(b"live-hash")?, 0);
         assert_eq!(database.match_latest_text(index, "native", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_v3_stays_point_resolved_through_commit_read_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"profile".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"counter".to_vec(), b"40".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"old".to_vec(), b"old".to_vec())?;
+        seed.hset(b"profile".to_vec(), b"due".to_vec(), b"stale".to_vec())?;
+        seed.hset(
+            b"profile".to_vec(),
+            b"blob".to_vec(),
+            vec![0x41; super::STRUCTURE_INLINE_VALUE_LIMIT + 1],
+        )?;
+        assert!(seed.expire_hash_field(b"profile".to_vec(), b"due".to_vec(), 10)?);
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let full_load_guard = FullLoadFailureGuard::install();
+        let mut delta = database.begin_optimistic_delta(10, DurabilityClass::Strict)?;
+        assert_eq!(
+            database.stage_delta_hset(
+                &mut delta,
+                b"profile".to_vec(),
+                b"old".to_vec(),
+                b"new".to_vec(),
+            )?,
+            HashSetOutcome::Updated
+        );
+        assert_eq!(
+            database.stage_delta_hset(
+                &mut delta,
+                b"profile".to_vec(),
+                b"due".to_vec(),
+                b"revived".to_vec(),
+            )?,
+            HashSetOutcome::Added
+        );
+        assert!(database.stage_delta_hdelete(&mut delta, b"profile".to_vec(), b"blob".to_vec(),)?);
+        assert_eq!(
+            database.stage_delta_hincrement(
+                &mut delta,
+                b"profile".to_vec(),
+                b"counter".to_vec(),
+                2,
+            )?,
+            42
+        );
+        assert_eq!(
+            database.stage_delta_hincrement(
+                &mut delta,
+                b"profile".to_vec(),
+                b"counter".to_vec(),
+                1,
+            )?,
+            43
+        );
+        database.commit_optimistic(delta)?;
+        assert_eq!(
+            database.hget_latest_hash_at(b"profile", b"old", 10)?,
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            database.hget_latest_hash_at(b"profile", b"due", 10)?,
+            Some(b"revived".to_vec())
+        );
+        assert_eq!(
+            database.hget_latest_hash_at(b"profile", b"counter", 10)?,
+            Some(b"43".to_vec())
+        );
+        assert_eq!(database.hget_latest_hash_at(b"profile", b"blob", 10)?, None);
+        // Open deliberately performs complete semantic recovery validation;
+        // only the reopened point read belongs to this lazy-delta contract.
+        drop(full_load_guard);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let _reopened_read_guard = FullLoadFailureGuard::install();
+        assert_eq!(
+            reopened.hget_latest_hash_at(b"profile", b"counter", 10)?,
+            Some(b"43".to_vec())
+        );
+        assert_eq!(reopened.hget_latest_hash_at(b"profile", b"blob", 10)?, None);
+        Ok(())
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct HashDeltaAccountingSnapshot {
+        mutation_count: usize,
+        dirty: [bool; 4],
+        overlay_count: usize,
+        hash_memory: u64,
+        retained_memory: u64,
+    }
+
+    fn hash_delta_accounting_snapshot(
+        batch: &NativeDeltaWriteBatch,
+    ) -> Result<HashDeltaAccountingSnapshot, NativeRuntimeError> {
+        let delta = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        Ok(HashDeltaAccountingSnapshot {
+            mutation_count: batch.mutation_count(),
+            dirty: batch.inner.dirty,
+            overlay_count: delta.structure_hash_fields.len(),
+            hash_memory: delta.structure_hash_memory_bytes,
+            retained_memory: delta.retained_memory_bytes,
+        })
+    }
+
+    fn assert_rejected_hash_stage_preserved_accounting(
+        batch: &NativeDeltaWriteBatch,
+        before: &HashDeltaAccountingSnapshot,
+        rejected_identity: &(Vec<u8>, Vec<u8>),
+    ) -> Result<(), NativeRuntimeError> {
+        assert_eq!(&hash_delta_accounting_snapshot(batch)?, before);
+        let delta = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        assert!(!delta.structure_hash_fields.contains_key(rejected_identity));
+        Ok(())
+    }
+
+    fn assert_oversized_hash_value_operations(
+        database: &NativeDatabase,
+    ) -> Result<(), NativeRuntimeError> {
+        let mut increment = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        assert!(matches!(
+            database.stage_delta_hincrement(
+                &mut increment,
+                b"budget".to_vec(),
+                b"oversized-old".to_vec(),
+                1,
+            ),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ParentCapacity
+            ))
+        ));
+        assert_eq!(increment.mutation_count(), 0);
+        let mut replace = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        assert_eq!(
+            database.stage_delta_hset(
+                &mut replace,
+                b"budget".to_vec(),
+                b"oversized-old".to_vec(),
+                b"small".to_vec(),
+            )?,
+            HashSetOutcome::Updated
+        );
+        let mut remove = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        assert!(database.stage_delta_hdelete(
+            &mut remove,
+            b"budget".to_vec(),
+            b"oversized-old".to_vec(),
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_value_budget_is_fail_closed_before_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"budget".to_vec())?;
+        seed.hset(
+            b"budget".to_vec(),
+            b"oversized-old".to_vec(),
+            vec![b'1'; usize::try_from(super::DELTA_HASH_MEMORY_BUDGET)? + 1],
+        )?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let physical_before = database.physical_observation()?;
+        assert_oversized_hash_value_operations(&database)?;
+
+        let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        assert_eq!(
+            database.delta_hget(&mut delta, b"budget", b"maximum")?,
+            None
+        );
+        let mutation_key = super::hash_field_identity(b"budget", b"maximum")?;
+        let retained_before_value = delta
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_memory_bytes
+            .checked_add(super::DELTA_HASH_MUTATION_OVERHEAD)
+            .and_then(|bytes| bytes.checked_add(u64::try_from(mutation_key.capacity()).ok()?))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let maximum_value_bytes = usize::try_from(
+            super::DELTA_HASH_MEMORY_BUDGET
+                .checked_sub(retained_before_value)
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+        )?;
+        assert_eq!(
+            database.stage_delta_hset(
+                &mut delta,
+                b"budget".to_vec(),
+                b"maximum".to_vec(),
+                vec![0; maximum_value_bytes],
+            )?,
+            HashSetOutcome::Added
+        );
+        let accounting_before = hash_delta_accounting_snapshot(&delta)?;
+        let rejected_identity = (b"budget".to_vec(), b"overflow".to_vec());
+        assert!(matches!(
+            database.stage_delta_hset(
+                &mut delta,
+                b"budget".to_vec(),
+                b"overflow".to_vec(),
+                vec![0],
+            ),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ParentCapacity
+            ))
+        ));
+        assert_rejected_hash_stage_preserved_accounting(
+            &delta,
+            &accounting_before,
+            &rejected_identity,
+        )?;
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(database.hget_latest_hash(b"budget", b"maximum")?, None);
+
+        let mut spare_capacity = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        let mut tiny = Vec::with_capacity(maximum_value_bytes);
+        tiny.push(7);
+        database.stage_delta_hset(
+            &mut spare_capacity,
+            b"budget".to_vec(),
+            b"canonical".to_vec(),
+            tiny,
+        )?;
+        assert_eq!(spare_capacity.inner.mutations[0].value, vec![7]);
+        assert_eq!(spare_capacity.inner.mutations[0].value.capacity(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_missing_field_identities_are_bounded_before_retention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"identity-budget".to_vec())?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        let physical_before = database.physical_observation()?;
+
+        let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        let mut accepted = 0_u64;
+        loop {
+            let mut field = vec![b'x'; hyphae_native_btree::BTREE_MAX_KEY_SIZE - 512];
+            field[..8].copy_from_slice(&accepted.to_be_bytes());
+            match database.delta_hget(&mut delta, b"identity-budget", &field) {
+                Ok(None) => accepted += 1,
+                Err(NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::ParentCapacity,
+                )) => break,
+                Ok(Some(_)) => return Err("missing field unexpectedly resolved a value".into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert!(accepted > 1);
+        assert_eq!(delta.mutation_count(), 0);
+        let retained = delta
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_memory_bytes;
+        assert!(retained <= super::DELTA_HASH_MEMORY_BUDGET);
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_hash_read_your_writes_and_internal_materialized_read_guards_are_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"ryw".to_vec())?;
+        seed.hset(b"ryw".to_vec(), b"counter".to_vec(), b"40".to_vec())?;
+        seed.hset(b"ryw".to_vec(), b"due".to_vec(), b"stale".to_vec())?;
+        seed.hset(
+            b"ryw".to_vec(),
+            b"blob".to_vec(),
+            vec![0x41; super::STRUCTURE_INLINE_VALUE_LIMIT + 1],
+        )?;
+        assert!(seed.expire_hash_field(b"ryw".to_vec(), b"due".to_vec(), 10)?);
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let _full_load_guard = FullLoadFailureGuard::install();
+        let mut delta = database.begin_optimistic_delta(10, DurabilityClass::Memory)?;
+        assert_eq!(database.delta_hget(&mut delta, b"ryw", b"due")?, None);
+        assert_eq!(
+            database.delta_ttl_hash_field(&mut delta, b"ryw", b"due")?,
+            super::Ttl::Missing
+        );
+        assert_eq!(
+            database.stage_delta_hset(
+                &mut delta,
+                b"ryw".to_vec(),
+                b"due".to_vec(),
+                b"revived".to_vec(),
+            )?,
+            HashSetOutcome::Added
+        );
+        assert_eq!(
+            database.delta_hget(&mut delta, b"ryw", b"due")?,
+            Some(b"revived".to_vec())
+        );
+        assert_eq!(
+            database.delta_ttl_hash_field(&mut delta, b"ryw", b"due")?,
+            super::Ttl::Persistent
+        );
+        assert_eq!(
+            database.delta_hget(&mut delta, b"ryw", b"blob")?,
+            Some(vec![0x41; super::STRUCTURE_INLINE_VALUE_LIMIT + 1])
+        );
+        assert_eq!(
+            database.stage_delta_hincrement(&mut delta, b"ryw".to_vec(), b"counter".to_vec(), 2,)?,
+            42
+        );
+        assert_eq!(
+            database.stage_delta_hincrement(&mut delta, b"ryw".to_vec(), b"counter".to_vec(), 1,)?,
+            43
+        );
+        assert_eq!(
+            database.delta_hget(&mut delta, b"ryw", b"counter")?,
+            Some(b"43".to_vec())
+        );
+        assert_eq!(
+            database.delta_ttl_hash_field(&mut delta, b"ryw", b"counter")?,
+            super::Ttl::Persistent
+        );
+        assert!(database.stage_delta_hdelete(&mut delta, b"ryw".to_vec(), b"counter".to_vec(),)?);
+        assert_eq!(database.delta_hget(&mut delta, b"ryw", b"counter")?, None);
+        assert_eq!(
+            database.delta_ttl_hash_field(&mut delta, b"ryw", b"counter")?,
+            super::Ttl::Missing
+        );
+        assert!(matches!(
+            delta.inner.hget(b"ryw", b"blob"),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.hget_many(b"ryw", &[b"blob".to_vec()]),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.hlen(b"ryw"),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.hscan(b"ryw", None, 1),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            delta.inner.hscan_reverse(b"ryw", None, 1),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delta_hash_v3_shape_rejects_unhydrated_or_malformed_field_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_hash(b"shape".to_vec())?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let mut unhydrated = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        database.stage_delta_hset(
+            &mut unhydrated,
+            b"shape".to_vec(),
+            b"hydrated".to_vec(),
+            b"value".to_vec(),
+        )?;
+        unhydrated.inner.mutations[0].key = super::hash_field_identity(b"shape", b"forged")?;
+        let before_unhydrated = database.physical_observation()?;
+        assert!(matches!(
+            database.commit_optimistic(unhydrated),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(database.physical_observation()?, before_unhydrated);
+
+        let mut malformed = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        assert!(!database.stage_delta_hdelete(
+            &mut malformed,
+            b"shape".to_vec(),
+            b"missing".to_vec(),
+        )?);
+        database.stage_delta_hset(
+            &mut malformed,
+            b"shape".to_vec(),
+            b"missing".to_vec(),
+            b"value".to_vec(),
+        )?;
+        malformed.inner.mutations[0].opcode = Opcode::DeleteHashField;
+        let before_malformed = database.physical_observation()?;
+        let malformed_error = database
+            .commit_optimistic(malformed)
+            .err()
+            .ok_or("malformed hash mutation unexpectedly committed")?;
+        assert!(
+            matches!(malformed_error, NativeRuntimeError::InvalidPreparedMutation),
+            "unexpected malformed shape error: {malformed_error:?}"
+        );
+        assert_eq!(database.physical_observation()?, before_malformed);
+
+        let mut forged_index = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        database.stage_delta_hset(
+            &mut forged_index,
+            b"shape".to_vec(),
+            b"index".to_vec(),
+            b"value".to_vec(),
+        )?;
+        forged_index
+            .inner
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_fields
+            .insert(
+                (b"shape".to_vec(), b"index".to_vec()),
+                super::DeltaHashFieldOverlay::Staged(usize::MAX),
+            );
+        let before_index = database.physical_observation()?;
+        let index_error = database
+            .commit_optimistic_resolved(forged_index, [5; 32], [6; 32])
+            .err()
+            .ok_or("forged staged index unexpectedly committed")?;
+        assert_eq!(index_error.resolution(), None);
+        assert!(matches!(
+            index_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(database.physical_observation()?, before_index);
+
+        let mut forged_accounting = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        database.stage_delta_hset(
+            &mut forged_accounting,
+            b"shape".to_vec(),
+            b"accounting".to_vec(),
+            vec![0x41; super::STRUCTURE_INLINE_VALUE_LIMIT + 1],
+        )?;
+        forged_accounting
+            .inner
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .structure_hash_memory_bytes += 1;
+        let before_accounting = database.physical_observation()?;
+        let accounting_error = database
+            .commit_optimistic_resolved(forged_accounting, [7; 32], [8; 32])
+            .err()
+            .ok_or("forged accounting unexpectedly committed")?;
+        assert_eq!(accounting_error.resolution(), None);
+        assert!(matches!(
+            accounting_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(database.physical_observation()?, before_accounting);
+
+        let mut forged_total = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        database.stage_delta_set(
+            &mut forged_total,
+            b"ledger".to_vec(),
+            b"value".to_vec(),
+            None,
+        )?;
+        forged_total
+            .inner
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes += 1;
+        let before_total = database.physical_observation()?;
+        let total_error = database
+            .commit_optimistic_resolved(forged_total, [9; 32], [10; 32])
+            .err()
+            .ok_or("forged total memory ledger unexpectedly committed")?;
+        assert_eq!(total_error.resolution(), None);
+        assert!(matches!(
+            total_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(database.physical_observation()?, before_total);
+        Ok(())
+    }
+
+    #[test]
+    fn delta_batches_are_bound_to_their_origin_directory_before_reads_or_wal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first_directory = TestDirectory::new();
+        let second_directory = TestDirectory::new();
+        let mut first = NativeDatabase::create(first_directory.path())?;
+        let mut second = NativeDatabase::create(second_directory.path())?;
+        for database in [&mut first, &mut second] {
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.create_hash(b"authority".to_vec())?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+        }
+
+        let mut staged_by_first = first.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+        let second_before_stage = second.physical_observation()?;
+        assert!(matches!(
+            second.stage_delta_hset(
+                &mut staged_by_first,
+                b"authority".to_vec(),
+                b"field".to_vec(),
+                b"wrong".to_vec(),
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(staged_by_first.mutation_count(), 0);
+        assert!(
+            staged_by_first
+                .inner
+                .delta
+                .as_ref()
+                .is_some_and(|delta| delta.structure_hash_fields.is_empty())
+        );
+        assert_eq!(second.physical_observation()?, second_before_stage);
+        first.stage_delta_hset(
+            &mut staged_by_first,
+            b"authority".to_vec(),
+            b"field".to_vec(),
+            b"right".to_vec(),
+        )?;
+        first.commit_optimistic(staged_by_first)?;
+
+        let mut resolved_by_first = first.begin_optimistic_delta(3, DurabilityClass::Memory)?;
+        first.stage_delta_hset(
+            &mut resolved_by_first,
+            b"authority".to_vec(),
+            b"resolved".to_vec(),
+            b"value".to_vec(),
+        )?;
+        let second_before_resolved = second.physical_observation()?;
+        let resolved_error = second
+            .commit_optimistic_resolved(resolved_by_first, [1; 32], [2; 32])
+            .err()
+            .ok_or("foreign resolved batch unexpectedly committed")?;
+        assert_eq!(resolved_error.resolution(), None);
+        assert!(matches!(
+            resolved_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(second.physical_observation()?, second_before_resolved);
+
+        let mut grouped_by_first = first.begin_optimistic_delta(3, DurabilityClass::Memory)?;
+        first.stage_delta_hset(
+            &mut grouped_by_first,
+            b"authority".to_vec(),
+            b"grouped".to_vec(),
+            b"value".to_vec(),
+        )?;
+        let second_before_group = second.physical_observation()?;
+        assert!(matches!(
+            second.commit_group(vec![grouped_by_first]),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(second.physical_observation()?, second_before_group);
+
+        let mut malformed = second.begin_optimistic_delta(3, DurabilityClass::Memory)?;
+        second.stage_delta_hset(
+            &mut malformed,
+            b"authority".to_vec(),
+            b"format".to_vec(),
+            b"value".to_vec(),
+        )?;
+        malformed.inner.structure_format = super::StructureFormat::BTreeV2;
+        let second_before_format = second.physical_observation()?;
+        let format_error = second
+            .commit_optimistic_resolved(malformed, [3; 32], [4; 32])
+            .err()
+            .ok_or("malformed resolved batch unexpectedly committed")?;
+        assert_eq!(format_error.resolution(), None);
+        assert!(matches!(
+            format_error.source(),
+            NativeRuntimeError::InvalidPreparedMutation
+        ));
+        assert_eq!(second.physical_observation()?, second_before_format);
         Ok(())
     }
 
@@ -35927,7 +40404,7 @@ mod tests {
             let policy = parallel_engine_admission_test_policy();
             let profile = portable_execution_profile(&policy);
             let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
-            database.set_resource_governor(Arc::clone(&governor));
+            database.set_resource_governor(Arc::clone(&governor))?;
             let serial = database.xrange_latest_stream_at_profiled(
                 b"segmented-events-v3",
                 100,
@@ -37578,7 +42055,7 @@ mod tests {
         );
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
 
         let root = database
             .coordinator
@@ -39623,7 +44100,7 @@ mod tests {
         );
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
         database.migrate_structure_to_v3(DurabilityClass::Strict)?;
         super::FAIL_FULL_STATE_LOAD.set(true);
         super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
@@ -39647,7 +44124,7 @@ mod tests {
         profile: &HardwareProfile,
         governor: &Arc<NativeResourceGovernor>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        database.set_resource_governor(Arc::clone(governor));
+        database.set_resource_governor(Arc::clone(governor))?;
         let ascending = database.zrange_by_score_latest_sorted_set_profiled(
             b"parallel-score-range",
             Bound::Included(64.0),
@@ -39765,7 +44242,7 @@ mod tests {
         );
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
         database.migrate_structure_to_v3(DurabilityClass::Strict)?;
         super::FAIL_FULL_STATE_LOAD.set(true);
         super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
@@ -39789,7 +44266,7 @@ mod tests {
         profile: &HardwareProfile,
         governor: &Arc<NativeResourceGovernor>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        database.set_resource_governor(Arc::clone(governor));
+        database.set_resource_governor(Arc::clone(governor))?;
         let small = database.zrange_latest_sorted_set_profiled(b"parallel-rank-range", 400, 410)?;
         assert_eq!(
             small.entries,
@@ -40312,12 +44789,12 @@ mod tests {
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
 
-        database.clear_resource_governor();
+        database.clear_resource_governor()?;
         database.migrate_structure_to_v3(DurabilityClass::Strict)?;
         super::FAIL_FULL_STATE_LOAD.set(true);
         super::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
         let v3_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            database.set_resource_governor(Arc::clone(&governor));
+            database.set_resource_governor(Arc::clone(&governor))?;
             let v3_small =
                 database.lrange_latest_list_at_profiled(b"parallel-list", 100, 110, i64::MIN)?;
             assert_eq!(v3_small.values, serial.values[100..=110]);
@@ -49879,6 +54356,310 @@ mod tests {
             .collect()
     }
 
+    fn seed_durable_routing_fixture(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+        unrelated_index: ObjectId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        seed_durable_routing_fixture_with_lifecycle(
+            database,
+            index,
+            unrelated_index,
+            super::ann_store::DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
+        )
+    }
+
+    fn seed_durable_routing_fixture_with_lifecycle(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+        unrelated_index: ObjectId,
+        lifecycle: IncrementalVectorLifecycle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?;
+        let mut create = database.begin(0, DurabilityClass::Memory)?;
+        create.create_vector_index_with_lifecycle(
+            index,
+            "durable-routing",
+            8,
+            VectorMetric::SquaredL2,
+            config,
+            lifecycle,
+        )?;
+        create.create_vector_index(
+            unrelated_index,
+            "durable-routing-unrelated",
+            8,
+            VectorMetric::SquaredL2,
+            config,
+        )?;
+        create.create_relation(ObjectId::new(87)?, "routing-relational")?;
+        create.insert(ObjectId::new(87)?, b"row".to_vec(), b"value".to_vec())?;
+        create.set(b"routing-key".to_vec(), b"routing-value".to_vec(), None)?;
+        create.create_search_index(ObjectId::new(88)?, "routing-lexical")?;
+        create.index_document(ObjectId::new(88)?, b"document".to_vec(), "durable routing")?;
+        create.commit()?;
+        let vectors = initial_ann_bulk_test_vectors()?;
+        let plan = database.plan_initial_ann_bulk(index, vectors.clone(), 4)?;
+        database.publish_initial_ann_bulk(plan, DurabilityClass::Memory)?;
+        let unrelated_plan = database.plan_initial_ann_bulk(unrelated_index, vectors, 4)?;
+        database.publish_initial_ann_bulk(unrelated_plan, DurabilityClass::Memory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ann_maintenance_status_and_due_planning_are_target_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let target = ObjectId::new(85)?;
+        let unrelated = ObjectId::new(86)?;
+        seed_durable_routing_fixture_with_lifecycle(
+            &mut database,
+            target,
+            unrelated,
+            IncrementalVectorLifecycle {
+                delta_max_entries: 8,
+                consolidate_after_deltas: 1,
+                retain_generations: 1,
+            },
+        )?;
+        let mut update = database.begin(1, DurabilityClass::Memory)?;
+        update.upsert_vector(target, ObjectId::new(1)?, Vector::new([2.0; 8])?)?;
+        update.commit()?;
+
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
+        let status = database.ann_maintenance_status(target)?;
+        let due = database
+            .plan_due_ann_consolidation(target, 256)?
+            .ok_or("target consolidation was not planned when due")?;
+        let receipt = database.consolidate_ann(due, DurabilityClass::Memory)?;
+        super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
+        super::FAIL_FULL_STATE_LOAD.set(false);
+
+        assert_eq!(status.delta_records, 1);
+        assert!(status.delta_bytes > 0);
+        assert!(status.due);
+        assert_eq!(receipt.consumed_delta_records, 1);
+        assert_eq!(database.observe_ann_index(target)?.delta_records, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ann_read_view_scratch_bound_covers_full_corpus_visited_sets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = AnnSearchOptions::new(10, 64, Some(64))?;
+        let base_vectors = 1_000_000_usize;
+        let visited_sets_bound = u64::try_from(base_vectors)?.saturating_mul(512);
+        for workers in [1_u64, 2, 4] {
+            let scratch = super::ann_read_view_query_scratch_bytes(
+                384,
+                64,
+                base_vectors,
+                4_096,
+                options,
+                workers,
+            )?;
+            assert!(scratch >= visited_sets_bound);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ann_read_view_cancels_at_routed_wave_and_merge_boundaries_and_remains_reusable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(92)?;
+        seed_durable_routing_fixture(&mut database, index, ObjectId::new(93)?)?;
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::new(NativeExecutionPool::new(&profile, &policy)?),
+            Duration::ZERO,
+        )?;
+        let (view, open) = database.open_ann_read_view(index)?;
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+        let options = AnnSearchOptions::new(10, 64, Some(64))?;
+        let retained_memory = governor.usage_snapshot().memory_bytes;
+        for point in [
+            super::ann_store::AnnSearchCancellationPoint::AfterFirstWave,
+            super::ann_store::AnnSearchCancellationPoint::AfterFallbackWave,
+            super::ann_store::AnnSearchCancellationPoint::BeforeDeltaMerge,
+        ] {
+            let cancellation = governor.cancellation_token();
+            super::ann_store::cancel_next_search_at_for_test(point);
+            assert!(matches!(
+                view.search_selected_with_cancellation(
+                    &query,
+                    options,
+                    open.logical_partitions.min(1),
+                    &cancellation,
+                ),
+                Err(NativeRuntimeError::ResourceQueue(
+                    GovernorQueueError::Cancelled
+                ))
+            ));
+            assert_eq!(governor.usage_snapshot().memory_bytes, retained_memory);
+            assert!(
+                view.search_selected(&query, options, open.logical_partitions)
+                    .is_ok()
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_underreported_ann_metadata_is_bounded(
+        database: &mut NativeDatabase,
+        search_root: PageId,
+        target: ObjectId,
+        target_definition: VectorIndexDefinition,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut metadata = BTree::from_root(search_root)
+            .get(&database.pages, &super::ann_store::meta_key(target))?
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if metadata.get(..8) != Some(b"HYANNM04") {
+            return Err("expected V4 ANN metadata".into());
+        }
+        metadata[104..120].fill(0);
+        metadata[192..208].fill(0);
+        let underreported_root = BTree::from_root(search_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::ann_store::meta_key(target),
+                metadata,
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let plan = super::ann_store::plan_index_load(
+            &database.pages,
+            &database.buffer_pool,
+            underreported_root,
+            target,
+            target_definition,
+        )?;
+        assert_eq!(plan.physical_entry_limit(), 0);
+        super::ann_store::reset_index_scoped_restore_count_for_test();
+        assert!(matches!(
+            super::ann_store::search_selected_planned(
+                &database.pages,
+                &database.buffer_pool,
+                &plan,
+                query,
+                options,
+                1,
+            ),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+        assert_eq!(super::ann_store::index_scoped_restore_count_for_test(), 0);
+        assert_eq!(
+            super::ann_store::index_scoped_peak_physical_entries_for_test(),
+            0
+        );
+        Ok(())
+    }
+
+    fn assert_target_ann_corruption_fails(
+        database: &mut NativeDatabase,
+        search_root: PageId,
+        target: ObjectId,
+        target_record: (ObjectId, [u8; 32]),
+        target_definition: VectorIndexDefinition,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let corrupted_root = BTree::from_root(search_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::ann_store::vector_key(target, target_record.1, target_record.0),
+                vec![0; 32],
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let plan = super::ann_store::plan_index_load(
+            &database.pages,
+            &database.buffer_pool,
+            corrupted_root,
+            target,
+            target_definition,
+        )?;
+        assert!(matches!(
+            super::ann_store::search_selected_planned(
+                &database.pages,
+                &database.buffer_pool,
+                &plan,
+                query,
+                options,
+                1,
+            ),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+        Ok(())
+    }
+
+    fn assert_index_scoped_governor_rejects_before_restore(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = engine_admission_test_policy();
+        policy
+            .class_limits
+            .iter_mut()
+            .find(|limit| limit.class == WorkloadClass::ForegroundBounded)
+            .ok_or("missing foreground bounded policy")?
+            .memory_bytes = super::FOREGROUND_BOUNDED_MEMORY_BYTES;
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        database.set_resource_governor(Arc::clone(&governor))?;
+        crate::ann_store::reset_index_scoped_restore_count_for_test();
+        assert!(matches!(
+            database.search_ann_selected_latest(index, query, options, 4),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ClassLimit
+            ))
+        ));
+        assert_eq!(crate::ann_store::index_scoped_restore_count_for_test(), 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        database.clear_resource_governor()?;
+        Ok(())
+    }
+
+    fn assert_full_fanout_routing_receipt(
+        receipt: &super::AnnSelectedSearchReceipt,
+        expected: &super::AnnSearchReceipt,
+    ) {
+        assert_eq!(&receipt.search, expected);
+        assert_eq!(
+            receipt.routing_mode,
+            super::AnnPartitionRoutingMode::FullFanout
+        );
+        assert_eq!(receipt.requested_maximum_partitions, 4);
+        assert_eq!(receipt.selected_partitions.len(), 4);
+        assert_eq!(receipt.total_partitions, 4);
+        assert_eq!(
+            receipt.routing_policy,
+            super::ANN_PARTITION_ROUTING_POLICY_V1
+        );
+        assert_eq!(
+            receipt.routing_outcome,
+            super::AnnPartitionRoutingOutcome::FullFanoutRequested
+        );
+        assert_eq!(receipt.base_build_identity, receipt.view_identity);
+        assert_eq!(receipt.view_identity, receipt.search.build_identity);
+        assert_eq!(receipt.exact_delta_candidates, 0);
+        assert_eq!(receipt.next_partition_lower_bound, None);
+        assert_eq!(receipt.execution_workers, 1);
+    }
+
     fn queue_competing_ann_memory(
         governor: &Arc<NativeResourceGovernor>,
         policy: &NativeGovernorPolicy,
@@ -50018,6 +54799,192 @@ mod tests {
     }
 
     #[test]
+    fn durable_selected_ann_routing_is_explicit_and_survives_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(86)?;
+        let unrelated_index = ObjectId::new(89)?;
+        seed_durable_routing_fixture(&mut database, index, unrelated_index)?;
+        let options = AnnSearchOptions::new(10, 64, Some(64))?;
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+
+        let default = database.search_ann_latest(index, &query, options)?;
+        assert_index_scoped_governor_rejects_before_restore(&mut database, index, &query, options)?;
+        crate::ann_store::reset_index_scoped_restore_count_for_test();
+        let full = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, &query, options, 4)
+        })?;
+        assert_eq!(crate::ann_store::index_scoped_restore_count_for_test(), 1);
+        assert_full_fanout_routing_receipt(&full, &default);
+
+        let selected = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, &query, options, 3)
+        })?;
+        assert_eq!(
+            selected.routing_mode,
+            super::AnnPartitionRoutingMode::SelectedPartitions
+        );
+        assert_eq!(selected.selected_partitions.len(), 3);
+        assert_eq!(selected.total_partitions, 4);
+        assert_eq!(
+            selected.routing_outcome,
+            super::AnnPartitionRoutingOutcome::SelectedCertified
+        );
+        assert!(selected.next_partition_lower_bound.is_some());
+        assert_eq!(
+            selected,
+            database.search_ann_selected_latest(index, &query, options, 3)?
+        );
+        let snapshot = database.snapshot(0)?;
+        assert_eq!(
+            snapshot.search_ann_selected(index, &query, options, 3)?,
+            selected
+        );
+        drop(snapshot);
+        let transaction = database.begin(0, DurabilityClass::Memory)?;
+        assert_eq!(
+            transaction.search_ann_selected(index, &query, options, 3)?,
+            selected
+        );
+        transaction.rollback();
+        assert!(matches!(
+            database.search_ann_selected_latest(index, &query, options, 0),
+            Err(NativeRuntimeError::Ann(
+                hyphae_native_ann::AnnError::InvalidPartitionCount
+            ))
+        ));
+
+        drop(database);
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            without_full_state_or_catalog_materialization(|| {
+                reopened.search_ann_selected_latest(index, &query, options, 3)
+            })?,
+            selected
+        );
+        let inserted = ObjectId::new(129)?;
+        let delta_query = Vector::new([64.25, 1.25, 4.25, 1.25, 9.25, 12.25, 13.25, 1.25])?;
+        let mut delta = reopened.begin(0, DurabilityClass::Memory)?;
+        delta.upsert_vector(index, inserted, delta_query.clone())?;
+        delta.commit()?;
+        let with_delta = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &delta_query, options, 3)
+        })?;
+        assert_eq!(with_delta.search.hits[0].object_id, inserted);
+        assert_eq!(with_delta.base_build_identity, selected.base_build_identity);
+        assert_ne!(with_delta.view_identity, with_delta.base_build_identity);
+        assert_eq!(with_delta.view_identity, with_delta.search.build_identity);
+        assert_eq!(with_delta.exact_delta_candidates, 1);
+
+        let consolidation = reopened.plan_ann_consolidation(index, 256, 4)?;
+        reopened.consolidate_ann(consolidation, DurabilityClass::Memory)?;
+        let fallback = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &query, options, 3)
+        })?;
+        assert_eq!(
+            fallback.routing_mode,
+            super::AnnPartitionRoutingMode::SingleGenerationFallback
+        );
+        assert_eq!(fallback.selected_partitions, vec![0]);
+        assert_eq!(fallback.total_partitions, 1);
+        assert_eq!(
+            fallback.routing_outcome,
+            super::AnnPartitionRoutingOutcome::SingleGenerationFallback
+        );
+        assert_eq!(fallback.base_build_identity, fallback.view_identity);
+        assert_eq!(
+            fallback.search,
+            reopened.search_ann_latest(index, &query, options)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn routed_ann_fanout_uses_persistent_workers_and_widens_deterministically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(96)?;
+        seed_durable_routing_fixture(&mut database, index, ObjectId::new(99)?)?;
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+        let options = AnnSearchOptions::new(10, 64, Some(64))?;
+        let serial = database.search_ann_selected_latest(index, &query, options, 4)?;
+
+        for workers in [1_u64, 2, 4] {
+            let policy = routed_ann_admission_test_policy(workers);
+            let profile = portable_execution_profile(&policy);
+            let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+            let pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+            database.set_resource_governor_with_execution_pool(
+                Arc::clone(&governor),
+                Arc::clone(&pool),
+                Duration::ZERO,
+            )?;
+            let completed_before = pool.completed_jobs();
+            let routed = without_full_state_or_catalog_materialization(|| {
+                database.search_ann_selected_latest(index, &query, options, 4)
+            })?;
+            assert_eq!(routed.search, serial.search);
+            assert_eq!(routed.selected_partitions, serial.selected_partitions);
+            assert_eq!(routed.routing_outcome, serial.routing_outcome);
+            assert_eq!(routed.execution_workers, usize::try_from(workers)?);
+            assert_eq!(routed.execution_worker_batches, usize::try_from(workers)?);
+            assert_eq!(routed.execution_waves, 1);
+            assert_eq!(pool.completed_jobs() - completed_before, workers);
+            assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        }
+
+        let certified = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, &query, options, 3)
+        })?;
+        assert_eq!(
+            certified.routing_outcome,
+            super::AnnPartitionRoutingOutcome::SelectedCertified
+        );
+        assert_eq!(certified.execution_workers, 3);
+        assert_eq!(certified.execution_worker_batches, 3);
+        assert_eq!(certified.execution_waves, 1);
+
+        let fallback_options = AnnSearchOptions::new(64, 64, Some(64))?;
+        let expected_fallback = database.search_ann_latest(index, &query, fallback_options)?;
+        let widened = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, &query, fallback_options, 1)
+        })?;
+        assert_eq!(widened.search, expected_fallback);
+        assert_eq!(
+            widened.routing_outcome,
+            super::AnnPartitionRoutingOutcome::FullFanoutBudgetFallback
+        );
+        assert_eq!(widened.selected_partitions.len(), 4);
+        assert_eq!(widened.execution_workers, 3);
+        assert_eq!(widened.execution_worker_batches, 4);
+        assert_eq!(widened.execution_waves, 2);
+
+        let governor = database
+            .resource_governor()
+            .ok_or("missing routed ANN governor")?;
+        let cancellation = governor.cancellation_token();
+        cancellation.cancel();
+        super::ann_store::reset_index_scoped_restore_count_for_test();
+        assert!(matches!(
+            database.search_ann_selected_latest_with_cancellation(
+                index,
+                &query,
+                options,
+                4,
+                &cancellation,
+            ),
+            Err(NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::Cancelled
+            ))
+        ));
+        assert_eq!(super::ann_store::index_scoped_restore_count_for_test(), 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
     fn initial_ann_bulk_publication_rejects_an_intervening_root_without_writes()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -50121,16 +55088,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             super::ann_store::maximum_initial_ann_bulk_partitions(1),
-            221
+            111
         );
-        assert_eq!(
-            super::ann_store::maximum_initial_ann_bulk_partitions(2),
-            220
-        );
-        assert_eq!(
-            super::ann_store::maximum_initial_ann_bulk_partitions(64),
-            123
-        );
+        assert_eq!(super::ann_store::maximum_initial_ann_bulk_partitions(2), 74);
+        assert_eq!(super::ann_store::maximum_initial_ann_bulk_partitions(64), 2);
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
         let index = ObjectId::new(84)?;
@@ -50143,7 +55104,7 @@ mod tests {
             ann_config()?,
         )?;
         create.commit()?;
-        let vectors = (1..=222_u16)
+        let vectors = (1..=112_u16)
             .map(|value| {
                 Ok((
                     ObjectId::new(u128::from(value))?,
@@ -50154,9 +55115,9 @@ mod tests {
         let physical_before = database.physical_observation()?;
 
         assert!(matches!(
-            database.plan_initial_ann_bulk(index, vectors, 222),
+            database.plan_initial_ann_bulk(index, vectors, 112),
             Err(NativeRuntimeError::InitialAnnBulkPartitionLimit {
-                requested: 222,
+                requested: 112,
                 maximum: super::MAX_INITIAL_ANN_BULK_PARTITIONS,
             })
         ));
@@ -50166,7 +55127,7 @@ mod tests {
 
         let representable = database.plan_initial_ann_bulk(
             index,
-            (1..=221_u16)
+            (1..=111_u16)
                 .map(|value| {
                     Ok((
                         ObjectId::new(u128::from(value))?,
@@ -50174,15 +55135,19 @@ mod tests {
                     ))
                 })
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
-            221,
+            111,
         )?;
-        assert_eq!(representable.build_evidence().planned_partitions, 221);
+        assert_eq!(representable.build_evidence().planned_partitions, 111);
         let reduced = database.plan_initial_ann_bulk(
             index,
             vec![(ObjectId::new(1)?, Vector::new([1.0, 1.0])?)],
             usize::MAX,
         )?;
         assert_eq!(reduced.build_evidence().planned_partitions, 1);
+        drop(reduced);
+        let published =
+            database.publish_initial_ann_bulk(representable, DurabilityClass::Memory)?;
+        assert_eq!(published.build.planned_partitions, 111);
 
         let retained_index = ObjectId::new(85)?;
         let mut create = database.begin(0, DurabilityClass::Memory)?;
@@ -50199,7 +55164,7 @@ mod tests {
             },
         )?;
         create.commit()?;
-        let retained_vectors = (1..=124_u16)
+        let retained_vectors = (1..=3_u16)
             .map(|value| {
                 Ok((
                     ObjectId::new(u128::from(value))?,
@@ -50208,10 +55173,10 @@ mod tests {
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         assert!(matches!(
-            database.plan_initial_ann_bulk(retained_index, retained_vectors, 124),
+            database.plan_initial_ann_bulk(retained_index, retained_vectors, 3),
             Err(NativeRuntimeError::InitialAnnBulkPartitionLimit {
-                requested: 124,
-                maximum: 123,
+                requested: 3,
+                maximum: 2,
             })
         ));
         Ok(())
@@ -50839,6 +55804,99 @@ mod tests {
             Err(NativeRuntimeError::InvalidAnnTree)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn index_scoped_ann_load_rejects_target_corruption_but_ignores_other_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let target = ObjectId::new(31)?;
+        let unrelated = ObjectId::new(32)?;
+        let target_object = ObjectId::new(41)?;
+        let unrelated_object = ObjectId::new(42)?;
+        let config = ann_config()?;
+        let mut transaction = database.begin(1, DurabilityClass::Memory)?;
+        transaction.create_vector_index(
+            target,
+            "target-index",
+            2,
+            VectorMetric::SquaredL2,
+            config,
+        )?;
+        transaction.create_vector_index(
+            unrelated,
+            "unrelated-index",
+            2,
+            VectorMetric::SquaredL2,
+            config,
+        )?;
+        transaction.upsert_vector(target, target_object, Vector::new([1.0, 0.0])?)?;
+        transaction.upsert_vector(unrelated, unrelated_object, Vector::new([0.0, 1.0])?)?;
+        transaction.commit()?;
+
+        let target_receipt =
+            database.search_ann_latest(target, &Vector::new([1.0, 0.0])?, ann_options()?)?;
+        let unrelated_receipt =
+            database.search_ann_latest(unrelated, &Vector::new([0.0, 1.0])?, ann_options()?)?;
+        let root_set = database.coordinator.snapshot(2)?.roots().clone();
+        let search_root = root_set
+            .root(super::SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let target_definition =
+            VectorIndexDefinition::new(target, 2, VectorMetric::SquaredL2, config)?;
+        let options = AnnSearchOptions::new(1, 4, Some(4))?;
+        let query = Vector::new([1.0, 0.0])?;
+
+        let unrelated_corrupted = BTree::from_root(search_root)
+            .upsert(
+                &mut database.pages,
+                Csn::new(1)?,
+                super::ann_store::vector_key(
+                    unrelated,
+                    unrelated_receipt.build_identity,
+                    unrelated_object,
+                ),
+                vec![0; 32],
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let target_plan = super::ann_store::plan_index_load(
+            &database.pages,
+            &database.buffer_pool,
+            unrelated_corrupted,
+            target,
+            target_definition,
+        )?;
+        let target_result = super::ann_store::search_selected_planned(
+            &database.pages,
+            &database.buffer_pool,
+            &target_plan,
+            &query,
+            options,
+            1,
+        )?;
+        assert_eq!(target_result.result.hits[0].object_id, target_object);
+
+        assert_target_ann_corruption_fails(
+            &mut database,
+            search_root,
+            target,
+            (target_object, target_receipt.build_identity),
+            target_definition,
+            &query,
+            options,
+        )?;
+
+        assert_underreported_ann_metadata_is_bounded(
+            &mut database,
+            search_root,
+            target,
+            target_definition,
+            &query,
+            options,
+        )
     }
 
     #[test]
@@ -52514,7 +57572,7 @@ mod tests {
         }
 
         let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
-        database.set_resource_governor(Arc::clone(&governor));
+        database.set_resource_governor(Arc::clone(&governor))?;
         let held = governor.try_admit(
             WorkloadClass::Maintenance,
             GovernorRequest {
@@ -52752,6 +57810,8 @@ mod tests {
             .ok_or(NativeRuntimeError::InvalidStructureTree)?;
         roots[2] = Some(forged);
         let batch = NativeWriteBatch {
+            lineage: None,
+            directory_identity: database.directory_identity().clone(),
             snapshot,
             state: super::MaterializedState::default(),
             mutations: vec![Mutation {
@@ -52767,10 +57827,12 @@ mod tests {
             structure_format: super::StructureFormat::BTreeV3,
             search_format: database.search_format,
             mode: super::NativeWriteBatchMode::PhysicalStructureCompaction,
+            delta_stage_active: false,
             delta: None,
             ann_consolidation: None,
+            ann_consolidation_structure: None,
             ann_initial_bulk: None,
-            _resource_permit: None,
+            resource_permit: None,
         };
         let compacted = super::commit_engine_roots(
             &mut database.pages,

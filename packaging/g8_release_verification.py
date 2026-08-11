@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Reverify the complete signed release layout and emit G8 evidence."""
 
@@ -16,6 +16,109 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
+SOFTWARE_LICENSE = "AGPL-3.0-only"
+
+
+def is_hyphae_component(name: object) -> bool:
+    return isinstance(name, str) and (
+        name == "hyphae"
+        or name.startswith("hyphae-")
+        or name == "@celiums/hyphae"
+        or name.startswith("@celiums/hyphae-")
+    )
+
+
+def verify_spdx_hyphae_licenses(document: object) -> list[str]:
+    if not isinstance(document, dict) or not isinstance(document.get("packages"), list):
+        raise RuntimeError("SPDX SBOM packages must be a list")
+    verified: set[str] = set()
+    for package in document["packages"]:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            raise RuntimeError("SPDX SBOM package must be a named object")
+        name = package["name"]
+        if not is_hyphae_component(name):
+            continue
+        for field in ("licenseDeclared", "licenseConcluded"):
+            if package.get(field) != SOFTWARE_LICENSE:
+                raise RuntimeError(
+                    f"SPDX Hyphae component {name} {field} must be {SOFTWARE_LICENSE}"
+                )
+        verified.add(name)
+    if not verified:
+        raise RuntimeError("SPDX SBOM contains no Hyphae component")
+    return sorted(verified)
+
+
+def cyclonedx_license_identifiers(component: dict) -> list[str] | None:
+    licenses = component.get("licenses")
+    if not isinstance(licenses, list) or not licenses:
+        return None
+    identifiers: list[str] = []
+    for choice in licenses:
+        if not isinstance(choice, dict):
+            return None
+        expression = choice.get("expression")
+        if isinstance(expression, str):
+            identifiers.append(expression)
+            continue
+        license_value = choice.get("license")
+        if not isinstance(license_value, dict) or not isinstance(
+            license_value.get("id"), str
+        ):
+            return None
+        identifiers.append(license_value["id"])
+    return identifiers
+
+
+def cyclonedx_components(document: dict) -> list[dict]:
+    roots = document.get("components", [])
+    if not isinstance(roots, list):
+        raise RuntimeError("CycloneDX SBOM components must be a list")
+    metadata = document.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise RuntimeError("CycloneDX SBOM metadata must be an object")
+        component = metadata.get("component")
+        if component is not None:
+            roots = [component, *roots]
+    pending = list(roots)
+    flattened: list[dict] = []
+    while pending:
+        component = pending.pop()
+        if not isinstance(component, dict):
+            raise RuntimeError("CycloneDX SBOM component must be an object")
+        children = component.get("components", [])
+        if not isinstance(children, list):
+            raise RuntimeError("CycloneDX nested components must be a list")
+        pending.extend(children)
+        flattened.append(component)
+    return flattened
+
+
+def verify_cyclonedx_hyphae_licenses(document: object) -> list[str]:
+    if not isinstance(document, dict):
+        raise RuntimeError("CycloneDX SBOM must be an object")
+    verified: set[str] = set()
+    for component in cyclonedx_components(document):
+        name = component.get("name")
+        if not is_hyphae_component(name):
+            continue
+        identifiers = cyclonedx_license_identifiers(component)
+        if identifiers is None or set(identifiers) != {SOFTWARE_LICENSE}:
+            raise RuntimeError(
+                f"CycloneDX Hyphae component {name} license must be {SOFTWARE_LICENSE}"
+            )
+        verified.add(name)
+    if not verified:
+        raise RuntimeError("CycloneDX SBOM contains no Hyphae component")
+    return sorted(verified)
+
+
+def read_json_document(path: Path, label: str) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{label} is not valid JSON: {error}") from error
 
 
 def expected_archives(tag: str) -> set[str]:
@@ -87,6 +190,17 @@ def verify(
     archives = sorted([*directory.glob("*.tar.gz"), *directory.glob("*.zip")])
     if {archive.name for archive in archives} != expected_archives(tag):
         raise RuntimeError("G8 release must contain the four canonical target archives")
+    spdx = directory / f"hyphae-{tag}.spdx.json"
+    cyclonedx = directory / f"hyphae-{tag}.cdx.json"
+    checksums = directory / "SHA256SUMS"
+    if not all(path.is_file() for path in (spdx, cyclonedx, checksums, manifest)):
+        raise RuntimeError("G8 release metadata set is incomplete")
+    spdx_components = verify_spdx_hyphae_licenses(
+        read_json_document(spdx, "SPDX SBOM")
+    )
+    cyclonedx_component_names = verify_cyclonedx_hyphae_licenses(
+        read_json_document(cyclonedx, "CycloneDX SBOM")
+    )
     signatures = 0
     attestations = 0
     for path in sorted(directory.iterdir()):
@@ -108,11 +222,6 @@ def verify(
             "cyclonedx", certificate_identity,
         )
         attestations += 3
-    spdx = directory / f"hyphae-{tag}.spdx.json"
-    cyclonedx = directory / f"hyphae-{tag}.cdx.json"
-    checksums = directory / "SHA256SUMS"
-    if not all(path.is_file() for path in (spdx, cyclonedx, checksums, manifest)):
-        raise RuntimeError("G8 release metadata set is incomplete")
     return {
         "schema": "hyphae-native-g8-signed-release-v1",
         "status": "passed",
@@ -121,6 +230,9 @@ def verify(
         "archive_count": len(archives),
         "signature_verifications": signatures,
         "attestation_verifications": attestations,
+        "software_license": SOFTWARE_LICENSE,
+        "spdx_hyphae_components": spdx_components,
+        "cyclonedx_hyphae_components": cyclonedx_component_names,
         "spdx_sha256": hashlib.sha256(spdx.read_bytes()).hexdigest(),
         "cyclonedx_sha256": hashlib.sha256(cyclonedx.read_bytes()).hexdigest(),
         "checksums_sha256": hashlib.sha256(checksums.read_bytes()).hexdigest(),

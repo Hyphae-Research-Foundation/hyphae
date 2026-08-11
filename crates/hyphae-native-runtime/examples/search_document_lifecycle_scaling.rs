@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Direct-Linux observations for point-resolved lexical document lifecycle.
 
@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hyphae_native_runtime::{NativeDatabase, NativePhysicalObservation, NativeWriteBatch};
+use hyphae_native_runtime::{NativeDatabase, NativeDeltaWriteBatch, NativePhysicalObservation};
 use hyphae_native_types::{DurabilityClass, ObjectId};
 
 const POPULATIONS: [u64; 3] = [0, 256, 4_096];
@@ -58,7 +58,7 @@ impl Operation {
     fn stage(
         self,
         database: &NativeDatabase,
-        batch: &mut NativeWriteBatch,
+        batch: &mut NativeDeltaWriteBatch,
         index: ObjectId,
         document_id: Vec<u8>,
         sequence: u64,

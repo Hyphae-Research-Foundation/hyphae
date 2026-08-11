@@ -89,11 +89,13 @@ ranking.
 
 Default approximate search fans out to every child, merges canonically, and
 reports the existing approximate-traversal recall risk. An explicit
-`search_selected` experiment ranks deterministic centroid/radius summaries,
-visits no more than its caller budget, and reports the exact selected partition
-identities. It remains a bakeoff route: it has no cross-partition navigation
-links or accepted-corpus quality policy, and therefore never replaces full
-fanout silently.
+The low-level `search_selected` experiment hard-caps deterministic child
+routing and remains useful only for bakeoff diagnostics. The durable runtime
+uses metric-bound adaptive routing: it certifies omitted children or widens
+explicitly to full fanout. It still has no cross-partition navigation links or
+accepted-corpus quality policy, and therefore never replaces full fanout
+silently. Its durable runtime contract is specified in
+[`native-ann-durable-routing-v1.md`](native-ann-durable-routing-v1.md).
 
 ## Durability boundary
 

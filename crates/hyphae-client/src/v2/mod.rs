@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Equivalent high-level API over HTTP `/v2` and exact `HYPHLCL1` local transport.
 

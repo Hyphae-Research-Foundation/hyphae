@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Shared fail-closed resource admission for every Native engine.
 
@@ -883,6 +883,10 @@ struct OwnedGovernorAllocation {
 }
 
 impl OwnedGovernorPermit {
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
+    }
+
     /// Returns the class owning this allocation.
     pub fn class(&self) -> WorkloadClass {
         self.allocation.class

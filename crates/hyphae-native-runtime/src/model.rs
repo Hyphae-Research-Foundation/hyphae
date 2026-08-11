@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2231,9 +2231,10 @@ impl SearchState {
             .indexes
             .get_mut(&index)
             .ok_or(ModelError::UnknownObject)?;
-        if documents.insert(document_id, text).is_some() {
+        if documents.contains_key(&document_id) {
             return Err(ModelError::DuplicateDocumentId);
         }
+        documents.insert(document_id, text);
         Ok(())
     }
 

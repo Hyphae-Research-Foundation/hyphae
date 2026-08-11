@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only
 
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_native_g7_g8_readiness import GateFailure, validate
+from tools.check_native_g7_g8_readiness import (
+    GateFailure,
+    validate,
+    validate_g7_execution_workflow,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +36,9 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
             (root / ".github/workflows/native-g8-closure.yml").write_bytes(
                 (ROOT / ".github/workflows/native-g8-closure.yml").read_bytes()
             )
+            (root / ".github/workflows/native-g7-g8-readiness.yml").write_bytes(
+                (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_bytes()
+            )
             path = root / "config/native-g8-suite-manifest.json"
             payload = json.loads(path.read_text())
             payload["requirements"][0]["status"] = "passed"
@@ -54,6 +61,9 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
             (root / ".github/workflows/native-g8-closure.yml").write_text(
                 workflow.replace("check_native_g8_receipts.py", "unchecked-g8.py")
             )
+            (root / ".github/workflows/native-g7-g8-readiness.yml").write_bytes(
+                (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_bytes()
+            )
             with self.assertRaisesRegex(GateFailure, "exact-SHA receipts"):
                 validate(root, "a" * 40)
 
@@ -72,8 +82,27 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
             (root / ".github/workflows/native-g8-closure.yml").write_text(
                 workflow + "\n# check_native_g7_matrix.py\n"
             )
+            (root / ".github/workflows/native-g7-g8-readiness.yml").write_bytes(
+                (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_bytes()
+            )
             with self.assertRaisesRegex(GateFailure, "independent from G7"):
                 validate(root, "a" * 40)
+
+    def test_dedicated_g7_execution_requires_hosted_exact_sha_qualification(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_text()
+        validate_g7_execution_workflow(workflow)
+        weakened = workflow.replace(
+            "needs: [authority, g7_qualification]",
+            "needs: [authority]",
+            1,
+        )
+        with self.assertRaisesRegex(GateFailure, "gated by successful qualification"):
+            validate_g7_execution_workflow(weakened)
+
+    def test_g7_workflow_cannot_provision_infrastructure(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_text()
+        with self.assertRaisesRegex(GateFailure, "must not provision"):
+            validate_g7_execution_workflow(workflow + "\n# aws ec2 run-instances\n")
 
 
 if __name__ == "__main__":

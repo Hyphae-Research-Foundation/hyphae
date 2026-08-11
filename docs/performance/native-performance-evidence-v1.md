@@ -132,24 +132,24 @@ digest. The progress contract does not promise that every algorithm can resume
 from every intermediate stage; resumability is declared by the presence and
 meaning of its checkpoint.
 
-The G7 ANN corpus builder emits `ann-private-build` observations from the
-canonical HNSW kernel, followed by `ann-publication` and `ann-published`. The
-completed checkpoint is the durable base-generation identity observed after
-commit, not a digest invented by the controller. A reused, independently
-validated seed does not replay synthetic build progress. The current
-publication path does not expose node-level progress and replays the initial
-vector mutation during commit; eliminating that duplicate generation is a P4
-optimization and remains visible as a separate stage in the meantime.
+The G7 ANN corpus builder emits planning and child-generation observations from
+the governed partitioned-HNSW builder, followed by `ann-publication` and
+`ann-published`. The completed checkpoint is the durable aggregate-generation
+identity observed after the prior-or-complete commit, not a digest invented by
+the controller. A reused, independently validated seed does not replay
+synthetic build progress. Progress details include the builder identity,
+logical partition and execution-worker counts, memory admission, worker
+batches, and a monotonic ETA.
 
 The complete G7 controller keeps ANN build progress separate from matrix
 progress. After every state/background/concurrency cell it atomically publishes
 an exact-source record containing the completed cell identities, total count,
 and the currently running cell. This controller record is diagnostic, not a
-claim that a partial cell can resume. Each cell has a two-hour watchdog, the
-matrix has an eleven-hour controller deadline, and the dedicated workflow has
-a twelve-hour hard stop so a failed or stalled run retains actionable progress
-without exceeding its approved host budget. Failure artifacts preserve both
-controller and ANN progress even when no closure matrix exists.
+claim that a partial cell can resume. Each cell has a two-hour deadline, lack
+of progress for thirty minutes is a stall, the matrix has an eleven-hour
+controller deadline, and the dedicated workflow has a twelve-hour hard stop.
+Failure artifacts preserve both controller and ANN progress even when no
+closure matrix exists.
 
 ## Validation
 
