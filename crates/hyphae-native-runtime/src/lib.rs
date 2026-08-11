@@ -54237,58 +54237,18 @@ mod tests {
         Ok(())
     }
 
-    fn assert_initial_ann_bulk_lifecycle(
-        mut database: NativeDatabase,
-        data_directory: &std::path::Path,
-        index: ObjectId,
-        query: &Vector,
-        evidence: super::InitialAnnBulkBuildEvidence,
-        expected: &[super::VectorHit],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let policy = parallel_engine_admission_test_policy();
-        let profile = portable_execution_profile(&policy);
-        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
-        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
-        database.set_resource_governor_with_execution_pool(
-            Arc::clone(&governor),
-            Arc::clone(&execution_pool),
-            Duration::from_secs(5),
-        )?;
-        let reopened_observation = database.observe_ann_index(index)?;
-        assert_eq!(reopened_observation.base_identity, evidence.build_identity);
-        assert_eq!(reopened_observation.base_vector_count, 128);
-        assert_eq!(
-            database.search_vector_exact_latest(index, query, 8)?,
-            expected
-        );
-        let inserted = ObjectId::new(129)?;
-        let mut update = database.begin(0, DurabilityClass::Strict)?;
-        update.upsert_vector(
-            index,
-            inserted,
-            Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?,
-        )?;
-        assert!(update.delete_vector(index, ObjectId::new(1)?)?);
-        update.commit()?;
-        let with_deltas = database.observe_ann_index(index)?;
-        assert_eq!(with_deltas.base_identity, evidence.build_identity);
-        assert_eq!(with_deltas.effective_vector_count, 128);
-        assert_eq!(with_deltas.delta_records, 2);
-        let expected_after_delta = database.search_vector_exact_latest(index, query, 8)?;
-        assert!(
-            expected_after_delta
-                .iter()
-                .any(|hit| hit.object_id == inserted)
-        );
-        let consolidation = database.plan_ann_consolidation(index, 256, 8)?;
+    fn assert_ann_consolidation_plan_accounting_and_reconfiguration(
+        database: &mut NativeDatabase,
+        consolidation: super::AnnConsolidationPlan,
+        definition: VectorIndexDefinition,
+        policy: &NativeGovernorPolicy,
+        governor: &Arc<NativeResourceGovernor>,
+        execution_pool: Arc<NativeExecutionPool>,
+    ) -> Result<super::AnnConsolidationPlan, Box<dyn std::error::Error>> {
+        let index = consolidation.index_id();
         let expected_retained_memory = super::partitioned_hnsw_build_memory_bytes(
             consolidation.effective_vector_count(),
-            VectorIndexDefinition::new(
-                index,
-                8,
-                Metric::SquaredL2,
-                HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?,
-            )?,
+            definition,
         );
         assert_eq!(
             governor.usage_snapshot().memory_bytes,
@@ -54346,7 +54306,7 @@ mod tests {
             observation_before_rejection
         );
         database.set_resource_governor_with_execution_pool(
-            Arc::clone(&governor),
+            Arc::clone(governor),
             execution_pool,
             Duration::from_secs(5),
         )?;
@@ -54354,6 +54314,66 @@ mod tests {
             governor.usage_snapshot().memory_bytes,
             expected_retained_memory
         );
+        Ok(consolidation)
+    }
+
+    fn assert_initial_ann_bulk_lifecycle(
+        mut database: NativeDatabase,
+        data_directory: &std::path::Path,
+        index: ObjectId,
+        query: &Vector,
+        evidence: super::InitialAnnBulkBuildEvidence,
+        expected: &[super::VectorHit],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&execution_pool),
+            Duration::from_secs(5),
+        )?;
+        let reopened_observation = database.observe_ann_index(index)?;
+        assert_eq!(reopened_observation.base_identity, evidence.build_identity);
+        assert_eq!(reopened_observation.base_vector_count, 128);
+        assert_eq!(
+            database.search_vector_exact_latest(index, query, 8)?,
+            expected
+        );
+        let inserted = ObjectId::new(129)?;
+        let mut update = database.begin(0, DurabilityClass::Strict)?;
+        update.upsert_vector(
+            index,
+            inserted,
+            Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?,
+        )?;
+        assert!(update.delete_vector(index, ObjectId::new(1)?)?);
+        update.commit()?;
+        let with_deltas = database.observe_ann_index(index)?;
+        assert_eq!(with_deltas.base_identity, evidence.build_identity);
+        assert_eq!(with_deltas.effective_vector_count, 128);
+        assert_eq!(with_deltas.delta_records, 2);
+        let expected_after_delta = database.search_vector_exact_latest(index, query, 8)?;
+        assert!(
+            expected_after_delta
+                .iter()
+                .any(|hit| hit.object_id == inserted)
+        );
+        let consolidation = database.plan_ann_consolidation(index, 256, 8)?;
+        let consolidation = assert_ann_consolidation_plan_accounting_and_reconfiguration(
+            &mut database,
+            consolidation,
+            VectorIndexDefinition::new(
+                index,
+                8,
+                Metric::SquaredL2,
+                HnswConfig::new(8, 48, 32, 64, 0x4455_5241)?,
+            )?,
+            &policy,
+            &governor,
+            execution_pool,
+        )?;
         let consolidated = database.consolidate_ann(consolidation, DurabilityClass::Strict)?;
         assert_eq!(governor.usage_snapshot().memory_bytes, 0);
         assert_eq!(consolidated.consumed_delta_records, 2);
@@ -54373,6 +54393,89 @@ mod tests {
         assert_eq!(
             reopened.search_vector_exact_latest(index, query, 8)?,
             expected_after_delta
+        );
+        Ok(())
+    }
+
+    fn consolidate_and_assert_ann_routing_receipt(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+        expected_base_identity: [u8; 32],
+        expected_view_identity: [u8; 32],
+    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        let consolidation = database.plan_ann_consolidation(index, 256, 4)?;
+        let captured_base_identity = consolidation.base_identity();
+        let captured_view_identity = consolidation.captured_view_identity();
+        let captured_delta_count = consolidation.captured_delta_count();
+        let effective_vector_count = consolidation.effective_vector_count();
+        let replacement_identity = consolidation.replacement_identity();
+        assert_eq!(captured_base_identity, expected_base_identity);
+        assert_eq!(captured_view_identity, expected_view_identity);
+        assert_eq!(captured_delta_count, 1);
+        assert_eq!(effective_vector_count, 129);
+        let consolidation_receipt =
+            database.consolidate_ann(consolidation, DurabilityClass::Memory)?;
+        assert_eq!(
+            consolidation_receipt.previous_base_identity,
+            captured_base_identity
+        );
+        assert_eq!(
+            consolidation_receipt.replacement_base_identity,
+            replacement_identity
+        );
+        assert_eq!(consolidation_receipt.consumed_delta_records, 1);
+        assert_eq!(consolidation_receipt.preserved_later_delta_records, 0);
+        assert_eq!(consolidation_receipt.effective_vector_count, 129);
+        Ok(replacement_identity)
+    }
+
+    fn assert_consolidated_partitioned_routing_reopens(
+        database: NativeDatabase,
+        data_directory: &std::path::Path,
+        index: ObjectId,
+        query: &Vector,
+        options: AnnSearchOptions,
+        inserted: ObjectId,
+        replacement_identity: [u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let consolidated = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, query, options, 3)
+        })?;
+        assert_eq!(
+            consolidated.routing_mode,
+            super::AnnPartitionRoutingMode::SelectedPartitions
+        );
+        assert_eq!(consolidated.selected_partitions.len(), 3);
+        assert_eq!(consolidated.total_partitions, 4);
+        assert_eq!(
+            consolidated.routing_outcome,
+            super::AnnPartitionRoutingOutcome::SelectedCertified
+        );
+        assert_eq!(consolidated.base_build_identity, replacement_identity);
+        assert_eq!(consolidated.view_identity, replacement_identity);
+        assert_eq!(consolidated.search.build_identity, replacement_identity);
+        assert_eq!(consolidated.exact_delta_candidates, 0);
+        assert_eq!(consolidated.search.hits[0].object_id, inserted);
+
+        let default_after_consolidation = database.search_ann_latest(index, query, options)?;
+        let full_after_consolidation = without_full_state_or_catalog_materialization(|| {
+            database.search_ann_selected_latest(index, query, options, 4)
+        })?;
+        assert_full_fanout_routing_receipt(&full_after_consolidation, &default_after_consolidation);
+
+        drop(database);
+        let reopened = NativeDatabase::open(data_directory)?;
+        assert_eq!(
+            without_full_state_or_catalog_materialization(|| {
+                reopened.search_ann_selected_latest(index, query, options, 3)
+            })?,
+            consolidated
+        );
+        assert_eq!(
+            without_full_state_or_catalog_materialization(|| {
+                reopened.search_ann_selected_latest(index, query, options, 4)
+            })?,
+            full_after_consolidation
         );
         Ok(())
     }
@@ -54952,71 +55055,21 @@ mod tests {
         assert_eq!(with_delta.view_identity, with_delta.search.build_identity);
         assert_eq!(with_delta.exact_delta_candidates, 1);
 
-        let consolidation = reopened.plan_ann_consolidation(index, 256, 4)?;
-        let captured_base_identity = consolidation.base_identity();
-        let captured_view_identity = consolidation.captured_view_identity();
-        let captured_delta_count = consolidation.captured_delta_count();
-        let effective_vector_count = consolidation.effective_vector_count();
-        let replacement_identity = consolidation.replacement_identity();
-        assert_eq!(captured_base_identity, selected.base_build_identity);
-        assert_eq!(captured_view_identity, with_delta.view_identity);
-        assert_eq!(captured_delta_count, 1);
-        assert_eq!(effective_vector_count, 129);
-        let consolidation_receipt =
-            reopened.consolidate_ann(consolidation, DurabilityClass::Memory)?;
-        assert_eq!(
-            consolidation_receipt.previous_base_identity,
-            captured_base_identity
-        );
-        assert_eq!(
-            consolidation_receipt.replacement_base_identity,
-            replacement_identity
-        );
-        assert_eq!(consolidation_receipt.consumed_delta_records, 1);
-        assert_eq!(consolidation_receipt.preserved_later_delta_records, 0);
-        assert_eq!(consolidation_receipt.effective_vector_count, 129);
-
-        let consolidated = without_full_state_or_catalog_materialization(|| {
-            reopened.search_ann_selected_latest(index, &delta_query, options, 3)
-        })?;
-        assert_eq!(
-            consolidated.routing_mode,
-            super::AnnPartitionRoutingMode::SelectedPartitions
-        );
-        assert_eq!(consolidated.selected_partitions.len(), 3);
-        assert_eq!(consolidated.total_partitions, 4);
-        assert_eq!(
-            consolidated.routing_outcome,
-            super::AnnPartitionRoutingOutcome::SelectedCertified
-        );
-        assert_eq!(consolidated.base_build_identity, replacement_identity);
-        assert_eq!(consolidated.view_identity, replacement_identity);
-        assert_eq!(consolidated.search.build_identity, replacement_identity);
-        assert_eq!(consolidated.exact_delta_candidates, 0);
-        assert_eq!(consolidated.search.hits[0].object_id, inserted);
-
-        let default_after_consolidation =
-            reopened.search_ann_latest(index, &delta_query, options)?;
-        let full_after_consolidation = without_full_state_or_catalog_materialization(|| {
-            reopened.search_ann_selected_latest(index, &delta_query, options, 4)
-        })?;
-        assert_full_fanout_routing_receipt(&full_after_consolidation, &default_after_consolidation);
-
-        drop(reopened);
-        let reopened = NativeDatabase::open(temporary.path())?;
-        assert_eq!(
-            without_full_state_or_catalog_materialization(|| {
-                reopened.search_ann_selected_latest(index, &delta_query, options, 3)
-            })?,
-            consolidated
-        );
-        assert_eq!(
-            without_full_state_or_catalog_materialization(|| {
-                reopened.search_ann_selected_latest(index, &delta_query, options, 4)
-            })?,
-            full_after_consolidation
-        );
-        Ok(())
+        let replacement_identity = consolidate_and_assert_ann_routing_receipt(
+            &mut reopened,
+            index,
+            selected.base_build_identity,
+            with_delta.view_identity,
+        )?;
+        assert_consolidated_partitioned_routing_reopens(
+            reopened,
+            temporary.path(),
+            index,
+            &delta_query,
+            options,
+            inserted,
+            replacement_identity,
+        )
     }
 
     #[test]
