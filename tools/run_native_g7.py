@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 import platform as platform_module
 import signal
@@ -19,6 +21,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
+from typing import TextIO
 
 if os.name == "posix":
     import resource
@@ -42,26 +45,104 @@ MAX_INITIAL_ANN_BULK_PARTITIONS = 111
 G7_LOGICAL_ANN_PARTITIONS = 64
 G7_PREFERRED_ANN_PARTITIONS = 32
 G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
+G7_SURFACES = (
+    "embedded-structure-point-get",
+    "embedded-prepared-sql-primary-key",
+    "local-structure-point-get",
+    "local-prepared-sql-primary-key",
+    "indexed-sql-bounded-read",
+    "two-index-join-bounded-read",
+    "bm25-top10",
+    "filtered-bm25-top10",
+    "ann-top10-recall-095",
+    "hybrid-top10",
+    "strict-group-commit",
+)
+PILOT_OBSERVATIONS = 10_000
+PILOT_WARMUP = 1_000
+PILOT_BUDGET_MULTIPLIER = 1.1
+PILOT_BUDGET_RESERVE_SECONDS = 300.0
+PROCESS_ERROR_TAIL_CHARS = 4_096
+CLOSURE_SEARCH_DOCUMENTS = 1_000_000
+CLOSURE_VECTOR_COUNT = 1_000_000
+CLOSURE_VECTOR_DIMENSION = 384
+CLOSURE_OVERRIDE_VARIABLES = (
+    "HYPHAE_G7_SMOKE",
+    "HYPHAE_G7_SEARCH_DOCUMENTS",
+    "HYPHAE_G7_VECTOR_DIMENSION",
+)
+
+
+class ProgressStalled(RuntimeError):
+    """The runner stopped producing measurable progress."""
+
+
+class RuntimeBudgetExceeded(RuntimeError):
+    """Measured work cannot complete inside the authorized runtime cap."""
+
+
+@dataclass
+class MatrixCellPlan:
+    state: str
+    background_mode: str
+    concurrency: int
+    pilot_receipt_path: Path
+    pilot_progress_path: Path
+    pilot_partial_path: Path
+    partial_receipt_path: Path
+    runner_receipt_path: Path
+    validated_receipt_path: Path
+    runtime_budget: dict[str, object] | None = None
+
+    def diagnostic(self, phase: str) -> dict[str, object]:
+        diagnostic: dict[str, object] = {
+            "state": self.state,
+            "background_mode": self.background_mode,
+            "concurrency": self.concurrency,
+            "phase": phase,
+            "pilot_receipt": str(self.pilot_receipt_path),
+            "partial_receipt": str(self.partial_receipt_path),
+            "runner_receipt": str(self.runner_receipt_path),
+            "validated_cell_receipt": str(self.validated_receipt_path),
+        }
+        if self.runtime_budget is not None:
+            diagnostic["runtime_budget"] = self.runtime_budget
+        return diagnostic
 
 
 class ProgressWatchdog:
-    def __init__(self, path: Path, timeout_seconds: float, started: float) -> None:
+    def __init__(
+        self,
+        path: Path,
+        timeout_seconds: float,
+        started: float,
+        expected_commit: str | None = None,
+    ) -> None:
         self.path = path
         self.timeout_seconds = timeout_seconds
+        self.expected_commit = expected_commit
         self.last_activity = started
         self.last_sequence: int | None = None
+        self.last_payload: dict[str, object] | None = None
         self.last_progress_summary = "no progress payload observed"
         self.completed = False
 
     def observe(self, now: float) -> None:
         if self.path.is_file():
             payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("G7 runner progress must be an object")
             sequence = payload.get("sequence")
             if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
                 raise RuntimeError("G7 runner progress has an invalid sequence")
+            if self.expected_commit is not None:
+                validate_progress(payload, self.expected_commit)
             if self.last_sequence is None or sequence > self.last_sequence:
+                if self.expected_commit is not None and self.last_payload is not None:
+                    validate_progress(payload, self.expected_commit, self.last_payload)
                 self.last_sequence = sequence
                 self.last_activity = now
+                self.last_payload = payload
             elif sequence < self.last_sequence:
                 raise RuntimeError("G7 runner progress sequence regressed")
             details = payload.get("details")
@@ -72,9 +153,13 @@ class ProgressWatchdog:
                 f"{payload.get('total_units')!r}, eta="
                 f"{json.dumps(eta, sort_keys=True, separators=(',', ':'))}"
             )
-            self.completed = payload.get("status") == "completed"
+            self.completed = (
+                payload.get("operation") == "g7-cell"
+                and payload.get("stage") == "cell-completed"
+                and payload.get("status") == "completed"
+            )
         if not self.completed and now - self.last_activity >= self.timeout_seconds:
-            raise RuntimeError(
+            raise ProgressStalled(
                 f"G7 runner progress stalled for {self.timeout_seconds:.0f}s; "
                 f"last progress: {self.last_progress_summary}"
             )
@@ -96,6 +181,283 @@ def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def closure_environment(environment: dict[str, str]) -> dict[str, str]:
+    sanitized = environment.copy()
+    for name in CLOSURE_OVERRIDE_VARIABLES:
+        sanitized.pop(name, None)
+    return sanitized
+
+
+def validate_receipt_dataset(
+    dataset: object,
+    *,
+    expected_observations: int,
+    expected_warmup: int,
+) -> str:
+    if (
+        not isinstance(dataset, dict)
+        or dataset.get("observations") != expected_observations
+        or dataset.get("warmup") != expected_warmup
+        or dataset.get("search_documents") != CLOSURE_SEARCH_DOCUMENTS
+        or dataset.get("vector_count") != CLOSURE_VECTOR_COUNT
+        or dataset.get("vector_dimension") != CLOSURE_VECTOR_DIMENSION
+    ):
+        raise RuntimeError("G7 receipt dataset differs from the exact closure corpus")
+    digest = dataset.get("digest")
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise RuntimeError("G7 receipt dataset digest is invalid")
+    return digest
+
+
+def validate_cross_artifact_dataset(
+    receipt: object,
+    progress: object,
+    partial: object,
+    *,
+    expected_observations: int,
+    expected_warmup: int,
+) -> None:
+    if not isinstance(receipt, dict):
+        raise RuntimeError("G7 runner receipt must be an object")
+    digest = validate_receipt_dataset(
+        receipt.get("dataset"),
+        expected_observations=expected_observations,
+        expected_warmup=expected_warmup,
+    )
+    if (
+        not isinstance(progress, dict)
+        or not isinstance(partial, dict)
+        or progress.get("dataset_digest") != digest
+        or partial.get("dataset_digest") != digest
+    ):
+        raise RuntimeError("G7 receipt, progress, or partial targets another dataset")
+
+
+def validate_partial_receipt(
+    payload: object,
+    *,
+    expected_commit: str,
+    expected_tree: str,
+    expected_platform: str,
+    expected_state: str,
+    expected_concurrency: int,
+) -> dict[str, object]:
+    fields = {
+        "schema", "source_commit", "source_tree", "dataset_digest", "platform",
+        "state", "concurrency", "sequence", "status", "completed_count",
+        "total_cells", "current_cell", "cells",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise RuntimeError("G7 partial receipt fields mismatch")
+    if (
+        payload["schema"] != "hyphae-native-g7-partial-receipt-v1"
+        or payload["source_commit"] != expected_commit
+        or payload["source_tree"] != expected_tree
+        or payload["platform"] != expected_platform
+        or payload["state"] != expected_state
+        or payload["concurrency"] != expected_concurrency
+    ):
+        raise RuntimeError("G7 partial receipt identity mismatch")
+    digest = payload["dataset_digest"]
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise RuntimeError("G7 partial receipt dataset digest is invalid")
+    sequence = payload["sequence"]
+    cells = payload["cells"]
+    completed_count = payload["completed_count"]
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence <= 0
+        or not isinstance(cells, dict)
+        or not set(cells).issubset(G7_SURFACES)
+        or not isinstance(completed_count, int)
+        or isinstance(completed_count, bool)
+        or completed_count != len(cells)
+        or payload["total_cells"] != len(G7_SURFACES)
+    ):
+        raise RuntimeError("G7 partial receipt progress is inconsistent")
+    status = payload["status"]
+    current_cell = payload["current_cell"]
+    if status == "running":
+        if current_cell is not None and current_cell not in G7_SURFACES:
+            raise RuntimeError("G7 partial receipt current cell is invalid")
+    elif status == "completed":
+        if completed_count != len(G7_SURFACES) or current_cell is not None:
+            raise RuntimeError("completed G7 partial receipt is incomplete")
+    else:
+        raise RuntimeError("G7 partial receipt status is invalid")
+    return payload
+
+
+def derive_cell_runtime_budget(
+    pilot: object,
+    *,
+    expected_commit: str,
+    expected_platform: str,
+    expected_state: str,
+    expected_concurrency: int,
+    observations: int,
+    warmup: int,
+    hard_cap_seconds: float,
+    seed_primed: bool,
+) -> dict[str, object]:
+    if not isinstance(pilot, dict):
+        raise RuntimeBudgetExceeded("G7 pilot receipt must be an object")
+    dataset = pilot.get("dataset")
+    cells = pilot.get("cells")
+    controller = pilot.get("controller")
+    if (
+        pilot.get("source_commit") != expected_commit
+        or pilot.get("platform") != expected_platform
+        or pilot.get("state") != expected_state
+        or pilot.get("concurrency") != expected_concurrency
+        or not isinstance(cells, dict)
+        or set(cells) != set(G7_SURFACES)
+        or not isinstance(controller, dict)
+    ):
+        raise RuntimeBudgetExceeded("G7 pilot receipt identity or coverage mismatch")
+    try:
+        validate_receipt_dataset(
+            dataset,
+            expected_observations=PILOT_OBSERVATIONS,
+            expected_warmup=PILOT_WARMUP,
+        )
+    except RuntimeError as error:
+        raise RuntimeBudgetExceeded(f"G7 pilot {error}") from error
+    wall_seconds = controller.get("wall_seconds")
+    if (
+        not isinstance(wall_seconds, (int, float))
+        or isinstance(wall_seconds, bool)
+        or not math.isfinite(wall_seconds)
+        or wall_seconds <= 0
+        or observations < PILOT_OBSERVATIONS
+        or warmup < PILOT_WARMUP
+        or hard_cap_seconds <= 0
+        or seed_primed is not True
+    ):
+        raise RuntimeBudgetExceeded("G7 pilot or requested runtime bounds are invalid")
+    full_surface_seconds: dict[str, float] = {}
+    pilot_surface_seconds = 0.0
+    for name in G7_SURFACES:
+        cell = cells[name]
+        throughput = cell.get("throughput_per_second") if isinstance(cell, dict) else None
+        p99_nanos = cell.get("p99") if isinstance(cell, dict) else None
+        if (
+            not isinstance(throughput, (int, float))
+            or isinstance(throughput, bool)
+            or not math.isfinite(throughput)
+            or throughput <= 0
+            or not isinstance(p99_nanos, int)
+            or isinstance(p99_nanos, bool)
+            or p99_nanos <= 0
+        ):
+            raise RuntimeBudgetExceeded(f"G7 pilot timing is invalid for {name}")
+        pilot_measurement_seconds = PILOT_OBSERVATIONS / throughput
+        throughput_seconds = observations / throughput
+        p99_measurement_seconds = (
+            observations
+            * p99_nanos
+            / max(expected_concurrency, 1)
+            / 1_000_000_000
+        )
+        pilot_warmup_seconds = 0.0
+        full_warmup_seconds = 0.0
+        if name != "strict-group-commit" and expected_state == "warm":
+            pilot_warmup_seconds = PILOT_WARMUP * p99_nanos / 1_000_000_000
+            full_warmup_seconds = warmup * p99_nanos / 1_000_000_000
+        pilot_surface_seconds += pilot_measurement_seconds + pilot_warmup_seconds
+        full_surface_seconds[name] = (
+            max(throughput_seconds, p99_measurement_seconds)
+            + full_warmup_seconds
+        )
+    fixed_overhead_seconds = max(0.0, wall_seconds - pilot_surface_seconds)
+    expected_seconds = fixed_overhead_seconds + sum(full_surface_seconds.values())
+    derived_seconds = (
+        expected_seconds * PILOT_BUDGET_MULTIPLIER
+        + PILOT_BUDGET_RESERVE_SECONDS
+    )
+    if derived_seconds > hard_cap_seconds:
+        slowest = max(full_surface_seconds, key=full_surface_seconds.get)
+        raise RuntimeBudgetExceeded(
+            "G7 pilot projects a runtime budget above the authorized cap: "
+            f"expected={expected_seconds:.1f}s, derived={derived_seconds:.1f}s, "
+            f"cap={hard_cap_seconds:.1f}s, slowest_surface={slowest}, "
+            f"slowest_seconds={full_surface_seconds[slowest]:.1f}s"
+        )
+    return {
+        "schema": "hyphae-native-g7-runtime-budget-v1",
+        "method": "exact-runner-short-pilot-v1",
+        "seed_treatment": "measured-after-identical-seed-prime",
+        "pilot_observations": PILOT_OBSERVATIONS,
+        "pilot_warmup": PILOT_WARMUP,
+        "full_observations": observations,
+        "full_warmup": warmup,
+        "pilot_wall_seconds": round(float(wall_seconds), 6),
+        "fixed_overhead_seconds": round(fixed_overhead_seconds, 6),
+        "expected_seconds": round(expected_seconds, 6),
+        "multiplier": PILOT_BUDGET_MULTIPLIER,
+        "reserve_seconds": PILOT_BUDGET_RESERVE_SECONDS,
+        "timeout_seconds": math.ceil(derived_seconds),
+        "hard_cap_seconds": hard_cap_seconds,
+        "surface_seconds": {
+            name: round(value, 6) for name, value in full_surface_seconds.items()
+        },
+    }
+
+
+def derive_matrix_runtime_plan(
+    *,
+    calibration_seconds: float,
+    cell_budgets: list[dict[str, object]],
+    hard_cap_seconds: float,
+    expected_cell_count: int,
+) -> dict[str, object]:
+    if (
+        not math.isfinite(calibration_seconds)
+        or calibration_seconds < 0
+        or not math.isfinite(hard_cap_seconds)
+        or hard_cap_seconds <= 0
+        or not cell_budgets
+        or expected_cell_count <= 0
+        or len(cell_budgets) != expected_cell_count
+    ):
+        raise RuntimeBudgetExceeded("G7 matrix runtime planning inputs are invalid")
+    timeouts: list[float] = []
+    for budget in cell_budgets:
+        timeout = budget.get("timeout_seconds")
+        if (
+            budget.get("schema") != "hyphae-native-g7-runtime-budget-v1"
+            or not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise RuntimeBudgetExceeded("G7 matrix contains an invalid cell budget")
+        timeouts.append(float(timeout))
+    planned_measurement_seconds = sum(timeouts)
+    planned_total_seconds = calibration_seconds + planned_measurement_seconds
+    if planned_total_seconds > hard_cap_seconds:
+        raise RuntimeBudgetExceeded(
+            "G7 pilots and evidence-derived cell budgets exceed the matrix cap: "
+            f"calibration={calibration_seconds:.1f}s, "
+            f"measurement={planned_measurement_seconds:.1f}s, "
+            f"total={planned_total_seconds:.1f}s, cap={hard_cap_seconds:.1f}s"
+        )
+    return {
+        "schema": "hyphae-native-g7-matrix-runtime-plan-v1",
+        "status": "accepted",
+        "calibration_seconds": round(calibration_seconds, 6),
+        "planned_measurement_seconds": round(planned_measurement_seconds, 6),
+        "planned_total_seconds": round(planned_total_seconds, 6),
+        "hard_cap_seconds": hard_cap_seconds,
+        "cell_count": len(cell_budgets),
+    }
 
 
 def write_matrix_progress(
@@ -143,6 +505,24 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         else:
             process.kill()
         process.wait(timeout=5)
+
+
+def collect_process_output(stdout: TextIO, stderr: TextIO) -> tuple[str, str]:
+    try:
+        stdout.flush()
+        stdout.seek(0)
+        output = stdout.read()
+        stderr.flush()
+        stderr.seek(0)
+        errors = stderr.read()
+        return output, errors
+    finally:
+        stdout.close()
+        stderr.close()
+
+
+def process_error_tail(stderr: str) -> str:
+    return stderr[-PROCESS_ERROR_TAIL_CHARS:].strip()
 
 
 def handle_controller_signal(signum: int, _frame: object) -> None:
@@ -244,15 +624,20 @@ def run_cell(
     stall_timeout_seconds: float | None = None,
 ) -> dict:
     global ACTIVE_PROCESS
+    environment = dict(os.environ if environment is None else environment)
     base_command = [str(binary), commit, platform, state, str(concurrency)]
     command = base_command
     perf_output: Path | None = None
     if (
         sys.platform.startswith("linux")
-        and os.environ.get("HYPHAE_G7_PERF") == "1"
+        and environment.get("HYPHAE_G7_PERF") == "1"
         and shutil.which("perf")
     ):
-        descriptor = tempfile.NamedTemporaryFile(prefix="hyphae-g7-perf-", suffix=".csv", delete=False)
+        descriptor = tempfile.NamedTemporaryFile(
+            prefix="hyphae-g7-perf-",
+            suffix=".csv",
+            delete=False,
+        )
         descriptor.close()
         perf_output = Path(descriptor.name)
         command = [
@@ -268,25 +653,36 @@ def run_cell(
         ]
     started = time.monotonic()
     watchdog = (
-        ProgressWatchdog(progress_path, stall_timeout_seconds, started)
+        ProgressWatchdog(
+            progress_path,
+            stall_timeout_seconds,
+            started,
+            expected_commit=commit,
+        )
         if progress_path is not None and stall_timeout_seconds is not None
         else None
     )
     next_progress_check = started
-    environment = dict(os.environ if environment is None else environment)
     environment["RUST_BACKTRACE"] = "1"
     child_usage_before = (
         resource.getrusage(resource.RUSAGE_CHILDREN) if os.name == "posix" else None
     )
-    process = subprocess.Popen(
-        command,
-        cwd=ROOT,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=os.name == "posix",
-    )
+    stdout_capture = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    stderr_capture = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=stdout_capture,
+            stderr=stderr_capture,
+            text=True,
+            start_new_session=os.name == "posix",
+        )
+    except BaseException:
+        stdout_capture.close()
+        stderr_capture.close()
+        raise
     ACTIVE_PROCESS = process
     metrics = ProcessMetrics(process.pid)
     while process.poll() is None:
@@ -295,27 +691,46 @@ def run_cell(
         if watchdog is not None and now >= next_progress_check:
             try:
                 watchdog.observe(now)
-            except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as error:
+            except ProgressStalled as error:
                 stop_process(process)
-                stdout, stderr = process.communicate()
+                _, stderr = collect_process_output(stdout_capture, stderr_capture)
+                ACTIVE_PROCESS = None
+                if perf_output is not None:
+                    perf_output.unlink(missing_ok=True)
+                raise ProgressStalled(
+                    f"G7 cell stalled ({state}/{concurrency}): {error}; "
+                    f"runner stderr tail: {process_error_tail(stderr)}"
+                ) from error
+            except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+                stop_process(process)
+                _, stderr = collect_process_output(stdout_capture, stderr_capture)
+                ACTIVE_PROCESS = None
                 if perf_output is not None:
                     perf_output.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"G7 cell progress watchdog failed ({state}/{concurrency}): {error}; "
-                    f"runner stderr: {stderr.strip()}"
+                    f"runner stderr tail: {process_error_tail(stderr)}"
                 ) from error
             next_progress_check = now + 1.0
         if timeout_seconds is not None and now - started >= timeout_seconds:
             stop_process(process)
-            stdout, stderr = process.communicate()
+            _, stderr = collect_process_output(stdout_capture, stderr_capture)
+            ACTIVE_PROCESS = None
             if perf_output is not None:
                 perf_output.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"G7 cell timed out after {timeout_seconds:.0f}s "
-                f"({state}/{concurrency}): {stderr.strip()}"
+            progress = (
+                watchdog.last_progress_summary
+                if watchdog is not None
+                else "progress watchdog disabled"
+            )
+            raise RuntimeBudgetExceeded(
+                f"G7 cell exceeded its evidence-derived runtime budget of "
+                f"{timeout_seconds:.0f}s ({state}/{concurrency}); "
+                f"last progress: {progress}; "
+                f"runner stderr tail: {process_error_tail(stderr)}"
             )
         time.sleep(0.01)
-    stdout, stderr = process.communicate()
+    stdout, stderr = collect_process_output(stdout_capture, stderr_capture)
     ACTIVE_PROCESS = None
     metrics.sample()
     if child_usage_before is not None:
@@ -328,7 +743,8 @@ def run_cell(
         if perf_output is not None:
             perf_output.unlink(missing_ok=True)
         raise RuntimeError(
-            f"G7 cell failed ({state}/{concurrency}): {completed.stderr.strip()}"
+            f"G7 cell failed ({state}/{concurrency}); "
+            f"runner stderr tail: {process_error_tail(completed.stderr)}"
         )
     payload = json.loads(completed.stdout)
     if perf_output is None:
@@ -356,6 +772,67 @@ def run_cell(
         "machine": platform_module.machine(),
     }
     return payload
+
+
+def run_calibration_pilot(
+    binary: Path,
+    *,
+    commit: str,
+    source_tree: str,
+    platform: str,
+    state: str,
+    concurrency: int,
+    environment: dict[str, str],
+    receipt_path: Path,
+    progress_path: Path,
+    partial_path: Path,
+    timeout_seconds: float,
+    stall_timeout_seconds: float,
+) -> dict[str, object]:
+    pilot_environment = closure_environment(environment)
+    pilot_environment["HYPHAE_G7_OBSERVATIONS"] = str(PILOT_OBSERVATIONS)
+    pilot_environment["HYPHAE_G7_WARMUP"] = str(PILOT_WARMUP)
+    pilot_environment["HYPHAE_G7_PROGRESS_FILE"] = str(progress_path.resolve())
+    pilot_environment["HYPHAE_G7_PARTIAL_RECEIPT_FILE"] = str(partial_path.resolve())
+    pilot_environment.pop("HYPHAE_G7_PERF", None)
+    for artifact in (receipt_path, progress_path, partial_path):
+        artifact.unlink(missing_ok=True)
+    pilot = run_cell(
+        binary,
+        commit,
+        platform,
+        state,
+        concurrency,
+        environment=pilot_environment,
+        macos_counter_template=None,
+        timeout_seconds=timeout_seconds,
+        progress_path=progress_path,
+        stall_timeout_seconds=stall_timeout_seconds,
+    )
+    if not progress_path.is_file():
+        raise RuntimeError("G7 pilot did not produce mandatory progress")
+    progress = validate_completed_cell_progress(
+        json.loads(progress_path.read_text(encoding="utf-8")), commit
+    )
+    if not partial_path.is_file():
+        raise RuntimeError("G7 pilot did not persist a partial receipt")
+    partial = validate_partial_receipt(
+        json.loads(partial_path.read_text(encoding="utf-8")),
+        expected_commit=commit,
+        expected_tree=source_tree,
+        expected_platform=platform,
+        expected_state=state,
+        expected_concurrency=concurrency,
+    )
+    validate_cross_artifact_dataset(
+        pilot,
+        progress,
+        partial,
+        expected_observations=PILOT_OBSERVATIONS,
+        expected_warmup=PILOT_WARMUP,
+    )
+    write_json_atomic(receipt_path, pilot)
+    return pilot
 
 
 class ProcessMetrics:
@@ -602,6 +1079,25 @@ def validate_completed_ann_progress(
         raise RuntimeError("G7 ANN progress details target another dataset")
 
 
+def validate_completed_cell_progress(
+    progress: dict[str, object], expected_commit: str
+) -> dict[str, object]:
+    validate_progress(progress, expected_commit)
+    if (
+        progress.get("operation") != "g7-cell"
+        or progress.get("stage") != "cell-completed"
+        or progress.get("status") != "completed"
+        or progress.get("unit") != "work-units"
+        or progress.get("completed_units") != progress.get("total_units")
+    ):
+        raise RuntimeError("G7 progress did not reach complete cell publication")
+    details = progress.get("details")
+    if not isinstance(details, dict):
+        raise RuntimeError("completed G7 cell progress omitted its details")
+    validate_progress_eta(details.get("eta"), completed=True)
+    return progress
+
+
 def validate_progress_eta(value: object, *, completed: bool) -> None:
     if not isinstance(value, dict) or set(value) != {
         "status", "estimated_remaining_nanos"
@@ -783,6 +1279,99 @@ def validate_execution_authority_evidence(
         raise RuntimeError("G7 execution authority stole work while NUMA stealing was disabled")
 
 
+def bind_and_validate_cell_receipt(
+    receipt: dict[str, object],
+    *,
+    expected_commit: str,
+    expected_platform: str,
+    expected_state: str,
+    expected_concurrency: int,
+    background_mode: str,
+    hardware: dict[str, object],
+    build: dict[str, str],
+    calibration_executable_blake3: str,
+) -> None:
+    dataset = receipt.get("dataset")
+    if (
+        receipt.get("source_commit") != expected_commit
+        or receipt.get("platform") != expected_platform
+        or receipt.get("state") != expected_state
+        or receipt.get("concurrency") != expected_concurrency
+    ):
+        raise RuntimeError("G7 runner receipt identity or normative workload mismatch")
+    validate_receipt_dataset(
+        dataset,
+        expected_observations=1_000_000,
+        expected_warmup=100_000,
+    )
+    receipt["background_mode"] = background_mode
+    receipt["hardware"] = hardware
+    receipt["build"] = build
+    initial_ann_bulk = receipt.get("initial_ann_bulk")
+    validate_initial_ann_bulk_evidence(initial_ann_bulk, expected_commit)
+    receipt_cells = receipt.get("cells")
+    if not isinstance(receipt_cells, dict):
+        raise RuntimeError("G7 runner omitted its measured cells or dataset")
+    observations = dataset.get("observations")
+    if not isinstance(observations, int) or isinstance(observations, bool):
+        raise RuntimeError("G7 runner dataset observations are invalid")
+    validate_ann_read_view_cell(
+        receipt_cells.get("ann-top10-recall-095"),
+        initial_ann_bulk,
+        observations,
+    )
+    if not isinstance(initial_ann_bulk, dict):
+        raise RuntimeError("G7 runner omitted initial ANN bulk evidence")
+    validate_execution_authority_evidence(
+        receipt.get("execution_authority"),
+        calibration_executable_blake3=calibration_executable_blake3,
+        topology_digest=initial_ann_bulk["topology_digest"],
+        background=background_mode == "interference",
+    )
+    if initial_ann_bulk["dataset_digest"] != dataset.get("digest"):
+        raise RuntimeError("G7 ANN evidence targets another receipt dataset")
+
+
+def persist_validated_cell_checkpoint(
+    path: Path,
+    receipt: dict[str, object],
+    *,
+    expected_commit: str,
+    expected_tree: str,
+    expected_platform: str,
+    expected_state: str,
+    expected_concurrency: int,
+    background_mode: str,
+    hardware: dict[str, object],
+    build: dict[str, str],
+    calibration_executable_blake3: str,
+    runtime_budget: dict[str, object],
+) -> None:
+    bind_and_validate_cell_receipt(
+        receipt,
+        expected_commit=expected_commit,
+        expected_platform=expected_platform,
+        expected_state=expected_state,
+        expected_concurrency=expected_concurrency,
+        background_mode=background_mode,
+        hardware=hardware,
+        build=build,
+        calibration_executable_blake3=calibration_executable_blake3,
+    )
+    write_json_atomic(path, {
+        "schema": "hyphae-native-g7-validated-cell-checkpoint-v1",
+        "status": "validated-pre-sweep",
+        "source_commit": expected_commit,
+        "source_tree": expected_tree,
+        "platform": expected_platform,
+        "state": expected_state,
+        "concurrency": expected_concurrency,
+        "background_mode": background_mode,
+        "runtime_budget": runtime_budget,
+        "receipt": receipt,
+    })
+
+
 def load_contract_path(path: Path, label: str) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"{label} must be a regular non-symlink file")
@@ -917,6 +1506,10 @@ def main() -> int:
         or arguments.stall_timeout_seconds <= 0
     ):
         raise ValueError("G7 timeout bounds must be positive")
+    if arguments.observations != 1_000_000 or arguments.warmup != 100_000:
+        raise ValueError(
+            "G7 closure requires exactly 1,000,000 observations and 100,000 warmups"
+        )
     source_tree = verify_source(arguments.source_commit)
     hardware_path = arguments.hardware_file or (
         Path(os.environ["HYPHAE_G7_HARDWARE_FILE"])
@@ -997,7 +1590,7 @@ def main() -> int:
     if sys.platform == "darwin":
         macos_counter_workspace = Path(tempfile.mkdtemp(prefix="hyphae-g7-template-"))
         macos_counter_template = prepare_macos_counter_template(macos_counter_workspace)
-    environment = os.environ.copy()
+    environment = closure_environment(dict(os.environ))
     environment["HYPHAE_G7_OBSERVATIONS"] = str(arguments.observations)
     environment["HYPHAE_G7_WARMUP"] = str(arguments.warmup)
     environment["HYPHAE_G7_SOURCE_TREE"] = source_tree
@@ -1009,8 +1602,18 @@ def main() -> int:
     runner_progress_path = arguments.output.with_name(
         f"{arguments.output.stem}.runner-progress.json"
     )
+    matrix_runtime_plan_path = arguments.output.with_name(
+        f"{arguments.output.stem}.runtime-plan.json"
+    )
     progress_path.unlink(missing_ok=True)
     runner_progress_path.unlink(missing_ok=True)
+    matrix_runtime_plan_path.unlink(missing_ok=True)
+    arguments.output.unlink(missing_ok=True)
+    pilot_directory = arguments.output.with_name(f"{arguments.output.stem}.pilots")
+    partial_directory = arguments.output.with_name(f"{arguments.output.stem}.partials")
+    cell_directory = arguments.output.with_name(f"{arguments.output.stem}.cells")
+    for directory in (pilot_directory, partial_directory, cell_directory):
+        directory.mkdir(parents=True, exist_ok=True)
     environment["HYPHAE_G7_PROGRESS_FILE"] = str(runner_progress_path.resolve())
     transient_seed_workspace: Path | None = None
     if arguments.background:
@@ -1030,6 +1633,14 @@ def main() -> int:
         else:
             seed_root = Path(data_root) / "shared-search-seeds"
         environment["HYPHAE_G7_SEARCH_SEED_ROOT"] = str(seed_root)
+    calibration_identity = contract_values[
+        "HYPHAE_G7_HARDWARE_CALIBRATION_FILE"
+    ].get("identity")
+    if not isinstance(calibration_identity, dict):
+        raise RuntimeError("G7 hardware calibration omitted its identity")
+    calibration_executable = calibration_identity.get("executable_blake3")
+    if not isinstance(calibration_executable, str):
+        raise RuntimeError("G7 hardware calibration omitted its executable digest")
     receipts = []
     completed_cells: list[dict[str, object]] = []
     matrix_started = time.monotonic()
@@ -1046,137 +1657,330 @@ def main() -> int:
         "running",
         started_unix_nanos,
     )
+    plans: list[MatrixCellPlan] = []
     for state in STATES:
         for background_mode in background_modes:
             for concurrency in CONCURRENCIES:
-                current_cell = {
-                    "state": state,
-                    "background_mode": background_mode,
-                    "concurrency": concurrency,
-                }
-                write_matrix_progress(
-                    progress_path,
-                    arguments.source_commit,
-                    arguments.platform,
-                    completed_cells,
-                    total_cells,
-                    current_cell,
-                    "running",
-                    started_unix_nanos,
+                artifact_name = f"{state}-{background_mode}-{concurrency}"
+                plan = MatrixCellPlan(
+                    state=state,
+                    background_mode=background_mode,
+                    concurrency=concurrency,
+                    pilot_receipt_path=pilot_directory / f"{artifact_name}.json",
+                    pilot_progress_path=pilot_directory / f"{artifact_name}.progress.json",
+                    pilot_partial_path=pilot_directory / f"{artifact_name}.partial.json",
+                    partial_receipt_path=partial_directory / f"{artifact_name}.json",
+                    runner_receipt_path=cell_directory / f"{artifact_name}.runner.json",
+                    validated_receipt_path=(
+                        cell_directory / f"{artifact_name}.validated.json"
+                    ),
                 )
-                remaining_seconds = (
-                    arguments.matrix_timeout_seconds
-                    - (time.monotonic() - matrix_started)
-                )
-                if remaining_seconds <= 0:
-                    write_matrix_progress(
-                        progress_path,
-                        arguments.source_commit,
-                        arguments.platform,
-                        completed_cells,
-                        total_cells,
-                        current_cell,
-                        "failed",
-                        started_unix_nanos,
-                    )
-                    raise RuntimeError("G7 matrix exceeded its controller deadline")
-                cell_environment = environment.copy()
-                if background_mode == "interference":
-                    cell_environment["HYPHAE_G7_BACKGROUND"] = "1"
-                else:
-                    cell_environment.pop("HYPHAE_G7_BACKGROUND", None)
-                try:
-                    runner_progress_path.unlink(missing_ok=True)
-                    receipt = run_cell(
-                        binary,
-                        arguments.source_commit,
-                        arguments.platform,
-                        state,
-                        concurrency,
-                        cell_environment,
-                        macos_counter_template,
-                        min(float(arguments.cell_timeout_seconds), remaining_seconds),
-                        runner_progress_path,
-                        float(arguments.stall_timeout_seconds),
-                    )
-                except BaseException:
-                    write_matrix_progress(
-                        progress_path,
-                        arguments.source_commit,
-                        arguments.platform,
-                        completed_cells,
-                        total_cells,
-                        current_cell,
-                        "failed",
-                        started_unix_nanos,
-                    )
-                    raise
-                try:
-                    if not runner_progress_path.is_file():
-                        raise RuntimeError("G7 runner did not produce mandatory progress")
-                    runner_progress = json.loads(
-                        runner_progress_path.read_text(encoding="utf-8")
-                    )
-                    validate_completed_ann_progress(
-                        runner_progress, arguments.source_commit
-                    )
-                except BaseException:
-                    write_matrix_progress(
-                        progress_path,
-                        arguments.source_commit,
-                        arguments.platform,
-                        completed_cells,
-                        total_cells,
-                        current_cell,
-                        "failed",
-                        started_unix_nanos,
-                    )
-                    raise
-                receipt["background_mode"] = background_mode
-                receipt["hardware"] = hardware
-                receipt["build"] = build
-                validate_initial_ann_bulk_evidence(
-                    receipt.get("initial_ann_bulk"), arguments.source_commit
-                )
-                receipt_cells = receipt.get("cells")
-                if not isinstance(receipt_cells, dict):
-                    raise RuntimeError("G7 runner omitted its measured cells")
-                validate_ann_read_view_cell(
-                    receipt_cells.get("ann-top10-recall-095"),
-                    receipt["initial_ann_bulk"],
-                    receipt["dataset"]["observations"],
-                )
-                calibration_identity = contract_values[
-                    "HYPHAE_G7_HARDWARE_CALIBRATION_FILE"
-                ].get("identity")
-                if not isinstance(calibration_identity, dict):
-                    raise RuntimeError("G7 hardware calibration omitted its identity")
-                calibration_executable = calibration_identity.get("executable_blake3")
-                if not isinstance(calibration_executable, str):
-                    raise RuntimeError("G7 hardware calibration omitted its executable digest")
-                validate_execution_authority_evidence(
-                    receipt.get("execution_authority"),
-                    calibration_executable_blake3=calibration_executable,
-                    topology_digest=receipt["initial_ann_bulk"]["topology_digest"],
-                    background=background_mode == "interference",
-                )
-                if (
-                    receipt["initial_ann_bulk"]["dataset_digest"]
-                    != receipt["dataset"]["digest"]
+                for artifact in (
+                    plan.pilot_receipt_path,
+                    plan.pilot_progress_path,
+                    plan.pilot_partial_path,
+                    plan.partial_receipt_path,
+                    plan.runner_receipt_path,
+                    plan.validated_receipt_path,
                 ):
-                    raise RuntimeError("G7 ANN evidence targets another receipt dataset")
-                receipts.append(receipt)
-                completed_cells.append(current_cell)
-                write_matrix_progress(
-                    progress_path,
-                    arguments.source_commit,
-                    arguments.platform,
-                    completed_cells,
-                    total_cells,
-                    None,
-                    "running",
-                    started_unix_nanos,
-                )
+                    artifact.unlink(missing_ok=True)
+                plans.append(plan)
+
+    prime_plan = plans[0]
+    prime_receipt_path = pilot_directory / "global-seed-prime.json"
+    prime_progress_path = pilot_directory / "global-seed-prime.progress.json"
+    prime_partial_path = pilot_directory / "global-seed-prime.partial.json"
+    current_cell = prime_plan.diagnostic("global-seed-prime")
+    current_cell["seed_prime_receipt"] = str(prime_receipt_path)
+    write_matrix_progress(
+        progress_path,
+        arguments.source_commit,
+        arguments.platform,
+        completed_cells,
+        total_cells,
+        current_cell,
+        "running",
+        started_unix_nanos,
+    )
+    prime_environment = environment.copy()
+    prime_environment.pop("HYPHAE_G7_BACKGROUND", None)
+    try:
+        run_calibration_pilot(
+            binary,
+            commit=arguments.source_commit,
+            source_tree=source_tree,
+            platform=arguments.platform,
+            state=prime_plan.state,
+            concurrency=prime_plan.concurrency,
+            environment=prime_environment,
+            receipt_path=prime_receipt_path,
+            progress_path=prime_progress_path,
+            partial_path=prime_partial_path,
+            timeout_seconds=float(arguments.cell_timeout_seconds),
+            stall_timeout_seconds=float(arguments.stall_timeout_seconds),
+        )
+    except BaseException:
+        write_matrix_progress(
+            progress_path,
+            arguments.source_commit,
+            arguments.platform,
+            completed_cells,
+            total_cells,
+            current_cell,
+            "failed",
+            started_unix_nanos,
+        )
+        raise
+
+    for plan in plans:
+        current_cell = plan.diagnostic("calibration-pilot")
+        current_cell["seed_prime_receipt"] = str(prime_receipt_path)
+        write_matrix_progress(
+            progress_path,
+            arguments.source_commit,
+            arguments.platform,
+            completed_cells,
+            total_cells,
+            current_cell,
+            "running",
+            started_unix_nanos,
+        )
+        remaining_seconds = (
+            arguments.matrix_timeout_seconds - (time.monotonic() - matrix_started)
+        )
+        if remaining_seconds <= 0:
+            write_matrix_progress(
+                progress_path,
+                arguments.source_commit,
+                arguments.platform,
+                completed_cells,
+                total_cells,
+                current_cell,
+                "failed",
+                started_unix_nanos,
+            )
+            raise RuntimeBudgetExceeded("G7 matrix budget was exhausted during pilots")
+        pilot_environment = environment.copy()
+        if plan.background_mode == "interference":
+            pilot_environment["HYPHAE_G7_BACKGROUND"] = "1"
+        else:
+            pilot_environment.pop("HYPHAE_G7_BACKGROUND", None)
+        try:
+            pilot = run_calibration_pilot(
+                binary,
+                commit=arguments.source_commit,
+                source_tree=source_tree,
+                platform=arguments.platform,
+                state=plan.state,
+                concurrency=plan.concurrency,
+                environment=pilot_environment,
+                receipt_path=plan.pilot_receipt_path,
+                progress_path=plan.pilot_progress_path,
+                partial_path=plan.pilot_partial_path,
+                timeout_seconds=min(
+                    float(arguments.cell_timeout_seconds), remaining_seconds
+                ),
+                stall_timeout_seconds=float(arguments.stall_timeout_seconds),
+            )
+            plan.runtime_budget = derive_cell_runtime_budget(
+                pilot,
+                expected_commit=arguments.source_commit,
+                expected_platform=arguments.platform,
+                expected_state=plan.state,
+                expected_concurrency=plan.concurrency,
+                observations=arguments.observations,
+                warmup=arguments.warmup,
+                hard_cap_seconds=float(arguments.cell_timeout_seconds),
+                seed_primed=True,
+            )
+        except BaseException:
+            write_matrix_progress(
+                progress_path,
+                arguments.source_commit,
+                arguments.platform,
+                completed_cells,
+                total_cells,
+                current_cell,
+                "failed",
+                started_unix_nanos,
+            )
+            raise
+
+    calibration_seconds = time.monotonic() - matrix_started
+    budgets = [
+        plan.runtime_budget for plan in plans if plan.runtime_budget is not None
+    ]
+    try:
+        matrix_runtime_plan = derive_matrix_runtime_plan(
+            calibration_seconds=calibration_seconds,
+            cell_budgets=budgets,
+            hard_cap_seconds=float(arguments.matrix_timeout_seconds),
+            expected_cell_count=total_cells,
+        )
+    except RuntimeBudgetExceeded:
+        current_cell = {
+            "phase": "matrix-budget-rejected",
+            "seed_prime_receipt": str(prime_receipt_path),
+            "steady_pilot_receipts": [
+                str(plan.pilot_receipt_path) for plan in plans
+            ],
+        }
+        write_matrix_progress(
+            progress_path,
+            arguments.source_commit,
+            arguments.platform,
+            completed_cells,
+            total_cells,
+            current_cell,
+            "failed",
+            started_unix_nanos,
+        )
+        raise
+    matrix_runtime_plan.update({
+        "source_commit": arguments.source_commit,
+        "source_tree": source_tree,
+        "platform": arguments.platform,
+        "seed_prime_receipt": str(prime_receipt_path),
+        "steady_pilot_receipts": [str(plan.pilot_receipt_path) for plan in plans],
+        "cell_budgets": budgets,
+    })
+    write_json_atomic(matrix_runtime_plan_path, matrix_runtime_plan)
+    write_matrix_progress(
+        progress_path,
+        arguments.source_commit,
+        arguments.platform,
+        completed_cells,
+        total_cells,
+        {
+            "phase": "matrix-budget-accepted",
+            "runtime_plan": str(matrix_runtime_plan_path),
+        },
+        "running",
+        started_unix_nanos,
+    )
+
+    for plan in plans:
+        if plan.runtime_budget is None:
+            raise RuntimeError("G7 cell plan omitted its calibrated runtime budget")
+        current_cell = plan.diagnostic("measurement")
+        current_cell["seed_prime_receipt"] = str(prime_receipt_path)
+        write_matrix_progress(
+            progress_path,
+            arguments.source_commit,
+            arguments.platform,
+            completed_cells,
+            total_cells,
+            current_cell,
+            "running",
+            started_unix_nanos,
+        )
+        remaining_seconds = (
+            arguments.matrix_timeout_seconds - (time.monotonic() - matrix_started)
+        )
+        if float(plan.runtime_budget["timeout_seconds"]) > remaining_seconds:
+            write_matrix_progress(
+                progress_path,
+                arguments.source_commit,
+                arguments.platform,
+                completed_cells,
+                total_cells,
+                current_cell,
+                "failed",
+                started_unix_nanos,
+            )
+            raise RuntimeBudgetExceeded(
+                "G7 matrix has less runtime remaining than the calibrated cell budget"
+            )
+        cell_environment = environment.copy()
+        if plan.background_mode == "interference":
+            cell_environment["HYPHAE_G7_BACKGROUND"] = "1"
+        else:
+            cell_environment.pop("HYPHAE_G7_BACKGROUND", None)
+        cell_environment["HYPHAE_G7_PROGRESS_FILE"] = str(
+            runner_progress_path.resolve()
+        )
+        cell_environment["HYPHAE_G7_PARTIAL_RECEIPT_FILE"] = str(
+            plan.partial_receipt_path.resolve()
+        )
+        runner_progress_path.unlink(missing_ok=True)
+        plan.partial_receipt_path.unlink(missing_ok=True)
+        try:
+            receipt = run_cell(
+                binary,
+                arguments.source_commit,
+                arguments.platform,
+                plan.state,
+                plan.concurrency,
+                cell_environment,
+                macos_counter_template,
+                float(plan.runtime_budget["timeout_seconds"]),
+                runner_progress_path,
+                float(arguments.stall_timeout_seconds),
+            )
+            write_json_atomic(plan.runner_receipt_path, receipt)
+            if not runner_progress_path.is_file():
+                raise RuntimeError("G7 runner did not produce mandatory progress")
+            cell_progress = validate_completed_cell_progress(
+                json.loads(runner_progress_path.read_text(encoding="utf-8")),
+                arguments.source_commit,
+            )
+            if not plan.partial_receipt_path.is_file():
+                raise RuntimeError("G7 runner did not persist a partial receipt")
+            partial = validate_partial_receipt(
+                json.loads(plan.partial_receipt_path.read_text(encoding="utf-8")),
+                expected_commit=arguments.source_commit,
+                expected_tree=source_tree,
+                expected_platform=arguments.platform,
+                expected_state=plan.state,
+                expected_concurrency=plan.concurrency,
+            )
+            validate_cross_artifact_dataset(
+                receipt,
+                cell_progress,
+                partial,
+                expected_observations=arguments.observations,
+                expected_warmup=arguments.warmup,
+            )
+            persist_validated_cell_checkpoint(
+                plan.validated_receipt_path,
+                receipt,
+                expected_commit=arguments.source_commit,
+                expected_tree=source_tree,
+                expected_platform=arguments.platform,
+                expected_state=plan.state,
+                expected_concurrency=plan.concurrency,
+                background_mode=plan.background_mode,
+                hardware=hardware,
+                build=build,
+                calibration_executable_blake3=calibration_executable,
+                runtime_budget=plan.runtime_budget,
+            )
+        except BaseException:
+            write_matrix_progress(
+                progress_path,
+                arguments.source_commit,
+                arguments.platform,
+                completed_cells,
+                total_cells,
+                current_cell,
+                "failed",
+                started_unix_nanos,
+            )
+            raise
+        receipts.append(receipt)
+        completed = plan.diagnostic("completed")
+        completed["seed_prime_receipt"] = str(prime_receipt_path)
+        completed_cells.append(completed)
+        write_matrix_progress(
+            progress_path,
+            arguments.source_commit,
+            arguments.platform,
+            completed_cells,
+            total_cells,
+            None,
+            "running",
+            started_unix_nanos,
+        )
     for state in STATES:
         for background_mode in ({value["background_mode"] for value in receipts}):
             sweep = {
@@ -1231,13 +2035,12 @@ def main() -> int:
         "claims": [],
         "closure_declared": False,
     }
-    arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     if not runner_progress_path.is_file():
         raise RuntimeError("G7 runner progress disappeared before matrix completion")
     runner_progress = json.loads(runner_progress_path.read_text(encoding="utf-8"))
-    validate_completed_ann_progress(runner_progress, arguments.source_commit)
+    validate_completed_cell_progress(runner_progress, arguments.source_commit)
     runner_progress_status = runner_progress["status"]
+    write_json_atomic(arguments.output, result)
     write_matrix_progress(
         progress_path,
         arguments.source_commit,

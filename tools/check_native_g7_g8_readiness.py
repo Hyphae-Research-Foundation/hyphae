@@ -11,6 +11,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+from tools.check_native_g7_receipt import (
+    GateFailure as ReceiptGateFailure,
+    profile_authority,
+)
+
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -110,13 +115,20 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
         "reason": "cold I/O has no universal latency target and cannot be represented by a million repeated accesses",
     }:
         raise GateFailure("G7 cold diagnostic boundary drifted")
+    try:
+        g7_authority = profile_authority(g7)
+    except ReceiptGateFailure as error:
+        raise GateFailure(str(error)) from error
     if (
         g7.get("required_background_modes") != ["control", "interference"]
-        or g7.get("minimum_hot_observations") != 1_000_000
-        or g7.get("required_dataset") != {"documents": 1_000_000, "vectors": 1_000_000, "vector_dimension": 384}
+        or g7_authority.observations != 1_000_000
+        or g7_authority.warmup != 100_000
+        or (
+            g7_authority.documents,
+            g7_authority.vectors,
+            g7_authority.vector_dimension,
+        ) != (1_000_000, 1_000_000, 384)
         or g7.get("required_hardware") != {"dedicated": True, "virtualization": "none"}
-        or set(g7.get("warm_targets_nanoseconds", {})) != set(cells) - {"strict-group-commit"}
-        or set(g7.get("advisory_targets_nanoseconds", {})) != {"strict-group-commit"}
     ):
         raise GateFailure("G7 normative measurement authority drifted")
     counters = g7.get("required_counters")

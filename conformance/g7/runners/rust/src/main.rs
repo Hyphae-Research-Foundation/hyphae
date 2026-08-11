@@ -51,6 +51,23 @@ const K: usize = 10;
 const ANN_QUERY_BREADTH: usize = 64;
 const G7_PREFERRED_ANN_PARTITIONS: usize = 32;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_CHUNK_UNITS: usize = 10_000;
+const READ_WORKLOADS: u64 = 10;
+const G7_SURFACES: usize = 11;
+const G7_SURFACE_NAMES: [&str; G7_SURFACES] = [
+    "embedded-structure-point-get",
+    "embedded-prepared-sql-primary-key",
+    "local-structure-point-get",
+    "local-prepared-sql-primary-key",
+    "indexed-sql-bounded-read",
+    "two-index-join-bounded-read",
+    "bm25-top10",
+    "filtered-bm25-top10",
+    "ann-top10-recall-095",
+    "hybrid-top10",
+    "strict-group-commit",
+];
 const ANN_DELTA_MAX_ENTRIES: u32 = 4_096;
 const ANN_CONSOLIDATE_AFTER_DELTAS: u16 = 4_096;
 const CORPUS_GENERATOR: &str =
@@ -90,81 +107,214 @@ struct ExecutionAuthority {
     execution_pool: Arc<NativeExecutionPool>,
 }
 
-struct AnnProgressSink {
+struct CellProgressSink {
     path: PathBuf,
     source_commit: String,
     source_tree: String,
     dataset_digest: String,
     started: Instant,
     sequence: u64,
-    total_vectors: usize,
-    completed_vectors: usize,
+    last_written_completed: u64,
 }
 
-struct AnnProgressUpdate<'a> {
-    operation: &'a str,
+#[derive(Clone)]
+struct ProgressPhase {
+    stage: String,
+    kind: String,
+    name: String,
+    index: usize,
+    total: usize,
+    base_completed: u64,
+    phase_total: u64,
+    started: Instant,
+    heartbeat_while_idle: bool,
+}
+
+struct CellProgress {
+    sink: Mutex<Option<CellProgressSink>>,
+    completed: AtomicU64,
+    total: u64,
+    search_documents: u64,
+    phase: Mutex<ProgressPhase>,
+    initial_ann_bulk: Mutex<Option<serde_json::Value>>,
+    ann_suboperation: Mutex<Option<serde_json::Value>>,
+    maintenance_evidence: Mutex<Option<serde_json::Value>>,
+    failure: Mutex<Option<String>>,
+}
+
+struct SurfaceProgress {
+    cell: Arc<CellProgress>,
+    name: String,
+    index: usize,
+    total: u64,
+    completed: AtomicU64,
+    phase_base: AtomicU64,
+    phase_total: AtomicU64,
+}
+
+struct ProgressReporter {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct PartialReceiptSink {
+    path: Option<PathBuf>,
+    source_commit: String,
+    source_tree: Option<String>,
+    dataset_digest: String,
+    platform: String,
+    state: String,
+    concurrency: usize,
+    sequence: u64,
+}
+
+struct CellProgressUpdate<'a> {
     stage: &'a str,
-    completed: usize,
     status: &'a str,
     checkpoint_digest: Option<String>,
     details: Option<serde_json::Value>,
 }
 
-impl AnnProgressSink {
-    fn from_environment(source_commit: &str) -> Result<Option<Self>, Box<dyn Error>> {
-        let Some(path) = std::env::var_os("HYPHAE_G7_PROGRESS_FILE").map(PathBuf::from) else {
-            return Ok(None);
-        };
-        let source_tree = std::env::var("HYPHAE_G7_SOURCE_TREE")
-            .map_err(|_| "G7 progress requires HYPHAE_G7_SOURCE_TREE")?;
-        Ok(Some(Self {
+impl CellProgress {
+    fn from_environment(
+        source_commit: &str,
+        observations: usize,
+        warmup: usize,
+        warm: bool,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        let path = std::env::var_os("HYPHAE_G7_PROGRESS_FILE").map(PathBuf::from);
+        let source_tree = path
+            .as_ref()
+            .map(|_| {
+                std::env::var("HYPHAE_G7_SOURCE_TREE")
+                    .map_err(|_| "G7 progress requires HYPHAE_G7_SOURCE_TREE")
+            })
+            .transpose()?;
+        let total = total_work_units(search_documents(), observations, warmup, warm)?;
+        let search_documents = u64::try_from(search_documents())?;
+        Self::new(
             path,
-            source_commit: source_commit.to_owned(),
+            source_commit.to_owned(),
             source_tree,
-            dataset_digest: dataset_digest(source_commit).to_hex().to_string(),
-            started: Instant::now(),
-            sequence: 0,
-            total_vectors: search_documents(),
-            completed_vectors: 0,
+            dataset_digest(source_commit).to_hex().to_string(),
+            total,
+            search_documents,
+        )
+    }
+
+    fn new(
+        path: Option<PathBuf>,
+        source_commit: String,
+        source_tree: Option<String>,
+        dataset_digest: String,
+        total: u64,
+        search_documents: u64,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        let sink = match (path, source_tree) {
+            (Some(path), Some(source_tree)) => Some(CellProgressSink {
+                path,
+                source_commit,
+                source_tree,
+                dataset_digest,
+                started: Instant::now(),
+                sequence: 0,
+                last_written_completed: 0,
+            }),
+            (None, None) => None,
+            _ => return Err("G7 progress path and source tree must be configured together".into()),
+        };
+        Ok(Arc::new(Self {
+            sink: Mutex::new(sink),
+            completed: AtomicU64::new(0),
+            total,
+            search_documents,
+            phase: Mutex::new(ProgressPhase {
+                stage: "cell-started".to_owned(),
+                kind: "cell".to_owned(),
+                name: "g7-cell".to_owned(),
+                index: 0,
+                total: G7_SURFACES,
+                base_completed: 0,
+                phase_total: 0,
+                started: Instant::now(),
+                heartbeat_while_idle: false,
+            }),
+            initial_ann_bulk: Mutex::new(None),
+            ann_suboperation: Mutex::new(None),
+            maintenance_evidence: Mutex::new(None),
+            failure: Mutex::new(None),
         }))
     }
 
-    fn begin_build(
-        &mut self,
+    fn start_reporter(self: &Arc<Self>) -> ProgressReporter {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reporter_stop = Arc::clone(&stop);
+        let progress = Arc::clone(self);
+        let handle = thread::spawn(move || {
+            while !reporter_stop.load(Ordering::Relaxed) {
+                thread::park_timeout(PROGRESS_REPORT_INTERVAL);
+                if reporter_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(error) = progress.flush_if_advanced() {
+                    progress.record_failure(error.to_string());
+                    break;
+                }
+            }
+        });
+        ProgressReporter {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn begin_ann_build(
+        &self,
         authority: &ExecutionAuthority,
         logical_partitions: usize,
     ) -> std::io::Result<()> {
-        self.write(AnnProgressUpdate {
-            operation: "ann-bulk-build",
-            stage: "ann-private-build",
-            completed: 0,
-            status: "running",
-            checkpoint_digest: None,
-            details: Some(json!({
-                "builder": "partitioned-hnsw-v1",
-                "partition_policy": ANN_PARTITION_POLICY,
-                "requested_partitions": logical_partitions,
-                "topology_workers": authority.topology.worker_count(),
-                "topology_digest": authority.topology_digest,
-                "planned_workers": null,
-                "planned_memory_bytes": null,
-                "worker_batches": null,
-            })),
-        })
+        self.set_phase(
+            "ann-private-build",
+            "search-seed",
+            "ann-bulk-build",
+            1,
+            2,
+            self.search_documents,
+        )?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "ann-private-build",
+                status: "running",
+                checkpoint_digest: None,
+                details: Some(json!({
+                    "builder": "partitioned-hnsw-v1",
+                    "partition_policy": ANN_PARTITION_POLICY,
+                    "requested_partitions": logical_partitions,
+                    "topology_workers": authority.topology.worker_count(),
+                    "topology_digest": authority.topology_digest,
+                    "planned_workers": null,
+                    "planned_memory_bytes": null,
+                    "worker_batches": null,
+                })),
+            },
+        )
     }
 
-    fn begin_publication(&mut self, evidence: &serde_json::Value) -> std::io::Result<()> {
-        self.write(AnnProgressUpdate {
-            operation: "ann-bulk-build",
-            stage: "ann-publication",
-            completed: self.total_vectors,
-            status: "running",
-            checkpoint_digest: None,
-            details: Some(evidence.clone()),
-        })
+    fn begin_ann_publication(&self, evidence: &serde_json::Value) -> std::io::Result<()> {
+        self.set_stage("ann-publication")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "ann-publication",
+                status: "running",
+                checkpoint_digest: None,
+                details: Some(evidence.clone()),
+            },
+        )
     }
 
-    fn update_build(&mut self, progress: InitialAnnBulkProgress) -> std::io::Result<()> {
+    fn update_ann_build(&self, progress: InitialAnnBulkProgress) -> std::io::Result<()> {
         let stage = match progress.stage {
             InitialAnnBulkProgressStage::Planning => "ann-planning",
             InitialAnnBulkProgressStage::Building => "ann-child-build",
@@ -172,87 +322,529 @@ impl AnnProgressSink {
         let completed = if progress.stage == InitialAnnBulkProgressStage::Planning {
             0
         } else {
-            self.total_vectors
+            usize::try_from(self.search_documents)
+                .map_err(std::io::Error::other)?
                 .checked_mul(progress.completed)
                 .ok_or_else(|| std::io::Error::other("G7 ANN progress multiplication overflow"))?
                 .checked_div(progress.total)
                 .ok_or_else(|| std::io::Error::other("G7 ANN progress total must be nonzero"))?
         };
-        self.write(AnnProgressUpdate {
-            operation: "ann-bulk-build",
-            stage,
-            completed,
-            status: "running",
-            checkpoint_digest: None,
-            details: Some(json!({
-                "builder": "partitioned-hnsw-v1",
-                "unit": if progress.stage == InitialAnnBulkProgressStage::Planning {
-                    "plan"
-                } else {
-                    "child-generation"
-                },
-                "stage_completed": progress.completed,
-                "stage_total": progress.total,
-            })),
-        })
+        let base_completed = self
+            .phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .base_completed;
+        self.completed.fetch_max(
+            base_completed
+                .checked_add(u64::try_from(completed).map_err(std::io::Error::other)?)
+                .ok_or_else(|| std::io::Error::other("G7 ANN progress units overflow"))?,
+            Ordering::Relaxed,
+        );
+        self.set_stage(stage)?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage,
+                status: "running",
+                checkpoint_digest: None,
+                details: Some(json!({
+                    "builder": "partitioned-hnsw-v1",
+                    "unit": if progress.stage == InitialAnnBulkProgressStage::Planning {
+                        "plan"
+                    } else {
+                        "child-generation"
+                    },
+                    "stage_completed": progress.completed,
+                    "stage_total": progress.total,
+                })),
+            },
+        )
     }
 
-    fn complete(
-        &mut self,
-        operation: &str,
+    fn complete_ann(
+        &self,
         checkpoint: [u8; 32],
         evidence: &serde_json::Value,
     ) -> std::io::Result<()> {
-        self.write(AnnProgressUpdate {
-            operation,
-            stage: "ann-published",
-            completed: self.total_vectors,
-            status: "completed",
-            checkpoint_digest: Some(blake3::Hash::from_bytes(checkpoint).to_hex().to_string()),
-            details: Some(evidence.clone()),
+        let ann_units = self.search_documents;
+        let base_completed = self
+            .phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .base_completed;
+        self.completed.fetch_max(
+            base_completed
+                .checked_add(ann_units)
+                .ok_or_else(|| std::io::Error::other("G7 ANN progress units overflow"))?,
+            Ordering::Relaxed,
+        );
+        let checkpoint_digest = blake3::Hash::from_bytes(checkpoint).to_hex().to_string();
+        *self
+            .initial_ann_bulk
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 ANN evidence synchronization failed"))? =
+            Some(evidence.clone());
+        *self
+            .ann_suboperation
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 ANN progress synchronization failed"))? =
+            Some(json!({
+                "operation": "ann-bulk-build",
+                "stage": "ann-published",
+                "status": "completed",
+                "completed_units": ann_units,
+                "total_units": ann_units,
+                "unit": "vectors",
+                "checkpoint_digest": checkpoint_digest,
+            }));
+        self.set_stage("ann-published")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "ann-published",
+                status: "running",
+                checkpoint_digest: None,
+                details: Some(evidence.clone()),
+            },
+        )
+    }
+
+    fn begin_search_seed_lexical(&self) -> std::io::Result<()> {
+        self.set_phase(
+            "search-seed-lexical",
+            "search-seed",
+            "lexical-filter-seed",
+            0,
+            2,
+            self.search_documents,
+        )?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-lexical",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn advance_search_seed_lexical(&self, units: usize) -> std::io::Result<()> {
+        self.advance(u64::try_from(units).map_err(std::io::Error::other)?)
+    }
+
+    fn complete_search_seed(&self) -> std::io::Result<()> {
+        self.set_stage("search-seed-ready")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-ready",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn begin_search_seed_maintenance(&self) -> std::io::Result<()> {
+        self.set_phase(
+            "search-seed-maintenance",
+            "search-seed",
+            "vacuum-checkpoint",
+            2,
+            3,
+            0,
+        )?;
+        self.phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .heartbeat_while_idle = true;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-maintenance",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn complete_search_seed_maintenance(
+        &self,
+        vacuum: &hyphae_native_runtime::PageVacuumReceipt,
+    ) -> std::io::Result<()> {
+        *self.maintenance_evidence.lock().map_err(|_| {
+            std::io::Error::other("G7 maintenance evidence synchronization failed")
+        })? = Some(json!({
+            "vacuum": {
+                "applied": vacuum.applied,
+                "previous_page_count": vacuum.previous_page_count,
+                "active_page_count": vacuum.active_page_count,
+                "reclaimed_pages": vacuum.reclaimed_pages,
+            },
+            "checkpoint": "completed",
+            "ann_identity_preserved": true,
+        }));
+        self.phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .heartbeat_while_idle = false;
+        self.set_stage("search-seed-maintenance-completed")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-maintenance-completed",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn begin_search_seed_open(&self) -> std::io::Result<()> {
+        self.set_phase(
+            "search-seed-open",
+            "search-seed",
+            "open-and-hydrate",
+            3,
+            4,
+            0,
+        )?;
+        self.phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .heartbeat_while_idle = true;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-open",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn complete_search_seed_open(&self) -> std::io::Result<()> {
+        self.phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .heartbeat_while_idle = false;
+        self.set_stage("search-seed-open-completed")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-open-completed",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn finish_search_seed_lexical(&self) -> std::io::Result<()> {
+        self.set_stage("search-seed-lexical-completed")?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "search-seed-lexical-completed",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn mark_reused_search_seed(
+        &self,
+        checkpoint: [u8; 32],
+        evidence: &serde_json::Value,
+    ) -> std::io::Result<()> {
+        self.begin_search_seed_lexical()?;
+        self.advance_search_seed_lexical(
+            usize::try_from(self.search_documents).map_err(std::io::Error::other)?,
+        )?;
+        self.finish_search_seed_lexical()?;
+        self.set_phase(
+            "ann-seed-verify",
+            "search-seed",
+            "ann-bulk-build",
+            1,
+            2,
+            self.search_documents,
+        )?;
+        self.complete_ann(checkpoint, evidence)?;
+        self.complete_search_seed()
+    }
+
+    fn begin_surface(
+        self: &Arc<Self>,
+        name: &str,
+        index: usize,
+        total_units: usize,
+    ) -> std::io::Result<SurfaceProgress> {
+        if G7_SURFACE_NAMES.get(index).copied() != Some(name) {
+            return Err(std::io::Error::other(format!(
+                "G7 progress surface {name} does not match index {index}"
+            )));
+        }
+        self.set_phase(
+            "surface-started",
+            "cell-workload",
+            name,
+            index,
+            G7_SURFACES,
+            u64::try_from(total_units).map_err(std::io::Error::other)?,
+        )?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "surface-started",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )?;
+        Ok(SurfaceProgress {
+            cell: Arc::clone(self),
+            name: name.to_owned(),
+            index,
+            total: u64::try_from(total_units).map_err(std::io::Error::other)?,
+            completed: AtomicU64::new(0),
+            phase_base: AtomicU64::new(0),
+            phase_total: AtomicU64::new(0),
         })
     }
 
-    fn write(&mut self, update: AnnProgressUpdate<'_>) -> std::io::Result<()> {
+    fn complete_cell(&self, receipt: &serde_json::Value) -> std::io::Result<()> {
+        self.check_failure()?;
+        let completed = self.completed.load(Ordering::Relaxed);
+        if completed != self.total {
+            return Err(std::io::Error::other(format!(
+                "G7 cell progress completed {completed} of {} work units",
+                self.total
+            )));
+        }
+        let checkpoint = blake3::hash(&serde_json::to_vec(receipt).map_err(std::io::Error::other)?)
+            .to_hex()
+            .to_string();
+        self.set_phase(
+            "cell-completed",
+            "cell",
+            "g7-cell",
+            G7_SURFACES,
+            G7_SURFACES,
+            0,
+        )?;
+        self.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "cell-completed",
+                status: "completed",
+                checkpoint_digest: Some(checkpoint),
+                details: None,
+            },
+        )
+    }
+
+    fn set_phase(
+        &self,
+        stage: &str,
+        kind: &str,
+        name: &str,
+        index: usize,
+        total: usize,
+        phase_total: u64,
+    ) -> std::io::Result<()> {
+        let completed = self.completed.load(Ordering::Relaxed);
+        *self
+            .phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))? =
+            ProgressPhase {
+                stage: stage.to_owned(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+                index,
+                total,
+                base_completed: completed,
+                phase_total,
+                started: Instant::now(),
+                heartbeat_while_idle: false,
+            };
+        Ok(())
+    }
+
+    fn set_stage(&self, stage: &str) -> std::io::Result<()> {
+        self.phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .stage = stage.to_owned();
+        Ok(())
+    }
+
+    fn advance(&self, units: u64) -> std::io::Result<()> {
+        let previous = self.completed.fetch_add(units, Ordering::Relaxed);
+        if previous.saturating_add(units) > self.total {
+            return Err(std::io::Error::other(
+                "G7 cell progress completed units exceed total",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_if_advanced(&self) -> std::io::Result<()> {
+        self.write_snapshot(
+            false,
+            CellProgressUpdate {
+                stage: "",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn write_snapshot(&self, force: bool, update: CellProgressUpdate<'_>) -> std::io::Result<()> {
+        self.check_failure()?;
+        let completed = self.completed.load(Ordering::Relaxed);
+        let phase = self
+            .phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .clone();
+        let mut sink = self
+            .sink
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress sink synchronization failed"))?;
+        let Some(sink) = sink.as_mut() else {
+            return Ok(());
+        };
+        if !force && completed == sink.last_written_completed && !phase.heartbeat_while_idle {
+            return Ok(());
+        }
+        let stage = if update.stage.is_empty() {
+            phase.stage.as_str()
+        } else {
+            update.stage
+        };
+        let mut details = update.details.unwrap_or_else(|| json!({}));
+        let phase_completed = completed.saturating_sub(phase.base_completed);
+        let eta = progress_eta(
+            phase.started.elapsed(),
+            phase_completed,
+            phase.phase_total,
+            completed,
+            self.total,
+            update.status == "completed",
+        )?;
+        if let Some(object) = details.as_object_mut() {
+            object.insert("eta".to_owned(), eta);
+            object.insert(
+                "phase".to_owned(),
+                json!({
+                    "kind": phase.kind,
+                    "name": phase.name,
+                    "index": phase.index,
+                    "total": phase.total,
+                    "completed_units": phase_completed.min(phase.phase_total),
+                    "total_units": phase.phase_total,
+                }),
+            );
+            if let Some(ann) = self
+                .ann_suboperation
+                .lock()
+                .map_err(|_| std::io::Error::other("G7 ANN progress synchronization failed"))?
+                .clone()
+            {
+                object.insert("suboperation".to_owned(), ann);
+            }
+            if let Some(evidence) = self
+                .initial_ann_bulk
+                .lock()
+                .map_err(|_| std::io::Error::other("G7 ANN evidence synchronization failed"))?
+                .clone()
+            {
+                object.insert("initial_ann_bulk".to_owned(), evidence);
+            }
+            if let Some(evidence) = self
+                .maintenance_evidence
+                .lock()
+                .map_err(|_| {
+                    std::io::Error::other("G7 maintenance evidence synchronization failed")
+                })?
+                .clone()
+            {
+                object.insert("maintenance".to_owned(), evidence);
+            }
+        }
+        sink.write(
+            completed,
+            self.total,
+            CellProgressUpdate {
+                stage,
+                status: update.status,
+                checkpoint_digest: update.checkpoint_digest,
+                details: Some(details),
+            },
+        )
+    }
+
+    fn record_failure(&self, error: String) {
+        if let Ok(mut failure) = self.failure.lock()
+            && failure.is_none()
+        {
+            *failure = Some(error);
+        }
+    }
+
+    fn check_failure(&self) -> std::io::Result<()> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress failure synchronization failed"))?
+            .as_ref()
+        {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl CellProgressSink {
+    fn write(
+        &mut self,
+        completed: u64,
+        total: u64,
+        update: CellProgressUpdate<'_>,
+    ) -> std::io::Result<()> {
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("G7 progress sequence overflow"))?;
-        if update.completed > self.total_vectors {
+        if completed > total {
             return Err(std::io::Error::other(
-                "G7 ANN progress completed vectors exceed dataset total",
+                "G7 cell progress completed units exceed total",
             ));
         }
-        self.completed_vectors = self.completed_vectors.max(update.completed);
-        let mut details = update.details.unwrap_or_else(|| json!({}));
-        if let Some(details) = details.as_object_mut() {
-            details.insert(
-                "eta".to_owned(),
-                progress_eta(
-                    self.started.elapsed(),
-                    self.completed_vectors,
-                    self.total_vectors,
-                    update.status == "completed",
-                )?,
-            );
-        }
         let elapsed_nanos = u64::try_from(self.started.elapsed().as_nanos())
-            .map_err(|_| std::io::Error::other("G7 ANN progress elapsed time exceeds u64"))?;
+            .map_err(|_| std::io::Error::other("G7 cell progress elapsed time exceeds u64"))?;
         let record = json!({
             "schema": "hyphae-native-performance-progress-v1",
             "source_commit": self.source_commit,
             "source_tree": self.source_tree,
             "dataset_digest": self.dataset_digest,
-            "operation": update.operation,
+            "operation": "g7-cell",
             "stage": update.stage,
             "sequence": self.sequence,
-            "completed_units": self.completed_vectors,
-            "total_units": self.total_vectors,
-            "unit": "vectors",
+            "completed_units": completed,
+            "total_units": total,
+            "unit": "work-units",
             "elapsed_nanos": elapsed_nanos,
             "status": update.status,
             "checkpoint_digest": update.checkpoint_digest,
-            "details": details,
+            "details": update.details.unwrap_or_else(|| json!({})),
         });
         let parent = self
             .path
@@ -270,8 +862,226 @@ impl AnnProgressSink {
         ));
         let encoded = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
         fs::write(&staging, encoded)?;
-        fs::rename(staging, &self.path)
+        fs::rename(staging, &self.path)?;
+        self.last_written_completed = completed;
+        Ok(())
     }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl SurfaceProgress {
+    fn begin_phase(&self, phase: &str, total_units: usize) -> std::io::Result<()> {
+        let completed = self.completed.load(Ordering::Relaxed);
+        self.phase_base.store(completed, Ordering::Relaxed);
+        self.phase_total.store(
+            u64::try_from(total_units).map_err(std::io::Error::other)?,
+            Ordering::Relaxed,
+        );
+        self.cell.set_phase(
+            &format!("surface-{phase}"),
+            phase,
+            &self.name,
+            self.index,
+            G7_SURFACES,
+            u64::try_from(total_units).map_err(std::io::Error::other)?,
+        )?;
+        self.cell.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: &format!("surface-{phase}"),
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn advance(&self, units: usize) -> std::io::Result<()> {
+        let units = u64::try_from(units).map_err(std::io::Error::other)?;
+        let previous = self.completed.fetch_add(units, Ordering::Relaxed);
+        if previous.saturating_add(units) > self.total {
+            return Err(std::io::Error::other(format!(
+                "G7 surface {} completed units exceed total",
+                self.name
+            )));
+        }
+        self.cell.advance(units)
+    }
+
+    fn finish_phase(&self, phase: &str) -> std::io::Result<()> {
+        let phase_completed = self
+            .completed
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.phase_base.load(Ordering::Relaxed));
+        let phase_total = self.phase_total.load(Ordering::Relaxed);
+        if phase_completed != phase_total {
+            return Err(std::io::Error::other(format!(
+                "G7 surface {} phase {phase} completed {phase_completed} of {phase_total} units",
+                self.name
+            )));
+        }
+        let stage = format!("surface-{phase}-completed");
+        self.cell.set_stage(&stage)?;
+        self.cell.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: &stage,
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+
+    fn complete(&self) -> std::io::Result<()> {
+        let completed = self.completed.load(Ordering::Relaxed);
+        if completed != self.total {
+            return Err(std::io::Error::other(format!(
+                "G7 surface {} completed {completed} of {} units",
+                self.name, self.total
+            )));
+        }
+        self.cell.set_phase(
+            "surface-completed",
+            "cell-workload",
+            &self.name,
+            self.index,
+            G7_SURFACES,
+            0,
+        )?;
+        self.cell.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: "surface-completed",
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
+    }
+}
+
+impl PartialReceiptSink {
+    fn from_environment(
+        source_commit: &str,
+        platform: &str,
+        state: &str,
+        concurrency: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let path = std::env::var_os("HYPHAE_G7_PARTIAL_RECEIPT_FILE").map(PathBuf::from);
+        let source_tree = path
+            .as_ref()
+            .map(|_| {
+                std::env::var("HYPHAE_G7_SOURCE_TREE")
+                    .map_err(|_| "G7 partial receipt requires HYPHAE_G7_SOURCE_TREE")
+            })
+            .transpose()?;
+        Ok(Self {
+            path,
+            source_commit: source_commit.to_owned(),
+            source_tree,
+            dataset_digest: dataset_digest(source_commit).to_hex().to_string(),
+            platform: platform.to_owned(),
+            state: state.to_owned(),
+            concurrency,
+            sequence: 0,
+        })
+    }
+
+    fn begin_surface(
+        &mut self,
+        name: &str,
+        cells: &BTreeMap<&str, serde_json::Value>,
+    ) -> Result<(), Box<dyn Error>> {
+        if !G7_SURFACE_NAMES.contains(&name) || cells.contains_key(name) {
+            return Err(format!("invalid G7 partial receipt current surface: {name}").into());
+        }
+        self.write("running", Some(name), cells)
+    }
+
+    fn complete_surface(
+        &mut self,
+        cells: &BTreeMap<&str, serde_json::Value>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.write("running", None, cells)
+    }
+
+    fn complete(
+        &mut self,
+        cells: &BTreeMap<&str, serde_json::Value>,
+    ) -> Result<(), Box<dyn Error>> {
+        if cells.len() != G7_SURFACES
+            || G7_SURFACE_NAMES
+                .iter()
+                .any(|name| !cells.contains_key(name))
+        {
+            return Err("G7 partial receipt cannot complete before every surface".into());
+        }
+        self.write("completed", None, cells)
+    }
+
+    fn write(
+        &mut self,
+        status: &str,
+        current_cell: Option<&str>,
+        cells: &BTreeMap<&str, serde_json::Value>,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or("G7 partial receipt sequence overflow")?;
+        write_json_atomic(
+            path,
+            &json!({
+                "schema": "hyphae-native-g7-partial-receipt-v1",
+                "source_commit": self.source_commit,
+                "source_tree": self.source_tree,
+                "dataset_digest": self.dataset_digest,
+                "platform": self.platform,
+                "state": self.state,
+                "concurrency": self.concurrency,
+                "sequence": self.sequence,
+                "status": status,
+                "completed_count": cells.len(),
+                "total_cells": G7_SURFACES,
+                "current_cell": current_cell,
+                "cells": cells,
+            }),
+        )
+    }
+}
+
+fn total_work_units(
+    search_documents: usize,
+    observations: usize,
+    warmup: usize,
+    warm: bool,
+) -> Result<u64, Box<dyn Error>> {
+    let search_seed = u64::try_from(search_documents)?
+        .checked_mul(2)
+        .ok_or("G7 progress search seed units overflow")?;
+    let observations = u64::try_from(observations)?;
+    let warmup = if warm { u64::try_from(warmup)? } else { 0 };
+    let read_units = observations
+        .checked_add(warmup)
+        .and_then(|units| units.checked_mul(READ_WORKLOADS))
+        .ok_or("G7 progress read units overflow")?;
+    search_seed
+        .checked_add(read_units)
+        .and_then(|units| units.checked_add(observations))
+        .ok_or_else(|| "G7 progress total units overflow".into())
 }
 
 impl ExecutionAuthority {
@@ -403,12 +1213,14 @@ impl SearchFixture {
         root: &Path,
         source_commit: &str,
         authority: &ExecutionAuthority,
+        progress: &Arc<CellProgress>,
     ) -> Result<Self, Box<dyn Error>> {
         let path = search_seed_path(root, source_commit)?;
         let created = !path.is_dir();
         if !path.is_dir() {
-            publish_search_seed(&path, source_commit, authority)?;
+            publish_search_seed(&path, source_commit, authority, progress)?;
         }
+        progress.begin_search_seed_open()?;
         let mut database =
             NativeDatabase::open(&path).map_err(|error| format!("search seed open: {error}"))?;
         authority.install(&mut database, "search-fixture")?;
@@ -423,10 +1235,14 @@ impl SearchFixture {
         if aggregate_identity != observed_identity {
             return Err("published G7 ANN base differs from its durable build evidence".into());
         }
-        if !created && let Some(sink) = AnnProgressSink::from_environment(source_commit)?.as_mut() {
-            sink.complete("ann-seed-verify", observed.base_identity, &initial_ann_bulk)?;
+        progress.complete_search_seed_open()?;
+        if !created {
+            progress.mark_reused_search_seed(observed.base_identity, &initial_ann_bulk)?;
         }
-        Self::from_database(database, lexical_index, vector_index, initial_ann_bulk)
+        progress.begin_search_seed_open()?;
+        let fixture = Self::from_database(database, lexical_index, vector_index, initial_ann_bulk)?;
+        progress.complete_search_seed_open()?;
+        Ok(fixture)
     }
 
     fn from_database(
@@ -466,6 +1282,7 @@ fn publish_search_seed(
     path: &Path,
     source_commit: &str,
     authority: &ExecutionAuthority,
+    progress: &Arc<CellProgress>,
 ) -> Result<(), Box<dyn Error>> {
     let parent = path.parent().ok_or("search seed path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -474,15 +1291,28 @@ fn publish_search_seed(
         std::process::id(),
         unique_nonce()
     ));
-    let evidence = seed_search_database(&staging, source_commit, authority)?;
-    fs::rename(&staging, path)?;
-    write_json_atomic(&initial_ann_bulk_evidence_path(path), &evidence)
+    let evidence = seed_search_database(&staging, source_commit, authority, progress)?;
+    publish_search_seed_directory(&staging, path, &evidence)
+}
+
+fn publish_search_seed_directory(
+    staging: &Path,
+    path: &Path,
+    evidence: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    if !staging.is_dir() {
+        return Err("G7 search seed staging directory is missing".into());
+    }
+    write_json_atomic(&initial_ann_bulk_evidence_path(staging), evidence)?;
+    fs::rename(staging, path)?;
+    Ok(())
 }
 
 fn seed_search_database(
     path: &Path,
     source_commit: &str,
     authority: &ExecutionAuthority,
+    progress: &Arc<CellProgress>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut database =
         NativeDatabase::create(path).map_err(|error| format!("search seed: {error}"))?;
@@ -490,8 +1320,6 @@ fn seed_search_database(
     let lexical_index = ObjectId::new(7)?;
     let vector_index = ObjectId::new(8)?;
     let document_count = search_documents();
-    let progress =
-        AnnProgressSink::from_environment(source_commit)?.map(|sink| Arc::new(Mutex::new(sink)));
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.create_search_index(lexical_index, "g7_search")?;
     seed.create_vector_index_with_lifecycle(
@@ -507,74 +1335,15 @@ fn seed_search_database(
     if logical_partitions > MAX_INITIAL_ANN_BULK_PARTITIONS {
         return Err("G7 logical ANN partition policy exceeds the durable format".into());
     }
-    if let Some(sink) = &progress {
-        sink.lock()
-            .map_err(|_| "G7 ANN progress sink synchronization failed")?
-            .begin_build(authority, logical_partitions)?;
-    }
-    let vectors = (0..document_count)
-        .map(|id| vector_fixture(id, document_count))
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let progress_failure = Arc::new(Mutex::new(None::<String>));
-    let callback_sink = progress.clone();
-    let callback_failure = Arc::clone(&progress_failure);
-    let plan = database.plan_initial_ann_bulk_with_progress(
-        vector_index,
-        vectors,
-        logical_partitions,
-        move |update| {
-            let Some(sink) = &callback_sink else {
-                return;
-            };
-            let outcome = sink
-                .lock()
-                .map_err(|_| "G7 ANN progress sink synchronization failed".to_owned())
-                .and_then(|mut sink| sink.update_build(update).map_err(|error| error.to_string()));
-            if let Err(error) = outcome
-                && let Ok(mut failure) = callback_failure.lock()
-                && failure.is_none()
-            {
-                *failure = Some(error);
-            }
-        },
-    )?;
-    if let Some(error) = progress_failure
-        .lock()
-        .map_err(|_| "G7 ANN progress failure synchronization failed")?
-        .take()
-    {
-        return Err(error.into());
-    }
-    let build = plan.build_evidence();
-    validate_initial_ann_bulk_build(build, authority, logical_partitions)?;
-    let evidence = initial_ann_bulk_evidence(source_commit, build, authority)?;
-    if let Some(sink) = &progress {
-        sink.lock()
-            .map_err(|_| "G7 ANN progress sink synchronization failed")?
-            .begin_publication(&evidence)?;
-    }
-    let published =
-        database.publish_initial_ann_bulk(plan, hyphae_native_types::DurabilityClass::Memory)?;
-    if published.build != build {
-        return Err("published G7 ANN build evidence changed after planning".into());
-    }
-    let observed = database.observe_ann_index(vector_index)?;
-    if observed.base_identity != build.build_identity {
-        return Err("published G7 ANN generation differs from its planned aggregate".into());
-    }
-    if let Some(sink) = &progress {
-        sink.lock()
-            .map_err(|_| "G7 ANN progress sink synchronization failed")?
-            .complete("ann-bulk-build", observed.base_identity, &evidence)?;
-    }
-    // Lexical documents and scalar filters use the physical all-engine delta
-    // path. Each batch resolves only the touched identities and preserves the
-    // already-published ANN generation, avoiding the former O(n^2) sequence of
-    // complete-state transaction materializations.
+    // Seed scalar and lexical state before publishing ANN. Opening any later
+    // transaction can cross the vector restoration boundary, so the ANN bulk
+    // generation must remain the final mutating seed operation.
+    progress.begin_search_seed_lexical()?;
     for batch_start in (0..document_count).step_by(512) {
+        let batch_end = (batch_start + 512).min(document_count);
         let mut batch =
             database.begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Memory)?;
-        for id in batch_start..(batch_start + 512).min(document_count) {
+        for id in batch_start..batch_end {
             let document_id = (id as u128 + 1).to_be_bytes();
             let text = if id == document_count / 2 {
                 "rare g7 native benchmark term"
@@ -599,8 +1368,49 @@ fn seed_search_database(
             )?;
         }
         database.commit_optimistic(batch)?;
+        progress.advance_search_seed_lexical(batch_end - batch_start)?;
     }
+    progress.finish_search_seed_lexical()?;
     database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+    progress.begin_ann_build(authority, logical_partitions)?;
+    let vectors = (0..document_count)
+        .map(|id| vector_fixture(id, document_count))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let callback_progress = Arc::clone(progress);
+    let plan = database.plan_initial_ann_bulk_with_progress(
+        vector_index,
+        vectors,
+        logical_partitions,
+        move |update| {
+            if let Err(error) = callback_progress.update_ann_build(update) {
+                callback_progress.record_failure(error.to_string());
+            }
+        },
+    )?;
+    progress.check_failure()?;
+    let build = plan.build_evidence();
+    validate_initial_ann_bulk_build(build, authority, logical_partitions)?;
+    let evidence = initial_ann_bulk_evidence(source_commit, build, authority)?;
+    progress.begin_ann_publication(&evidence)?;
+    let published =
+        database.publish_initial_ann_bulk(plan, hyphae_native_types::DurabilityClass::Memory)?;
+    if published.build != build {
+        return Err("published G7 ANN build evidence changed after planning".into());
+    }
+    let observed = database.observe_ann_index(vector_index)?;
+    if observed.base_identity != build.build_identity {
+        return Err("published G7 ANN generation differs from its planned aggregate".into());
+    }
+    progress.complete_ann(observed.base_identity, &evidence)?;
+    progress.begin_search_seed_maintenance()?;
+    let vacuum = database.vacuum_pages()?;
+    black_box(database.checkpoint()?);
+    let maintained = database.observe_ann_index(vector_index)?;
+    if maintained.base_identity != observed.base_identity {
+        return Err("G7 search seed maintenance changed the published ANN identity".into());
+    }
+    progress.complete_search_seed_maintenance(&vacuum)?;
+    progress.complete_search_seed()?;
     drop(database);
     Ok(evidence)
 }
@@ -644,18 +1454,29 @@ fn validate_initial_ann_bulk_build(
 }
 
 fn progress_eta(
-    elapsed: Duration,
-    completed: usize,
-    total: usize,
+    phase_elapsed: Duration,
+    phase_completed: u64,
+    phase_total: u64,
+    completed: u64,
+    total: u64,
     finished: bool,
 ) -> std::io::Result<serde_json::Value> {
-    if finished || completed >= total {
+    if finished {
         return Ok(json!({
             "status": "completed",
             "estimated_remaining_nanos": 0,
         }));
     }
-    if completed == 0 {
+    if completed > total || phase_completed > phase_total {
+        return Err(std::io::Error::other("G7 cell progress exceeds total"));
+    }
+    if completed == total {
+        return Ok(json!({
+            "status": "estimated",
+            "estimated_remaining_nanos": 0,
+        }));
+    }
+    if phase_completed == 0 {
         return Ok(json!({
             "status": "pending",
             "estimated_remaining_nanos": null,
@@ -663,16 +1484,16 @@ fn progress_eta(
     }
     let remaining_units = total
         .checked_sub(completed)
-        .ok_or_else(|| std::io::Error::other("G7 ANN progress exceeds total"))?
+        .ok_or_else(|| std::io::Error::other("G7 cell progress exceeds total"))?
         as u128;
-    let remaining_nanos = elapsed
+    let remaining_nanos = phase_elapsed
         .as_nanos()
         .checked_mul(remaining_units)
-        .ok_or_else(|| std::io::Error::other("G7 ANN progress ETA multiplication overflow"))?
-        .checked_div(completed as u128)
-        .ok_or_else(|| std::io::Error::other("G7 ANN progress ETA divisor must be nonzero"))?;
+        .ok_or_else(|| std::io::Error::other("G7 progress ETA multiplication overflow"))?
+        .checked_div(phase_completed as u128)
+        .ok_or_else(|| std::io::Error::other("G7 progress ETA divisor must be nonzero"))?;
     let remaining_nanos = u64::try_from(remaining_nanos)
-        .map_err(|_| std::io::Error::other("G7 ANN progress ETA exceeds u64"))?;
+        .map_err(|_| std::io::Error::other("G7 progress ETA exceeds u64"))?;
     Ok(json!({
         "status": "estimated",
         "estimated_remaining_nanos": remaining_nanos,
@@ -722,11 +1543,7 @@ fn initial_ann_bulk_evidence(
 }
 
 fn initial_ann_bulk_evidence_path(seed_path: &Path) -> PathBuf {
-    let name = seed_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("search-seed");
-    seed_path.with_file_name(format!("{name}.initial-ann-bulk.json"))
+    seed_path.join("initial-ann-bulk.json")
 }
 
 fn load_initial_ann_bulk_evidence(
@@ -915,7 +1732,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &root,
         &source_commit,
     )?)?);
-    let search = SearchFixture::open_or_create(&root, &source_commit, &authority)?;
+    let progress =
+        CellProgress::from_environment(&source_commit, observations, warmup, state == "warm")?;
+    let _progress_reporter = progress.start_reporter();
+    let search = SearchFixture::open_or_create(&root, &source_commit, &authority, &progress)?;
+    let mut partial_receipt =
+        PartialReceiptSink::from_environment(&source_commit, &platform, &state, concurrency)?;
     let background_enabled =
         std::env::var("HYPHAE_G7_BACKGROUND").is_ok_and(|value| value == "1" || value == "true");
     let background_stop = Arc::new(AtomicBool::new(false));
@@ -989,110 +1811,181 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "closure_declared": false,
     });
     let mut cells = BTreeMap::new();
+    let read_surface_units = observations
+        .checked_add(if state == "warm" { warmup } else { 0 })
+        .ok_or("G7 read surface progress units overflow")?;
     if state == "cold" {
         // Cold state is a fresh process and fresh data directory for this
         // receipt. Warm state retains the process-local seeded handles.
         fs::create_dir_all(root.join("cold-marker"))?;
     }
-    cells.insert(
-        "embedded-structure-point-get",
-        run_embedded_structure(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .map_err(|error| format!("embedded structure: {error}"))?,
-    );
-    cells.insert(
-        "embedded-prepared-sql-primary-key",
-        run_embedded_sql(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .map_err(|error| format!("embedded sql: {error}"))?,
-    );
-    cells.insert(
-        "local-structure-point-get",
-        run_local_structure(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .await
-        .map_err(|error| format!("local structure: {error}"))?,
-    );
-    cells.insert(
-        "local-prepared-sql-primary-key",
-        run_local_sql(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .await
-        .map_err(|error| format!("local sql: {error}"))?,
-    );
-    cells.insert(
-        "indexed-sql-bounded-read",
-        run_indexed_sql(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .map_err(|error| format!("indexed sql: {error}"))?,
-    );
-    cells.insert(
-        "two-index-join-bounded-read",
-        run_join_sql(
-            &root,
-            &authority,
-            state == "warm",
-            concurrency,
-            observations,
-            warmup,
-        )
-        .map_err(|error| format!("two-index join: {error}"))?,
-    );
-    cells.insert(
-        "bm25-top10",
-        run_bm25(&search, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("bm25: {error}"))?,
-    );
-    cells.insert(
-        "filtered-bm25-top10",
-        run_filtered_bm25(&search, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("filtered bm25: {error}"))?,
-    );
-    cells.insert(
-        "ann-top10-recall-095",
-        run_ann(&search, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("ann: {error}"))?,
-    );
-    cells.insert(
-        "hybrid-top10",
-        run_hybrid(&search, state == "warm", concurrency, observations, warmup)
-            .map_err(|error| format!("hybrid: {error}"))?,
-    );
-    cells.insert(
-        "strict-group-commit",
-        run_commit(&root, &authority, concurrency, observations)?,
-    );
-    receipt["cells"] = serde_json::to_value(cells)?;
+    let surface = progress.begin_surface("embedded-structure-point-get", 0, read_surface_units)?;
+    partial_receipt.begin_surface("embedded-structure-point-get", &cells)?;
+    let value = run_embedded_structure(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("embedded structure: {error}"))?;
+    surface.complete()?;
+    cells.insert("embedded-structure-point-get", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface =
+        progress.begin_surface("embedded-prepared-sql-primary-key", 1, read_surface_units)?;
+    partial_receipt.begin_surface("embedded-prepared-sql-primary-key", &cells)?;
+    let value = run_embedded_sql(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("embedded sql: {error}"))?;
+    surface.complete()?;
+    cells.insert("embedded-prepared-sql-primary-key", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("local-structure-point-get", 2, read_surface_units)?;
+    partial_receipt.begin_surface("local-structure-point-get", &cells)?;
+    let value = run_local_structure(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .await
+    .map_err(|error| format!("local structure: {error}"))?;
+    surface.complete()?;
+    cells.insert("local-structure-point-get", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface =
+        progress.begin_surface("local-prepared-sql-primary-key", 3, read_surface_units)?;
+    partial_receipt.begin_surface("local-prepared-sql-primary-key", &cells)?;
+    let value = run_local_sql(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .await
+    .map_err(|error| format!("local sql: {error}"))?;
+    surface.complete()?;
+    cells.insert("local-prepared-sql-primary-key", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("indexed-sql-bounded-read", 4, read_surface_units)?;
+    partial_receipt.begin_surface("indexed-sql-bounded-read", &cells)?;
+    let value = run_indexed_sql(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("indexed sql: {error}"))?;
+    surface.complete()?;
+    cells.insert("indexed-sql-bounded-read", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("two-index-join-bounded-read", 5, read_surface_units)?;
+    partial_receipt.begin_surface("two-index-join-bounded-read", &cells)?;
+    let value = run_join_sql(
+        &root,
+        &authority,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("two-index join: {error}"))?;
+    surface.complete()?;
+    cells.insert("two-index-join-bounded-read", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("bm25-top10", 6, read_surface_units)?;
+    partial_receipt.begin_surface("bm25-top10", &cells)?;
+    let value = run_bm25(
+        &search,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("bm25: {error}"))?;
+    surface.complete()?;
+    cells.insert("bm25-top10", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("filtered-bm25-top10", 7, read_surface_units)?;
+    partial_receipt.begin_surface("filtered-bm25-top10", &cells)?;
+    let value = run_filtered_bm25(
+        &search,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("filtered bm25: {error}"))?;
+    surface.complete()?;
+    cells.insert("filtered-bm25-top10", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("ann-top10-recall-095", 8, read_surface_units)?;
+    partial_receipt.begin_surface("ann-top10-recall-095", &cells)?;
+    let value = run_ann(
+        &search,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("ann: {error}"))?;
+    surface.complete()?;
+    cells.insert("ann-top10-recall-095", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("hybrid-top10", 9, read_surface_units)?;
+    partial_receipt.begin_surface("hybrid-top10", &cells)?;
+    let value = run_hybrid(
+        &search,
+        state == "warm",
+        concurrency,
+        observations,
+        warmup,
+        &surface,
+    )
+    .map_err(|error| format!("hybrid: {error}"))?;
+    surface.complete()?;
+    cells.insert("hybrid-top10", value);
+    partial_receipt.complete_surface(&cells)?;
+
+    let surface = progress.begin_surface("strict-group-commit", 10, observations)?;
+    partial_receipt.begin_surface("strict-group-commit", &cells)?;
+    let value = run_commit(&root, &authority, concurrency, observations, &surface)?;
+    surface.complete()?;
+    cells.insert("strict-group-commit", value);
+    partial_receipt.complete_surface(&cells)?;
+    receipt["cells"] = serde_json::to_value(&cells)?;
     receipt["physical_observation"] = physical_observation(&root, &authority)?;
     receipt["counters"] = counters_process(&root)?;
     let allocation_change = GLOBAL_ALLOCATOR.stats() - allocation_start;
@@ -1119,8 +2012,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         receipt["background_interference"]["operations"] = json!(operations);
     }
     receipt["execution_authority"] = authority.observation()?;
-    fs::remove_dir_all(&root)?;
+    finalize_cell(&progress, &mut partial_receipt, &cells, &root, &receipt)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
+fn finalize_cell(
+    progress: &CellProgress,
+    partial_receipt: &mut PartialReceiptSink,
+    cells: &BTreeMap<&str, serde_json::Value>,
+    root: &Path,
+    receipt: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    partial_receipt.complete(cells)?;
+    fs::remove_dir_all(root)?;
+    progress.complete_cell(receipt)?;
     Ok(())
 }
 
@@ -1323,6 +2229,7 @@ fn run_embedded_structure(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("structure");
@@ -1338,18 +2245,23 @@ fn run_embedded_structure(
     let target = (STRUCTURE_KEYS / 2).to_be_bytes();
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(database.get_latest_structure(&target, 0)?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
+    progress.begin_phase("measure", observations)?;
     let target_value = [0xa5; 64];
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let value = database.get_latest_structure(&target, 0)?;
         if value.as_deref() != Some(target_value.as_slice()) {
             return Err("structure result mismatch".into());
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
+    progress.finish_phase("measure")?;
     stats_with_materialization(stats, materialization)
 }
 
@@ -1360,6 +2272,7 @@ fn run_embedded_sql(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("sql");
@@ -1387,11 +2300,15 @@ fn run_embedded_sql(
     )];
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let result = database.execute_prepared_latest(&prepared, &parameters)?;
         if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
         {
@@ -1399,6 +2316,7 @@ fn run_embedded_sql(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
+    progress.finish_phase("measure")?;
     stats_with_materialization(stats, materialization)
 }
 
@@ -1409,6 +2327,7 @@ async fn run_local_structure(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("local-structure");
@@ -1448,15 +2367,19 @@ async fn run_local_structure(
         let options = RequestOptions::default();
         let materialization = NativeDatabase::process_materialization_observation();
         if warm {
+            progress.begin_phase("warmup", warmup)?;
             for _ in 0..warmup {
                 require_structure_response(
                     client
                         .structure_get(b"g7-local-structure".to_vec(), options.clone())
                         .await?,
                 )?;
+                progress.advance(1)?;
             }
+            progress.finish_phase("warmup")?;
         }
-        let stats = measure_async(concurrency, observations, || {
+        progress.begin_phase("measure", observations)?;
+        let stats = measure_async(concurrency, observations, progress, || {
             let client = client.clone();
             let options = options.clone();
             async move {
@@ -1469,6 +2392,7 @@ async fn run_local_structure(
             }
         })
         .await?;
+        progress.finish_phase("measure")?;
         stats_with_materialization(stats, materialization)
     }
     .await;
@@ -1484,6 +2408,7 @@ async fn run_local_sql(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("local-sql");
@@ -1511,6 +2436,7 @@ async fn run_local_sql(
         };
         let materialization = NativeDatabase::process_materialization_observation();
         if warm {
+            progress.begin_phase("warmup", warmup)?;
             for _ in 0..warmup {
                 require_sql_response(
                     client
@@ -1523,9 +2449,12 @@ async fn run_local_sql(
                         )
                         .await?,
                 )?;
+                progress.advance(1)?;
             }
+            progress.finish_phase("warmup")?;
         }
-        let stats = measure_async(concurrency, observations, || {
+        progress.begin_phase("measure", observations)?;
+        let stats = measure_async(concurrency, observations, progress, || {
             let client = client.clone();
             let options = options.clone();
             async move {
@@ -1544,6 +2473,7 @@ async fn run_local_sql(
             }
         })
         .await?;
+        progress.finish_phase("measure")?;
         stats_with_materialization(stats, materialization)
     }
     .await;
@@ -1559,6 +2489,7 @@ fn run_indexed_sql(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let path = root.join("indexed");
@@ -1592,11 +2523,15 @@ fn run_indexed_sql(
     ))];
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let result = database.execute_prepared_latest(&prepared, &parameters)?;
         if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
         {
@@ -1604,6 +2539,7 @@ fn run_indexed_sql(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
+    progress.finish_phase("measure")?;
     let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-indexed-sql");
     value["concurrency"] = json!(concurrency);
@@ -1617,6 +2553,7 @@ fn run_join_sql(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let path = root.join("join");
     let mut database = NativeDatabase::create(&path)?;
@@ -1661,11 +2598,15 @@ fn run_join_sql(
     ))];
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(database.execute_prepared_latest(&prepared, &parameters)?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let result = database.execute_prepared_latest(&prepared, &parameters)?;
         if !matches!(result, hyphae_native_runtime::SqlResult::Rows { rows, .. } if rows.len() == 1)
         {
@@ -1673,6 +2614,7 @@ fn run_join_sql(
         }
         Ok(())
     })?;
+    progress.finish_phase("measure")?;
     stats_with_materialization(stats, materialization)
 }
 
@@ -1682,22 +2624,28 @@ fn run_filtered_bm25(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(filtered_bm25_query(
                 &fixture.database,
                 fixture.lexical_index,
             )?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         if filtered_bm25_query(&fixture.database, fixture.lexical_index)? != 1 {
             return Err("filtered BM25 result mismatch".into());
         }
         Ok(())
     })?;
+    progress.finish_phase("measure")?;
     let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-same-snapshot-filtered-bm25");
     value["filter_selectivity"] = json!(0.5);
@@ -1712,10 +2660,12 @@ fn run_hybrid(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let snapshot = fixture.database.snapshot(0)?;
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(hybrid_query(
                 &fixture.database,
@@ -1725,9 +2675,12 @@ fn run_hybrid(
                 &fixture.query,
                 fixture.options,
             )?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         if hybrid_query(
             &fixture.database,
             &snapshot,
@@ -1741,6 +2694,7 @@ fn run_hybrid(
         }
         Ok(())
     })?;
+    progress.finish_phase("measure")?;
     let mut value = stats_with_materialization(stats, materialization)?;
     value["route"] = json!("native-same-snapshot-hybrid");
     value["lexical_branch"] = json!(true);
@@ -1876,6 +2830,7 @@ fn require_sql_response(
 async fn measure_async<F, Fut>(
     concurrency: usize,
     observations: usize,
+    progress: &SurfaceProgress,
     mut operation: F,
 ) -> Result<Stats, Box<dyn Error>>
 where
@@ -1892,6 +2847,7 @@ where
         for result in results {
             result?;
             samples.push(elapsed);
+            progress.advance(1)?;
             if samples.len() == observations {
                 break;
             }
@@ -1915,18 +2871,23 @@ fn run_bm25(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
             black_box(
                 fixture
                     .database
                     .match_latest_text(fixture.lexical_index, "rare", K)?,
             );
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let hits = fixture
             .database
             .match_latest_text(fixture.lexical_index, "rare", K)?;
@@ -1935,6 +2896,7 @@ fn run_bm25(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
+    progress.finish_phase("measure")?;
     stats_with_materialization(stats, materialization)
 }
 
@@ -1944,6 +2906,7 @@ fn run_ann(
     concurrency: usize,
     observations: usize,
     warmup: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let view = fixture
         .ann_view
@@ -1973,6 +2936,7 @@ fn run_ann(
     let physical_before = fixture.database.physical_observation()?;
     let restores_before = NativeDatabase::process_ann_index_restore_count();
     if warm {
+        progress.begin_phase("warmup", warmup)?;
         if warmup > 0 {
             let first = view.search_selected_with_worker_budget(
                 &fixture.query,
@@ -1983,6 +2947,7 @@ fn run_ann(
             )?;
             validate_g7_ann_selected_route(&first.search, preferred_partitions)?;
             black_box(first);
+            progress.advance(1)?;
         }
         for _ in 1..warmup {
             black_box(view.search_selected_with_worker_budget(
@@ -1992,9 +2957,12 @@ fn run_ann(
                 query_workers,
                 query_queue_wait,
             )?);
+            progress.advance(1)?;
         }
+        progress.finish_phase("warmup")?;
     }
-    let stats = measure_concurrent(concurrency, observations, &|| {
+    progress.begin_phase("measure", observations)?;
+    let stats = measure_concurrent(concurrency, observations, progress, &|| {
         let receipt = view.search_selected_with_worker_budget(
             &fixture.query,
             fixture.options,
@@ -2041,6 +3009,7 @@ fn run_ann(
         black_box(receipt);
         Ok::<(), Box<dyn Error>>(())
     })?;
+    progress.finish_phase("measure")?;
     let physical_after = fixture.database.physical_observation()?;
     let restores_after = NativeDatabase::process_ann_index_restore_count();
     let interval_page_reads = physical_after
@@ -2174,6 +3143,7 @@ fn run_commit(
     authority: &ExecutionAuthority,
     concurrency: usize,
     observations: usize,
+    progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let group_path = root.join("group");
@@ -2193,6 +3163,7 @@ fn run_commit(
         .map(|_| scheduler.client())
         .collect::<Vec<_>>();
     let barrier = Barrier::new(concurrency);
+    progress.begin_phase("measure", observations)?;
     let started = Instant::now();
     let samples = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(concurrency);
@@ -2202,6 +3173,7 @@ fn run_commit(
             let barrier = &barrier;
             handles.push(scope.spawn(move || -> Result<Vec<u64>, String> {
                 let mut samples = Vec::with_capacity(count);
+                let mut pending_progress = 0;
                 barrier.wait();
                 for sequence in 0..count {
                     let sample = Instant::now();
@@ -2218,6 +3190,18 @@ fn run_commit(
                         .map_err(|error| error.to_string())?;
                     client.submit(batch).map_err(|error| error.to_string())?;
                     samples.push(sample.elapsed().as_nanos() as u64);
+                    pending_progress += 1;
+                    if pending_progress == PROGRESS_CHUNK_UNITS {
+                        progress
+                            .advance(pending_progress)
+                            .map_err(|error| error.to_string())?;
+                        pending_progress = 0;
+                    }
+                }
+                if pending_progress > 0 {
+                    progress
+                        .advance(pending_progress)
+                        .map_err(|error| error.to_string())?;
                 }
                 Ok(samples)
             }));
@@ -2235,6 +3219,7 @@ fn run_commit(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    progress.finish_phase("measure")?;
     let stats = stats_from_samples(samples, started.elapsed().as_secs_f64());
     scheduler.shutdown()?;
     let mut output = stats_with_materialization(stats, materialization)?;
@@ -2246,6 +3231,7 @@ fn run_commit(
 fn measure_concurrent(
     concurrency: usize,
     observations: usize,
+    progress: &SurfaceProgress,
     operation: &(impl Fn() -> Result<(), Box<dyn Error>> + Sync),
 ) -> Result<Stats, Box<dyn Error>> {
     if concurrency == 0 || observations < concurrency {
@@ -2261,11 +3247,24 @@ fn measure_concurrent(
             let barrier = &barrier;
             handles.push(scope.spawn(move || -> Result<Vec<u64>, String> {
                 let mut samples = Vec::with_capacity(count);
+                let mut pending_progress = 0;
                 barrier.wait();
                 for _ in 0..count {
                     let sample = Instant::now();
                     operation().map_err(|error| error.to_string())?;
                     samples.push(sample.elapsed().as_nanos() as u64);
+                    pending_progress += 1;
+                    if pending_progress == PROGRESS_CHUNK_UNITS {
+                        progress
+                            .advance(pending_progress)
+                            .map_err(|error| error.to_string())?;
+                        pending_progress = 0;
+                    }
+                }
+                if pending_progress > 0 {
+                    progress
+                        .advance(pending_progress)
+                        .map_err(|error| error.to_string())?;
                 }
                 Ok(samples)
             }));
@@ -2378,6 +3377,343 @@ mod tests {
             .to_hex()
             .to_string();
         assert_eq!(current_executable_blake3()?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ann_publication_is_not_terminal_cell_progress() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-g7-progress-regression-{}-{}.json",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let progress = CellProgress::new(
+            Some(path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            30,
+            10,
+        )?;
+        progress.begin_search_seed_lexical()?;
+        progress.advance_search_seed_lexical(10)?;
+        progress.finish_search_seed_lexical()?;
+        let lexical: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.set_phase(
+            "ann-private-build",
+            "search-seed",
+            "ann-bulk-build",
+            1,
+            2,
+            10,
+        )?;
+        progress.complete_ann([7; 32], &json!({"builder": "test"}))?;
+        let ann: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+
+        let surface = progress.begin_surface(G7_SURFACE_NAMES[0], 0, 10)?;
+        surface.begin_phase("measure", 10)?;
+        surface.advance(10)?;
+        surface.finish_phase("measure")?;
+        surface.complete()?;
+        progress.complete_cell(&json!({"cells": {"embedded-structure-point-get": {}}}))?;
+        let terminal: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        fs::remove_file(path)?;
+
+        assert_eq!(lexical["stage"], "search-seed-lexical-completed");
+        assert_eq!(lexical["completed_units"], 10);
+        assert_eq!(ann["stage"], "ann-published");
+        assert_eq!(ann["status"], "running");
+        assert_eq!(ann["completed_units"], 20);
+        assert_eq!(ann["total_units"], 30);
+        assert_eq!(ann["details"]["suboperation"]["status"], "completed");
+        assert_eq!(ann["details"]["suboperation"]["completed_units"], 10);
+        assert_eq!(ann["details"]["suboperation"]["total_units"], 10);
+        assert!(ann["sequence"].as_u64() > lexical["sequence"].as_u64());
+        assert_eq!(terminal["stage"], "cell-completed");
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["completed_units"], terminal["total_units"]);
+        assert!(terminal["sequence"].as_u64() > ann["sequence"].as_u64());
+        Ok(())
+    }
+
+    #[test]
+    fn slow_seed_maintenance_and_open_emit_heartbeats_but_workloads_do_not()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-g7-progress-heartbeat-{}-{}.json",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let progress = CellProgress::new(
+            Some(path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            10,
+            10,
+        )?;
+
+        progress.begin_search_seed_maintenance()?;
+        let maintenance: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.flush_if_advanced()?;
+        let heartbeat: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.begin_search_seed_open()?;
+        let opened: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.flush_if_advanced()?;
+        let open_heartbeat: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.complete_search_seed_open()?;
+        let surface = progress.begin_surface(G7_SURFACE_NAMES[0], 0, 10)?;
+        let started: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        progress.flush_if_advanced()?;
+        let quiet: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        fs::remove_file(path)?;
+
+        assert_eq!(maintenance["stage"], "search-seed-maintenance");
+        assert_eq!(maintenance["completed_units"], heartbeat["completed_units"]);
+        assert!(heartbeat["sequence"].as_u64() > maintenance["sequence"].as_u64());
+        assert_eq!(opened["stage"], "search-seed-open");
+        assert_eq!(opened["completed_units"], open_heartbeat["completed_units"]);
+        assert!(open_heartbeat["sequence"].as_u64() > opened["sequence"].as_u64());
+        assert_eq!(started["sequence"], quiet["sequence"]);
+        drop(surface);
+        Ok(())
+    }
+
+    #[test]
+    fn progress_reporter_stops_immediately_during_idle_heartbeat_phase()
+    -> Result<(), Box<dyn Error>> {
+        let progress = CellProgress::new(None, "1".repeat(40), None, "3".repeat(64), 10, 10)?;
+        progress.begin_search_seed_open()?;
+        let started = Instant::now();
+        let reporter = progress.start_reporter();
+        drop(reporter);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
+    fn search_seed_directory_is_not_published_before_its_evidence() -> Result<(), Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-seed-publication-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let staging = root.join("staging");
+        let published = root.join("published");
+        fs::create_dir_all(&staging)?;
+        publish_search_seed_directory(&staging, &published, &json!({"status": "complete"}))?;
+        assert!(published.is_dir());
+        assert!(initial_ann_bulk_evidence_path(&published).is_file());
+
+        let missing_staging = root.join("missing-staging");
+        let incomplete = root.join("incomplete");
+        assert!(
+            publish_search_seed_directory(
+                &missing_staging,
+                &incomplete,
+                &json!({"status": "complete"})
+            )
+            .is_err()
+        );
+        assert!(!incomplete.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn partial_receipt_is_atomic_cumulative_and_terminal_only_after_all_surfaces()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-g7-partial-receipt-{}-{}.json",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let mut sink = PartialReceiptSink {
+            path: Some(path.clone()),
+            source_commit: "1".repeat(40),
+            source_tree: Some("2".repeat(40)),
+            dataset_digest: "3".repeat(64),
+            platform: "linux".to_owned(),
+            state: "warm".to_owned(),
+            concurrency: 1,
+            sequence: 0,
+        };
+        let mut cells = BTreeMap::new();
+        sink.begin_surface(G7_SURFACE_NAMES[0], &cells)?;
+        assert!(sink.complete(&cells).is_err());
+        for name in G7_SURFACE_NAMES {
+            cells.insert(name, json!({"status": "measured"}));
+        }
+        sink.complete(&cells)?;
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        fs::remove_file(path)?;
+
+        assert_eq!(receipt.as_object().map(serde_json::Map::len), Some(13));
+        assert_eq!(receipt["schema"], "hyphae-native-g7-partial-receipt-v1");
+        assert_eq!(receipt["status"], "completed");
+        assert_eq!(receipt["completed_count"], G7_SURFACES);
+        assert_eq!(receipt["total_cells"], G7_SURFACES);
+        assert!(receipt["current_cell"].is_null());
+        assert_eq!(
+            receipt["cells"].as_object().map(serde_json::Map::len),
+            Some(G7_SURFACES)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cell_terminal_follows_partial_terminal_and_required_cleanup() -> Result<(), Box<dyn Error>> {
+        let base = std::env::temp_dir().join(format!(
+            "hyphae-g7-terminal-order-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        fs::create_dir_all(&base)?;
+        let root = base.join("cell-root");
+        fs::create_dir_all(&root)?;
+        let blocked_parent = base.join("blocked-partial-parent");
+        fs::write(&blocked_parent, b"not-a-directory")?;
+        let progress_path = base.join("progress.json");
+        let progress = CellProgress::new(
+            Some(progress_path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            0,
+            0,
+        )?;
+        progress.begin_search_seed_open()?;
+        let mut partial = PartialReceiptSink {
+            path: Some(blocked_parent.join("partial.json")),
+            source_commit: "1".repeat(40),
+            source_tree: Some("2".repeat(40)),
+            dataset_digest: "3".repeat(64),
+            platform: "linux".to_owned(),
+            state: "warm".to_owned(),
+            concurrency: 1,
+            sequence: 0,
+        };
+        let cells = G7_SURFACE_NAMES
+            .into_iter()
+            .map(|name| (name, json!({"status": "measured"})))
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(finalize_cell(&progress, &mut partial, &cells, &root, &json!({})).is_err());
+        let observed: serde_json::Value = serde_json::from_slice(&fs::read(&progress_path)?)?;
+        let root_preserved = root.is_dir();
+        fs::remove_dir_all(&base)?;
+
+        assert_ne!(observed["stage"], "cell-completed");
+        assert!(root_preserved);
+
+        let cleanup_base = std::env::temp_dir().join(format!(
+            "hyphae-g7-cleanup-order-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        fs::create_dir_all(&cleanup_base)?;
+        let cleanup_target = cleanup_base.join("not-a-directory");
+        fs::write(&cleanup_target, b"cell-root")?;
+        let cleanup_progress_path = cleanup_base.join("progress.json");
+        let cleanup_partial_path = cleanup_base.join("partial.json");
+        let cleanup_progress = CellProgress::new(
+            Some(cleanup_progress_path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            0,
+            0,
+        )?;
+        cleanup_progress.begin_search_seed_open()?;
+        let mut cleanup_partial = PartialReceiptSink {
+            path: Some(cleanup_partial_path.clone()),
+            source_commit: "1".repeat(40),
+            source_tree: Some("2".repeat(40)),
+            dataset_digest: "3".repeat(64),
+            platform: "linux".to_owned(),
+            state: "warm".to_owned(),
+            concurrency: 1,
+            sequence: 0,
+        };
+
+        assert!(
+            finalize_cell(
+                &cleanup_progress,
+                &mut cleanup_partial,
+                &cells,
+                &cleanup_target,
+                &json!({})
+            )
+            .is_err()
+        );
+        let cleanup_progress_observed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cleanup_progress_path)?)?;
+        let cleanup_partial_observed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cleanup_partial_path)?)?;
+        fs::remove_dir_all(&cleanup_base)?;
+
+        assert_eq!(cleanup_partial_observed["status"], "completed");
+        assert_ne!(cleanup_progress_observed["stage"], "cell-completed");
+
+        let success_base = std::env::temp_dir().join(format!(
+            "hyphae-g7-terminal-success-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let success_root = success_base.join("cell-root");
+        fs::create_dir_all(&success_root)?;
+        let success_progress_path = success_base.join("progress.json");
+        let success_partial_path = success_base.join("partial.json");
+        let success_progress = CellProgress::new(
+            Some(success_progress_path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            0,
+            0,
+        )?;
+        success_progress.begin_search_seed_open()?;
+        let mut success_partial = PartialReceiptSink {
+            path: Some(success_partial_path.clone()),
+            source_commit: "1".repeat(40),
+            source_tree: Some("2".repeat(40)),
+            dataset_digest: "3".repeat(64),
+            platform: "linux".to_owned(),
+            state: "warm".to_owned(),
+            concurrency: 1,
+            sequence: 0,
+        };
+
+        finalize_cell(
+            &success_progress,
+            &mut success_partial,
+            &cells,
+            &success_root,
+            &json!({}),
+        )?;
+        let success_progress_observed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&success_progress_path)?)?;
+        let success_partial_observed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&success_partial_path)?)?;
+        let success_root_removed = !success_root.exists();
+        fs::remove_dir_all(&success_base)?;
+
+        assert_eq!(success_partial_observed["status"], "completed");
+        assert!(success_root_removed);
+        assert_eq!(success_progress_observed["stage"], "cell-completed");
+        Ok(())
+    }
+
+    #[test]
+    fn closure_progress_budget_preserves_every_requested_operation() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            total_work_units(1_000_000, 1_000_000, 100_000, true)?,
+            14_000_000
+        );
+        assert_eq!(
+            total_work_units(1_000_000, 1_000_000, 100_000, false)?,
+            13_000_000
+        );
         Ok(())
     }
 }

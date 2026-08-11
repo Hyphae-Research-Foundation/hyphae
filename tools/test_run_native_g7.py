@@ -4,17 +4,32 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.check_native_performance_receipt import validate_progress
 from tools.run_native_g7 import (
+    G7_SURFACES,
+    PILOT_OBSERVATIONS,
+    PILOT_WARMUP,
     ProgressWatchdog,
+    ProgressStalled,
+    RuntimeBudgetExceeded,
+    derive_cell_runtime_budget,
+    derive_matrix_runtime_plan,
     parse_macos_counter_export,
+    persist_validated_cell_checkpoint,
+    run_cell,
+    run_calibration_pilot,
+    validate_cross_artifact_dataset,
     validate_completed_ann_progress,
+    validate_completed_cell_progress,
     validate_execution_authority_evidence,
     validate_initial_ann_bulk_evidence,
+    validate_partial_receipt,
     write_matrix_progress,
 )
 
@@ -152,6 +167,73 @@ class NativeG7ControllerTests(unittest.TestCase):
             "details": details,
         }
 
+    @classmethod
+    def pilot_receipt(cls, throughput: float = 10_000.0) -> dict[str, object]:
+        return {
+            "source_commit": cls.SOURCE_COMMIT,
+            "platform": "linux",
+            "state": "warm",
+            "concurrency": 1,
+            "dataset": {
+                "observations": PILOT_OBSERVATIONS,
+                "warmup": PILOT_WARMUP,
+                "search_documents": 1_000_000,
+                "vector_count": 1_000_000,
+                "vector_dimension": 384,
+                "digest": "3" * 64,
+            },
+            "cells": {
+                name: {
+                    "throughput_per_second": throughput,
+                    "p99": 100_000,
+                }
+                for name in G7_SURFACES
+            },
+            "controller": {"wall_seconds": 20.0},
+        }
+
+    @classmethod
+    def partial_receipt(cls) -> dict[str, object]:
+        return {
+            "schema": "hyphae-native-g7-partial-receipt-v1",
+            "source_commit": cls.SOURCE_COMMIT,
+            "source_tree": "2" * 40,
+            "dataset_digest": "3" * 64,
+            "platform": "linux",
+            "state": "warm",
+            "concurrency": 1,
+            "sequence": 2,
+            "status": "running",
+            "completed_count": 1,
+            "total_cells": len(G7_SURFACES),
+            "current_cell": G7_SURFACES[1],
+            "cells": {G7_SURFACES[0]: {"status": "measured"}},
+        }
+
+    @classmethod
+    def completed_cell_progress(cls) -> dict[str, object]:
+        return {
+            "schema": "hyphae-native-performance-progress-v1",
+            "source_commit": cls.SOURCE_COMMIT,
+            "source_tree": "2" * 40,
+            "dataset_digest": "3" * 64,
+            "operation": "g7-cell",
+            "stage": "cell-completed",
+            "sequence": 12,
+            "completed_units": 13_100_000,
+            "total_units": 13_100_000,
+            "unit": "work-units",
+            "elapsed_nanos": 10,
+            "status": "completed",
+            "checkpoint_digest": "4" * 64,
+            "details": {
+                "eta": {
+                    "status": "completed",
+                    "estimated_remaining_nanos": 0,
+                },
+            },
+        }
+
     def test_parses_macos_counter_rows_and_references(self) -> None:
         document = """<?xml version="1.0"?>
 <trace-query-result><node><schema name="MetricTable"/>
@@ -176,6 +258,30 @@ class NativeG7ControllerTests(unittest.TestCase):
 
     def test_accepts_durably_published_ann_progress(self) -> None:
         validate_completed_ann_progress(self.completed_progress(), self.SOURCE_COMMIT)
+
+    def test_accepts_only_terminal_whole_cell_progress(self) -> None:
+        validate_completed_cell_progress(
+            self.completed_cell_progress(), self.SOURCE_COMMIT
+        )
+        progress = self.completed_cell_progress()
+        progress["stage"] = "ann-published"
+        with self.assertRaisesRegex(RuntimeError, "complete cell publication"):
+            validate_completed_cell_progress(progress, self.SOURCE_COMMIT)
+
+    def test_progress_watchdog_fails_closed_on_source_commit_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runner-progress.json"
+            watchdog = ProgressWatchdog(
+                path,
+                timeout_seconds=5.0,
+                started=10.0,
+                expected_commit=self.SOURCE_COMMIT,
+            )
+            progress = self.completed_cell_progress()
+            progress["source_commit"] = "f" * 40
+            path.write_text(json.dumps(progress))
+            with self.assertRaisesRegex(ValueError, "differs from expected"):
+                watchdog.observe(11.0)
 
     def test_progress_schema_covers_runner_details_and_eta(self) -> None:
         schema_path = Path(__file__).parents[1] / "contracts" / "json-schema" / (
@@ -320,8 +426,374 @@ class NativeG7ControllerTests(unittest.TestCase):
             path = Path(directory) / "runner-progress.json"
             watchdog = ProgressWatchdog(path, timeout_seconds=5.0, started=10.0)
             watchdog.observe(14.9)
-            with self.assertRaisesRegex(RuntimeError, "stalled for 5s"):
+            with self.assertRaisesRegex(ProgressStalled, "stalled for 5s"):
                 watchdog.observe(15.0)
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX executable fixture")
+    def test_run_cell_distinguishes_stall_from_runtime_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "runner"
+            runner.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
+            runner.chmod(0o755)
+            progress = root / "progress.json"
+            with self.assertRaisesRegex(RuntimeBudgetExceeded, "runtime budget"):
+                run_cell(
+                    runner,
+                    self.SOURCE_COMMIT,
+                    "linux",
+                    "warm",
+                    1,
+                    timeout_seconds=0.05,
+                    progress_path=progress,
+                    stall_timeout_seconds=10.0,
+                )
+            with self.assertRaisesRegex(ProgressStalled, "cell stalled"):
+                run_cell(
+                    runner,
+                    self.SOURCE_COMMIT,
+                    "linux",
+                    "warm",
+                    1,
+                    timeout_seconds=2.0,
+                    progress_path=progress,
+                    stall_timeout_seconds=0.05,
+                )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX executable fixtures")
+    def test_run_cell_uses_only_effective_child_environment_for_perf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "perf-used"
+            perf = root / "perf"
+            perf.write_text(
+                "#!/bin/sh\n"
+                "touch \"$PERF_MARKER\"\n"
+                "while [ \"$1\" != \"--\" ]; do shift; done\n"
+                "shift\n"
+                "exec \"$@\"\n"
+            )
+            perf.chmod(0o755)
+            runner = root / "runner"
+            runner.write_text("#!/bin/sh\nprintf '{\"counters\": {}}\\n'\n")
+            runner.chmod(0o755)
+            parent_path = f"{root}{os.pathsep}{os.environ.get('PATH', '')}"
+            for parent_perf, child_perf, expected in (
+                (True, False, False),
+                (False, True, True),
+            ):
+                with self.subTest(parent_perf=parent_perf, child_perf=child_perf):
+                    marker.unlink(missing_ok=True)
+                    with patch.dict(
+                        os.environ,
+                        {"PATH": parent_path},
+                        clear=False,
+                    ), patch("tools.run_native_g7.sys.platform", "linux"):
+                        if parent_perf:
+                            os.environ["HYPHAE_G7_PERF"] = "1"
+                        else:
+                            os.environ.pop("HYPHAE_G7_PERF", None)
+                        child_environment = os.environ.copy()
+                        if child_perf:
+                            child_environment["HYPHAE_G7_PERF"] = "1"
+                        else:
+                            child_environment.pop("HYPHAE_G7_PERF", None)
+                        child_environment["PERF_MARKER"] = str(marker)
+                        run_cell(
+                            runner,
+                            self.SOURCE_COMMIT,
+                            "linux",
+                            "warm",
+                            1,
+                            environment=child_environment,
+                        )
+                    self.assertEqual(marker.exists(), expected)
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX executable fixture")
+    def test_run_cell_does_not_block_on_large_final_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "runner"
+            runner.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "print(json.dumps({'counters': {}, 'padding': 'x' * 1_100_000}))\n"
+            )
+            runner.chmod(0o755)
+            payload = run_cell(
+                runner,
+                self.SOURCE_COMMIT,
+                "linux",
+                "warm",
+                1,
+                timeout_seconds=2.0,
+            )
+            self.assertEqual(len(payload["padding"]), 1_100_000)
+
+    def test_calibration_pilot_strips_smoke_corpus_overrides(self) -> None:
+        captured: dict[str, str] = {}
+
+        def capture_environment(*args, **kwargs):
+            child_environment = (
+                kwargs["environment"] if "environment" in kwargs else args[5]
+            )
+            captured.update(child_environment)
+            raise RuntimeError("captured")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "tools.run_native_g7.run_cell",
+            side_effect=capture_environment,
+        ):
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "captured"):
+                run_calibration_pilot(
+                    root / "runner",
+                    commit=self.SOURCE_COMMIT,
+                    source_tree="2" * 40,
+                    platform="linux",
+                    state="warm",
+                    concurrency=1,
+                    environment={
+                        "HYPHAE_G7_SMOKE": "1",
+                        "HYPHAE_G7_SEARCH_DOCUMENTS": "128",
+                        "HYPHAE_G7_VECTOR_DIMENSION": "16",
+                    },
+                    receipt_path=root / "receipt.json",
+                    progress_path=root / "progress.json",
+                    partial_path=root / "partial.json",
+                    timeout_seconds=1,
+                    stall_timeout_seconds=1,
+                )
+        self.assertNotIn("HYPHAE_G7_SMOKE", captured)
+        self.assertNotIn("HYPHAE_G7_SEARCH_DOCUMENTS", captured)
+        self.assertNotIn("HYPHAE_G7_VECTOR_DIMENSION", captured)
+
+    def test_pilot_budget_rejects_nonclosure_corpus(self) -> None:
+        for field, value in (
+            ("search_documents", 128),
+            ("vector_count", 128),
+            ("vector_dimension", 16),
+        ):
+            with self.subTest(field=field):
+                pilot = self.pilot_receipt()
+                pilot["dataset"][field] = value
+                with self.assertRaisesRegex(
+                    RuntimeBudgetExceeded,
+                    "exact closure corpus",
+                ):
+                    derive_cell_runtime_budget(
+                        pilot,
+                        expected_commit=self.SOURCE_COMMIT,
+                        expected_platform="linux",
+                        expected_state="warm",
+                        expected_concurrency=1,
+                        observations=1_000_000,
+                        warmup=100_000,
+                        hard_cap_seconds=7_200,
+                        seed_primed=True,
+                    )
+
+    def test_receipt_progress_and_partial_must_bind_same_dataset(self) -> None:
+        receipt = self.pilot_receipt()
+        progress = self.completed_cell_progress()
+        partial = self.partial_receipt()
+        validate_cross_artifact_dataset(
+            receipt,
+            progress,
+            partial,
+            expected_observations=PILOT_OBSERVATIONS,
+            expected_warmup=PILOT_WARMUP,
+        )
+        for artifact in (progress, partial):
+            with self.subTest(artifact=artifact["schema"]):
+                drifted = dict(artifact)
+                drifted["dataset_digest"] = "f" * 64
+                with self.assertRaisesRegex(RuntimeError, "another dataset"):
+                    validate_cross_artifact_dataset(
+                        receipt,
+                        drifted if artifact is progress else progress,
+                        drifted if artifact is partial else partial,
+                        expected_observations=PILOT_OBSERVATIONS,
+                        expected_warmup=PILOT_WARMUP,
+                    )
+
+    def test_short_pilot_derives_a_bounded_full_cell_budget(self) -> None:
+        budget = derive_cell_runtime_budget(
+            self.pilot_receipt(),
+            expected_commit=self.SOURCE_COMMIT,
+            expected_platform="linux",
+            expected_state="warm",
+            expected_concurrency=1,
+            observations=1_000_000,
+            warmup=100_000,
+            hard_cap_seconds=7_200,
+            seed_primed=True,
+        )
+        self.assertEqual(budget["method"], "exact-runner-short-pilot-v1")
+        self.assertEqual(
+            budget["seed_treatment"],
+            "measured-after-identical-seed-prime",
+        )
+        self.assertEqual(budget["full_observations"], 1_000_000)
+        self.assertEqual(budget["full_warmup"], 100_000)
+        self.assertGreater(budget["timeout_seconds"], budget["expected_seconds"])
+        self.assertLessEqual(budget["timeout_seconds"], 7_200)
+
+    def test_budget_keeps_high_concurrency_warmup_serial(self) -> None:
+        pilot = self.pilot_receipt(throughput=1_000_000_000.0)
+        for cell in pilot["cells"].values():
+            cell["p99"] = 1_000_000
+        pilot["concurrency"] = 32
+        budget = derive_cell_runtime_budget(
+            pilot,
+            expected_commit=self.SOURCE_COMMIT,
+            expected_platform="linux",
+            expected_state="warm",
+            expected_concurrency=32,
+            observations=1_000_000,
+            warmup=100_000,
+            hard_cap_seconds=7_200,
+            seed_primed=True,
+        )
+        self.assertGreater(
+            budget["surface_seconds"]["embedded-structure-point-get"],
+            100,
+        )
+
+    def test_short_pilot_fails_early_when_projection_exceeds_hard_cap(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeBudgetExceeded,
+            "above the authorized cap.*slowest_surface",
+        ):
+            derive_cell_runtime_budget(
+                self.pilot_receipt(throughput=100.0),
+                expected_commit=self.SOURCE_COMMIT,
+                expected_platform="linux",
+                expected_state="warm",
+                expected_concurrency=1,
+                observations=1_000_000,
+                warmup=100_000,
+                hard_cap_seconds=7_200,
+                seed_primed=True,
+            )
+
+    def test_short_pilot_is_exact_sha_and_complete_surface_evidence(self) -> None:
+        pilot = self.pilot_receipt()
+        pilot["source_commit"] = "f" * 40
+        with self.assertRaisesRegex(RuntimeBudgetExceeded, "identity or coverage"):
+            derive_cell_runtime_budget(
+                pilot,
+                expected_commit=self.SOURCE_COMMIT,
+                expected_platform="linux",
+                expected_state="warm",
+                expected_concurrency=1,
+                observations=1_000_000,
+                warmup=100_000,
+                hard_cap_seconds=7_200,
+                seed_primed=True,
+            )
+
+    def test_budget_rejects_a_pilot_that_includes_one_time_seed_cost(self) -> None:
+        with self.assertRaisesRegex(RuntimeBudgetExceeded, "runtime bounds"):
+            derive_cell_runtime_budget(
+                self.pilot_receipt(),
+                expected_commit=self.SOURCE_COMMIT,
+                expected_platform="linux",
+                expected_state="warm",
+                expected_concurrency=1,
+                observations=1_000_000,
+                warmup=100_000,
+                hard_cap_seconds=7_200,
+                seed_primed=False,
+            )
+
+    def test_matrix_budget_is_accepted_before_measurements_start(self) -> None:
+        budget = derive_cell_runtime_budget(
+            self.pilot_receipt(),
+            expected_commit=self.SOURCE_COMMIT,
+            expected_platform="linux",
+            expected_state="warm",
+            expected_concurrency=1,
+            observations=1_000_000,
+            warmup=100_000,
+            hard_cap_seconds=7_200,
+            seed_primed=True,
+        )
+        plan = derive_matrix_runtime_plan(
+            calibration_seconds=600,
+            cell_budgets=[budget] * 6,
+            hard_cap_seconds=39_600,
+            expected_cell_count=6,
+        )
+        self.assertEqual(plan["status"], "accepted")
+        self.assertEqual(plan["cell_count"], 6)
+        self.assertLessEqual(plan["planned_total_seconds"], 39_600)
+
+    def test_matrix_budget_fails_before_measurement_when_plan_cannot_fit(self) -> None:
+        budget = {
+            "schema": "hyphae-native-g7-runtime-budget-v1",
+            "timeout_seconds": 7_200,
+        }
+        with self.assertRaisesRegex(
+            RuntimeBudgetExceeded,
+            "exceed the matrix cap.*total=.*cap=39600",
+        ):
+            derive_matrix_runtime_plan(
+                calibration_seconds=600,
+                cell_budgets=[budget] * 6,
+                hard_cap_seconds=39_600,
+                expected_cell_count=6,
+            )
+
+    def test_invalid_runner_output_never_becomes_a_validated_cell_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "validated.json"
+            with self.assertRaisesRegex(RuntimeError, "identity or normative"):
+                persist_validated_cell_checkpoint(
+                    path,
+                    {"source_commit": "f" * 40},
+                    expected_commit=self.SOURCE_COMMIT,
+                    expected_tree="2" * 40,
+                    expected_platform="linux",
+                    expected_state="warm",
+                    expected_concurrency=1,
+                    background_mode="control",
+                    hardware={},
+                    build={},
+                    calibration_executable_blake3="8" * 64,
+                    runtime_budget={},
+                )
+            self.assertFalse(path.exists())
+
+    def test_partial_receipt_preserves_exact_sha_and_completed_surfaces(self) -> None:
+        receipt = self.partial_receipt()
+        validated = validate_partial_receipt(
+            receipt,
+            expected_commit=self.SOURCE_COMMIT,
+            expected_tree="2" * 40,
+            expected_platform="linux",
+            expected_state="warm",
+            expected_concurrency=1,
+        )
+        self.assertEqual(validated["completed_count"], 1)
+        self.assertEqual(set(validated["cells"]), {G7_SURFACES[0]})
+
+    def test_partial_receipt_rejects_identity_or_count_drift(self) -> None:
+        for field, value in (
+            ("source_commit", "f" * 40),
+            ("completed_count", 2),
+        ):
+            with self.subTest(field=field):
+                receipt = self.partial_receipt()
+                receipt[field] = value
+                with self.assertRaisesRegex(RuntimeError, "identity|inconsistent"):
+                    validate_partial_receipt(
+                        receipt,
+                        expected_commit=self.SOURCE_COMMIT,
+                        expected_tree="2" * 40,
+                        expected_platform="linux",
+                        expected_state="warm",
+                        expected_concurrency=1,
+                    )
 
     def test_progress_watchdog_stall_reports_last_stage_progress_and_eta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -355,11 +827,35 @@ class NativeG7ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runner-progress.json"
             watchdog = ProgressWatchdog(path, timeout_seconds=5.0, started=10.0)
-            path.write_text(json.dumps({"sequence": 1, "status": "running"}))
+            path.write_text(json.dumps({
+                "operation": "g7-cell",
+                "stage": "surface-measure",
+                "sequence": 1,
+                "status": "running",
+            }))
             watchdog.observe(14.0)
-            path.write_text(json.dumps({"sequence": 2, "status": "completed"}))
+            path.write_text(json.dumps({
+                "operation": "g7-cell",
+                "stage": "cell-completed",
+                "sequence": 2,
+                "status": "completed",
+            }))
             watchdog.observe(18.0)
             watchdog.observe(100.0)
+
+    def test_progress_watchdog_keeps_watching_after_ann_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runner-progress.json"
+            watchdog = ProgressWatchdog(path, timeout_seconds=5.0, started=10.0)
+            path.write_text(json.dumps({
+                "operation": "ann-bulk-build",
+                "stage": "ann-published",
+                "sequence": 2,
+                "status": "completed",
+            }))
+            watchdog.observe(12.0)
+            with self.assertRaisesRegex(RuntimeError, "stalled for 5s"):
+                watchdog.observe(17.0)
 
 
 if __name__ == "__main__":

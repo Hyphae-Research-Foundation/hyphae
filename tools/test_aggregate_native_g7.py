@@ -9,6 +9,7 @@ from pathlib import Path
 from tools.aggregate_native_g7 import aggregate
 from tools.check_native_g7_matrix import validate_closure_bundle
 from tools.test_check_native_g7_matrix import matrix
+from tools.test_check_native_g7_receipt import TREE
 
 
 class G7AggregateTests(unittest.TestCase):
@@ -21,10 +22,15 @@ class G7AggregateTests(unittest.TestCase):
                 (path / "native-g7-matrix.json").write_text(
                     json.dumps({**matrix(), "platform": platform})
                 )
-            result = aggregate(root, "a" * 40)
+            result = aggregate(root, "a" * 40, expected_tree=TREE)
             self.assertEqual(set(result["platforms"]), {"linux"})
             self.assertEqual(
-                validate_closure_bundle(result, root, "a" * 40)["status"],
+                validate_closure_bundle(
+                    result,
+                    root,
+                    "a" * 40,
+                    expected_tree=TREE,
+                )["status"],
                 "passed",
             )
 
@@ -39,10 +45,15 @@ class G7AggregateTests(unittest.TestCase):
                 receipt["platform"] = "darwin"
                 receipt["build"]["target"] = "aarch64-apple-darwin"
             (path / "native-g7-matrix.json").write_text(json.dumps(payload))
-            result = aggregate(root, "a" * 40)
+            result = aggregate(root, "a" * 40, expected_tree=TREE)
             self.assertEqual(set(result["platforms"]), {"darwin"})
             self.assertEqual(
-                validate_closure_bundle(result, root, "a" * 40)["status"],
+                validate_closure_bundle(
+                    result,
+                    root,
+                    "a" * 40,
+                    expected_tree=TREE,
+                )["status"],
                 "passed",
             )
 

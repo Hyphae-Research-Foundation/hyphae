@@ -15,7 +15,12 @@ from tools.check_native_g7_matrix import GateFailure, validate_matrix
 SUPPORTED_PLATFORMS = ("linux", "darwin")
 
 
-def aggregate(root: Path, source_commit: str) -> dict:
+def aggregate(
+    root: Path,
+    source_commit: str,
+    *,
+    expected_tree: str | None = None,
+) -> dict:
     platforms = tuple(
         platform
         for platform in SUPPORTED_PLATFORMS
@@ -27,7 +32,11 @@ def aggregate(root: Path, source_commit: str) -> dict:
     for platform in platforms:
         path = root / platform / "native-g7-matrix.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
-        audit = validate_matrix(payload, source_commit)
+        audit = validate_matrix(
+            payload,
+            source_commit,
+            expected_tree=expected_tree,
+        )
         if payload.get("platform") != platform:
             raise GateFailure(f"G7 matrix platform mismatch: {platform}")
         matrices[platform] = {
@@ -59,11 +68,16 @@ def aggregate(root: Path, source_commit: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--expected-tree")
     parser.add_argument("--platform-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     try:
-        result = aggregate(arguments.platform_root, arguments.source_commit)
+        result = aggregate(
+            arguments.platform_root,
+            arguments.source_commit,
+            expected_tree=arguments.expected_tree,
+        )
         arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     except (GateFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"native G7 aggregate failed: {error}")

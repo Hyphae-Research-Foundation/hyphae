@@ -16,7 +16,47 @@ from tools.check_native_g7_g8_readiness import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def copy_authority(root: Path) -> None:
+    (root / "config").mkdir()
+    (root / ".github/workflows").mkdir(parents=True)
+    for name in (
+        "native-g7-readiness-profile.json",
+        "native-g8-readiness-profile.json",
+        "native-g8-suite-manifest.json",
+    ):
+        (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
+    for name in ("native-g8-closure.yml", "native-g7-g8-readiness.yml"):
+        (root / ".github/workflows" / name).write_bytes(
+            (ROOT / ".github/workflows" / name).read_bytes()
+        )
+
+
 class NativeG7G8ReadinessTests(unittest.TestCase):
+    def test_g7_numeric_threshold_authority_fails_closed_when_malformed(self) -> None:
+        for field, replacement in (("p50", 0), ("p99", "10000")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                copy_authority(root)
+                path = root / "config/native-g7-readiness-profile.json"
+                profile = json.loads(path.read_text(encoding="utf-8"))
+                profile["warm_targets_nanoseconds"]["embedded-structure-point-get"][
+                    field
+                ] = replacement
+                path.write_text(json.dumps(profile), encoding="utf-8")
+                with self.assertRaisesRegex(GateFailure, "latency targets"):
+                    validate(root, "a" * 40)
+
+    def test_g7_authority_requires_the_exact_hot_warmup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            copy_authority(root)
+            path = root / "config/native-g7-readiness-profile.json"
+            profile = json.loads(path.read_text(encoding="utf-8"))
+            profile["required_hot_warmup"] = 99_999
+            path.write_text(json.dumps(profile), encoding="utf-8")
+            with self.assertRaisesRegex(GateFailure, "measurement authority"):
+                validate(root, "a" * 40)
+
     def test_g8_sbom_authority_uses_the_exact_release_verifier(self) -> None:
         manifest = json.loads(
             (ROOT / "config/native-g8-suite-manifest.json").read_text()

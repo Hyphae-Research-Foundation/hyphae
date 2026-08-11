@@ -2,9 +2,36 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 import copy
+import json
+import subprocess
 import unittest
+from pathlib import Path
 
-from tools.check_native_g7_receipt import GateFailure, validate
+from tools.check_native_g7_receipt import (
+    GateFailure,
+    resolve_expected_tree,
+    validate as validate_receipt,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+COMMIT = "a" * 40
+TREE = "d" * 40
+
+
+def validate(
+    payload: dict,
+    expected_commit: str,
+    **kwargs: object,
+) -> dict:
+    kwargs.setdefault("expected_tree", TREE)
+    return validate_receipt(payload, expected_commit, **kwargs)
+
+
+def readiness_profile() -> dict:
+    return json.loads(
+        (ROOT / "config/native-g7-readiness-profile.json").read_text(encoding="utf-8")
+    )
 
 
 def receipt() -> dict:
@@ -96,10 +123,11 @@ def receipt() -> dict:
             "target": "x86_64-unknown-linux-gnu",
             "os": "Linux-test",
             "binary_sha256": "c" * 64,
-            "source_tree": "d" * 40,
+            "source_tree": TREE,
         },
         "dataset": {
             "observations": 1_000_000,
+            "warmup": 100_000,
             "search_documents": 1_000_000,
             "vector_count": 1_000_000,
             "vector_dimension": 384,
@@ -231,6 +259,53 @@ class G7ReceiptTests(unittest.TestCase):
     def test_valid_receipt(self) -> None:
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
+
+    def test_build_source_tree_must_equal_the_expected_tree_not_commit(self) -> None:
+        self.assertNotEqual(COMMIT, TREE)
+        self.assertEqual(validate(receipt(), COMMIT)["status"], "passed")
+        payload = receipt()
+        payload["build"]["source_tree"] = "e" * 40
+        with self.assertRaisesRegex(GateFailure, "source tree"):
+            validate(payload, COMMIT)
+
+    def test_source_tree_resolver_uses_the_commit_tree_object(self) -> None:
+        commit = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ("git", "rev-parse", "HEAD^{tree}"),
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertNotEqual(commit, tree)
+        self.assertEqual(resolve_expected_tree(commit, repository=ROOT), tree)
+
+    def test_dataset_requires_exact_closure_observations_and_warmup(self) -> None:
+        for field, value in (
+            ("observations", 999_999),
+            ("observations", 1_000_001),
+            ("warmup", 99_999),
+            ("warmup", 100_001),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["dataset"][field] = value
+                with self.assertRaisesRegex(GateFailure, "measurement counts"):
+                    validate(payload, "a" * 40)
+
+    def test_latency_targets_are_derived_from_the_profile_authority(self) -> None:
+        profile = readiness_profile()
+        profile["warm_targets_nanoseconds"]["bm25-top10"]["p99"] = 499_999
+        payload = receipt()
+        payload["cells"]["bm25-top10"]["p99"] = 500_000
+        with self.assertRaisesRegex(GateFailure, "latency target"):
+            validate(payload, "a" * 40, profile=profile)
 
     def test_ann_cell_requires_durable_read_view_and_worker_budget(self) -> None:
         payload = receipt()

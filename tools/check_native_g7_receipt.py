@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,49 +20,160 @@ MAX_INITIAL_ANN_BULK_PARTITIONS = 111
 G7_LOGICAL_ANN_PARTITIONS = 64
 G7_PREFERRED_ANN_PARTITIONS = 32
 G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
-CELLS = {
-    "embedded-structure-point-get",
-    "embedded-prepared-sql-primary-key",
-    "local-structure-point-get",
-    "local-prepared-sql-primary-key",
-    "indexed-sql-bounded-read",
-    "two-index-join-bounded-read",
-    "bm25-top10",
-    "filtered-bm25-top10",
-    "ann-top10-recall-095",
-    "hybrid-top10",
-    "strict-group-commit",
-}
-TARGETS_NS = {
-    "embedded-structure-point-get": (2_000, 10_000),
-    "local-structure-point-get": (25_000, 100_000),
-    "embedded-prepared-sql-primary-key": (5_000, 25_000),
-    "local-prepared-sql-primary-key": (35_000, 150_000),
-    "indexed-sql-bounded-read": (50_000, 250_000),
-    "two-index-join-bounded-read": (75_000, 400_000),
-    "bm25-top10": (100_000, 500_000),
-    "filtered-bm25-top10": (200_000, 750_000),
-    "ann-top10-recall-095": (250_000, 900_000),
-    "hybrid-top10": (400_000, 950_000),
-}
-COUNTERS = {
-    "allocations",
-    "rss",
-    "cpu_cycles",
-    "cache_misses",
-    "page_faults",
-    "bytes_read",
-    "bytes_written",
-}
+G7_PROFILE_PATH = Path(__file__).resolve().parents[1] / "config/native-g7-readiness-profile.json"
 
 
 class GateFailure(ValueError):
     pass
 
 
-def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
+@dataclass(frozen=True)
+class G7ProfileAuthority:
+    cells: frozenset[str]
+    counters: frozenset[str]
+    observations: int
+    warmup: int
+    documents: int
+    vectors: int
+    vector_dimension: int
+    warm_targets: dict[str, tuple[int, int]]
+    advisory_targets: dict[str, tuple[int, int]]
+
+
+def _latency_targets(value: object, name: str) -> dict[str, tuple[int, int]]:
+    if not isinstance(value, dict):
+        raise GateFailure(f"G7 {name} latency targets are invalid")
+    targets: dict[str, tuple[int, int]] = {}
+    for surface, target in value.items():
+        if (
+            not isinstance(surface, str)
+            or not surface
+            or not isinstance(target, dict)
+            or set(target) != {"p50", "p99"}
+        ):
+            raise GateFailure(f"G7 {name} latency targets are invalid")
+        p50 = target["p50"]
+        p99 = target["p99"]
+        if (
+            not isinstance(p50, int)
+            or isinstance(p50, bool)
+            or not isinstance(p99, int)
+            or isinstance(p99, bool)
+            or p50 <= 0
+            or p99 < p50
+        ):
+            raise GateFailure(f"G7 {name} latency targets are invalid")
+        targets[surface] = (p50, p99)
+    return targets
+
+
+def profile_authority(profile: object) -> G7ProfileAuthority:
+    if not isinstance(profile, dict):
+        raise GateFailure("G7 readiness profile must be an object")
+    cells_value = profile.get("required_cells")
+    counters_value = profile.get("required_counters")
+    dataset = profile.get("required_dataset")
+    observations = profile.get("minimum_hot_observations")
+    warmup = profile.get("required_hot_warmup")
+    if (
+        not isinstance(cells_value, list)
+        or not cells_value
+        or any(not isinstance(cell, str) or not cell for cell in cells_value)
+        or len(cells_value) != len(set(cells_value))
+        or not isinstance(counters_value, list)
+        or not counters_value
+        or any(not isinstance(counter, str) or not counter for counter in counters_value)
+        or len(counters_value) != len(set(counters_value))
+        or not isinstance(dataset, dict)
+        or set(dataset) != {"documents", "vectors", "vector_dimension"}
+        or not isinstance(observations, int)
+        or isinstance(observations, bool)
+        or observations <= 0
+        or not isinstance(warmup, int)
+        or isinstance(warmup, bool)
+        or warmup <= 0
+        or any(
+            not isinstance(dataset[field], int)
+            or isinstance(dataset[field], bool)
+            or dataset[field] <= 0
+            for field in ("documents", "vectors", "vector_dimension")
+        )
+    ):
+        raise GateFailure("G7 normative measurement authority is invalid")
+    cells = frozenset(cells_value)
+    warm_targets = _latency_targets(profile.get("warm_targets_nanoseconds"), "warm")
+    advisory_targets = _latency_targets(
+        profile.get("advisory_targets_nanoseconds"),
+        "advisory",
+    )
+    if set(warm_targets).intersection(advisory_targets) or (
+        set(warm_targets) | set(advisory_targets)
+    ) != set(cells):
+        raise GateFailure("G7 latency targets do not cover the required cells exactly")
+    return G7ProfileAuthority(
+        cells=cells,
+        counters=frozenset(counters_value),
+        observations=observations,
+        warmup=warmup,
+        documents=dataset["documents"],
+        vectors=dataset["vectors"],
+        vector_dimension=dataset["vector_dimension"],
+        warm_targets=warm_targets,
+        advisory_targets=advisory_targets,
+    )
+
+
+def load_profile_authority(path: Path = G7_PROFILE_PATH) -> G7ProfileAuthority:
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise GateFailure(f"G7 readiness profile could not be loaded: {error}") from error
+    return profile_authority(profile)
+
+
+DEFAULT_AUTHORITY = load_profile_authority()
+CELLS = set(DEFAULT_AUTHORITY.cells)
+COUNTERS = set(DEFAULT_AUTHORITY.counters)
+
+
+def resolve_expected_tree(
+    expected_commit: str,
+    *,
+    repository: Path = Path(__file__).resolve().parents[1],
+) -> str:
     if HEX40.fullmatch(expected_commit) is None:
         raise GateFailure("source commit is not canonical SHA-1")
+    try:
+        completed = subprocess.run(
+            ("git", "rev-parse", "--verify", f"{expected_commit}^{{tree}}"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise GateFailure("G7 source tree authority could not be resolved") from error
+    source_tree = completed.stdout.strip()
+    if HEX40.fullmatch(source_tree) is None:
+        raise GateFailure("resolved G7 source tree is not canonical SHA-1")
+    return source_tree
+
+
+def validate(
+    payload: dict[str, Any],
+    expected_commit: str,
+    *,
+    expected_tree: str | None = None,
+    profile: object | None = None,
+) -> dict[str, Any]:
+    if HEX40.fullmatch(expected_commit) is None:
+        raise GateFailure("source commit is not canonical SHA-1")
+    if expected_tree is None:
+        expected_tree = resolve_expected_tree(expected_commit)
+    elif HEX40.fullmatch(expected_tree) is None:
+        raise GateFailure("expected source tree is not canonical SHA-1")
+    authority = DEFAULT_AUTHORITY if profile is None else profile_authority(profile)
     required = {
         "schema", "gate", "status", "evidence_class", "source_commit", "platform",
         "state", "concurrency", "background_mode", "dataset", "hardware", "cells", "counters", "saturation",
@@ -88,14 +201,15 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
     dataset = payload["dataset"]
     if (
         not isinstance(dataset, dict)
-        or dataset.get("observations", 0) < 1_000_000
-        or dataset.get("search_documents", 0) < 1_000_000
-        or dataset.get("vector_count", 0) < 1_000_000
-        or dataset.get("vector_dimension") != 384
+        or dataset.get("observations") != authority.observations
+        or dataset.get("warmup") != authority.warmup
+        or dataset.get("search_documents") != authority.documents
+        or dataset.get("vector_count") != authority.vectors
+        or dataset.get("vector_dimension") != authority.vector_dimension
         or not isinstance(dataset.get("generator"), str)
         or HEX64.fullmatch(dataset.get("digest", "")) is None
     ):
-        raise GateFailure("G7 dataset does not meet the normative corpus")
+        raise GateFailure("G7 dataset measurement counts or corpus differ from authority")
     build = payload["build"]
     if (
         not isinstance(build, dict)
@@ -114,9 +228,9 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         )
         or any(not isinstance(build.get(field), str) or not build[field] for field in ("rustc", "cargo", "target", "os"))
         or HEX64.fullmatch(str(build.get("binary_sha256", ""))) is None
-        or HEX40.fullmatch(str(build.get("source_tree", ""))) is None
+        or build.get("source_tree") != expected_tree
     ):
-        raise GateFailure("G7 build identity is incomplete")
+        raise GateFailure("G7 build identity or source tree is incomplete")
     workload = payload["workload"]
     expected_workload = {
         "structure_keys": 2_048,
@@ -156,7 +270,7 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         or saturation.get("status") != "measured"
         or saturation.get("levels") != [1, 8, 32]
         or saturation.get("method") != "executed-concurrency-sweep"
-        or set(saturation.get("throughput_per_second", {})) != CELLS
+        or set(saturation.get("throughput_per_second", {})) != set(authority.cells)
     ):
         raise GateFailure("G7 saturation evidence is incomplete")
     for levels in saturation["throughput_per_second"].values():
@@ -169,11 +283,11 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
     if expected_background == "measured" and (
         not isinstance(background.get("operations"), int)
         or background["operations"] <= 0
-        or set(background.get("p99_ratio_by_cell", {})) != CELLS
+        or set(background.get("p99_ratio_by_cell", {})) != set(authority.cells)
     ):
         raise GateFailure("G7 background control comparison is incomplete")
     cells = payload["cells"]
-    if not isinstance(cells, dict) or set(cells) != CELLS:
+    if not isinstance(cells, dict) or set(cells) != set(authority.cells):
         raise GateFailure("G7 cell identity is invalid")
     for name, cell in cells.items():
         if not isinstance(cell, dict) or cell.get("status") != "measured":
@@ -198,9 +312,9 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
             payload["state"] == "warm"
             and payload["concurrency"] == 1
             and payload["background_mode"] == "control"
-            and name in TARGETS_NS
+            and name in authority.warm_targets
         ):
-            target_p50, target_p99 = TARGETS_NS[name]
+            target_p50, target_p99 = authority.warm_targets[name]
             if cell["p50"] > target_p50 or cell["p99"] > target_p99:
                 raise GateFailure(f"G7 latency target missed: {name}")
     ann_recall = cells["ann-top10-recall-095"].get("recall_at_10")
@@ -212,7 +326,7 @@ def validate(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
         payload["dataset"]["observations"],
     )
     counters = payload["counters"]
-    if set(counters) != COUNTERS:
+    if set(counters) != set(authority.counters):
         raise GateFailure("G7 counters are incomplete")
     for name, counter in counters.items():
         if not isinstance(counter, dict) or counter.get("status") != "measured":
@@ -452,11 +566,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-tree")
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     try:
         payload = json.loads(arguments.receipt.read_text(encoding="utf-8"))
-        result = validate(payload, arguments.expected_commit)
+        result = validate(
+            payload,
+            arguments.expected_commit,
+            expected_tree=arguments.expected_tree,
+        )
         arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except (GateFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"native G7 receipt failed: {error}")
