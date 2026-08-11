@@ -73,6 +73,9 @@ def signed_release() -> dict:
         "signature_verifications": 12,
         "attestation_verifications": 12,
         "software_license": "AGPL-3.0-only",
+        "license_authority": "tracked-package-manifests-and-local-locks-v1",
+        "first_party_artifact_count": 78,
+        "first_party_identity_count": 32,
         "spdx_hyphae_components": ["hyphae-native-runtime"],
         "cyclonedx_hyphae_components": ["hyphae-native-runtime"],
         "spdx_sha256": "1" * 64,
@@ -300,6 +303,9 @@ class G8ProducerTests(unittest.TestCase):
     def test_signed_release_requires_semantically_verified_agpl_sboms(self) -> None:
         for field, value in (
             ("software_license", "GPL-3.0-only"),
+            ("license_authority", "untrusted"),
+            ("first_party_artifact_count", 77),
+            ("first_party_identity_count", 31),
             ("spdx_hyphae_components", []),
             ("cyclonedx_hyphae_components", []),
             ("spdx_hyphae_components", ["third-party-runtime"]),

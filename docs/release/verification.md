@@ -184,10 +184,31 @@ identity and `--type spdxjson` or `--type cyclonedx`, respectively.
 
 ## 5. Inspect and smoke-test
 
-The SPDX and CycloneDX JSON files are dependency inventories. Retain them with
-the installed binary. Extract the archive into an empty directory and confirm
-that it contains one executable plus `LICENSE`, `README.md`, and
-`THIRD_PARTY_NOTICES.md`:
+The SPDX and CycloneDX JSON files contain the normalized package inventory,
+including first-party Hyphae components and third-party dependencies. Retain
+them with the installed binary. For every first-party Hyphae identity, require:
+
+- SPDX `licenseDeclared` and `licenseConcluded` both equal
+  `AGPL-3.0-only`;
+- the CycloneDX license expression or identifier equals `AGPL-3.0-only`;
+- the complete multiset of `(name, version, purl)` identities, including
+  duplicate observations, is identical between SPDX and CycloneDX.
+
+The release pipeline derives both formats from one normalized Syft inventory.
+Each discovered first-party license conclusion is backed by an exact Cargo or
+npm package manifest authority plus applicable local lock/source evidence. The
+Python SDK, which the pinned scanner does not discover from `pyproject.toml`,
+is added as an explicitly identified manifest-backed component rather than as
+scanner evidence. An unsupported discovered first-party package type fails
+closed.
+Third-party artifacts retain the licenses observed by Syft; the first-party
+conclusion step must not rewrite them. The signed G8 release verifier rejects
+missing or mismatched first-party license fields, any difference from the
+complete lock-derived plus Python-manifest inventory, and any cross-format
+first-party identity drift.
+
+Extract the archive into an empty directory and confirm that it contains one
+executable plus `LICENSE`, `README.md`, and `THIRD_PARTY_NOTICES.md`:
 
 ```bash
 tar -xzf hyphae-VERSION-TARGET.tar.gz

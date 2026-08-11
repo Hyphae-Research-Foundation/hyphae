@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -106,17 +107,184 @@ def literal_tuple(path: Path, name: str) -> tuple[str, ...] | None:
     return None
 
 
-def toml_string(path: Path, section: str, key: str) -> str | None:
-    current_section = ""
-    assignment = re.compile(rf'^{re.escape(key)}\s*=\s*"([^"]+)"\s*$')
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line.startswith("[") and line.endswith("]"):
-            current_section = line[1:-1]
+def manifest_paths(root: Path, name: str) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob(name)
+        if path.is_file()
+        and not IGNORED_GENERATED_DIRECTORIES.intersection(
+            path.relative_to(root).parts
+        )
+    )
+
+
+def manifest_name(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def read_toml_manifest(
+    path: Path, root: Path, failures: list[str]
+) -> dict[str, object] | None:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        failures.append(f"{manifest_name(path, root)}: malformed TOML: {error}")
+        return None
+
+
+def read_json_manifest(
+    path: Path, root: Path, failures: list[str]
+) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        failures.append(f"{manifest_name(path, root)}: malformed JSON: {error}")
+        return None
+    if not isinstance(value, dict):
+        failures.append(f"{manifest_name(path, root)}: manifest must be an object")
+        return None
+    return value
+
+
+def nearest_workspace_license(
+    path: Path,
+    root: Path,
+    cargo_documents: dict[Path, dict[str, object]],
+) -> object:
+    directory = path.parent
+    while True:
+        workspace_document = cargo_documents.get(directory / "Cargo.toml")
+        workspace = (
+            workspace_document.get("workspace")
+            if workspace_document is not None
+            else None
+        )
+        if isinstance(workspace, dict):
+            package = workspace.get("package")
+            return package.get("license") if isinstance(package, dict) else None
+        if directory == root:
+            return None
+        if root not in directory.parents:
+            return None
+        directory = directory.parent
+
+
+def validate_cargo_package_manifests(root: Path) -> list[str]:
+    failures: list[str] = []
+    cargo_documents: dict[Path, dict[str, object]] = {}
+    for path in manifest_paths(root, "Cargo.toml"):
+        document = read_toml_manifest(path, root, failures)
+        if document is not None:
+            cargo_documents[path] = document
+
+    for path, document in cargo_documents.items():
+        relative = manifest_name(path, root)
+        workspace = document.get("workspace")
+        if isinstance(workspace, dict) and "package" in workspace:
+            package_defaults = workspace.get("package")
+            if (
+                not isinstance(package_defaults, dict)
+                or package_defaults.get("license") != SOFTWARE_IDENTIFIER
+            ):
+                failures.append(
+                    f"{relative}: workspace package license differs from "
+                    f"{SOFTWARE_IDENTIFIER}"
+                )
+
+        package = document.get("package")
+        if package is None:
             continue
-        if current_section == section and (match := assignment.fullmatch(line)):
-            return match.group(1)
-    return None
+        if not isinstance(package, dict):
+            failures.append(f"{relative}: package manifest must be a table")
+            continue
+        license_value = package.get("license")
+        if license_value == SOFTWARE_IDENTIFIER:
+            continue
+        if license_value == {"workspace": True}:
+            license_value = nearest_workspace_license(path, root, cargo_documents)
+        if license_value != SOFTWARE_IDENTIFIER:
+            failures.append(
+                f"{relative}: package license does not resolve to "
+                f"{SOFTWARE_IDENTIFIER}"
+            )
+    return failures
+
+
+def validate_npm_package_manifests(root: Path) -> list[str]:
+    failures: list[str] = []
+    for path in manifest_paths(root, "package.json"):
+        document = read_json_manifest(path, root, failures)
+        if document is not None and document.get("license") != SOFTWARE_IDENTIFIER:
+            failures.append(
+                f"{manifest_name(path, root)}: package license differs from "
+                f"{SOFTWARE_IDENTIFIER}"
+            )
+
+    for path in manifest_paths(root, "package-lock.json"):
+        document = read_json_manifest(path, root, failures)
+        if document is None:
+            continue
+        packages = document.get("packages")
+        if not isinstance(packages, dict):
+            failures.append(
+                f"{manifest_name(path, root)}: packages must be an object"
+            )
+            continue
+        root_package = packages.get("")
+        if (
+            not isinstance(root_package, dict)
+            or root_package.get("license") != SOFTWARE_IDENTIFIER
+        ):
+            failures.append(
+                f"{manifest_name(path, root)}:packages..license differs from "
+                f"{SOFTWARE_IDENTIFIER}"
+            )
+        for package in packages.values():
+            if not isinstance(package, dict) or package.get("link") is not True:
+                continue
+            resolved = package.get("resolved")
+            target = packages.get(resolved) if isinstance(resolved, str) else None
+            if not isinstance(target, dict) or target.get("license") != SOFTWARE_IDENTIFIER:
+                target_name = resolved if isinstance(resolved, str) else "<unresolved>"
+                failures.append(
+                    f"{manifest_name(path, root)}:packages.{target_name}.license "
+                    f"differs from {SOFTWARE_IDENTIFIER}"
+                )
+    return failures
+
+
+def validate_python_package_manifests(root: Path) -> list[str]:
+    failures: list[str] = []
+    for path in manifest_paths(root, "pyproject.toml"):
+        document = read_toml_manifest(path, root, failures)
+        if document is None or "project" not in document:
+            continue
+        project = document.get("project")
+        relative = manifest_name(path, root)
+        if not isinstance(project, dict):
+            failures.append(f"{relative}: project manifest must be a table")
+            continue
+        if project.get("license") != SOFTWARE_IDENTIFIER:
+            failures.append(
+                f"{relative}: project license differs from {SOFTWARE_IDENTIFIER}"
+            )
+        license_files = project.get("license-files")
+        if (
+            not isinstance(license_files, list)
+            or not all(isinstance(item, str) for item in license_files)
+            or not set(PACKAGE_LICENSE_DOCUMENTS).issubset(license_files)
+        ):
+            failures.append(f"{relative}: license-files are incomplete")
+    return failures
+
+
+def validate_package_manifests(root: Path) -> list[str]:
+    root = root.resolve()
+    return [
+        *validate_cargo_package_manifests(root),
+        *validate_npm_package_manifests(root),
+        *validate_python_package_manifests(root),
+    ]
 
 
 def validate_openapi_license(path: Path) -> str | None:
@@ -143,52 +311,7 @@ def validate_repository(root: Path = ROOT) -> list[str]:
         elif sha256(path) != expected:
             failures.append(f"{relative}: canonical license text digest differs")
 
-    if toml_string(root / "Cargo.toml", "workspace.package", "license") != SOFTWARE_IDENTIFIER:
-        failures.append("Cargo.toml: workspace license differs from AGPL-3.0-only")
-    if toml_string(root / "fuzz" / "Cargo.toml", "package", "license") != SOFTWARE_IDENTIFIER:
-        failures.append("fuzz/Cargo.toml: package license differs from AGPL-3.0-only")
-    if (
-        toml_string(
-            root / "sdks" / "python" / "pyproject.toml",
-            "project",
-            "license",
-        )
-        != SOFTWARE_IDENTIFIER
-    ):
-        failures.append("sdks/python/pyproject.toml: license differs from AGPL-3.0-only")
-    python_project = (root / "sdks" / "python" / "pyproject.toml").read_text(
-        encoding="utf-8"
-    )
-    if (
-        'license-files = ["LICENSE", "LICENSE-DOCUMENTATION", '
-        '"LICENSE-POLICY.md"]'
-        not in python_project
-    ):
-        failures.append("sdks/python/pyproject.toml: license-files are incomplete")
-
-    json_licenses = (
-        ("sdks/typescript/package.json", ("license",)),
-        ("sdks/typescript/package-lock.json", ("packages", "", "license")),
-        ("integrations/javascript/package.json", ("license",)),
-        ("integrations/javascript/package-lock.json", ("packages", "", "license")),
-        ("integrations/host-smoke/package.json", ("license",)),
-        ("integrations/host-smoke/package-lock.json", ("packages", "", "license")),
-        (
-            "integrations/javascript/package-lock.json",
-            ("packages", "../../sdks/typescript", "license"),
-        ),
-    )
-    for relative, keys in json_licenses:
-        value: object = json.loads((root / relative).read_text(encoding="utf-8"))
-        for key in keys:
-            if not isinstance(value, dict) or key not in value:
-                value = None
-                break
-            value = value[key]
-        if value != SOFTWARE_IDENTIFIER:
-            failures.append(
-                f"{relative}:{'.'.join(keys)} differs from {SOFTWARE_IDENTIFIER}"
-            )
+    failures.extend(validate_package_manifests(root))
 
     for relative in (
         "sdks/typescript/package.json",

@@ -424,6 +424,10 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
         or payload["signature_verifications"] not in {12, 13}
         or payload.get("attestation_verifications") != 12
         or payload.get("software_license") != SOFTWARE_LICENSE
+        or payload.get("license_authority")
+        != "tracked-package-manifests-and-local-locks-v1"
+        or payload.get("first_party_artifact_count") != 78
+        or payload.get("first_party_identity_count") != 32
         or not is_canonical_component_list(spdx_components)
         or not is_canonical_component_list(cyclonedx_components)
         or not isinstance(payload.get("provenance_targets"), list)
@@ -444,6 +448,15 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
         "cyclonedx": (
             f"CycloneDX SBOM verified {SOFTWARE_LICENSE} for "
             f"{len(cyclonedx_components)} Hyphae components ({digests[1]})"
+        ),
+        "manifest-license-authority": (
+            "all first-party license conclusions were bound to tracked package "
+            "manifests and local lock/source evidence"
+        ),
+        "identity-completeness": (
+            f"complete first-party inventory verified: "
+            f"{payload['first_party_artifact_count']} artifacts and "
+            f"{payload['first_party_identity_count']} canonical identities"
         ),
         "checksums": f"canonical SHA256SUMS verified ({digests[2]})",
         "cosign": f"{payload['signature_verifications']} signatures and 12 attestations cryptographically verified",

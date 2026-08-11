@@ -40,6 +40,19 @@ The root `LICENSE` contains the canonical AGPLv3 text,
 under their original Apache-2.0 terms; this decision governs the repository
 after adoption and future releases.
 
+For future release SBOMs, tracked first-party package manifests are the
+authority for Hyphae package name, version, and license. The release pipeline
+may conclude `AGPL-3.0-only` only after a discovered first-party artifact
+matches that exact manifest authority and its applicable local lock/source
+evidence. Because the pinned scanner does not catalog the Python source
+manifest, the normalizer records that one package as an explicit
+manifest-backed supplement rather than presenting it as scanner discovery.
+The conclusion step does not rewrite third-party artifacts or their observed
+licenses. SPDX and CycloneDX are derived from the same normalized inventory,
+and release verification requires equality with the complete lock-derived plus
+Python-manifest first-party inventory and exact multiset parity of first-party
+`(name, version, purl)` identities between both formats.
+
 ## Consequences
 
 - Distributed modified software must satisfy AGPLv3 source and license duties.
@@ -56,6 +69,8 @@ after adoption and future releases.
 
 CI verifies the canonical license-text digests, package metadata, OpenAPI
 metadata, authored source SPDX identifiers, generated-client headers, archive
-contents, and absence of stale project-license declarations. Historical
-release records, dependency evidence, and the porting ledger are explicit
-exceptions because they describe third-party or prior-version facts.
+contents, absence of stale project-license declarations, manifest-backed
+first-party SBOM license conclusions, and complete cross-format first-party
+identity parity for the normalized inventory. Historical release records,
+dependency evidence, and the porting ledger are explicit exceptions because
+they describe third-party or prior-version facts.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 
+from collections import Counter
 import json
 import sys
 import tempfile
@@ -29,6 +30,13 @@ def spdx(license_identifier: str = "AGPL-3.0-only") -> dict:
         "packages": [
             {
                 "name": "hyphae-native-runtime",
+                "versionInfo": "1.0.1",
+                "externalRefs": [
+                    {
+                        "referenceType": "purl",
+                        "referenceLocator": "pkg:cargo/hyphae-native-runtime@1.0.1",
+                    }
+                ],
                 "licenseDeclared": license_identifier,
                 "licenseConcluded": license_identifier,
             },
@@ -46,6 +54,8 @@ def cyclonedx(license_identifier: str = "AGPL-3.0-only") -> dict:
         "components": [
             {
                 "name": "hyphae-native-runtime",
+                "version": "1.0.1",
+                "purl": "pkg:cargo/hyphae-native-runtime@1.0.1",
                 "licenses": [{"license": {"id": license_identifier}}],
             },
             {
@@ -79,6 +89,18 @@ class G8ReleaseVerificationTests(unittest.TestCase):
                 patch("g8_release_verification.run") as run,
                 patch("g8_release_verification.verify_blob") as blob,
                 patch("g8_release_verification.verify_attestation") as attestation,
+                patch(
+                    "g8_release_verification.expected_hyphae_identities",
+                    return_value=Counter(
+                        {
+                            (
+                                "hyphae-native-runtime",
+                                "1.0.1",
+                                "pkg:cargo/hyphae-native-runtime@1.0.1",
+                            ): 1
+                        }
+                    ),
+                ),
             ):
                 result = verify(
                     directory,
@@ -95,6 +117,12 @@ class G8ReleaseVerificationTests(unittest.TestCase):
             self.assertEqual(blob.call_count, 8)
             self.assertEqual(attestation.call_count, 12)
             self.assertEqual(result["software_license"], "AGPL-3.0-only")
+            self.assertEqual(
+                result["license_authority"],
+                "tracked-package-manifests-and-local-locks-v1",
+            )
+            self.assertEqual(result["first_party_artifact_count"], 1)
+            self.assertEqual(result["first_party_identity_count"], 1)
             self.assertEqual(
                 result["spdx_hyphae_components"], ["hyphae-native-runtime"]
             )
@@ -140,6 +168,75 @@ class G8ReleaseVerificationTests(unittest.TestCase):
             verify_cyclonedx_hyphae_licenses(
                 {"components": cyclonedx()["components"][1:]}
             )
+
+    def test_verify_rejects_spdx_cyclonedx_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in expected_archives(TAG):
+                (directory / name).write_bytes(name.encode("ascii"))
+            (directory / f"hyphae-{TAG}.spdx.json").write_text(
+                json.dumps(spdx()), encoding="utf-8"
+            )
+            drifted = cyclonedx()
+            drifted["components"][0]["version"] = "9.9.9"
+            (directory / f"hyphae-{TAG}.cdx.json").write_text(
+                json.dumps(drifted), encoding="utf-8"
+            )
+            for name in (f"hyphae-{TAG}.release-evidence.json", "SHA256SUMS"):
+                (directory / name).write_text(name, encoding="ascii")
+            with (
+                patch("g8_release_verification.run"),
+                patch(
+                    "g8_release_verification.expected_hyphae_identities",
+                    return_value=Counter(
+                        {
+                            (
+                                "hyphae-native-runtime",
+                                "1.0.1",
+                                "pkg:cargo/hyphae-native-runtime@1.0.1",
+                            ): 1
+                        }
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identities differ"):
+                    verify(directory, COMMIT, TAG, "workflow-identity")
+
+    def test_verify_rejects_matching_but_truncated_sbom_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in expected_archives(TAG):
+                (directory / name).write_bytes(name.encode("ascii"))
+            (directory / f"hyphae-{TAG}.spdx.json").write_text(
+                json.dumps(spdx()), encoding="utf-8"
+            )
+            (directory / f"hyphae-{TAG}.cdx.json").write_text(
+                json.dumps(cyclonedx()), encoding="utf-8"
+            )
+            for name in (f"hyphae-{TAG}.release-evidence.json", "SHA256SUMS"):
+                (directory / name).write_text(name, encoding="ascii")
+            with (
+                patch("g8_release_verification.run"),
+                patch(
+                    "g8_release_verification.expected_hyphae_identities",
+                    return_value=Counter(
+                        {
+                            (
+                                "hyphae-native-runtime",
+                                "1.0.1",
+                                "pkg:cargo/hyphae-native-runtime@1.0.1",
+                            ): 1,
+                            (
+                                "hyphae-core",
+                                "1.0.1",
+                                "pkg:cargo/hyphae-core@1.0.1",
+                            ): 1,
+                        }
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "omits or adds"):
+                    verify(directory, COMMIT, TAG, "workflow-identity")
 
     def test_verify_rejects_partial_tag_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

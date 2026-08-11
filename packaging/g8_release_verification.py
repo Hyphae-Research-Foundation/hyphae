@@ -6,12 +6,18 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+from conclude_release_sbom_licenses import (
+    discover_package_authorities,
+    expected_artifact_identities,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +53,29 @@ def verify_spdx_hyphae_licenses(document: object) -> list[str]:
     if not verified:
         raise RuntimeError("SPDX SBOM contains no Hyphae component")
     return sorted(verified)
+
+
+def spdx_hyphae_identities(document: object) -> list[tuple[str, str, str]]:
+    if not isinstance(document, dict) or not isinstance(document.get("packages"), list):
+        raise RuntimeError("SPDX SBOM packages must be a list")
+    identities: list[tuple[str, str, str]] = []
+    for package in document["packages"]:
+        if not isinstance(package, dict) or not is_hyphae_component(package.get("name")):
+            continue
+        name = package["name"]
+        version = package.get("versionInfo")
+        references = package.get("externalRefs")
+        if not isinstance(version, str) or not isinstance(references, list):
+            raise RuntimeError(f"SPDX Hyphae component {name} identity is incomplete")
+        purls = [
+            reference.get("referenceLocator")
+            for reference in references
+            if isinstance(reference, dict) and reference.get("referenceType") == "purl"
+        ]
+        if len(purls) != 1 or not isinstance(purls[0], str):
+            raise RuntimeError(f"SPDX Hyphae component {name} must have one package URL")
+        identities.append((name, version, purls[0]))
+    return identities
 
 
 def cyclonedx_license_identifiers(component: dict) -> list[str] | None:
@@ -112,6 +141,32 @@ def verify_cyclonedx_hyphae_licenses(document: object) -> list[str]:
     if not verified:
         raise RuntimeError("CycloneDX SBOM contains no Hyphae component")
     return sorted(verified)
+
+
+def cyclonedx_hyphae_identities(document: object) -> list[tuple[str, str, str]]:
+    if not isinstance(document, dict):
+        raise RuntimeError("CycloneDX SBOM must be an object")
+    identities: list[tuple[str, str, str]] = []
+    for component in cyclonedx_components(document):
+        if not is_hyphae_component(component.get("name")):
+            continue
+        name = component["name"]
+        version = component.get("version")
+        purl = component.get("purl")
+        if not isinstance(version, str) or not isinstance(purl, str):
+            raise RuntimeError(
+                f"CycloneDX Hyphae component {name} identity is incomplete"
+            )
+        identities.append((name, version, purl))
+    return identities
+
+
+def expected_hyphae_identities(root: Path = ROOT) -> Counter[tuple[str, str, str]]:
+    authorities = discover_package_authorities(root)
+    return Counter(
+        (identity.name, identity.version, identity.purl)
+        for identity in expected_artifact_identities(root, authorities).elements()
+    )
 
 
 def read_json_document(path: Path, label: str) -> object:
@@ -195,12 +250,19 @@ def verify(
     checksums = directory / "SHA256SUMS"
     if not all(path.is_file() for path in (spdx, cyclonedx, checksums, manifest)):
         raise RuntimeError("G8 release metadata set is incomplete")
-    spdx_components = verify_spdx_hyphae_licenses(
-        read_json_document(spdx, "SPDX SBOM")
-    )
+    spdx_document = read_json_document(spdx, "SPDX SBOM")
+    cyclonedx_document = read_json_document(cyclonedx, "CycloneDX SBOM")
+    spdx_components = verify_spdx_hyphae_licenses(spdx_document)
     cyclonedx_component_names = verify_cyclonedx_hyphae_licenses(
-        read_json_document(cyclonedx, "CycloneDX SBOM")
+        cyclonedx_document
     )
+    spdx_identities = Counter(spdx_hyphae_identities(spdx_document))
+    cyclonedx_identities = Counter(cyclonedx_hyphae_identities(cyclonedx_document))
+    if spdx_identities != cyclonedx_identities:
+        raise RuntimeError("SPDX and CycloneDX Hyphae component identities differ")
+    expected_identities = expected_hyphae_identities()
+    if spdx_identities != expected_identities:
+        raise RuntimeError("release SBOM omits or adds first-party package identities")
     signatures = 0
     attestations = 0
     for path in sorted(directory.iterdir()):
@@ -231,6 +293,9 @@ def verify(
         "signature_verifications": signatures,
         "attestation_verifications": attestations,
         "software_license": SOFTWARE_LICENSE,
+        "license_authority": "tracked-package-manifests-and-local-locks-v1",
+        "first_party_artifact_count": sum(expected_identities.values()),
+        "first_party_identity_count": len(expected_identities),
         "spdx_hyphae_components": spdx_components,
         "cyclonedx_hyphae_components": cyclonedx_component_names,
         "spdx_sha256": hashlib.sha256(spdx.read_bytes()).hexdigest(),

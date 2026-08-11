@@ -184,24 +184,25 @@ jobs:
           fi
           echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
           echo "RELEASE_COMMIT=$RELEASE_COMMIT_INPUT" >> "$GITHUB_ENV"
-      - name: Generate SPDX JSON SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          path: .
-          format: spdx-json
-          output-file: dist/hyphae-${{ env.RELEASE_TAG }}.spdx.json
           syft-version: v1.46.0
-          upload-artifact: false
-          upload-release-assets: false
-      - name: Generate CycloneDX JSON SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: .
-          format: cyclonedx-json
-          output-file: dist/hyphae-${{ env.RELEASE_TAG }}.cdx.json
-          syft-version: v1.46.0
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Generate manifest-backed release SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          syft="${{ steps.syft.outputs.cmd }}"
+          native_sbom="${RUNNER_TEMP}/hyphae-${RELEASE_TAG}.syft.json"
+          spdx_sbom="dist/hyphae-${RELEASE_TAG}.spdx.json"
+          cyclonedx_sbom="dist/hyphae-${RELEASE_TAG}.cdx.json"
+          "$syft" scan dir:. -o "syft-json=${native_sbom}"
+          python packaging/conclude_release_sbom_licenses.py \
+            --input "$native_sbom" \
+            --root .
+          "$syft" convert "$native_sbom" -o "spdx-json=${spdx_sbom}"
+          "$syft" convert "$native_sbom" -o "cyclonedx-json=${cyclonedx_sbom}"
       - name: Bind successful hosted checks for a tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:

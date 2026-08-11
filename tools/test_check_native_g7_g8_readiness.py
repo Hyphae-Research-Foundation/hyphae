@@ -17,6 +17,69 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeG7G8ReadinessTests(unittest.TestCase):
+    def test_g8_sbom_authority_uses_the_exact_release_verifier(self) -> None:
+        manifest = json.loads(
+            (ROOT / "config/native-g8-suite-manifest.json").read_text()
+        )
+        row = next(
+            requirement
+            for requirement in manifest["requirements"]
+            if requirement["id"] == "sbom-signatures-provenance"
+        )
+        self.assertEqual(
+            row,
+            {
+                "id": "sbom-signatures-provenance",
+                "status": "implemented-unhosted",
+                "platforms": ["release"],
+                "runner": "python packaging/g8_release_verification.py",
+                "acceptance": [
+                    "spdx",
+                    "cyclonedx",
+                    "manifest-license-authority",
+                    "identity-completeness",
+                    "checksums",
+                    "cosign",
+                    "provenance",
+                ],
+            },
+        )
+
+    def test_g8_sbom_authority_drift_fails_closed(self) -> None:
+        for field, replacement in (
+            ("runner", "python packaging/release_evidence.py verify"),
+            ("acceptance", ["spdx", "cyclonedx"]),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "config").mkdir()
+                (root / ".github/workflows").mkdir(parents=True)
+                for name in (
+                    "native-g7-readiness-profile.json",
+                    "native-g8-readiness-profile.json",
+                    "native-g8-suite-manifest.json",
+                ):
+                    (root / "config" / name).write_bytes(
+                        (ROOT / "config" / name).read_bytes()
+                    )
+                path = root / "config/native-g8-suite-manifest.json"
+                payload = json.loads(path.read_text())
+                row = next(
+                    requirement
+                    for requirement in payload["requirements"]
+                    if requirement["id"] == "sbom-signatures-provenance"
+                )
+                row[field] = replacement
+                path.write_text(json.dumps(payload))
+                (root / ".github/workflows/native-g8-closure.yml").write_bytes(
+                    (ROOT / ".github/workflows/native-g8-closure.yml").read_bytes()
+                )
+                (root / ".github/workflows/native-g7-g8-readiness.yml").write_bytes(
+                    (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_bytes()
+                )
+                with self.assertRaisesRegex(GateFailure, "SBOM authority drifted"):
+                    validate(root, "a" * 40)
+
     def test_checked_in_authority_is_open_and_claim_free(self) -> None:
         result = validate(ROOT, "a" * 40)
         self.assertEqual(result["status"], "passed")

@@ -14,6 +14,21 @@ from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+G8_SBOM_AUTHORITY = {
+    "id": "sbom-signatures-provenance",
+    "status": "implemented-unhosted",
+    "platforms": ["release"],
+    "runner": "python packaging/g8_release_verification.py",
+    "acceptance": [
+        "spdx",
+        "cyclonedx",
+        "manifest-license-authority",
+        "identity-completeness",
+        "checksums",
+        "cosign",
+        "provenance",
+    ],
+}
 
 
 class GateFailure(ValueError):
@@ -127,6 +142,12 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
             or not row["runner"]
         ):
             raise GateFailure(f"invalid G8 suite definition: {row.get('id')}")
+    sbom = next(
+        (row for row in rows if row.get("id") == "sbom-signatures-provenance"),
+        None,
+    )
+    if sbom != G8_SBOM_AUTHORITY:
+        raise GateFailure("G8 SBOM authority drifted")
     packaging = next((row for row in rows if row.get("id") == "multiplatform-packaging"), None)
     if (
         g8.get("required_platforms") != ["linux", "macos", "windows"]
