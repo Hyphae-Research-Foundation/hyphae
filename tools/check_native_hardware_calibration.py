@@ -201,10 +201,9 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     passed = correctness["status"] == "passed"
     if passed != (result_digest == reference_digest):
         fail(f"{prefix} correctness status disagrees with result digests")
-    stable = (
-        passed
-        and mad_ppm <= policy["maximum_relative_mad_ppm"]
-        and range_ppm <= policy["maximum_relative_range_ppm"]
+    scheduler_input = primitive in SCHEDULER_MEASUREMENT_PRIMITIVES
+    stable = passed and mad_ppm <= policy["maximum_relative_mad_ppm"] and (
+        scheduler_input or range_ppm <= policy["maximum_relative_range_ppm"]
     )
     expected_status = "stable" if stable else ("rejected" if not passed else "unstable")
     if measurement["status"] != expected_status:

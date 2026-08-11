@@ -197,7 +197,7 @@ pub struct CalibrationPolicy {
     pub target_sample_duration_ms: u64,
     /// Maximum accepted median absolute deviation in parts per million.
     pub maximum_relative_mad_ppm: u64,
-    /// Maximum accepted full sample range in parts per million.
+    /// Maximum accepted full sample range for diagnostic cells in parts per million.
     pub maximum_relative_range_ppm: u64,
 }
 
@@ -2505,8 +2505,12 @@ fn scheduling_measurements_are_stable(measurements: &[CalibrationMeasurement]) -
 }
 
 fn measurement_influences_scheduling(measurement: &CalibrationMeasurement) -> bool {
+    is_scheduler_measurement_primitive(&measurement.primitive)
+}
+
+fn is_scheduler_measurement_primitive(primitive: &str) -> bool {
     matches!(
-        measurement.primitive.as_str(),
+        primitive,
         "thread-scaling-memory-scan" | "queue-depth-random-read" | "numa-memory-read"
     )
 }
@@ -2644,8 +2648,7 @@ fn measure<T: Copy + PartialEq>(
         samples.push(run_batch(&mut operation, operations));
     }
     let statistics = summarize(&samples, spec.bytes_per_operation);
-    let stable = statistics.relative_mad_ppm <= policy.maximum_relative_mad_ppm
-        && statistics.relative_range_ppm <= policy.maximum_relative_range_ppm;
+    let stable = statistics_are_stable_for_primitive(spec.primitive, &statistics, policy);
     let status = if !correctness_passed {
         "rejected"
     } else if stable {
@@ -2675,6 +2678,17 @@ fn measure<T: Copy + PartialEq>(
         },
         status: status.to_owned(),
     }
+}
+
+fn statistics_are_stable_for_primitive(
+    primitive: &str,
+    statistics: &CalibrationStatistics,
+    policy: CalibrationPolicy,
+) -> bool {
+    let median_is_stable = statistics.relative_mad_ppm <= policy.maximum_relative_mad_ppm;
+    median_is_stable
+        && (is_scheduler_measurement_primitive(primitive)
+            || statistics.relative_range_ppm <= policy.maximum_relative_range_ppm)
 }
 
 fn operations_per_sample<T>(
@@ -2947,6 +2961,29 @@ mod tests {
         assert_eq!(statistics.relative_mad_ppm, 50_000);
         assert_eq!(statistics.relative_range_ppm, 200_000);
         assert_eq!(statistics.median_bytes_per_second, Some(80_000_000_000));
+    }
+
+    #[test]
+    fn scheduler_statistics_use_robust_median_stability_and_retain_tail_range() {
+        let statistics = summarize(
+            &[
+                100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 1_000,
+            ],
+            8,
+        );
+        let policy = CalibrationMode::Thorough.policy();
+        assert_eq!(statistics.relative_mad_ppm, 0);
+        assert_eq!(statistics.relative_range_ppm, 9_000_000);
+        assert!(statistics_are_stable_for_primitive(
+            "thread-scaling-memory-scan",
+            &statistics,
+            policy
+        ));
+        assert!(!statistics_are_stable_for_primitive(
+            "native-wal-group-flush",
+            &statistics,
+            policy
+        ));
     }
 
     #[test]

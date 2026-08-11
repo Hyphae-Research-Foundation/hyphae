@@ -186,12 +186,59 @@ class CalibrationCheckerTests(unittest.TestCase):
         with self.assertRaisesRegex(CalibrationValidationError, "scheduler variance"):
             validate_receipt(receipt)
 
-    def test_rejects_selection_when_receipt_is_unstable(self) -> None:
+    def test_accepts_scheduler_input_with_stable_mad_and_observed_tail_outlier(self) -> None:
+        receipt = valid_receipt()
+        scheduler_input = copy.deepcopy(receipt["measurements"][0])
+        scheduler_input.update(
+            {
+                "primitive": "queue-depth-random-read",
+                "variant": "persistent-sync-workers-buffered-4k",
+                "input_size": 16,
+                "input_unit": "outstanding-reads",
+            }
+        )
+        scheduler_input["statistics"].update(
+            {
+                "minimum": 100,
+                "median": 200,
+                "maximum": 2_000,
+                "median_absolute_deviation": 2,
+                "relative_mad_ppm": 10_000,
+                "relative_range_ppm": 9_500_000,
+                "median_bytes_per_second": 15_360_000_000_000,
+            }
+        )
+        receipt["measurements"].append(scheduler_input)
+        receipt["selected_kernels"].append(
+            {
+                "primitive": scheduler_input["primitive"],
+                "input_size": scheduler_input["input_size"],
+                "input_unit": scheduler_input["input_unit"],
+                "variant": scheduler_input["variant"],
+                "reason": "candidate passed correctness and variance policy",
+            }
+        )
+        receipt["coverage"]["measured"].append("queue-depth-random-read")
+        receipt["coverage"]["measured"].sort()
+        receipt["io_scaling"].update(
+            {
+                "measured_queue_depths": [16],
+                "status": "stable",
+                "peak_queue_depth": 16,
+                "peak_bytes_per_second": 15_360_000_000_000,
+                "recommended_io_slots": 16,
+                "recommendation": "single measured depth",
+            }
+        )
+
+        validate_receipt(receipt)
+
+    def test_rejects_selection_when_scheduler_mad_is_unstable(self) -> None:
         receipt = valid_receipt()
         measurement = receipt["measurements"][0]
         measurement["primitive"] = "thread-scaling-memory-scan"
         receipt["coverage"]["measured"] = ["thread-scaling-memory-scan"]
-        measurement["statistics"]["relative_range_ppm"] = 600_000
+        measurement["statistics"]["relative_mad_ppm"] = 600_000
         measurement["status"] = "unstable"
         receipt["status"] = "unstable"
         receipt["accepted_for_scheduling"] = False

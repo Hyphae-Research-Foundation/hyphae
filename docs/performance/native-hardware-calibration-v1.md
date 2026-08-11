@@ -135,18 +135,21 @@ Candidate outputs are digested and compared to a separately structured
 reference path before timing can be selected. Vector, comparison, and memory
 references use independent loops; CRC32C uses a portable bitwise Castagnoli
 reference; BLAKE3 compares one-shot and chunked incremental APIs. A failed
-comparison makes the cell `rejected`. A correct cell outside the frozen MAD or
-range bound is `unstable`.
+comparison makes the cell `rejected`. A correct diagnostic cell outside the
+frozen MAD or range bound is `unstable`.
 
 Scheduler acceptance is narrower than diagnostic stability. Every measurement
 must be correct and total duration must remain inside the mode window. The
 topology inputs `thread-scaling-memory-scan`, `queue-depth-random-read`, and any
-measured `numa-memory-read` cells must also be stable. Other measurements are
-diagnostics or candidate-kernel observations: a stable one may be selected,
-but variance in `fsync`, WAL, direct I/O, or another non-topology diagnostic
-does not invalidate an independently stable worker and I/O placement decision.
-This preserves observed durability jitter instead of hiding it or using it as
-unrelated scheduler authority.
+measured `numa-memory-read` cells use the frozen relative-MAD bound because the
+scheduler decision is derived from their median. Their full min/max and
+relative range remain in the receipt as tail-jitter evidence, but tail pauses
+cannot erase an otherwise stable median curve. Other measurements are
+diagnostics or candidate-kernel observations and continue to require both MAD
+and range stability. Variance in `fsync`, WAL, direct I/O, or another
+non-topology diagnostic does not invalidate an independently stable worker and
+I/O placement decision. This preserves observed jitter instead of hiding it or
+using it as unrelated scheduler authority.
 
 `accepted_for_scheduling` is false and `selected_kernels` is empty whenever
 correctness, elapsed time, or a topology input fails. When scheduling is
