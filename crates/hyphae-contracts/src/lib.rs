@@ -2,8 +2,24 @@
 
 //! Canonical public contract documents embedded for validation and generation.
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+
 pub mod v1;
 pub mod v2;
+
+/// Canonical SPDX marker embedded in every generated JSON Schema document.
+pub const JSON_SCHEMA_LICENSE_COMMENT: &str = "SPDX-License-Identifier: AGPL-3.0-only";
+
+/// Generates a canonical JSON Schema document for a public Rust wire model.
+///
+/// The root `$comment` is always set to [`JSON_SCHEMA_LICENSE_COMMENT`] so generated
+/// artifacts retain their machine-readable license marker.
+#[must_use]
+pub fn generate_json_schema<T: JsonSchema>() -> Schema {
+    let mut schema = SchemaGenerator::default().into_root_schema_for::<T>();
+    schema.insert("$comment".to_owned(), JSON_SCHEMA_LICENSE_COMMENT.into());
+    schema
+}
 
 /// `OpenAPI` 3.1 document for HTTP API version 1.
 pub const OPENAPI_V1: &str = include_str!("../assets/openapi/hyphae-v1.yaml");
@@ -118,7 +134,7 @@ mod tests {
     use serde_json::Value as JsonValue;
     use serde_yaml_ng::Value as YamlValue;
 
-    use schemars::{JsonSchema, SchemaGenerator};
+    use schemars::JsonSchema;
 
     use super::{
         CAPABILITIES_SCHEMA_V1, COMMIT_RECEIPT_SCHEMA_V1, DEFINE_LEXICAL_INDEX_REQUEST_SCHEMA_V1,
@@ -126,9 +142,10 @@ mod tests {
         DELETE_VECTORS_REQUEST_SCHEMA_V1, ERROR_SCHEMA_V1, EXACT_RETRIEVAL_REQUEST_SCHEMA_V1,
         EXACT_RETRIEVAL_RESPONSE_SCHEMA_V1, GET_REQUEST_SCHEMA_V1, GET_RESPONSE_SCHEMA_V1,
         HEALTH_SCHEMA_V1, HYBRID_RETRIEVAL_REQUEST_SCHEMA_V1, HYBRID_RETRIEVAL_RESPONSE_SCHEMA_V1,
-        LEXICAL_RETRIEVAL_REQUEST_SCHEMA_V1, LEXICAL_RETRIEVAL_RESPONSE_SCHEMA_V1, OPENAPI_V1,
-        PROOF_SCHEMA_V1, PUT_REQUEST_SCHEMA_V1, PUT_VECTORS_REQUEST_SCHEMA_V1,
-        QUERY_REQUEST_SCHEMA_V1, QUERY_RESPONSE_SCHEMA_V1, RETRIEVAL_PROOF_SCHEMA_V1,
+        JSON_SCHEMA_LICENSE_COMMENT, LEXICAL_RETRIEVAL_REQUEST_SCHEMA_V1,
+        LEXICAL_RETRIEVAL_RESPONSE_SCHEMA_V1, OPENAPI_V1, PROOF_SCHEMA_V1, PUT_REQUEST_SCHEMA_V1,
+        PUT_VECTORS_REQUEST_SCHEMA_V1, QUERY_REQUEST_SCHEMA_V1, QUERY_RESPONSE_SCHEMA_V1,
+        RETRIEVAL_PROOF_SCHEMA_V1, generate_json_schema,
         v1::{
             CapabilitiesV1, CommitReceiptV1, DefineLexicalIndexRequestV1,
             DefineVectorSpaceRequestV1, DeleteRequestV1, DeleteVectorsRequestV1, ErrorV1,
@@ -349,9 +366,16 @@ mod tests {
     }
 
     fn assert_schema<T: JsonSchema>(checked_in: &str) -> Result<(), Box<dyn Error>> {
-        let generated = SchemaGenerator::default().into_root_schema_for::<T>();
+        let generated = serde_json::to_value(generate_json_schema::<T>())?;
         let checked_in: JsonValue = serde_json::from_str(checked_in)?;
-        assert_eq!(serde_json::to_value(generated)?, checked_in);
+        for (source, schema) in [("generated", &generated), ("checked-in", &checked_in)] {
+            assert_eq!(
+                schema.get("$comment").and_then(JsonValue::as_str),
+                Some(JSON_SCHEMA_LICENSE_COMMENT),
+                "{source} schema lacks the canonical SPDX comment"
+            );
+        }
+        assert_eq!(generated, checked_in);
         Ok(())
     }
 
