@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "9b41f509a252f0e99fae4df33f96842755aa2273e9ce173d71a264796f15d90c"
+CONTRACT_SHA256 = "12a96301fd68effabdb085725984b3ebfa9b465fd0c5690a219a30f227b4cc55"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -55,6 +55,21 @@ class ApiLimitsV1(TypedDict):
     vector_dimensions: int
     witness_bytes: int
 
+class Build(TypedDict):
+    builder: Literal["partitioned-hnsw-v1"]
+    input_identity: Identity
+    aggregate_identity: Identity
+    expected_base_identity: Identity
+    expected_view_identity: Identity
+    published_base_identity: Identity
+    published_view_identity: Identity
+    vector_count: Positive
+    logical_partitions: Literal[64]
+    planned_workers: Positive
+    planned_memory_bytes: Positive
+    worker_batches: Positive
+    routing_policy: Literal["metric-bound-adaptive-v1"]
+
 class CapabilitiesV1(TypedDict):
     """Public capability response."""
     api_version: str
@@ -79,6 +94,18 @@ class CommitReceiptV1(TypedDict):
     status: str
     transaction_digest: str
     transaction_id: str
+
+class Consolidation(TypedDict):
+    before_base_identity: Identity
+    before_view_identity: Identity
+    after_base_identity: Identity
+    after_view_identity: Identity
+    remaining_delta_records: Literal[0]
+    view_preserved: Literal[True]
+    visible_result_identity: Identity
+    partitioned_base_preserved: Literal[True]
+    routing_outcome_after: Literal["selected-certified"]
+    total_partitions_after: int
 
 class Counter(TypedDict):
     status: Literal["measured", "unsupported"]
@@ -113,11 +140,26 @@ class DeleteVectorsRequestV1(TypedDict):
     transaction_id: NotRequired[str | None]
     vector_space: str
 
+class Delta(TypedDict):
+    before_base_identity: Identity
+    before_view_identity: Identity
+    after_base_identity: Identity
+    after_view_identity: Identity
+    upserted_vectors: Positive
+    deleted_vectors: Positive
+    upserts_visible: Literal[True]
+    deletes_hidden: Literal[True]
+    visible_result_identity: Identity
+
 class ErrorV1(TypedDict):
     """Stable version 1 public error envelope."""
     code: str
     message: str
     request_id: str
+
+class Eta(TypedDict):
+    status: Literal["pending", "estimated", "completed"]
+    estimated_remaining_nanos: None | int
 
 class ExactAbstentionV1(TypedDict):
     """Stable exact-retrieval abstention evidence."""
@@ -199,6 +241,15 @@ class FilterV1Not(TypedDict):
     filter: FilterV1
     op: Literal["not"]
 
+class FinalReopen(TypedDict):
+    base_identity: Identity
+    view_identity: Identity
+    delta_records: Literal[0]
+    view_preserved: Literal[True]
+    visible_result_identity: Identity
+    routing_outcome: Literal["selected-certified"]
+    total_partitions: int
+
 class GetRequestV1(TypedDict):
     """Exact durable KV lookup."""
     key_hex: str
@@ -273,6 +324,18 @@ class HybridRetrievalResponseV1(TypedDict):
     outcome: HybridRetrievalOutcomeV1
     proof: RetrievalProofV1
 
+class HyphaeNativeANNDurableLocalQualificationV1(TypedDict):
+    schema: Literal["hyphae-native-ann-durable-qualification-v1"]
+    status: Literal["diagnostic"]
+    source: dict[str, JsonValue]
+    dataset: dict[str, JsonValue]
+    build: Build
+    quality: None | Quality
+    lifecycle: dict[str, JsonValue]
+    missing_gate_evidence: list[Literal["adaptive-routing-certification", "consolidation-visibility", "delta-visibility", "durable-reopen", "full-fanout-equality", "post-consolidation-reopen", "selected-recall-floor"]]
+    claims: Literal[[]]
+    closure_declared: Literal[False]
+
 class HyphaeNativeHardwareCalibrationV1(TypedDict):
     schema: Literal["hyphae-native-hardware-calibration-v1"]
     mode: Literal["quick", "thorough"]
@@ -312,6 +375,7 @@ class HyphaeNativePerformanceProgressV1(TypedDict):
     elapsed_nanos: int
     status: Literal["running", "completed"]
     checkpoint_digest: None | Sha256
+    details: dict[str, JsonValue]
 
 class HyphaeNativePerformanceReceiptV1(TypedDict):
     schema: Literal["hyphae-native-performance-receipt-v1"]
@@ -345,6 +409,7 @@ class HyphaeNativePersistentExecutionTopologyV1(TypedDict):
     hardware_fingerprint: str
     schedulable_compute_threads: int
     hard_affinity: bool
+    numa_steal_policy: NumaStealPolicy
     pools: list[Pool]
 
 class HyphaeNativeResourceGovernorPolicyV1(TypedDict):
@@ -362,6 +427,27 @@ class HyphaeNativeResourceGovernorPolicyV1(TypedDict):
     foreground_burst_limit: Literal[16]
     class_limits: list[ClassLimit]
 
+class HyphaeNativeSchedulerAuthorityV1(TypedDict):
+    schema: Literal["hyphae-native-scheduler-authority-v1"]
+    source_commit: str
+    source_tree: str
+    executable_blake3: Blake3
+    mode: Literal["latency", "bulk", "mixed"]
+    hardware_fingerprint: Blake3
+    calibration_cache_key: Blake3
+    input_canonical_sha256: dict[str, JsonValue]
+    calibrated_worker_limit: int
+    schedulable_compute_threads: int
+    io_slots: int
+    memory_bytes: int
+    numa_pools: list[int | None]
+    hard_affinity: bool
+    numa_steal_policy_schema: Literal["hyphae-native-numa-steal-policy-v1"]
+    numa_steal_status: Literal["not-applicable", "disabled", "calibrated"]
+    numa_steal_thresholds: list[dict[str, JsonValue]]
+    status: Literal["verified"]
+    claims: list[JsonValue]
+
 class HyphaeNativeVectorBulkBuildBakeoffV1(TypedDict):
     schema: Literal["hyphae-native-vector-bulk-bakeoff-v1"]
     status: Literal["diagnostic"]
@@ -374,6 +460,11 @@ class HyphaeNativeVectorBulkBuildBakeoffV1(TypedDict):
     missing_gate_evidence: list[str]
     claims: Literal[[]]
     closure_declared: Literal[False]
+
+class InitialReopen(TypedDict):
+    base_identity: Identity
+    view_identity: Identity
+    selected_result_identity: Identity
 
 class LexicalAbstentionV1(TypedDict):
     """Stable lexical abstention evidence."""
@@ -491,6 +582,23 @@ class NamedMetricV1Max(TypedDict):
     name: str
     path: list[str]
 
+class NumaStealPolicy(TypedDict):
+    schema: Literal["hyphae-native-numa-steal-policy-v1"]
+    calibration_cache_key: str
+    status: Literal["not-applicable", "disabled", "calibrated"]
+    working_set_bytes: Literal[8388608]
+    foreground_burst_limit: Literal[16]
+    pools: list[NumaStealPool]
+
+class NumaStealPool(TypedDict):
+    worker_numa_node_id: NullableId
+    steal_targets: list[NumaStealTarget]
+
+class NumaStealTarget(TypedDict):
+    home_numa_node_id: int
+    remote_to_local_latency_ppm: int
+    steal_after_nanoseconds: int
+
 class Pool(TypedDict):
     numa_node_id: NullableId
     workers: list[Worker]
@@ -516,6 +624,23 @@ class PutVectorsRequestV1(TypedDict):
     transaction_id: NotRequired[str | None]
     vector_space: str
     vectors: list[VectorV1]
+
+class Quality(TypedDict):
+    query_set_identity: Identity
+    queries: Positive
+    k: Positive
+    ef_search: Positive
+    selected_partitions: Literal[32]
+    certified_selected_queries: Positive
+    full_fanout_fallback_queries: Literal[0]
+    maximum_searched_partitions: Literal[32]
+    selected_query_recall_ppm: int
+    minimum_selected_query_recall_ppm: int
+    oracle_result_identity: Identity
+    default_result_identity: Identity
+    full_fanout_result_identity: Identity
+    selected_result_identity: Identity
+    full_fanout_equals_default: Literal[True]
 
 class QueryRequestV1(TypedDict):
     """Complete version 1 structured query request."""
@@ -581,6 +706,7 @@ class Worker(TypedDict):
     core_id: NullableId
     smt_rank: NullableId
 
+Blake3: TypeAlias = str
 Class: TypeAlias = Literal["foreground-point", "foreground-bounded", "mutation", "bulk", "maintenance", "recovery", "administrative"]
 CompareOperatorV1: TypeAlias = Literal["equal"] | Literal["not_equal"] | Literal["less"] | Literal["less_or_equal"] | Literal["greater"] | Literal["greater_or_equal"]
 Digest: TypeAlias = str
@@ -590,6 +716,7 @@ FilterV1: TypeAlias = FilterV1MatchAll | FilterV1Exists | FilterV1Compare | Filt
 GroupKeyValueV1: TypeAlias = GroupKeyValueV1Missing | GroupKeyValueV1Value
 HybridBranchAbsenceV1: TypeAlias = Literal["lexical_no_candidates"] | Literal["vector_no_candidates"] | Literal["vector_below_threshold"] | Literal["vector_ambiguous"]
 HybridRetrievalOutcomeV1: TypeAlias = HybridRetrievalOutcomeV1Matches | HybridRetrievalOutcomeV1Abstained
+Identity: TypeAlias = str
 LexicalAbstentionReasonV1: TypeAlias = Literal["no_candidates"]
 LexicalRetrievalOutcomeV1: TypeAlias = LexicalRetrievalOutcomeV1Matches | LexicalRetrievalOutcomeV1Abstained
 MetricValueV1: TypeAlias = MetricValueV1Count | MetricValueV1Integer | MetricValueV1Value
@@ -603,6 +730,7 @@ OptionalPositiveInteger: TypeAlias = None | int
 OptionalString: TypeAlias = None | str
 Positive: TypeAlias = int
 Recall: TypeAlias = int
+Sha: TypeAlias = str
 Sha1: TypeAlias = str
 Sha256: TypeAlias = str
 SortDirectionV1: TypeAlias = Literal["ascending"] | Literal["descending"]
@@ -613,20 +741,25 @@ __all__ = [
     "AggregationPlanV1",
     "AggregationResultV1",
     "ApiLimitsV1",
+    "Blake3",
+    "Build",
     "CONTRACT_SHA256",
     "CapabilitiesV1",
     "Class",
     "ClassLimit",
     "CommitReceiptV1",
     "CompareOperatorV1",
+    "Consolidation",
     "Counter",
     "CursorV1",
     "DefineLexicalIndexRequestV1",
     "DefineVectorSpaceRequestV1",
     "DeleteRequestV1",
     "DeleteVectorsRequestV1",
+    "Delta",
     "Digest",
     "ErrorV1",
+    "Eta",
     "ExactAbstentionReasonV1",
     "ExactAbstentionV1",
     "ExactRetrievalMatchV1",
@@ -644,6 +777,7 @@ __all__ = [
     "FilterV1MatchAll",
     "FilterV1Not",
     "FilterV1Prefix",
+    "FinalReopen",
     "GetRequestV1",
     "GetResponseV1",
     "GroupKeyValueV1",
@@ -660,6 +794,7 @@ __all__ = [
     "HybridRetrievalOutcomeV1Matches",
     "HybridRetrievalRequestV1",
     "HybridRetrievalResponseV1",
+    "HyphaeNativeANNDurableLocalQualificationV1",
     "HyphaeNativeHardwareCalibrationV1",
     "HyphaeNativeHardwareProfileV1",
     "HyphaeNativePerformanceProgressV1",
@@ -667,7 +802,10 @@ __all__ = [
     "HyphaeNativePerformanceSuiteV1",
     "HyphaeNativePersistentExecutionTopologyV1",
     "HyphaeNativeResourceGovernorPolicyV1",
+    "HyphaeNativeSchedulerAuthorityV1",
     "HyphaeNativeVectorBulkBuildBakeoffV1",
+    "Identity",
+    "InitialReopen",
     "JsonValue",
     "LexicalAbstentionReasonV1",
     "LexicalAbstentionV1",
@@ -696,6 +834,9 @@ __all__ = [
     "NonnegativeInteger",
     "NullPlacementV1",
     "NullableId",
+    "NumaStealPolicy",
+    "NumaStealPool",
+    "NumaStealTarget",
     "OptionalNonnegativeInteger",
     "OptionalPositiveInteger",
     "OptionalString",
@@ -704,11 +845,13 @@ __all__ = [
     "ProofV1",
     "PutRequestV1",
     "PutVectorsRequestV1",
+    "Quality",
     "QueryRequestV1",
     "QueryResponseV1",
     "Recall",
     "RecordV1",
     "RetrievalProofV1",
+    "Sha",
     "Sha1",
     "Sha256",
     "SortDirectionV1",

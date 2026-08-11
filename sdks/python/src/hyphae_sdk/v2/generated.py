@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "3020230ce681b9140bf160f5ce814a1c66255546aa8fd4ac79688636bbd7b0d2"
+CONTRACT_SHA256 = "55ae2a7da6e40d3ceb78409a7fa8f54369532a7c7e96b439031115514e5f9ed9"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]

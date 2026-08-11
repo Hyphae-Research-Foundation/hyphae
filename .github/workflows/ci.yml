@@ -232,7 +232,9 @@ jobs:
         with:
           python-version: 3.11.15
       - name: Check generated SDK models
-        run: python tools/generate_sdk_models.py --check
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_generate_sdk_models -v
+          python tools/generate_sdk_models.py --check
       - name: Build and test TypeScript SDK
         working-directory: sdks/typescript
         run: |

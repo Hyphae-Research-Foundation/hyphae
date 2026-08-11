@@ -26,6 +26,7 @@ OUTPUTS = {
         ROOT / "sdks" / "python" / "src" / "hyphae_sdk" / "v2" / "generated.py",
     ),
 }
+ROOT_DOCUMENT_METADATA_KEYS = frozenset({"$schema", "$comment", "$defs", "title"})
 
 
 def load_models(version: str) -> tuple[dict[str, dict[str, Any]], str]:
@@ -58,11 +59,7 @@ def load_models(version: str) -> tuple[dict[str, dict[str, Any]], str]:
             raise ValueError(f"conflicting root model name for {path.name}")
         documents.append((path, schema, root_name))
     for path, schema, root_name in documents:
-        root = {
-            key: value
-            for key, value in schema.items()
-            if key not in {"$schema", "$defs", "title"}
-        }
+        root = project_root_model(schema)
         add_model(models, root_name, normalize_model_references(root, root_names), path.name)
         for name, definition in schema.get("$defs", {}).items():
             add_model(
@@ -72,6 +69,15 @@ def load_models(version: str) -> tuple[dict[str, dict[str, Any]], str]:
                 path.name,
             )
     return models, digest.hexdigest()
+
+
+def project_root_model(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove document metadata while preserving the root model schema."""
+    return {
+        key: value
+        for key, value in schema.items()
+        if key not in ROOT_DOCUMENT_METADATA_KEYS
+    }
 
 
 def add_model(
