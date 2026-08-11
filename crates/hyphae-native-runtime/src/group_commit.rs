@@ -585,6 +585,8 @@ struct SubmissionGate {
 pub struct NativeCommitClient {
     gate: Arc<Mutex<SubmissionGate>>,
     database: Arc<RwLock<Option<NativeDatabase>>>,
+    #[cfg(test)]
+    cohort_collection_gate: Arc<RwLock<()>>,
 }
 
 impl NativeCommitClient {
@@ -777,7 +779,7 @@ impl NativeCommitClient {
     #[cfg(test)]
     pub(crate) fn enqueue_for_test(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<
         Receiver<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
         GroupCommitSubmitError,
@@ -789,7 +791,7 @@ impl NativeCommitClient {
         admit_command(
             &self.gate,
             SchedulerCommand::Commit(Box::new(CommitRequest {
-                batch,
+                batch: batch.into().into_inner(),
                 submitted_at,
                 enqueued_at: submitted_at,
                 control,
@@ -800,6 +802,15 @@ impl NativeCommitClient {
             false,
         )?;
         Ok(receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_cohort_collection_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, GroupCommitSubmitError> {
+        self.cohort_collection_gate
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
     }
 
     #[cfg(test)]
@@ -892,9 +903,13 @@ impl NativeCommitScheduler {
             accepting: true,
         }));
         let database = Arc::new(RwLock::new(Some(database)));
+        #[cfg(test)]
+        let cohort_collection_gate = Arc::new(RwLock::new(()));
         let client = NativeCommitClient {
             gate: Arc::clone(&gate),
             database: Arc::clone(&database),
+            #[cfg(test)]
+            cohort_collection_gate: Arc::clone(&cohort_collection_gate),
         };
         let (active_expiry, active_expiry_metrics) = active_expiry
             .map_or((None, None), |(runtime, metrics)| {
@@ -902,7 +917,17 @@ impl NativeCommitScheduler {
             });
         let worker = thread::Builder::new()
             .name("hyphae-commit-scheduler".to_owned())
-            .spawn(move || run_scheduler(&receiver, &database, &gate, config, active_expiry))
+            .spawn(move || {
+                run_scheduler(
+                    &receiver,
+                    &database,
+                    &gate,
+                    config,
+                    active_expiry,
+                    #[cfg(test)]
+                    &cohort_collection_gate,
+                );
+            })
             .map_err(|source| GroupCommitSubmitError::runtime(NativeRuntimeError::Io(source)))?;
         Ok(Self {
             client,
@@ -1158,6 +1183,7 @@ fn run_scheduler(
     gate: &Mutex<SubmissionGate>,
     config: GroupCommitConfig,
     mut active_expiry: Option<ActiveExpiryRuntime>,
+    #[cfg(test)] cohort_collection_gate: &RwLock<()>,
 ) {
     let mut shutdown = false;
     let mut pending = None;
@@ -1189,6 +1215,12 @@ fn run_scheduler(
                     continue;
                 }
             };
+        #[cfg(test)]
+        let Ok(cohort_collection_guard) = cohort_collection_gate.read() else {
+            break;
+        };
+        #[cfg(test)]
+        drop(cohort_collection_guard);
         let counts_after_due = active_expiry
             .as_ref()
             .is_some_and(|expiry| expiry.wait_until_deadline().is_zero());

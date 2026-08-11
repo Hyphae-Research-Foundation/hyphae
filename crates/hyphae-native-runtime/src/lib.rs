@@ -46912,29 +46912,20 @@ mod tests {
                 )?;
                 batches.push(batch);
             }
-            let barrier = Barrier::new(clients.len());
-            let submitted = std::thread::scope(|scope| {
-                clients
-                    .iter()
-                    .zip(batches)
-                    .map(|(client, batch)| {
-                        let barrier = &barrier;
-                        scope.spawn(move || {
-                            barrier.wait();
-                            client.submit(batch)
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(std::thread::ScopedJoinHandle::join)
-                    .collect::<Vec<_>>()
-            });
-            let receipts = submitted
+            let collection_guard = clients[0].block_cohort_collection_for_test()?;
+            let receivers = clients
+                .iter()
+                .zip(batches)
+                .map(|(client, batch)| client.enqueue_for_test(batch))
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(collection_guard);
+            let receipts = receivers
                 .into_iter()
-                .map(|joined| -> Result<_, Box<dyn std::error::Error>> {
-                    let receipt =
-                        joined.map_err(|_| std::io::Error::other("delta submitter panicked"))??;
-                    Ok(receipt)
+                .map(|receiver| -> Result<_, Box<dyn std::error::Error>> {
+                    receiver
+                        .recv()
+                        .map_err(|_| std::io::Error::other("delta response channel closed"))?
+                        .map_err(Into::into)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             assert!(
