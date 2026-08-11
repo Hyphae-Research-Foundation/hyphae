@@ -140,16 +140,18 @@ frozen MAD or range bound is `unstable`.
 
 Scheduler acceptance is narrower than diagnostic stability. Every measurement
 must be correct and total duration must remain inside the mode window. The
-topology inputs `thread-scaling-memory-scan`, `queue-depth-random-read`, and any
-measured `numa-memory-read` cells use the frozen relative-MAD bound because the
-scheduler decision is derived from their median. Their full min/max and
-relative range remain in the receipt as tail-jitter evidence, but tail pauses
-cannot erase an otherwise stable median curve. Other measurements are
-diagnostics or candidate-kernel observations and continue to require both MAD
-and range stability. Variance in `fsync`, WAL, direct I/O, or another
-non-topology diagnostic does not invalidate an independently stable worker and
-I/O placement decision. This preserves observed jitter instead of hiding it or
-using it as unrelated scheduler authority.
+worker and topology inputs `thread-scaling-memory-scan` and any measured
+`numa-memory-read` cells use the frozen relative-MAD bound because the scheduler
+decision is derived from their median. `queue-depth-random-read` uses the same
+robust median rule when stable, but an unstable I/O curve remains admissible
+only through the existing one-slot governor fallback. Full min/max and relative
+range remain in the receipt as tail-jitter evidence, but tail pauses cannot
+erase an otherwise stable median curve. Other measurements are diagnostics or
+candidate-kernel observations and continue to require both MAD and range
+stability. Variance in `fsync`, WAL, direct I/O, or another non-topology
+diagnostic does not invalidate an independently stable worker placement
+decision. This preserves observed jitter instead of hiding it or using it as
+unrelated scheduler authority.
 
 `accepted_for_scheduling` is false and `selected_kernels` is empty whenever
 correctness, elapsed time, or a topology input fails. When scheduling is

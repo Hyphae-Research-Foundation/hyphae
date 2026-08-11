@@ -162,10 +162,10 @@ class CalibrationCheckerTests(unittest.TestCase):
         scheduler_input = copy.deepcopy(receipt["measurements"][0])
         scheduler_input.update(
             {
-                "primitive": "queue-depth-random-read",
-                "variant": "persistent-sync-workers-buffered-4k",
-                "input_size": 16,
-                "input_unit": "outstanding-reads",
+                "primitive": "numa-memory-read",
+                "variant": "linux-first-touch-node-0-read-node-0-cpu-0",
+                "input_size": 8 * 1024 * 1024,
+                "input_unit": "working-set-bytes",
                 "status": "unstable",
             }
         )
@@ -185,6 +185,35 @@ class CalibrationCheckerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CalibrationValidationError, "scheduler variance"):
             validate_receipt(receipt)
+
+    def test_accepts_unstable_io_curve_with_single_slot_fallback(self) -> None:
+        receipt = valid_receipt()
+        io_input = copy.deepcopy(receipt["measurements"][0])
+        io_input.update(
+            {
+                "primitive": "queue-depth-random-read",
+                "variant": "persistent-sync-workers-buffered-4k",
+                "input_size": 4,
+                "input_unit": "outstanding-reads",
+                "status": "unstable",
+            }
+        )
+        io_input["statistics"].update(
+            {
+                "minimum": 100,
+                "median": 200,
+                "maximum": 900,
+                "median_absolute_deviation": 100,
+                "relative_mad_ppm": 500_000,
+                "relative_range_ppm": 4_000_000,
+            }
+        )
+        receipt["measurements"].append(io_input)
+        receipt["coverage"]["measured"].append("queue-depth-random-read")
+        receipt["coverage"]["measured"].sort()
+        receipt["io_scaling"]["measured_queue_depths"] = [4]
+
+        validate_receipt(receipt)
 
     def test_accepts_scheduler_input_with_stable_mad_and_observed_tail_outlier(self) -> None:
         receipt = valid_receipt()

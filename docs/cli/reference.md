@@ -173,10 +173,10 @@ without starting a listener.
 hyphae hardware discover [--data-dir <PATH>]
 hyphae hardware calibrate [--data-dir <PATH>] [--mode <quick|thorough>]
                            [--cache-dir <PATH> | --no-cache]
-hyphae hardware governor-policy [--data-dir <PATH>]
+hyphae hardware governor-policy [--data-dir <PATH> | --profile <FILE>]
                                 --calibration <RECEIPT.json>
                                 [--mode <latency|bulk|mixed>]
-hyphae hardware execution-topology [--data-dir <PATH>]
+hyphae hardware execution-topology [--data-dir <PATH> | --profile <FILE>]
                                    --calibration <RECEIPT.json>
                                    [--mode <latency|bulk|mixed>]
 ```
@@ -188,6 +188,10 @@ The JSON fingerprint excludes available memory and the literal data path while
 binding scheduling-relevant topology, affinity, quota, mount, device, and
 kernel properties. Missing platform data remains explicit rather than being
 reported as zero.
+
+Policy and topology derivation may consume the exact discovery receipt through
+`--profile`; this is the qualification path because volatile available-memory
+observations must not be silently rediscovered between evidence steps.
 
 `calibrate` binds the static profile to the exact executable and compiler, then
 measures the implemented CPU, memory, engine, storage, WAL, thread-scaling,

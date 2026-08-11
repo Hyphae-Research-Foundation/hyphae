@@ -208,14 +208,14 @@ jobs:
           PYTHONPATH=. python tools/check_native_hardware_calibration.py \
             --receipt "$EVIDENCE_DIR/native-g7-hardware-calibration.json"
           target/release/hyphae hardware governor-policy \
-            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            --profile "$EVIDENCE_DIR/native-g7-hardware-profile.json" \
             --calibration "$EVIDENCE_DIR/native-g7-hardware-calibration.json" \
             --mode mixed \
             > "$EVIDENCE_DIR/native-g7-governor-policy.json"
           PYTHONPATH=. python tools/check_native_governor_policy.py \
             --policy "$EVIDENCE_DIR/native-g7-governor-policy.json"
           target/release/hyphae hardware execution-topology \
-            --data-dir "$HYPHAE_G7_DATA_ROOT" \
+            --profile "$EVIDENCE_DIR/native-g7-hardware-profile.json" \
             --calibration "$EVIDENCE_DIR/native-g7-hardware-calibration.json" \
             --mode mixed \
             > "$EVIDENCE_DIR/native-g7-execution-topology.json"

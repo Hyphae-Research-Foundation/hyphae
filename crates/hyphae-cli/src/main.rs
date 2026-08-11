@@ -330,8 +330,11 @@ enum HardwareCommand {
     /// Derive an inspectable resource policy from one calibration receipt.
     GovernorPolicy {
         /// Data path whose current static profile must match the calibration.
-        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        #[arg(long, env = "HYPHAE_DATA_DIR", conflicts_with = "profile")]
         data_dir: Option<PathBuf>,
+        /// Exact discovery receipt used as immutable policy authority.
+        #[arg(long, conflicts_with = "data_dir")]
+        profile: Option<PathBuf>,
         /// Hardware calibration receipt used as the decision evidence.
         #[arg(long)]
         calibration: PathBuf,
@@ -342,8 +345,11 @@ enum HardwareCommand {
     /// Derive inspectable persistent worker and NUMA placement.
     ExecutionTopology {
         /// Data path whose current static profile must match the calibration.
-        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        #[arg(long, env = "HYPHAE_DATA_DIR", conflicts_with = "profile")]
         data_dir: Option<PathBuf>,
+        /// Exact discovery receipt used as immutable topology authority.
+        #[arg(long, conflicts_with = "data_dir")]
+        profile: Option<PathBuf>,
         /// Hardware calibration receipt used to derive the governor budget.
         #[arg(long)]
         calibration: PathBuf,
@@ -1419,11 +1425,11 @@ fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
         }
         HardwareCommand::GovernorPolicy {
             data_dir,
+            profile,
             calibration,
             mode,
         } => {
-            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
-            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let profile = load_or_discover_hardware_profile(data_dir, profile)?;
             let encoded = fs::read(calibration)?;
             let calibration: HardwareCalibration =
                 serde_json::from_slice(&encoded).map_err(|_| CliFailure::invalid())?;
@@ -1433,11 +1439,11 @@ fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
         }
         HardwareCommand::ExecutionTopology {
             data_dir,
+            profile,
             calibration,
             mode,
         } => {
-            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
-            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let profile = load_or_discover_hardware_profile(data_dir, profile)?;
             let encoded = fs::read(calibration)?;
             let calibration: HardwareCalibration =
                 serde_json::from_slice(&encoded).map_err(|_| CliFailure::invalid())?;
@@ -1449,6 +1455,18 @@ fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
             print_json(&serde_json::to_value(topology)?)
         }
     }
+}
+
+fn load_or_discover_hardware_profile(
+    data_dir: Option<PathBuf>,
+    profile: Option<PathBuf>,
+) -> Result<HardwareProfile, CliFailure> {
+    if let Some(profile) = profile {
+        let encoded = fs::read(profile)?;
+        return HardwareProfile::from_json_slice(&encoded).map_err(|_| CliFailure::invalid());
+    }
+    let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+    HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())
 }
 
 fn default_hardware_cache_directory() -> Result<PathBuf, CliFailure> {
@@ -4344,6 +4362,7 @@ mod tests {
             Ok(Command::Hardware {
                 operation: HardwareCommand::GovernorPolicy {
                     data_dir: None,
+                    profile: None,
                     calibration,
                     mode: HardwareGovernorMode::Mixed,
                 }
@@ -4365,10 +4384,27 @@ mod tests {
             Ok(Command::Hardware {
                 operation: HardwareCommand::ExecutionTopology {
                     data_dir: None,
+                    profile: None,
                     calibration,
                     mode: HardwareGovernorMode::Mixed,
                 }
             }) if calibration == Path::new("receipt.json")
         ));
+    }
+
+    #[test]
+    fn hardware_policy_profile_conflicts_with_live_discovery() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "governor-policy",
+            "--data-dir",
+            "data",
+            "--profile",
+            "profile.json",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(cli.is_err());
     }
 }

@@ -15,10 +15,12 @@ SCHEMA = "hyphae-native-hardware-calibration-v1"
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 SMT_RECOMMENDATION_RATIO_PPM = 1_050_000
 IO_RECOMMENDATION_FLOOR_PPM = 950_000
-SCHEDULER_MEASUREMENT_PRIMITIVES = {
+REQUIRED_SCHEDULER_MEASUREMENT_PRIMITIVES = {
     "numa-memory-read",
-    "queue-depth-random-read",
     "thread-scaling-memory-scan",
+}
+ROBUST_MEDIAN_MEASUREMENT_PRIMITIVES = REQUIRED_SCHEDULER_MEASUREMENT_PRIMITIVES | {
+    "queue-depth-random-read"
 }
 NUMA_VARIANT = re.compile(
     r"^linux-first-touch-node-(?P<source>[0-9]+)-read-node-(?P<reader>[0-9]+)-cpu-(?P<cpu>[0-9]+)$"
@@ -201,7 +203,7 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     passed = correctness["status"] == "passed"
     if passed != (result_digest == reference_digest):
         fail(f"{prefix} correctness status disagrees with result digests")
-    scheduler_input = primitive in SCHEDULER_MEASUREMENT_PRIMITIVES
+    scheduler_input = primitive in ROBUST_MEDIAN_MEASUREMENT_PRIMITIVES
     stable = passed and mad_ppm <= policy["maximum_relative_mad_ppm"] and (
         scheduler_input or range_ppm <= policy["maximum_relative_range_ppm"]
     )
@@ -525,7 +527,7 @@ def validate_receipt(receipt: Any) -> None:
     scheduling_inputs_stable = all(
         item["status"] == "stable"
         for item in measurements
-        if item["primitive"] in SCHEDULER_MEASUREMENT_PRIMITIVES
+        if item["primitive"] in REQUIRED_SCHEDULER_MEASUREMENT_PRIMITIVES
     )
     accepted = all_correct and timing_valid and scheduling_inputs_stable
     if root["accepted_for_scheduling"] is not accepted:

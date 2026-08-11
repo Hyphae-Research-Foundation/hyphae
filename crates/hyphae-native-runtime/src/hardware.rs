@@ -14,9 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
-#[cfg(any(target_os = "windows", test))]
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const PROFILE_SCHEMA: &str = "hyphae-native-hardware-profile-v1";
@@ -36,10 +34,16 @@ pub enum HardwareProfileError {
     /// The normalized profile could not be encoded for fingerprinting.
     #[error("hardware profile could not be encoded: {0}")]
     Encode(#[from] serde_json::Error),
+    /// A serialized hardware profile could not be decoded.
+    #[error("hardware profile receipt could not be decoded: {0}")]
+    Decode(serde_json::Error),
+    /// A serialized hardware profile did not preserve its schema or fingerprint.
+    #[error("hardware profile receipt is invalid: {0}")]
+    InvalidReceipt(&'static str),
 }
 
 /// One normalized processor cache visible to the current process.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareCache {
     /// Cache level.
     pub level: u8,
@@ -54,7 +58,7 @@ pub struct HardwareCache {
 }
 
 /// One logical processor with its physical placement where discoverable.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareProcessor {
     /// Operating-system logical processor identifier.
     pub logical_id: u32,
@@ -69,7 +73,7 @@ pub struct HardwareProcessor {
 }
 
 /// Normalized processor and topology discovery.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareCpu {
     /// Rust target architecture.
     pub architecture: String,
@@ -98,7 +102,7 @@ pub struct HardwareCpu {
 }
 
 /// CPU and memory placement reported for one NUMA node.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareNumaNode {
     /// Operating-system node identifier.
     pub id: u32,
@@ -111,7 +115,7 @@ pub struct HardwareNumaNode {
 }
 
 /// Normalized memory discovery.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareMemory {
     /// Installed memory visible to the operating system.
     pub total_bytes: Option<u64>,
@@ -128,7 +132,7 @@ pub struct HardwareMemory {
 }
 
 /// Storage and filesystem properties for the selected Native data path.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareStorage {
     /// Canonical existing path used for mount resolution.
     pub path: String,
@@ -147,7 +151,7 @@ pub struct HardwareStorage {
 }
 
 /// Operating-system properties that affect calibrated decisions.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareOperatingSystem {
     /// Rust target operating system.
     pub family: String,
@@ -160,7 +164,7 @@ pub struct HardwareOperatingSystem {
 }
 
 /// Read-only hardware snapshot used by calibration and scheduling.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HardwareProfile {
     /// Versioned profile schema.
     pub schema: String,
@@ -207,6 +211,26 @@ struct HardwareStorageFingerprint<'a> {
 }
 
 impl HardwareProfile {
+    /// Decodes and verifies one immutable discovery receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HardwareProfileError`] when the receipt is malformed, uses a
+    /// different schema, or its scheduling-relevant fingerprint is invalid.
+    pub fn from_json_slice(encoded: &[u8]) -> Result<Self, HardwareProfileError> {
+        let profile: Self =
+            serde_json::from_slice(encoded).map_err(HardwareProfileError::Decode)?;
+        if profile.schema != PROFILE_SCHEMA {
+            return Err(HardwareProfileError::InvalidReceipt("unexpected schema"));
+        }
+        if profile.fingerprint != profile.computed_fingerprint()? {
+            return Err(HardwareProfileError::InvalidReceipt(
+                "fingerprint does not match receipt fields",
+            ));
+        }
+        Ok(profile)
+    }
+
     /// Discovers hardware relevant to the current process and `data_path`.
     ///
     /// Discovery is read-only. If `data_path` does not exist, its nearest
@@ -241,14 +265,28 @@ impl HardwareProfile {
         let (cpu, memory, storage, operating_system) =
             discover_portable(&storage_path, logical_processors_available);
 
+        let mut profile = Self {
+            schema: PROFILE_SCHEMA.to_owned(),
+            fingerprint: String::new(),
+            cpu,
+            memory,
+            storage,
+            operating_system,
+        };
+        profile.fingerprint = profile.computed_fingerprint()?;
+        Ok(profile)
+    }
+
+    fn computed_fingerprint(&self) -> Result<String, HardwareProfileError> {
         let encoded = serde_json::to_vec(&HardwareFingerprint {
             schema: PROFILE_SCHEMA,
-            cpu: &cpu,
-            total_memory_bytes: memory.total_bytes,
-            page_size_bytes: memory.page_size_bytes,
-            huge_page_size_bytes: memory.huge_page_size_bytes,
-            huge_pages_total: memory.huge_pages_total,
-            numa_nodes: memory
+            cpu: &self.cpu,
+            total_memory_bytes: self.memory.total_bytes,
+            page_size_bytes: self.memory.page_size_bytes,
+            huge_page_size_bytes: self.memory.huge_page_size_bytes,
+            huge_pages_total: self.memory.huge_pages_total,
+            numa_nodes: self
+                .memory
                 .numa_nodes
                 .iter()
                 .map(|node| HardwareNumaFingerprint {
@@ -258,23 +296,16 @@ impl HardwareProfile {
                 })
                 .collect(),
             storage: HardwareStorageFingerprint {
-                filesystem: &storage.filesystem,
-                device: &storage.device,
-                mount_options: &storage.mount_options,
-                rotational: storage.rotational,
-                queue_depth: storage.queue_depth,
-                discard_max_bytes: storage.discard_max_bytes,
+                filesystem: &self.storage.filesystem,
+                device: &self.storage.device,
+                mount_options: &self.storage.mount_options,
+                rotational: self.storage.rotational,
+                queue_depth: self.storage.queue_depth,
+                discard_max_bytes: self.storage.discard_max_bytes,
             },
-            operating_system: &operating_system,
+            operating_system: &self.operating_system,
         })?;
-        Ok(Self {
-            schema: PROFILE_SCHEMA.to_owned(),
-            fingerprint: blake3::hash(&encoded).to_hex().to_string(),
-            cpu,
-            memory,
-            storage,
-            operating_system,
-        })
+        Ok(blake3::hash(&encoded).to_hex().to_string())
     }
 }
 
@@ -1552,6 +1583,20 @@ mod tests {
         assert_ne!(first.storage.path, second.storage.path);
         assert!(first.cpu.logical_processors_available > 0);
         assert!(!first.cpu.instruction_sets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_profile_round_trips_and_rejects_stable_field_tampering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let profile = HardwareProfile::discover(env!("CARGO_MANIFEST_DIR"))?;
+        let encoded = serde_json::to_vec(&profile)?;
+        assert_eq!(HardwareProfile::from_json_slice(&encoded)?, profile);
+
+        let mut tampered = serde_json::to_value(&profile)?;
+        tampered["cpu"]["architecture"] = serde_json::Value::String("tampered".to_owned());
+        let tampered = serde_json::to_vec(&tampered)?;
+        assert!(HardwareProfile::from_json_slice(&tampered).is_err());
         Ok(())
     }
 }

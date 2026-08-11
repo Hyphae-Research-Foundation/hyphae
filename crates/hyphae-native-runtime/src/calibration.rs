@@ -2505,10 +2505,13 @@ fn scheduling_measurements_are_stable(measurements: &[CalibrationMeasurement]) -
 }
 
 fn measurement_influences_scheduling(measurement: &CalibrationMeasurement) -> bool {
-    is_scheduler_measurement_primitive(&measurement.primitive)
+    matches!(
+        measurement.primitive.as_str(),
+        "thread-scaling-memory-scan" | "numa-memory-read"
+    )
 }
 
-fn is_scheduler_measurement_primitive(primitive: &str) -> bool {
+fn uses_robust_median_stability(primitive: &str) -> bool {
     matches!(
         primitive,
         "thread-scaling-memory-scan" | "queue-depth-random-read" | "numa-memory-read"
@@ -2687,7 +2690,7 @@ fn statistics_are_stable_for_primitive(
 ) -> bool {
     let median_is_stable = statistics.relative_mad_ppm <= policy.maximum_relative_mad_ppm;
     median_is_stable
-        && (is_scheduler_measurement_primitive(primitive)
+        && (uses_robust_median_stability(primitive)
             || statistics.relative_range_ppm <= policy.maximum_relative_range_ppm)
 }
 
@@ -2937,15 +2940,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_acceptance_ignores_only_non_topology_variance() {
+    fn scheduler_acceptance_requires_worker_and_numa_stability() {
         let diagnostic = measurement_with_status("native-wal-group-flush", "unstable");
         assert!(scheduling_measurements_are_stable(&[diagnostic]));
 
-        for primitive in [
-            "thread-scaling-memory-scan",
-            "queue-depth-random-read",
-            "numa-memory-read",
-        ] {
+        let io_fallback = measurement_with_status("queue-depth-random-read", "unstable");
+        assert!(scheduling_measurements_are_stable(&[io_fallback]));
+
+        for primitive in ["thread-scaling-memory-scan", "numa-memory-read"] {
             let scheduler_input = measurement_with_status(primitive, "unstable");
             assert!(!scheduling_measurements_are_stable(&[scheduler_input]));
         }
