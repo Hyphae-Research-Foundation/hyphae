@@ -82,6 +82,10 @@ const LOCAL_SDK_COVERAGE: &[&str] = &[
 const HTTP_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const DENIED_IDENTITY: &str = "hyphae-g6-conformance-denied";
 
+type ProductFailureCase = (&'static str, ProductOperation, RequestOptions);
+type ProofArtifact = (Vec<u8>, Vec<u8>, [u8; 32]);
+type TransportResult = Result<ProductResponse, Box<ProductError>>;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
@@ -119,9 +123,11 @@ async fn serve_lane(data: &Path, endpoint: &str, port_file: &Path) -> Result<(),
         Default::default(),
         DENIED_IDENTITY,
     )?;
-    let mut config = hyphae_server::NativeHttpV2Config::default();
-    config.bind = "127.0.0.1:0".parse()?;
-    config.bearer_token = Some(hyphae_server::BearerToken::new(HTTP_TOKEN)?);
+    let config = hyphae_server::NativeHttpV2Config {
+        bind: "127.0.0.1:0".parse()?,
+        bearer_token: Some(hyphae_server::BearerToken::new(HTTP_TOKEN)?),
+        ..hyphae_server::NativeHttpV2Config::default()
+    };
     let server = hyphae_server::NativeHttpV2Server::new(handle, config)?
         .bind()
         .await?;
@@ -141,8 +147,7 @@ fn bootstrap(work: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(work)?;
     let mut product = NativeProduct::create(&source)?;
     let mut session = session();
-    let mut request_id = 1_u128;
-    for operation in [
+    for (request_id, operation) in (1_u128..).zip([
         ProductOperation::ExecuteSql {
             statement: "CREATE TABLE g6_items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)".into(),
             parameters: vec![],
@@ -156,11 +161,10 @@ fn bootstrap(work: &Path) -> Result<(), Box<dyn Error>> {
             value: b"ready".to_vec(),
             expires_at_micros: None,
         },
-    ] {
+    ]) {
         let mut context = context(&session, request_id);
         context.durability = ProductDurabilityPolicy::STRICT;
         product.dispatch(&mut session, &context, operation)?;
-        request_id += 1;
     }
     product.create_catalog_object_v2(
         LogicalCatalogObject::V2(CatalogObjectV2::Database(header(
@@ -307,9 +311,11 @@ async fn run_lane(lane: &str) -> Result<(), Box<dyn Error>> {
             NativeProduct::open(&data)?,
             Default::default(),
         )?;
-        let mut config = hyphae_server::NativeHttpV2Config::default();
-        config.bind = "127.0.0.1:0".parse()?;
-        config.bearer_token = Some(hyphae_server::BearerToken::new(HTTP_TOKEN)?);
+        let config = hyphae_server::NativeHttpV2Config {
+            bind: "127.0.0.1:0".parse()?,
+            bearer_token: Some(hyphae_server::BearerToken::new(HTTP_TOKEN)?),
+            ..hyphae_server::NativeHttpV2Config::default()
+        };
         let server = hyphae_server::NativeHttpV2Server::new(service.handle(), config)?
             .bind()
             .await?;
@@ -400,11 +406,7 @@ fn common_cases(
 }
 
 trait CaseTransport {
-    fn execute(
-        &mut self,
-        operation: ProductOperation,
-        request_id: u64,
-    ) -> Result<ProductResponse, ProductError>;
+    fn execute(&mut self, operation: ProductOperation, request_id: u64) -> TransportResult;
 }
 
 struct EmbeddedTransport<'a> {
@@ -413,16 +415,14 @@ struct EmbeddedTransport<'a> {
 }
 
 impl CaseTransport for EmbeddedTransport<'_> {
-    fn execute(
-        &mut self,
-        operation: ProductOperation,
-        request_id: u64,
-    ) -> Result<ProductResponse, ProductError> {
-        self.product.dispatch(
-            self.session,
-            &context(self.session, u128::from(request_id)),
-            operation,
-        )
+    fn execute(&mut self, operation: ProductOperation, request_id: u64) -> TransportResult {
+        self.product
+            .dispatch(
+                self.session,
+                &context(self.session, u128::from(request_id)),
+                operation,
+            )
+            .map_err(Box::new)
     }
 }
 
@@ -555,7 +555,6 @@ fn execute_corpus(
 
     let _snapshot = response_snapshot(&run(ProductOperation::CatalogList(catalog_list_request()))?)
         .ok_or("catalog list snapshot")?;
-    drop(run);
     let proof_context = context(transport.session, 6040);
     let (_, generated) = hyphae_native_product::proof::generate_native_operation_proof(
         transport.product,
@@ -925,7 +924,7 @@ fn failure_cases(
             let error = transport
                 .execute(operation, request_id + offset as u64)
                 .expect_err("failure accepted");
-            Ok(error_case(&format!("failures/{name}"), error))
+            Ok(error_case(&format!("failures/{name}"), *error))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let operation = ProductOperation::ExecuteSql {
@@ -1001,8 +1000,7 @@ fn stable_failures() -> Result<Vec<(&'static str, ProductOperation)>, Box<dyn Er
     ])
 }
 
-fn product_failure_operations()
--> Result<Vec<(&'static str, ProductOperation, RequestOptions)>, Box<dyn Error>> {
+fn product_failure_operations() -> Result<Vec<ProductFailureCase>, Box<dyn Error>> {
     let operation = || ProductOperation::ExecuteSql {
         statement: "SELECT id FROM g6_items".into(),
         parameters: vec![],
@@ -1345,9 +1343,7 @@ fn doctor_outcome(response: ProductResponse) -> Result<Value, Box<dyn Error>> {
     )
 }
 
-fn proof_artifact(
-    response: ProductResponse,
-) -> Result<(Vec<u8>, Vec<u8>, [u8; 32]), Box<dyn Error>> {
+fn proof_artifact(response: ProductResponse) -> Result<ProofArtifact, Box<dyn Error>> {
     let ProductResponse::Proven { artifact, .. } = response else {
         return Err("proof generation response".into());
     };
@@ -1359,7 +1355,7 @@ fn proof_artifact(
 }
 
 fn proof_generation_outcome(
-    artifact: &(Vec<u8>, Vec<u8>, [u8; 32]),
+    artifact: &ProofArtifact,
     verification: &ProductResponse,
 ) -> Result<Value, Box<dyn Error>> {
     let ProductResponse::ProofVerification(report) = verification else {
