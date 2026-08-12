@@ -15,18 +15,19 @@ from tools.run_native_g7 import (
     G7_SURFACES,
     PILOT_OBSERVATIONS,
     PILOT_WARMUP,
-    ProgressWatchdog,
+    ProcessMetrics,
     ProgressStalled,
+    ProgressWatchdog,
     RuntimeBudgetExceeded,
     derive_cell_runtime_budget,
     derive_matrix_runtime_plan,
     parse_macos_counter_export,
     persist_validated_cell_checkpoint,
-    run_cell,
     run_calibration_pilot,
-    validate_cross_artifact_dataset,
+    run_cell,
     validate_completed_ann_progress,
     validate_completed_cell_progress,
+    validate_cross_artifact_dataset,
     validate_execution_authority_evidence,
     validate_initial_ann_bulk_evidence,
     validate_partial_receipt,
@@ -428,6 +429,95 @@ class NativeG7ControllerTests(unittest.TestCase):
             watchdog.observe(14.9)
             with self.assertRaisesRegex(ProgressStalled, "stalled for 5s"):
                 watchdog.observe(15.0)
+
+    @unittest.skipUnless(os.name == "posix", "requires Linux procfs semantics")
+    def test_process_metrics_preserves_runner_counters_when_proc_becomes_inaccessible(
+        self,
+    ) -> None:
+        metrics = ProcessMetrics(12345)
+        runner_counters = {
+            name: {
+                "status": "measured",
+                "value": value,
+                "unit": "count" if name == "page_faults" else "bytes",
+                "provider": f"runner-{name}",
+            }
+            for name, value in (
+                ("bytes_read", 101),
+                ("bytes_written", 202),
+                ("rss", 303),
+                ("page_faults", 404),
+            )
+        }
+        payload = {
+            "counters": {
+                name: counter.copy() for name, counter in runner_counters.items()
+            }
+        }
+        proc_io = "read_bytes: 10\nwrite_bytes: 20\n"
+        denied = PermissionError(13, "permission denied", "/proc/12345/io")
+
+        with (
+            patch("tools.run_native_g7.sys.platform", "linux"),
+            patch.object(
+                metrics,
+                "_status",
+                side_effect=({"rss": 4096}, {"rss": 8192}),
+            ),
+            patch.object(metrics, "_faults", side_effect=(2, 5)),
+            patch.object(Path, "read_text", side_effect=(proc_io, denied)),
+        ):
+            metrics.sample()
+            metrics.sample()
+
+        metrics.inject(payload)
+        self.assertEqual(payload["counters"], runner_counters)
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX executable fixture")
+    def test_run_cell_preserves_runner_counters_when_proc_sampling_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "runner"
+            counters = {
+                name: {
+                    "status": "measured",
+                    "value": value,
+                    "unit": "bytes" if name != "page_faults" else "count",
+                    "provider": f"runner-{name}",
+                }
+                for name, value in (
+                    ("rss", 101),
+                    ("page_faults", 202),
+                    ("bytes_read", 303),
+                    ("bytes_written", 404),
+                )
+            }
+            runner.write_text(
+                "#!/bin/sh\n"
+                "sleep 0.05\n"
+                f"printf '%s\\n' '{json.dumps({'counters': counters})}'\n"
+            )
+            runner.chmod(0o755)
+            original_read_text = Path.read_text
+
+            def deny_proc_io(path: Path, *args, **kwargs) -> str:
+                if str(path).startswith("/proc/") and path.name == "io":
+                    raise PermissionError(13, "permission denied", str(path))
+                return original_read_text(path, *args, **kwargs)
+
+            with (
+                patch("tools.run_native_g7.sys.platform", "linux"),
+                patch.object(Path, "read_text", deny_proc_io),
+            ):
+                payload = run_cell(
+                    runner,
+                    self.SOURCE_COMMIT,
+                    "linux",
+                    "warm",
+                    1,
+                    timeout_seconds=2.0,
+                )
+
+        self.assertEqual(payload["counters"], counters)
 
     @unittest.skipUnless(os.name == "posix", "requires a POSIX executable fixture")
     def test_run_cell_distinguishes_stall_from_runtime_budget(self) -> None:

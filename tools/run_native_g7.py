@@ -841,6 +841,7 @@ class ProcessMetrics:
         self.peak_rss: int | None = None
         self.initial_io: dict[str, int] | None = None
         self.final_io: dict[str, int] | None = None
+        self.linux_proc_sample_complete = True
         self.page_faults: int | None = None
         self.cpu_cycles: int | None = None
         self.macos_bytes_read: int | None = None
@@ -858,11 +859,11 @@ class ProcessMetrics:
             )
             value = completed.stdout.strip()
             return {"rss": int(value) * 1024} if value.isdigit() else {}
-        path = Path(f"/proc/{self.process_id}/status")
-        if not path.is_file():
+        contents = self._read_linux_proc("status")
+        if contents is None:
             return {}
         values: dict[str, int] = {}
-        for line in path.read_text(encoding="ascii", errors="ignore").splitlines():
+        for line in contents.splitlines():
             if line.startswith("VmHWM:"):
                 values["rss"] = int(line.split()[1]) * 1024
         return values
@@ -870,11 +871,11 @@ class ProcessMetrics:
     def _io(self) -> dict[str, int]:
         if os.name != "posix" or not sys.platform.startswith("linux"):
             return {}
-        path = Path(f"/proc/{self.process_id}/io")
-        if not path.is_file():
+        contents = self._read_linux_proc("io")
+        if contents is None:
             return {}
         values: dict[str, int] = {}
-        for line in path.read_text(encoding="ascii", errors="ignore").splitlines():
+        for line in contents.splitlines():
             name, _, value = line.partition(":")
             if name in {"read_bytes", "write_bytes"}:
                 values[name] = int(value.strip())
@@ -883,13 +884,26 @@ class ProcessMetrics:
     def _faults(self) -> int | None:
         if os.name != "posix" or not sys.platform.startswith("linux"):
             return None
-        path = Path(f"/proc/{self.process_id}/stat")
-        if not path.is_file():
+        contents = self._read_linux_proc("stat")
+        if contents is None:
             return None
-        fields = path.read_text(encoding="ascii", errors="ignore").split()
+        fields = contents.split()
         if len(fields) <= 14:
             return None
         return int(fields[9]) + int(fields[11])
+
+    def _read_linux_proc(self, name: str) -> str | None:
+        try:
+            return Path(f"/proc/{self.process_id}/{name}").read_text(
+                encoding="ascii",
+                errors="ignore",
+            )
+        except OSError:
+            # The process can exit or cross a ptrace/dumpability boundary
+            # between poll() and this optional controller-side sample. Never
+            # publish a truncated interval over the runner's own counters.
+            self.linux_proc_sample_complete = False
+            return None
 
     def sample(self) -> None:
         status = self._status()
@@ -919,12 +933,13 @@ class ProcessMetrics:
 
     def inject(self, payload: dict) -> None:
         counters = payload["counters"]
-        if self.peak_rss is not None:
+        linux_proc_usable = self.linux_proc_sample_complete
+        if self.peak_rss is not None and linux_proc_usable:
             counters["rss"] = {
                 "status": "measured", "value": self.peak_rss, "unit": "bytes",
                 "provider": "macos-proc-pid-rusage-v4" if sys.platform == "darwin" else "linux-proc-vmhwm",
             }
-        if self.page_faults is not None:
+        if self.page_faults is not None and linux_proc_usable:
             counters["page_faults"] = {
                 "status": "measured", "value": self.page_faults, "unit": "count",
                 "provider": "macos-getrusage-child-faults" if sys.platform == "darwin" else "linux-proc-stat",
@@ -943,7 +958,11 @@ class ProcessMetrics:
                     "status": "measured", "value": value, "unit": "bytes",
                     "provider": "macos-proc-pid-rusage-v4",
                 }
-        if self.initial_io is not None and self.final_io is not None:
+        if (
+            linux_proc_usable
+            and self.initial_io is not None
+            and self.final_io is not None
+        ):
             for source, target in (("read_bytes", "bytes_read"), ("write_bytes", "bytes_written")):
                 if source in self.initial_io and source in self.final_io:
                     counters[target] = {
