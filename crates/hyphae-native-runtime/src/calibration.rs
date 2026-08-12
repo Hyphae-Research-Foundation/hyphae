@@ -49,6 +49,8 @@ const OPERATION_CALIBRATION_TARGET_LOWER_PPM: u128 = 900_000;
 const OPERATION_CALIBRATION_TARGET_UPPER_PPM: u128 = 1_100_000;
 const MAX_OPERATIONS_PER_SAMPLE: u64 = 1 << 32;
 const THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE: u64 = 1 << 20;
+const THREAD_SCALING_BATCH_MINIMUM_TARGET_PPM: u128 = 800_000;
+const THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM: u128 = 1_250_000;
 const SMT_RECOMMENDATION_RATIO_PPM: u64 = 1_050_000;
 const IO_RECOMMENDATION_FLOOR_PPM: u64 = 950_000;
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2962,7 +2964,7 @@ fn sample_operation<T>(
     for _ in 0..policy.warmup_batches {
         run_batch(operation, preliminary_calibration.operations);
     }
-    let operation_calibration = if spec.require_target_convergence {
+    let mut operation_calibration = if spec.require_target_convergence {
         operations_per_sample(
             operation,
             policy.target_sample_duration_ms,
@@ -2977,11 +2979,34 @@ fn sample_operation<T>(
         samples.push(run_batch(operation, operation_calibration.operations));
     }
     let statistics = summarize(&samples, spec.bytes_per_operation);
+    if spec.require_target_convergence
+        && !recorded_batch_confirms_target(
+            &statistics,
+            operation_calibration.operations,
+            policy.target_sample_duration_ms,
+        )
+    {
+        operation_calibration.converged = false;
+    }
     SampledOperation {
         operation_calibration,
         samples,
         statistics,
     }
+}
+
+fn recorded_batch_confirms_target(
+    statistics: &CalibrationStatistics,
+    operations: u64,
+    target_ms: u64,
+) -> bool {
+    let median_batch_picoseconds =
+        u128::from(statistics.median).saturating_mul(u128::from(operations));
+    let target_picoseconds = u128::from(target_ms).saturating_mul(1_000_000_000).max(1);
+    median_batch_picoseconds.saturating_mul(PPM)
+        >= target_picoseconds.saturating_mul(THREAD_SCALING_BATCH_MINIMUM_TARGET_PPM)
+        && median_batch_picoseconds.saturating_mul(PPM)
+            <= target_picoseconds.saturating_mul(THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM)
 }
 
 fn statistics_are_stable_for_primitive(
@@ -3468,6 +3493,15 @@ mod tests {
                 converged: false,
             }
         );
+    }
+
+    #[test]
+    fn recorded_thread_scaling_samples_can_revoke_probe_convergence() {
+        let inside = summarize(&[2_250_000_000; 31], 1);
+        let outside = summarize(&[3_000_000_000; 31], 1);
+
+        assert!(recorded_batch_confirms_target(&inside, 100, 225));
+        assert!(!recorded_batch_confirms_target(&outside, 100, 225));
     }
 
     #[test]
