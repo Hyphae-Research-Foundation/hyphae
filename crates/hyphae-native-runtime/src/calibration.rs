@@ -11,7 +11,6 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -21,6 +20,8 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use nix::{
@@ -42,7 +43,12 @@ const CACHE_SCHEMA: &str = "hyphae-native-hardware-calibration-cache-v1";
 const PPM: u128 = 1_000_000;
 const PICOSECONDS_PER_SECOND: u128 = 1_000_000_000_000;
 const OPERATION_CALIBRATION_FLOOR: Duration = Duration::from_millis(1);
+const OPERATION_CALIBRATION_CONFIRMATIONS: u8 = 2;
+const OPERATION_CALIBRATION_MAX_REFINEMENTS: u8 = 6;
+const OPERATION_CALIBRATION_TARGET_LOWER_PPM: u128 = 900_000;
+const OPERATION_CALIBRATION_TARGET_UPPER_PPM: u128 = 1_100_000;
 const MAX_OPERATIONS_PER_SAMPLE: u64 = 1 << 32;
+const THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE: u64 = 1 << 20;
 const SMT_RECOMMENDATION_RATIO_PPM: u64 = 1_050_000;
 const IO_RECOMMENDATION_FLOOR_PPM: u64 = 950_000;
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +150,22 @@ pub enum CalibrationError {
     /// A required build identity was empty.
     #[error("calibration requires a non-empty {0}")]
     MissingIdentity(&'static str),
+    /// A diagnostic request did not cover the exact canonical scaling curve.
+    #[error(
+        "thread-scaling diagnostic worker counts differ: expected {expected:?}, got {actual:?}"
+    )]
+    InvalidDiagnosticWorkerCounts {
+        /// Canonical worker counts derived from the hardware profile.
+        expected: Vec<usize>,
+        /// Worker counts supplied by the diagnostic orchestrator.
+        actual: Vec<usize>,
+    },
+    /// A diagnostic candidate disagreed with its independent reference.
+    #[error("thread-scaling diagnostic correctness failed at {worker_count} workers")]
+    DiagnosticCorrectness {
+        /// Worker point whose output differed from the reference.
+        worker_count: usize,
+    },
     /// The cache identity could not be encoded.
     #[error("calibration identity could not be encoded: {0}")]
     Encode(#[from] serde_json::Error),
@@ -292,6 +314,65 @@ pub struct CalibrationMeasurement {
     pub correctness: CalibrationCorrectness,
     /// `stable`, `unstable`, or `rejected`.
     pub status: String,
+}
+
+/// Frozen, diagnostic-only thread-scaling sampling policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ThreadScalingDiagnosticPolicy {
+    /// Fixed diagnostic mode; never scheduling authority.
+    pub mode: CalibrationMode,
+    /// Unrecorded batches executed before hot-state calibration.
+    pub warmup_batches: u32,
+    /// Chronological samples retained for each worker point.
+    pub samples_per_measurement: u32,
+    /// Target duration for one calibrated sample batch.
+    pub target_sample_duration_ms: u64,
+    /// Maximum accepted median absolute deviation in parts per million.
+    pub maximum_relative_mad_ppm: u64,
+    /// Lower convergence bound in parts per million of the target.
+    pub operation_calibration_target_lower_ppm: u64,
+    /// Upper convergence bound in parts per million of the target.
+    pub operation_calibration_target_upper_ppm: u64,
+    /// Consecutive in-window probes required for convergence.
+    pub operation_calibration_confirmations: u8,
+    /// Maximum number of hot-state refinement probes.
+    pub operation_calibration_max_refinements: u8,
+}
+
+/// One raw, non-authoritative thread-scaling worker point.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ThreadScalingDiagnosticPoint {
+    /// Concurrent workers participating in this point.
+    pub worker_count: usize,
+    /// Candidate and binding identity.
+    pub variant: String,
+    /// Logical bytes scanned by one operation across all workers.
+    pub bytes_per_operation: u64,
+    /// Hot-state operations executed in each recorded sample.
+    pub operations_per_sample: u64,
+    /// Hard operation limit used by calibration.
+    pub maximum_operations_per_sample: u64,
+    /// `converged` only after two in-window hot-state probes below the cap.
+    pub batch_calibration_status: String,
+    /// Exactly 31 chronological picosecond-per-operation samples.
+    pub samples_picoseconds_per_operation: Vec<u64>,
+    /// Integer-only statistics derived from the raw samples.
+    pub statistics: CalibrationStatistics,
+    /// Differential correctness evidence for the worker pool.
+    pub correctness: CalibrationCorrectness,
+    /// `stable` only when correctness, convergence, and MAD pass.
+    pub status: String,
+}
+
+/// Raw thread-scaling diagnostics that cannot authorize scheduling or G7.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ThreadScalingDiagnostic {
+    /// Frozen thorough diagnostic policy.
+    pub policy: ThreadScalingDiagnosticPolicy,
+    /// Processor binding used consistently for the complete curve.
+    pub binding: String,
+    /// Exact canonical worker curve in ascending order.
+    pub worker_points: Vec<ThreadScalingDiagnosticPoint>,
 }
 
 /// Candidate authorized for scheduler consumption.
@@ -1391,9 +1472,9 @@ fn measure_thread_scaling(
 ) -> Result<(), CalibrationError> {
     const WORKING_SET_BYTES_PER_WORKER: usize = 256 * 1_024;
     const SCANS_PER_OPERATION: usize = 4;
-    let input = Arc::new(byte_input(WORKING_SET_BYTES_PER_WORKER));
+    let reference_input = byte_input(WORKING_SET_BYTES_PER_WORKER);
     let expected_per_worker = (0..SCANS_PER_OPERATION).fold(0_u64, |total, _| {
-        total.wrapping_add(sequential_sum_reference(&input))
+        total.wrapping_add(sequential_sum_reference(&reference_input))
     });
     let physical_limit = effective_physical_core_limit(profile);
     #[cfg(target_os = "linux")]
@@ -1415,29 +1496,21 @@ fn measure_thread_scaling(
         let binding = cpu_order
             .as_deref()
             .and_then(|order| order.get(..worker_count));
-        let pool = CalibrationThreadPool::create(worker_count, &input, binding)?;
+        let pool = CalibrationThreadPool::create(
+            worker_count,
+            WORKING_SET_BYTES_PER_WORKER,
+            SCANS_PER_OPERATION,
+            binding,
+        )?;
         let expected =
             expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
-        let variant = if worker_count <= physical_limit && binding.is_some() {
-            "persistent-workers-physical-range-linux-affinity"
-        } else if worker_count > physical_limit && binding.is_some() {
-            "persistent-workers-smt-range-linux-affinity"
-        } else if worker_count <= physical_limit {
-            "persistent-workers-physical-range-unbound"
-        } else {
-            "persistent-workers-smt-range-unbound"
-        };
+        let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
         measurements.push(measure_u64(
-            &MeasurementSpec::new(
-                "thread-scaling-memory-scan",
-                variant,
+            &thread_scaling_measurement_spec(
                 worker_count,
-                "threads",
-                WORKING_SET_BYTES_PER_WORKER
-                    .saturating_mul(SCANS_PER_OPERATION)
-                    .saturating_mul(worker_count),
-            )
-            .with_operation_cap(64),
+                variant,
+                WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
+            ),
             policy,
             || pool.execute(),
             expected,
@@ -1446,9 +1519,187 @@ fn measure_thread_scaling(
     Ok(())
 }
 
+impl ThreadScalingDiagnostic {
+    /// Measures the exact canonical thread-scaling curve while retaining every sample.
+    ///
+    /// The result is diagnostic-only: it is not a [`HardwareCalibration`], is never
+    /// cached, and cannot authorize a scheduler or governor policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `requested_worker_counts` is not the exact canonical
+    /// curve, a worker cannot be created or bound, or differential correctness fails.
+    pub fn run(
+        profile: &HardwareProfile,
+        requested_worker_counts: &[usize],
+    ) -> Result<Self, CalibrationError> {
+        const WORKING_SET_BYTES_PER_WORKER: usize = 256 * 1_024;
+        const SCANS_PER_OPERATION: usize = 4;
+
+        let expected_worker_counts = thread_scaling_levels(profile);
+        if requested_worker_counts != expected_worker_counts {
+            return Err(CalibrationError::InvalidDiagnosticWorkerCounts {
+                expected: expected_worker_counts,
+                actual: requested_worker_counts.to_vec(),
+            });
+        }
+        let policy = CalibrationMode::Thorough.policy();
+        let diagnostic_policy = ThreadScalingDiagnosticPolicy::frozen(policy);
+        let reference_input = byte_input(WORKING_SET_BYTES_PER_WORKER);
+        let expected_per_worker = (0..SCANS_PER_OPERATION).fold(0_u64, |total, _| {
+            total.wrapping_add(sequential_sum_reference(&reference_input))
+        });
+        let physical_limit = effective_physical_core_limit(profile);
+        #[cfg(target_os = "linux")]
+        let cpu_order = thread_binding_cpu_order(profile);
+        #[cfg(not(target_os = "linux"))]
+        let cpu_order: Option<Vec<usize>> = None;
+        let binding_name = if cpu_order.is_some() {
+            "linux-sched-affinity"
+        } else {
+            "unbound"
+        };
+        let mut worker_points = Vec::with_capacity(requested_worker_counts.len());
+        for &worker_count in requested_worker_counts {
+            let binding = cpu_order
+                .as_deref()
+                .and_then(|order| order.get(..worker_count));
+            let pool = CalibrationThreadPool::create(
+                worker_count,
+                WORKING_SET_BYTES_PER_WORKER,
+                SCANS_PER_OPERATION,
+                binding,
+            )?;
+            let expected =
+                expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
+            let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
+            worker_points.push(measure_thread_scaling_diagnostic_point(
+                &pool,
+                worker_count,
+                variant,
+                WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
+                expected,
+                policy,
+            )?);
+        }
+        Ok(Self {
+            policy: diagnostic_policy,
+            binding: binding_name.to_owned(),
+            worker_points,
+        })
+    }
+}
+
+impl ThreadScalingDiagnosticPolicy {
+    fn frozen(policy: CalibrationPolicy) -> Self {
+        Self {
+            mode: CalibrationMode::Thorough,
+            warmup_batches: policy.warmup_batches,
+            samples_per_measurement: policy.samples_per_measurement,
+            target_sample_duration_ms: policy.target_sample_duration_ms,
+            maximum_relative_mad_ppm: policy.maximum_relative_mad_ppm,
+            operation_calibration_target_lower_ppm: u64::try_from(
+                OPERATION_CALIBRATION_TARGET_LOWER_PPM,
+            )
+            .unwrap_or(u64::MAX),
+            operation_calibration_target_upper_ppm: u64::try_from(
+                OPERATION_CALIBRATION_TARGET_UPPER_PPM,
+            )
+            .unwrap_or(u64::MAX),
+            operation_calibration_confirmations: OPERATION_CALIBRATION_CONFIRMATIONS,
+            operation_calibration_max_refinements: OPERATION_CALIBRATION_MAX_REFINEMENTS,
+        }
+    }
+}
+
+fn measure_thread_scaling_diagnostic_point(
+    pool: &CalibrationThreadPool,
+    worker_count: usize,
+    variant: &str,
+    bytes_per_worker: usize,
+    expected: u64,
+    policy: CalibrationPolicy,
+) -> Result<ThreadScalingDiagnosticPoint, CalibrationError> {
+    let spec = thread_scaling_measurement_spec(worker_count, variant, bytes_per_worker);
+    let candidate = pool.execute();
+    let candidate_bytes = candidate.to_le_bytes();
+    let reference_bytes = expected.to_le_bytes();
+    if candidate != expected {
+        return Err(CalibrationError::DiagnosticCorrectness { worker_count });
+    }
+    let correctness = CalibrationCorrectness {
+        status: "passed".to_owned(),
+        result_digest_blake3: blake3::hash(&candidate_bytes).to_hex().to_string(),
+        reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
+    };
+    let mut operation = || pool.execute();
+    let sampled = sample_operation(&spec, policy, &mut operation);
+    let converged = sampled.operation_calibration.converged
+        && sampled.operation_calibration.operations < spec.max_operations_per_sample;
+    let stable =
+        converged && sampled.statistics.relative_mad_ppm <= policy.maximum_relative_mad_ppm;
+    Ok(ThreadScalingDiagnosticPoint {
+        worker_count,
+        variant: variant.to_owned(),
+        bytes_per_operation: u64::try_from(spec.bytes_per_operation).unwrap_or(u64::MAX),
+        operations_per_sample: sampled.operation_calibration.operations,
+        maximum_operations_per_sample: spec.max_operations_per_sample,
+        batch_calibration_status: if converged {
+            "converged"
+        } else {
+            "not-converged"
+        }
+        .to_owned(),
+        samples_picoseconds_per_operation: sampled.samples,
+        statistics: sampled.statistics,
+        correctness,
+        status: if stable { "stable" } else { "unstable" }.to_owned(),
+    })
+}
+
+fn thread_scaling_variant(worker_count: usize, physical_limit: usize, bound: bool) -> &'static str {
+    match (worker_count <= physical_limit, bound) {
+        (true, true) => "persistent-workers-physical-range-linux-affinity",
+        (false, true) => "persistent-workers-smt-range-linux-affinity",
+        (true, false) => "persistent-workers-physical-range-unbound",
+        (false, false) => "persistent-workers-smt-range-unbound",
+    }
+}
+
+fn thread_scaling_measurement_spec(
+    worker_count: usize,
+    variant: &str,
+    bytes_per_worker: usize,
+) -> MeasurementSpec<'_> {
+    MeasurementSpec::new(
+        "thread-scaling-memory-scan",
+        variant,
+        worker_count,
+        "threads",
+        bytes_per_worker.saturating_mul(worker_count),
+    )
+    .with_operation_cap(THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE)
+    .requiring_target_convergence()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn thread_binding_cpu_order(profile: &HardwareProfile) -> Option<Vec<usize>> {
     let logical_limit = effective_logical_processor_limit(profile);
+    let order = physical_core_first_processor_order(profile)?;
+    if order.len() < logical_limit {
+        return None;
+    }
+    order
+        .into_iter()
+        .take(logical_limit)
+        .map(|(logical_id, _)| usize::try_from(logical_id))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
+pub(crate) fn physical_core_first_processor_order(
+    profile: &HardwareProfile,
+) -> Option<Vec<(u32, u32)>> {
     let mut cores = std::collections::BTreeMap::<(Option<u32>, u32, u32), Vec<u32>>::new();
     for processor in &profile.cpu.processor_topology {
         cores
@@ -1481,32 +1732,31 @@ fn thread_binding_cpu_order(profile: &HardwareProfile) -> Option<Vec<usize>> {
     for core_index in 0..maximum_cores_per_node {
         for cores in by_node.values() {
             if let Some(cpu) = cores.get(core_index).and_then(|siblings| siblings.first()) {
-                order.push(*cpu);
+                order.push((*cpu, 0));
             }
         }
     }
     for sibling_index in 1..maximum_siblings {
+        let smt_rank = u32::try_from(sibling_index).ok()?;
         for core_index in 0..maximum_cores_per_node {
             for cores in by_node.values() {
                 if let Some(cpu) = cores
                     .get(core_index)
                     .and_then(|siblings| siblings.get(sibling_index))
                 {
-                    order.push(*cpu);
+                    order.push((*cpu, smt_rank));
                 }
             }
         }
     }
-    let distinct = order.iter().copied().collect::<BTreeSet<_>>();
-    if distinct.len() != order.len() || order.len() < logical_limit {
+    let distinct = order
+        .iter()
+        .map(|(logical_id, _)| *logical_id)
+        .collect::<BTreeSet<_>>();
+    if distinct.len() != order.len() || order.len() != profile.cpu.processor_topology.len() {
         return None;
     }
-    order
-        .into_iter()
-        .take(logical_limit)
-        .map(usize::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
+    Some(order)
 }
 
 fn effective_logical_processor_limit(profile: &HardwareProfile) -> usize {
@@ -1742,12 +1992,15 @@ struct CalibrationThreadPool {
     requests: Vec<SyncSender<ThreadPoolMessage>>,
     responses: Receiver<u64>,
     workers: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    worker_input_addresses: Vec<usize>,
 }
 
 impl CalibrationThreadPool {
     fn create(
         worker_count: usize,
-        input: &Arc<Vec<u8>>,
+        working_set_bytes: usize,
+        scans_per_operation: usize,
         cpu_order: Option<&[usize]>,
     ) -> Result<Self, CalibrationError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(worker_count.max(1));
@@ -1755,12 +2008,13 @@ impl CalibrationThreadPool {
             requests: Vec::with_capacity(worker_count),
             responses: response_receiver,
             workers: Vec::with_capacity(worker_count),
+            #[cfg(test)]
+            worker_input_addresses: Vec::with_capacity(worker_count),
         };
         for worker_index in 0..worker_count {
             let cpu = cpu_order.and_then(|order| order.get(worker_index)).copied();
             let (request_sender, request_receiver) = mpsc::sync_channel(1);
             let worker_response = response_sender.clone();
-            let worker_input = Arc::clone(input);
             let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
             let worker = thread::Builder::new()
                 .name(format!("hyphae-calibration-scaling-{worker_index}"))
@@ -1769,13 +2023,17 @@ impl CalibrationThreadPool {
                         let _ignored = ready_sender.send(Err(reason));
                         return;
                     }
-                    if ready_sender.send(Ok(())).is_err() {
+                    let worker_input = byte_input(working_set_bytes);
+                    if ready_sender
+                        .send(Ok(worker_input.as_ptr() as usize))
+                        .is_err()
+                    {
                         return;
                     }
                     while let Ok(message) = request_receiver.recv() {
                         match message {
                             ThreadPoolMessage::Execute => {
-                                let result = (0..4).fold(0_u64, |total, _| {
+                                let result = (0..scans_per_operation).fold(0_u64, |total, _| {
                                     total.wrapping_add(sequential_sum_candidate(black_box(
                                         worker_input.as_slice(),
                                     )))
@@ -1790,7 +2048,12 @@ impl CalibrationThreadPool {
                 })
                 .map_err(|source| primitive_setup("thread-scaling-memory-scan", source))?;
             match ready_receiver.recv() {
-                Ok(Ok(())) => {}
+                Ok(Ok(worker_input_address)) => {
+                    #[cfg(test)]
+                    pool.worker_input_addresses.push(worker_input_address);
+                    #[cfg(not(test))]
+                    let _ = worker_input_address;
+                }
                 Ok(Err(reason)) => {
                     let _ignored = worker.join();
                     return Err(primitive_setup(
@@ -2601,6 +2864,7 @@ struct MeasurementSpec<'a> {
     input_unit: &'a str,
     bytes_per_operation: usize,
     max_operations_per_sample: u64,
+    require_target_convergence: bool,
 }
 
 impl<'a> MeasurementSpec<'a> {
@@ -2618,11 +2882,17 @@ impl<'a> MeasurementSpec<'a> {
             input_unit,
             bytes_per_operation,
             max_operations_per_sample: MAX_OPERATIONS_PER_SAMPLE,
+            require_target_convergence: false,
         }
     }
 
     fn with_operation_cap(mut self, max_operations_per_sample: u64) -> Self {
         self.max_operations_per_sample = max_operations_per_sample.max(1);
+        self
+    }
+
+    fn requiring_target_convergence(mut self) -> Self {
+        self.require_target_convergence = true;
         self
     }
 }
@@ -2638,20 +2908,9 @@ fn measure<T: Copy + PartialEq>(
     let candidate_bytes = encode(candidate);
     let reference_bytes = encode(reference);
     let correctness_passed = candidate == reference;
-    let operations = operations_per_sample(
-        &mut operation,
-        policy.target_sample_duration_ms,
-        spec.max_operations_per_sample,
-    );
-    for _ in 0..policy.warmup_batches {
-        run_batch(&mut operation, operations);
-    }
-    let mut samples = Vec::with_capacity(policy.samples_per_measurement as usize);
-    for _ in 0..policy.samples_per_measurement {
-        samples.push(run_batch(&mut operation, operations));
-    }
-    let statistics = summarize(&samples, spec.bytes_per_operation);
-    let stable = statistics_are_stable_for_primitive(spec.primitive, &statistics, policy);
+    let sampled = sample_operation(spec, policy, &mut operation);
+    let stable = (!spec.require_target_convergence || sampled.operation_calibration.converged)
+        && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
     let status = if !correctness_passed {
         "rejected"
     } else if stable {
@@ -2665,10 +2924,10 @@ fn measure<T: Copy + PartialEq>(
         input_size: u64::try_from(spec.input_size).unwrap_or(u64::MAX),
         input_unit: spec.input_unit.to_owned(),
         bytes_per_operation: u64::try_from(spec.bytes_per_operation).unwrap_or(u64::MAX),
-        operations_per_sample: operations,
+        operations_per_sample: sampled.operation_calibration.operations,
         maximum_operations_per_sample: spec.max_operations_per_sample,
         sample_count: policy.samples_per_measurement,
-        statistics,
+        statistics: sampled.statistics,
         correctness: CalibrationCorrectness {
             status: if correctness_passed {
                 "passed"
@@ -2680,6 +2939,48 @@ fn measure<T: Copy + PartialEq>(
             reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
         },
         status: status.to_owned(),
+    }
+}
+
+struct SampledOperation {
+    operation_calibration: OperationCalibration,
+    samples: Vec<u64>,
+    statistics: CalibrationStatistics,
+}
+
+fn sample_operation<T>(
+    spec: &MeasurementSpec<'_>,
+    policy: CalibrationPolicy,
+    operation: &mut impl FnMut() -> T,
+) -> SampledOperation {
+    let preliminary_calibration = operations_per_sample(
+        operation,
+        policy.target_sample_duration_ms,
+        spec.max_operations_per_sample,
+        false,
+    );
+    for _ in 0..policy.warmup_batches {
+        run_batch(operation, preliminary_calibration.operations);
+    }
+    let operation_calibration = if spec.require_target_convergence {
+        operations_per_sample(
+            operation,
+            policy.target_sample_duration_ms,
+            spec.max_operations_per_sample,
+            true,
+        )
+    } else {
+        preliminary_calibration
+    };
+    let mut samples = Vec::with_capacity(policy.samples_per_measurement as usize);
+    for _ in 0..policy.samples_per_measurement {
+        samples.push(run_batch(operation, operation_calibration.operations));
+    }
+    let statistics = summarize(&samples, spec.bytes_per_operation);
+    SampledOperation {
+        operation_calibration,
+        samples,
+        statistics,
     }
 }
 
@@ -2698,24 +2999,122 @@ fn operations_per_sample<T>(
     operation: &mut impl FnMut() -> T,
     target_ms: u64,
     max_operations_per_sample: u64,
-) -> u64 {
+    require_target_convergence: bool,
+) -> OperationCalibration {
     let target = Duration::from_millis(target_ms.max(1));
     let operation_cap = max_operations_per_sample.max(1);
+    if !require_target_convergence {
+        return operations_per_sample_once(operation, target, operation_cap);
+    }
+    calibrated_operations_for_target(target, operation_cap, |operations| {
+        let started = Instant::now();
+        run_batch(operation, operations);
+        started.elapsed()
+    })
+}
+
+fn operations_per_sample_once<T>(
+    operation: &mut impl FnMut() -> T,
+    target: Duration,
+    operation_cap: u64,
+) -> OperationCalibration {
     let mut operations = 1_u64;
     loop {
         let started = Instant::now();
         run_batch(operation, operations);
         let elapsed = started.elapsed();
         if elapsed >= OPERATION_CALIBRATION_FLOOR || operations >= operation_cap {
-            let elapsed_nanos = elapsed.as_nanos().max(1);
-            let scaled = u128::from(operations)
-                .saturating_mul(target.as_nanos())
-                .div_ceil(elapsed_nanos)
-                .clamp(1, u128::from(operation_cap));
-            return u64::try_from(scaled).unwrap_or(operation_cap);
+            return OperationCalibration {
+                operations: scaled_operations_for_elapsed(
+                    operations,
+                    elapsed,
+                    target,
+                    operation_cap,
+                ),
+                converged: true,
+            };
         }
         operations = operations.saturating_mul(2).min(operation_cap);
     }
+}
+
+fn calibrated_operations_for_target(
+    target: Duration,
+    operation_cap: u64,
+    mut measure_elapsed: impl FnMut(u64) -> Duration,
+) -> OperationCalibration {
+    let operation_cap = operation_cap.max(1);
+    let mut operations = 1_u64;
+    let initial_elapsed = loop {
+        let elapsed = measure_elapsed(operations);
+        if elapsed >= OPERATION_CALIBRATION_FLOOR || operations >= operation_cap {
+            break elapsed;
+        }
+        operations = operations.saturating_mul(2).min(operation_cap);
+    };
+
+    operations = scaled_operations_for_elapsed(operations, initial_elapsed, target, operation_cap);
+    let mut best_operations = operations;
+    let mut best_distance = u128::MAX;
+    let mut confirmations = 0_u8;
+    for _ in 0..OPERATION_CALIBRATION_MAX_REFINEMENTS {
+        let elapsed = measure_elapsed(operations);
+        let distance = elapsed.as_nanos().abs_diff(target.as_nanos());
+        if distance < best_distance {
+            best_operations = operations;
+            best_distance = distance;
+        }
+        if sample_duration_matches_target(elapsed, target) {
+            confirmations = confirmations.saturating_add(1);
+            if confirmations >= OPERATION_CALIBRATION_CONFIRMATIONS {
+                return OperationCalibration {
+                    operations,
+                    converged: operations < operation_cap,
+                };
+            }
+            continue;
+        }
+        confirmations = 0;
+        let refined = scaled_operations_for_elapsed(operations, elapsed, target, operation_cap);
+        if refined == operations {
+            return OperationCalibration {
+                operations: best_operations,
+                converged: false,
+            };
+        }
+        operations = refined;
+    }
+    OperationCalibration {
+        operations: best_operations,
+        converged: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationCalibration {
+    operations: u64,
+    converged: bool,
+}
+
+fn sample_duration_matches_target(elapsed: Duration, target: Duration) -> bool {
+    let elapsed_ppm = elapsed.as_nanos().saturating_mul(PPM);
+    let target_nanos = target.as_nanos();
+    elapsed_ppm >= target_nanos.saturating_mul(OPERATION_CALIBRATION_TARGET_LOWER_PPM)
+        && elapsed_ppm <= target_nanos.saturating_mul(OPERATION_CALIBRATION_TARGET_UPPER_PPM)
+}
+
+fn scaled_operations_for_elapsed(
+    operations: u64,
+    elapsed: Duration,
+    target: Duration,
+    operation_cap: u64,
+) -> u64 {
+    let operation_cap = operation_cap.max(1);
+    let scaled = u128::from(operations.max(1))
+        .saturating_mul(target.as_nanos())
+        .div_ceil(elapsed.as_nanos().max(1))
+        .clamp(1, u128::from(operation_cap));
+    u64::try_from(scaled).unwrap_or(operation_cap)
 }
 
 fn run_batch<T>(operation: &mut impl FnMut() -> T, operations: u64) -> u64 {
@@ -2966,6 +3365,146 @@ mod tests {
     }
 
     #[test]
+    fn thread_scaling_batch_cap_can_reach_the_thorough_sample_target() {
+        let specification = thread_scaling_measurement_spec(4, "test-affinity", 1_048_576);
+        let target =
+            Duration::from_millis(CalibrationMode::Thorough.policy().target_sample_duration_ms);
+        let scaled = scaled_operations_for_elapsed(
+            64,
+            Duration::from_micros(1_600),
+            target,
+            specification.max_operations_per_sample,
+        );
+
+        assert_eq!(scaled, 9_000);
+    }
+
+    #[test]
+    fn thorough_targeted_batch_budget_fits_the_duration_contract() {
+        // 39 fixed cells, 4 queue-depth cells, and 2 direct-I/O cells use the
+        // one-shot selector. Up to 8 thread levels require refined convergence.
+        // Expanding either group requires re-budgeting here.
+        const MAXIMUM_ONE_SHOT_CELLS: u64 = 39 + 4 + 2;
+        const MAXIMUM_CONVERGED_THREAD_CELLS: u64 = 8;
+        let policy = CalibrationMode::Thorough.policy();
+        let sampled_batches =
+            u64::from(policy.samples_per_measurement) + u64::from(policy.warmup_batches);
+        let targeted_duration_ms =
+            MAXIMUM_ONE_SHOT_CELLS
+                .saturating_mul(sampled_batches)
+                .saturating_add(MAXIMUM_CONVERGED_THREAD_CELLS.saturating_mul(
+                    sampled_batches + u64::from(OPERATION_CALIBRATION_MAX_REFINEMENTS),
+                ))
+                .saturating_mul(policy.target_sample_duration_ms);
+
+        assert_eq!(targeted_duration_ms, 428_175);
+        assert!(targeted_duration_ms <= policy.maximum_duration_ms);
+    }
+
+    #[test]
+    fn quick_targeted_batch_budget_fits_the_duration_contract() {
+        const MAXIMUM_ONE_SHOT_CELLS: u64 = 39 + 4 + 2;
+        const MAXIMUM_CONVERGED_THREAD_CELLS: u64 = 8;
+        let policy = CalibrationMode::Quick.policy();
+        let sampled_batches =
+            u64::from(policy.samples_per_measurement) + u64::from(policy.warmup_batches);
+        let targeted_duration_ms =
+            MAXIMUM_ONE_SHOT_CELLS
+                .saturating_mul(sampled_batches)
+                .saturating_add(MAXIMUM_CONVERGED_THREAD_CELLS.saturating_mul(
+                    sampled_batches + u64::from(OPERATION_CALIBRATION_MAX_REFINEMENTS),
+                ))
+                .saturating_mul(policy.target_sample_duration_ms);
+
+        assert_eq!(targeted_duration_ms, 14_235);
+        assert!(targeted_duration_ms <= policy.maximum_duration_ms);
+    }
+
+    #[test]
+    fn operation_calibration_rechecks_a_cold_target_before_sampling() {
+        let target = Duration::from_millis(225);
+        let mut measured_operations = Vec::new();
+        let operations = calibrated_operations_for_target(
+            target,
+            THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE,
+            |candidate| {
+                measured_operations.push(candidate);
+                match measured_operations.as_slice() {
+                    [.., 64] if candidate == 64 => Duration::from_micros(1_600),
+                    [.., 9_000] if candidate == 9_000 => {
+                        if measured_operations.len() == 8 {
+                            target
+                        } else {
+                            Duration::from_millis(40)
+                        }
+                    }
+                    [.., 50_625] if candidate == 50_625 => target,
+                    _ => Duration::from_micros(candidate.saturating_mul(25)),
+                }
+            },
+        );
+
+        assert_eq!(
+            operations,
+            OperationCalibration {
+                operations: 50_625,
+                converged: true,
+            }
+        );
+        assert_eq!(&measured_operations[7..], &[9_000, 9_000, 50_625, 50_625]);
+    }
+
+    #[test]
+    fn operation_calibration_fails_closed_when_the_cap_blocks_the_target() {
+        let calibration =
+            calibrated_operations_for_target(Duration::from_millis(225), 64, |operations| {
+                Duration::from_micros(operations.saturating_mul(25))
+            });
+
+        assert_eq!(
+            calibration,
+            OperationCalibration {
+                operations: 64,
+                converged: false,
+            }
+        );
+    }
+
+    #[test]
+    fn thread_scaling_workers_own_distinct_working_sets() -> Result<(), CalibrationError> {
+        let worker_count = 2;
+        let working_set_bytes = 4_096;
+        let scans_per_operation = 3;
+        let input = byte_input(working_set_bytes);
+        let expected = sequential_sum_reference(&input)
+            .wrapping_mul(u64::try_from(worker_count * scans_per_operation).unwrap_or(u64::MAX));
+        let pool = CalibrationThreadPool::create(
+            worker_count,
+            working_set_bytes,
+            scans_per_operation,
+            None,
+        )?;
+        let distinct_addresses = pool
+            .worker_input_addresses
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let specification = thread_scaling_measurement_spec(
+            worker_count,
+            "test-affinity",
+            working_set_bytes * scans_per_operation,
+        );
+
+        assert_eq!(distinct_addresses.len(), worker_count);
+        assert_eq!(
+            specification.bytes_per_operation,
+            worker_count * working_set_bytes * scans_per_operation
+        );
+        assert_eq!(pool.execute(), expected);
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_statistics_use_robust_median_stability_and_retain_tail_range() {
         let statistics = summarize(
             &[
@@ -3012,6 +3551,33 @@ mod tests {
         assert_eq!(storage_queue_depth_levels(&profile), vec![1, 4, 16, 64]);
         profile.storage.queue_depth = Some(2);
         assert_eq!(storage_queue_depth_levels(&profile), vec![1, 2]);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_requires_the_exact_canonical_worker_curve()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "hyphae-calibration-diagnostic-levels-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory)?;
+        let mut profile = HardwareProfile::discover(&directory)?;
+        profile.cpu.logical_processors_available = 8;
+        profile.cpu.physical_cores_visible = Some(4);
+        profile.cpu.quota_millicores = None;
+
+        let Err(error) = ThreadScalingDiagnostic::run(&profile, &[1, 2, 4]) else {
+            return Err("an incomplete diagnostic curve was accepted".into());
+        };
+        assert!(matches!(
+            error,
+            CalibrationError::InvalidDiagnosticWorkerCounts {
+                expected,
+                actual
+            } if expected == vec![1, 2, 4, 8] && actual == vec![1, 2, 4]
+        ));
         fs::remove_dir_all(directory)?;
         Ok(())
     }

@@ -26,6 +26,7 @@ use thiserror::Error;
 use crate::{
     GovernorAdmissionError, GovernorRequest, HardwareCalibration, HardwareProfile,
     NativeGovernorPolicy, OwnedGovernorPermit, WorkloadClass,
+    calibration::physical_core_first_processor_order,
 };
 
 struct Job {
@@ -236,61 +237,38 @@ fn derive_discovered_pools(
     worker_count: usize,
 ) -> Result<Vec<NativeNumaPoolTopology>, NativeExecutionError> {
     let mut seen = BTreeSet::new();
-    let mut siblings = BTreeMap::<(u32, u32), Vec<u32>>::new();
     for processor in &profile.cpu.processor_topology {
         if !seen.insert(processor.logical_id) {
             return Err(NativeExecutionError::DuplicateProcessor(
                 processor.logical_id,
             ));
         }
-        siblings
-            .entry((processor.socket_id, processor.core_id))
-            .or_default()
-            .push(processor.logical_id);
     }
-    for logical_ids in siblings.values_mut() {
-        logical_ids.sort_unstable();
-    }
-    let mut candidates = profile
+    let processors = profile
         .cpu
         .processor_topology
         .iter()
-        .map(|processor| {
-            let smt_rank = siblings
-                .get(&(processor.socket_id, processor.core_id))
-                .and_then(|logical_ids| {
-                    logical_ids
-                        .iter()
-                        .position(|logical_id| *logical_id == processor.logical_id)
-                })
-                .and_then(|rank| u32::try_from(rank).ok())
-                .ok_or(NativeExecutionError::InsufficientTopology)?;
-            Ok((smt_rank, processor))
-        })
-        .collect::<Result<Vec<_>, NativeExecutionError>>()?;
-    candidates.sort_by_key(|(smt_rank, processor)| {
-        (
-            *smt_rank,
-            processor.core_id,
-            processor.numa_node_id,
-            processor.socket_id,
-            processor.logical_id,
-        )
-    });
+        .map(|processor| (processor.logical_id, processor))
+        .collect::<BTreeMap<_, _>>();
+    let candidates = physical_core_first_processor_order(profile)
+        .ok_or(NativeExecutionError::InsufficientTopology)?;
     if candidates.len() < worker_count {
         return Err(NativeExecutionError::InsufficientTopology);
     }
     let mut by_node = BTreeMap::<Option<u32>, Vec<NativeWorkerPlacement>>::new();
-    for (worker_index, (smt_rank, processor)) in
+    for (worker_index, (logical_id, smt_rank)) in
         candidates.into_iter().take(worker_count).enumerate()
     {
+        let processor = processors
+            .get(&logical_id)
+            .ok_or(NativeExecutionError::InsufficientTopology)?;
         by_node
             .entry(processor.numa_node_id)
             .or_default()
             .push(NativeWorkerPlacement {
                 worker_index,
                 numa_node_id: processor.numa_node_id,
-                logical_processor_id: Some(processor.logical_id),
+                logical_processor_id: Some(logical_id),
                 socket_id: Some(processor.socket_id),
                 core_id: Some(processor.core_id),
                 smt_rank: Some(smt_rank),
@@ -1376,6 +1354,39 @@ mod tests {
                 .flat_map(|pool| &pool.workers)
                 .all(|worker| worker.smt_rank == Some(0))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_uses_every_canonical_calibration_prefix_across_numa() -> Result<(), Box<dyn Error>>
+    {
+        let profile = profile();
+        let canonical = physical_core_first_processor_order(&profile)
+            .ok_or_else(|| io::Error::other("test topology has no canonical CPU order"))?;
+
+        for worker_count in 1..=canonical.len() {
+            let expected = canonical
+                .iter()
+                .take(worker_count)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let actual = derive_discovered_pools(&profile, worker_count)?
+                .into_iter()
+                .flat_map(|pool| pool.workers)
+                .map(|worker| {
+                    Ok((
+                        worker
+                            .logical_processor_id
+                            .ok_or_else(|| io::Error::other("worker lost logical CPU identity"))?,
+                        worker
+                            .smt_rank
+                            .ok_or_else(|| io::Error::other("worker lost SMT rank"))?,
+                    ))
+                })
+                .collect::<Result<BTreeSet<_>, io::Error>>()?;
+
+            assert_eq!(actual, expected, "worker prefix {worker_count} diverged");
+        }
         Ok(())
     }
 

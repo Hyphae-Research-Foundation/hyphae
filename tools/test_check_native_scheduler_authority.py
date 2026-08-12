@@ -132,6 +132,17 @@ def measurement(template: dict, primitive: str, variant: str, size: int, unit: s
             "bytes_per_operation": 8 * 1_024 * 1_024,
         }
     )
+    if primitive == "thread-scaling-memory-scan":
+        cell["statistics"].update(
+            {
+                "minimum": 1_400_000,
+                "median": 1_500_000,
+                "maximum": 1_600_000,
+                "median_absolute_deviation": 30_000,
+                "relative_mad_ppm": 20_000,
+                "relative_range_ppm": 133_333,
+            }
+        )
     cell["statistics"]["median_bytes_per_second"] = throughput
     return cell
 

@@ -33,6 +33,30 @@ The semantic checker is:
 python3 tools/check_native_hardware_calibration.py --receipt <RECEIPT.json>
 ```
 
+Thread-scaling failures can be inspected without rerunning every calibration
+surface. The separate diagnostic contract retains exactly 31 chronological
+samples for every canonical worker count:
+
+```text
+python3 tools/run_native_hardware_calibration_diagnostic.py \
+  --producer <EXACT-G7-RUNNER> \
+  --source-commit <COMMIT> --source-tree <TREE> \
+  --platform <PLATFORM> --hardware-profile <PROFILE.json> \
+  --producer-executable-blake3 <BLAKE3> \
+  --compiler-identity <IDENTITY> --hyphae-build-identity <IDENTITY> \
+  --worker-counts <ORDERED-COUNTS> --output <DIAGNOSTIC.json>
+```
+
+The producer measures through the same private worker buffers, affinity order,
+hot-state batch convergence, correctness reference, and 225 ms thorough policy.
+The orchestrator independently hashes the producer bytes before execution. The
+checker recomputes every statistic from the raw samples and requires the frozen
+operation cap, exact worker curve, differential digests, source identity, and
+hardware fingerprint. The envelope is permanently `diagnostic-only`, with
+`authority=false`, empty claims, and no cache or scheduling fields. It cannot
+select a governor policy, substitute for a complete thorough receipt, or close
+G7.
+
 ## Identity and cache key
 
 Each receipt binds the stable hardware fingerprint, kernel release, selected
@@ -126,10 +150,26 @@ synchronization semantics visible instead of amortizing them into an
 uncontrolled batch.
 
 Every timing cell uses adaptive inner batches, unrecorded warmups, and an odd
-sample count. Receipts report integer picoseconds per operation, min/median/max,
-median absolute deviation, relative MAD, relative range, and derived byte
-throughput where meaningful. Integer statistics avoid platform-dependent JSON
-floating-point representations.
+sample count. The thorough policy targets 225 milliseconds per sample. The
+thread-scaling selector measures its scaled candidate twice and fails closed if
+the target cannot be reached without exhausting the recorded cap. Other
+surfaces retain one bounded extrapolation so the complete Quick and Thorough
+measurement plans fit their 15-second and 600-second contracts. The semantic
+checker independently verifies that recorded thread-scaling batch medians
+remain near the target. Receipts report integer picoseconds per operation,
+min/median/max, median absolute deviation, relative MAD, relative range, and
+derived byte throughput where meaningful. Integer statistics avoid
+platform-dependent JSON floating-point representations.
+
+Each affinity-bound thread-scaling worker allocates and initializes its own
+private working buffer only after binding to its processor. This removes the
+shared page-home and cache-directory bias of one buffer initialized by the
+coordinator. First touch reduces that known bias; it is not proof that an
+operating system or hypervisor preserved NUMA residency for the full sample.
+Calibration and execution consume the same physical-core-first processor order:
+physical cores are spread round-robin across visible NUMA nodes before any SMT
+sibling is admitted. A calibrated worker-count prefix therefore names the exact
+processor prefix later used by the scheduler.
 
 Candidate outputs are digested and compared to a separately structured
 reference path before timing can be selected. Vector, comparison, and memory

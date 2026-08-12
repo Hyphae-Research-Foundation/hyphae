@@ -15,6 +15,8 @@ SCHEMA = "hyphae-native-hardware-calibration-v1"
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 SMT_RECOMMENDATION_RATIO_PPM = 1_050_000
 IO_RECOMMENDATION_FLOOR_PPM = 950_000
+THREAD_SCALING_BATCH_MINIMUM_TARGET_PPM = 800_000
+THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM = 1_250_000
 REQUIRED_SCHEDULER_MEASUREMENT_PRIMITIVES = {
     "numa-memory-read",
     "thread-scaling-memory-scan",
@@ -149,6 +151,8 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     )
     if operations > operation_cap:
         fail(f"{prefix}.operations_per_sample exceeds its recorded hard limit")
+    if primitive == "thread-scaling-memory-scan" and operations == operation_cap:
+        fail(f"{prefix}.operations_per_sample exhausted its operation cap")
     sample_count = require_integer(measurement["sample_count"], f"{prefix}.sample_count", 3)
     if sample_count != policy["samples_per_measurement"]:
         fail(f"{prefix}.sample_count differs from policy")
@@ -174,6 +178,16 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     maximum = require_integer(statistics["maximum"], f"{prefix}.statistics.maximum", 1)
     if not minimum <= median <= maximum:
         fail(f"{prefix} timing order is invalid")
+    if primitive == "thread-scaling-memory-scan":
+        median_batch_picoseconds = median * operations
+        target_batch_picoseconds = policy["target_sample_duration_ms"] * 1_000_000_000
+        if (
+            median_batch_picoseconds * 1_000_000
+            < target_batch_picoseconds * THREAD_SCALING_BATCH_MINIMUM_TARGET_PPM
+            or median_batch_picoseconds * 1_000_000
+            > target_batch_picoseconds * THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM
+        ):
+            fail(f"{prefix} median batch duration missed its target window")
     require_integer(
         statistics["median_absolute_deviation"],
         f"{prefix}.statistics.median_absolute_deviation",
@@ -186,7 +200,6 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
             f"{prefix}.statistics.median_bytes_per_second",
             1,
         )
-
     correctness = require_object(
         measurement["correctness"],
         f"{prefix}.correctness",

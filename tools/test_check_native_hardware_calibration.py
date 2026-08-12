@@ -9,6 +9,7 @@ import unittest
 
 from tools.check_native_hardware_calibration import (
     CalibrationValidationError,
+    validate_measurement,
     validate_receipt,
 )
 
@@ -267,7 +268,14 @@ class CalibrationCheckerTests(unittest.TestCase):
         measurement = receipt["measurements"][0]
         measurement["primitive"] = "thread-scaling-memory-scan"
         receipt["coverage"]["measured"] = ["thread-scaling-memory-scan"]
-        measurement["statistics"]["relative_mad_ppm"] = 600_000
+        measurement["statistics"].update(
+            {
+                "minimum": 1_400_000,
+                "median": 1_500_000,
+                "maximum": 2_400_000,
+                "relative_mad_ppm": 600_000,
+            }
+        )
         measurement["status"] = "unstable"
         receipt["status"] = "unstable"
         receipt["accepted_for_scheduling"] = False
@@ -291,6 +299,33 @@ class CalibrationCheckerTests(unittest.TestCase):
         receipt["measurements"][0]["maximum_operations_per_sample"] = 9_999
         with self.assertRaisesRegex(CalibrationValidationError, "hard limit"):
             validate_receipt(receipt)
+
+    def test_thread_scaling_batch_must_not_exhaust_its_operation_cap(self) -> None:
+        receipt = valid_receipt()
+        measurement = copy.deepcopy(receipt["measurements"][0])
+        measurement.update(
+            {
+                "primitive": "thread-scaling-memory-scan",
+                "variant": "persistent-workers-physical-range-linux-affinity",
+                "input_size": 4,
+                "input_unit": "threads",
+                "operations_per_sample": 64,
+                "maximum_operations_per_sample": 64,
+            }
+        )
+        with self.assertRaisesRegex(CalibrationValidationError, "exhausted its operation cap"):
+            validate_measurement(measurement, receipt["policy"], 0)
+
+        measurement["operations_per_sample"] = 9_000
+        measurement["maximum_operations_per_sample"] = 1_048_576
+        measurement["statistics"].update(
+            {"minimum": 1_500_000, "median": 1_666_667, "maximum": 1_800_000}
+        )
+        validate_measurement(measurement, receipt["policy"], 0)
+
+        measurement["operations_per_sample"] = 900
+        with self.assertRaisesRegex(CalibrationValidationError, "missed its target window"):
+            validate_measurement(measurement, receipt["policy"], 0)
 
     def test_rejects_out_of_window_receipt_claiming_stable(self) -> None:
         receipt = valid_receipt()

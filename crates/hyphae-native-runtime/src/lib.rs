@@ -76,6 +76,7 @@ pub use calibration::{
     CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling, CalibrationMeasurement,
     CalibrationMode, CalibrationPolicy, CalibrationRequest, CalibrationStatistics,
     CalibrationThreadScaling, HardwareCalibration, SelectedCalibrationKernel,
+    ThreadScalingDiagnostic, ThreadScalingDiagnosticPoint, ThreadScalingDiagnosticPolicy,
     UnsupportedCalibration,
 };
 pub use convergence::{

@@ -27,9 +27,9 @@ use hyphae_native_runtime::{
     AnnPartitionRoutingOutcome, AnnSearchOptions, CalibrationMode, CalibrationRequest,
     HardwareCalibration, HardwareProfile, HnswConfig, InitialAnnBulkBuildEvidence,
     InitialAnnBulkBuilder, InitialAnnBulkProgress, InitialAnnBulkProgressStage,
-    MAX_INITIAL_ANN_BULK_PARTITIONS, NativeCommitScheduler, NativeDatabase, NativeExecutionPool,
-    NativeExecutionTopology, NativeGovernorPolicy, NativeResourceGovernor, NativeSnapshot, Vector,
-    VectorMetric, WorkloadClass,
+    MAX_INITIAL_ANN_BULK_PARTITIONS, NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch,
+    NativeExecutionPool, NativeExecutionTopology, NativeGovernorPolicy, NativeResourceGovernor,
+    NativeSnapshot, ThreadScalingDiagnostic, Vector, VectorMetric, WorkloadClass,
 };
 use hyphae_native_types::ObjectId;
 use serde_json::json;
@@ -53,6 +53,165 @@ const G7_PREFERRED_ANN_PARTITIONS: usize = 32;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_CHUNK_UNITS: usize = 10_000;
+const SEED_BATCH_DOCUMENTS: usize = 512;
+const MAX_SEED_COHORTS: usize = 2;
+const SEED_PARTITION_RULE: &str = "batch-index-modulo-cohort-count-ordinal-commit-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeedCohortPlan {
+    cohort_count: usize,
+    batch_size: usize,
+    partition_rule: &'static str,
+}
+
+impl SeedCohortPlan {
+    fn for_database(database: &NativeDatabase, document_count: usize) -> Self {
+        let total_batches = document_count.div_ceil(SEED_BATCH_DOCUMENTS).max(1);
+        Self {
+            cohort_count: seed_cohort_count(database).min(total_batches),
+            batch_size: SEED_BATCH_DOCUMENTS,
+            partition_rule: SEED_PARTITION_RULE,
+        }
+    }
+}
+
+/// Bounds staging by both process visibility and the installed governor's
+/// effective Mutation-class compute and I/O capacity. Retained-memory
+/// admission remains enforced by each detached delta batch itself.
+fn seed_cohort_count(database: &NativeDatabase) -> usize {
+    let host_parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let admitted_parallelism = database
+        .resource_governor()
+        .map_or(host_parallelism, |governor| {
+            let policy = governor.policy();
+            let mutation = policy.limit(WorkloadClass::Mutation);
+            [
+                policy.schedulable_compute_threads,
+                policy.io_slots,
+                mutation.compute_threads,
+                mutation.io_slots,
+            ]
+            .into_iter()
+            .min()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(1)
+        });
+    bounded_seed_cohort_count(host_parallelism, admitted_parallelism)
+}
+
+fn bounded_seed_cohort_count(host_parallelism: usize, admitted_parallelism: usize) -> usize {
+    host_parallelism
+        .min(admitted_parallelism)
+        .clamp(1, MAX_SEED_COHORTS)
+}
+
+fn stage_seed_batch(
+    database: &NativeDatabase,
+    lexical_index: ObjectId,
+    batch_start: usize,
+    batch_end: usize,
+    document_count: usize,
+) -> Result<NativeDeltaWriteBatch, String> {
+    let mut batch = database
+        .begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Memory)
+        .map_err(|error| error.to_string())?;
+    for id in batch_start..batch_end {
+        let document_id = (id as u128 + 1).to_be_bytes();
+        let text = if id == document_count / 2 {
+            "rare g7 native benchmark term"
+        } else {
+            "common g7 native benchmark"
+        };
+        database
+            .stage_delta_index_document(
+                &mut batch,
+                lexical_index,
+                document_id.to_vec(),
+                text.to_owned(),
+            )
+            .map_err(|error| error.to_string())?;
+        database
+            .stage_delta_set(
+                &mut batch,
+                filter_key(&document_id),
+                if id % 2 == 0 {
+                    b"keep".to_vec()
+                } else {
+                    b"drop".to_vec()
+                },
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(batch)
+}
+
+fn sort_staged_seed_batches<T>(staged: &mut [(usize, T)]) {
+    staged.sort_unstable_by_key(|(batch_index, _)| *batch_index);
+}
+
+/// Stages disjoint delta batches concurrently, then commits the tagged
+/// batches in deterministic ordinal order. Commit publication remains the
+/// sole-writer path and progress advances only after each successful commit.
+fn seed_lexical_with_cohorts(
+    database: &mut NativeDatabase,
+    lexical_index: ObjectId,
+    document_count: usize,
+    plan: SeedCohortPlan,
+    progress: &Arc<CellProgress>,
+) -> Result<(), Box<dyn Error>> {
+    if document_count == 0 {
+        return Ok(());
+    }
+    let total_batches = document_count.div_ceil(plan.batch_size);
+    let cohorts = plan.cohort_count.min(total_batches).max(1);
+    let mut window_start = 0usize;
+    while window_start < total_batches {
+        let window = cohorts.min(total_batches - window_start);
+        let read_database: &NativeDatabase = database;
+        let mut staged: Vec<(usize, Result<NativeDeltaWriteBatch, String>)> =
+            thread::scope(|scope| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                for slot in 0..window {
+                    let batch_index = window_start + slot;
+                    let batch_start = batch_index * plan.batch_size;
+                    let batch_end = (batch_start + plan.batch_size).min(document_count);
+                    let slot_sender = sender.clone();
+                    scope.spawn(move || {
+                        let staged = stage_seed_batch(
+                            read_database,
+                            lexical_index,
+                            batch_start,
+                            batch_end,
+                            document_count,
+                        );
+                        let _ignored = slot_sender.send((batch_index, staged));
+                    });
+                }
+                drop(sender);
+                receiver.into_iter().collect()
+            });
+        if staged.len() != window {
+            return Err(format!(
+                "G7 seed window staged {} batches but {window} were required",
+                staged.len()
+            )
+            .into());
+        }
+        sort_staged_seed_batches(&mut staged);
+        for (batch_index, staged_batch) in staged {
+            let batch = staged_batch.map_err(|error| -> Box<dyn Error> { error.into() })?;
+            database.commit_optimistic(batch)?;
+            let batch_start = batch_index * plan.batch_size;
+            let committed = (batch_start + plan.batch_size).min(document_count) - batch_start;
+            progress.advance_search_seed_lexical(committed)?;
+        }
+        window_start += window;
+    }
+    Ok(())
+}
 const READ_WORKLOADS: u64 = 10;
 const G7_SURFACES: usize = 11;
 const G7_SURFACE_NAMES: [&str; G7_SURFACES] = [
@@ -410,6 +569,13 @@ impl CellProgress {
     }
 
     fn begin_search_seed_lexical(&self) -> std::io::Result<()> {
+        self.begin_search_seed_lexical_with_plan(None)
+    }
+
+    fn begin_search_seed_lexical_with_plan(
+        &self,
+        plan: Option<SeedCohortPlan>,
+    ) -> std::io::Result<()> {
         self.set_phase(
             "search-seed-lexical",
             "search-seed",
@@ -424,7 +590,13 @@ impl CellProgress {
                 stage: "search-seed-lexical",
                 status: "running",
                 checkpoint_digest: None,
-                details: None,
+                details: plan.map(|plan| {
+                    json!({
+                        "cohort_count": plan.cohort_count,
+                        "batch_size": plan.batch_size,
+                        "partition_rule": plan.partition_rule,
+                    })
+                }),
             },
         )
     }
@@ -1338,38 +1510,15 @@ fn seed_search_database(
     // Seed scalar and lexical state before publishing ANN. Opening any later
     // transaction can cross the vector restoration boundary, so the ANN bulk
     // generation must remain the final mutating seed operation.
-    progress.begin_search_seed_lexical()?;
-    for batch_start in (0..document_count).step_by(512) {
-        let batch_end = (batch_start + 512).min(document_count);
-        let mut batch =
-            database.begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Memory)?;
-        for id in batch_start..batch_end {
-            let document_id = (id as u128 + 1).to_be_bytes();
-            let text = if id == document_count / 2 {
-                "rare g7 native benchmark term"
-            } else {
-                "common g7 native benchmark"
-            };
-            database.stage_delta_index_document(
-                &mut batch,
-                lexical_index,
-                document_id.to_vec(),
-                text.to_owned(),
-            )?;
-            database.stage_delta_set(
-                &mut batch,
-                filter_key(&document_id),
-                if id % 2 == 0 {
-                    b"keep".to_vec()
-                } else {
-                    b"drop".to_vec()
-                },
-                None,
-            )?;
-        }
-        database.commit_optimistic(batch)?;
-        progress.advance_search_seed_lexical(batch_end - batch_start)?;
-    }
+    let cohort_plan = SeedCohortPlan::for_database(&database, document_count);
+    progress.begin_search_seed_lexical_with_plan(Some(cohort_plan))?;
+    seed_lexical_with_cohorts(
+        &mut database,
+        lexical_index,
+        document_count,
+        cohort_plan,
+        progress,
+    )?;
     progress.finish_search_seed_lexical()?;
     database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
     progress.begin_ann_build(authority, logical_partitions)?;
@@ -1690,12 +1839,147 @@ fn run_hardware_calibration(arguments: &[String]) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct HardwareCalibrationDiagnosticArguments {
+    source_commit: String,
+    source_tree: String,
+    platform: String,
+    hardware_profile: PathBuf,
+    producer_executable_blake3: String,
+    compiler_identity: String,
+    hyphae_build_identity: String,
+    worker_counts: Vec<usize>,
+}
+
+impl HardwareCalibrationDiagnosticArguments {
+    fn parse(arguments: &[String]) -> Result<Self, Box<dyn Error>> {
+        const FIELDS: [&str; 8] = [
+            "--source-commit",
+            "--source-tree",
+            "--platform",
+            "--hardware-profile",
+            "--producer-executable-blake3",
+            "--compiler-identity",
+            "--hyphae-build-identity",
+            "--worker-counts",
+        ];
+        if arguments.len() != FIELDS.len() * 2 {
+            return Err("hardware calibration diagnostic requires eight named values".into());
+        }
+        let mut values = BTreeMap::new();
+        for pair in arguments.chunks_exact(2) {
+            let field = pair[0].as_str();
+            if !FIELDS.contains(&field) || values.insert(field, pair[1].clone()).is_some() {
+                return Err(format!("unexpected or duplicate diagnostic field {field}").into());
+            }
+        }
+        let mut take = |field: &'static str| -> Result<String, Box<dyn Error>> {
+            values
+                .remove(field)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("missing diagnostic field {field}").into())
+        };
+        let source_commit = take("--source-commit")?;
+        let source_tree = take("--source-tree")?;
+        if !is_canonical_hex_digest(&source_commit, 40)
+            || !is_canonical_hex_digest(&source_tree, 40)
+        {
+            return Err("diagnostic source commit and tree must be lowercase Git objects".into());
+        }
+        let platform = take("--platform")?;
+        let hardware_profile = PathBuf::from(take("--hardware-profile")?);
+        let producer_executable_blake3 = take("--producer-executable-blake3")?;
+        if !is_canonical_hex_digest(&producer_executable_blake3, 64) {
+            return Err("diagnostic producer digest must be lowercase BLAKE3".into());
+        }
+        let compiler_identity = take("--compiler-identity")?;
+        let hyphae_build_identity = take("--hyphae-build-identity")?;
+        let worker_counts = take("--worker-counts")?
+            .split(',')
+            .map(str::parse::<usize>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if worker_counts.is_empty()
+            || worker_counts.contains(&0)
+            || !worker_counts.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err("diagnostic worker counts must be positive, unique, and ordered".into());
+        }
+        Ok(Self {
+            source_commit,
+            source_tree,
+            platform,
+            hardware_profile,
+            producer_executable_blake3,
+            compiler_identity,
+            hyphae_build_identity,
+            worker_counts,
+        })
+    }
+}
+
+fn is_canonical_hex_digest(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn run_hardware_calibration_diagnostic(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let arguments = HardwareCalibrationDiagnosticArguments::parse(arguments)?;
+    if arguments.platform != std::env::consts::OS {
+        return Err("diagnostic platform differs from the executing platform".into());
+    }
+    if arguments.compiler_identity != env!("HYPHAE_RUSTC_IDENTITY") {
+        return Err("diagnostic compiler identity differs from the producer build".into());
+    }
+    let expected_build_identity = concat!("hyphae-native-g7-runner/", env!("CARGO_PKG_VERSION"));
+    if arguments.hyphae_build_identity != expected_build_identity {
+        return Err("diagnostic Hyphae build identity differs from the producer build".into());
+    }
+    let executable_blake3 = current_executable_blake3()?;
+    if arguments.producer_executable_blake3 != executable_blake3 {
+        return Err("diagnostic producer executable digest differs from its bytes".into());
+    }
+    let profile = HardwareProfile::from_json_slice(&fs::read(&arguments.hardware_profile)?)?;
+    let diagnostic = ThreadScalingDiagnostic::run(&profile, &arguments.worker_counts)?;
+    let receipt = json!({
+        "schema": "hyphae-native-hardware-calibration-diagnostic-v1",
+        "authority": false,
+        "evidence_class": "diagnostic-only",
+        "claims": [],
+        "closure_declared": false,
+        "source": {
+            "commit": arguments.source_commit,
+            "tree": arguments.source_tree,
+        },
+        "platform": arguments.platform,
+        "identity": {
+            "hardware_fingerprint": profile.fingerprint,
+            "producer_executable_blake3": executable_blake3,
+            "compiler_identity": arguments.compiler_identity,
+            "hyphae_build_identity": arguments.hyphae_build_identity,
+        },
+        "policy": diagnostic.policy,
+        "surface": {
+            "primitive": "thread-scaling-memory-scan",
+            "binding": diagnostic.binding,
+            "worker_points": diagnostic.worker_points,
+        },
+    });
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &receipt)?;
+    println!();
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let allocation_start = GLOBAL_ALLOCATOR.stats();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("--hardware-calibrate") {
         return run_hardware_calibration(&arguments[1..]);
+    }
+    if arguments.first().map(String::as_str) == Some("--hardware-calibration-diagnostic") {
+        return run_hardware_calibration_diagnostic(&arguments[1..]);
     }
     let source_commit = arguments
         .first()
@@ -3361,6 +3645,215 @@ fn physical_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_arguments_bind_every_external_authority() -> Result<(), Box<dyn Error>> {
+        let arguments = [
+            "--source-commit",
+            &"1".repeat(40),
+            "--source-tree",
+            &"2".repeat(40),
+            "--platform",
+            "linux",
+            "--hardware-profile",
+            "/tmp/profile.json",
+            "--producer-executable-blake3",
+            &"3".repeat(64),
+            "--compiler-identity",
+            "rustc test",
+            "--hyphae-build-identity",
+            "hyphae-native-g7-runner/0.0.0",
+            "--worker-counts",
+            "1,2,4,8",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        let parsed = HardwareCalibrationDiagnosticArguments::parse(&arguments)?;
+        assert_eq!(parsed.source_commit, "1".repeat(40));
+        assert_eq!(parsed.source_tree, "2".repeat(40));
+        assert_eq!(parsed.worker_counts, vec![1, 2, 4, 8]);
+
+        let mut duplicate = arguments;
+        duplicate[2] = "--source-commit".to_owned();
+        assert!(HardwareCalibrationDiagnosticArguments::parse(&duplicate).is_err());
+        Ok(())
+    }
+
+    fn create_lexical_seed_test_database(
+        path: &Path,
+        lexical_index: ObjectId,
+    ) -> Result<NativeDatabase, Box<dyn Error>> {
+        let mut database = NativeDatabase::create(path)?;
+        let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        seed.create_search_index(lexical_index, "g7_search")?;
+        seed.commit()?;
+        Ok(database)
+    }
+
+    fn test_seed_progress(document_count: usize) -> Result<Arc<CellProgress>, Box<dyn Error>> {
+        CellProgress::new(
+            None,
+            "1".repeat(40),
+            None,
+            "3".repeat(64),
+            u64::try_from(document_count)?,
+            u64::try_from(document_count)?,
+        )
+    }
+
+    #[test]
+    fn staged_seed_results_are_sorted_by_batch_ordinal() {
+        let mut staged = vec![(3, "third"), (1, "first"), (2, "second")];
+        sort_staged_seed_batches(&mut staged);
+        assert_eq!(staged, vec![(1, "first"), (2, "second"), (3, "third")]);
+    }
+
+    #[test]
+    fn seed_cohort_bound_respects_one_slot_authority() {
+        assert_eq!(bounded_seed_cohort_count(96, 1), 1);
+        assert_eq!(bounded_seed_cohort_count(96, 2), 2);
+        assert_eq!(bounded_seed_cohort_count(1, 2), 1);
+        assert_eq!(bounded_seed_cohort_count(96, 8), MAX_SEED_COHORTS);
+    }
+
+    #[test]
+    fn seed_progress_records_the_executed_cohort_plan() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-g7-seed-cohort-progress-{}-{}.json",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let progress = CellProgress::new(
+            Some(path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            1_024,
+            1_024,
+        )?;
+        let plan = SeedCohortPlan {
+            cohort_count: 2,
+            batch_size: SEED_BATCH_DOCUMENTS,
+            partition_rule: SEED_PARTITION_RULE,
+        };
+        progress.begin_search_seed_lexical_with_plan(Some(plan))?;
+        let observed: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        fs::remove_file(path)?;
+
+        assert_eq!(observed["details"]["cohort_count"], plan.cohort_count);
+        assert_eq!(observed["details"]["batch_size"], plan.batch_size);
+        assert_eq!(observed["details"]["partition_rule"], plan.partition_rule);
+        Ok(())
+    }
+
+    #[test]
+    fn two_cohort_seed_matches_serial_seed_after_reopen() -> Result<(), Box<dyn Error>> {
+        const DOCUMENT_COUNT: usize = SEED_BATCH_DOCUMENTS * 2 + 1;
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-seed-cohort-equivalence-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let serial_path = root.join("serial");
+        let cohort_path = root.join("cohort");
+        let lexical_index = ObjectId::new(7)?;
+        fs::create_dir_all(&root)?;
+
+        let mut serial = create_lexical_seed_test_database(&serial_path, lexical_index)?;
+        let serial_progress = test_seed_progress(DOCUMENT_COUNT)?;
+        serial_progress.begin_search_seed_lexical()?;
+        seed_lexical_with_cohorts(
+            &mut serial,
+            lexical_index,
+            DOCUMENT_COUNT,
+            SeedCohortPlan {
+                cohort_count: 1,
+                batch_size: SEED_BATCH_DOCUMENTS,
+                partition_rule: SEED_PARTITION_RULE,
+            },
+            &serial_progress,
+        )?;
+        serial_progress.finish_search_seed_lexical()?;
+        drop(serial);
+
+        let mut cohort = create_lexical_seed_test_database(&cohort_path, lexical_index)?;
+        let cohort_progress = test_seed_progress(DOCUMENT_COUNT)?;
+        let cohort_plan = SeedCohortPlan {
+            cohort_count: 2,
+            batch_size: SEED_BATCH_DOCUMENTS,
+            partition_rule: SEED_PARTITION_RULE,
+        };
+        cohort_progress.begin_search_seed_lexical_with_plan(Some(cohort_plan))?;
+        seed_lexical_with_cohorts(
+            &mut cohort,
+            lexical_index,
+            DOCUMENT_COUNT,
+            cohort_plan,
+            &cohort_progress,
+        )?;
+        cohort_progress.finish_search_seed_lexical()?;
+        drop(cohort);
+
+        let serial = NativeDatabase::open(&serial_path)?;
+        let cohort = NativeDatabase::open(&cohort_path)?;
+        let serial_snapshot = serial.snapshot(0)?;
+        let cohort_snapshot = cohort.snapshot(0)?;
+        let expected_documents = (0..DOCUMENT_COUNT)
+            .map(|id| {
+                let text = if id == DOCUMENT_COUNT / 2 {
+                    "rare g7 native benchmark term"
+                } else {
+                    "common g7 native benchmark"
+                };
+                ((id as u128 + 1).to_be_bytes().to_vec(), text.to_owned())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            serial_snapshot.search_documents(lexical_index),
+            Some(expected_documents.clone())
+        );
+        assert_eq!(
+            cohort_snapshot.search_documents(lexical_index),
+            Some(expected_documents)
+        );
+        assert_eq!(
+            serial.recovery_report().committed_transactions,
+            cohort.recovery_report().committed_transactions
+        );
+        for query in ["rare", "common", "native benchmark"] {
+            assert_eq!(
+                serial.match_latest_text(lexical_index, query, 10)?,
+                cohort.match_latest_text(lexical_index, query, 10)?
+            );
+        }
+        for id in 0..DOCUMENT_COUNT {
+            let document_id = (id as u128 + 1).to_be_bytes();
+            let expected = if id % 2 == 0 {
+                b"keep".as_slice()
+            } else {
+                b"drop".as_slice()
+            };
+            assert_eq!(
+                serial
+                    .get_latest_structure(&filter_key(&document_id), 0)?
+                    .as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                cohort
+                    .get_latest_structure(&filter_key(&document_id), 0)?
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        drop(serial);
+        drop(cohort);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn logical_ann_partition_policy_is_corpus_bound_not_hardware_bound() {

@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-hardware-calibration-diagnostic-v1.schema.json",
+  "title": "Hyphae Native thread-scaling calibration diagnostic v1",
+  "description": "Diagnostic-only evidence. Source commit/tree come from an external exact-source authority; producer_executable_blake3 binds the independently hashed producer bytes. This schema never grants scheduling, governor, cache, G7, or closure authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "authority", "evidence_class", "claims", "closure_declared", "source", "platform", "identity", "policy", "surface"],
+  "properties": {
+    "schema": {"const": "hyphae-native-hardware-calibration-diagnostic-v1"},
+    "authority": {"const": false},
+    "evidence_class": {"const": "diagnostic-only"},
+    "claims": {"type": "array", "maxItems": 0},
+    "closure_declared": {"const": false},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree"],
+      "properties": {
+        "commit": {"$ref": "#/$defs/git_object"},
+        "tree": {"$ref": "#/$defs/git_object"}
+      }
+    },
+    "platform": {"type": "string", "minLength": 1},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hardware_fingerprint", "producer_executable_blake3", "compiler_identity", "hyphae_build_identity"],
+      "properties": {
+        "hardware_fingerprint": {"$ref": "#/$defs/digest"},
+        "producer_executable_blake3": {
+          "description": "BLAKE3 of the exact producer executable bytes, recomputed by the orchestrator.",
+          "$ref": "#/$defs/digest"
+        },
+        "compiler_identity": {"type": "string", "minLength": 1},
+        "hyphae_build_identity": {"type": "string", "minLength": 1}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "warmup_batches", "samples_per_measurement", "target_sample_duration_ms", "maximum_relative_mad_ppm", "operation_calibration_target_lower_ppm", "operation_calibration_target_upper_ppm", "operation_calibration_confirmations", "operation_calibration_max_refinements"],
+      "properties": {
+        "mode": {"const": "thorough"},
+        "warmup_batches": {"const": 4},
+        "samples_per_measurement": {"const": 31},
+        "target_sample_duration_ms": {"const": 225},
+        "maximum_relative_mad_ppm": {"const": 40000},
+        "operation_calibration_target_lower_ppm": {"const": 900000},
+        "operation_calibration_target_upper_ppm": {"const": 1100000},
+        "operation_calibration_confirmations": {"const": 2},
+        "operation_calibration_max_refinements": {"const": 6}
+      }
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primitive", "binding", "worker_points"],
+      "properties": {
+        "primitive": {"const": "thread-scaling-memory-scan"},
+        "binding": {"enum": ["linux-sched-affinity", "unbound"]},
+        "worker_points": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/worker_point"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "git_object": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "minimum", "median", "maximum", "median_absolute_deviation", "relative_mad_ppm", "relative_range_ppm", "median_bytes_per_second"],
+      "properties": {
+        "unit": {"const": "picoseconds_per_operation"},
+        "minimum": {"type": "integer", "minimum": 1},
+        "median": {"type": "integer", "minimum": 1},
+        "maximum": {"type": "integer", "minimum": 1},
+        "median_absolute_deviation": {"type": "integer", "minimum": 0},
+        "relative_mad_ppm": {"type": "integer", "minimum": 0},
+        "relative_range_ppm": {"type": "integer", "minimum": 0},
+        "median_bytes_per_second": {"type": "integer", "minimum": 1}
+      }
+    },
+    "worker_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_count", "variant", "bytes_per_operation", "operations_per_sample", "maximum_operations_per_sample", "batch_calibration_status", "samples_picoseconds_per_operation", "statistics", "correctness", "status"],
+      "properties": {
+        "worker_count": {"type": "integer", "minimum": 1},
+        "variant": {"type": "string", "minLength": 1},
+        "bytes_per_operation": {"type": "integer", "minimum": 1},
+        "operations_per_sample": {"type": "integer", "minimum": 1},
+        "maximum_operations_per_sample": {"const": 1048576},
+        "batch_calibration_status": {"enum": ["converged", "not-converged"]},
+        "samples_picoseconds_per_operation": {
+          "type": "array",
+          "minItems": 31,
+          "maxItems": 31,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "statistics": {"$ref": "#/$defs/statistics"},
+        "correctness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "result_digest_blake3", "reference_digest_blake3"],
+          "properties": {
+            "status": {"const": "passed"},
+            "result_digest_blake3": {"$ref": "#/$defs/digest"},
+            "reference_digest_blake3": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "status": {"enum": ["stable", "unstable"]}
+      }
+    }
+  }
+}
