@@ -151,8 +151,11 @@ uncontrolled batch.
 
 Every timing cell uses adaptive inner batches, unrecorded warmups, and an odd
 sample count. The thorough policy targets 225 milliseconds per sample. The
-thread-scaling selector measures its scaled candidate twice and fails closed if
-the target cannot be reached without exhausting the recorded cap. Other
+thread-scaling selector requires three consecutive in-window hot-state probes
+and fails closed if the target cannot be reached without exhausting the
+recorded cap. The retained 31-sample median is the final convergence authority;
+an out-of-window median remains valid `unstable` evidence and cannot authorize
+scheduling. Other
 surfaces retain one bounded extrapolation so the complete Quick and Thorough
 measurement plans fit their 15-second and 600-second contracts. The semantic
 checker independently verifies that recorded thread-scaling batch medians

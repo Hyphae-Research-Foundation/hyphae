@@ -43,7 +43,7 @@ const CACHE_SCHEMA: &str = "hyphae-native-hardware-calibration-cache-v1";
 const PPM: u128 = 1_000_000;
 const PICOSECONDS_PER_SECOND: u128 = 1_000_000_000_000;
 const OPERATION_CALIBRATION_FLOOR: Duration = Duration::from_millis(1);
-const OPERATION_CALIBRATION_CONFIRMATIONS: u8 = 2;
+const OPERATION_CALIBRATION_CONFIRMATIONS: u8 = 3;
 const OPERATION_CALIBRATION_MAX_REFINEMENTS: u8 = 6;
 const OPERATION_CALIBRATION_TARGET_LOWER_PPM: u128 = 900_000;
 const OPERATION_CALIBRATION_TARGET_UPPER_PPM: u128 = 1_100_000;
@@ -354,7 +354,7 @@ pub struct ThreadScalingDiagnosticPoint {
     pub operations_per_sample: u64,
     /// Hard operation limit used by calibration.
     pub maximum_operations_per_sample: u64,
-    /// `converged` only after two in-window hot-state probes below the cap.
+    /// `converged` only when the retained median confirms the calibrated target.
     pub batch_calibration_status: String,
     /// Exactly 31 chronological picosecond-per-operation samples.
     pub samples_picoseconds_per_operation: Vec<u64>,
@@ -2979,14 +2979,14 @@ fn sample_operation<T>(
         samples.push(run_batch(operation, operation_calibration.operations));
     }
     let statistics = summarize(&samples, spec.bytes_per_operation);
-    if spec.require_target_convergence
-        && !recorded_batch_confirms_target(
-            &statistics,
-            operation_calibration.operations,
-            policy.target_sample_duration_ms,
-        )
-    {
-        operation_calibration.converged = false;
+    if spec.require_target_convergence {
+        operation_calibration.converged = operation_calibration.operations
+            < spec.max_operations_per_sample
+            && recorded_batch_confirms_target(
+                &statistics,
+                operation_calibration.operations,
+                policy.target_sample_duration_ms,
+            );
     }
     SampledOperation {
         operation_calibration,
@@ -3476,7 +3476,10 @@ mod tests {
                 converged: true,
             }
         );
-        assert_eq!(&measured_operations[7..], &[9_000, 9_000, 50_625, 50_625]);
+        assert_eq!(
+            &measured_operations[7..],
+            &[9_000, 9_000, 50_625, 50_625, 50_625]
+        );
     }
 
     #[test]
@@ -3493,6 +3496,35 @@ mod tests {
                 converged: false,
             }
         );
+    }
+
+    #[test]
+    fn operation_calibration_requires_three_consecutive_target_probes() {
+        let target = Duration::from_millis(225);
+        let mut measured_operations = Vec::new();
+        let calibration = calibrated_operations_for_target(
+            target,
+            THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE,
+            |operations| {
+                measured_operations.push(operations);
+                match measured_operations.as_slice() {
+                    [1] => Duration::from_millis(1),
+                    [.., 225] if measured_operations.len() <= 3 => target,
+                    [.., 225] => Duration::from_millis(100),
+                    [.., 507] => target,
+                    _ => Duration::from_millis(1),
+                }
+            },
+        );
+
+        assert_eq!(
+            calibration,
+            OperationCalibration {
+                operations: 507,
+                converged: true,
+            }
+        );
+        assert_eq!(measured_operations, [1, 225, 225, 225, 507, 507, 507]);
     }
 
     #[test]

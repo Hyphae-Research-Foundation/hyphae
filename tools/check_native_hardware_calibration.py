@@ -151,8 +151,7 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     )
     if operations > operation_cap:
         fail(f"{prefix}.operations_per_sample exceeds its recorded hard limit")
-    if primitive == "thread-scaling-memory-scan" and operations == operation_cap:
-        fail(f"{prefix}.operations_per_sample exhausted its operation cap")
+    thread_scaling_batch_is_stable = True
     sample_count = require_integer(measurement["sample_count"], f"{prefix}.sample_count", 3)
     if sample_count != policy["samples_per_measurement"]:
         fail(f"{prefix}.sample_count differs from policy")
@@ -181,13 +180,12 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     if primitive == "thread-scaling-memory-scan":
         median_batch_picoseconds = median * operations
         target_batch_picoseconds = policy["target_sample_duration_ms"] * 1_000_000_000
-        if (
+        thread_scaling_batch_is_stable = operations < operation_cap and not (
             median_batch_picoseconds * 1_000_000
             < target_batch_picoseconds * THREAD_SCALING_BATCH_MINIMUM_TARGET_PPM
             or median_batch_picoseconds * 1_000_000
             > target_batch_picoseconds * THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM
-        ):
-            fail(f"{prefix} median batch duration missed its target window")
+        )
     require_integer(
         statistics["median_absolute_deviation"],
         f"{prefix}.statistics.median_absolute_deviation",
@@ -217,8 +215,11 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     if passed != (result_digest == reference_digest):
         fail(f"{prefix} correctness status disagrees with result digests")
     scheduler_input = primitive in ROBUST_MEDIAN_MEASUREMENT_PRIMITIVES
-    stable = passed and mad_ppm <= policy["maximum_relative_mad_ppm"] and (
-        scheduler_input or range_ppm <= policy["maximum_relative_range_ppm"]
+    stable = (
+        passed
+        and mad_ppm <= policy["maximum_relative_mad_ppm"]
+        and (scheduler_input or range_ppm <= policy["maximum_relative_range_ppm"])
+        and thread_scaling_batch_is_stable
     )
     expected_status = "stable" if stable else ("rejected" if not passed else "unstable")
     if measurement["status"] != expected_status:

@@ -25,7 +25,7 @@ POLICY = {
     "maximum_relative_mad_ppm": 40_000,
     "operation_calibration_target_lower_ppm": 900_000,
     "operation_calibration_target_upper_ppm": 1_100_000,
-    "operation_calibration_confirmations": 2,
+    "operation_calibration_confirmations": 3,
     "operation_calibration_max_refinements": 6,
 }
 BATCH_MINIMUM_TARGET_PPM = 800_000

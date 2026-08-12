@@ -300,7 +300,7 @@ class CalibrationCheckerTests(unittest.TestCase):
         with self.assertRaisesRegex(CalibrationValidationError, "hard limit"):
             validate_receipt(receipt)
 
-    def test_thread_scaling_batch_must_not_exhaust_its_operation_cap(self) -> None:
+    def test_thread_scaling_batch_drift_is_valid_only_as_unstable_evidence(self) -> None:
         receipt = valid_receipt()
         measurement = copy.deepcopy(receipt["measurements"][0])
         measurement.update(
@@ -313,19 +313,24 @@ class CalibrationCheckerTests(unittest.TestCase):
                 "maximum_operations_per_sample": 64,
             }
         )
-        with self.assertRaisesRegex(CalibrationValidationError, "exhausted its operation cap"):
+        with self.assertRaisesRegex(CalibrationValidationError, "status must be unstable"):
             validate_measurement(measurement, receipt["policy"], 0)
+        measurement["status"] = "unstable"
+        validate_measurement(measurement, receipt["policy"], 0)
 
         measurement["operations_per_sample"] = 9_000
         measurement["maximum_operations_per_sample"] = 1_048_576
+        measurement["status"] = "stable"
         measurement["statistics"].update(
             {"minimum": 1_500_000, "median": 1_666_667, "maximum": 1_800_000}
         )
         validate_measurement(measurement, receipt["policy"], 0)
 
         measurement["operations_per_sample"] = 900
-        with self.assertRaisesRegex(CalibrationValidationError, "missed its target window"):
+        with self.assertRaisesRegex(CalibrationValidationError, "status must be unstable"):
             validate_measurement(measurement, receipt["policy"], 0)
+        measurement["status"] = "unstable"
+        validate_measurement(measurement, receipt["policy"], 0)
 
     def test_rejects_out_of_window_receipt_claiming_stable(self) -> None:
         receipt = valid_receipt()
