@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "12a96301fd68effabdb085725984b3ebfa9b465fd0c5690a219a30f227b4cc55"
+CONTRACT_SHA256 = "f7f0452be462c6a02b14923e5b7c0118e067f915efa8badfb7db3b10b1049e0c"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -448,6 +448,19 @@ class HyphaeNativeSchedulerAuthorityV1(TypedDict):
     status: Literal["verified"]
     claims: list[JsonValue]
 
+class HyphaeNativeThreadScalingCalibrationDiagnosticV1(TypedDict):
+    """Diagnostic-only evidence. Source commit/tree come from an external exact-source authority; producer_executable_blake3 binds the independently hashed producer bytes. This schema never grants scheduling, governor, cache, G7, or closure authority."""
+    schema: Literal["hyphae-native-hardware-calibration-diagnostic-v1"]
+    authority: Literal[False]
+    evidence_class: Literal["diagnostic-only"]
+    claims: list[JsonValue]
+    closure_declared: Literal[False]
+    source: dict[str, JsonValue]
+    platform: str
+    identity: dict[str, JsonValue]
+    policy: dict[str, JsonValue]
+    surface: dict[str, JsonValue]
+
 class HyphaeNativeVectorBulkBuildBakeoffV1(TypedDict):
     schema: Literal["hyphae-native-vector-bulk-bakeoff-v1"]
     status: Literal["diagnostic"]
@@ -682,6 +695,16 @@ class SortFieldV1(TypedDict):
     nulls: NullPlacementV1
     path: list[str]
 
+class Statistics(TypedDict):
+    unit: Literal["picoseconds_per_operation"]
+    minimum: int
+    median: int
+    maximum: int
+    median_absolute_deviation: int
+    relative_mad_ppm: int
+    relative_range_ppm: int
+    median_bytes_per_second: int
+
 class VectorSpaceV1(TypedDict):
     """One immutable durable vector-space definition."""
     dimension: int
@@ -706,6 +729,18 @@ class Worker(TypedDict):
     core_id: NullableId
     smt_rank: NullableId
 
+class WorkerPoint(TypedDict):
+    worker_count: int
+    variant: str
+    bytes_per_operation: int
+    operations_per_sample: int
+    maximum_operations_per_sample: Literal[1048576]
+    batch_calibration_status: Literal["converged", "not-converged"]
+    samples_picoseconds_per_operation: list[int]
+    statistics: Statistics
+    correctness: dict[str, JsonValue]
+    status: Literal["stable", "unstable"]
+
 Blake3: TypeAlias = str
 Class: TypeAlias = Literal["foreground-point", "foreground-bounded", "mutation", "bulk", "maintenance", "recovery", "administrative"]
 CompareOperatorV1: TypeAlias = Literal["equal"] | Literal["not_equal"] | Literal["less"] | Literal["less_or_equal"] | Literal["greater"] | Literal["greater_or_equal"]
@@ -713,6 +748,7 @@ Digest: TypeAlias = str
 ExactAbstentionReasonV1: TypeAlias = Literal["no_candidates"] | Literal["below_threshold"] | Literal["ambiguous"]
 ExactRetrievalOutcomeV1: TypeAlias = ExactRetrievalOutcomeV1Matches | ExactRetrievalOutcomeV1Abstained
 FilterV1: TypeAlias = FilterV1MatchAll | FilterV1Exists | FilterV1Compare | FilterV1Prefix | FilterV1Contains | FilterV1All | FilterV1Any | FilterV1Not
+GitObject: TypeAlias = str
 GroupKeyValueV1: TypeAlias = GroupKeyValueV1Missing | GroupKeyValueV1Value
 HybridBranchAbsenceV1: TypeAlias = Literal["lexical_no_candidates"] | Literal["vector_no_candidates"] | Literal["vector_below_threshold"] | Literal["vector_ambiguous"]
 HybridRetrievalOutcomeV1: TypeAlias = HybridRetrievalOutcomeV1Matches | HybridRetrievalOutcomeV1Abstained
@@ -780,6 +816,7 @@ __all__ = [
     "FinalReopen",
     "GetRequestV1",
     "GetResponseV1",
+    "GitObject",
     "GroupKeyValueV1",
     "GroupKeyValueV1Missing",
     "GroupKeyValueV1Value",
@@ -803,6 +840,7 @@ __all__ = [
     "HyphaeNativePersistentExecutionTopologyV1",
     "HyphaeNativeResourceGovernorPolicyV1",
     "HyphaeNativeSchedulerAuthorityV1",
+    "HyphaeNativeThreadScalingCalibrationDiagnosticV1",
     "HyphaeNativeVectorBulkBuildBakeoffV1",
     "Identity",
     "InitialReopen",
@@ -856,10 +894,12 @@ __all__ = [
     "Sha256",
     "SortDirectionV1",
     "SortFieldV1",
+    "Statistics",
     "UniqueStrings",
     "VectorMetricV1",
     "VectorSpaceV1",
     "VectorV1",
     "WitnessV1",
     "Worker",
+    "WorkerPoint",
 ]
