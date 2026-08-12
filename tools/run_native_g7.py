@@ -28,11 +28,21 @@ if os.name == "posix":
 
 try:
     from tools.prepare_native_g7_macos_template import prepare as prepare_macos_template
-    from tools.check_native_g7_receipt import validate_ann_read_view_cell
+    from tools.check_native_g7_receipt import (
+        validate_ann_read_view_cell,
+        validate_bm25_read_view_cell,
+        validate_filtered_bm25_read_view_cell,
+        validate_hybrid_read_view_cell,
+    )
     from tools.check_native_performance_receipt import validate_progress
 except ModuleNotFoundError:
     from prepare_native_g7_macos_template import prepare as prepare_macos_template
-    from check_native_g7_receipt import validate_ann_read_view_cell
+    from check_native_g7_receipt import (
+        validate_ann_read_view_cell,
+        validate_bm25_read_view_cell,
+        validate_filtered_bm25_read_view_cell,
+        validate_hybrid_read_view_cell,
+    )
     from check_native_performance_receipt import validate_progress
 
 
@@ -45,6 +55,7 @@ MAX_INITIAL_ANN_BULK_PARTITIONS = 111
 G7_LOGICAL_ANN_PARTITIONS = 64
 G7_PREFERRED_ANN_PARTITIONS = 32
 G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
+G7_RECEIPT_SCHEMA = "hyphae-native-g7-receipt-v4"
 G7_SURFACES = (
     "embedded-structure-point-get",
     "embedded-prepared-sql-primary-key",
@@ -831,8 +842,50 @@ def run_calibration_pilot(
         expected_observations=PILOT_OBSERVATIONS,
         expected_warmup=PILOT_WARMUP,
     )
+    validate_pilot_search_evidence(pilot, commit)
     write_json_atomic(receipt_path, pilot)
     return pilot
+
+
+def validate_pilot_search_evidence(
+    pilot: dict[str, object], expected_commit: str
+) -> None:
+    """Bind the runtime projection to honest ANN and hybrid hot-path evidence."""
+    if (
+        pilot.get("schema") != G7_RECEIPT_SCHEMA
+        or pilot.get("gate") != "G7"
+        or pilot.get("status") != "passed"
+        or pilot.get("evidence_class") != "closure-candidate"
+        or pilot.get("source_commit") != expected_commit
+        or pilot.get("claims") != []
+        or pilot.get("closure_declared") is not False
+    ):
+        raise RuntimeError("G7 pilot receipt identity or open state mismatch")
+    dataset = pilot.get("dataset")
+    cells = pilot.get("cells")
+    initial_ann_bulk = pilot.get("initial_ann_bulk")
+    if not isinstance(dataset, dict) or not isinstance(cells, dict):
+        raise RuntimeError("G7 pilot omitted its dataset or measured cells")
+    observations = dataset.get("observations")
+    if not isinstance(observations, int) or isinstance(observations, bool):
+        raise RuntimeError("G7 pilot observations are invalid")
+    validate_initial_ann_bulk_evidence(initial_ann_bulk, expected_commit)
+    if not isinstance(initial_ann_bulk, dict):
+        raise RuntimeError("G7 pilot omitted initial ANN bulk evidence")
+    ann_cell = cells.get("ann-top10-recall-095")
+    hybrid_cell = cells.get("hybrid-top10")
+    validate_ann_read_view_cell(ann_cell, initial_ann_bulk, observations)
+    validate_hybrid_read_view_cell(
+        hybrid_cell,
+        ann_cell,
+        observations,
+    )
+    validate_bm25_read_view_cell(
+        cells.get("bm25-top10"), hybrid_cell, observations
+    )
+    validate_filtered_bm25_read_view_cell(
+        cells.get("filtered-bm25-top10"), hybrid_cell, observations
+    )
 
 
 class ProcessMetrics:
@@ -1312,10 +1365,16 @@ def bind_and_validate_cell_receipt(
 ) -> None:
     dataset = receipt.get("dataset")
     if (
-        receipt.get("source_commit") != expected_commit
+        receipt.get("schema") != G7_RECEIPT_SCHEMA
+        or receipt.get("gate") != "G7"
+        or receipt.get("status") != "passed"
+        or receipt.get("evidence_class") != "closure-candidate"
+        or receipt.get("source_commit") != expected_commit
         or receipt.get("platform") != expected_platform
         or receipt.get("state") != expected_state
         or receipt.get("concurrency") != expected_concurrency
+        or receipt.get("claims") != []
+        or receipt.get("closure_declared") is not False
     ):
         raise RuntimeError("G7 runner receipt identity or normative workload mismatch")
     validate_receipt_dataset(
@@ -1334,10 +1393,19 @@ def bind_and_validate_cell_receipt(
     observations = dataset.get("observations")
     if not isinstance(observations, int) or isinstance(observations, bool):
         raise RuntimeError("G7 runner dataset observations are invalid")
-    validate_ann_read_view_cell(
-        receipt_cells.get("ann-top10-recall-095"),
-        initial_ann_bulk,
+    ann_cell = receipt_cells.get("ann-top10-recall-095")
+    hybrid_cell = receipt_cells.get("hybrid-top10")
+    validate_ann_read_view_cell(ann_cell, initial_ann_bulk, observations)
+    validate_hybrid_read_view_cell(
+        hybrid_cell,
+        ann_cell,
         observations,
+    )
+    validate_bm25_read_view_cell(
+        receipt_cells.get("bm25-top10"), hybrid_cell, observations
+    )
+    validate_filtered_bm25_read_view_cell(
+        receipt_cells.get("filtered-bm25-top10"), hybrid_cell, observations
     )
     if not isinstance(initial_ann_bulk, dict):
         raise RuntimeError("G7 runner omitted initial ANN bulk evidence")
@@ -2042,7 +2110,7 @@ def main() -> int:
     for receipt in receipts:
         receipt.pop("controller", None)
     result = {
-        "schema": "hyphae-native-g7-matrix-v3",
+        "schema": "hyphae-native-g7-matrix-v4",
         "gate": "G7",
         "status": "closure-candidate",
         "source_commit": arguments.source_commit,

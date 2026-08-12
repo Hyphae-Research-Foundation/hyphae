@@ -753,6 +753,25 @@ impl PartitionedAnnSearchPlan {
     pub fn ranked_partitions(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         self.routes.iter().map(|route| route.2)
     }
+
+    /// Canonical cumulative child counts for adaptive routing execution.
+    ///
+    /// Selected routing starts with one child, doubles without exceeding the
+    /// preferred budget, and includes that exact budget as its final prefix.
+    /// An explicit complete-fanout request remains one complete wave because
+    /// it does not authorize partition pruning.
+    pub fn geometric_prefixes(&self) -> impl Iterator<Item = usize> + '_ {
+        let preferred = self.preferred_partitions;
+        let complete_fanout_requested = preferred == self.routes.len();
+        std::iter::once(preferred)
+            .filter(move |_| complete_fanout_requested)
+            .chain(
+                std::iter::successors(Some(1_usize), move |current| {
+                    (*current < preferred).then(|| current.saturating_mul(2).min(preferred))
+                })
+                .filter(move |_| !complete_fanout_requested),
+            )
+    }
 }
 
 /// Opaque result of one child execution bound to its ranked plan position.
@@ -2313,21 +2332,25 @@ impl PartitionedHnswIndex {
         preferred_maximum_partitions: usize,
     ) -> Result<PartitionedAnnRoutedSearchResult, AnnError> {
         let plan = self.plan_routed_search(query, options, preferred_maximum_partitions)?;
-        let mut children = (0..plan.preferred_partitions())
-            .map(|position| self.search_planned_partition(&plan, position))
-            .collect::<Result<Vec<_>, _>>()?;
-        match self.merge_routed_search(&plan, &children) {
-            Ok(result) => Ok(result),
-            Err(AnnError::RoutingBudgetInsufficient) => {
-                children.extend(
-                    (plan.preferred_partitions()..plan.total_partitions())
-                        .map(|position| self.search_planned_partition(&plan, position))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                self.merge_routed_search(&plan, &children)
+        let mut children = Vec::new();
+        for prefix in plan.geometric_prefixes() {
+            children.extend(
+                (children.len()..prefix)
+                    .map(|position| self.search_planned_partition(&plan, position))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            match self.merge_routed_search(&plan, &children) {
+                Ok(result) => return Ok(result),
+                Err(AnnError::RoutingBudgetInsufficient) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
+        children.extend(
+            (children.len()..plan.total_partitions())
+                .map(|position| self.search_planned_partition(&plan, position))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        self.merge_routed_search(&plan, &children)
     }
 
     /// Plans deterministic metric-bound child ordering without executing a
@@ -2388,15 +2411,15 @@ impl PartitionedHnswIndex {
         })
     }
 
-    /// Merges either the preferred child batch or a complete fallback batch.
-    /// An uncertified preferred batch returns
+    /// Merges any non-empty canonical prefix within the preferred budget, or
+    /// a complete fallback batch. An uncertified selected prefix returns
     /// [`AnnError::RoutingBudgetInsufficient`] so an external governor can run
-    /// the remaining children before retrying the merge.
+    /// the next geometric prefix before retrying the merge.
     ///
     /// # Errors
     ///
     /// Returns an error for stale/mixed plans, misordered child results, an
-    /// incomplete batch, or an uncertified preferred batch.
+    /// out-of-budget batch, or an uncertified selected prefix.
     pub fn merge_routed_search(
         &self,
         plan: &PartitionedAnnSearchPlan,
@@ -2404,7 +2427,11 @@ impl PartitionedHnswIndex {
     ) -> Result<PartitionedAnnRoutedSearchResult, AnnError> {
         self.validate_routed_plan(plan)?;
         let child_count = children.len();
-        if child_count != plan.preferred_partitions && child_count != plan.routes.len() {
+        if child_count == 0
+            || child_count > plan.routes.len()
+            || (child_count > plan.preferred_partitions && child_count != plan.routes.len())
+            || (plan.preferred_partitions == plan.routes.len() && child_count != plan.routes.len())
+        {
             return Err(AnnError::InvalidPartitionCount);
         }
         for (position, ((_, _, partition), child)) in plan.routes.iter().zip(children).enumerate() {
@@ -3995,12 +4022,12 @@ mod tests {
     }
 
     #[test]
-    fn partition_routing_bounds_never_exceed_child_metric_distance()
+    fn partition_routing_bounds_are_conservative_for_384d_randomized_vectors()
     -> Result<(), Box<dyn std::error::Error>> {
         for metric in [Metric::SquaredL2, Metric::Cosine, Metric::NegativeDot] {
             let definition = VectorIndexDefinition::new(
                 object(98)?,
-                8,
+                384,
                 metric,
                 HnswConfig::new(16, 96, 64, 128, 0xb0_0d)?,
             )?;
@@ -4009,14 +4036,14 @@ mod tests {
                     Ok(VectorRecord {
                         object_id: object(u128::from(value))?,
                         creating_csn: csn(u64::from(value))?,
-                        vector: deterministic_vector(value, 8)?,
+                        vector: deterministic_vector(value, 384)?,
                     })
                 })
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
             let plan = HnswPartitionPlan::build(definition, records, 4)?;
             let index = PartitionedHnswIndex::build(&plan)?;
             for query_id in [1_u16, 17, 33, 64] {
-                let query = deterministic_vector(query_id, 8)?;
+                let query = deterministic_vector(query_id, 384)?;
                 for summary in &index.summaries {
                     let lower_bound = partition_routing_lower_bound(metric, &query, summary)?;
                     let partition = index
@@ -4045,13 +4072,10 @@ mod tests {
             Metric::SquaredL2,
             HnswConfig::new(8, 32, 8, 32, 0xada9_71ce)?,
         )?;
-        let records = (0..16_u16)
+        let records = (0..32_u16)
             .map(|offset| {
-                let coordinate = if offset < 8 {
-                    f32::from(offset) / 100.0
-                } else {
-                    100.0 + f32::from(offset - 8) / 100.0
-                };
+                let cluster = offset / 8;
+                let coordinate = 100.0 * f32::from(cluster) + f32::from(offset % 8) / 100.0;
                 Ok(VectorRecord {
                     object_id: object(u128::from(offset) + 1)?,
                     creating_csn: csn(u64::from(offset) + 1)?,
@@ -4059,26 +4083,91 @@ mod tests {
                 })
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-        let plan = HnswPartitionPlan::build(definition, records, 2)?;
+        let plan = HnswPartitionPlan::build(definition, records, 4)?;
         let index = PartitionedHnswIndex::build(&plan)?;
         let query = Vector::new([0.0, 0.0])?;
         let options = SearchOptions::new(2, 8, Some(8))?;
 
-        let routed = index.search_routed(&query, options, 1)?;
-        let plan = index.plan_routed_search(&query, options, 1)?;
+        let routed = index.search_routed(&query, options, 2)?;
+        let plan = index.plan_routed_search(&query, options, 2)?;
+        assert_eq!(plan.geometric_prefixes().collect::<Vec<_>>(), [1, 2]);
         let child = index.search_planned_partition(&plan, 0)?;
+        let mut equality_plan = plan.clone();
+        equality_plan.routes[1].0 = child.result.hits[options.k - 1].distance;
+        assert!(matches!(
+            index.merge_routed_search(&equality_plan, std::slice::from_ref(&child)),
+            Err(AnnError::RoutingBudgetInsufficient)
+        ));
         assert_eq!(index.merge_routed_search(&plan, &[child])?, routed);
         assert_eq!(
             routed.outcome,
             PartitionedAnnRoutingOutcome::SelectedCertified
         );
         assert_eq!(routed.selected_partitions.len(), 1);
-        assert_eq!(routed.total_partitions, 2);
+        assert_eq!(routed.total_partitions, 4);
         let full = index.search(&query, options)?;
         assert_eq!(routed.result.hits, full.hits);
         assert_eq!(routed.result.build_identity, full.build_identity);
         assert!(routed.result.visited_nodes < full.visited_nodes);
         assert!(routed.next_partition_lower_bound.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_routing_geometric_prefixes_end_at_non_power_of_two_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(100)?,
+            2,
+            Metric::SquaredL2,
+            HnswConfig::new(4, 16, 4, 16, 0x9e0_6e7)?,
+        )?;
+        let records = (0..12_u16)
+            .map(|offset| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(offset) + 1)?,
+                    creating_csn: csn(u64::from(offset) + 1)?,
+                    vector: Vector::new([f32::from(offset), 0.0])?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let partition_plan = HnswPartitionPlan::build(definition, records, 6)?;
+        let index = PartitionedHnswIndex::build(&partition_plan)?;
+        let query = Vector::new([0.0, 0.0])?;
+        let options = SearchOptions::new(12, 16, Some(16))?;
+        let plan = index.plan_routed_search(&query, options, 6)?;
+
+        assert_eq!(
+            plan.geometric_prefixes().collect::<Vec<_>>(),
+            [6],
+            "an explicit complete-fanout request must not prune"
+        );
+        let first_full_child = index.search_planned_partition(&plan, 0)?;
+        assert!(matches!(
+            index.merge_routed_search(&plan, &[first_full_child]),
+            Err(AnnError::InvalidPartitionCount)
+        ));
+        let selected_plan = index.plan_routed_search(&query, options, 5)?;
+        assert_eq!(
+            selected_plan.geometric_prefixes().collect::<Vec<_>>(),
+            [1, 2, 4, 5]
+        );
+
+        let children = (0..selected_plan.total_partitions())
+            .map(|position| index.search_planned_partition(&selected_plan, position))
+            .collect::<Result<Vec<_>, _>>()?;
+        for prefix in [1_usize, 2, 4, 5] {
+            assert!(matches!(
+                index.merge_routed_search(&selected_plan, &children[..prefix]),
+                Err(AnnError::RoutingBudgetInsufficient)
+            ));
+        }
+        let routed = index.merge_routed_search(&selected_plan, &children)?;
+        assert_eq!(
+            routed.outcome,
+            PartitionedAnnRoutingOutcome::FullFanoutBudgetFallback
+        );
+        assert_eq!(routed.result, index.search(&query, options)?);
         Ok(())
     }
 

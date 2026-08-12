@@ -190,8 +190,17 @@ pub use migration::{
 };
 pub use native_hybrid::{
     MAX_NATIVE_HYBRID_BRANCH_HITS, MAX_NATIVE_HYBRID_RETURNED, NATIVE_HYBRID_RRF_CONSTANT,
+    NATIVE_LEXICAL_INDEX_IDENTITY_ALGORITHM, NATIVE_LEXICAL_READ_VIEW_EXECUTION,
+    NATIVE_LEXICAL_READ_VIEW_PLAN_SCOPE, NATIVE_STRUCTURE_FILTER_EXECUTION,
+    NATIVE_STRUCTURE_FILTER_IDENTITY_ALGORITHM, NATIVE_STRUCTURE_FILTER_VALUE_SCOPE,
+    NativeFilteredLexicalReadView, NativeFilteredLexicalReadViewOpenReceipt,
+    NativeFilteredLexicalReadViewOpenRequest, NativeFilteredLexicalReadViewQueryReceipt,
     NativeHybridError, NativeHybridExplanation, NativeHybridFusion, NativeHybridMatch,
-    NativeHybridOutcome, NativeHybridReceipt, NativeHybridRequest, NativeVectorBranch,
+    NativeHybridOutcome, NativeHybridReadView, NativeHybridReadViewOpenReceipt,
+    NativeHybridReadViewOpenRequest, NativeHybridReadViewQuery, NativeHybridReadViewQueryReceipt,
+    NativeHybridReceipt, NativeHybridRequest, NativeLexicalReadView,
+    NativeLexicalReadViewOpenReceipt, NativeLexicalReadViewOpenRequest,
+    NativeLexicalReadViewQueryReceipt, NativeStructureScalarFilter, NativeVectorBranch,
 };
 pub use search_doc_values::{
     DocValue, DocValueAggregation, DocValueAggregationValue, DocValueCandidate, DocValueError,
@@ -603,7 +612,7 @@ enum SearchFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PhysicalSearchFormat {
+pub(crate) enum PhysicalSearchFormat {
     V1,
     V2,
     V3,
@@ -2969,6 +2978,15 @@ pub struct NativeAnnReadViewQueryReceipt {
     pub restore_count: u64,
 }
 
+pub(crate) struct NativeAnnReadViewParentQuery<'query> {
+    pub(crate) query: &'query Vector,
+    pub(crate) options: AnnSearchOptions,
+    pub(crate) maximum_partitions: usize,
+    pub(crate) compute_threads: u64,
+    pub(crate) query_scratch_bytes: u64,
+    pub(crate) cancellation: Option<&'query GovernorCancellation>,
+}
+
 /// Admission and component timing for one completed native engine scope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeEngineWorkReceipt {
@@ -3156,6 +3174,166 @@ struct LexicalExecutionPlan {
     expected_document_frequencies: Vec<u64>,
     work: Vec<LexicalSegmentWork>,
     planning: Option<NativeEngineWorkReceipt>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeLexicalReadPostingBytes {
+    pub(crate) document_id: Vec<u8>,
+    pub(crate) encoded_frequency: Vec<u8>,
+    pub(crate) encoded_document_header: [u8; SEARCH_DOCUMENT_HEADER_SIZE],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeLexicalReadTerm {
+    pub(crate) document_frequency: u64,
+    pub(crate) postings: Vec<NativeLexicalReadPostingBytes>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeLexicalReadState {
+    pub(crate) root_identity: [u8; 32],
+    pub(crate) lexical_index_identity: [u8; 32],
+    pub(crate) snapshot_csn: Csn,
+    pub(crate) catalog_version: CatalogVersion,
+    pub(crate) index: ObjectId,
+    pub(crate) limit: usize,
+    pub(crate) format: PhysicalSearchFormat,
+    pub(crate) document_count: u64,
+    pub(crate) total_document_terms: u64,
+    pub(crate) terms: Vec<NativeLexicalReadTerm>,
+    pub(crate) retained_postings: usize,
+    observed_physical_entries: usize,
+    pub(crate) observed_physical_bytes: u64,
+    pub(crate) retained_memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeLexicalReadPlan {
+    physical_entries: usize,
+    physical_bytes: u64,
+    retained_terms: usize,
+    retained_memory_bytes: u64,
+    hydration_memory_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeStructureFilterRecord {
+    pub(crate) document_id: Vec<u8>,
+    pub(crate) encoded: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeStructureFilterState {
+    pub(crate) structure_identity: [u8; 32],
+    pub(crate) expected_inline_value: Vec<u8>,
+    pub(crate) logical_time_micros: i64,
+    pub(crate) records: Vec<NativeStructureFilterRecord>,
+    pub(crate) observed_physical_entries: usize,
+    pub(crate) observed_physical_bytes: u64,
+    pub(crate) retained_memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeStructureFilterPlan {
+    pub(crate) maximum_records: usize,
+    pub(crate) physical_entries: usize,
+    pub(crate) physical_bytes: u64,
+    pub(crate) retained_memory_bytes: u64,
+    pub(crate) hydration_memory_bytes: u64,
+}
+
+fn lexical_retained_allocation_bytes(
+    terms: &[NativeLexicalReadTerm],
+    terms_capacity: usize,
+) -> Result<u64, NativeRuntimeError> {
+    let mut bytes = u64::try_from(terms_capacity)
+        .unwrap_or(u64::MAX)
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<NativeLexicalReadTerm>()).unwrap_or(u64::MAX),
+        )
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    for term in terms {
+        bytes = bytes
+            .checked_add(
+                u64::try_from(term.postings.capacity())
+                    .unwrap_or(u64::MAX)
+                    .checked_mul(
+                        u64::try_from(std::mem::size_of::<NativeLexicalReadPostingBytes>())
+                            .unwrap_or(u64::MAX),
+                    )
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        for posting in &term.postings {
+            bytes = bytes
+                .checked_add(u64::try_from(posting.document_id.capacity()).unwrap_or(u64::MAX))
+                .and_then(|total| {
+                    total.checked_add(
+                        u64::try_from(posting.encoded_frequency.capacity()).unwrap_or(u64::MAX),
+                    )
+                })
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        }
+    }
+    Ok(bytes.max(1))
+}
+
+fn validate_retained_structure_filter_record(
+    encoded: Option<&[u8]>,
+) -> Result<(), NativeRuntimeError> {
+    let Some(encoded) = encoded else {
+        return Ok(());
+    };
+    if is_structure_tombstone(encoded) {
+        return Ok(());
+    }
+    if encoded.len() >= STRUCTURE_VALUE_HEADER_SIZE
+        && encoded.get(..8) == Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        && encoded[9] == STRUCTURE_VALUE_BLOB
+    {
+        return Err(NativeRuntimeError::Model(
+            "structure-filter-inline-scalar-only-v1".to_owned(),
+        ));
+    }
+    if encoded.len() < STRUCTURE_VALUE_HEADER_SIZE
+        || encoded.get(..8) != Some(STRUCTURE_VALUE_MAGIC.as_slice())
+        || !matches!(encoded[8], 0 | STRUCTURE_VALUE_HAS_EXPIRY)
+        || encoded[9] != STRUCTURE_VALUE_INLINE
+        || encoded[10..16] != [0; 6]
+        || encoded.len() > STRUCTURE_VALUE_HEADER_SIZE + STRUCTURE_INLINE_VALUE_LIMIT
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    let mut expiry = [0_u8; 8];
+    expiry.copy_from_slice(&encoded[16..24]);
+    let raw_expiry = i64::from_le_bytes(expiry);
+    if (encoded[8] == 0 && raw_expiry != 0)
+        || (encoded[8] == STRUCTURE_VALUE_HAS_EXPIRY && raw_expiry == 0)
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+pub(crate) fn retained_structure_filter_matches(
+    encoded: Option<&[u8]>,
+    expected_inline_value: &[u8],
+    logical_time_micros: i64,
+) -> Result<bool, NativeRuntimeError> {
+    validate_retained_structure_filter_record(encoded)?;
+    let Some(encoded) = encoded else {
+        return Ok(false);
+    };
+    if is_structure_tombstone(encoded) {
+        return Ok(false);
+    }
+    let mut expiry = [0_u8; 8];
+    expiry.copy_from_slice(&encoded[16..24]);
+    let raw_expiry = i64::from_le_bytes(expiry);
+    if encoded[8] == STRUCTURE_VALUE_HAS_EXPIRY && raw_expiry <= logical_time_micros {
+        return Ok(false);
+    }
+    Ok(&encoded[STRUCTURE_VALUE_HEADER_SIZE..] == expected_inline_value)
 }
 
 struct SortedSetScoreRangeRequest {
@@ -4300,6 +4478,39 @@ impl DatabaseGovernorPermit {
         }
     }
 
+    pub(crate) fn subdivision(
+        &self,
+        request: GovernorRequest,
+    ) -> Result<DatabaseGovernorSubdivision<'_>, NativeRuntimeError> {
+        Ok(DatabaseGovernorSubdivision {
+            _permit: self.permit().try_subdivide(request)?,
+            class: self.permit().class(),
+            request,
+            execution_started: Instant::now(),
+        })
+    }
+
+    /// Starts timing one sequential phase whose complete resource request is
+    /// already covered by this parent peak allocation. This records evidence;
+    /// it deliberately does not reserve the same global tokens twice.
+    pub(crate) fn sequential_phase_evidence(
+        &self,
+        request: GovernorRequest,
+    ) -> Result<DatabaseGovernorSequentialPhase, NativeRuntimeError> {
+        let parent = self.permit().request();
+        if request.compute_threads > parent.compute_threads
+            || request.io_slots > parent.io_slots
+            || request.memory_bytes > parent.memory_bytes
+        {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        Ok(DatabaseGovernorSequentialPhase {
+            class: self.permit().class(),
+            request,
+            execution_started: Instant::now(),
+        })
+    }
+
     fn retain_memory(self, memory_bytes: u64) -> Result<Self, NativeRuntimeError> {
         let request = GovernorRequest {
             compute_threads: 0,
@@ -4320,6 +4531,45 @@ impl DatabaseGovernorPermit {
 
     fn finish(self) -> NativeEngineWorkReceipt {
         self.evidence()
+    }
+}
+
+pub(crate) struct DatabaseGovernorSubdivision<'permit> {
+    _permit: NestedGovernorPermit<'permit>,
+    class: WorkloadClass,
+    request: GovernorRequest,
+    execution_started: Instant,
+}
+
+impl DatabaseGovernorSubdivision<'_> {
+    pub(crate) fn finish(self) -> NativeEngineWorkReceipt {
+        NativeEngineWorkReceipt {
+            class: self.class,
+            request: self.request,
+            queue_ticket: None,
+            initial_queue_depth: 0,
+            queue_time: Duration::ZERO,
+            execution_time: self.execution_started.elapsed(),
+        }
+    }
+}
+
+pub(crate) struct DatabaseGovernorSequentialPhase {
+    class: WorkloadClass,
+    request: GovernorRequest,
+    execution_started: Instant,
+}
+
+impl DatabaseGovernorSequentialPhase {
+    pub(crate) fn finish(self) -> NativeEngineWorkReceipt {
+        NativeEngineWorkReceipt {
+            class: self.class,
+            request: self.request,
+            queue_ticket: None,
+            initial_queue_depth: 0,
+            queue_time: Duration::ZERO,
+            execution_time: self.execution_started.elapsed(),
+        }
     }
 }
 
@@ -4523,13 +4773,40 @@ impl NativeAnnReadView {
         maximum_wait: Duration,
         cancellation: Option<&GovernorCancellation>,
     ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
-        validate_ann_partition_bound(maximum_partitions)?;
-        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
-            return Err(GovernorQueueError::Cancelled.into());
-        }
-        if !self.inner.database_live.load(Ordering::Acquire) {
-            return Err(NativeRuntimeError::AnnReadViewDatabaseClosed);
-        }
+        let compute_threads = self.query_compute_threads(requested_worker_limit)?;
+        let query_scratch_bytes = self.query_scratch_bytes(options, compute_threads)?;
+        let permit = admit_governor_work(
+            &self.inner.governor,
+            maximum_wait,
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads,
+                io_slots: 0,
+                memory_bytes: query_scratch_bytes,
+            },
+            cancellation,
+        )?;
+        self.search_selected_with_parent_permit(
+            &NativeAnnReadViewParentQuery {
+                query,
+                options,
+                maximum_partitions,
+                compute_threads,
+                query_scratch_bytes,
+                cancellation,
+            },
+            permit.permit(),
+        )
+        .map(|receipt| NativeAnnReadViewQueryReceipt {
+            execution: permit.finish(),
+            ..receipt
+        })
+    }
+
+    pub(crate) fn query_compute_threads(
+        &self,
+        requested_worker_limit: Option<u64>,
+    ) -> Result<u64, NativeRuntimeError> {
         let maximum_compute_threads = self
             .inner
             .governor
@@ -4548,39 +4825,64 @@ impl NativeAnnReadView {
                 maximum: maximum_compute_threads,
             });
         }
-        let query_scratch_bytes = ann_read_view_query_scratch_bytes(
+        Ok(compute_threads)
+    }
+
+    pub(crate) fn query_scratch_bytes(
+        &self,
+        options: AnnSearchOptions,
+        compute_threads: u64,
+    ) -> Result<u64, NativeRuntimeError> {
+        ann_read_view_query_scratch_bytes(
             self.inner.dimension,
             self.inner.open_receipt.logical_partitions,
             self.inner.open_receipt.base_vector_count,
             self.inner.open_receipt.delta_records,
             options,
             compute_threads,
-        )?;
-        let permit = admit_governor_work(
-            &self.inner.governor,
-            maximum_wait,
-            WorkloadClass::ForegroundBounded,
-            GovernorRequest {
-                compute_threads,
-                io_slots: 0,
-                memory_bytes: query_scratch_bytes,
-            },
-            cancellation,
-        )?;
+        )
+    }
+
+    pub(crate) fn search_selected_with_parent_permit(
+        &self,
+        request: &NativeAnnReadViewParentQuery<'_>,
+        permit: &OwnedGovernorPermit,
+    ) -> Result<NativeAnnReadViewQueryReceipt, NativeRuntimeError> {
+        validate_ann_partition_bound(request.maximum_partitions)?;
+        let expected_scratch =
+            self.query_scratch_bytes(request.options, request.compute_threads)?;
+        if request.compute_threads == 0
+            || !permit.is_admitted_by(&self.inner.governor)
+            || permit.class() != WorkloadClass::ForegroundBounded
+            || permit.request().compute_threads < request.compute_threads
+            || permit.request().memory_bytes < request.query_scratch_bytes
+            || request.query_scratch_bytes != expected_scratch
+        {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        if request
+            .cancellation
+            .is_some_and(GovernorCancellation::is_cancelled)
+        {
+            return Err(GovernorQueueError::Cancelled.into());
+        }
+        if !self.inner.database_live.load(Ordering::Acquire) {
+            return Err(NativeRuntimeError::AnnReadViewDatabaseClosed);
+        }
         let execution = self.inner.state.search_selected_parallel(
-            query,
-            options,
-            maximum_partitions,
+            request.query,
+            request.options,
+            request.maximum_partitions,
             ann_store::AnnParallelSearchExecution {
                 pool: &self.inner.execution_pool,
-                permit: permit.permit(),
-                cancellation,
+                permit,
+                cancellation: request.cancellation,
             },
         )?;
         let search = ann_selected_search_receipt(
             self.inner.index,
             self.inner.snapshot_csn,
-            maximum_partitions,
+            request.maximum_partitions,
             execution,
         );
         Ok(NativeAnnReadViewQueryReceipt {
@@ -4588,9 +4890,20 @@ impl NativeAnnReadView {
             root_identity: self.inner.root_identity,
             governor_policy_identity: self.inner.governor_policy_identity,
             governor_generation: self.inner.governor_generation,
-            execution: permit.finish(),
-            query_scratch_bytes,
-            requested_worker_limit: compute_threads,
+            execution: NativeEngineWorkReceipt {
+                class: WorkloadClass::ForegroundBounded,
+                request: GovernorRequest {
+                    compute_threads: request.compute_threads,
+                    io_slots: 0,
+                    memory_bytes: request.query_scratch_bytes,
+                },
+                queue_ticket: None,
+                initial_queue_depth: 0,
+                queue_time: Duration::ZERO,
+                execution_time: Duration::ZERO,
+            },
+            query_scratch_bytes: request.query_scratch_bytes,
+            requested_worker_limit: request.compute_threads,
             hydration_performed: false,
             physical_page_reads: 0,
             restore_count: 0,
@@ -14026,6 +14339,611 @@ impl NativeDatabase {
         self.match_btree_text_profiled(index, query, limit, planning_permit)
     }
 
+    // Keep the ordered fail-closed validation, bounded visitor, accounting,
+    // and retained-state construction visible as one auditable hydration.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn open_lexical_read_state(
+        &self,
+        snapshot: &Snapshot,
+        request: &NativeLexicalReadViewOpenRequest<'_>,
+        retained_permit: &OwnedGovernorPermit,
+        planned_terms: usize,
+    ) -> Result<NativeLexicalReadState, NativeRuntimeError> {
+        let NativeLexicalReadViewOpenRequest {
+            index,
+            query,
+            limit,
+            maximum_retained_postings,
+            maximum_retained_bytes,
+        } = *request;
+        if limit == 0
+            || maximum_retained_postings == 0
+            || maximum_retained_bytes == 0
+            || query.len() > MAX_LOCAL_SEARCH_QUERY_BYTES
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        if retained_permit.class() != WorkloadClass::ForegroundBounded
+            || retained_permit.request().memory_bytes < maximum_retained_bytes
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let snapshot_csn = snapshot
+            .visible_csn
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let roots = snapshot.roots();
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if !matches!(
+            self.catalog_object_at_root(catalog_root, index)?,
+            Some(CatalogObject::Search(_))
+        ) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let format = physical_search_format(&self.pages, tree)?;
+        let format_identity = match format {
+            PhysicalSearchFormat::V1 => b"v1".as_slice(),
+            PhysicalSearchFormat::V2 => b"v2".as_slice(),
+            PhysicalSearchFormat::V3 => b"v3".as_slice(),
+        };
+        let mut lexical_identity = blake3::Hasher::new();
+        lexical_identity.update(native_hybrid::NATIVE_LEXICAL_INDEX_IDENTITY_ALGORITHM.as_bytes());
+        lexical_identity.update(&root.get().to_le_bytes());
+        lexical_identity.update(&index.get().to_le_bytes());
+        lexical_identity.update(format_identity);
+        let lexical_index_identity = *lexical_identity.finalize().as_bytes();
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &search_index_meta_key(index),
+            )?
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let (document_count, total_document_terms) =
+            decode_search_index_metadata(metadata.bytes())?;
+        let index_metadata_key = search_index_meta_key(index);
+        let query_tokens: BTreeSet<String> = analyze(query).into_iter().collect();
+        let mut terms = Vec::with_capacity(planned_terms);
+        let mut retained_postings = 0_usize;
+        let mut retained_memory_bytes = 0_u64;
+        let mut observed_physical_entries = 1_usize;
+        let mut observed_physical_bytes = u64::try_from(index_metadata_key.len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(u64::try_from(metadata.bytes().len()).ok()?))
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        for term in query_tokens {
+            let term_key = search_term_meta_key(index, term.as_bytes())?;
+            let Some(term_metadata) =
+                tree.get_cached_pinned(&self.pages, &self.buffer_pool, &term_key)?
+            else {
+                continue;
+            };
+            let Some(document_frequency) =
+                decode_live_search_term_metadata(term_metadata.bytes(), format)?
+            else {
+                continue;
+            };
+            if document_frequency == 0 || document_frequency > document_count {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            observed_physical_entries = observed_physical_entries
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            observed_physical_bytes = observed_physical_bytes
+                .checked_add(u64::try_from(term_key.len()).unwrap_or(u64::MAX))
+                .and_then(|bytes| {
+                    bytes
+                        .checked_add(u64::try_from(term_metadata.bytes().len()).unwrap_or(u64::MAX))
+                })
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let required = retained_postings
+                .checked_add(
+                    usize::try_from(document_frequency)
+                        .map_err(|_| NativeRuntimeError::InvalidSearchTree)?,
+                )
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            if required > maximum_retained_postings {
+                return Err(NativeRuntimeError::Model(format!(
+                    "lexical-read-view-retention-postings required={required} maximum={maximum_retained_postings}"
+                )));
+            }
+            let posting_prefix = search_posting_prefix(index, term.as_bytes())?;
+            let expected = usize::try_from(document_frequency)
+                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+            let mut retained = Vec::with_capacity(expected);
+            let mut visit_error = None;
+            let _visit = tree.visit_prefix_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &posting_prefix,
+                None,
+                |key, encoded_frequency| {
+                    if retained.len() >= expected {
+                        visit_error = Some(NativeRuntimeError::InvalidSearchTree);
+                        return ControlFlow::Break(());
+                    }
+                    let next = (|| -> Result<NativeLexicalReadPostingBytes, NativeRuntimeError> {
+                        let document_id = key
+                            .strip_prefix(posting_prefix.as_slice())
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?
+                            .to_vec();
+                        decode_live_search_posting(encoded_frequency, format)?
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        let document = tree
+                            .get_cached_pinned(
+                                &self.pages,
+                                &self.buffer_pool,
+                                &search_document_key(index, &document_id)?,
+                            )?
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        if is_search_document_tombstone(document.bytes()) {
+                            return Err(NativeRuntimeError::InvalidSearchTree);
+                        }
+                        let encoded_document_header: [u8; SEARCH_DOCUMENT_HEADER_SIZE] = document
+                            .bytes()
+                            .get(..SEARCH_DOCUMENT_HEADER_SIZE)
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?
+                            .try_into()
+                            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+                        decode_search_document_header(&encoded_document_header)?;
+                        let document_key = search_document_key(index, &document_id)?;
+                        let posting_physical_bytes = u64::try_from(key.len())
+                            .ok()
+                            .and_then(|bytes| {
+                                bytes.checked_add(u64::try_from(encoded_frequency.len()).ok()?)
+                            })
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    u64::try_from(document_key.len()).ok()?,
+                                )
+                            })
+                            .and_then(|bytes| {
+                                bytes.checked_add(u64::try_from(document.bytes().len()).ok()?)
+                            })
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        observed_physical_entries = observed_physical_entries
+                            .checked_add(2)
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        observed_physical_bytes = observed_physical_bytes
+                            .checked_add(posting_physical_bytes)
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        let retained_encoded_bytes = u64::try_from(document_id.len())
+                            .ok()
+                            .and_then(|bytes| {
+                                bytes.checked_add(u64::try_from(encoded_frequency.len()).ok()?)
+                            })
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    u64::try_from(SEARCH_DOCUMENT_HEADER_SIZE).ok()?,
+                                )
+                            })
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        retained_memory_bytes = retained_memory_bytes
+                            .checked_add(retained_encoded_bytes)
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    u64::try_from(std::mem::size_of::<
+                                        NativeLexicalReadPostingBytes,
+                                    >())
+                                    .unwrap_or(u64::MAX),
+                                )
+                            })
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        if retained_memory_bytes > maximum_retained_bytes {
+                            return Err(NativeRuntimeError::Model(format!(
+                                "lexical-read-view-retention-bytes required={retained_memory_bytes} maximum={maximum_retained_bytes}"
+                            )));
+                        }
+                        Ok(NativeLexicalReadPostingBytes {
+                            document_id,
+                            encoded_frequency: encoded_frequency.to_vec(),
+                            encoded_document_header,
+                        })
+                    })();
+                    match next {
+                        Ok(posting) => {
+                            retained.push(posting);
+                            ControlFlow::Continue(())
+                        }
+                        Err(error) => {
+                            visit_error = Some(error);
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )?;
+            if let Some(error) = visit_error {
+                return Err(error);
+            }
+            if u64::try_from(retained.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?
+                != document_frequency
+            {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            retained_postings = required;
+            retained_memory_bytes = retained_memory_bytes
+                .checked_add(
+                    u64::try_from(std::mem::size_of::<NativeLexicalReadTerm>()).unwrap_or(u64::MAX),
+                )
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            if retained_memory_bytes > maximum_retained_bytes {
+                return Err(NativeRuntimeError::Model(format!(
+                    "lexical-read-view-retention-bytes required={retained_memory_bytes} maximum={maximum_retained_bytes}"
+                )));
+            }
+            terms.push(NativeLexicalReadTerm {
+                document_frequency,
+                postings: retained,
+            });
+        }
+        if terms.len() != planned_terms {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let retained_memory_bytes = lexical_retained_allocation_bytes(&terms, terms.capacity())?;
+        if retained_memory_bytes > maximum_retained_bytes {
+            return Err(NativeRuntimeError::Model(format!(
+                "lexical-read-view-retention-bytes required={retained_memory_bytes} maximum={maximum_retained_bytes}"
+            )));
+        }
+        Ok(NativeLexicalReadState {
+            root_identity: roots.digest(),
+            lexical_index_identity,
+            snapshot_csn,
+            catalog_version: roots.catalog_version(),
+            index,
+            limit,
+            format,
+            document_count,
+            total_document_terms,
+            terms,
+            retained_postings,
+            observed_physical_entries,
+            observed_physical_bytes,
+            retained_memory_bytes,
+        })
+    }
+
+    // The preplan deliberately mirrors every hydration accounting term so a
+    // review can compare the conservative bound with the observed receipt.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn plan_lexical_read_state(
+        &self,
+        snapshot: &Snapshot,
+        request: &NativeLexicalReadViewOpenRequest<'_>,
+    ) -> Result<NativeLexicalReadPlan, NativeRuntimeError> {
+        let NativeLexicalReadViewOpenRequest {
+            index,
+            query,
+            limit,
+            maximum_retained_postings,
+            maximum_retained_bytes,
+        } = *request;
+        if limit == 0
+            || maximum_retained_postings == 0
+            || maximum_retained_bytes == 0
+            || query.len() > MAX_LOCAL_SEARCH_QUERY_BYTES
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let roots = snapshot.roots();
+        let catalog_root = roots
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if !matches!(
+            self.catalog_object_at_root(catalog_root, index)?,
+            Some(CatalogObject::Search(_))
+        ) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        let format = physical_search_format(&self.pages, tree)?;
+        let metadata = tree
+            .get_cached_pinned(
+                &self.pages,
+                &self.buffer_pool,
+                &search_index_meta_key(index),
+            )?
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let (document_count, _) = decode_search_index_metadata(metadata.bytes())?;
+        let mut planned_physical_entries = 1_usize;
+        let index_metadata_key = search_index_meta_key(index);
+        let mut planned_physical_bytes = u64::try_from(index_metadata_key.len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(u64::try_from(SEARCH_INDEX_META_SIZE).ok()?))
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let mut retained_memory_bytes = 0_u64;
+        let mut retained_postings = 0_usize;
+        let mut retained_terms = 0_usize;
+        let query_tokens = analyze(query).into_iter().collect::<BTreeSet<_>>();
+        let query_token_bytes = query_tokens.iter().try_fold(0_u64, |total, term| {
+            total.checked_add(u64::try_from(term.len()).unwrap_or(u64::MAX))
+        });
+        let query_working_bytes = query_token_bytes
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(query_tokens.len())
+                        .unwrap_or(u64::MAX)
+                        .checked_mul(256)?,
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(4_096))
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        for term in query_tokens {
+            let term_key = search_term_meta_key(index, term.as_bytes())?;
+            let Some(term_metadata) =
+                tree.get_cached_pinned(&self.pages, &self.buffer_pool, &term_key)?
+            else {
+                continue;
+            };
+            let Some(document_frequency) =
+                decode_live_search_term_metadata(term_metadata.bytes(), format)?
+            else {
+                continue;
+            };
+            if document_frequency == 0 || document_frequency > document_count {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            let count = usize::try_from(document_frequency)
+                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+            retained_postings = retained_postings
+                .checked_add(count)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            if retained_postings > maximum_retained_postings {
+                return Err(NativeRuntimeError::Model(format!(
+                    "lexical-read-view-retention-postings required={retained_postings} maximum={maximum_retained_postings}"
+                )));
+            }
+            retained_terms = retained_terms
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            planned_physical_entries = planned_physical_entries
+                .checked_add(1)
+                .and_then(|entries| entries.checked_add(count.checked_mul(2)?))
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let per_posting_physical = BTREE_MAX_KEY_SIZE
+                .checked_add(SEARCH_POSTING_SIZE)
+                .and_then(|bytes| bytes.checked_add(BTREE_MAX_KEY_SIZE))
+                .and_then(|bytes| {
+                    bytes.checked_add(SEARCH_DOCUMENT_HEADER_SIZE + SEARCH_INLINE_VALUE_LIMIT)
+                })
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            planned_physical_bytes = planned_physical_bytes
+                .checked_add(u64::try_from(term_key.len()).unwrap_or(u64::MAX))
+                .and_then(|bytes| {
+                    bytes.checked_add(u64::try_from(SEARCH_TERM_META_SIZE).unwrap_or(u64::MAX))
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        u64::try_from(count)
+                            .unwrap_or(u64::MAX)
+                            .checked_mul(u64::try_from(per_posting_physical).unwrap_or(u64::MAX))?,
+                    )
+                })
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let per_posting_memory = per_posting_physical
+                .checked_add(std::mem::size_of::<NativeLexicalReadPostingBytes>())
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            retained_memory_bytes = retained_memory_bytes
+                .checked_add(
+                    u64::try_from(count)
+                        .unwrap_or(u64::MAX)
+                        .checked_mul(u64::try_from(per_posting_memory).unwrap_or(u64::MAX))
+                        .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                )
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        u64::try_from(std::mem::size_of::<NativeLexicalReadTerm>())
+                            .unwrap_or(u64::MAX),
+                    )
+                })
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        }
+        let retained_memory_bytes = retained_memory_bytes.max(1);
+        if retained_memory_bytes > maximum_retained_bytes {
+            return Err(NativeRuntimeError::Model(format!(
+                "lexical-read-view-retention-bytes required={retained_memory_bytes} maximum={maximum_retained_bytes}"
+            )));
+        }
+        Ok(NativeLexicalReadPlan {
+            physical_entries: planned_physical_entries,
+            physical_bytes: planned_physical_bytes,
+            retained_terms,
+            retained_memory_bytes,
+            hydration_memory_bytes: retained_memory_bytes
+                .checked_add(query_working_bytes)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+        })
+    }
+
+    pub(crate) fn plan_structure_filter_state(
+        lexical: &NativeLexicalReadState,
+        request: &NativeStructureScalarFilter<'_>,
+    ) -> Result<NativeStructureFilterPlan, NativeRuntimeError> {
+        if request.key_prefix.is_empty()
+            || request.expected_inline_value.len() > STRUCTURE_INLINE_VALUE_LIMIT
+            || lexical
+                .terms
+                .iter()
+                .flat_map(|term| &term.postings)
+                .any(|posting| {
+                    request
+                        .key_prefix
+                        .len()
+                        .checked_add(posting.document_id.len())
+                        .and_then(|bytes| bytes.checked_add(1))
+                        .is_none_or(|bytes| bytes > BTREE_MAX_KEY_SIZE)
+                })
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let maximum_records = lexical.retained_postings;
+        let per_record_physical = BTREE_MAX_KEY_SIZE
+            .checked_add(STRUCTURE_VALUE_HEADER_SIZE + STRUCTURE_INLINE_VALUE_LIMIT)
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let per_record_memory = per_record_physical
+            .checked_add(std::mem::size_of::<NativeStructureFilterRecord>())
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let physical_bytes = u64::try_from(maximum_records)
+            .unwrap_or(u64::MAX)
+            .checked_mul(u64::try_from(per_record_physical).unwrap_or(u64::MAX))
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        let retained_memory_bytes = u64::try_from(maximum_records)
+            .unwrap_or(u64::MAX)
+            .checked_mul(u64::try_from(per_record_memory).unwrap_or(u64::MAX))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(request.expected_inline_value.len()).unwrap_or(u64::MAX),
+                )
+            })
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?
+            .max(1);
+        Ok(NativeStructureFilterPlan {
+            maximum_records,
+            physical_entries: maximum_records,
+            physical_bytes,
+            retained_memory_bytes,
+            hydration_memory_bytes: retained_memory_bytes
+                .checked_add(64 * 1_024)
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn open_structure_filter_state(
+        &self,
+        snapshot: &Snapshot,
+        lexical: &NativeLexicalReadState,
+        request: &NativeStructureScalarFilter<'_>,
+        retained_permit: &OwnedGovernorPermit,
+        plan: NativeStructureFilterPlan,
+    ) -> Result<NativeStructureFilterState, NativeRuntimeError> {
+        if retained_permit.class() != WorkloadClass::ForegroundBounded
+            || retained_permit.request().memory_bytes < plan.retained_memory_bytes
+        {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let roots = snapshot.roots();
+        if roots.digest() != lexical.root_identity
+            || snapshot.visible_csn != Some(lexical.snapshot_csn)
+            || roots.catalog_version() != lexical.catalog_version
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        let structure_root = roots
+            .root(SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(structure_root);
+        let mut identities = BTreeSet::new();
+        for term in &lexical.terms {
+            for posting in &term.postings {
+                identities.insert(posting.document_id.clone());
+            }
+        }
+        if identities.len() > plan.maximum_records {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        let mut records = Vec::with_capacity(identities.len());
+        let mut observed_physical_bytes = 0_u64;
+        let mut observed_physical_entries = 0_usize;
+        for document_id in identities {
+            let mut logical_key = Vec::with_capacity(
+                request
+                    .key_prefix
+                    .len()
+                    .checked_add(document_id.len())
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?,
+            );
+            logical_key.extend_from_slice(request.key_prefix);
+            logical_key.extend_from_slice(&document_id);
+            let encoded_key = structure_key(&logical_key);
+            if encoded_key.len() > BTREE_MAX_KEY_SIZE {
+                return Err(NativeRuntimeError::InvalidStructureTree);
+            }
+            let encoded = tree
+                .get_cached_pinned(&self.pages, &self.buffer_pool, &encoded_key)?
+                .map(|value| value.bytes().to_vec());
+            validate_retained_structure_filter_record(encoded.as_deref())?;
+            if let Some(encoded) = &encoded {
+                observed_physical_entries = observed_physical_entries
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+                observed_physical_bytes = observed_physical_bytes
+                    .checked_add(u64::try_from(encoded_key.len()).unwrap_or(u64::MAX))
+                    .and_then(|bytes| {
+                        bytes.checked_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
+                    })
+                    .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+            }
+            records.push(NativeStructureFilterRecord {
+                document_id,
+                encoded,
+            });
+        }
+        let mut retained_memory_bytes = u64::try_from(records.capacity())
+            .unwrap_or(u64::MAX)
+            .checked_mul(
+                u64::try_from(std::mem::size_of::<NativeStructureFilterRecord>())
+                    .unwrap_or(u64::MAX),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(request.expected_inline_value.len()).unwrap_or(u64::MAX),
+                )
+            })
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        for record in &records {
+            retained_memory_bytes = retained_memory_bytes
+                .checked_add(u64::try_from(record.document_id.capacity()).unwrap_or(u64::MAX))
+                .and_then(|bytes| {
+                    bytes.checked_add(record.encoded.as_ref().map_or(0, |encoded| {
+                        u64::try_from(encoded.capacity()).unwrap_or(u64::MAX)
+                    }))
+                })
+                .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        }
+        let mut retained_memory_bytes = retained_memory_bytes.max(1);
+        let expected_inline_value = request.expected_inline_value.to_vec();
+        retained_memory_bytes = retained_memory_bytes
+            .checked_sub(u64::try_from(request.expected_inline_value.len()).unwrap_or(u64::MAX))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(expected_inline_value.capacity()).unwrap_or(u64::MAX),
+                )
+            })
+            .ok_or(NativeRuntimeError::InvalidStructureTree)?;
+        if records.len() > plan.physical_entries
+            || observed_physical_bytes > plan.physical_bytes
+            || retained_memory_bytes > plan.retained_memory_bytes
+        {
+            return Err(NativeRuntimeError::Model(
+                "structure-filter-read-view-plan-underflow".to_owned(),
+            ));
+        }
+        let mut identity = blake3::Hasher::new();
+        identity.update(native_hybrid::NATIVE_STRUCTURE_FILTER_IDENTITY_ALGORITHM.as_bytes());
+        identity.update(&structure_root.get().to_le_bytes());
+        identity.update(request.key_prefix);
+        identity.update(request.expected_inline_value);
+        identity.update(&request.logical_time_micros.to_le_bytes());
+        Ok(NativeStructureFilterState {
+            structure_identity: *identity.finalize().as_bytes(),
+            expected_inline_value,
+            logical_time_micros: request.logical_time_micros,
+            records,
+            observed_physical_entries,
+            observed_physical_bytes,
+            retained_memory_bytes,
+        })
+    }
+
     fn match_btree_text_profiled(
         &self,
         index: ObjectId,
@@ -14409,6 +15327,16 @@ impl NativeDatabase {
         index: ObjectId,
         cancellation: Option<&GovernorCancellation>,
     ) -> Result<(NativeAnnReadView, NativeAnnReadViewOpenReceipt), NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.open_ann_read_view_at_snapshot(index, &snapshot, cancellation)
+    }
+
+    fn open_ann_read_view_at_snapshot(
+        &self,
+        index: ObjectId,
+        snapshot: &Snapshot,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<(NativeAnnReadView, NativeAnnReadViewOpenReceipt), NativeRuntimeError> {
         let (governor, execution_pool) = self
             .resource_governor
             .as_ref()
@@ -14420,7 +15348,6 @@ impl NativeDatabase {
         let planning = self
             .admit_foreground_bounded_with_cancellation(cancellation)?
             .ok_or(NativeRuntimeError::AnnReadViewExecutionAuthorityRequired)?;
-        let snapshot = self.coordinator.snapshot(0)?;
         let roots = snapshot.roots();
         let catalog_root = roots
             .root(SLOT_CATALOG)
@@ -54437,7 +55364,7 @@ mod tests {
             consolidated.routing_mode,
             super::AnnPartitionRoutingMode::SelectedPartitions
         );
-        assert_eq!(consolidated.selected_partitions.len(), 3);
+        assert_eq!(consolidated.selected_partitions.len(), 2);
         assert_eq!(consolidated.total_partitions, 4);
         assert_eq!(
             consolidated.routing_outcome,
@@ -54636,6 +55563,53 @@ mod tests {
     }
 
     #[test]
+    fn ann_parent_query_rejects_zero_worker_evidence_before_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(91)?;
+        seed_durable_routing_fixture(&mut database, index, ObjectId::new(94)?)?;
+        let policy = parallel_engine_admission_test_policy();
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::new(NativeExecutionPool::new(&profile, &policy)?),
+            Duration::ZERO,
+        )?;
+        let (view, open) = database.open_ann_read_view(index)?;
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+        let options = AnnSearchOptions::new(10, 64, Some(64))?;
+        let query_scratch_bytes = view.query_scratch_bytes(options, 0)?;
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: query_scratch_bytes,
+            },
+        )?;
+        let result = view.search_selected_with_parent_permit(
+            &super::NativeAnnReadViewParentQuery {
+                query: &query,
+                options,
+                maximum_partitions: open.logical_partitions,
+                compute_threads: 0,
+                query_scratch_bytes,
+                cancellation: None,
+            },
+            &parent,
+        );
+        assert!(matches!(
+            result,
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ParentCapacity
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ann_read_view_cancels_at_routed_wave_and_merge_boundaries_and_remains_reusable()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -54678,6 +55652,27 @@ mod tests {
                     .is_ok()
             );
         }
+        let widening_options = AnnSearchOptions::new(64, 64, Some(64))?;
+        let cancellation = governor.cancellation_token();
+        super::ann_store::cancel_next_search_at_for_test(
+            super::ann_store::AnnSearchCancellationPoint::AfterGeometricWidening,
+        );
+        assert!(matches!(
+            view.search_selected_with_cancellation(
+                &query,
+                widening_options,
+                open.logical_partitions.min(3),
+                &cancellation,
+            ),
+            Err(NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::Cancelled
+            ))
+        ));
+        assert_eq!(governor.usage_snapshot().memory_bytes, retained_memory);
+        assert!(
+            view.search_selected(&query, widening_options, open.logical_partitions)
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -54995,7 +55990,7 @@ mod tests {
             selected.routing_mode,
             super::AnnPartitionRoutingMode::SelectedPartitions
         );
-        assert_eq!(selected.selected_partitions.len(), 3);
+        assert_eq!(selected.selected_partitions.len(), 2);
         assert_eq!(selected.total_partitions, 4);
         assert_eq!(
             selected.routing_outcome,
@@ -55106,9 +56101,10 @@ mod tests {
             certified.routing_outcome,
             super::AnnPartitionRoutingOutcome::SelectedCertified
         );
-        assert_eq!(certified.execution_workers, 3);
+        assert_eq!(certified.selected_partitions.len(), 3);
+        assert_eq!(certified.execution_workers, 1);
         assert_eq!(certified.execution_worker_batches, 3);
-        assert_eq!(certified.execution_waves, 1);
+        assert_eq!(certified.execution_waves, 3);
 
         let fallback_options = AnnSearchOptions::new(64, 64, Some(64))?;
         let expected_fallback = database.search_ann_latest(index, &query, fallback_options)?;

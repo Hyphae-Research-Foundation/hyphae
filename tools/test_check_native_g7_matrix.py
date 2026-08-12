@@ -18,7 +18,7 @@ def matrix() -> dict:
                 value["concurrency"] = concurrency
                 receipts.append(value)
     return {
-        "schema": "hyphae-native-g7-matrix-v3",
+        "schema": "hyphae-native-g7-matrix-v4",
         "gate": "G7",
         "status": "closure-candidate",
         "source_commit": "a" * 40,
@@ -51,6 +51,12 @@ class G7MatrixTests(unittest.TestCase):
         payload["receipts"][0] = copy.deepcopy(payload["receipts"][0])
         payload["receipts"][0]["cells"].pop("hybrid-top10")
         with self.assertRaises(GateFailure):
+            validate_matrix(payload, "a" * 40, expected_tree=TREE)
+
+    def test_legacy_v3_matrix_cannot_carry_v4_receipts(self) -> None:
+        payload = matrix()
+        payload["schema"] = "hyphae-native-g7-matrix-v3"
+        with self.assertRaisesRegex(GateFailure, "identity or open state"):
             validate_matrix(payload, "a" * 40, expected_tree=TREE)
 
     def test_mixed_build_identity_fails(self) -> None:

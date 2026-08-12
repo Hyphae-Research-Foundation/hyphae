@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 import copy
+import hashlib
 import json
 import subprocess
 import unittest
@@ -17,6 +18,217 @@ from tools.check_native_g7_receipt import (
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
 TREE = "d" * 40
+
+
+def _object_id(value: int) -> str:
+    return f"{value:032x}"
+
+
+def _hybrid_oracle() -> dict:
+    lexical_ranking = [_object_id(1)]
+    vector_ranking = [_object_id(value) for value in range(1, 11)]
+    fused_results = []
+    for final_rank, object_id in enumerate(vector_ranking, start=1):
+        lexical_rank = 1 if object_id == lexical_ranking[0] else None
+        vector_rank = final_rank
+        lexical_contribution = (
+            1_000_000_000 // (60 + lexical_rank) if lexical_rank is not None else 0
+        )
+        vector_contribution = 1_000_000_000 // (60 + vector_rank)
+        fused_results.append({
+            "object_id": object_id,
+            "lexical_rank": lexical_rank,
+            "vector_rank": vector_rank,
+            "lexical_contribution": lexical_contribution,
+            "vector_contribution": vector_contribution,
+            "fusion_score": lexical_contribution + vector_contribution,
+            "final_rank": final_rank,
+        })
+    digest = hashlib.sha256(
+        json.dumps(
+            fused_results,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return {
+        "status": "passed",
+        "method": "independent-branch-rrf-v1",
+        "root_identity": "5" * 64,
+        "snapshot_csn": 1,
+        "rrf_constant": 60,
+        "contribution_scale": 1_000_000_000,
+        "lexical_weight": 1,
+        "vector_weight": 1,
+        "result_limit": 10,
+        "tie_break": "fusion-score-desc-object-id-asc",
+        "lexical_ranking": lexical_ranking,
+        "vector_ranking": vector_ranking,
+        "fused_results": fused_results,
+        "result_digest": digest,
+        "oracle_digest": digest,
+    }
+
+
+def _hybrid_evidence() -> dict:
+    return {
+        "per_query_worker_limit": 44,
+        "query_queue_wait_millis": 60_000,
+        "preferred_partition_budget": 32,
+        "hybrid_read_view_open": {
+            "root_identity": "5" * 64,
+            "snapshot_csn": 1,
+            "lexical_index_identity": "9" * 64,
+            "ann_view_identity": "7" * 64,
+            "lexical_plan_scope": "query-bound-encoded-postings-v1",
+            "planned_physical_entries": 4,
+            "planned_physical_bytes": 16_502,
+            "observed_physical_entries": 4,
+            "observed_physical_bytes": 200,
+            "admitted_retained_memory_bytes": 1_048_576,
+            "retained_memory_bytes": 1_000,
+        },
+        "hybrid_read_view_query_interval": {
+            "observations": 1_000_000,
+            "hydrations": 0,
+            "physical_page_reads": 0,
+            "index_scoped_restores": 0,
+            "full_state_loads": 0,
+            "full_catalog_loads": 0,
+            "lexical_execution": "decode-bm25-rank-per-observation-v1",
+            "peak_admission_executions": 1_000_000,
+            "peak_admission_class": "foreground-bounded",
+            "peak_admission_compute_threads": 44,
+            "peak_admission_io_slots": 0,
+            "peak_admission_memory_bytes_min": 2_000_000,
+            "peak_admission_memory_bytes_max": 2_000_000,
+            "result_retention_executions": 1_000_000,
+            "result_retention_class": "foreground-bounded",
+            "result_retention_compute_threads": 0,
+            "result_retention_io_slots": 0,
+            "result_retention_memory_bytes_min": 1_000_000,
+            "result_retention_memory_bytes_max": 1_000_000,
+            "fusion_executions": 1_000_000,
+            "fusion_class": "foreground-bounded",
+            "fusion_compute_threads": 1,
+            "fusion_io_slots": 0,
+            "fusion_memory_bytes": 0,
+            "provider": "hybrid-read-view-interval-counters-v1",
+        },
+        "hybrid_ann_routing_interval": {
+            "observations": 1_000_000,
+            "selected_certified": 1_000_000,
+            "full_fanout_requested": 0,
+            "full_fanout_budget_fallback": 0,
+            "single_generation_fallback": 0,
+            "next_partition_lower_bound_present": 1_000_000,
+            "selected_partitions_max": 8,
+            "execution_workers_max": 8,
+            "execution_worker_batches_max": 8,
+            "execution_waves_max": 4,
+            "minimum_next_partition_lower_bound": 0.25,
+            "maximum_kth_distance": 0.20,
+        },
+        "hybrid_oracle": _hybrid_oracle(),
+    }
+
+
+def _lexical_read_view_open() -> dict:
+    return {
+        "root_identity": "5" * 64,
+        "snapshot_csn": 1,
+        "lexical_index_identity_algorithm": "blake3-search-root-page-object-format-v1",
+        "lexical_index_identity": "9" * 64,
+        "lexical_plan_scope": "query-bound-encoded-postings-v1",
+        "index_id": _object_id(7),
+        "planned_terms": 1,
+        "retained_postings": 1,
+        "maximum_retained_postings": 10,
+        "maximum_retained_bytes": 1_048_576,
+        "planned_physical_entries": 4,
+        "planned_physical_bytes": 16_502,
+        "observed_physical_entries": 4,
+        "observed_physical_bytes": 200,
+        "admitted_retained_memory_bytes": 1_048_576,
+        "retained_memory_bytes": 1_000,
+        "open_physical_page_reads": 1_000,
+    }
+
+
+def _bm25_evidence() -> dict:
+    return {
+        "route": "native-retained-lexical-read-view",
+        "lexical_read_view_open": _lexical_read_view_open(),
+        "lexical_read_view_query_interval": {
+            "observations": 1_000_000,
+            "postings_evaluated": 1_000_000,
+            "execution_sequence_first": 100_001,
+            "execution_sequence_last": 1_100_000,
+            "receipt_physical_page_reads": 0,
+            "process_physical_page_reads": 0,
+            "full_state_loads": 0,
+            "full_catalog_loads": 0,
+            "lexical_execution": "decode-bm25-rank-per-observation-v1",
+            "provider": "lexical-read-view-interval-counters-v1",
+        },
+    }
+
+
+def _engine_work_evidence(*, memory_bytes: int) -> dict:
+    return {
+        "class": "foreground-bounded",
+        "compute_threads": 1,
+        "io_slots": 1,
+        "memory_bytes": memory_bytes,
+        "queue_ticket": None,
+        "initial_queue_depth": 0,
+        "queue_time_nanos": 0,
+        "execution_time_nanos": 1,
+    }
+
+
+def _filtered_bm25_evidence() -> dict:
+    return {
+        "route": "native-root-bound-filter-before-rank",
+        "correctness_scope": "lexical-and-structure-one-root-query-bound",
+        "corpus_filter_density": 0.5,
+        "candidate_filter_selectivity": 1.0,
+        "filtered_lexical_read_view_open": {
+            "root_identity": "5" * 64,
+            "snapshot_csn": 1,
+            "lexical_index_identity": "9" * 64,
+            "lexical_plan_scope": "query-bound-encoded-postings-v1",
+            "structure_filter_identity_algorithm": (
+                "blake3-structure-root-key-prefix-value-time-v1"
+            ),
+            "structure_filter_value_scope": "inline-scalar-only-v1",
+            "structure_filter_identity": "f" * 64,
+            "retained_filter_records": 1,
+            "planned_filter_physical_entries": 1,
+            "planned_filter_physical_bytes": 256,
+            "observed_filter_physical_entries": 1,
+            "observed_filter_physical_bytes": 64,
+            "retained_filter_memory_bytes": 128,
+            "filter_planning": _engine_work_evidence(memory_bytes=1_024),
+            "filter_hydration": _engine_work_evidence(memory_bytes=256),
+            "open_filter_physical_page_reads": 1,
+        },
+        "filtered_lexical_read_view_query_interval": {
+            "observations": 1_000_000,
+            "execution_sequence_first": 100_001,
+            "execution_sequence_last": 1_100_000,
+            "postings_scored": 1_000_000,
+            "filter_records_evaluated": 1_000_000,
+            "filter_records_matched": 1_000_000,
+            "receipt_physical_page_reads": 0,
+            "process_physical_page_reads": 0,
+            "full_state_loads": 0,
+            "full_catalog_loads": 0,
+            "filter_execution": "decode-expiry-inline-value-filter-before-rank-v1",
+            "provider": "filtered-lexical-read-view-interval-counters-v1",
+        },
+    }
 
 
 def validate(
@@ -80,6 +292,9 @@ def receipt() -> dict:
             "full_fanout_budget_fallback": 0,
             "single_generation_fallback": 0,
             "next_partition_lower_bound_present": 1_000_000,
+            "selected_partitions_max": 8,
+            "minimum_next_partition_lower_bound": 0.25,
+            "maximum_kth_distance": 0.20,
         },
         "post_open_hydration_performed": False,
         "post_open_physical_page_reads": 0,
@@ -91,6 +306,7 @@ def receipt() -> dict:
         },
         "ann_read_view_open": {
             "root_identity": "5" * 64,
+            "snapshot_csn": 1,
             "base_build_identity": "6" * 64,
             "view_identity": "7" * 64,
             "routing_policy_identity": "8" * 64,
@@ -106,8 +322,11 @@ def receipt() -> dict:
             "governor_generation": 1,
         },
     })
+    cells["bm25-top10"].update(_bm25_evidence())
+    cells["filtered-bm25-top10"].update(_filtered_bm25_evidence())
+    cells["hybrid-top10"].update(_hybrid_evidence())
     return {
-        "schema": "hyphae-native-g7-receipt-v3",
+        "schema": "hyphae-native-g7-receipt-v4",
         "gate": "G7",
         "status": "passed",
         "evidence_class": "closure-candidate",
@@ -190,6 +409,24 @@ def receipt() -> dict:
                 "execution_time_nanos": 1,
             },
         },
+        "execution_authority": {
+            "status": "measured",
+            "topology_digest": "4" * 64,
+            "runner_executable_blake3": "e" * 64,
+            "calibration_executable_blake3": "e" * 64,
+            "installations": 11,
+            "installed_surfaces": sorted({
+                "search-fixture", "embedded-structure", "embedded-sql",
+                "local-structure-seed", "local-structure-migration",
+                "local-structure-daemon", "local-sql-daemon", "indexed-sql",
+                "join-sql", "group-commit", "physical-observation",
+            }),
+            "registered_pools": 1,
+            "local_dispatches": 9,
+            "stolen_dispatches": 0,
+            "completed_jobs": 9,
+            "numa_steal_status": "disabled",
+        },
         "hardware": {
             "dedicated": True,
             "cpu": "test-cpu",
@@ -247,6 +484,11 @@ def receipt() -> dict:
 def interference_receipt() -> dict:
     payload = receipt()
     payload["background_mode"] = "interference"
+    payload["execution_authority"]["installed_surfaces"].append(
+        "background-maintenance"
+    )
+    payload["execution_authority"]["installed_surfaces"].sort()
+    payload["execution_authority"]["installations"] += 1
     payload["background_interference"] = {
         "status": "measured",
         "operations": 1,
@@ -335,12 +577,36 @@ class G7ReceiptTests(unittest.TestCase):
             ("full_fanout_budget_fallback", 1),
             ("full_fanout_requested", 1),
             ("selected_certified", 999_999),
-            ("execution_waves_max", 2),
+            ("selected_partitions_max", 33),
+            ("execution_waves_max", 7),
         ):
             with self.subTest(field=field):
                 payload = receipt()
                 payload["cells"]["ann-top10-recall-095"]["ann_routing_interval"][field] = value
                 with self.assertRaisesRegex(GateFailure, "selected-certified"):
+                    validate(payload, "a" * 40)
+
+    def test_ann_adaptive_prefix_accepts_multiple_bounded_waves(self) -> None:
+        payload = receipt()
+        payload["cells"]["ann-top10-recall-095"]["ann_routing_interval"][
+            "execution_waves_max"
+        ] = 4
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+    def test_ann_routing_requires_finite_strict_omission_bound(self) -> None:
+        for field, value in (
+            ("minimum_next_partition_lower_bound", float("nan")),
+            ("minimum_next_partition_lower_bound", float("inf")),
+            ("minimum_next_partition_lower_bound", 0.20),
+            ("maximum_kth_distance", float("nan")),
+            ("maximum_kth_distance", float("inf")),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["ann-top10-recall-095"]["ann_routing_interval"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "ANN routing.*bound"):
                     validate(payload, "a" * 40)
 
     def test_ann_cell_rejects_claimed_hydration_without_measured_restore(self) -> None:
@@ -349,6 +615,485 @@ class G7ReceiptTests(unittest.TestCase):
             "hydration_restore_count"
         ] = 0
         with self.assertRaisesRegex(GateFailure, "contradicts"):
+            validate(payload, "a" * 40)
+
+    def test_hybrid_evidence_is_valid_only_in_receipt_v4(self) -> None:
+        payload = receipt()
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+        payload["schema"] = "hyphae-native-g7-receipt-v3"
+        with self.assertRaisesRegex(GateFailure, "identity"):
+            validate(payload, "a" * 40)
+
+    def test_bm25_requires_one_prepared_lexical_read_view_authority(self) -> None:
+        for mutation in ("missing-open", "extra-open", "foreign-root", "foreign-index"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                cell = payload["cells"]["bm25-top10"]
+                if mutation == "missing-open":
+                    del cell["lexical_read_view_open"]
+                elif mutation == "extra-open":
+                    cell["lexical_read_view_open"]["unexpected"] = 0
+                elif mutation == "foreign-root":
+                    cell["lexical_read_view_open"]["root_identity"] = "a" * 64
+                else:
+                    cell["lexical_read_view_open"]["lexical_index_identity"] = "b" * 64
+                with self.assertRaisesRegex(GateFailure, "BM25.*read-view"):
+                    validate(payload, "a" * 40)
+
+    def test_bm25_prepared_open_requires_exact_bounded_plan(self) -> None:
+        mutations = (
+            ("planned_terms", 2),
+            ("retained_postings", 2),
+            ("maximum_retained_postings", 11),
+            ("maximum_retained_bytes", 1_048_577),
+            ("observed_physical_entries", 1_000_001),
+            ("observed_physical_bytes", 1_000_000_001),
+            ("retained_memory_bytes", 1_048_577),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["bm25-top10"]["lexical_read_view_open"][field] = value
+                with self.assertRaisesRegex(GateFailure, "BM25.*read-view"):
+                    validate(payload, "a" * 40)
+
+    def test_bm25_interval_requires_every_fresh_execution_and_zero_storage(self) -> None:
+        mutations = (
+            ("observations", 999_999),
+            ("postings_evaluated", 999_999),
+            ("execution_sequence_last", 1_099_999),
+            ("receipt_physical_page_reads", 1),
+            ("process_physical_page_reads", 1),
+            ("full_state_loads", 1),
+            ("full_catalog_loads", 1),
+            ("lexical_execution", "cached-ranking-v1"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["bm25-top10"]["lexical_read_view_query_interval"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "BM25.*interval"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["bm25-top10"]["lexical_read_view_query_interval"][
+            "observations"
+        ] = True
+        with self.assertRaisesRegex(GateFailure, "BM25.*interval"):
+            validate(payload, "a" * 40)
+
+    def test_filtered_bm25_requires_exact_same_root_authority(self) -> None:
+        for mutation in (
+            "missing-open", "extra-open", "foreign-root", "foreign-csn",
+            "foreign-lexical", "zero-filter-identity", "wrong-scope",
+            "wrong-route", "wrong-correctness",
+        ):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                cell = payload["cells"]["filtered-bm25-top10"]
+                view = cell["filtered_lexical_read_view_open"]
+                if mutation == "missing-open":
+                    del cell["filtered_lexical_read_view_open"]
+                elif mutation == "extra-open":
+                    view["unexpected"] = 0
+                elif mutation == "foreign-root":
+                    view["root_identity"] = "a" * 64
+                elif mutation == "foreign-csn":
+                    view["snapshot_csn"] = 2
+                elif mutation == "foreign-lexical":
+                    view["lexical_index_identity"] = "b" * 64
+                elif mutation == "zero-filter-identity":
+                    view["structure_filter_identity"] = "0" * 64
+                elif mutation == "wrong-scope":
+                    view["lexical_plan_scope"] = "cached-final-ranking-v1"
+                elif mutation == "wrong-route":
+                    cell["route"] = "latest-snapshot-filter"
+                else:
+                    cell["correctness_scope"] = "best-effort"
+                with self.assertRaisesRegex(GateFailure, "filtered BM25"):
+                    validate(payload, "a" * 40)
+
+    def test_filtered_bm25_open_requires_bounded_plan_and_admission(self) -> None:
+        mutations = (
+            ("retained_filter_records", 2),
+            ("planned_filter_physical_entries", 2),
+            ("observed_filter_physical_entries", 2),
+            ("observed_filter_physical_bytes", 257),
+            ("retained_filter_memory_bytes", 257),
+            ("structure_filter_value_scope", "blob-or-inline-v1"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["filtered-bm25-top10"][
+                    "filtered_lexical_read_view_open"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "filtered BM25"):
+                    validate(payload, "a" * 40)
+
+        for phase, field, value in (
+            ("filter_planning", "compute_threads", 2),
+            ("filter_planning", "io_slots", 0),
+            ("filter_hydration", "class", "bulk"),
+            ("filter_hydration", "memory_bytes", 127),
+            ("filter_hydration", "queue_ticket", True),
+            ("filter_hydration", "unexpected", 0),
+        ):
+            with self.subTest(phase=phase, field=field):
+                payload = receipt()
+                payload["cells"]["filtered-bm25-top10"][
+                    "filtered_lexical_read_view_open"
+                ][phase][field] = value
+                with self.assertRaisesRegex(GateFailure, "filtered BM25.*admission"):
+                    validate(payload, "a" * 40)
+
+    def test_filtered_bm25_interval_reexecutes_filter_before_rank(self) -> None:
+        mutations = (
+            ("observations", 999_999),
+            ("execution_sequence_first", 100_002),
+            ("execution_sequence_last", 1_099_999),
+            ("postings_scored", 999_999),
+            ("filter_records_evaluated", 999_999),
+            ("filter_records_matched", 999_999),
+            ("receipt_physical_page_reads", 1),
+            ("process_physical_page_reads", 1),
+            ("full_state_loads", 1),
+            ("full_catalog_loads", 1),
+            ("filter_execution", "cached-filter-result-v1"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["filtered-bm25-top10"][
+                    "filtered_lexical_read_view_query_interval"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "filtered BM25.*interval"):
+                    validate(payload, "a" * 40)
+
+        for field, value in (
+            ("corpus_filter_density", 0.500_001),
+            ("candidate_filter_selectivity", 0.999_999),
+            ("candidate_filter_selectivity", True),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["filtered-bm25-top10"][field] = value
+                with self.assertRaisesRegex(GateFailure, "filtered BM25"):
+                    validate(payload, "a" * 40)
+
+    def test_execution_authority_requires_exact_fields(self) -> None:
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                evidence = payload["execution_authority"]
+                if mutation == "missing":
+                    del evidence["registered_pools"]
+                else:
+                    evidence["unexpected"] = 0
+                with self.assertRaisesRegex(GateFailure, "authority.*fields"):
+                    validate(payload, "a" * 40)
+
+    def test_execution_authority_binds_topology_and_exact_runner(self) -> None:
+        for field, value in (
+            ("topology_digest", "f" * 64),
+            ("runner_executable_blake3", "f" * 64),
+            ("calibration_executable_blake3", "f" * 64),
+            ("runner_executable_blake3", "not-a-digest"),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["execution_authority"][field] = value
+                with self.assertRaisesRegex(GateFailure, "authority identity"):
+                    validate(payload, "a" * 40)
+
+    def test_execution_authority_requires_canonical_complete_surfaces(self) -> None:
+        mutations = ("missing", "invented", "duplicate", "wrong-count", "wrong-pools")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                evidence = payload["execution_authority"]
+                if mutation == "missing":
+                    evidence["installed_surfaces"].remove("local-sql-daemon")
+                    evidence["installations"] -= 1
+                elif mutation == "invented":
+                    evidence["installed_surfaces"].append("second-execution-pool")
+                    evidence["installed_surfaces"].sort()
+                    evidence["installations"] += 1
+                elif mutation == "duplicate":
+                    evidence["installed_surfaces"].append("search-fixture")
+                    evidence["installed_surfaces"].sort()
+                    evidence["installations"] += 1
+                elif mutation == "wrong-count":
+                    evidence["installations"] += 1
+                else:
+                    evidence["registered_pools"] = 2
+                with self.assertRaisesRegex(GateFailure, "surfaces or pools"):
+                    validate(payload, "a" * 40)
+
+    def test_execution_authority_reconciles_dispatch_and_numa_evidence(self) -> None:
+        for field, value, message in (
+            ("completed_jobs", 10, "counters"),
+            ("local_dispatches", True, "counters"),
+            ("numa_steal_status", "unknown", "NUMA"),
+            ("stolen_dispatches", 1, "NUMA"),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["execution_authority"][field] = value
+                if field == "stolen_dispatches":
+                    payload["execution_authority"]["local_dispatches"] = 8
+                with self.assertRaisesRegex(GateFailure, message):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        evidence = payload["execution_authority"]
+        evidence["numa_steal_status"] = "calibrated"
+        evidence["local_dispatches"] = 7
+        evidence["stolen_dispatches"] = 2
+        self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+    def test_hybrid_view_must_share_ann_root_csn_and_view_identity(self) -> None:
+        for field, value in (
+            ("root_identity", "a" * 64),
+            ("snapshot_csn", 2),
+            ("ann_view_identity", "b" * 64),
+            ("lexical_plan_scope", "final-result-cache-v1"),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"]["hybrid_read_view_open"][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*authority"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_query_queue_wait_must_equal_ann_authority(self) -> None:
+        for mutation, value in (
+            ("missing", None),
+            ("zero", 0),
+            ("mismatch", 59_999),
+            ("bool", True),
+        ):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                cell = payload["cells"]["hybrid-top10"]
+                if mutation == "missing":
+                    del cell["query_queue_wait_millis"]
+                else:
+                    cell["query_queue_wait_millis"] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*queue wait"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_view_rejects_unplanned_or_excess_open_work(self) -> None:
+        payload = receipt()
+        payload["cells"]["hybrid-top10"]["hybrid_read_view_open"]["unexpected"] = 0
+        with self.assertRaisesRegex(GateFailure, "hybrid read-view open"):
+            validate(payload, "a" * 40)
+
+        for observed, planned in (
+            ("observed_physical_entries", "planned_physical_entries"),
+            ("observed_physical_bytes", "planned_physical_bytes"),
+        ):
+            with self.subTest(observed=observed):
+                payload = receipt()
+                view = payload["cells"]["hybrid-top10"]["hybrid_read_view_open"]
+                view[observed] = view[planned] + 1
+                with self.assertRaisesRegex(GateFailure, "physical plan"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        view = payload["cells"]["hybrid-top10"]["hybrid_read_view_open"]
+        view["retained_memory_bytes"] = view["admitted_retained_memory_bytes"] + 1
+        with self.assertRaisesRegex(GateFailure, "retained memory"):
+            validate(payload, "a" * 40)
+
+    def test_hybrid_interval_requires_exact_observations_and_zero_storage_work(self) -> None:
+        for field, value in (
+            ("observations", 999_999),
+            ("hydrations", 1),
+            ("physical_page_reads", 1),
+            ("index_scoped_restores", 1),
+            ("full_state_loads", 1),
+            ("full_catalog_loads", 1),
+            ("lexical_execution", "cached-ranking-v1"),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"][
+                    "hybrid_read_view_query_interval"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*interval"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["hybrid-top10"]["hybrid_read_view_query_interval"][
+            "hydrations"
+        ] = False
+        with self.assertRaisesRegex(GateFailure, "hybrid.*interval"):
+            validate(payload, "a" * 40)
+
+    def test_hybrid_interval_requires_atomic_peak_admission_for_every_query(self) -> None:
+        for field, value in (
+            ("peak_admission_executions", 999_999),
+            ("peak_admission_class", "bulk"),
+            ("peak_admission_compute_threads", 43),
+            ("peak_admission_compute_threads", True),
+            ("peak_admission_io_slots", 1),
+            ("peak_admission_memory_bytes_min", 0),
+            ("peak_admission_memory_bytes_min", 999_999),
+            ("peak_admission_memory_bytes_max", 1_999_999),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"][
+                    "hybrid_read_view_query_interval"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*peak admission"):
+                    validate(payload, "a" * 40)
+
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                interval = payload["cells"]["hybrid-top10"][
+                    "hybrid_read_view_query_interval"
+                ]
+                if mutation == "missing":
+                    del interval["peak_admission_executions"]
+                else:
+                    interval["unexpected"] = 0
+                with self.assertRaisesRegex(GateFailure, "hybrid.*fields"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_interval_requires_result_retention_through_publication(self) -> None:
+        for field, value in (
+            ("result_retention_executions", 999_999),
+            ("result_retention_class", "bulk"),
+            ("result_retention_compute_threads", 1),
+            ("result_retention_compute_threads", False),
+            ("result_retention_io_slots", 1),
+            ("result_retention_memory_bytes_min", 0),
+            ("result_retention_memory_bytes_max", 999_999),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"][
+                    "hybrid_read_view_query_interval"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*result retention"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_interval_requires_compute_only_fusion_for_every_query(self) -> None:
+        for field, value in (
+            ("fusion_executions", 999_999),
+            ("fusion_class", "bulk"),
+            ("fusion_compute_threads", 2),
+            ("fusion_compute_threads", True),
+            ("fusion_io_slots", 1),
+            ("fusion_memory_bytes", 1),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"][
+                    "hybrid_read_view_query_interval"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*fusion"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_routing_requires_selected_certification_for_every_observation(self) -> None:
+        for field, value in (
+            ("observations", 999_999),
+            ("selected_certified", 999_999),
+            ("full_fanout_requested", 1),
+            ("full_fanout_budget_fallback", 1),
+            ("single_generation_fallback", 1),
+            ("next_partition_lower_bound_present", 999_999),
+            ("selected_partitions_max", 33),
+            ("execution_waves_max", 7),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"]["hybrid_ann_routing_interval"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*routing"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_routing_requires_finite_strict_omission_bound(self) -> None:
+        for field, value in (
+            ("minimum_next_partition_lower_bound", float("nan")),
+            ("minimum_next_partition_lower_bound", float("inf")),
+            ("minimum_next_partition_lower_bound", 0.20),
+            ("maximum_kth_distance", float("nan")),
+            ("maximum_kth_distance", float("inf")),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"]["hybrid_ann_routing_interval"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*bound"):
+                    validate(payload, "a" * 40)
+
+    def test_hybrid_oracle_recomputes_rrf_order_explanations_and_digest(self) -> None:
+        mutations = (
+            ("rrf_constant", 61),
+            ("result_digest", "0" * 64),
+            ("oracle_digest", "0" * 64),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"]["hybrid_oracle"][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*oracle"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        results = payload["cells"]["hybrid-top10"]["hybrid_oracle"]["fused_results"]
+        results[0]["fusion_score"] += 1
+        with self.assertRaisesRegex(GateFailure, "hybrid.*oracle"):
+            validate(payload, "a" * 40)
+
+        payload = receipt()
+        results = payload["cells"]["hybrid-top10"]["hybrid_oracle"]["fused_results"]
+        results[0], results[1] = results[1], results[0]
+        with self.assertRaisesRegex(GateFailure, "hybrid.*oracle"):
+            validate(payload, "a" * 40)
+
+    def test_hybrid_oracle_rejects_foreign_authority_and_noncanonical_inputs(self) -> None:
+        for field, value in (("root_identity", "a" * 64), ("snapshot_csn", 2)):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["hybrid-top10"]["hybrid_oracle"][field] = value
+                with self.assertRaisesRegex(GateFailure, "hybrid.*oracle authority"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        ranking = payload["cells"]["hybrid-top10"]["hybrid_oracle"][
+            "vector_ranking"
+        ]
+        ranking[1] = ranking[0]
+        with self.assertRaisesRegex(GateFailure, "hybrid.*ranking"):
+            validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["hybrid-top10"]["hybrid_oracle"]["lexical_ranking"][0] = (
+            "0" * 32
+        )
+        with self.assertRaisesRegex(GateFailure, "hybrid.*ranking"):
+            validate(payload, "a" * 40)
+
+    def test_hybrid_oracle_rejects_bool_as_numeric_evidence(self) -> None:
+        payload = receipt()
+        payload["cells"]["hybrid-top10"]["hybrid_oracle"]["lexical_weight"] = True
+        with self.assertRaisesRegex(GateFailure, "hybrid.*oracle authority"):
+            validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["hybrid-top10"]["hybrid_oracle"]["fused_results"][0][
+            "final_rank"
+        ] = True
+        with self.assertRaisesRegex(GateFailure, "hybrid.*explanation"):
             validate(payload, "a" * 40)
 
     def test_initial_bulk_accepts_compute_only_governor_request(self) -> None:

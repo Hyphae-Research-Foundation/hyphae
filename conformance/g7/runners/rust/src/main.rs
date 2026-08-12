@@ -24,12 +24,18 @@ use hyphae_native_product::{
     ProductPrincipal, ProductRequestContext, ProductSession, ProductSessionId,
 };
 use hyphae_native_runtime::{
-    AnnPartitionRoutingOutcome, AnnSearchOptions, CalibrationMode, CalibrationRequest,
-    HardwareCalibration, HardwareProfile, HnswConfig, InitialAnnBulkBuildEvidence,
-    InitialAnnBulkBuilder, InitialAnnBulkProgress, InitialAnnBulkProgressStage,
-    MAX_INITIAL_ANN_BULK_PARTITIONS, NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch,
-    NativeExecutionPool, NativeExecutionTopology, NativeGovernorPolicy, NativeResourceGovernor,
-    NativeSnapshot, ThreadScalingDiagnostic, Vector, VectorMetric, WorkloadClass,
+    ANN_PARTITION_ROUTING_POLICY_V1, AnnPartitionRoutingOutcome, AnnSearchOptions, CalibrationMode,
+    CalibrationRequest, HardwareCalibration, HardwareProfile, HnswConfig,
+    InitialAnnBulkBuildEvidence, InitialAnnBulkBuilder, InitialAnnBulkProgress,
+    InitialAnnBulkProgressStage, MAX_INITIAL_ANN_BULK_PARTITIONS,
+    NATIVE_LEXICAL_INDEX_IDENTITY_ALGORITHM, NATIVE_LEXICAL_READ_VIEW_PLAN_SCOPE,
+    NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch, NativeExecutionPool,
+    NativeExecutionTopology, NativeFilteredLexicalReadView,
+    NativeFilteredLexicalReadViewOpenReceipt, NativeGovernorPolicy, NativeHybridFusion,
+    NativeHybridOutcome, NativeHybridReadView, NativeHybridReadViewOpenReceipt,
+    NativeHybridReadViewOpenRequest, NativeHybridReadViewQuery, NativeLexicalReadView,
+    NativeLexicalReadViewOpenRequest, NativeResourceGovernor, NativeStructureScalarFilter,
+    ThreadScalingDiagnostic, Vector, VectorMetric, WorkloadClass,
 };
 use hyphae_native_types::ObjectId;
 use serde_json::json;
@@ -38,7 +44,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
 
-const VERSION: &str = "hyphae-native-g7-receipt-v3";
+const VERSION: &str = "hyphae-native-g7-receipt-v4";
 const DEFAULT_OBSERVATIONS: usize = 1_000_000;
 const DEFAULT_WARMUP: usize = 100_000;
 const STRUCTURE_KEYS: usize = 2_048;
@@ -50,9 +56,14 @@ const ANN_PARTITION_POLICY: &str = "g7-fixed-64-logical-partitions-v1";
 const K: usize = 10;
 const ANN_QUERY_BREADTH: usize = 64;
 const G7_PREFERRED_ANN_PARTITIONS: usize = 32;
+const G7_LEXICAL_RETAINED_POSTINGS: usize = K;
+const G7_LEXICAL_RETAINED_BYTES: u64 = 1024 * 1024;
+const G7_FILTER_KEY_PREFIX: &[u8] = b"g7-filter:";
+const G7_FILTER_EXPECTED_VALUE: &[u8] = b"keep";
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_CHUNK_UNITS: usize = 10_000;
+const EVIDENCE_MEASUREMENT_CHUNK: usize = 256;
 const SEED_BATCH_DOCUMENTS: usize = 512;
 const MAX_SEED_COHORTS: usize = 2;
 const SEED_PARTITION_RULE: &str = "batch-index-modulo-cohort-count-ordinal-commit-v1";
@@ -242,12 +253,495 @@ struct Stats {
     throughput: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RoutingObservation {
+    execution_workers: u64,
+    execution_worker_batches: u64,
+    execution_waves: u64,
+    selected_partitions: u64,
+    next_partition_lower_bound: f64,
+    kth_distance: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoutingIntervalEvidence {
+    execution_workers_max: u64,
+    execution_worker_batches_max: u64,
+    execution_waves_max: u64,
+    selected_certified: u64,
+    selected_partitions_max: u64,
+    next_partition_lower_bound_present: u64,
+    minimum_next_partition_lower_bound: f64,
+    maximum_kth_distance: f64,
+}
+
+impl RoutingIntervalEvidence {
+    fn new() -> Self {
+        Self {
+            execution_workers_max: 0,
+            execution_worker_batches_max: 0,
+            execution_waves_max: 0,
+            selected_certified: 0,
+            selected_partitions_max: 0,
+            next_partition_lower_bound_present: 0,
+            minimum_next_partition_lower_bound: f64::INFINITY,
+            maximum_kth_distance: 0.0,
+        }
+    }
+
+    fn observe(&mut self, observation: RoutingObservation) {
+        self.execution_workers_max = self
+            .execution_workers_max
+            .max(observation.execution_workers);
+        self.execution_worker_batches_max = self
+            .execution_worker_batches_max
+            .max(observation.execution_worker_batches);
+        self.execution_waves_max = self.execution_waves_max.max(observation.execution_waves);
+        self.selected_partitions_max = self
+            .selected_partitions_max
+            .max(observation.selected_partitions);
+        self.minimum_next_partition_lower_bound = self
+            .minimum_next_partition_lower_bound
+            .min(observation.next_partition_lower_bound);
+        self.maximum_kth_distance = self.maximum_kth_distance.max(observation.kth_distance);
+        self.selected_certified = self.selected_certified.saturating_add(1);
+        self.next_partition_lower_bound_present =
+            self.next_partition_lower_bound_present.saturating_add(1);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.execution_workers_max = self.execution_workers_max.max(other.execution_workers_max);
+        self.execution_worker_batches_max = self
+            .execution_worker_batches_max
+            .max(other.execution_worker_batches_max);
+        self.execution_waves_max = self.execution_waves_max.max(other.execution_waves_max);
+        self.selected_partitions_max = self
+            .selected_partitions_max
+            .max(other.selected_partitions_max);
+        self.minimum_next_partition_lower_bound = self
+            .minimum_next_partition_lower_bound
+            .min(other.minimum_next_partition_lower_bound);
+        self.maximum_kth_distance = self.maximum_kth_distance.max(other.maximum_kth_distance);
+        self.selected_certified = self
+            .selected_certified
+            .saturating_add(other.selected_certified);
+        self.next_partition_lower_bound_present = self
+            .next_partition_lower_bound_present
+            .saturating_add(other.next_partition_lower_bound_present);
+    }
+
+    fn observation(
+        receipt: &hyphae_native_runtime::AnnSelectedSearchReceipt,
+        next_lower_bound: f64,
+        kth_distance: f64,
+    ) -> Result<RoutingObservation, Box<dyn Error>> {
+        Ok(RoutingObservation {
+            execution_workers: u64::try_from(receipt.execution_workers)?,
+            execution_worker_batches: u64::try_from(receipt.execution_worker_batches)?,
+            execution_waves: u64::try_from(receipt.execution_waves)?,
+            selected_partitions: u64::try_from(receipt.selected_partitions.len())?,
+            next_partition_lower_bound: next_lower_bound,
+            kth_distance,
+        })
+    }
+
+    fn json(&self, observations: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+        let observations = u64::try_from(observations)?;
+        if self.selected_certified != observations
+            || self.next_partition_lower_bound_present != observations
+            || !self.minimum_next_partition_lower_bound.is_finite()
+            || !self.maximum_kth_distance.is_finite()
+            || self.minimum_next_partition_lower_bound <= self.maximum_kth_distance
+        {
+            return Err("G7 ANN routing interval did not preserve strict certification".into());
+        }
+        Ok(json!({
+            "observations": observations,
+            "execution_workers_max": self.execution_workers_max,
+            "execution_worker_batches_max": self.execution_worker_batches_max,
+            "execution_waves_max": self.execution_waves_max,
+            "selected_certified": self.selected_certified,
+            "full_fanout_requested": 0,
+            "full_fanout_budget_fallback": 0,
+            "single_generation_fallback": 0,
+            "next_partition_lower_bound_present": self.next_partition_lower_bound_present,
+            "selected_partitions_max": self.selected_partitions_max,
+            "minimum_next_partition_lower_bound": self.minimum_next_partition_lower_bound,
+            "maximum_kth_distance": self.maximum_kth_distance,
+        }))
+    }
+}
+
+impl Default for RoutingIntervalEvidence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+trait MeasurementEvidence: Default + Send {
+    type Observation: Send;
+
+    fn observe(&mut self, observation: Self::Observation);
+    fn merge(&mut self, other: Self);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueryPhaseTiming {
+    started: Instant,
+    finished: Instant,
+}
+
+struct EvidenceWorkerResult<E> {
+    samples: Vec<u64>,
+    evidence: E,
+    phases: Vec<Option<QueryPhaseTiming>>,
+}
+
+#[derive(Debug, Default)]
+struct MeasurementFailure {
+    failed: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl MeasurementEvidence for RoutingIntervalEvidence {
+    type Observation = RoutingObservation;
+
+    fn observe(&mut self, observation: Self::Observation) {
+        Self::observe(self, observation);
+    }
+
+    fn merge(&mut self, other: Self) {
+        Self::merge(self, other);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HybridObservation {
+    routing: RoutingObservation,
+    peak_admission_compute_threads: u64,
+    peak_admission_memory_bytes: u64,
+    result_retention_memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HybridIntervalEvidence {
+    routing: RoutingIntervalEvidence,
+    peak_admission_executions: u64,
+    peak_admission_compute_threads: u64,
+    peak_admission_memory_bytes_min: u64,
+    peak_admission_memory_bytes_max: u64,
+    result_retention_executions: u64,
+    result_retention_memory_bytes_min: u64,
+    result_retention_memory_bytes_max: u64,
+    fusion_executions: u64,
+}
+
+impl Default for HybridIntervalEvidence {
+    fn default() -> Self {
+        Self {
+            routing: RoutingIntervalEvidence::default(),
+            peak_admission_executions: 0,
+            peak_admission_compute_threads: 0,
+            peak_admission_memory_bytes_min: u64::MAX,
+            peak_admission_memory_bytes_max: 0,
+            result_retention_executions: 0,
+            result_retention_memory_bytes_min: u64::MAX,
+            result_retention_memory_bytes_max: 0,
+            fusion_executions: 0,
+        }
+    }
+}
+
+impl MeasurementEvidence for HybridIntervalEvidence {
+    type Observation = HybridObservation;
+
+    fn observe(&mut self, observation: Self::Observation) {
+        self.routing.observe(observation.routing);
+        self.peak_admission_executions = self.peak_admission_executions.saturating_add(1);
+        self.peak_admission_compute_threads = self
+            .peak_admission_compute_threads
+            .max(observation.peak_admission_compute_threads);
+        self.peak_admission_memory_bytes_min = self
+            .peak_admission_memory_bytes_min
+            .min(observation.peak_admission_memory_bytes);
+        self.peak_admission_memory_bytes_max = self
+            .peak_admission_memory_bytes_max
+            .max(observation.peak_admission_memory_bytes);
+        self.result_retention_executions = self.result_retention_executions.saturating_add(1);
+        self.result_retention_memory_bytes_min = self
+            .result_retention_memory_bytes_min
+            .min(observation.result_retention_memory_bytes);
+        self.result_retention_memory_bytes_max = self
+            .result_retention_memory_bytes_max
+            .max(observation.result_retention_memory_bytes);
+        self.fusion_executions = self.fusion_executions.saturating_add(1);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.routing.merge(other.routing);
+        self.peak_admission_executions = self
+            .peak_admission_executions
+            .saturating_add(other.peak_admission_executions);
+        self.peak_admission_compute_threads = self
+            .peak_admission_compute_threads
+            .max(other.peak_admission_compute_threads);
+        self.peak_admission_memory_bytes_min = self
+            .peak_admission_memory_bytes_min
+            .min(other.peak_admission_memory_bytes_min);
+        self.peak_admission_memory_bytes_max = self
+            .peak_admission_memory_bytes_max
+            .max(other.peak_admission_memory_bytes_max);
+        self.result_retention_executions = self
+            .result_retention_executions
+            .saturating_add(other.result_retention_executions);
+        self.result_retention_memory_bytes_min = self
+            .result_retention_memory_bytes_min
+            .min(other.result_retention_memory_bytes_min);
+        self.result_retention_memory_bytes_max = self
+            .result_retention_memory_bytes_max
+            .max(other.result_retention_memory_bytes_max);
+        self.fusion_executions = self
+            .fusion_executions
+            .saturating_add(other.fusion_executions);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LexicalObservation {
+    execution_sequence: u64,
+    postings_evaluated: u64,
+    physical_page_reads: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LexicalIntervalEvidence {
+    observations: u64,
+    postings_evaluated: u64,
+    physical_page_reads: u64,
+    execution_sequence_first: u64,
+    execution_sequence_last: u64,
+}
+
+impl Default for LexicalIntervalEvidence {
+    fn default() -> Self {
+        Self {
+            observations: 0,
+            postings_evaluated: 0,
+            physical_page_reads: 0,
+            execution_sequence_first: u64::MAX,
+            execution_sequence_last: 0,
+        }
+    }
+}
+
+impl MeasurementEvidence for LexicalIntervalEvidence {
+    type Observation = LexicalObservation;
+
+    fn observe(&mut self, observation: Self::Observation) {
+        self.observations = self.observations.saturating_add(1);
+        self.postings_evaluated = self
+            .postings_evaluated
+            .saturating_add(observation.postings_evaluated);
+        self.physical_page_reads = self
+            .physical_page_reads
+            .saturating_add(observation.physical_page_reads);
+        self.execution_sequence_first = self
+            .execution_sequence_first
+            .min(observation.execution_sequence);
+        self.execution_sequence_last = self
+            .execution_sequence_last
+            .max(observation.execution_sequence);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.observations = self.observations.saturating_add(other.observations);
+        self.postings_evaluated = self
+            .postings_evaluated
+            .saturating_add(other.postings_evaluated);
+        self.physical_page_reads = self
+            .physical_page_reads
+            .saturating_add(other.physical_page_reads);
+        self.execution_sequence_first = self
+            .execution_sequence_first
+            .min(other.execution_sequence_first);
+        self.execution_sequence_last = self
+            .execution_sequence_last
+            .max(other.execution_sequence_last);
+    }
+}
+
+impl LexicalIntervalEvidence {
+    fn json(
+        &self,
+        expected_observations: usize,
+        global_physical_page_reads: u64,
+        full_state_loads: u64,
+        full_catalog_loads: u64,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let expected = u64::try_from(expected_observations)?;
+        if self.observations != expected
+            || self.postings_evaluated != expected
+            || self.physical_page_reads != 0
+            || global_physical_page_reads != 0
+            || full_state_loads != 0
+            || full_catalog_loads != 0
+            || self.execution_sequence_first == u64::MAX
+            || self.execution_sequence_last < self.execution_sequence_first
+            || self
+                .execution_sequence_last
+                .checked_sub(self.execution_sequence_first)
+                .and_then(|delta| delta.checked_add(1))
+                != Some(expected)
+        {
+            return Err("G7 lexical interval changed or skipped its retained execution".into());
+        }
+        Ok(json!({
+            "observations": expected,
+            "postings_evaluated": self.postings_evaluated,
+            "execution_sequence_first": self.execution_sequence_first,
+            "execution_sequence_last": self.execution_sequence_last,
+            "receipt_physical_page_reads": self.physical_page_reads,
+            "process_physical_page_reads": global_physical_page_reads,
+            "full_state_loads": full_state_loads,
+            "full_catalog_loads": full_catalog_loads,
+            "lexical_execution": hyphae_native_runtime::NATIVE_LEXICAL_READ_VIEW_EXECUTION,
+            "provider": "lexical-read-view-interval-counters-v1",
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FilteredLexicalObservation {
+    execution_sequence: u64,
+    postings_scored: u64,
+    filter_records_evaluated: u64,
+    filter_records_matched: u64,
+    physical_page_reads: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FilteredLexicalIntervalEvidence {
+    observations: u64,
+    execution_sequence_first: u64,
+    execution_sequence_last: u64,
+    postings_scored: u64,
+    filter_records_evaluated: u64,
+    filter_records_matched: u64,
+    physical_page_reads: u64,
+}
+
+impl Default for FilteredLexicalIntervalEvidence {
+    fn default() -> Self {
+        Self {
+            observations: 0,
+            execution_sequence_first: u64::MAX,
+            execution_sequence_last: 0,
+            postings_scored: 0,
+            filter_records_evaluated: 0,
+            filter_records_matched: 0,
+            physical_page_reads: 0,
+        }
+    }
+}
+
+impl MeasurementEvidence for FilteredLexicalIntervalEvidence {
+    type Observation = FilteredLexicalObservation;
+
+    fn observe(&mut self, observation: Self::Observation) {
+        self.observations = self.observations.saturating_add(1);
+        self.execution_sequence_first = self
+            .execution_sequence_first
+            .min(observation.execution_sequence);
+        self.execution_sequence_last = self
+            .execution_sequence_last
+            .max(observation.execution_sequence);
+        self.postings_scored = self
+            .postings_scored
+            .saturating_add(observation.postings_scored);
+        self.filter_records_evaluated = self
+            .filter_records_evaluated
+            .saturating_add(observation.filter_records_evaluated);
+        self.filter_records_matched = self
+            .filter_records_matched
+            .saturating_add(observation.filter_records_matched);
+        self.physical_page_reads = self
+            .physical_page_reads
+            .saturating_add(observation.physical_page_reads);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.observations = self.observations.saturating_add(other.observations);
+        self.execution_sequence_first = self
+            .execution_sequence_first
+            .min(other.execution_sequence_first);
+        self.execution_sequence_last = self
+            .execution_sequence_last
+            .max(other.execution_sequence_last);
+        self.postings_scored = self.postings_scored.saturating_add(other.postings_scored);
+        self.filter_records_evaluated = self
+            .filter_records_evaluated
+            .saturating_add(other.filter_records_evaluated);
+        self.filter_records_matched = self
+            .filter_records_matched
+            .saturating_add(other.filter_records_matched);
+        self.physical_page_reads = self
+            .physical_page_reads
+            .saturating_add(other.physical_page_reads);
+    }
+}
+
+impl FilteredLexicalIntervalEvidence {
+    fn json(
+        &self,
+        expected_observations: usize,
+        process_page_reads: u64,
+        full_state_loads: u64,
+        full_catalog_loads: u64,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let expected = u64::try_from(expected_observations)?;
+        if self.observations != expected
+            || self.postings_scored != expected
+            || self.filter_records_evaluated != expected
+            || self.filter_records_matched != expected
+            || self.physical_page_reads != 0
+            || process_page_reads != 0
+            || full_state_loads != 0
+            || full_catalog_loads != 0
+            || self.execution_sequence_first == u64::MAX
+            || self.execution_sequence_last < self.execution_sequence_first
+            || self
+                .execution_sequence_last
+                .checked_sub(self.execution_sequence_first)
+                .and_then(|delta| delta.checked_add(1))
+                != Some(expected)
+        {
+            return Err("G7 filtered lexical interval changed its root-bound predicate".into());
+        }
+        Ok(json!({
+            "observations": expected,
+            "execution_sequence_first": self.execution_sequence_first,
+            "execution_sequence_last": self.execution_sequence_last,
+            "postings_scored": self.postings_scored,
+            "filter_records_evaluated": self.filter_records_evaluated,
+            "filter_records_matched": self.filter_records_matched,
+            "receipt_physical_page_reads": self.physical_page_reads,
+            "process_physical_page_reads": process_page_reads,
+            "full_state_loads": full_state_loads,
+            "full_catalog_loads": full_catalog_loads,
+            "filter_execution": hyphae_native_runtime::NATIVE_STRUCTURE_FILTER_EXECUTION,
+            "provider": "filtered-lexical-read-view-interval-counters-v1",
+        }))
+    }
+}
+
 struct SearchFixture {
     database: NativeDatabase,
-    ann_view: Mutex<Option<hyphae_native_runtime::NativeAnnReadView>>,
-    ann_view_open: hyphae_native_runtime::NativeAnnReadViewOpenReceipt,
-    lexical_index: ObjectId,
-    vector_index: ObjectId,
+    hybrid_view: NativeHybridReadView,
+    hybrid_view_open: NativeHybridReadViewOpenReceipt,
+    lexical_view: NativeLexicalReadView,
+    filtered_lexical_view: NativeFilteredLexicalReadView,
+    filtered_lexical_view_open: NativeFilteredLexicalReadViewOpenReceipt,
+    ann_view: hyphae_native_runtime::NativeAnnReadView,
     foreground_compute_threads: u64,
     query: Vector,
     options: AnnSearchOptions,
@@ -1435,19 +1929,133 @@ impl SearchFixture {
             .policy()
             .limit(WorkloadClass::ForegroundBounded)
             .compute_threads;
-        let (ann_view, ann_view_open) = database.open_ann_read_view(vector_index)?;
-        Ok(Self {
-            database,
-            ann_view: Mutex::new(Some(ann_view)),
-            ann_view_open,
+        let hybrid_request = NativeHybridReadViewOpenRequest {
+            lexical: NativeLexicalReadViewOpenRequest {
+                index: lexical_index,
+                query: "rare",
+                limit: K,
+                maximum_retained_postings: G7_LEXICAL_RETAINED_POSTINGS,
+                maximum_retained_bytes: G7_LEXICAL_RETAINED_BYTES,
+            },
+            vector_index,
+        };
+        let (hybrid_view, hybrid_view_open) = database.open_hybrid_read_view(&hybrid_request)?;
+        validate_g7_search_fixture_open(
+            &hybrid_view_open,
             lexical_index,
             vector_index,
+            &initial_ann_bulk,
+        )?;
+        let filter_request = NativeStructureScalarFilter {
+            key_prefix: G7_FILTER_KEY_PREFIX,
+            expected_inline_value: G7_FILTER_EXPECTED_VALUE,
+            logical_time_micros: 0,
+        };
+        let lexical_view = hybrid_view.lexical_view();
+        let (filtered_lexical_view, filtered_lexical_view_open) = database
+            .open_filtered_lexical_read_view_from_lexical(&lexical_view, &filter_request)?;
+        validate_g7_filtered_search_fixture_open(
+            &filtered_lexical_view_open,
+            &hybrid_view_open.lexical,
+        )?;
+        let ann_view = hybrid_view.ann_view();
+        Ok(Self {
+            database,
+            hybrid_view,
+            hybrid_view_open,
+            lexical_view,
+            filtered_lexical_view,
+            filtered_lexical_view_open,
+            ann_view,
             foreground_compute_threads,
             query,
             options,
             initial_ann_bulk,
         })
     }
+}
+
+fn validate_g7_search_fixture_open(
+    open: &NativeHybridReadViewOpenReceipt,
+    lexical_index: ObjectId,
+    vector_index: ObjectId,
+    initial_ann_bulk: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let lexical = &open.lexical;
+    let ann = &open.ann;
+    let expected_partitions =
+        usize::try_from(required_json_u64(initial_ann_bulk, "planned_partitions")?)?;
+    if open.snapshot_csn.is_none()
+        || open.root_identity != lexical.root_identity
+        || open.root_identity != ann.root_identity
+        || open.snapshot_csn != lexical.snapshot_csn
+        || open.snapshot_csn != ann.snapshot_csn
+        || open.catalog_version != lexical.catalog_version
+        || open.catalog_version != ann.catalog_version
+        || lexical.index_id != lexical_index
+        || ann.index_id != vector_index
+        || lexical.lexical_plan_scope != NATIVE_LEXICAL_READ_VIEW_PLAN_SCOPE
+        || lexical.lexical_index_identity_algorithm != NATIVE_LEXICAL_INDEX_IDENTITY_ALGORITHM
+        || lexical.planned_terms != 1
+        || lexical.retained_postings != 1
+        || lexical.maximum_retained_postings != G7_LEXICAL_RETAINED_POSTINGS
+        || lexical.maximum_retained_bytes != G7_LEXICAL_RETAINED_BYTES
+        || lexical.planned_physical_entries == 0
+        || lexical.planned_physical_bytes == 0
+        || lexical.observed_physical_entries == 0
+        || lexical.observed_physical_entries > lexical.planned_physical_entries
+        || lexical.observed_physical_bytes == 0
+        || lexical.observed_physical_bytes > lexical.planned_physical_bytes
+        || lexical.admitted_retained_memory_bytes == 0
+        || lexical.admitted_retained_memory_bytes > G7_LEXICAL_RETAINED_BYTES
+        || lexical.retained_memory_bytes == 0
+        || lexical.retained_memory_bytes > lexical.admitted_retained_memory_bytes
+        || ann.logical_partitions != expected_partitions
+        || ann.hydration_restore_count != 1
+        || ann.observed_physical_entries > ann.planned_physical_entries
+        || ann.observed_physical_bytes > ann.planned_physical_bytes
+        || ann.retained_memory_bytes > ann.planned_peak_memory_bytes
+    {
+        return Err("G7 search fixture open receipt violates its shared bounded authority".into());
+    }
+    Ok(())
+}
+
+fn validate_g7_filtered_search_fixture_open(
+    open: &NativeFilteredLexicalReadViewOpenReceipt,
+    shared_lexical: &hyphae_native_runtime::NativeLexicalReadViewOpenReceipt,
+) -> Result<(), Box<dyn Error>> {
+    if open.snapshot_csn.is_none()
+        || open.root_identity != shared_lexical.root_identity
+        || open.snapshot_csn != shared_lexical.snapshot_csn
+        || open.catalog_version != shared_lexical.catalog_version
+        || open.lexical.lexical_index_identity != shared_lexical.lexical_index_identity
+        || open.lexical.index_id != shared_lexical.index_id
+        || open.lexical.lexical_plan_scope != NATIVE_LEXICAL_READ_VIEW_PLAN_SCOPE
+        || open.structure_filter_identity_algorithm
+            != hyphae_native_runtime::NATIVE_STRUCTURE_FILTER_IDENTITY_ALGORITHM
+        || open.structure_filter_value_scope
+            != hyphae_native_runtime::NATIVE_STRUCTURE_FILTER_VALUE_SCOPE
+        || open.structure_filter_identity == [0; 32]
+        || open.retained_filter_records != 1
+        || open.planned_filter_physical_entries == 0
+        || open.observed_filter_physical_entries != 1
+        || open.observed_filter_physical_entries > open.planned_filter_physical_entries
+        || open.planned_filter_physical_bytes == 0
+        || open.observed_filter_physical_bytes == 0
+        || open.observed_filter_physical_bytes > open.planned_filter_physical_bytes
+        || open.retained_filter_memory_bytes == 0
+        || open.filter_planning.class != WorkloadClass::ForegroundBounded
+        || open.filter_planning.request.compute_threads == 0
+        || open.filter_planning.request.io_slots == 0
+        || open.filter_hydration.class != WorkloadClass::ForegroundBounded
+        || open.filter_hydration.request.compute_threads == 0
+        || open.filter_hydration.request.io_slots == 0
+        || open.filter_hydration.request.memory_bytes < open.retained_filter_memory_bytes
+    {
+        return Err("G7 filtered lexical fixture violates its same-root bounded authority".into());
+    }
+    Ok(())
 }
 
 fn publish_search_seed(
@@ -2911,30 +3519,72 @@ fn run_filtered_bm25(
     progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let materialization = NativeDatabase::process_materialization_observation();
+    let physical_before = fixture.database.physical_observation()?;
     if warm {
         progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
-            black_box(filtered_bm25_query(
-                &fixture.database,
-                fixture.lexical_index,
-            )?);
+            let receipt = fixture.filtered_lexical_view.search()?;
+            validate_g7_filtered_lexical_query(&receipt, &fixture.filtered_lexical_view_open)?;
+            black_box(receipt);
             progress.advance(1)?;
         }
         progress.finish_phase("warmup")?;
     }
     progress.begin_phase("measure", observations)?;
-    let stats = measure_concurrent(concurrency, observations, progress, &|| {
-        if filtered_bm25_query(&fixture.database, fixture.lexical_index)? != 1 {
-            return Err("filtered BM25 result mismatch".into());
-        }
-        Ok(())
-    })?;
+    let (stats, filtered) = measure_concurrent_with_evidence::<_, FilteredLexicalIntervalEvidence>(
+        concurrency,
+        observations,
+        progress,
+        &|| {
+            fixture
+                .filtered_lexical_view
+                .search()
+                .map_err(|error| -> Box<dyn Error> { error.into() })
+        },
+        &|receipt| {
+            validate_g7_filtered_lexical_query(&receipt, &fixture.filtered_lexical_view_open)?;
+            let observation = FilteredLexicalObservation {
+                execution_sequence: receipt.execution_sequence,
+                postings_scored: u64::try_from(receipt.postings_scored)?,
+                filter_records_evaluated: u64::try_from(receipt.filter_records_evaluated)?,
+                filter_records_matched: u64::try_from(receipt.filter_records_matched)?,
+                physical_page_reads: receipt.physical_page_reads,
+            };
+            black_box(receipt);
+            Ok(observation)
+        },
+    )?;
     progress.finish_phase("measure")?;
+    let physical_after = fixture.database.physical_observation()?;
+    let interval_page_reads = physical_after
+        .physical_page_reads
+        .saturating_sub(physical_before.physical_page_reads);
     let mut value = stats_with_materialization(stats, materialization)?;
-    value["route"] = json!("native-same-snapshot-filtered-bm25");
-    value["filter_selectivity"] = json!(0.5);
-    value["correctness_scope"] = json!("lexical-and-structure-same-snapshot");
+    let materialization = value
+        .get("materialization")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("filtered BM25 materialization interval is missing")?;
+    let full_state_loads = materialization
+        .get("full_state_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("filtered BM25 full-state counter is missing")?;
+    let full_catalog_loads = materialization
+        .get("full_catalog_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("filtered BM25 full-catalog counter is missing")?;
+    value["route"] = json!("native-root-bound-filter-before-rank");
+    value["correctness_scope"] = json!("lexical-and-structure-one-root-query-bound");
+    value["corpus_filter_density"] = json!(0.5);
+    value["candidate_filter_selectivity"] = json!(1.0);
     value["concurrency"] = json!(concurrency);
+    value["filtered_lexical_read_view_open"] =
+        filtered_lexical_read_view_open_json(&fixture.filtered_lexical_view_open)?;
+    value["filtered_lexical_read_view_query_interval"] = filtered.json(
+        observations,
+        interval_page_reads,
+        full_state_loads,
+        full_catalog_loads,
+    )?;
     Ok(value)
 }
 
@@ -2946,44 +3596,183 @@ fn run_hybrid(
     warmup: usize,
     progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let snapshot = fixture.database.snapshot(0)?;
+    let offered_concurrency = u64::try_from(concurrency)?;
+    let preferred_partitions = G7_PREFERRED_ANN_PARTITIONS
+        .min(fixture.hybrid_view_open.ann.logical_partitions)
+        .max(1);
+    let query_workers = fixture
+        .foreground_compute_threads
+        .checked_div(offered_concurrency.max(1))
+        .unwrap_or(0)
+        .max(1)
+        .min(u64::try_from(preferred_partitions)?);
+    let query_queue_wait = Duration::from_secs(60);
+    let query = NativeHybridReadViewQuery {
+        vector_query: &fixture.query,
+        ann_options: fixture.options,
+        maximum_partitions: preferred_partitions,
+        fusion: NativeHybridFusion {
+            lexical_weight: 1,
+            vector_weight: 1,
+            limit: K,
+        },
+    };
+    let physical_before = fixture.database.physical_observation()?;
+    let restores_before = NativeDatabase::process_ann_index_restore_count();
     let materialization = NativeDatabase::process_materialization_observation();
     if warm {
         progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
-            black_box(hybrid_query(
-                &fixture.database,
-                &snapshot,
-                fixture.lexical_index,
-                fixture.vector_index,
-                &fixture.query,
-                fixture.options,
-            )?);
+            let receipt = fixture.hybrid_view.search_selected_with_worker_budget(
+                &query,
+                query_workers,
+                query_queue_wait,
+            )?;
+            validate_g7_hybrid_query(
+                &receipt,
+                &fixture.hybrid_view_open,
+                preferred_partitions,
+                query_workers,
+            )?;
+            black_box(receipt);
             progress.advance(1)?;
         }
         progress.finish_phase("warmup")?;
     }
     progress.begin_phase("measure", observations)?;
-    let stats = measure_concurrent(concurrency, observations, progress, &|| {
-        if hybrid_query(
-            &fixture.database,
-            &snapshot,
-            fixture.lexical_index,
-            fixture.vector_index,
-            &fixture.query,
-            fixture.options,
-        )? < K
-        {
-            return Err("hybrid result mismatch".into());
-        }
-        Ok(())
-    })?;
+    let (stats, evidence) = measure_concurrent_with_evidence::<_, HybridIntervalEvidence>(
+        concurrency,
+        observations,
+        progress,
+        &|| {
+            fixture
+                .hybrid_view
+                .search_selected_with_worker_budget(&query, query_workers, query_queue_wait)
+                .map_err(|error| -> Box<dyn Error> { error.into() })
+        },
+        &|receipt| {
+            let (next_lower_bound, kth_distance) = validate_g7_hybrid_query(
+                &receipt,
+                &fixture.hybrid_view_open,
+                preferred_partitions,
+                query_workers,
+            )?;
+            let routing = RoutingIntervalEvidence::observation(
+                &receipt.ann.search,
+                next_lower_bound,
+                kth_distance,
+            )?;
+            let observation = HybridObservation {
+                routing,
+                peak_admission_compute_threads: receipt.peak_admission.request.compute_threads,
+                peak_admission_memory_bytes: receipt.peak_admission.request.memory_bytes,
+                result_retention_memory_bytes: receipt.result_retention.request.memory_bytes,
+            };
+            black_box(receipt);
+            Ok(observation)
+        },
+    )?;
     progress.finish_phase("measure")?;
+    let physical_after = fixture.database.physical_observation()?;
+    let restores_after = NativeDatabase::process_ann_index_restore_count();
+    let interval_page_reads = physical_after
+        .physical_page_reads
+        .saturating_sub(physical_before.physical_page_reads);
+    let interval_restores = restores_after.saturating_sub(restores_before);
+    if interval_page_reads != 0 || interval_restores != 0 {
+        return Err("hybrid read-view interval crossed the hydration boundary".into());
+    }
     let mut value = stats_with_materialization(stats, materialization)?;
+    let materialization_interval = value
+        .get("materialization")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("hybrid materialization interval is missing")?;
+    let full_state_loads = materialization_interval
+        .get("full_state_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("hybrid full-state counter is missing")?;
+    let full_catalog_loads = materialization_interval
+        .get("full_catalog_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("hybrid full-catalog counter is missing")?;
+    if full_state_loads != 0 || full_catalog_loads != 0 {
+        return Err("hybrid read view materialized complete state".into());
+    }
+    let lexical_open = &fixture.hybrid_view_open.lexical;
+    let ann_open = &fixture.hybrid_view_open.ann;
+    let snapshot_csn = fixture
+        .hybrid_view_open
+        .snapshot_csn
+        .map(hyphae_native_types::Csn::get)
+        .ok_or("hybrid read view omitted its snapshot CSN")?;
     value["route"] = json!("native-same-snapshot-hybrid");
-    value["lexical_branch"] = json!(true);
-    value["vector_branch"] = json!("ann-exact-rerank");
     value["concurrency"] = json!(concurrency);
+    value["per_query_worker_limit"] = json!(query_workers);
+    value["preferred_partition_budget"] = json!(preferred_partitions);
+    value["query_queue_wait_millis"] = json!(query_queue_wait.as_millis());
+    value["hybrid_read_view_open"] = json!({
+        "root_identity": hex_digest(fixture.hybrid_view_open.root_identity),
+        "snapshot_csn": snapshot_csn,
+        "lexical_index_identity": hex_digest(lexical_open.lexical_index_identity),
+        "ann_view_identity": hex_digest(ann_open.view_identity),
+        "lexical_plan_scope": lexical_open.lexical_plan_scope,
+        "planned_physical_entries": lexical_open.planned_physical_entries,
+        "planned_physical_bytes": lexical_open.planned_physical_bytes,
+        "observed_physical_entries": lexical_open.observed_physical_entries,
+        "observed_physical_bytes": lexical_open.observed_physical_bytes,
+        "admitted_retained_memory_bytes": lexical_open.admitted_retained_memory_bytes,
+        "retained_memory_bytes": lexical_open.retained_memory_bytes,
+    });
+    let expected_observations = u64::try_from(observations)?;
+    if evidence.peak_admission_executions != expected_observations
+        || evidence.peak_admission_compute_threads != query_workers
+        || evidence.peak_admission_memory_bytes_min == u64::MAX
+        || evidence.peak_admission_memory_bytes_min == 0
+        || evidence.peak_admission_memory_bytes_min > evidence.peak_admission_memory_bytes_max
+        || evidence.peak_admission_memory_bytes_min < evidence.result_retention_memory_bytes_max
+        || evidence.result_retention_executions != expected_observations
+        || evidence.fusion_executions != expected_observations
+        || evidence.result_retention_memory_bytes_min == u64::MAX
+        || evidence.result_retention_memory_bytes_min == 0
+        || evidence.result_retention_memory_bytes_min > evidence.result_retention_memory_bytes_max
+    {
+        return Err("hybrid fusion interval omitted bounded governor evidence".into());
+    }
+    value["hybrid_read_view_query_interval"] = json!({
+        "observations": observations,
+        "hydrations": 0,
+        "physical_page_reads": interval_page_reads,
+        "index_scoped_restores": interval_restores,
+        "full_state_loads": full_state_loads,
+        "full_catalog_loads": full_catalog_loads,
+        "lexical_execution": hyphae_native_runtime::NATIVE_LEXICAL_READ_VIEW_EXECUTION,
+        "peak_admission_executions": evidence.peak_admission_executions,
+        "peak_admission_class": "foreground-bounded",
+        "peak_admission_compute_threads": evidence.peak_admission_compute_threads,
+        "peak_admission_io_slots": 0,
+        "peak_admission_memory_bytes_min": evidence.peak_admission_memory_bytes_min,
+        "peak_admission_memory_bytes_max": evidence.peak_admission_memory_bytes_max,
+        "result_retention_executions": evidence.result_retention_executions,
+        "result_retention_class": "foreground-bounded",
+        "result_retention_compute_threads": 0,
+        "result_retention_io_slots": 0,
+        "result_retention_memory_bytes_min": evidence.result_retention_memory_bytes_min,
+        "result_retention_memory_bytes_max": evidence.result_retention_memory_bytes_max,
+        "fusion_executions": evidence.fusion_executions,
+        "fusion_class": "foreground-bounded",
+        "fusion_compute_threads": 1,
+        "fusion_io_slots": 0,
+        "fusion_memory_bytes": 0,
+        "provider": "hybrid-read-view-interval-counters-v1",
+    });
+    value["hybrid_ann_routing_interval"] = evidence.routing.json(observations)?;
+    value["hybrid_oracle"] = hybrid_oracle(
+        fixture,
+        &query,
+        query_workers,
+        query_queue_wait,
+        preferred_partitions,
+    )?;
     Ok(value)
 }
 
@@ -2993,53 +3782,451 @@ fn filter_key(document_id: &[u8; 16]) -> Vec<u8> {
     key
 }
 
-fn filtered_bm25_query(
-    database: &NativeDatabase,
-    index: ObjectId,
-) -> Result<usize, Box<dyn Error>> {
-    let hits = database.match_latest_text(index, "rare", K)?;
-    let mut admitted = 0;
-    for hit in hits {
-        let document_id: [u8; 16] = hit
-            .document_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| "filtered BM25 document identity is not 16 bytes")?;
-        if database
-            .get_latest_structure(&filter_key(&document_id), 0)?
-            .as_deref()
-            == Some(b"keep".as_slice())
-        {
-            admitted += 1;
-        }
+fn validate_g7_filtered_lexical_query(
+    receipt: &hyphae_native_runtime::NativeFilteredLexicalReadViewQueryReceipt,
+    open: &NativeFilteredLexicalReadViewOpenReceipt,
+) -> Result<(), Box<dyn Error>> {
+    if receipt.filter_execution != hyphae_native_runtime::NATIVE_STRUCTURE_FILTER_EXECUTION
+        || receipt.root_identity != open.root_identity
+        || receipt.snapshot_csn != open.snapshot_csn
+        || receipt.catalog_version != open.catalog_version
+        || receipt.lexical_index_identity != open.lexical.lexical_index_identity
+        || receipt.structure_filter_identity != open.structure_filter_identity
+        || receipt.postings_scored != 1
+        || receipt.filter_records_evaluated != 1
+        || receipt.filter_records_matched != 1
+        || receipt.hits.len() != 1
+        || receipt.execution.class != WorkloadClass::ForegroundBounded
+        || receipt.execution.request.compute_threads != 1
+        || receipt.execution.request.io_slots != 0
+        || receipt.execution.request.memory_bytes == 0
+        || receipt.physical_page_reads != 0
+    {
+        return Err("G7 filtered BM25 query changed its same-root predicate authority".into());
     }
-    Ok(admitted)
+    Ok(())
 }
 
-fn hybrid_query(
-    database: &NativeDatabase,
-    snapshot: &NativeSnapshot,
-    lexical_index: ObjectId,
-    vector_index: ObjectId,
-    query: &Vector,
-    options: AnnSearchOptions,
-) -> Result<usize, Box<dyn Error>> {
-    let lexical = database.match_latest_text(lexical_index, "rare", K)?;
-    let vector = snapshot.search_ann(vector_index, query, options)?;
-    let mut fused = BTreeMap::<ObjectId, f64>::new();
-    for (rank, hit) in lexical.into_iter().enumerate() {
-        let document_id: [u8; 16] = hit
-            .document_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| "hybrid lexical identity is not 16 bytes")?;
-        let object_id = ObjectId::new(u128::from_be_bytes(document_id))?;
-        *fused.entry(object_id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+fn filtered_lexical_read_view_open_json(
+    open: &NativeFilteredLexicalReadViewOpenReceipt,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(json!({
+        "root_identity": hex_digest(open.root_identity),
+        "snapshot_csn": open.snapshot_csn
+            .map(hyphae_native_types::Csn::get)
+            .ok_or("filtered lexical read view omitted its snapshot CSN")?,
+        "lexical_index_identity": hex_digest(open.lexical.lexical_index_identity),
+        "lexical_plan_scope": open.lexical.lexical_plan_scope,
+        "structure_filter_identity_algorithm": open.structure_filter_identity_algorithm,
+        "structure_filter_value_scope": open.structure_filter_value_scope,
+        "structure_filter_identity": hex_digest(open.structure_filter_identity),
+        "retained_filter_records": open.retained_filter_records,
+        "planned_filter_physical_entries": open.planned_filter_physical_entries,
+        "planned_filter_physical_bytes": open.planned_filter_physical_bytes,
+        "observed_filter_physical_entries": open.observed_filter_physical_entries,
+        "observed_filter_physical_bytes": open.observed_filter_physical_bytes,
+        "retained_filter_memory_bytes": open.retained_filter_memory_bytes,
+        "filter_planning": engine_work_receipt_json(&open.filter_planning)?,
+        "filter_hydration": engine_work_receipt_json(&open.filter_hydration)?,
+        "open_filter_physical_page_reads": open.physical_page_reads,
+    }))
+}
+
+fn engine_work_receipt_json(
+    receipt: &hyphae_native_runtime::NativeEngineWorkReceipt,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if receipt.class != WorkloadClass::ForegroundBounded
+        || receipt.request.compute_threads == 0
+        || receipt.request.memory_bytes == 0
+    {
+        return Err("G7 engine work receipt omitted its bounded governor authority".into());
     }
-    for (rank, hit) in vector.hits.into_iter().enumerate() {
-        *fused.entry(hit.object_id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+    Ok(json!({
+        "class": "foreground-bounded",
+        "compute_threads": receipt.request.compute_threads,
+        "io_slots": receipt.request.io_slots,
+        "memory_bytes": receipt.request.memory_bytes,
+        "queue_ticket": receipt.queue_ticket,
+        "initial_queue_depth": receipt.initial_queue_depth,
+        "queue_time_nanos": u64::try_from(receipt.queue_time.as_nanos())?,
+        "execution_time_nanos": u64::try_from(receipt.execution_time.as_nanos())?,
+    }))
+}
+
+fn validate_g7_hybrid_query(
+    receipt: &hyphae_native_runtime::NativeHybridReadViewQueryReceipt,
+    open: &NativeHybridReadViewOpenReceipt,
+    preferred_partitions: usize,
+    worker_limit: u64,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    if receipt.root_identity != open.root_identity
+        || receipt.snapshot_csn != open.snapshot_csn
+        || receipt.catalog_version != open.catalog_version
+        || receipt.peak_admission.class != WorkloadClass::ForegroundBounded
+        || receipt.peak_admission.request.compute_threads != worker_limit
+        || receipt.peak_admission.request.io_slots != 0
+        || receipt.peak_admission.request.memory_bytes == 0
+        || receipt.result_retention.class != WorkloadClass::ForegroundBounded
+        || receipt.result_retention.request.compute_threads != 0
+        || receipt.result_retention.request.io_slots != 0
+        || receipt.result_retention.request.memory_bytes == 0
+        || receipt.fusion.class != WorkloadClass::ForegroundBounded
+        || receipt.fusion.request.compute_threads != 1
+        || receipt.fusion.request.io_slots != 0
+        || receipt.fusion.request.memory_bytes != 0
+        || receipt.peak_admission.request.memory_bytes
+            < receipt
+                .result_retention
+                .request
+                .memory_bytes
+                .checked_add(
+                    receipt
+                        .lexical
+                        .execution
+                        .request
+                        .memory_bytes
+                        .max(receipt.ann.execution.request.memory_bytes),
+                )
+                .ok_or("hybrid peak admission memory overflow")?
+        || receipt.peak_admission.execution_time < receipt.lexical.execution.execution_time
+        || receipt.peak_admission.execution_time < receipt.ann.execution.execution_time
+        || receipt.peak_admission.execution_time < receipt.fusion.execution_time
+        || receipt.peak_admission.execution_time < receipt.result_retention.execution_time
+        || receipt.result_retention.execution_time < receipt.lexical.execution.execution_time
+        || receipt.result_retention.execution_time < receipt.ann.execution.execution_time
+        || receipt.result_retention.execution_time < receipt.fusion.execution_time
+    {
+        return Err("hybrid query crossed or changed its shared read-view authority".into());
     }
-    Ok(fused.len())
+    validate_g7_lexical_query(&receipt.lexical, &open.lexical)?;
+    let routing = validate_g7_ann_query_authority(
+        &receipt.ann,
+        &open.ann,
+        preferred_partitions,
+        worker_limit,
+    )?;
+    match &receipt.outcome {
+        NativeHybridOutcome::Matches(matches) if matches.len() == K => Ok(routing),
+        _ => Err("hybrid query did not return the complete fused top-k".into()),
+    }
+}
+
+fn validate_g7_lexical_query(
+    receipt: &hyphae_native_runtime::NativeLexicalReadViewQueryReceipt,
+    open: &hyphae_native_runtime::NativeLexicalReadViewOpenReceipt,
+) -> Result<(), Box<dyn Error>> {
+    if receipt.lexical_execution != hyphae_native_runtime::NATIVE_LEXICAL_READ_VIEW_EXECUTION
+        || receipt.lexical_index_identity != open.lexical_index_identity
+        || receipt.root_identity != open.root_identity
+        || receipt.snapshot_csn != open.snapshot_csn
+        || receipt.catalog_version != open.catalog_version
+        || receipt.execution_sequence == 0
+        || receipt.postings_evaluated != open.retained_postings
+        || receipt.hits.is_empty()
+        || receipt.hits.len() > K
+        || receipt.execution.class != WorkloadClass::ForegroundBounded
+        || receipt.execution.request.compute_threads == 0
+        || receipt.execution.request.io_slots != 0
+        || receipt.execution.request.memory_bytes == 0
+        || receipt.physical_page_reads != 0
+    {
+        return Err("G7 lexical query changed or exceeded its retained read-view authority".into());
+    }
+    Ok(())
+}
+
+fn validate_g7_ann_query_authority(
+    receipt: &hyphae_native_runtime::NativeAnnReadViewQueryReceipt,
+    open: &hyphae_native_runtime::NativeAnnReadViewOpenReceipt,
+    preferred_partitions: usize,
+    worker_limit: u64,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    if receipt.root_identity != open.root_identity
+        || receipt.view_identity != open.view_identity
+        || receipt.governor_policy_identity != open.governor_policy_identity
+        || receipt.governor_generation != open.governor_generation
+        || receipt.requested_worker_limit != worker_limit
+        || receipt.query_scratch_bytes == 0
+        || receipt.execution.class != WorkloadClass::ForegroundBounded
+        || receipt.execution.request.compute_threads == 0
+        || receipt.execution.request.compute_threads > worker_limit
+        || receipt.execution.request.io_slots != 0
+        || receipt.execution.request.memory_bytes != receipt.query_scratch_bytes
+        || receipt.hydration_performed
+        || receipt.physical_page_reads != 0
+        || receipt.restore_count != 0
+        || receipt.search.base_build_identity != open.base_build_identity
+        || receipt.search.view_identity != open.view_identity
+        || receipt.search.search.index_id != open.index_id
+        || receipt.search.search.snapshot_csn != open.snapshot_csn
+        || receipt.search.search.build_identity != open.view_identity
+    {
+        return Err("G7 ANN query changed its retained read-view authority".into());
+    }
+    validate_g7_ann_selected_route(
+        &receipt.search,
+        preferred_partitions,
+        open.logical_partitions,
+        worker_limit,
+    )
+}
+
+fn hybrid_oracle(
+    fixture: &SearchFixture,
+    query: &NativeHybridReadViewQuery<'_>,
+    query_workers: u64,
+    query_queue_wait: Duration,
+    preferred_partitions: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let lexical = fixture.lexical_view.search()?;
+    if lexical.root_identity != fixture.hybrid_view_open.root_identity
+        || lexical.snapshot_csn != fixture.hybrid_view_open.snapshot_csn
+        || lexical.lexical_index_identity != fixture.hybrid_view_open.lexical.lexical_index_identity
+        || lexical.physical_page_reads != 0
+    {
+        return Err("hybrid oracle lexical branch changed authority".into());
+    }
+    let vector = fixture.ann_view.search_selected_with_worker_budget(
+        &fixture.query,
+        fixture.options,
+        preferred_partitions,
+        query_workers,
+        query_queue_wait,
+    )?;
+    validate_g7_ann_query_authority(
+        &vector,
+        &fixture.hybrid_view_open.ann,
+        preferred_partitions,
+        query_workers,
+    )?;
+    if vector.root_identity != fixture.hybrid_view_open.root_identity
+        || vector.view_identity != fixture.hybrid_view_open.ann.view_identity
+        || vector.hydration_performed
+        || vector.physical_page_reads != 0
+        || vector.restore_count != 0
+    {
+        return Err("hybrid oracle vector branch changed authority".into());
+    }
+    let lexical_ranking = lexical
+        .hits
+        .iter()
+        .map(|hit| canonical_lexical_object_id(&hit.document_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let vector_ranking = vector
+        .search
+        .search
+        .hits
+        .iter()
+        .map(|hit| canonical_object_id(hit.object_id))
+        .collect::<Vec<_>>();
+    let expected = fuse_oracle_rankings(&lexical_ranking, &vector_ranking)?;
+    let native = fixture.hybrid_view.search_selected_with_worker_budget(
+        query,
+        query_workers,
+        query_queue_wait,
+    )?;
+    validate_g7_hybrid_query(
+        &native,
+        &fixture.hybrid_view_open,
+        preferred_partitions,
+        query_workers,
+    )?;
+    if native_hybrid_results(&native.outcome)? != expected {
+        return Err("native hybrid fusion differs from the independent RRF oracle".into());
+    }
+    let canonical = serde_json::to_vec(&expected)?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &canonical);
+    let digest = hex_bytes(digest.as_ref());
+    let snapshot_csn = fixture
+        .hybrid_view_open
+        .snapshot_csn
+        .map(hyphae_native_types::Csn::get)
+        .ok_or("hybrid oracle omitted its snapshot CSN")?;
+    Ok(json!({
+        "status": "passed",
+        "method": "independent-branch-rrf-v1",
+        "root_identity": hex_digest(fixture.hybrid_view_open.root_identity),
+        "snapshot_csn": snapshot_csn,
+        "rrf_constant": 60,
+        "contribution_scale": 1_000_000_000_u64,
+        "lexical_weight": 1,
+        "vector_weight": 1,
+        "result_limit": K,
+        "tie_break": "fusion-score-desc-object-id-asc",
+        "lexical_ranking": lexical_ranking,
+        "vector_ranking": vector_ranking,
+        "fused_results": expected,
+        "result_digest": digest,
+        "oracle_digest": digest,
+    }))
+}
+
+fn fuse_oracle_rankings(
+    lexical: &[String],
+    vector: &[String],
+) -> Result<Vec<BTreeMap<String, serde_json::Value>>, Box<dyn Error>> {
+    let lexical_ranks = lexical
+        .iter()
+        .enumerate()
+        .map(|(index, object_id)| Ok((object_id.clone(), u64::try_from(index)? + 1)))
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    let vector_ranks = vector
+        .iter()
+        .enumerate()
+        .map(|(index, object_id)| Ok((object_id.clone(), u64::try_from(index)? + 1)))
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    if lexical_ranks.len() != lexical.len() || vector_ranks.len() != vector.len() {
+        return Err("hybrid oracle branch repeated one object identity".into());
+    }
+    let identities = lexical_ranks
+        .keys()
+        .chain(vector_ranks.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut results = identities
+        .into_iter()
+        .map(|object_id| {
+            let lexical_rank = lexical_ranks.get(&object_id).copied();
+            let vector_rank = vector_ranks.get(&object_id).copied();
+            oracle_result(object_id, lexical_rank, vector_rank, 0)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    results.sort_by(|left, right| {
+        oracle_u64(right, "fusion_score")
+            .cmp(&oracle_u64(left, "fusion_score"))
+            .then_with(|| oracle_string(left, "object_id").cmp(oracle_string(right, "object_id")))
+    });
+    results.truncate(K);
+    for (index, result) in results.iter_mut().enumerate() {
+        result.insert("final_rank".to_owned(), json!(u64::try_from(index)? + 1));
+    }
+    Ok(results)
+}
+
+fn native_hybrid_results(
+    outcome: &NativeHybridOutcome,
+) -> Result<Vec<BTreeMap<String, serde_json::Value>>, Box<dyn Error>> {
+    let NativeHybridOutcome::Matches(matches) = outcome else {
+        return Err("native hybrid oracle abstained".into());
+    };
+    matches
+        .iter()
+        .map(|matched| {
+            Ok(BTreeMap::from([
+                (
+                    "object_id".to_owned(),
+                    json!(canonical_object_id(matched.object_id)),
+                ),
+                (
+                    "lexical_rank".to_owned(),
+                    json!(matched.explanation.lexical_rank),
+                ),
+                (
+                    "vector_rank".to_owned(),
+                    json!(matched.explanation.vector_rank),
+                ),
+                (
+                    "lexical_contribution".to_owned(),
+                    json!(matched.explanation.lexical_contribution),
+                ),
+                (
+                    "vector_contribution".to_owned(),
+                    json!(matched.explanation.vector_contribution),
+                ),
+                (
+                    "fusion_score".to_owned(),
+                    json!(matched.explanation.fusion_score),
+                ),
+                (
+                    "final_rank".to_owned(),
+                    json!(matched.explanation.final_rank),
+                ),
+            ]))
+        })
+        .collect()
+}
+
+fn oracle_result(
+    object_id: String,
+    lexical_rank: Option<u64>,
+    vector_rank: Option<u64>,
+    final_rank: u64,
+) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn Error>> {
+    const SCALE: u64 = 1_000_000_000;
+    let contribution = |rank: Option<u64>| -> Result<u64, Box<dyn Error>> {
+        rank.map_or(Ok(0), |rank| {
+            60_u64
+                .checked_add(rank)
+                .and_then(|denominator| SCALE.checked_div(denominator))
+                .ok_or_else(|| "hybrid oracle contribution overflow".into())
+        })
+    };
+    let lexical_contribution = contribution(lexical_rank)?;
+    let vector_contribution = contribution(vector_rank)?;
+    let fusion_score = lexical_contribution
+        .checked_add(vector_contribution)
+        .ok_or("hybrid oracle fusion overflow")?;
+    Ok(BTreeMap::from([
+        ("object_id".to_owned(), json!(object_id)),
+        ("lexical_rank".to_owned(), json!(lexical_rank)),
+        ("vector_rank".to_owned(), json!(vector_rank)),
+        (
+            "lexical_contribution".to_owned(),
+            json!(lexical_contribution),
+        ),
+        ("vector_contribution".to_owned(), json!(vector_contribution)),
+        ("fusion_score".to_owned(), json!(fusion_score)),
+        ("final_rank".to_owned(), json!(final_rank)),
+    ]))
+}
+
+fn oracle_u64(value: &BTreeMap<String, serde_json::Value>, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn oracle_string<'value>(
+    value: &'value BTreeMap<String, serde_json::Value>,
+    key: &str,
+) -> &'value str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn canonical_lexical_object_id(document_id: &[u8]) -> Result<String, Box<dyn Error>> {
+    let bytes: [u8; 16] = document_id
+        .try_into()
+        .map_err(|_| "hybrid lexical identity is not 16 bytes")?;
+    canonical_nonzero_object_id(u128::from_be_bytes(bytes))
+}
+
+fn canonical_object_id(object_id: ObjectId) -> String {
+    format!("{:032x}", object_id.get())
+}
+
+fn canonical_nonzero_object_id(value: u128) -> Result<String, Box<dyn Error>> {
+    if value == 0 {
+        return Err("hybrid object identity is zero".into());
+    }
+    Ok(format!("{value:032x}"))
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    hex_bytes(&digest)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn seed_product_sql(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
@@ -3158,30 +4345,93 @@ fn run_bm25(
     progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let materialization = NativeDatabase::process_materialization_observation();
+    let physical_before = fixture.database.physical_observation()?;
     if warm {
         progress.begin_phase("warmup", warmup)?;
         for _ in 0..warmup {
-            black_box(
-                fixture
-                    .database
-                    .match_latest_text(fixture.lexical_index, "rare", K)?,
-            );
+            let receipt = fixture.lexical_view.search()?;
+            validate_g7_lexical_query(&receipt, &fixture.hybrid_view_open.lexical)?;
+            black_box(receipt);
             progress.advance(1)?;
         }
         progress.finish_phase("warmup")?;
     }
     progress.begin_phase("measure", observations)?;
-    let stats = measure_concurrent(concurrency, observations, progress, &|| {
-        let hits = fixture
-            .database
-            .match_latest_text(fixture.lexical_index, "rare", K)?;
-        if hits.is_empty() {
-            return Err("BM25 result mismatch".into());
-        }
-        Ok::<(), Box<dyn Error>>(())
-    })?;
+    let (stats, lexical) = measure_concurrent_with_evidence::<_, LexicalIntervalEvidence>(
+        concurrency,
+        observations,
+        progress,
+        &|| {
+            fixture
+                .lexical_view
+                .search()
+                .map_err(|error| -> Box<dyn Error> { error.into() })
+        },
+        &|receipt| {
+            validate_g7_lexical_query(&receipt, &fixture.hybrid_view_open.lexical)?;
+            let observation = LexicalObservation {
+                execution_sequence: receipt.execution_sequence,
+                postings_evaluated: u64::try_from(receipt.postings_evaluated)?,
+                physical_page_reads: receipt.physical_page_reads,
+            };
+            black_box(receipt);
+            Ok(observation)
+        },
+    )?;
     progress.finish_phase("measure")?;
-    stats_with_materialization(stats, materialization)
+    let physical_after = fixture.database.physical_observation()?;
+    let interval_page_reads = physical_after
+        .physical_page_reads
+        .saturating_sub(physical_before.physical_page_reads);
+    let mut value = stats_with_materialization(stats, materialization)?;
+    let materialization = value
+        .get("materialization")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("BM25 materialization interval is missing")?;
+    let full_state_loads = materialization
+        .get("full_state_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("BM25 full-state counter is missing")?;
+    let full_catalog_loads = materialization
+        .get("full_catalog_loads")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("BM25 full-catalog counter is missing")?;
+    value["route"] = json!("native-retained-lexical-read-view");
+    value["lexical_read_view_open"] =
+        lexical_read_view_open_json(&fixture.hybrid_view_open.lexical)?;
+    value["lexical_read_view_query_interval"] = lexical.json(
+        observations,
+        interval_page_reads,
+        full_state_loads,
+        full_catalog_loads,
+    )?;
+    Ok(value)
+}
+
+fn lexical_read_view_open_json(
+    open: &hyphae_native_runtime::NativeLexicalReadViewOpenReceipt,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(json!({
+        "root_identity": hex_digest(open.root_identity),
+        "snapshot_csn": open.snapshot_csn
+            .map(hyphae_native_types::Csn::get)
+            .ok_or("lexical read view omitted its snapshot CSN")?,
+        "lexical_index_identity_algorithm": open.lexical_index_identity_algorithm,
+        "lexical_index_identity": hex_digest(open.lexical_index_identity),
+        "lexical_plan_scope": open.lexical_plan_scope,
+        "index_id": canonical_object_id(open.index_id),
+        "planned_terms": open.planned_terms,
+        "retained_postings": open.retained_postings,
+        "maximum_retained_postings": open.maximum_retained_postings,
+        "maximum_retained_bytes": open.maximum_retained_bytes,
+        "planned_physical_entries": open.planned_physical_entries,
+        "planned_physical_bytes": open.planned_physical_bytes,
+        "observed_physical_entries": open.observed_physical_entries,
+        "observed_physical_bytes": open.observed_physical_bytes,
+        "admitted_retained_memory_bytes": open.admitted_retained_memory_bytes,
+        "retained_memory_bytes": open.retained_memory_bytes,
+        "open_physical_page_reads": open.physical_page_reads,
+    }))
 }
 
 fn run_ann(
@@ -3192,107 +4442,74 @@ fn run_ann(
     warmup: usize,
     progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let view = fixture
-        .ann_view
-        .lock()
-        .map_err(|_| "ANN read-view fixture lock poisoned")?
-        .take()
-        .ok_or("ANN read view was already consumed")?;
+    let view = &fixture.ann_view;
+    let ann_view_open = &fixture.hybrid_view_open.ann;
     let offered_concurrency = u64::try_from(concurrency).map_err(|_| "invalid ANN concurrency")?;
+    let preferred_partitions = G7_PREFERRED_ANN_PARTITIONS
+        .min(ann_view_open.logical_partitions)
+        .max(1);
     let query_workers = fixture
         .foreground_compute_threads
         .checked_div(offered_concurrency.max(1))
         .unwrap_or(0)
-        .max(1);
+        .max(1)
+        .min(u64::try_from(preferred_partitions)?);
     let query_queue_wait = Duration::from_secs(60);
-    let preferred_partitions = G7_PREFERRED_ANN_PARTITIONS
-        .min(fixture.ann_view_open.logical_partitions)
-        .max(1);
     let materialization = NativeDatabase::process_materialization_observation();
-    let execution_workers_max = AtomicU64::new(0);
-    let worker_batches_max = AtomicU64::new(0);
-    let execution_waves_max = AtomicU64::new(0);
-    let selected_certified = AtomicU64::new(0);
-    let full_fanout_requested = AtomicU64::new(0);
-    let budget_fallback = AtomicU64::new(0);
-    let single_generation_fallback = AtomicU64::new(0);
-    let lower_bound_present = AtomicU64::new(0);
     let physical_before = fixture.database.physical_observation()?;
     let restores_before = NativeDatabase::process_ann_index_restore_count();
     if warm {
         progress.begin_phase("warmup", warmup)?;
-        if warmup > 0 {
-            let first = view.search_selected_with_worker_budget(
+        for _ in 0..warmup {
+            let receipt = view.search_selected_with_worker_budget(
                 &fixture.query,
                 fixture.options,
                 preferred_partitions,
                 query_workers,
                 query_queue_wait,
             )?;
-            validate_g7_ann_selected_route(&first.search, preferred_partitions)?;
-            black_box(first);
-            progress.advance(1)?;
-        }
-        for _ in 1..warmup {
-            black_box(view.search_selected_with_worker_budget(
-                &fixture.query,
-                fixture.options,
+            validate_g7_ann_query_authority(
+                &receipt,
+                ann_view_open,
                 preferred_partitions,
                 query_workers,
-                query_queue_wait,
-            )?);
+            )?;
+            black_box(receipt);
             progress.advance(1)?;
         }
         progress.finish_phase("warmup")?;
     }
     progress.begin_phase("measure", observations)?;
-    let stats = measure_concurrent(concurrency, observations, progress, &|| {
-        let receipt = view.search_selected_with_worker_budget(
-            &fixture.query,
-            fixture.options,
-            preferred_partitions,
-            query_workers,
-            query_queue_wait,
-        )?;
-        if receipt.hydration_performed
-            || receipt.physical_page_reads != 0
-            || receipt.restore_count != 0
-        {
-            return Err("ANN read-view query crossed the hydration boundary".into());
-        }
-        validate_g7_ann_selected_route(&receipt.search, preferred_partitions)?;
-        execution_workers_max.fetch_max(
-            u64::try_from(receipt.search.execution_workers).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        worker_batches_max.fetch_max(
-            u64::try_from(receipt.search.execution_worker_batches).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        execution_waves_max.fetch_max(
-            u64::try_from(receipt.search.execution_waves).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        match receipt.search.routing_outcome {
-            AnnPartitionRoutingOutcome::SelectedCertified => {
-                selected_certified.fetch_add(1, Ordering::Relaxed);
-            }
-            AnnPartitionRoutingOutcome::FullFanoutRequested => {
-                full_fanout_requested.fetch_add(1, Ordering::Relaxed);
-            }
-            AnnPartitionRoutingOutcome::FullFanoutBudgetFallback => {
-                budget_fallback.fetch_add(1, Ordering::Relaxed);
-            }
-            AnnPartitionRoutingOutcome::SingleGenerationFallback => {
-                single_generation_fallback.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if receipt.search.next_partition_lower_bound.is_some() {
-            lower_bound_present.fetch_add(1, Ordering::Relaxed);
-        }
-        black_box(receipt);
-        Ok::<(), Box<dyn Error>>(())
-    })?;
+    let (stats, routing) = measure_concurrent_with_evidence::<_, RoutingIntervalEvidence>(
+        concurrency,
+        observations,
+        progress,
+        &|| {
+            view.search_selected_with_worker_budget(
+                &fixture.query,
+                fixture.options,
+                preferred_partitions,
+                query_workers,
+                query_queue_wait,
+            )
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+        },
+        &|receipt| {
+            let (next_lower_bound, kth_distance) = validate_g7_ann_query_authority(
+                &receipt,
+                ann_view_open,
+                preferred_partitions,
+                query_workers,
+            )?;
+            let observation = RoutingIntervalEvidence::observation(
+                &receipt.search,
+                next_lower_bound,
+                kth_distance,
+            )?;
+            black_box(receipt);
+            Ok(observation)
+        },
+    )?;
     progress.finish_phase("measure")?;
     let physical_after = fixture.database.physical_observation()?;
     let restores_after = NativeDatabase::process_ann_index_restore_count();
@@ -3312,13 +4529,12 @@ fn run_ann(
         query_workers,
         query_queue_wait,
     )?;
-    if correctness.hydration_performed
-        || correctness.physical_page_reads != 0
-        || correctness.restore_count != 0
-    {
-        return Err("ANN read-view correctness query crossed the hydration boundary".into());
-    }
-    validate_g7_ann_selected_route(&correctness.search, preferred_partitions)?;
+    validate_g7_ann_query_authority(
+        &correctness,
+        ann_view_open,
+        preferred_partitions,
+        query_workers,
+    )?;
     let expected_ids = (1..=K)
         .map(|id| ObjectId::new(id as u128))
         .collect::<Result<BTreeSet<_>, _>>()?;
@@ -3345,66 +4561,89 @@ fn run_ann(
         "index_scoped_restores": interval_restores,
         "provider": "database-page-counter-plus-process-ann-restore-counter",
     });
-    output["ann_routing_interval"] = json!({
-        "observations": observations,
-        "execution_workers_max": execution_workers_max.load(Ordering::Relaxed),
-        "execution_worker_batches_max": worker_batches_max.load(Ordering::Relaxed),
-        "execution_waves_max": execution_waves_max.load(Ordering::Relaxed),
-        "selected_certified": selected_certified.load(Ordering::Relaxed),
-        "full_fanout_requested": full_fanout_requested.load(Ordering::Relaxed),
-        "full_fanout_budget_fallback": budget_fallback.load(Ordering::Relaxed),
-        "single_generation_fallback": single_generation_fallback.load(Ordering::Relaxed),
-        "next_partition_lower_bound_present": lower_bound_present.load(Ordering::Relaxed),
-    });
+    output["ann_routing_interval"] = routing.json(observations)?;
     output["ann_read_view_open"] = json!({
-        "root_identity": blake3::Hash::from_bytes(fixture.ann_view_open.root_identity)
+        "root_identity": blake3::Hash::from_bytes(ann_view_open.root_identity)
             .to_hex()
             .to_string(),
-        "base_build_identity": blake3::Hash::from_bytes(
-            fixture.ann_view_open.base_build_identity,
-        )
+        "snapshot_csn": ann_view_open.snapshot_csn
+            .map(hyphae_native_types::Csn::get)
+            .ok_or("ANN read view omitted its snapshot CSN")?,
+        "base_build_identity": blake3::Hash::from_bytes(ann_view_open.base_build_identity)
         .to_hex()
         .to_string(),
-        "view_identity": blake3::Hash::from_bytes(fixture.ann_view_open.view_identity)
+        "view_identity": blake3::Hash::from_bytes(ann_view_open.view_identity)
             .to_hex()
             .to_string(),
-        "logical_partitions": fixture.ann_view_open.logical_partitions,
-        "planned_physical_entries": fixture.ann_view_open.planned_physical_entries,
-        "planned_physical_bytes": fixture.ann_view_open.planned_physical_bytes,
-        "observed_physical_entries": fixture.ann_view_open.observed_physical_entries,
-        "observed_physical_bytes": fixture.ann_view_open.observed_physical_bytes,
-        "planned_peak_memory_bytes": fixture.ann_view_open.planned_peak_memory_bytes,
-        "retained_memory_bytes": fixture.ann_view_open.retained_memory_bytes,
-        "hydration_restore_count": fixture.ann_view_open.hydration_restore_count,
-        "process_physical_page_read_delta": fixture
-            .ann_view_open
-            .process_physical_page_read_delta,
-        "governor_generation": fixture.ann_view_open.governor_generation,
+        "logical_partitions": ann_view_open.logical_partitions,
+        "planned_physical_entries": ann_view_open.planned_physical_entries,
+        "planned_physical_bytes": ann_view_open.planned_physical_bytes,
+        "observed_physical_entries": ann_view_open.observed_physical_entries,
+        "observed_physical_bytes": ann_view_open.observed_physical_bytes,
+        "planned_peak_memory_bytes": ann_view_open.planned_peak_memory_bytes,
+        "retained_memory_bytes": ann_view_open.retained_memory_bytes,
+        "hydration_restore_count": ann_view_open.hydration_restore_count,
+        "process_physical_page_read_delta": ann_view_open.process_physical_page_read_delta,
+        "governor_generation": ann_view_open.governor_generation,
         "routing_policy_identity": blake3::Hash::from_bytes(
-            fixture.ann_view_open.routing_policy_identity,
+            ann_view_open.routing_policy_identity,
         )
         .to_hex()
         .to_string(),
     });
-    drop(view);
     Ok(output)
 }
 
 fn validate_g7_ann_selected_route(
     receipt: &hyphae_native_runtime::AnnSelectedSearchReceipt,
     preferred_partitions: usize,
-) -> Result<(), Box<dyn Error>> {
+    total_partitions: usize,
+    worker_limit: u64,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    let next_lower_bound = receipt
+        .next_partition_lower_bound
+        .ok_or("G7 ANN route omitted its next-partition lower bound")?;
+    let kth_distance = receipt
+        .search
+        .hits
+        .last()
+        .filter(|_| receipt.search.hits.len() == K)
+        .ok_or("G7 ANN route did not return the complete top-k")?
+        .distance;
     if receipt.requested_maximum_partitions != preferred_partitions
+        || receipt.total_partitions != total_partitions
+        || receipt.routing_mode
+            != hyphae_native_runtime::AnnPartitionRoutingMode::SelectedPartitions
         || receipt.routing_outcome != AnnPartitionRoutingOutcome::SelectedCertified
+        || receipt.routing_policy != ANN_PARTITION_ROUTING_POLICY_V1
+        || receipt.base_build_identity == [0; 32]
+        || receipt.view_identity == [0; 32]
+        || receipt.selected_partitions.is_empty()
         || receipt.selected_partitions.len() > preferred_partitions
+        || receipt.selected_partitions.len() >= total_partitions
+        || receipt
+            .selected_partitions
+            .iter()
+            .any(|partition| *partition >= total_partitions)
+        || receipt
+            .selected_partitions
+            .iter()
+            .enumerate()
+            .any(|(index, partition)| receipt.selected_partitions[..index].contains(partition))
         || receipt.execution_workers == 0
+        || u64::try_from(receipt.execution_workers)? > worker_limit
         || receipt.execution_worker_batches == 0
-        || receipt.execution_waves != 1
-        || receipt.next_partition_lower_bound.is_none()
+        || receipt.execution_worker_batches > preferred_partitions
+        || !(1..=6).contains(&receipt.execution_waves)
+        || !next_lower_bound.is_finite()
+        || !kth_distance.is_finite()
+        || next_lower_bound < 0.0
+        || kth_distance < 0.0
+        || next_lower_bound <= kth_distance
     {
         return Err("G7 ANN route was not selected-certified within the preferred budget".into());
     }
-    Ok(())
+    Ok((next_lower_bound, kth_distance))
 }
 
 fn vector_fixture(id: usize, document_count: usize) -> Result<(ObjectId, Vector), Box<dyn Error>> {
@@ -3569,6 +4808,212 @@ fn measure_concurrent(
     Ok(stats_from_samples(samples, started.elapsed().as_secs_f64()))
 }
 
+fn measure_concurrent_with_evidence<T, E>(
+    concurrency: usize,
+    observations: usize,
+    progress: &SurfaceProgress,
+    operation: &(impl Fn() -> Result<T, Box<dyn Error>> + Sync),
+    validate: &(impl Fn(T) -> Result<E::Observation, Box<dyn Error>> + Sync),
+) -> Result<(Stats, E), Box<dyn Error>>
+where
+    T: Send,
+    E: MeasurementEvidence,
+{
+    if concurrency == 0 || observations < concurrency {
+        return Err("routed benchmark requires at least one observation per worker".into());
+    }
+    let barrier = Barrier::new(concurrency);
+    let failure = MeasurementFailure::default();
+    let maximum_worker_observations = observations.div_ceil(concurrency);
+    let rounds = maximum_worker_observations.div_ceil(EVIDENCE_MEASUREMENT_CHUNK);
+    let workers = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker in 0..concurrency {
+            let count =
+                observations / concurrency + usize::from(worker < observations % concurrency);
+            let barrier = &barrier;
+            let failure = &failure;
+            handles.push(scope.spawn(move || {
+                run_evidence_worker::<T, E>(
+                    count, rounds, barrier, failure, progress, operation, validate,
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    "routed benchmark worker panicked outside guarded phases".to_owned()
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    let failed = failure.failed.load(Ordering::Acquire);
+    let error = failure
+        .message
+        .into_inner()
+        .map_err(|_| "routed benchmark failure state was poisoned")?;
+    if failed {
+        return Err(error
+            .unwrap_or_else(|| "routed benchmark failed without an error message".to_owned())
+            .into());
+    }
+    let mut samples = Vec::with_capacity(observations);
+    let mut evidence = E::default();
+    let mut query_elapsed = Duration::ZERO;
+    for round in 0..rounds {
+        let started = workers
+            .iter()
+            .filter_map(|worker| worker.phases[round].map(|phase| phase.started))
+            .min()
+            .ok_or("routed benchmark query phase omitted every worker")?;
+        let finished = workers
+            .iter()
+            .filter_map(|worker| worker.phases[round].map(|phase| phase.finished))
+            .max()
+            .ok_or("routed benchmark query phase omitted its completion")?;
+        query_elapsed = query_elapsed.saturating_add(finished.saturating_duration_since(started));
+    }
+    for worker in workers {
+        samples.extend(worker.samples);
+        evidence.merge(worker.evidence);
+    }
+    if samples.len() != observations || query_elapsed.is_zero() {
+        return Err("routed benchmark did not measure every requested observation".into());
+    }
+    Ok((
+        stats_from_samples(samples, query_elapsed.as_secs_f64()),
+        evidence,
+    ))
+}
+
+fn run_evidence_worker<T, E>(
+    observations: usize,
+    rounds: usize,
+    barrier: &Barrier,
+    failure: &MeasurementFailure,
+    progress: &SurfaceProgress,
+    operation: &(impl Fn() -> Result<T, Box<dyn Error>> + Sync),
+    validate: &(impl Fn(T) -> Result<E::Observation, Box<dyn Error>> + Sync),
+) -> EvidenceWorkerResult<E>
+where
+    T: Send,
+    E: MeasurementEvidence,
+{
+    let mut result = EvidenceWorkerResult {
+        samples: Vec::with_capacity(observations),
+        evidence: E::default(),
+        phases: Vec::with_capacity(rounds),
+    };
+    let mut pending_progress = 0;
+    for round in 0..rounds {
+        let offset = round.saturating_mul(EVIDENCE_MEASUREMENT_CHUNK);
+        let count = observations
+            .saturating_sub(offset)
+            .min(EVIDENCE_MEASUREMENT_CHUNK);
+        barrier.wait();
+        let phase = run_evidence_query_phase(count, failure, operation, &mut result.samples);
+        result
+            .phases
+            .push(phase.as_ref().map(|(_, timing)| *timing));
+        barrier.wait();
+        if let Some((receipts, _)) = phase {
+            for receipt in receipts {
+                if measurement_failed(failure) {
+                    break;
+                }
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let observation = validate(receipt)?;
+                    result.evidence.observe(observation);
+                    Ok::<(), Box<dyn Error>>(())
+                })) {
+                    Ok(Ok(())) => {
+                        pending_progress += 1;
+                    }
+                    Ok(Err(error)) => record_measurement_failure(failure, error.to_string()),
+                    Err(_) => record_measurement_failure(
+                        failure,
+                        "routed benchmark receipt validator panicked".to_owned(),
+                    ),
+                }
+            }
+        }
+        if pending_progress >= PROGRESS_CHUNK_UNITS {
+            if let Err(error) = progress.advance(pending_progress) {
+                record_measurement_failure(failure, error.to_string());
+            }
+            pending_progress = 0;
+        }
+        barrier.wait();
+    }
+    if pending_progress > 0
+        && let Err(error) = progress.advance(pending_progress)
+    {
+        record_measurement_failure(failure, error.to_string());
+    }
+    result
+}
+
+fn run_evidence_query_phase<T>(
+    count: usize,
+    failure: &MeasurementFailure,
+    operation: &(impl Fn() -> Result<T, Box<dyn Error>> + Sync),
+    samples: &mut Vec<u64>,
+) -> Option<(Vec<T>, QueryPhaseTiming)>
+where
+    T: Send,
+{
+    if count == 0 || measurement_failed(failure) {
+        return None;
+    }
+    let mut receipts = Vec::with_capacity(count);
+    let phase_started = Instant::now();
+    for _ in 0..count {
+        if measurement_failed(failure) {
+            break;
+        }
+        let sample = Instant::now();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+            Ok(Ok(receipt)) => {
+                samples.push(sample.elapsed().as_nanos() as u64);
+                receipts.push(receipt);
+            }
+            Ok(Err(error)) => {
+                record_measurement_failure(failure, error.to_string());
+                break;
+            }
+            Err(_) => {
+                record_measurement_failure(
+                    failure,
+                    "routed benchmark operation panicked".to_owned(),
+                );
+                break;
+            }
+        }
+    }
+    let timing = QueryPhaseTiming {
+        started: phase_started,
+        finished: Instant::now(),
+    };
+    Some((receipts, timing))
+}
+
+fn measurement_failed(failure: &MeasurementFailure) -> bool {
+    failure.failed.load(Ordering::Acquire)
+}
+
+fn record_measurement_failure(failure: &MeasurementFailure, message: String) {
+    if failure
+        .failed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && let Ok(mut error) = failure.message.lock()
+    {
+        *error = Some(message);
+    }
+}
+
 fn stats_from_samples(mut samples: Vec<u64>, elapsed_seconds: f64) -> Stats {
     samples.sort_unstable();
     Stats {
@@ -3645,6 +5090,193 @@ fn physical_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct CountEvidence(u64);
+
+    impl MeasurementEvidence for CountEvidence {
+        type Observation = ();
+
+        fn observe(&mut self, (): Self::Observation) {
+            self.0 = self.0.saturating_add(1);
+        }
+
+        fn merge(&mut self, other: Self) {
+            self.0 = self.0.saturating_add(other.0);
+        }
+    }
+
+    struct BufferedReceipt {
+        live: Arc<AtomicU64>,
+    }
+
+    impl Drop for BufferedReceipt {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn measurement_test_progress(total: usize) -> Result<SurfaceProgress, Box<dyn Error>> {
+        let cell = CellProgress::new(
+            None,
+            "1".repeat(40),
+            None,
+            "3".repeat(64),
+            u64::try_from(total)?,
+            0,
+        )?;
+        cell.begin_surface(G7_SURFACE_NAMES[0], 0, total)
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn ann_worker_budget_is_bounded_by_the_selected_partition_ceiling() {
+        fn worker_budget(
+            foreground_threads: u64,
+            concurrency: u64,
+            preferred_partitions: usize,
+        ) -> u64 {
+            foreground_threads
+                .checked_div(concurrency.max(1))
+                .unwrap_or(0)
+                .max(1)
+                .min(u64::try_from(preferred_partitions).unwrap_or(u64::MAX))
+        }
+
+        assert_eq!(worker_budget(96, 1, 32), 32);
+        assert_eq!(worker_budget(96, 8, 32), 12);
+        assert_eq!(worker_budget(96, 32, 32), 3);
+        assert_eq!(worker_budget(4, 8, 32), 1);
+    }
+
+    #[test]
+    fn evidence_validation_does_not_reduce_measured_engine_throughput() -> Result<(), Box<dyn Error>>
+    {
+        let observations = 512;
+        let fast_progress = measurement_test_progress(observations)?;
+        fast_progress.begin_phase("measure", observations)?;
+        let (fast, fast_evidence) = measure_concurrent_with_evidence::<_, CountEvidence>(
+            4,
+            observations,
+            &fast_progress,
+            &|| {
+                thread::sleep(Duration::from_micros(100));
+                Ok(())
+            },
+            &|()| Ok(()),
+        )?;
+        fast_progress.finish_phase("measure")?;
+
+        let slow_progress = measurement_test_progress(observations)?;
+        slow_progress.begin_phase("measure", observations)?;
+        let (slow, slow_evidence) = measure_concurrent_with_evidence::<_, CountEvidence>(
+            4,
+            observations,
+            &slow_progress,
+            &|| {
+                thread::sleep(Duration::from_micros(100));
+                Ok(())
+            },
+            &|()| {
+                thread::sleep(Duration::from_micros(200));
+                Ok(())
+            },
+        )?;
+        slow_progress.finish_phase("measure")?;
+
+        assert_eq!(fast_evidence.0, u64::try_from(observations)?);
+        assert_eq!(slow_evidence.0, u64::try_from(observations)?);
+        assert!(slow.throughput >= fast.throughput * 0.5);
+        assert!(slow.p99 < 5_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_measurement_validates_each_receipt_once_and_fails_on_corruption()
+    -> Result<(), Box<dyn Error>> {
+        let observations = EVIDENCE_MEASUREMENT_CHUNK + 17;
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("measure", observations)?;
+        let sequence = AtomicU64::new(0);
+        let validated = AtomicU64::new(0);
+        let result = measure_concurrent_with_evidence::<_, CountEvidence>(
+            3,
+            observations,
+            &progress,
+            &|| Ok(sequence.fetch_add(1, Ordering::Relaxed)),
+            &|receipt| {
+                validated.fetch_add(1, Ordering::Relaxed);
+                if receipt == 111 {
+                    return Err("corrupt routed receipt".into());
+                }
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        let validated = validated.load(Ordering::Relaxed);
+        assert!(validated > 0);
+        assert!(validated < u64::try_from(observations)?);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_measurement_bounds_live_receipts_by_worker_chunk() -> Result<(), Box<dyn Error>> {
+        let concurrency = 3;
+        let observations = EVIDENCE_MEASUREMENT_CHUNK * concurrency + 19;
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("measure", observations)?;
+        let live = Arc::new(AtomicU64::new(0));
+        let peak = AtomicU64::new(0);
+        let (_, evidence) = measure_concurrent_with_evidence::<_, CountEvidence>(
+            concurrency,
+            observations,
+            &progress,
+            &|| {
+                let current = live.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                peak.fetch_max(current, Ordering::Relaxed);
+                Ok(BufferedReceipt {
+                    live: Arc::clone(&live),
+                })
+            },
+            &|receipt| {
+                black_box(&receipt);
+                Ok(())
+            },
+        )?;
+        progress.finish_phase("measure")?;
+
+        assert_eq!(evidence.0, u64::try_from(observations)?);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert!(
+            peak.load(Ordering::Relaxed)
+                <= u64::try_from(concurrency.saturating_mul(EVIDENCE_MEASUREMENT_CHUNK))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_measurement_operation_panic_is_bounded_and_does_not_deadlock()
+    -> Result<(), Box<dyn Error>> {
+        let observations = EVIDENCE_MEASUREMENT_CHUNK * 2;
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("measure", observations)?;
+        let sequence = AtomicU64::new(0);
+        let result = measure_concurrent_with_evidence::<_, CountEvidence>(
+            4,
+            observations,
+            &progress,
+            &|| {
+                let current = sequence.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(current, 57, "injected routed operation panic");
+                Ok(())
+            },
+            &|()| Ok(()),
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
 
     #[test]
     fn diagnostic_arguments_bind_every_external_authority() -> Result<(), Box<dyn Error>> {
@@ -3871,6 +5503,193 @@ mod tests {
             .to_string();
         assert_eq!(current_executable_blake3()?, expected);
         Ok(())
+    }
+
+    #[test]
+    fn hybrid_oracle_is_canonical_and_rejects_native_contribution_drift()
+    -> Result<(), Box<dyn Error>> {
+        let lexical = [1_u128, 2, 3]
+            .into_iter()
+            .map(|value| format!("{value:032x}"))
+            .collect::<Vec<_>>();
+        let vector = [2_u128, 1, 4]
+            .into_iter()
+            .map(|value| format!("{value:032x}"))
+            .collect::<Vec<_>>();
+        let expected = fuse_oracle_rankings(&lexical, &vector)?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &serde_json::to_vec(&expected)?);
+
+        assert_eq!(
+            hex_bytes(digest.as_ref()),
+            "2b7c71d552ac4b5b5ab35062e8445431c26de892ceb16ee0aa9ef63b4e6514a2"
+        );
+        assert_eq!(oracle_string(&expected[0], "object_id"), lexical[0]);
+        assert_eq!(oracle_string(&expected[1], "object_id"), lexical[1]);
+        assert_eq!(oracle_u64(&expected[0], "fusion_score"), 32_522_474);
+
+        let mut matches = expected
+            .iter()
+            .map(|result| {
+                let object_id = u128::from_str_radix(oracle_string(result, "object_id"), 16)?;
+                Ok(hyphae_native_runtime::NativeHybridMatch {
+                    object_id: ObjectId::new(object_id)?,
+                    explanation: hyphae_native_runtime::NativeHybridExplanation {
+                        lexical_rank: result["lexical_rank"].as_u64(),
+                        lexical_score_nanos: None,
+                        vector_rank: result["vector_rank"].as_u64(),
+                        vector_score_nanos: None,
+                        lexical_contribution: oracle_u64(result, "lexical_contribution"),
+                        vector_contribution: oracle_u64(result, "vector_contribution"),
+                        fusion_score: oracle_u64(result, "fusion_score"),
+                        final_rank: oracle_u64(result, "final_rank"),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let outcome = NativeHybridOutcome::Matches(matches.clone());
+        assert_eq!(native_hybrid_results(&outcome)?, expected);
+
+        matches[0].explanation.lexical_contribution += 1;
+        let corrupted = NativeHybridOutcome::Matches(matches);
+        assert_ne!(native_hybrid_results(&corrupted)?, expected);
+        assert!(fuse_oracle_rankings(&[lexical[0].clone(), lexical[0].clone()], &vector).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_oracle_matches_the_normative_disjoint_g7_rankings() -> Result<(), Box<dyn Error>> {
+        let lexical = vec![format!("{:032x}", 500_001_u128)];
+        let vector = (1_u128..=10)
+            .map(|value| format!("{value:032x}"))
+            .collect::<Vec<_>>();
+        let expected = fuse_oracle_rankings(&lexical, &vector)?;
+        let ordered_ids = expected
+            .iter()
+            .map(|result| u128::from_str_radix(oracle_string(result, "object_id"), 16))
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &serde_json::to_vec(&expected)?);
+
+        assert_eq!(ordered_ids, vec![1, 500_001, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(expected.len(), K);
+        assert_eq!(
+            hex_bytes(digest.as_ref()),
+            "53146580a1857d393a55bf5c68d8e2d0a437fddb750d2f87161500a8f7a6f2c9"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn routing_interval_requires_complete_strict_certification() -> Result<(), Box<dyn Error>> {
+        let route = valid_selected_route()?;
+        let (next, kth) = validate_g7_ann_selected_route(&route, 32, 64, 4)?;
+        let mut evidence = RoutingIntervalEvidence::new();
+        let workers = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let route = route.clone();
+                handles.push(scope.spawn(move || {
+                    let mut evidence = RoutingIntervalEvidence::new();
+                    let observation = RoutingIntervalEvidence::observation(&route, next, kth)
+                        .map_err(|error| error.to_string())?;
+                    evidence.observe(observation);
+                    Ok::<_, String>(evidence)
+                }));
+            }
+            let mut workers = Vec::new();
+            for handle in handles {
+                workers.push(
+                    handle
+                        .join()
+                        .map_err(|_| "routing evidence worker panicked")?
+                        .map_err(|error| -> Box<dyn Error> { error.into() })?,
+                );
+            }
+            Ok(workers)
+        })?;
+        for worker in workers {
+            evidence.merge(worker);
+        }
+        assert!(evidence.json(3).is_ok());
+
+        evidence.selected_certified = 2;
+        assert!(evidence.json(3).is_err());
+        evidence.selected_certified = 3;
+        evidence.minimum_next_partition_lower_bound = evidence.maximum_kth_distance;
+        assert!(evidence.json(3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_route_validation_rejects_every_authority_drift() -> Result<(), Box<dyn Error>> {
+        let valid = valid_selected_route()?;
+        assert!(validate_g7_ann_selected_route(&valid, 32, 64, 4).is_ok());
+
+        let mut mutated = valid.clone();
+        mutated.next_partition_lower_bound = mutated.search.hits.last().map(|hit| hit.distance);
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.next_partition_lower_bound = Some(f64::NAN);
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.routing_mode = hyphae_native_runtime::AnnPartitionRoutingMode::FullFanout;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.routing_policy = "unbound-routing-policy";
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.total_partitions = 63;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.execution_workers = 5;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.execution_worker_batches = 33;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid;
+        mutated.search.hits.pop();
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        Ok(())
+    }
+
+    fn valid_selected_route()
+    -> Result<hyphae_native_runtime::AnnSelectedSearchReceipt, Box<dyn Error>> {
+        Ok(hyphae_native_runtime::AnnSelectedSearchReceipt {
+            search: hyphae_native_runtime::AnnSearchReceipt {
+                index_id: ObjectId::new(8)?,
+                snapshot_csn: None,
+                approximate: true,
+                build_identity: [2; 32],
+                metric: VectorMetric::Cosine,
+                ef_search: ANN_QUERY_BREADTH,
+                candidate_count: K,
+                eligible_candidate_count: K,
+                strategy: hyphae_native_runtime::AnnSearchStrategy::GraphTraversal,
+                recall_risk: hyphae_native_runtime::AnnRecallRisk::ApproximateTraversal,
+                exact_reranked: true,
+                visited_nodes: K,
+                hits: (0..K)
+                    .map(|index| {
+                        Ok(hyphae_native_runtime::VectorHit {
+                            object_id: ObjectId::new(u128::try_from(index)? + 1)?,
+                            distance: 0.1 + (index as f64 * 0.01),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+            },
+            base_build_identity: [1; 32],
+            view_identity: [2; 32],
+            exact_delta_candidates: 0,
+            requested_maximum_partitions: 32,
+            selected_partitions: vec![0, 1],
+            total_partitions: 64,
+            routing_mode: hyphae_native_runtime::AnnPartitionRoutingMode::SelectedPartitions,
+            routing_outcome: AnnPartitionRoutingOutcome::SelectedCertified,
+            next_partition_lower_bound: Some(0.75),
+            routing_policy: ANN_PARTITION_ROUTING_POLICY_V1,
+            execution_workers: 2,
+            execution_worker_batches: 2,
+            execution_waves: 2,
+        })
     }
 
     #[test]

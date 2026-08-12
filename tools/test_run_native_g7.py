@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tools.check_native_g7_receipt import GateFailure
 from tools.check_native_performance_receipt import validate_progress
 from tools.run_native_g7 import (
     G7_SURFACES,
@@ -31,6 +32,7 @@ from tools.run_native_g7 import (
     validate_execution_authority_evidence,
     validate_initial_ann_bulk_evidence,
     validate_partial_receipt,
+    validate_pilot_search_evidence,
     write_matrix_progress,
 )
 
@@ -681,6 +683,70 @@ class NativeG7ControllerTests(unittest.TestCase):
                         hard_cap_seconds=7_200,
                         seed_primed=True,
                     )
+
+    def test_pilot_search_evidence_is_validated_before_budget_projection(self) -> None:
+        from tools.test_check_native_g7_receipt import receipt as closure_receipt
+
+        pilot = closure_receipt()
+        pilot["dataset"]["observations"] = PILOT_OBSERVATIONS
+        ann = pilot["cells"]["ann-top10-recall-095"]
+        ann["ann_routing_interval"]["observations"] = PILOT_OBSERVATIONS
+        ann["ann_routing_interval"]["selected_certified"] = PILOT_OBSERVATIONS
+        ann["ann_routing_interval"]["next_partition_lower_bound_present"] = (
+            PILOT_OBSERVATIONS
+        )
+        bm25 = pilot["cells"]["bm25-top10"]
+        bm25_interval = bm25["lexical_read_view_query_interval"]
+        bm25_interval["observations"] = PILOT_OBSERVATIONS
+        bm25_interval["postings_evaluated"] = PILOT_OBSERVATIONS
+        bm25_interval["execution_sequence_last"] = (
+            bm25_interval["execution_sequence_first"] + PILOT_OBSERVATIONS - 1
+        )
+        filtered = pilot["cells"]["filtered-bm25-top10"]
+        filtered_interval = filtered["filtered_lexical_read_view_query_interval"]
+        for field in (
+            "observations",
+            "postings_scored",
+            "filter_records_evaluated",
+            "filter_records_matched",
+        ):
+            filtered_interval[field] = PILOT_OBSERVATIONS
+        filtered_interval["execution_sequence_last"] = (
+            filtered_interval["execution_sequence_first"] + PILOT_OBSERVATIONS - 1
+        )
+        hybrid = pilot["cells"]["hybrid-top10"]
+        hybrid_interval = hybrid["hybrid_read_view_query_interval"]
+        hybrid_interval["observations"] = PILOT_OBSERVATIONS
+        for field in (
+            "peak_admission_executions",
+            "result_retention_executions",
+            "fusion_executions",
+        ):
+            hybrid_interval[field] = PILOT_OBSERVATIONS
+        hybrid["hybrid_ann_routing_interval"]["observations"] = PILOT_OBSERVATIONS
+        hybrid["hybrid_ann_routing_interval"]["selected_certified"] = PILOT_OBSERVATIONS
+        hybrid["hybrid_ann_routing_interval"]["next_partition_lower_bound_present"] = (
+            PILOT_OBSERVATIONS
+        )
+        validate_pilot_search_evidence(pilot, "a" * 40)
+
+        pilot["schema"] = "hyphae-native-g7-receipt-v3"
+        with self.assertRaisesRegex(RuntimeError, "identity or open state"):
+            validate_pilot_search_evidence(pilot, "a" * 40)
+        pilot["schema"] = "hyphae-native-g7-receipt-v4"
+        bm25_interval["process_physical_page_reads"] = 1
+        with self.assertRaisesRegex(GateFailure, "BM25 read-view interval"):
+            validate_pilot_search_evidence(pilot, "a" * 40)
+        bm25_interval["process_physical_page_reads"] = 0
+
+        filtered_interval["filter_records_matched"] = PILOT_OBSERVATIONS - 1
+        with self.assertRaisesRegex(GateFailure, "filtered BM25 read-view interval"):
+            validate_pilot_search_evidence(pilot, "a" * 40)
+        filtered_interval["filter_records_matched"] = PILOT_OBSERVATIONS
+
+        hybrid["hybrid_read_view_query_interval"]["physical_page_reads"] = 1
+        with self.assertRaisesRegex(GateFailure, "storage or materialization"):
+            validate_pilot_search_evidence(pilot, "a" * 40)
 
     def test_receipt_progress_and_partial_must_bind_same_dataset(self) -> None:
         receipt = self.pilot_receipt()

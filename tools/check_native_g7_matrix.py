@@ -43,7 +43,7 @@ def validate_matrix(
     }:
         raise GateFailure("G7 matrix fields mismatch")
     if (
-        payload["schema"] != "hyphae-native-g7-matrix-v3"
+        payload["schema"] != "hyphae-native-g7-matrix-v4"
         or payload["gate"] != "G7"
         or payload["status"] != "closure-candidate"
         or payload["source_commit"] != expected_commit

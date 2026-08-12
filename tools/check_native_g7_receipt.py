@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import re
 import subprocess
 from dataclasses import dataclass
@@ -15,6 +17,7 @@ from typing import Any
 
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_INITIAL_ANN_BULK_PARTITIONS = 111
 G7_LOGICAL_ANN_PARTITIONS = 64
@@ -179,12 +182,12 @@ def validate(
         "state", "concurrency", "background_mode", "dataset", "hardware", "cells", "counters", "saturation",
         "background_interference", "claims", "closure_declared", "physical_observation",
         "build", "workload", "durability", "proofs_included", "correctness",
-        "initial_ann_bulk",
+        "initial_ann_bulk", "execution_authority",
     }
     if set(payload) != required:
         raise GateFailure("G7 receipt fields mismatch")
     if (
-        payload["schema"] != "hyphae-native-g7-receipt-v3"
+        payload["schema"] != "hyphae-native-g7-receipt-v4"
         or payload["gate"] != "G7"
         or payload["status"] != "passed"
         or payload["evidence_class"] != "closure-candidate"
@@ -260,6 +263,11 @@ def validate(
     }:
         raise GateFailure("G7 correctness evidence differs")
     validate_initial_ann_bulk(payload["initial_ann_bulk"], payload)
+    validate_execution_authority_evidence(
+        payload["execution_authority"],
+        payload["initial_ann_bulk"],
+        payload["background_mode"],
+    )
     hardware = payload["hardware"]
     hardware_fields = {"dedicated", "cpu", "topology", "ram_bytes", "storage", "filesystem", "governor", "affinity", "priority", "background_services", "virtualization"}
     if not isinstance(hardware, dict) or set(hardware) != hardware_fields or hardware.get("dedicated") is not True or hardware.get("virtualization") != "none":
@@ -323,6 +331,21 @@ def validate(
     validate_ann_read_view_cell(
         cells["ann-top10-recall-095"],
         payload["initial_ann_bulk"],
+        payload["dataset"]["observations"],
+    )
+    validate_hybrid_read_view_cell(
+        cells["hybrid-top10"],
+        cells["ann-top10-recall-095"],
+        payload["dataset"]["observations"],
+    )
+    validate_bm25_read_view_cell(
+        cells["bm25-top10"],
+        cells["hybrid-top10"],
+        payload["dataset"]["observations"],
+    )
+    validate_filtered_bm25_read_view_cell(
+        cells["filtered-bm25-top10"],
+        cells["hybrid-top10"],
         payload["dataset"]["observations"],
     )
     counters = payload["counters"]
@@ -392,12 +415,11 @@ def validate_ann_read_view_cell(
         raise GateFailure("G7 ANN cell omitted its bounded queue wait")
     view = cell.get("ann_read_view_open")
     fields = {
-        "root_identity", "base_build_identity", "view_identity", "routing_policy_identity",
-        "logical_partitions", "planned_physical_entries", "planned_physical_bytes",
-        "observed_physical_entries", "observed_physical_bytes",
-        "planned_peak_memory_bytes", "retained_memory_bytes",
-        "hydration_restore_count", "process_physical_page_read_delta",
-        "governor_generation",
+        "root_identity", "snapshot_csn", "base_build_identity", "view_identity",
+        "routing_policy_identity", "logical_partitions", "planned_physical_entries",
+        "planned_physical_bytes", "observed_physical_entries", "observed_physical_bytes",
+        "planned_peak_memory_bytes", "retained_memory_bytes", "hydration_restore_count",
+        "process_physical_page_read_delta", "governor_generation",
     }
     if not isinstance(view, dict) or set(view) != fields:
         raise GateFailure("G7 ANN cell omitted its durable read-view open receipt")
@@ -410,6 +432,7 @@ def validate_ann_read_view_cell(
         "logical_partitions", "planned_physical_entries", "planned_physical_bytes",
         "observed_physical_entries", "observed_physical_bytes",
         "planned_peak_memory_bytes", "retained_memory_bytes", "governor_generation",
+        "snapshot_csn",
     ):
         value = view[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -439,26 +462,764 @@ def validate_ann_read_view_cell(
     ):
         raise GateFailure("G7 ANN cell performed storage or restore work after read-view open")
     routing = cell.get("ann_routing_interval")
-    observations = routing.get("observations") if isinstance(routing, dict) else None
     if (
         cell.get("preferred_partition_budget") != G7_PREFERRED_ANN_PARTITIONS
-        or not isinstance(observations, int)
-        or isinstance(observations, bool)
-        or observations != expected_observations
-        or routing.get("selected_certified") != observations
-        or routing.get("full_fanout_requested") != 0
-        or routing.get("full_fanout_budget_fallback") != 0
-        or routing.get("single_generation_fallback") != 0
-        or routing.get("next_partition_lower_bound_present") != observations
-        or not isinstance(routing.get("execution_workers_max"), int)
-        or routing["execution_workers_max"] <= 0
-        or routing["execution_workers_max"] > worker_limit
-        or not isinstance(routing.get("execution_worker_batches_max"), int)
-        or routing["execution_worker_batches_max"] <= 0
-        or routing["execution_worker_batches_max"] > G7_PREFERRED_ANN_PARTITIONS
-        or routing.get("execution_waves_max") != 1
     ):
         raise GateFailure("G7 ANN routing interval was not selected-certified")
+    _validate_selected_routing_interval(
+        routing,
+        expected_observations=expected_observations,
+        worker_limit=worker_limit,
+        label="ANN",
+    )
+
+
+def validate_bm25_read_view_cell(
+    cell: Any,
+    hybrid_cell: Any,
+    expected_observations: int,
+) -> None:
+    """Validate one prepared BM25 interval against its shared lexical authority."""
+    if not isinstance(cell, dict) or not isinstance(hybrid_cell, dict):
+        raise GateFailure("G7 BM25 cell is not an evidence object")
+    if cell.get("route") != "native-retained-lexical-read-view":
+        raise GateFailure("G7 BM25 did not use its retained lexical read-view route")
+    view = cell.get("lexical_read_view_open")
+    hybrid_view = hybrid_cell.get("hybrid_read_view_open")
+    fields = {
+        "root_identity", "snapshot_csn", "lexical_index_identity_algorithm",
+        "lexical_index_identity", "lexical_plan_scope", "index_id",
+        "planned_terms", "retained_postings", "maximum_retained_postings",
+        "maximum_retained_bytes", "planned_physical_entries",
+        "planned_physical_bytes", "observed_physical_entries",
+        "observed_physical_bytes", "admitted_retained_memory_bytes",
+        "retained_memory_bytes", "open_physical_page_reads",
+    }
+    if (
+        not isinstance(view, dict)
+        or set(view) != fields
+        or not isinstance(hybrid_view, dict)
+    ):
+        raise GateFailure("G7 BM25 read-view open receipt is incomplete")
+    for name in ("root_identity", "lexical_index_identity"):
+        if not isinstance(view[name], str) or HEX64.fullmatch(view[name]) is None:
+            raise GateFailure(f"G7 BM25 read-view identity is invalid: {name}")
+    if (
+        not isinstance(view["index_id"], str)
+        or HEX32.fullmatch(view["index_id"]) is None
+        or int(view["index_id"], 16) == 0
+    ):
+        raise GateFailure("G7 BM25 read-view index identity is invalid")
+    positive_fields = (
+        "snapshot_csn", "planned_terms", "retained_postings",
+        "maximum_retained_postings", "maximum_retained_bytes",
+        "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "admitted_retained_memory_bytes", "retained_memory_bytes",
+    )
+    if any(
+        not isinstance(view[name], int)
+        or isinstance(view[name], bool)
+        or view[name] <= 0
+        for name in positive_fields
+    ) or (
+        not isinstance(view["open_physical_page_reads"], int)
+        or isinstance(view["open_physical_page_reads"], bool)
+        or view["open_physical_page_reads"] < 0
+    ):
+        raise GateFailure("G7 BM25 read-view resource evidence is invalid")
+    if (
+        view["lexical_index_identity_algorithm"]
+        != "blake3-search-root-page-object-format-v1"
+        or view["lexical_plan_scope"] != "query-bound-encoded-postings-v1"
+        or view["planned_terms"] != 1
+        or view["retained_postings"] != 1
+        or view["maximum_retained_postings"] != 10
+        or view["maximum_retained_bytes"] != 1_048_576
+        or view["observed_physical_entries"] > view["planned_physical_entries"]
+        or view["observed_physical_bytes"] > view["planned_physical_bytes"]
+        or view["admitted_retained_memory_bytes"] > view["maximum_retained_bytes"]
+        or view["retained_memory_bytes"] > view["admitted_retained_memory_bytes"]
+    ):
+        raise GateFailure("G7 BM25 read-view plan or retention boundary is invalid")
+    shared_fields = (
+        "root_identity", "snapshot_csn", "lexical_index_identity",
+        "lexical_plan_scope", "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "admitted_retained_memory_bytes", "retained_memory_bytes",
+    )
+    if any(view[name] != hybrid_view.get(name) for name in shared_fields):
+        raise GateFailure("G7 BM25 read-view differs from the hybrid lexical authority")
+
+    interval = cell.get("lexical_read_view_query_interval")
+    interval_fields = {
+        "observations", "postings_evaluated", "execution_sequence_first",
+        "execution_sequence_last", "receipt_physical_page_reads",
+        "process_physical_page_reads", "full_state_loads", "full_catalog_loads",
+        "lexical_execution", "provider",
+    }
+    if not isinstance(interval, dict) or set(interval) != interval_fields:
+        raise GateFailure("G7 BM25 read-view interval fields mismatch")
+    integer_fields = interval_fields - {"lexical_execution", "provider"}
+    if any(
+        not isinstance(interval[name], int) or isinstance(interval[name], bool)
+        for name in integer_fields
+    ):
+        raise GateFailure("G7 BM25 read-view interval contains invalid counters")
+    first = interval["execution_sequence_first"]
+    last = interval["execution_sequence_last"]
+    if (
+        interval["observations"] != expected_observations
+        or interval["postings_evaluated"] != expected_observations
+        or first <= 0
+        or last < first
+        or last - first + 1 != expected_observations
+        or interval["receipt_physical_page_reads"] != 0
+        or interval["process_physical_page_reads"] != 0
+        or interval["full_state_loads"] != 0
+        or interval["full_catalog_loads"] != 0
+        or interval["lexical_execution"]
+        != "decode-bm25-rank-per-observation-v1"
+        or interval["provider"] != "lexical-read-view-interval-counters-v1"
+    ):
+        raise GateFailure("G7 BM25 read-view interval crossed or skipped its authority")
+
+
+def validate_filtered_bm25_read_view_cell(
+    cell: Any,
+    hybrid_cell: Any,
+    expected_observations: int,
+) -> None:
+    """Validate root-bound predicate evaluation before BM25 ranking."""
+    if not isinstance(cell, dict) or not isinstance(hybrid_cell, dict):
+        raise GateFailure("G7 filtered BM25 cell is not an evidence object")
+    if (
+        cell.get("route") != "native-root-bound-filter-before-rank"
+        or cell.get("correctness_scope")
+        != "lexical-and-structure-one-root-query-bound"
+        or not isinstance(cell.get("corpus_filter_density"), float)
+        or not math.isfinite(cell["corpus_filter_density"])
+        or cell["corpus_filter_density"] != 0.5
+        or not isinstance(cell.get("candidate_filter_selectivity"), float)
+        or not math.isfinite(cell["candidate_filter_selectivity"])
+        or cell["candidate_filter_selectivity"] != 1.0
+    ):
+        raise GateFailure("G7 filtered BM25 route or selectivity authority is invalid")
+
+    view = cell.get("filtered_lexical_read_view_open")
+    hybrid_view = hybrid_cell.get("hybrid_read_view_open")
+    fields = {
+        "root_identity", "snapshot_csn", "lexical_index_identity",
+        "lexical_plan_scope", "structure_filter_identity_algorithm",
+        "structure_filter_value_scope", "structure_filter_identity",
+        "retained_filter_records", "planned_filter_physical_entries",
+        "planned_filter_physical_bytes", "observed_filter_physical_entries",
+        "observed_filter_physical_bytes", "retained_filter_memory_bytes",
+        "filter_planning", "filter_hydration", "open_filter_physical_page_reads",
+    }
+    if (
+        not isinstance(view, dict)
+        or set(view) != fields
+        or not isinstance(hybrid_view, dict)
+    ):
+        raise GateFailure("G7 filtered BM25 read-view open receipt is incomplete")
+    for name in (
+        "root_identity", "lexical_index_identity", "structure_filter_identity",
+    ):
+        if (
+            not isinstance(view[name], str)
+            or HEX64.fullmatch(view[name]) is None
+            or (name == "structure_filter_identity" and int(view[name], 16) == 0)
+        ):
+            raise GateFailure(f"G7 filtered BM25 identity is invalid: {name}")
+    positive_fields = (
+        "snapshot_csn", "retained_filter_records",
+        "planned_filter_physical_entries", "planned_filter_physical_bytes",
+        "observed_filter_physical_entries", "observed_filter_physical_bytes",
+        "retained_filter_memory_bytes",
+    )
+    if any(
+        not isinstance(view[name], int)
+        or isinstance(view[name], bool)
+        or view[name] <= 0
+        for name in positive_fields
+    ) or (
+        not isinstance(view["open_filter_physical_page_reads"], int)
+        or isinstance(view["open_filter_physical_page_reads"], bool)
+        or view["open_filter_physical_page_reads"] < 0
+    ):
+        raise GateFailure("G7 filtered BM25 read-view open resources are invalid")
+    if (
+        view["root_identity"] != hybrid_view.get("root_identity")
+        or view["snapshot_csn"] != hybrid_view.get("snapshot_csn")
+        or view["lexical_index_identity"]
+        != hybrid_view.get("lexical_index_identity")
+        or view["lexical_plan_scope"] != "query-bound-encoded-postings-v1"
+        or view["lexical_plan_scope"] != hybrid_view.get("lexical_plan_scope")
+        or view["structure_filter_identity_algorithm"]
+        != "blake3-structure-root-key-prefix-value-time-v1"
+        or view["structure_filter_value_scope"] != "inline-scalar-only-v1"
+    ):
+        raise GateFailure("G7 filtered BM25 same-root authority is invalid")
+    if (
+        view["retained_filter_records"] != 1
+        or view["planned_filter_physical_entries"] != 1
+        or view["observed_filter_physical_entries"] != 1
+        or view["observed_filter_physical_bytes"]
+        > view["planned_filter_physical_bytes"]
+    ):
+        raise GateFailure("G7 filtered BM25 read-view open plan is invalid")
+    planning_memory = _validate_filtered_bm25_admission(
+        view["filter_planning"], "planning"
+    )
+    hydration_memory = _validate_filtered_bm25_admission(
+        view["filter_hydration"], "hydration"
+    )
+    if (
+        planning_memory <= 0
+        or view["retained_filter_memory_bytes"] > hydration_memory
+    ):
+        raise GateFailure("G7 filtered BM25 read-view admission is insufficient")
+
+    interval = cell.get("filtered_lexical_read_view_query_interval")
+    fields = {
+        "observations", "execution_sequence_first", "execution_sequence_last",
+        "postings_scored", "filter_records_evaluated", "filter_records_matched",
+        "receipt_physical_page_reads",
+        "process_physical_page_reads", "full_state_loads", "full_catalog_loads",
+        "filter_execution", "provider",
+    }
+    if not isinstance(interval, dict) or set(interval) != fields:
+        raise GateFailure("G7 filtered BM25 read-view interval fields mismatch")
+    numeric_fields = fields - {"filter_execution", "provider"}
+    first = interval.get("execution_sequence_first")
+    last = interval.get("execution_sequence_last")
+    if any(
+        not isinstance(interval[name], int) or isinstance(interval[name], bool)
+        for name in numeric_fields
+    ) or (
+        interval["observations"] != expected_observations
+        or first <= 0
+        or last < first
+        or last - first + 1 != expected_observations
+        or interval["postings_scored"] != expected_observations
+        or interval["filter_records_evaluated"] != expected_observations
+        or interval["filter_records_matched"] != expected_observations
+        or interval["receipt_physical_page_reads"] != 0
+        or interval["process_physical_page_reads"] != 0
+        or interval["full_state_loads"] != 0
+        or interval["full_catalog_loads"] != 0
+        or interval["filter_execution"]
+        != "decode-expiry-inline-value-filter-before-rank-v1"
+        or interval["provider"]
+        != "filtered-lexical-read-view-interval-counters-v1"
+    ):
+        raise GateFailure("G7 filtered BM25 read-view interval changed its predicate")
+
+
+def _validate_filtered_bm25_admission(value: Any, phase: str) -> int:
+    fields = {
+        "class", "compute_threads", "io_slots", "memory_bytes", "queue_ticket",
+        "initial_queue_depth", "queue_time_nanos", "execution_time_nanos",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise GateFailure(f"G7 filtered BM25 {phase} admission fields mismatch")
+    queue_ticket = value["queue_ticket"]
+    nonnegative_fields = (
+        "initial_queue_depth", "queue_time_nanos", "execution_time_nanos",
+    )
+    if (
+        value["class"] != "foreground-bounded"
+        or value["compute_threads"] != 1
+        or isinstance(value["compute_threads"], bool)
+        or value["io_slots"] != 1
+        or isinstance(value["io_slots"], bool)
+        or not isinstance(value["memory_bytes"], int)
+        or isinstance(value["memory_bytes"], bool)
+        or value["memory_bytes"] <= 0
+        or any(
+            not isinstance(value[name], int)
+            or isinstance(value[name], bool)
+            or value[name] < 0
+            for name in nonnegative_fields
+        )
+        or value["execution_time_nanos"] == 0
+        or (
+            queue_ticket is not None
+            and (
+                not isinstance(queue_ticket, int)
+                or isinstance(queue_ticket, bool)
+                or queue_ticket < 0
+            )
+        )
+    ):
+        raise GateFailure(f"G7 filtered BM25 {phase} admission is invalid")
+    return value["memory_bytes"]
+
+
+def _validate_selected_routing_interval(
+    routing: Any,
+    *,
+    expected_observations: int,
+    worker_limit: int,
+    label: str,
+) -> None:
+    fields = {
+        "observations", "execution_workers_max", "execution_worker_batches_max",
+        "execution_waves_max", "selected_certified", "full_fanout_requested",
+        "full_fanout_budget_fallback", "single_generation_fallback",
+        "next_partition_lower_bound_present", "selected_partitions_max",
+        "minimum_next_partition_lower_bound", "maximum_kth_distance",
+    }
+    if not isinstance(routing, dict) or set(routing) != fields:
+        raise GateFailure(f"G7 {label} routing interval fields mismatch")
+    observations = routing["observations"]
+    integer_fields = (
+        "execution_workers_max", "execution_worker_batches_max", "execution_waves_max",
+        "selected_certified", "full_fanout_requested", "full_fanout_budget_fallback",
+        "single_generation_fallback", "next_partition_lower_bound_present",
+        "selected_partitions_max",
+    )
+    if (
+        not isinstance(observations, int)
+        or isinstance(observations, bool)
+        or observations != expected_observations
+        or any(
+            not isinstance(routing[field], int) or isinstance(routing[field], bool)
+            for field in integer_fields
+        )
+        or routing["selected_certified"] != observations
+        or routing["full_fanout_requested"] != 0
+        or routing["full_fanout_budget_fallback"] != 0
+        or routing["single_generation_fallback"] != 0
+        or routing["next_partition_lower_bound_present"] != observations
+        or not 1 <= routing["selected_partitions_max"] <= G7_PREFERRED_ANN_PARTITIONS
+        or not 1 <= routing["execution_workers_max"] <= worker_limit
+        or not 1
+        <= routing["execution_worker_batches_max"]
+        <= G7_PREFERRED_ANN_PARTITIONS
+        or not 1 <= routing["execution_waves_max"] <= 6
+    ):
+        raise GateFailure(f"G7 {label} routing interval was not selected-certified")
+    lower_bound = routing["minimum_next_partition_lower_bound"]
+    kth_distance = routing["maximum_kth_distance"]
+    if (
+        not isinstance(lower_bound, float)
+        or not math.isfinite(lower_bound)
+        or not isinstance(kth_distance, float)
+        or not math.isfinite(kth_distance)
+        or lower_bound <= kth_distance
+    ):
+        raise GateFailure(f"G7 {label} routing omission bound is not strict and finite")
+
+
+def validate_hybrid_read_view_cell(
+    cell: Any,
+    ann_cell: Any,
+    expected_observations: int,
+) -> None:
+    """Validate one G7 hybrid cell against its shared ANN/root authority."""
+    if not isinstance(cell, dict) or not isinstance(ann_cell, dict):
+        raise GateFailure("G7 hybrid cell is not an evidence object")
+    worker_limit = cell.get("per_query_worker_limit")
+    if (
+        not isinstance(worker_limit, int)
+        or isinstance(worker_limit, bool)
+        or worker_limit <= 0
+        or worker_limit != ann_cell.get("per_query_worker_limit")
+        or cell.get("preferred_partition_budget") != G7_PREFERRED_ANN_PARTITIONS
+    ):
+        raise GateFailure("G7 hybrid routing authority is invalid")
+    queue_wait = cell.get("query_queue_wait_millis")
+    if (
+        not isinstance(queue_wait, int)
+        or isinstance(queue_wait, bool)
+        or queue_wait <= 0
+        or queue_wait != ann_cell.get("query_queue_wait_millis")
+    ):
+        raise GateFailure("G7 hybrid query queue wait differs from ANN authority")
+    ann_open = ann_cell.get("ann_read_view_open")
+    view = cell.get("hybrid_read_view_open")
+    fields = {
+        "root_identity", "snapshot_csn", "lexical_index_identity", "ann_view_identity",
+        "lexical_plan_scope", "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "admitted_retained_memory_bytes", "retained_memory_bytes",
+    }
+    if (
+        not isinstance(ann_open, dict)
+        or not isinstance(view, dict)
+        or set(view) != fields
+    ):
+        raise GateFailure("G7 hybrid read-view open receipt is incomplete")
+    for name in ("root_identity", "lexical_index_identity", "ann_view_identity"):
+        if not isinstance(view[name], str) or HEX64.fullmatch(view[name]) is None:
+            raise GateFailure(f"G7 hybrid read-view identity is invalid: {name}")
+    for name in (
+        "snapshot_csn", "planned_physical_entries", "planned_physical_bytes",
+        "observed_physical_entries", "observed_physical_bytes",
+        "admitted_retained_memory_bytes", "retained_memory_bytes",
+    ):
+        value = view[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise GateFailure(f"G7 hybrid read-view resource is invalid: {name}")
+    if (
+        view["root_identity"] != ann_open.get("root_identity")
+        or view["snapshot_csn"] != ann_open.get("snapshot_csn")
+        or view["ann_view_identity"] != ann_open.get("view_identity")
+        or view["lexical_plan_scope"] != "query-bound-encoded-postings-v1"
+    ):
+        raise GateFailure("G7 hybrid read-view authority differs from ANN root authority")
+    if (
+        view["observed_physical_entries"] > view["planned_physical_entries"]
+        or view["observed_physical_bytes"] > view["planned_physical_bytes"]
+    ):
+        raise GateFailure("G7 hybrid read-view open receipt exceeds its physical plan")
+    if view["retained_memory_bytes"] > view["admitted_retained_memory_bytes"]:
+        raise GateFailure("G7 hybrid read-view retained memory exceeds its admission")
+    interval = cell.get("hybrid_read_view_query_interval")
+    interval_fields = {
+        "observations", "hydrations", "physical_page_reads",
+        "index_scoped_restores", "full_state_loads", "full_catalog_loads",
+        "lexical_execution", "peak_admission_executions",
+        "peak_admission_class", "peak_admission_compute_threads",
+        "peak_admission_io_slots", "peak_admission_memory_bytes_min",
+        "peak_admission_memory_bytes_max", "result_retention_executions",
+        "result_retention_class", "result_retention_compute_threads",
+        "result_retention_io_slots", "result_retention_memory_bytes_min",
+        "result_retention_memory_bytes_max", "fusion_executions", "fusion_class",
+        "fusion_compute_threads", "fusion_io_slots", "fusion_memory_bytes",
+        "provider",
+    }
+    if not isinstance(interval, dict) or set(interval) != interval_fields:
+        raise GateFailure("G7 hybrid query interval fields mismatch")
+    storage_fields = (
+        "observations", "hydrations", "physical_page_reads",
+        "index_scoped_restores", "full_state_loads", "full_catalog_loads",
+    )
+    if (
+        any(
+            not isinstance(interval[name], int) or isinstance(interval[name], bool)
+            for name in storage_fields
+        )
+        or interval["observations"] != expected_observations
+        or any(interval[name] != 0 for name in storage_fields[1:])
+        or interval["lexical_execution"]
+        != "decode-bm25-rank-per-observation-v1"
+        or interval["provider"] != "hybrid-read-view-interval-counters-v1"
+    ):
+        raise GateFailure("G7 hybrid query interval crossed storage or materialization boundaries")
+    _validate_hybrid_peak_admission(
+        interval,
+        expected_observations=expected_observations,
+        worker_limit=worker_limit,
+    )
+    _validate_hybrid_result_retention(
+        interval,
+        expected_observations=expected_observations,
+    )
+    _validate_hybrid_fusion(
+        interval,
+        expected_observations=expected_observations,
+    )
+    _validate_selected_routing_interval(
+        cell.get("hybrid_ann_routing_interval"),
+        expected_observations=expected_observations,
+        worker_limit=worker_limit,
+        label="hybrid",
+    )
+    _validate_hybrid_oracle(cell.get("hybrid_oracle"), view)
+
+
+def _validate_hybrid_peak_admission(
+    interval: dict[str, Any],
+    *,
+    expected_observations: int,
+    worker_limit: int,
+) -> None:
+    integers = (
+        "peak_admission_executions", "peak_admission_compute_threads",
+        "peak_admission_io_slots", "peak_admission_memory_bytes_min",
+        "peak_admission_memory_bytes_max",
+    )
+    minimum = interval["peak_admission_memory_bytes_min"]
+    maximum = interval["peak_admission_memory_bytes_max"]
+    if (
+        any(
+            not isinstance(interval[name], int) or isinstance(interval[name], bool)
+            for name in integers
+        )
+        or interval["peak_admission_executions"] != expected_observations
+        or interval["peak_admission_class"] != "foreground-bounded"
+        or interval["peak_admission_compute_threads"] != worker_limit
+        or interval["peak_admission_io_slots"] != 0
+        or minimum <= 0
+        or maximum < minimum
+    ):
+        raise GateFailure("G7 hybrid peak admission is invalid")
+
+
+def _validate_hybrid_result_retention(
+    interval: dict[str, Any],
+    *,
+    expected_observations: int,
+) -> None:
+    integers = (
+        "result_retention_executions", "result_retention_compute_threads",
+        "result_retention_io_slots", "result_retention_memory_bytes_min",
+        "result_retention_memory_bytes_max",
+    )
+    minimum = interval["result_retention_memory_bytes_min"]
+    maximum = interval["result_retention_memory_bytes_max"]
+    if (
+        any(
+            not isinstance(interval[name], int) or isinstance(interval[name], bool)
+            for name in integers
+        )
+        or interval["result_retention_executions"] != expected_observations
+        or interval["result_retention_class"] != "foreground-bounded"
+        or interval["result_retention_compute_threads"] != 0
+        or interval["result_retention_io_slots"] != 0
+        or minimum <= 0
+        or maximum < minimum
+    ):
+        raise GateFailure("G7 hybrid result retention is invalid")
+    if interval["peak_admission_memory_bytes_min"] < maximum:
+        raise GateFailure("G7 hybrid peak admission is below result retention")
+
+
+def _validate_hybrid_fusion(
+    interval: dict[str, Any],
+    *,
+    expected_observations: int,
+) -> None:
+    integers = (
+        "fusion_executions", "fusion_compute_threads", "fusion_io_slots",
+        "fusion_memory_bytes",
+    )
+    if (
+        any(
+            not isinstance(interval[name], int) or isinstance(interval[name], bool)
+            for name in integers
+        )
+        or interval["fusion_executions"] != expected_observations
+        or interval["fusion_class"] != "foreground-bounded"
+        or interval["fusion_compute_threads"] != 1
+        or interval["fusion_io_slots"] != 0
+        or interval["fusion_memory_bytes"] != 0
+    ):
+        raise GateFailure("G7 hybrid fusion admission is invalid")
+
+
+def _validate_hybrid_oracle(oracle: Any, view: dict[str, Any]) -> None:
+    fields = {
+        "status", "method", "root_identity", "snapshot_csn", "rrf_constant",
+        "contribution_scale", "lexical_weight", "vector_weight", "result_limit",
+        "tie_break", "lexical_ranking", "vector_ranking", "fused_results",
+        "result_digest", "oracle_digest",
+    }
+    if not isinstance(oracle, dict) or set(oracle) != fields:
+        raise GateFailure("G7 hybrid oracle fields mismatch")
+    integer_fields = (
+        "snapshot_csn", "rrf_constant", "contribution_scale", "lexical_weight",
+        "vector_weight", "result_limit",
+    )
+    if (
+        any(
+            not isinstance(oracle[field], int) or isinstance(oracle[field], bool)
+            for field in integer_fields
+        )
+        or oracle["status"] != "passed"
+        or oracle["method"] != "independent-branch-rrf-v1"
+        or oracle["root_identity"] != view["root_identity"]
+        or oracle["snapshot_csn"] != view["snapshot_csn"]
+        or oracle["rrf_constant"] != 60
+        or oracle["contribution_scale"] != 1_000_000_000
+        or oracle["lexical_weight"] != 1
+        or oracle["vector_weight"] != 1
+        or oracle["result_limit"] != 10
+        or oracle["tie_break"] != "fusion-score-desc-object-id-asc"
+    ):
+        raise GateFailure("G7 hybrid oracle authority is invalid")
+    lexical = _validate_hybrid_ranking(oracle["lexical_ranking"], "lexical", 10)
+    vector = _validate_hybrid_ranking(oracle["vector_ranking"], "vector", 10)
+    if len(vector) != 10:
+        raise GateFailure("G7 hybrid oracle vector ranking is incomplete")
+    expected = _fuse_hybrid_oracle(lexical, vector)
+    _validate_hybrid_results(oracle["fused_results"])
+    if oracle["fused_results"] != expected:
+        raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+    canonical = json.dumps(
+        expected,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = hashlib.sha256(canonical).hexdigest()
+    if (
+        not isinstance(oracle["result_digest"], str)
+        or HEX64.fullmatch(oracle["result_digest"]) is None
+        or not isinstance(oracle["oracle_digest"], str)
+        or HEX64.fullmatch(oracle["oracle_digest"]) is None
+        or oracle["result_digest"] != digest
+        or oracle["oracle_digest"] != digest
+    ):
+        raise GateFailure("G7 hybrid oracle digest mismatch")
+
+
+def _validate_hybrid_results(value: Any) -> None:
+    fields = {
+        "object_id", "lexical_rank", "vector_rank", "lexical_contribution",
+        "vector_contribution", "fusion_score", "final_rank",
+    }
+    if not isinstance(value, list) or len(value) != 10:
+        raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+    for result in value:
+        if not isinstance(result, dict) or set(result) != fields:
+            raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+        if (
+            not isinstance(result["object_id"], str)
+            or HEX32.fullmatch(result["object_id"]) is None
+            or int(result["object_id"], 16) == 0
+        ):
+            raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+        for name in ("lexical_rank", "vector_rank"):
+            rank = result[name]
+            if rank is not None and (
+                not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0
+            ):
+                raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+        for name in (
+            "lexical_contribution", "vector_contribution", "fusion_score", "final_rank",
+        ):
+            number = result[name]
+            if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+                raise GateFailure("G7 hybrid oracle result or explanation mismatch")
+
+
+def _validate_hybrid_ranking(value: Any, label: str, limit: int) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > limit
+        or len(value) != len(set(value))
+        or any(
+            not isinstance(object_id, str)
+            or HEX32.fullmatch(object_id) is None
+            or int(object_id, 16) == 0
+            for object_id in value
+        )
+    ):
+        raise GateFailure(f"G7 hybrid oracle {label} ranking is invalid")
+    return value
+
+
+def _fuse_hybrid_oracle(lexical: list[str], vector: list[str]) -> list[dict[str, Any]]:
+    lexical_ranks = {object_id: rank for rank, object_id in enumerate(lexical, start=1)}
+    vector_ranks = {object_id: rank for rank, object_id in enumerate(vector, start=1)}
+    results = []
+    for object_id in set(lexical) | set(vector):
+        lexical_rank = lexical_ranks.get(object_id)
+        vector_rank = vector_ranks.get(object_id)
+        lexical_contribution = (
+            1_000_000_000 // (60 + lexical_rank) if lexical_rank is not None else 0
+        )
+        vector_contribution = (
+            1_000_000_000 // (60 + vector_rank) if vector_rank is not None else 0
+        )
+        results.append({
+            "object_id": object_id,
+            "lexical_rank": lexical_rank,
+            "vector_rank": vector_rank,
+            "lexical_contribution": lexical_contribution,
+            "vector_contribution": vector_contribution,
+            "fusion_score": lexical_contribution + vector_contribution,
+            "final_rank": 0,
+        })
+    results.sort(key=lambda result: (-result["fusion_score"], result["object_id"]))
+    del results[10:]
+    for final_rank, result in enumerate(results, start=1):
+        result["final_rank"] = final_rank
+    return results
+
+
+def validate_execution_authority_evidence(
+    evidence: Any,
+    initial_ann_bulk: Any,
+    background_mode: str,
+) -> None:
+    """Validate the single calibrated execution authority used by one G7 cell."""
+    fields = {
+        "status", "topology_digest", "runner_executable_blake3",
+        "calibration_executable_blake3", "installations", "installed_surfaces",
+        "registered_pools", "local_dispatches", "stolen_dispatches",
+        "completed_jobs", "numa_steal_status",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        raise GateFailure("G7 execution authority evidence fields mismatch")
+    if not isinstance(initial_ann_bulk, dict):
+        raise GateFailure("G7 execution authority has no ANN topology authority")
+    runner = evidence["runner_executable_blake3"]
+    calibration = evidence["calibration_executable_blake3"]
+    if (
+        evidence["status"] != "measured"
+        or not isinstance(evidence["topology_digest"], str)
+        or HEX64.fullmatch(evidence["topology_digest"]) is None
+        or evidence["topology_digest"] != initial_ann_bulk.get("topology_digest")
+        or not isinstance(runner, str)
+        or HEX64.fullmatch(runner) is None
+        or not isinstance(calibration, str)
+        or HEX64.fullmatch(calibration) is None
+        or runner != calibration
+    ):
+        raise GateFailure("G7 execution authority identity differs from calibration")
+    surfaces = evidence["installed_surfaces"]
+    required_surfaces = {
+        "search-fixture", "embedded-structure", "embedded-sql",
+        "local-structure-seed", "local-structure-migration",
+        "local-structure-daemon", "local-sql-daemon", "indexed-sql",
+        "join-sql", "group-commit", "physical-observation",
+    }
+    if background_mode == "interference":
+        required_surfaces.add("background-maintenance")
+    allowed_surfaces = required_surfaces | {"search-seed-builder"}
+    if (
+        not isinstance(surfaces, list)
+        or any(not isinstance(surface, str) or not surface for surface in surfaces)
+        or surfaces != sorted(set(surfaces))
+        or not required_surfaces.issubset(surfaces)
+        or not set(surfaces).issubset(allowed_surfaces)
+        or not isinstance(evidence["installations"], int)
+        or isinstance(evidence["installations"], bool)
+        or evidence["installations"] != len(surfaces)
+        or not isinstance(evidence["registered_pools"], int)
+        or isinstance(evidence["registered_pools"], bool)
+        or evidence["registered_pools"] != 1
+    ):
+        raise GateFailure("G7 execution authority surfaces or pools differ")
+    counters = (
+        evidence["local_dispatches"],
+        evidence["stolen_dispatches"],
+        evidence["completed_jobs"],
+    )
+    if (
+        any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in counters
+        )
+        or evidence["completed_jobs"]
+        != evidence["local_dispatches"] + evidence["stolen_dispatches"]
+    ):
+        raise GateFailure("G7 execution authority counters do not reconcile")
+    if (
+        evidence["numa_steal_status"]
+        not in {"calibrated", "disabled", "not-applicable"}
+        or (
+            evidence["numa_steal_status"] != "calibrated"
+            and evidence["stolen_dispatches"] != 0
+        )
+    ):
+        raise GateFailure("G7 execution authority NUMA evidence differs")
 
 
 def validate_initial_ann_bulk(evidence: Any, receipt: dict[str, Any]) -> None:

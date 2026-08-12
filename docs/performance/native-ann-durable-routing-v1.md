@@ -24,11 +24,17 @@ the ordinary ANN search receipt plus:
 - the number of child-search workers that actually executed.
 
 Zero is rejected. A budget at least as large as the durable child count runs
-complete fanout and must equal the existing default result. A smaller budget
-is preferred rather than unsafe: when the next child's metric lower bound can
-still improve the current kth hit, the runtime widens to complete fanout and
-reports `FullFanoutBudgetFallback`. A consolidated or legacy single generation
-executes its one graph and reports
+complete fanout in one wave and must equal the existing default result. A
+smaller budget is a ceiling, not an instruction to execute every preferred
+child. The runtime executes cumulative canonical prefixes `1, 2, 4, ...`,
+ending at the exact preferred budget when that budget is not a power of two.
+After every prefix it merges the accumulated child results and certifies the
+next omitted child's metric lower bound. Certification may therefore stop at
+any non-empty prefix within the preferred budget. If the preferred prefix
+still cannot prove that the omitted partitions cannot improve the current kth
+hit, one final wave executes every remaining child and reports
+`FullFanoutBudgetFallback`. A consolidated or legacy single generation executes
+its one graph and reports
 `SingleGenerationFallback`; it must not pretend that partition pruning ran.
 
 Filtered selected routing is outside v1. The existing filtered API retains its
@@ -48,6 +54,13 @@ bound that caused fallback, when present.
 Repeating a query against the same view, reopening the data directory, or
 changing only execution-worker capacity must not change it.
 
+Each widening step executes only the newly admitted suffix; already completed
+children are never searched again. The receipt's selected partitions are the
+exact accumulated prefix. Workers are the maximum concurrent workers used by
+one wave, worker batches accumulate across waves, and waves include the first
+prefix and every widening or complete-fallback suffix. This evidence makes a
+prefix-one certification distinguishable from a preferred-budget fanout.
+
 Base hits are merged with exact online delta upserts and tombstones before the
 ordinary canonical `(distance, object_id)` top-k truncation. Consolidation of a
 non-empty partitioned base rebuilds the same canonical geometric layout and
@@ -56,6 +69,14 @@ count is smaller because v1 does not encode empty child partitions. Worker
 capacity affects execution only and cannot change memberships or the aggregate
 identity. Removing every vector publishes the canonical empty single base and
 reports the explicit single-generation fallback.
+
+Selection certification is revalidated after that exact delta merge. The next
+omitted partition's lower bound must remain strictly greater than the final
+kth distance, and the merged result must still contain exactly `k` hits. A
+tombstone that removes a selected base hit can invalidate an otherwise correct
+base certificate; the query then continues the same geometric widening plan or
+executes complete fallback. Delta application may improve a certificate, but
+it can never preserve one using the pre-delta kth distance alone.
 
 ## Quality gate
 

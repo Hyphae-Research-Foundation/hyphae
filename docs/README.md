@@ -134,6 +134,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native ANN initial bulk publication v1](performance/native-ann-initial-bulk-publication-v1.md)
 - [Native ANN durable routing v1](performance/native-ann-durable-routing-v1.md)
 - [Native ANN retained read view v1](performance/native-ann-read-view-v1.md)
+- [Native hybrid read view v1](performance/native-hybrid-read-view-v1.md)
 - Native ANN durable local qualification v1:
   [contract](performance/native-ann-durable-qualification-v1.md)
 - [Native SQL vector execution v1](performance/native-sql-vector-execution-v1.md)

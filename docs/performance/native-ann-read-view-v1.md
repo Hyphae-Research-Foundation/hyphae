@@ -83,12 +83,23 @@ that owns the view. Parallel routed fanout subdivides that parent permit through
 the persistent `NativeExecutionPool`. It does not create a pool, acquire child
 capacity independently, or multiply the machine budget.
 
-One immutable routing plan is shared by all child tasks. The first wave executes
-the preferred partitions in canonical bound order. If canonical merge cannot
-certify the next omitted partition, a second wave executes the remaining
-partitions against the same view and plan. Ordered merge and exact delta overlay
-must be byte-for-byte equivalent to serial `search_routed` for worker capacities
-1, 2, 4, and the calibrated maximum.
+One immutable routing plan is shared by all child tasks. For a selected budget,
+the first wave executes the first canonical child through the persistent pool;
+its one selected partition, one executed worker batch, and one wave are explicit
+receipt evidence rather than hidden inline work. If canonical merge cannot
+certify the next omitted partition, later waves execute only the new suffixes
+needed to reach cumulative prefixes `2, 4, ...`, followed by the exact preferred
+budget. If that final preferred prefix remains uncertified, one complete-fallback
+wave executes every remaining child. An explicit complete-fanout request remains
+one complete wave because it does not authorize pruning. Ordered merge and exact
+delta overlay must be byte-for-byte equivalent to serial `search_routed` for
+worker capacities 1, 2, 4, and the calibrated maximum.
+
+Every selected-prefix certificate is checked again after exact delta upserts
+and tombstones are applied. It is accepted only when the merged result still
+contains `k` hits and the next omitted lower bound is strictly greater than the
+final kth distance. A tombstone-invalidated certificate continues widening;
+the view never reports selected routing using only a pre-delta kth bound.
 
 After a successful open, a query must perform none of the following:
 
@@ -100,11 +111,11 @@ After a successful open, a query must perform none of the following:
 
 Per-query allocation is limited to the routing plan, child results, merge heap,
 delta candidates, and final receipt under the query permit. Query cancellation
-is cooperative before planning, before each child execution, between widening
-waves, and before final merge. Cancellation or child failure releases every
-query subdivision but does not poison, mutate, or evict the reusable view.
-Concurrent queries may share the immutable view; each owns independent query
-admission and cancellation.
+is cooperative before planning, before each prefix wave, before each child
+execution, between widening waves, and before final merge. Cancellation or
+child failure releases every query subdivision but does not poison, mutate, or
+evict the reusable view. Concurrent queries may share the immutable view; each
+owns independent query admission and cancellation.
 
 ## Root advance, vacuum, and reopen
 
@@ -175,9 +186,10 @@ current per-query restore path and green only when these conditions hold:
 3. **One hydration:** one open followed by at least 10,000 selected queries
    records exactly one target scan and restore. Query-time fail-on-hydration,
    fail-on-page-read, and fail-on-catalog-read guards remain green.
-4. **Deterministic fanout:** worker capacities 1, 2, and 4 reproduce the serial
-   oracle for certified selection, requested full fanout, and budget-triggered
-   widening, including exact delta upserts and tombstones.
+4. **Deterministic fanout:** geometric prefixes reproduce the serial oracle and
+   never execute one child twice. Worker capacities 1, 2, and 4 reproduce the
+   same certified prefix, requested full fanout, and budget-triggered complete
+   fallback, including exact delta upserts and tombstones.
 5. **Admission and RAII:** open rejection occurs before physical scan; retained
    memory remains charged across clones; every query CPU/scratch allocation
    returns after success, cancellation, error, and panic; the last view drop

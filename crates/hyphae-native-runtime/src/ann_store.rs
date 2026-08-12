@@ -12,9 +12,10 @@ use std::{
 use hyphae_native_ann::{
     AnnError, AnnRecallRisk, AnnSearchResult, AnnSearchStrategy, GraphNodeRecord,
     HnswBuildProgress, HnswConfig, HnswIndex, HnswPartitionPlan, IndexSnapshot, MAX_HNSW_LEVEL,
-    Metric, PartitionedAnnChildSearchResult, PartitionedAnnRoutingOutcome,
-    PartitionedAnnSearchPlan, PartitionedHnswIndex, PartitionedIndexSnapshot, SearchOptions,
-    Vector, VectorHit, VectorIndexDefinition, VectorRecord,
+    Metric, PartitionedAnnChildSearchResult, PartitionedAnnRoutedSearchResult,
+    PartitionedAnnRoutingOutcome, PartitionedAnnSearchPlan, PartitionedHnswIndex,
+    PartitionedIndexSnapshot, SearchOptions, Vector, VectorHit, VectorIndexDefinition,
+    VectorRecord,
 };
 use hyphae_native_btree::{
     BTree, BTreeError, KeyValue, PrefixReplacementBatch, PrefixReplacementStructuralLimits,
@@ -120,6 +121,7 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AnnSearchCancellationPoint {
     AfterFirstWave,
+    AfterGeometricWidening,
     AfterFallbackWave,
     BeforeDeltaMerge,
 }
@@ -894,11 +896,9 @@ impl AnnIndexState {
         query: &Vector,
         options: SearchOptions,
         maximum_partitions: usize,
-        execution_pool: &NativeExecutionPool,
-        permit: &OwnedGovernorPermit,
-        cancellation: Option<&GovernorCancellation>,
+        execution: AnnParallelSearchExecution<'_>,
     ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
-        reject_cancelled_ann_search(cancellation)?;
+        reject_cancelled_ann_search(execution.cancellation)?;
         let routing_plan = match &self.base {
             AnnBase::Single(_) => {
                 return self.search_selected(query, options, maximum_partitions);
@@ -909,73 +909,33 @@ impl AnnIndexState {
         };
         let state = self;
         let routing_plan = Arc::new(routing_plan);
-        let (mut children, first_workers) = execute_routed_wave(
-            &state,
-            &routing_plan,
-            0..routing_plan.preferred_partitions(),
-            execution_pool,
-            permit,
-            cancellation,
-        )?;
-        cancel_ann_search_at_test_point(AnnSearchCancellationPoint::AfterFirstWave, cancellation);
-        reject_cancelled_ann_search(cancellation)?;
-        let mut worker_batches = first_workers;
-        let mut execution_workers = first_workers;
-        let mut execution_waves = 1;
-        let routed = match partitioned_base(&state)?.merge_routed_search(&routing_plan, &children) {
-            Ok(result) => result,
-            Err(AnnError::RoutingBudgetInsufficient) => {
-                reject_cancelled_ann_search(cancellation)?;
-                let (remaining, fallback_workers) = execute_routed_wave(
-                    &state,
-                    &routing_plan,
-                    routing_plan.preferred_partitions()..routing_plan.total_partitions(),
-                    execution_pool,
-                    permit,
-                    cancellation,
-                )?;
-                cancel_ann_search_at_test_point(
-                    AnnSearchCancellationPoint::AfterFallbackWave,
-                    cancellation,
-                );
-                reject_cancelled_ann_search(cancellation)?;
-                children.extend(remaining);
-                worker_batches = worker_batches.saturating_add(fallback_workers);
-                execution_workers = execution_workers.max(fallback_workers);
-                execution_waves = 2;
-                reject_cancelled_ann_search(cancellation)?;
-                partitioned_base(&state)?.merge_routed_search(&routing_plan, &children)?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let routed =
+            execute_adaptive_routed_base(&state, &routing_plan, query, options, execution)?;
         let exact_delta_candidates = state
             .deltas
             .values()
             .filter(|delta| matches!(delta, DeltaRecord::Upsert { .. }))
             .count();
-        let routing_mode = routing_execution_mode(routed.outcome);
-        let mut result = routed.result;
-        cancel_ann_search_at_test_point(AnnSearchCancellationPoint::BeforeDeltaMerge, cancellation);
-        reject_cancelled_ann_search(cancellation)?;
-        result = state.merge_delta_search_result_controlled(
-            query,
-            options,
-            None,
+        let PartitionedAnnRoutedSearchResult {
             result,
-            cancellation,
-        )?;
+            selected_partitions,
+            total_partitions,
+            outcome,
+            next_partition_lower_bound,
+        } = routed.result;
+        let routing_mode = routing_execution_mode(outcome);
         Ok(AnnRoutedSearchExecution {
             result,
             base_build_identity: state.base.build_identity(),
             view_identity: state.view_identity,
             exact_delta_candidates,
-            selected_partitions: routed.selected_partitions,
-            total_partitions: routed.total_partitions,
+            selected_partitions,
+            total_partitions,
             routing_mode,
-            next_partition_lower_bound: routed.next_partition_lower_bound,
-            execution_workers,
-            execution_worker_batches: worker_batches,
-            execution_waves,
+            next_partition_lower_bound,
+            execution_workers: routed.workers,
+            execution_worker_batches: routed.worker_batches,
+            execution_waves: routed.waves,
         })
     }
 
@@ -988,7 +948,6 @@ impl AnnIndexState {
     ) -> Result<AnnSearchResult, NativeRuntimeError> {
         self.merge_delta_search_result_controlled(query, options, allowlist, base_result, None)
     }
-
     fn merge_delta_search_result_controlled(
         &self,
         query: &Vector,
@@ -1077,6 +1036,127 @@ fn routing_execution_mode(outcome: PartitionedAnnRoutingOutcome) -> AnnRoutingEx
             AnnRoutingExecutionMode::FullFanoutBudgetFallback
         }
     }
+}
+
+struct AdaptiveRoutedBaseExecution {
+    result: PartitionedAnnRoutedSearchResult,
+    workers: usize,
+    worker_batches: usize,
+    waves: usize,
+}
+
+fn execute_adaptive_routed_base(
+    state: &Arc<AnnIndexState>,
+    plan: &Arc<PartitionedAnnSearchPlan>,
+    query: &Vector,
+    options: SearchOptions,
+    execution: AnnParallelSearchExecution<'_>,
+) -> Result<AdaptiveRoutedBaseExecution, NativeRuntimeError> {
+    let mut children = Vec::new();
+    let mut worker_batches = 0_usize;
+    let mut workers = 0_usize;
+    let mut waves = 0_usize;
+    let mut routed = None;
+    for prefix in plan.geometric_prefixes() {
+        reject_cancelled_ann_search(execution.cancellation)?;
+        let (next, wave_workers) = execute_routed_wave(
+            state,
+            plan,
+            children.len()..prefix,
+            execution.pool,
+            execution.permit,
+            execution.cancellation,
+        )?;
+        children.extend(next);
+        worker_batches = worker_batches.saturating_add(wave_workers);
+        workers = workers.max(wave_workers);
+        waves = waves.saturating_add(1);
+        let cancellation_point = if waves == 1 {
+            AnnSearchCancellationPoint::AfterFirstWave
+        } else {
+            AnnSearchCancellationPoint::AfterGeometricWidening
+        };
+        cancel_ann_search_at_test_point(cancellation_point, execution.cancellation);
+        reject_cancelled_ann_search(execution.cancellation)?;
+        match partitioned_base(state)?.merge_routed_search(plan, &children) {
+            Ok(result) => {
+                let result = merge_routed_candidate_with_deltas(
+                    state,
+                    query,
+                    options,
+                    result,
+                    execution.cancellation,
+                )?;
+                if selected_certificate_survives_deltas(&result, options) {
+                    routed = Some(result);
+                    break;
+                }
+            }
+            Err(AnnError::RoutingBudgetInsufficient) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let result = if let Some(result) = routed {
+        result
+    } else {
+        reject_cancelled_ann_search(execution.cancellation)?;
+        let (remaining, fallback_workers) = execute_routed_wave(
+            state,
+            plan,
+            children.len()..plan.total_partitions(),
+            execution.pool,
+            execution.permit,
+            execution.cancellation,
+        )?;
+        cancel_ann_search_at_test_point(
+            AnnSearchCancellationPoint::AfterFallbackWave,
+            execution.cancellation,
+        );
+        reject_cancelled_ann_search(execution.cancellation)?;
+        children.extend(remaining);
+        worker_batches = worker_batches.saturating_add(fallback_workers);
+        workers = workers.max(fallback_workers);
+        waves = waves.saturating_add(1);
+        let result = partitioned_base(state)?.merge_routed_search(plan, &children)?;
+        merge_routed_candidate_with_deltas(state, query, options, result, execution.cancellation)?
+    };
+    Ok(AdaptiveRoutedBaseExecution {
+        result,
+        workers,
+        worker_batches,
+        waves,
+    })
+}
+
+fn merge_routed_candidate_with_deltas(
+    state: &AnnIndexState,
+    query: &Vector,
+    options: SearchOptions,
+    mut routed: PartitionedAnnRoutedSearchResult,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<PartitionedAnnRoutedSearchResult, NativeRuntimeError> {
+    cancel_ann_search_at_test_point(AnnSearchCancellationPoint::BeforeDeltaMerge, cancellation);
+    reject_cancelled_ann_search(cancellation)?;
+    routed.result = state.merge_delta_search_result_controlled(
+        query,
+        options,
+        None,
+        routed.result,
+        cancellation,
+    )?;
+    Ok(routed)
+}
+
+fn selected_certificate_survives_deltas(
+    routed: &PartitionedAnnRoutedSearchResult,
+    options: SearchOptions,
+) -> bool {
+    routed.outcome != PartitionedAnnRoutingOutcome::SelectedCertified
+        || (routed.result.hits.len() == options.k()
+            && routed.next_partition_lower_bound.is_some_and(|bound| {
+                bound.total_cmp(&routed.result.hits[options.k() - 1].distance)
+                    == std::cmp::Ordering::Greater
+            }))
 }
 
 fn partitioned_base(state: &AnnIndexState) -> Result<&PartitionedHnswIndex, NativeRuntimeError> {
@@ -1769,9 +1849,7 @@ impl AnnOwnedReadState {
             query,
             options,
             maximum_partitions,
-            execution.pool,
-            execution.permit,
-            execution.cancellation,
+            execution,
         )
     }
 }
@@ -2327,14 +2405,7 @@ pub(crate) fn search_selected_planned_parallel(
 ) -> Result<AnnRoutedSearchExecution, NativeRuntimeError> {
     reject_cancelled_ann_search(execution.cancellation)?;
     let state = load_planned_index(pages, buffer_pool, plan, execution.cancellation)?;
-    Arc::new(state).search_selected_parallel(
-        query,
-        options,
-        maximum_partitions,
-        execution.pool,
-        execution.permit,
-        execution.cancellation,
-    )
+    Arc::new(state).search_selected_parallel(query, options, maximum_partitions, execution)
 }
 
 pub(crate) fn hydrate_owned_read_state(
@@ -5687,6 +5758,32 @@ mod tests {
             encode_consolidated_metadata(&state, &replacement, replacement_view_identity)?;
         assert_eq!(decode_metadata(&encoded)?.children.len(), 1);
         assert_eq!(ANN_BASE_SNAPSHOT_EXPORTS.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_certificate_is_revoked_when_a_tombstone_removes_the_selected_kth_hit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = partitioned_state()?;
+        let query = Vector::new([0.0, 0.0])?;
+        let options = SearchOptions::new(1, 4, Some(4))?;
+        let AnnBase::Partitioned(index) = &state.base else {
+            return Err("expected partitioned base".into());
+        };
+        let plan = index.plan_routed_search(&query, options, 1)?;
+        let child = index.search_planned_partition(&plan, 0)?;
+        let routed = index.merge_routed_search(&plan, &[child])?;
+        assert_eq!(
+            routed.outcome,
+            PartitionedAnnRoutingOutcome::SelectedCertified
+        );
+        let selected_hit = routed.result.hits[0].object_id;
+
+        assert!(state.delete(selected_hit, Csn::new(4)?)?);
+        let merged = merge_routed_candidate_with_deltas(&state, &query, options, routed, None)?;
+
+        assert!(!selected_certificate_survives_deltas(&merged, options));
+        assert!(merged.result.hits.is_empty());
         Ok(())
     }
 

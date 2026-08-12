@@ -15,8 +15,9 @@ use std::{
 use hyphae_native_catalog::IncrementalVectorLifecycle;
 use hyphae_native_runtime::{
     AnnPartitionRoutingMode, AnnSearchOptions, CommitBoundary, GovernorClassLimit, GovernorMode,
-    HardwareProfile, HnswConfig, NativeDatabase, NativeExecutionPool, NativeGovernorPolicy,
-    NativeResourceGovernor, NativeRuntimeError, SnapshotPinId, Vector, VectorMetric, WorkloadClass,
+    HardwareCpu, HardwareMemory, HardwareOperatingSystem, HardwareProfile, HardwareStorage,
+    HnswConfig, NativeDatabase, NativeExecutionPool, NativeGovernorPolicy, NativeResourceGovernor,
+    NativeRuntimeError, SnapshotPinId, Vector, VectorMetric, WorkloadClass,
 };
 use hyphae_native_types::{DurabilityClass, ObjectId};
 
@@ -150,6 +151,52 @@ fn test_governor_policy(profile: &HardwareProfile, workers: u64) -> NativeGovern
                 memory_bytes,
             })
             .collect(),
+    }
+}
+
+fn portable_execution_profile(path: &Path) -> HardwareProfile {
+    // Hardware discovery launches subprocesses on some platforms. Keep this
+    // file-lock lifecycle suite fork-free so sibling reopen tests are isolated.
+    HardwareProfile {
+        schema: "hyphae-native-hardware-profile-v1".to_owned(),
+        fingerprint: "1".repeat(64),
+        cpu: HardwareCpu {
+            architecture: std::env::consts::ARCH.to_owned(),
+            logical_processors_available: 2,
+            physical_cores_visible: None,
+            smt_threads_per_core: None,
+            sockets_visible: None,
+            numa_nodes_visible: None,
+            affinity: "unknown".to_owned(),
+            quota_millicores: None,
+            instruction_sets: Vec::new(),
+            caches: Vec::new(),
+            processor_topology: Vec::new(),
+            frequency_governors: Vec::new(),
+        },
+        memory: HardwareMemory {
+            total_bytes: Some(1 << 30),
+            available_bytes: Some(1 << 30),
+            page_size_bytes: Some(4_096),
+            huge_page_size_bytes: None,
+            huge_pages_total: None,
+            numa_nodes: Vec::new(),
+        },
+        storage: HardwareStorage {
+            path: path.display().to_string(),
+            filesystem: None,
+            device: None,
+            mount_options: Vec::new(),
+            rotational: None,
+            queue_depth: None,
+            discard_max_bytes: None,
+        },
+        operating_system: HardwareOperatingSystem {
+            family: std::env::consts::OS.to_owned(),
+            kernel_release: "test".to_owned(),
+            virtualization: "none".to_owned(),
+            local_transports: Vec::new(),
+        },
     }
 }
 
@@ -410,7 +457,7 @@ fn partitioned_consolidation_identity_is_independent_of_worker_count() -> Result
         update.commit()?;
     }
 
-    let profile = HardwareProfile::discover(parallel_directory.path())?;
+    let profile = portable_execution_profile(parallel_directory.path());
     let workers = u64::try_from(
         profile
             .cpu
@@ -458,7 +505,7 @@ fn cancelled_partitioned_consolidation_releases_governor_without_a_candidate()
     update.upsert_vector(index, ObjectId::new(8)?, Vector::new([8.25, 3.25])?)?;
     update.commit()?;
 
-    let profile = HardwareProfile::discover(temporary.path())?;
+    let profile = portable_execution_profile(temporary.path());
     let policy = test_governor_policy(&profile, 2);
     let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
     let execution_pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
