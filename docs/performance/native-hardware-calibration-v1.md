@@ -125,6 +125,13 @@ threads are admitted. Incomplete Linux topology and other platforms retain an
 explicitly `unbound` curve and an unsupported affinity entry; the two bindings
 cannot be mixed in one recommendation.
 
+The curve is measured from the maximum visible worker prefix down to one
+worker, then serialized in canonical ascending order. Each smaller prefix is
+therefore measured immediately after a larger superset exercised the same
+processors, instead of first admitting idle processors at each larger point.
+Warmups, convergence probes, the retained-sample median, correctness, and the
+four-percent MAD limit remain the independent authority for every point.
+
 `thread_scaling` derives a scheduler-facing decision mechanically from that
 curve. It records the effective physical and logical boundaries, each measured
 worker count, the physical-range peak, the SMT-range peak, and their throughput

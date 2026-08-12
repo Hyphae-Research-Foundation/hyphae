@@ -1494,31 +1494,48 @@ fn measure_thread_scaling(
             .to_owned(),
         });
     }
-    for worker_count in thread_scaling_levels(profile) {
-        let binding = cpu_order
-            .as_deref()
-            .and_then(|order| order.get(..worker_count));
-        let pool = CalibrationThreadPool::create(
-            worker_count,
-            WORKING_SET_BYTES_PER_WORKER,
-            SCANS_PER_OPERATION,
-            binding,
-        )?;
-        let expected =
-            expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
-        let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
-        measurements.push(measure_u64(
-            &thread_scaling_measurement_spec(
+    let worker_counts = thread_scaling_levels(profile);
+    let scaling_curve = measure_thread_scaling_curve_descending(
+        &worker_counts,
+        |worker_count| -> Result<CalibrationMeasurement, CalibrationError> {
+            let binding = cpu_order
+                .as_deref()
+                .and_then(|order| order.get(..worker_count));
+            let pool = CalibrationThreadPool::create(
                 worker_count,
-                variant,
-                WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
-            ),
-            policy,
-            || pool.execute(),
-            expected,
-        ));
-    }
+                WORKING_SET_BYTES_PER_WORKER,
+                SCANS_PER_OPERATION,
+                binding,
+            )?;
+            let expected =
+                expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
+            let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
+            Ok(measure_u64(
+                &thread_scaling_measurement_spec(
+                    worker_count,
+                    variant,
+                    WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
+                ),
+                policy,
+                || pool.execute(),
+                expected,
+            ))
+        },
+    )?;
+    measurements.extend(scaling_curve);
     Ok(())
+}
+
+fn measure_thread_scaling_curve_descending<T, E>(
+    canonical_worker_counts: &[usize],
+    mut measure: impl FnMut(usize) -> Result<T, E>,
+) -> Result<Vec<T>, E> {
+    let mut curve = Vec::with_capacity(canonical_worker_counts.len());
+    for &worker_count in canonical_worker_counts.iter().rev() {
+        curve.push(measure(worker_count)?);
+    }
+    curve.reverse();
+    Ok(curve)
 }
 
 impl ThreadScalingDiagnostic {
@@ -1561,29 +1578,30 @@ impl ThreadScalingDiagnostic {
         } else {
             "unbound"
         };
-        let mut worker_points = Vec::with_capacity(requested_worker_counts.len());
-        for &worker_count in requested_worker_counts {
-            let binding = cpu_order
-                .as_deref()
-                .and_then(|order| order.get(..worker_count));
-            let pool = CalibrationThreadPool::create(
-                worker_count,
-                WORKING_SET_BYTES_PER_WORKER,
-                SCANS_PER_OPERATION,
-                binding,
-            )?;
-            let expected =
-                expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
-            let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
-            worker_points.push(measure_thread_scaling_diagnostic_point(
-                &pool,
-                worker_count,
-                variant,
-                WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
-                expected,
-                policy,
-            )?);
-        }
+        let worker_points =
+            measure_thread_scaling_curve_descending(requested_worker_counts, |worker_count| {
+                let binding = cpu_order
+                    .as_deref()
+                    .and_then(|order| order.get(..worker_count));
+                let pool = CalibrationThreadPool::create(
+                    worker_count,
+                    WORKING_SET_BYTES_PER_WORKER,
+                    SCANS_PER_OPERATION,
+                    binding,
+                )?;
+                let expected = expected_per_worker
+                    .wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
+                let variant =
+                    thread_scaling_variant(worker_count, physical_limit, binding.is_some());
+                measure_thread_scaling_diagnostic_point(
+                    &pool,
+                    worker_count,
+                    variant,
+                    WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
+                    expected,
+                    policy,
+                )
+            })?;
         Ok(Self {
             policy: diagnostic_policy,
             binding: binding_name.to_owned(),
@@ -3619,6 +3637,38 @@ mod tests {
         assert_eq!(storage_queue_depth_levels(&profile), vec![1, 2]);
         fs::remove_dir_all(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_measures_descending_and_canonicalizes_output() -> Result<(), CalibrationError>
+    {
+        let canonical = [1, 2, 4, 8, 16, 32, 60];
+        let mut measured = Vec::new();
+        let output = measure_thread_scaling_curve_descending(&canonical, |worker_count| {
+            measured.push(worker_count);
+            Ok::<_, CalibrationError>(worker_count)
+        })?;
+
+        assert_eq!(measured, [60, 32, 16, 8, 4, 2, 1]);
+        assert_eq!(output, canonical);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_measurement_stops_without_a_partial_curve() {
+        let mut measured = Vec::new();
+        let result =
+            measure_thread_scaling_curve_descending(&[1, 2, 4, 8, 16, 32, 60], |worker_count| {
+                measured.push(worker_count);
+                if worker_count == 8 {
+                    Err("synthetic measurement failure")
+                } else {
+                    Ok(worker_count)
+                }
+            });
+
+        assert_eq!(result, Err("synthetic measurement failure"));
+        assert_eq!(measured, [60, 32, 16, 8]);
     }
 
     #[test]
