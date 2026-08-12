@@ -97,6 +97,7 @@ def validate_policy(value: Any) -> dict[str, int]:
             "minimum_duration_ms",
             "maximum_duration_ms",
             "warmup_batches",
+            "measurement_retry_limit",
             "samples_per_measurement",
             "target_sample_duration_ms",
             "maximum_relative_mad_ppm",
@@ -112,9 +113,48 @@ def validate_policy(value: Any) -> dict[str, int]:
         fail("policy maximum duration is below minimum duration")
     if policy["maximum_relative_mad_ppm"] > 1_000_000:
         fail("policy maximum relative MAD exceeds 1,000,000 ppm")
+    if not 1 <= policy["measurement_retry_limit"] <= 4:
+        fail("policy.measurement_retry_limit must be between 1 and 4")
     if policy["maximum_relative_range_ppm"] > 1_000_000:
         fail("policy maximum relative range exceeds 1,000,000 ppm")
     return policy
+
+
+def validate_statistics(value: Any, prefix: str) -> tuple[int, int]:
+    statistics = require_object(
+        value,
+        prefix,
+        {
+            "unit",
+            "minimum",
+            "median",
+            "maximum",
+            "median_absolute_deviation",
+            "relative_mad_ppm",
+            "relative_range_ppm",
+            "median_bytes_per_second",
+        },
+    )
+    if statistics["unit"] != "picoseconds_per_operation":
+        fail(f"{prefix}.unit is not canonical")
+    minimum = require_integer(statistics["minimum"], f"{prefix}.minimum", 1)
+    median = require_integer(statistics["median"], f"{prefix}.median", 1)
+    maximum = require_integer(statistics["maximum"], f"{prefix}.maximum", 1)
+    if not minimum <= median <= maximum:
+        fail(f"{prefix} timing order is invalid")
+    require_integer(
+        statistics["median_absolute_deviation"],
+        f"{prefix}.median_absolute_deviation",
+    )
+    mad_ppm = require_integer(statistics["relative_mad_ppm"], f"{prefix}.relative_mad_ppm")
+    range_ppm = require_integer(statistics["relative_range_ppm"], f"{prefix}.relative_range_ppm")
+    if statistics["median_bytes_per_second"] is not None:
+        require_integer(
+            statistics["median_bytes_per_second"],
+            f"{prefix}.median_bytes_per_second",
+            1,
+        )
+    return mad_ppm, range_ppm
 
 
 def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tuple[tuple[Any, ...], bool]:
@@ -134,6 +174,7 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
             "statistics",
             "correctness",
             "status",
+            "retry_history",
         },
     )
     primitive = require_string(measurement["primitive"], f"{prefix}.primitive")
@@ -156,28 +197,10 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
     if sample_count != policy["samples_per_measurement"]:
         fail(f"{prefix}.sample_count differs from policy")
 
-    statistics = require_object(
-        measurement["statistics"],
-        f"{prefix}.statistics",
-        {
-            "unit",
-            "minimum",
-            "median",
-            "maximum",
-            "median_absolute_deviation",
-            "relative_mad_ppm",
-            "relative_range_ppm",
-            "median_bytes_per_second",
-        },
-    )
-    if statistics["unit"] != "picoseconds_per_operation":
-        fail(f"{prefix}.statistics.unit is not canonical")
-    minimum = require_integer(statistics["minimum"], f"{prefix}.statistics.minimum", 1)
-    median = require_integer(statistics["median"], f"{prefix}.statistics.median", 1)
-    maximum = require_integer(statistics["maximum"], f"{prefix}.statistics.maximum", 1)
-    if not minimum <= median <= maximum:
-        fail(f"{prefix} timing order is invalid")
+    statistics = measurement["statistics"]
+    mad_ppm, range_ppm = validate_statistics(statistics, f"{prefix}.statistics")
     if primitive == "thread-scaling-memory-scan":
+        median = statistics["median"]
         median_batch_picoseconds = median * operations
         target_batch_picoseconds = policy["target_sample_duration_ms"] * 1_000_000_000
         thread_scaling_batch_is_stable = operations < operation_cap and not (
@@ -186,18 +209,33 @@ def validate_measurement(value: Any, policy: dict[str, int], index: int) -> tupl
             or median_batch_picoseconds * 1_000_000
             > target_batch_picoseconds * THREAD_SCALING_BATCH_MAXIMUM_TARGET_PPM
         )
-    require_integer(
-        statistics["median_absolute_deviation"],
-        f"{prefix}.statistics.median_absolute_deviation",
-    )
-    mad_ppm = require_integer(statistics["relative_mad_ppm"], f"{prefix}.statistics.relative_mad_ppm")
-    range_ppm = require_integer(statistics["relative_range_ppm"], f"{prefix}.statistics.relative_range_ppm")
-    if statistics["median_bytes_per_second"] is not None:
-        require_integer(
-            statistics["median_bytes_per_second"],
-            f"{prefix}.statistics.median_bytes_per_second",
-            1,
+    retry_history = measurement["retry_history"]
+    if not isinstance(retry_history, list):
+        fail(f"{prefix}.retry_history must be a list")
+    retry_limit = policy["measurement_retry_limit"]
+    previous_attempt = 0
+    for retry_index, attempt in enumerate(retry_history):
+        attempt = require_object(
+            attempt,
+            f"{prefix}.retry_history[{retry_index}]",
+            {"attempt", "status", "statistics"},
         )
+        ordinal = require_integer(
+            attempt["attempt"], f"{prefix}.retry_history[{retry_index}].attempt", 1
+        )
+        if ordinal != previous_attempt + 1:
+            fail(f"{prefix}.retry_history[{retry_index}].attempt must ascend from 1")
+        previous_attempt = ordinal
+        if attempt["status"] != "unstable":
+            fail(f"{prefix}.retry_history[{retry_index}].status must be unstable")
+        validate_statistics(
+            attempt["statistics"], f"{prefix}.retry_history[{retry_index}].statistics"
+        )
+    if len(retry_history) > retry_limit - 1:
+        fail(f"{prefix}.retry_history exceeds measurement_retry_limit")
+    if measurement["status"] == "rejected" and retry_history:
+        fail(f"{prefix}.retry_history must be empty for rejected measurements")
+
     correctness = require_object(
         measurement["correctness"],
         f"{prefix}.correctness",

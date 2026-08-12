@@ -221,6 +221,8 @@ pub struct CalibrationPolicy {
     pub maximum_relative_mad_ppm: u64,
     /// Maximum accepted full sample range for diagnostic cells in parts per million.
     pub maximum_relative_range_ppm: u64,
+    /// Total measurement attempts per ADR-0026 (nominal attempt plus retries).
+    pub measurement_retry_limit: u32,
 }
 
 impl CalibrationMode {
@@ -234,6 +236,7 @@ impl CalibrationMode {
                 target_sample_duration_ms: 15,
                 maximum_relative_mad_ppm: 75_000,
                 maximum_relative_range_ppm: 500_000,
+                measurement_retry_limit: 2,
             },
             Self::Thorough => CalibrationPolicy {
                 minimum_duration_ms: 180_000,
@@ -243,6 +246,7 @@ impl CalibrationMode {
                 target_sample_duration_ms: 225,
                 maximum_relative_mad_ppm: 40_000,
                 maximum_relative_range_ppm: 300_000,
+                measurement_retry_limit: 3,
             },
         }
     }
@@ -314,6 +318,23 @@ pub struct CalibrationMeasurement {
     pub correctness: CalibrationCorrectness,
     /// `stable`, `unstable`, or `rejected`.
     pub status: String,
+    /// Discarded unstable attempts re-measured under ADR-0026, oldest first.
+    #[serde(default)]
+    pub retry_history: Vec<CalibrationRetryAttempt>,
+}
+
+/// One discarded unstable measurement attempt retained as evidence.
+///
+/// Correctness rejections are never retried; every recorded attempt failed
+/// only the stability policy.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CalibrationRetryAttempt {
+    /// One-based discarded attempt ordinal; the final attempt is not listed.
+    pub attempt: u32,
+    /// Discard verdict, always `unstable`.
+    pub status: String,
+    /// Full distribution summary of the discarded attempt.
+    pub statistics: CalibrationStatistics,
 }
 
 /// Frozen, diagnostic-only thread-scaling sampling policy.
@@ -1698,9 +1719,24 @@ fn measure_thread_scaling_point(
             "measurement reference disagreed at {worker_count} workers: expected {reference}, got {candidate}"
         )));
     }
-    let sampled = sample_thread_scaling_operation(pool, worker_count, spec, policy)?;
-    let stable = sampled.operation_calibration.converged
-        && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
+    let mut retry_history = Vec::new();
+    let (sampled, stable) = loop {
+        let sampled = sample_thread_scaling_operation(pool, worker_count, spec, policy)?;
+        let attempt_stable = sampled.operation_calibration.converged
+            && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
+        if attempt_stable {
+            break (sampled, true);
+        }
+        let attempts_used = retry_history.len() + 1;
+        if attempts_used >= policy.measurement_retry_limit.max(1) as usize {
+            break (sampled, false);
+        }
+        retry_history.push(CalibrationRetryAttempt {
+            attempt: u32::try_from(attempts_used).unwrap_or(u32::MAX),
+            status: "unstable".to_owned(),
+            statistics: sampled.statistics,
+        });
+    };
     let status = if stable { "stable" } else { "unstable" };
     Ok(CalibrationMeasurement {
         primitive: spec.primitive.to_owned(),
@@ -1718,6 +1754,7 @@ fn measure_thread_scaling_point(
             reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
         },
         status: status.to_owned(),
+        retry_history,
     })
 }
 
@@ -3547,15 +3584,28 @@ fn measure<T: Copy + PartialEq>(
     let candidate_bytes = encode(candidate);
     let reference_bytes = encode(reference);
     let correctness_passed = candidate == reference;
-    let sampled = sample_operation(spec, policy, &mut operation);
-    let stable = (!spec.require_target_convergence || sampled.operation_calibration.converged)
-        && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
-    let status = if !correctness_passed {
-        "rejected"
-    } else if stable {
-        "stable"
-    } else {
-        "unstable"
+    let mut retry_history = Vec::new();
+    let (sampled, stable) = loop {
+        let sampled = sample_operation(spec, policy, &mut operation);
+        let attempt_stable = (!spec.require_target_convergence
+            || sampled.operation_calibration.converged)
+            && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
+        if !correctness_passed {
+            break (sampled, false);
+        }
+        if attempt_stable {
+            break (sampled, true);
+        }
+        let attempts_used = retry_history.len() + 1;
+        if attempts_used >= policy.measurement_retry_limit.max(1) as usize {
+            // Final attempt supplies the official statistics, per ADR-0026.
+            break (sampled, false);
+        }
+        retry_history.push(CalibrationRetryAttempt {
+            attempt: u32::try_from(attempts_used).unwrap_or(u32::MAX),
+            status: "unstable".to_owned(),
+            statistics: sampled.statistics,
+        });
     };
     CalibrationMeasurement {
         primitive: spec.primitive.to_owned(),
@@ -3577,7 +3627,14 @@ fn measure<T: Copy + PartialEq>(
             result_digest_blake3: blake3::hash(&candidate_bytes).to_hex().to_string(),
             reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
         },
-        status: status.to_owned(),
+        status: if !correctness_passed {
+            "rejected".to_owned()
+        } else if stable {
+            "stable".to_owned()
+        } else {
+            "unstable".to_owned()
+        },
+        retry_history,
     }
 }
 
@@ -4140,6 +4197,7 @@ mod tests {
             target_sample_duration_ms: 1,
             maximum_relative_mad_ppm: 1_000_000,
             maximum_relative_range_ppm: 1_000_000,
+            measurement_retry_limit: 1,
         }
     }
 
@@ -4162,6 +4220,96 @@ mod tests {
                     && source.downcast_ref::<ThreadScalingFailure>().is_some()
                     && source.to_string().contains(detail)
         )
+    }
+
+    #[test]
+    fn bounded_retry_sequences_discarded_attempts_before_verdict() {
+        // A zero MAD tolerance cannot be met by real timing samples, and the
+        // operation below escalates its own cost so every sample differs.
+        // Every attempt is therefore unstable; the verdict arrives after
+        // exactly `measurement_retry_limit` attempts with discards retained.
+        let policy = CalibrationPolicy {
+            maximum_relative_mad_ppm: 0,
+            measurement_retry_limit: 3,
+            ..test_policy()
+        };
+        let calls = std::sync::atomic::AtomicU64::new(0);
+        let measurement = measure_u64(
+            &MeasurementSpec::new("retry-probe", "test-variant", 1, "items", 8),
+            policy,
+            || {
+                let ordinal = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_micros(ordinal.min(500)));
+                ordinal
+            },
+            u64::MAX,
+        );
+        assert_eq!(measurement.status, "rejected"); // ordinal never equals u64::MAX
+        assert!(measurement.retry_history.is_empty());
+
+        let calls = std::sync::atomic::AtomicU64::new(0);
+        let measurement = measure_u64(
+            &MeasurementSpec::new("retry-probe", "test-variant", 1, "items", 8),
+            policy,
+            || {
+                let ordinal = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_micros(ordinal.min(500)));
+                ordinal.saturating_sub(1)
+            },
+            0,
+        );
+        // correctness only observes the first call (ordinal 1 → value 0)
+        assert_eq!(measurement.status, "unstable");
+        assert_eq!(measurement.retry_history.len(), 2);
+        assert!(
+            measurement
+                .retry_history
+                .iter()
+                .all(|attempt| attempt.status == "unstable")
+        );
+        assert_eq!(
+            measurement
+                .retry_history
+                .iter()
+                .map(|attempt| attempt.attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn stable_first_attempt_leaves_retry_history_empty() {
+        let measurement = measure_u64(
+            &MeasurementSpec::new("retry-probe", "test-variant", 1, "items", 8),
+            test_policy(),
+            || 1_u64,
+            1,
+        );
+        assert_eq!(measurement.status, "stable");
+        assert!(measurement.retry_history.is_empty());
+    }
+
+    #[test]
+    fn correctness_rejection_is_never_retried() {
+        // With a correctness mismatch the verdict must be rejected and no
+        // retry may run: ADR-0026 retries unstable verdicts only.
+        let policy = CalibrationPolicy {
+            maximum_relative_mad_ppm: 0,
+            measurement_retry_limit: 3,
+            ..test_policy()
+        };
+        let batches = std::sync::atomic::AtomicU64::new(0);
+        let measurement = measure_u64(
+            &MeasurementSpec::new("retry-probe", "test-variant", 1, "items", 8),
+            policy,
+            || {
+                batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1_u64
+            },
+            2, // reference mismatch: candidate never equals reference
+        );
+        assert_eq!(measurement.status, "rejected");
+        assert!(measurement.retry_history.is_empty());
     }
 
     #[test]

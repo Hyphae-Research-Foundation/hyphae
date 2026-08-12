@@ -4541,6 +4541,7 @@ mod tests {
                 reference_digest_blake3: digest.to_owned(),
             },
             status: "stable".to_owned(),
+            retry_history: Vec::new(),
         }
     }
 
@@ -4570,6 +4571,7 @@ mod tests {
                 reference_digest_blake3: digest.to_owned(),
             },
             status: "stable".to_owned(),
+            retry_history: Vec::new(),
         }
     }
 
@@ -4603,6 +4605,7 @@ mod tests {
                 target_sample_duration_ms: 225,
                 maximum_relative_mad_ppm: 40_000,
                 maximum_relative_range_ppm: 300_000,
+                measurement_retry_limit: 3,
             },
             feature_detection: CalibrationFeatureDetection {
                 instruction_sets: profile.cpu.instruction_sets.clone(),

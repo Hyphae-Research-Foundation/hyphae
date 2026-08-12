@@ -2,6 +2,11 @@
 
 name: Native G7 G8 Readiness Spine
 
+run-name: >-
+  ${{ inputs.g7_mode == 'benchmark'
+    && format('G7 {0} matrix [{1} c={2}] (hardware evidence)', inputs.g7_state, inputs.g7_platform, inputs.g7_concurrency)
+    || 'G7 G8 authority validation (no hardware benchmark)' }}
+
 on:
   workflow_dispatch:
     inputs:

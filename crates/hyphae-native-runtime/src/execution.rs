@@ -1908,6 +1908,7 @@ mod tests {
                 reference_digest_blake3: "3".repeat(64),
             },
             status: "stable".to_owned(),
+            retry_history: Vec::new(),
         }
     }
 
@@ -1942,6 +1943,7 @@ mod tests {
                 target_sample_duration_ms: 15,
                 maximum_relative_mad_ppm: 75_000,
                 maximum_relative_range_ppm: 500_000,
+                measurement_retry_limit: 1,
             },
             feature_detection: CalibrationFeatureDetection {
                 instruction_sets: Vec::new(),

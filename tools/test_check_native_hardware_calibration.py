@@ -42,6 +42,7 @@ def valid_receipt() -> dict:
             "target_sample_duration_ms": 15,
             "maximum_relative_mad_ppm": 75_000,
             "maximum_relative_range_ppm": 500_000,
+            "measurement_retry_limit": 2,
         },
         "feature_detection": {
             "instruction_sets": ["sse2"],
@@ -73,6 +74,7 @@ def valid_receipt() -> dict:
                     "reference_digest_blake3": DIGEST,
                 },
                 "status": "stable",
+                "retry_history": [],
             }
         ],
         "selected_kernels": [
@@ -123,6 +125,101 @@ def valid_receipt() -> dict:
 
 
 class CalibrationCheckerTests(unittest.TestCase):
+    def test_rejects_measurement_without_retry_history(self) -> None:
+        receipt = valid_receipt()
+        del receipt["measurements"][0]["retry_history"]
+        with self.assertRaises(CalibrationValidationError):
+            validate_receipt(receipt)
+
+    def test_accepts_well_formed_retry_history(self) -> None:
+        receipt = valid_receipt()
+        measurement = receipt["measurements"][0]
+        measurement["status"] = "stable"
+        measurement["retry_history"] = [
+            {
+                "attempt": 1,
+                "status": "unstable",
+                "statistics": {
+                    "unit": "picoseconds_per_operation",
+                    "minimum": 950,
+                    "median": 1_050,
+                    "maximum": 1_200,
+                    "median_absolute_deviation": 30,
+                    "relative_mad_ppm": 28_571,
+                    "relative_range_ppm": 238_095,
+                    "median_bytes_per_second": 2_926_000_000_000,
+                },
+            }
+        ]
+        validate_receipt(receipt)
+
+    def test_rejects_retry_history_over_budget(self) -> None:
+        receipt = valid_receipt()
+        measurement = receipt["measurements"][0]
+        attempt = {
+            "attempt": 1,
+            "status": "unstable",
+            "statistics": {
+                "unit": "picoseconds_per_operation",
+                "minimum": 950,
+                "median": 1_050,
+                "maximum": 1_200,
+                "median_absolute_deviation": 30,
+                "relative_mad_ppm": 28_571,
+                "relative_range_ppm": 238_095,
+                "median_bytes_per_second": 2_926_000_000_000,
+            },
+        }
+        measurement["retry_history"] = [attempt, dict(attempt, attempt=2), dict(attempt, attempt=3)]
+        with self.assertRaises(CalibrationValidationError):
+            validate_receipt(receipt)
+
+    def test_rejects_rejected_measurement_with_retry_history(self) -> None:
+        receipt = valid_receipt()
+        measurement = receipt["measurements"][0]
+        measurement["status"] = "rejected"
+        measurement["correctness"]["status"] = "failed"
+        measurement["correctness"]["result_digest_blake3"] = "0" * 64
+        measurement["retry_history"] = [
+            {
+                "attempt": 1,
+                "status": "unstable",
+                "statistics": {
+                    "unit": "picoseconds_per_operation",
+                    "minimum": 950,
+                    "median": 1_050,
+                    "maximum": 1_200,
+                    "median_absolute_deviation": 30,
+                    "relative_mad_ppm": 28_571,
+                    "relative_range_ppm": 238_095,
+                    "median_bytes_per_second": 2_926_000_000_000,
+                },
+            }
+        ]
+        with self.assertRaises(CalibrationValidationError):
+            validate_receipt(receipt)
+
+    def test_rejects_retry_history_with_wrong_verdict(self) -> None:
+        receipt = valid_receipt()
+        measurement = receipt["measurements"][0]
+        measurement["retry_history"] = [
+            {
+                "attempt": 1,
+                "status": "stable",
+                "statistics": {
+                    "unit": "picoseconds_per_operation",
+                    "minimum": 950,
+                    "median": 1_050,
+                    "maximum": 1_200,
+                    "median_absolute_deviation": 30,
+                    "relative_mad_ppm": 28_571,
+                    "relative_range_ppm": 238_095,
+                    "median_bytes_per_second": 2_926_000_000_000,
+                },
+            }
+        ]
+        with self.assertRaises(CalibrationValidationError):
+            validate_receipt(receipt)
     def test_accepts_semantically_consistent_receipt(self) -> None:
         validate_receipt(valid_receipt())
 

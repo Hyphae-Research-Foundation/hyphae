@@ -200,6 +200,17 @@ physical cores are spread round-robin across visible NUMA nodes before any SMT
 sibling is admitted. A calibrated worker-count prefix therefore names the exact
 processor prefix later used by the scheduler.
 
+Each cell is measured up to a bounded number of attempts per ADR-0026: 2
+attempts in quick mode and 3 in thorough mode, recorded as the policy's
+`measurement_retry_limit`. Only `unstable` cells are re-measured, with full
+warmup batches between attempts; `rejected` (correctness-failed) cells are
+never retried. Discarded attempts are retained oldest-first in the cell's
+`retry_history` with their complete integer statistics, and the final attempt
+produces the cell's authoritative `statistics` and `status`. Receipts without
+`retry_history`, with malformed history, or over the recorded retry budget fail
+the checker, so one tail burst cannot void a calibration and no retry can
+silence persistent instability.
+
 Candidate outputs are digested and compared to a separately structured
 reference path before timing can be selected. Vector, comparison, and memory
 references use independent loops; CRC32C uses a portable bitwise Castagnoli
