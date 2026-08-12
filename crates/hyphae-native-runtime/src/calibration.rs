@@ -11,7 +11,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -19,15 +20,12 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
-
-#[cfg(target_os = "linux")]
 use nix::{
     sched::{CpuSet, sched_setaffinity},
     unistd::Pid,
 };
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1495,31 +1493,35 @@ fn measure_thread_scaling(
         });
     }
     let worker_counts = thread_scaling_levels(profile);
+    let maximum_worker_count = worker_counts.last().copied().ok_or_else(|| {
+        thread_scaling_protocol("canonical worker curve must contain at least one point")
+    })?;
+    let binding = cpu_order
+        .as_deref()
+        .and_then(|order| order.get(..maximum_worker_count));
+    let pool = CalibrationThreadPool::create(
+        maximum_worker_count,
+        WORKING_SET_BYTES_PER_WORKER,
+        SCANS_PER_OPERATION,
+        binding,
+    )?;
     let scaling_curve = measure_thread_scaling_curve_descending(
         &worker_counts,
         |worker_count| -> Result<CalibrationMeasurement, CalibrationError> {
-            let binding = cpu_order
-                .as_deref()
-                .and_then(|order| order.get(..worker_count));
-            let pool = CalibrationThreadPool::create(
-                worker_count,
-                WORKING_SET_BYTES_PER_WORKER,
-                SCANS_PER_OPERATION,
-                binding,
-            )?;
             let expected =
                 expected_per_worker.wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
             let variant = thread_scaling_variant(worker_count, physical_limit, binding.is_some());
-            Ok(measure_u64(
+            measure_thread_scaling_point(
+                &pool,
                 &thread_scaling_measurement_spec(
                     worker_count,
                     variant,
                     WORKING_SET_BYTES_PER_WORKER.saturating_mul(SCANS_PER_OPERATION),
                 ),
+                worker_count,
                 policy,
-                || pool.execute(),
                 expected,
-            ))
+            )
         },
     )?;
     measurements.extend(scaling_curve);
@@ -1578,17 +1580,20 @@ impl ThreadScalingDiagnostic {
         } else {
             "unbound"
         };
+        let maximum_worker_count = requested_worker_counts.last().copied().ok_or_else(|| {
+            thread_scaling_protocol("canonical diagnostic curve must contain at least one point")
+        })?;
+        let binding = cpu_order
+            .as_deref()
+            .and_then(|order| order.get(..maximum_worker_count));
+        let pool = CalibrationThreadPool::create(
+            maximum_worker_count,
+            WORKING_SET_BYTES_PER_WORKER,
+            SCANS_PER_OPERATION,
+            binding,
+        )?;
         let worker_points =
             measure_thread_scaling_curve_descending(requested_worker_counts, |worker_count| {
-                let binding = cpu_order
-                    .as_deref()
-                    .and_then(|order| order.get(..worker_count));
-                let pool = CalibrationThreadPool::create(
-                    worker_count,
-                    WORKING_SET_BYTES_PER_WORKER,
-                    SCANS_PER_OPERATION,
-                    binding,
-                )?;
                 let expected = expected_per_worker
                     .wrapping_mul(u64::try_from(worker_count).unwrap_or(u64::MAX));
                 let variant =
@@ -1641,19 +1646,20 @@ fn measure_thread_scaling_diagnostic_point(
     policy: CalibrationPolicy,
 ) -> Result<ThreadScalingDiagnosticPoint, CalibrationError> {
     let spec = thread_scaling_measurement_spec(worker_count, variant, bytes_per_worker);
-    let candidate = pool.execute();
+    let candidate = pool.execute_batch(worker_count, 1)?;
     let candidate_bytes = candidate.to_le_bytes();
     let reference_bytes = expected.to_le_bytes();
     if candidate != expected {
-        return Err(CalibrationError::DiagnosticCorrectness { worker_count });
+        return Err(thread_scaling_protocol(format!(
+            "diagnostic reference disagreed at {worker_count} workers: expected {expected}, got {candidate}"
+        )));
     }
     let correctness = CalibrationCorrectness {
         status: "passed".to_owned(),
         result_digest_blake3: blake3::hash(&candidate_bytes).to_hex().to_string(),
         reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
     };
-    let mut operation = || pool.execute();
-    let sampled = sample_operation(&spec, policy, &mut operation);
+    let sampled = sample_thread_scaling_operation(pool, worker_count, &spec, policy)?;
     let converged = sampled.operation_calibration.converged
         && sampled.operation_calibration.operations < spec.max_operations_per_sample;
     let stable =
@@ -1674,6 +1680,44 @@ fn measure_thread_scaling_diagnostic_point(
         statistics: sampled.statistics,
         correctness,
         status: if stable { "stable" } else { "unstable" }.to_owned(),
+    })
+}
+
+fn measure_thread_scaling_point(
+    pool: &CalibrationThreadPool,
+    spec: &MeasurementSpec<'_>,
+    worker_count: usize,
+    policy: CalibrationPolicy,
+    reference: u64,
+) -> Result<CalibrationMeasurement, CalibrationError> {
+    let candidate = pool.execute_batch(worker_count, 1)?;
+    let candidate_bytes = candidate.to_le_bytes();
+    let reference_bytes = reference.to_le_bytes();
+    if candidate != reference {
+        return Err(thread_scaling_protocol(format!(
+            "measurement reference disagreed at {worker_count} workers: expected {reference}, got {candidate}"
+        )));
+    }
+    let sampled = sample_thread_scaling_operation(pool, worker_count, spec, policy)?;
+    let stable = sampled.operation_calibration.converged
+        && statistics_are_stable_for_primitive(spec.primitive, &sampled.statistics, policy);
+    let status = if stable { "stable" } else { "unstable" };
+    Ok(CalibrationMeasurement {
+        primitive: spec.primitive.to_owned(),
+        variant: spec.variant.to_owned(),
+        input_size: u64::try_from(spec.input_size).unwrap_or(u64::MAX),
+        input_unit: spec.input_unit.to_owned(),
+        bytes_per_operation: u64::try_from(spec.bytes_per_operation).unwrap_or(u64::MAX),
+        operations_per_sample: sampled.operation_calibration.operations,
+        maximum_operations_per_sample: spec.max_operations_per_sample,
+        sample_count: policy.samples_per_measurement,
+        statistics: sampled.statistics,
+        correctness: CalibrationCorrectness {
+            status: "passed".to_owned(),
+            result_digest_blake3: blake3::hash(&candidate_bytes).to_hex().to_string(),
+            reference_digest_blake3: blake3::hash(&reference_bytes).to_hex().to_string(),
+        },
+        status: status.to_owned(),
     })
 }
 
@@ -2004,16 +2048,343 @@ impl Drop for CalibrationPinnedMemoryReader {
 }
 
 enum ThreadPoolMessage {
-    Execute,
+    ExecuteBatch {
+        generation: u64,
+        active_workers: usize,
+        iterations: u64,
+    },
     Stop,
+}
+
+#[derive(Clone, Copy)]
+enum ThreadPoolResponse {
+    Ready {
+        generation: u64,
+        worker_index: usize,
+    },
+    Completed {
+        generation: u64,
+        worker_index: usize,
+        value: u64,
+    },
+    Failed {
+        generation: u64,
+        worker_index: usize,
+    },
+}
+
+fn validate_thread_pool_ready(
+    response: ThreadPoolResponse,
+    generation: u64,
+    worker_index: usize,
+) -> Result<(), String> {
+    match response {
+        ThreadPoolResponse::Ready {
+            generation: response_generation,
+            worker_index: response_worker,
+        } if response_generation == generation && response_worker == worker_index => Ok(()),
+        ThreadPoolResponse::Ready { .. } => Err(format!(
+            "worker {worker_index} sent stale or misattributed ready evidence"
+        )),
+        ThreadPoolResponse::Completed { .. } => Err(format!(
+            "worker {worker_index} sent a completion before ready"
+        )),
+        ThreadPoolResponse::Failed { .. } => {
+            Err(format!("worker {worker_index} failed before ready"))
+        }
+    }
+}
+
+fn validate_thread_pool_completion(
+    response: ThreadPoolResponse,
+    generation: u64,
+    worker_index: usize,
+) -> Result<u64, String> {
+    match response {
+        ThreadPoolResponse::Completed {
+            generation: response_generation,
+            worker_index: response_worker,
+            value,
+        } if response_generation == generation && response_worker == worker_index => Ok(value),
+        ThreadPoolResponse::Completed { .. } => Err(format!(
+            "worker {worker_index} sent stale or misattributed completion evidence"
+        )),
+        ThreadPoolResponse::Ready { .. } => Err(format!(
+            "worker {worker_index} sent duplicate ready evidence"
+        )),
+        ThreadPoolResponse::Failed {
+            generation: response_generation,
+            worker_index: response_worker,
+        } if response_generation == generation && response_worker == worker_index => {
+            Err(format!("worker {worker_index} failed before completion"))
+        }
+        ThreadPoolResponse::Failed { .. } => Err(format!(
+            "worker {worker_index} sent stale or misattributed failure evidence"
+        )),
+    }
+}
+
+#[derive(Default)]
+struct ThreadPoolGateState {
+    generation: u64,
+    released: bool,
+    aborted: bool,
+}
+
+#[derive(Default)]
+struct ThreadPoolStartGate {
+    state: Mutex<ThreadPoolGateState>,
+    changed: Condvar,
+}
+
+impl ThreadPoolStartGate {
+    fn prepare(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = generation;
+        state.released = false;
+        state.aborted = false;
+    }
+
+    fn release(&self, generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation || state.aborted {
+            return false;
+        }
+        state.released = true;
+        self.changed.notify_all();
+        true
+    }
+
+    fn abort(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.aborted = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_for_release(&self, generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.generation == generation && !state.released && !state.aborted {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.generation == generation && state.released && !state.aborted
+    }
+}
+
+struct ThreadScalingWorkerContext {
+    worker_index: usize,
+    cpu: Option<usize>,
+    working_set_bytes: usize,
+    scans_per_operation: usize,
+    request: Receiver<ThreadPoolMessage>,
+    response: SyncSender<ThreadPoolResponse>,
+    ready: SyncSender<Result<usize, String>>,
+    gate: Arc<ThreadPoolStartGate>,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    command_counts: Arc<Vec<AtomicU64>>,
+    #[cfg(test)]
+    iteration_counts: Arc<Vec<AtomicU64>>,
+    #[cfg(test)]
+    early_start_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    fail_after_release: Arc<Vec<AtomicBool>>,
+    #[cfg(test)]
+    result_offsets: Arc<Vec<AtomicU64>>,
+}
+
+struct ActiveThreadScalingGeneration {
+    generation: u64,
+    gate: Arc<ThreadPoolStartGate>,
+    cancelled: Arc<AtomicBool>,
+    response: SyncSender<ThreadPoolResponse>,
+    worker_index: usize,
+    completed: bool,
+}
+
+impl ActiveThreadScalingGeneration {
+    fn new(context: &ThreadScalingWorkerContext, generation: u64) -> Self {
+        Self {
+            generation,
+            gate: Arc::clone(&context.gate),
+            cancelled: Arc::clone(&context.cancelled),
+            response: context.response.clone(),
+            worker_index: context.worker_index,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ActiveThreadScalingGeneration {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancelled.store(true, AtomicOrdering::Release);
+            self.gate.abort(self.generation);
+            let _ignored = self.response.try_send(ThreadPoolResponse::Failed {
+                generation: self.generation,
+                worker_index: self.worker_index,
+            });
+        }
+    }
+}
+
+fn run_thread_scaling_worker(context: &ThreadScalingWorkerContext) {
+    if let Err(reason) = bind_scaling_worker(context.cpu) {
+        let _ignored = context.ready.send(Err(reason));
+        return;
+    }
+    let worker_input = byte_input(context.working_set_bytes);
+    if context
+        .ready
+        .send(Ok(worker_input.as_ptr() as usize))
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(message) = context.request.recv() {
+        match message {
+            ThreadPoolMessage::ExecuteBatch {
+                generation,
+                active_workers,
+                iterations,
+            } => {
+                let mut active_generation = ActiveThreadScalingGeneration::new(context, generation);
+                #[cfg(not(test))]
+                let _ = active_workers;
+                #[cfg(test)]
+                context.command_counts[context.worker_index].fetch_add(1, AtomicOrdering::SeqCst);
+                if context
+                    .response
+                    .send(ThreadPoolResponse::Ready {
+                        generation,
+                        worker_index: context.worker_index,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if !context.gate.wait_for_release(generation) {
+                    continue;
+                }
+                #[cfg(test)]
+                if context.fail_after_release[context.worker_index]
+                    .swap(false, AtomicOrdering::SeqCst)
+                {
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    if context.command_counts[..active_workers]
+                        .iter()
+                        .any(|count| count.load(AtomicOrdering::SeqCst) == 0)
+                    {
+                        context
+                            .early_start_count
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                }
+                let mut value = 0_u64;
+                for _ in 0..iterations {
+                    if context.cancelled.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    #[cfg(test)]
+                    context.iteration_counts[context.worker_index]
+                        .fetch_add(1, AtomicOrdering::SeqCst);
+                    value = value.wrapping_add(scan_worker_iteration(
+                        worker_input.as_slice(),
+                        context.scans_per_operation,
+                    ));
+                }
+                if context.cancelled.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                #[cfg(test)]
+                let value = value.wrapping_add(
+                    context.result_offsets[context.worker_index].load(AtomicOrdering::SeqCst),
+                );
+                if context
+                    .response
+                    .send(ThreadPoolResponse::Completed {
+                        generation,
+                        worker_index: context.worker_index,
+                        value,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                active_generation.complete();
+            }
+            ThreadPoolMessage::Stop => break,
+        }
+    }
 }
 
 struct CalibrationThreadPool {
     requests: Vec<SyncSender<ThreadPoolMessage>>,
-    responses: Receiver<u64>,
-    workers: Vec<JoinHandle<()>>,
+    responses: Vec<Receiver<ThreadPoolResponse>>,
+    workers: Vec<Option<JoinHandle<()>>>,
+    gate: Arc<ThreadPoolStartGate>,
+    generation: AtomicU64,
+    poisoned: Arc<AtomicBool>,
+    expected_per_worker: u64,
     #[cfg(test)]
     worker_input_addresses: Vec<usize>,
+    #[cfg(test)]
+    worker_command_counts: Arc<Vec<AtomicU64>>,
+    #[cfg(test)]
+    worker_iteration_counts: Arc<Vec<AtomicU64>>,
+    #[cfg(test)]
+    worker_early_start_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    fail_after_release: Arc<Vec<AtomicBool>>,
+    #[cfg(test)]
+    result_offsets: Arc<Vec<AtomicU64>>,
+}
+
+#[cfg(test)]
+struct ThreadScalingTestState {
+    command_counts: Arc<Vec<AtomicU64>>,
+    iteration_counts: Arc<Vec<AtomicU64>>,
+    early_start_count: Arc<AtomicU64>,
+    fail_after_release: Arc<Vec<AtomicBool>>,
+    result_offsets: Arc<Vec<AtomicU64>>,
+}
+
+#[cfg(test)]
+impl ThreadScalingTestState {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            command_counts: Arc::new((0..worker_count).map(|_| AtomicU64::new(0)).collect()),
+            iteration_counts: Arc::new((0..worker_count).map(|_| AtomicU64::new(0)).collect()),
+            early_start_count: Arc::new(AtomicU64::new(0)),
+            fail_after_release: Arc::new(
+                (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
+            ),
+            result_offsets: Arc::new((0..worker_count).map(|_| AtomicU64::new(0)).collect()),
+        }
+    }
 }
 
 impl CalibrationThreadPool {
@@ -2023,48 +2394,80 @@ impl CalibrationThreadPool {
         scans_per_operation: usize,
         cpu_order: Option<&[usize]>,
     ) -> Result<Self, CalibrationError> {
-        let (response_sender, response_receiver) = mpsc::sync_channel(worker_count.max(1));
+        if worker_count == 0 {
+            return Err(thread_scaling_protocol("worker count must be positive"));
+        }
+        let gate = Arc::new(ThreadPoolStartGate::default());
+        let reference_input = byte_input(working_set_bytes);
+        let expected_per_worker = (0..scans_per_operation).fold(0_u64, |total, _| {
+            total.wrapping_add(sequential_sum_reference(&reference_input))
+        });
+        #[cfg(test)]
+        let test_state = ThreadScalingTestState::new(worker_count);
+        let poisoned = Arc::new(AtomicBool::new(false));
         let mut pool = Self {
             requests: Vec::with_capacity(worker_count),
-            responses: response_receiver,
+            responses: Vec::with_capacity(worker_count),
             workers: Vec::with_capacity(worker_count),
+            gate: Arc::clone(&gate),
+            generation: AtomicU64::new(0),
+            poisoned: Arc::clone(&poisoned),
+            expected_per_worker,
             #[cfg(test)]
             worker_input_addresses: Vec::with_capacity(worker_count),
+            #[cfg(test)]
+            worker_command_counts: Arc::clone(&test_state.command_counts),
+            #[cfg(test)]
+            worker_iteration_counts: Arc::clone(&test_state.iteration_counts),
+            #[cfg(test)]
+            worker_early_start_count: Arc::clone(&test_state.early_start_count),
+            #[cfg(test)]
+            fail_after_release: Arc::clone(&test_state.fail_after_release),
+            #[cfg(test)]
+            result_offsets: Arc::clone(&test_state.result_offsets),
         };
         for worker_index in 0..worker_count {
             let cpu = cpu_order.and_then(|order| order.get(worker_index)).copied();
             let (request_sender, request_receiver) = mpsc::sync_channel(1);
-            let worker_response = response_sender.clone();
+            let (worker_response, response_receiver) = mpsc::sync_channel(1);
             let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+            let worker_gate = Arc::clone(&gate);
+            let worker_cancelled = Arc::clone(&poisoned);
+            #[cfg(test)]
+            let command_counts = Arc::clone(&test_state.command_counts);
+            #[cfg(test)]
+            let iteration_counts = Arc::clone(&test_state.iteration_counts);
+            #[cfg(test)]
+            let early_start_count = Arc::clone(&test_state.early_start_count);
+            #[cfg(test)]
+            let worker_fail_after_release = Arc::clone(&test_state.fail_after_release);
+            #[cfg(test)]
+            let result_offsets = Arc::clone(&test_state.result_offsets);
             let worker = thread::Builder::new()
                 .name(format!("hyphae-calibration-scaling-{worker_index}"))
                 .spawn(move || {
-                    if let Err(reason) = bind_scaling_worker(cpu) {
-                        let _ignored = ready_sender.send(Err(reason));
-                        return;
-                    }
-                    let worker_input = byte_input(working_set_bytes);
-                    if ready_sender
-                        .send(Ok(worker_input.as_ptr() as usize))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    while let Ok(message) = request_receiver.recv() {
-                        match message {
-                            ThreadPoolMessage::Execute => {
-                                let result = (0..scans_per_operation).fold(0_u64, |total, _| {
-                                    total.wrapping_add(sequential_sum_candidate(black_box(
-                                        worker_input.as_slice(),
-                                    )))
-                                });
-                                if worker_response.send(result).is_err() {
-                                    break;
-                                }
-                            }
-                            ThreadPoolMessage::Stop => break,
-                        }
-                    }
+                    let context = ThreadScalingWorkerContext {
+                        worker_index,
+                        cpu,
+                        working_set_bytes,
+                        scans_per_operation,
+                        request: request_receiver,
+                        response: worker_response,
+                        ready: ready_sender,
+                        gate: worker_gate,
+                        cancelled: worker_cancelled,
+                        #[cfg(test)]
+                        command_counts,
+                        #[cfg(test)]
+                        iteration_counts,
+                        #[cfg(test)]
+                        early_start_count,
+                        #[cfg(test)]
+                        fail_after_release: worker_fail_after_release,
+                        #[cfg(test)]
+                        result_offsets,
+                    };
+                    run_thread_scaling_worker(&context);
                 })
                 .map_err(|source| primitive_setup("thread-scaling-memory-scan", source))?;
             match ready_receiver.recv() {
@@ -2087,27 +2490,240 @@ impl CalibrationThreadPool {
                 }
             }
             pool.requests.push(request_sender);
-            pool.workers.push(worker);
+            pool.responses.push(response_receiver);
+            pool.workers.push(Some(worker));
         }
         Ok(pool)
     }
 
-    fn execute(&self) -> u64 {
-        for request in &self.requests {
-            if request.send(ThreadPoolMessage::Execute).is_err() {
-                return u64::MAX;
+    fn execute_batch(
+        &self,
+        active_workers: usize,
+        iterations: u64,
+    ) -> Result<u64, CalibrationError> {
+        if self.poisoned.load(AtomicOrdering::Acquire) {
+            return Err(thread_scaling_protocol("worker pool is poisoned"));
+        }
+        if active_workers == 0 || active_workers > self.requests.len() {
+            return Err(self.fail_protocol(
+                0,
+                format!(
+                    "active worker prefix {active_workers} is outside 1..={}",
+                    self.requests.len()
+                ),
+            ));
+        }
+        if !(1..=THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE).contains(&iterations) {
+            return Err(self.fail_protocol(
+                0,
+                format!(
+                    "batch iterations {iterations} are outside 1..={THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE}"
+                ),
+            ));
+        }
+        let previous_generation = self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        let Some(generation) = previous_generation.checked_add(1) else {
+            return Err(self.fail_protocol(0, "worker generation overflowed"));
+        };
+        self.gate.prepare(generation);
+        for (worker_index, request) in self.requests[..active_workers].iter().enumerate() {
+            if request
+                .send(ThreadPoolMessage::ExecuteBatch {
+                    generation,
+                    active_workers,
+                    iterations,
+                })
+                .is_err()
+            {
+                return Err(self.fail_protocol(
+                    generation,
+                    format!("worker {worker_index} disconnected during dispatch"),
+                ));
             }
         }
-        let mut total = 0_u64;
-        for _ in &self.requests {
-            let Ok(value) = self.responses.recv() else {
-                return u64::MAX;
-            };
-            total = total.wrapping_add(value);
+        for (worker_index, response) in self.responses[..active_workers].iter().enumerate() {
+            match response.recv() {
+                Ok(message) => {
+                    if let Err(reason) =
+                        validate_thread_pool_ready(message, generation, worker_index)
+                    {
+                        return Err(self.fail_protocol(generation, reason));
+                    }
+                }
+                Err(_) => {
+                    return Err(self.fail_protocol(
+                        generation,
+                        format!("worker {worker_index} disconnected before ready"),
+                    ));
+                }
+            }
         }
-        total
+        if !self.gate.release(generation) {
+            return Err(self.fail_protocol(generation, "start gate rejected the generation"));
+        }
+        let expected_per_worker = self.expected_per_worker.wrapping_mul(iterations);
+        let mut total = 0_u64;
+        for (worker_index, response) in self.responses[..active_workers].iter().enumerate() {
+            match response.recv() {
+                Ok(message) => {
+                    match validate_thread_pool_completion(message, generation, worker_index) {
+                        Ok(value) if value == expected_per_worker => {
+                            total = total.wrapping_add(value);
+                        }
+                        Ok(value) => {
+                            return Err(self.fail_protocol(
+                                generation,
+                                format!(
+                                    "worker {worker_index} batch correctness failed at {iterations} iterations: expected {expected_per_worker}, got {value}"
+                                ),
+                            ));
+                        }
+                        Err(reason) => return Err(self.fail_protocol(generation, reason)),
+                    }
+                }
+                Err(_) => {
+                    return Err(self.fail_protocol(
+                        generation,
+                        format!("worker {worker_index} disconnected before completion"),
+                    ));
+                }
+            }
+        }
+        let expected = self
+            .expected_per_worker
+            .wrapping_mul(u64::try_from(active_workers).unwrap_or(u64::MAX))
+            .wrapping_mul(iterations);
+        if total != expected {
+            self.poisoned.store(true, AtomicOrdering::Release);
+            return Err(thread_scaling_protocol(format!(
+                "batch correctness failed at {active_workers} workers and {iterations} iterations: expected {expected}, got {total}"
+            )));
+        }
+        Ok(total)
+    }
+
+    fn fail_protocol(&self, generation: u64, reason: impl Into<String>) -> CalibrationError {
+        self.poisoned.store(true, AtomicOrdering::Release);
+        self.gate.abort(generation);
+        thread_scaling_protocol(reason)
+    }
+
+    #[cfg(test)]
+    fn worker_command_counts(&self) -> Vec<u64> {
+        self.worker_command_counts
+            .iter()
+            .map(|count| count.load(AtomicOrdering::SeqCst))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn worker_iteration_counts(&self) -> Vec<u64> {
+        self.worker_iteration_counts
+            .iter()
+            .map(|count| count.load(AtomicOrdering::SeqCst))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn worker_early_start_count(&self) -> u64 {
+        self.worker_early_start_count.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn stop_worker_for_test(&mut self, worker_index: usize) -> Result<(), CalibrationError> {
+        let request = self
+            .requests
+            .get(worker_index)
+            .ok_or_else(|| thread_scaling_protocol("test worker index is out of range"))?;
+        request
+            .send(ThreadPoolMessage::Stop)
+            .map_err(|_| thread_scaling_protocol("test worker was already stopped"))?;
+        let worker = self
+            .workers
+            .get_mut(worker_index)
+            .and_then(Option::take)
+            .ok_or_else(|| thread_scaling_protocol("test worker handle is unavailable"))?;
+        worker
+            .join()
+            .map_err(|_| thread_scaling_protocol("test worker panicked while stopping"))
+    }
+
+    #[cfg(test)]
+    fn fail_worker_after_release_for_test(
+        &self,
+        worker_index: usize,
+    ) -> Result<(), CalibrationError> {
+        let fail = self
+            .fail_after_release
+            .get(worker_index)
+            .ok_or_else(|| thread_scaling_protocol("test worker index is out of range"))?;
+        fail.store(true, AtomicOrdering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_worker_result_offset_for_test(
+        &self,
+        worker_index: usize,
+        offset: u64,
+    ) -> Result<(), CalibrationError> {
+        let result_offset = self
+            .result_offsets
+            .get(worker_index)
+            .ok_or_else(|| thread_scaling_protocol("test worker index is out of range"))?;
+        result_offset.store(offset, AtomicOrdering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn dispatch_without_release_for_test(
+        &self,
+        active_workers: usize,
+        iterations: u64,
+    ) -> Result<u64, CalibrationError> {
+        let generation = self
+            .generation
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .checked_add(1)
+            .ok_or_else(|| thread_scaling_protocol("test worker generation overflowed"))?;
+        self.gate.prepare(generation);
+        for request in &self.requests[..active_workers] {
+            request
+                .send(ThreadPoolMessage::ExecuteBatch {
+                    generation,
+                    active_workers,
+                    iterations,
+                })
+                .map_err(|_| thread_scaling_protocol("test worker dispatch failed"))?;
+        }
+        for (worker_index, response) in self.responses[..active_workers].iter().enumerate() {
+            let message = response
+                .recv()
+                .map_err(|_| thread_scaling_protocol("test worker did not become ready"))?;
+            validate_thread_pool_ready(message, generation, worker_index)
+                .map_err(thread_scaling_protocol)?;
+        }
+        Ok(generation)
     }
 }
+
+#[inline(never)]
+fn scan_worker_iteration(worker_input: &[u8], scans_per_operation: usize) -> u64 {
+    (0..scans_per_operation).fold(0_u64, |total, _| {
+        total.wrapping_add(sequential_sum_candidate(black_box(worker_input)))
+    })
+}
+
+fn thread_scaling_protocol(reason: impl Into<String>) -> CalibrationError {
+    primitive_setup(
+        "thread-scaling-memory-scan",
+        ThreadScalingFailure(reason.into()),
+    )
+}
+
+#[derive(Debug, Error)]
+#[error("thread-scaling worker protocol failed: {0}")]
+struct ThreadScalingFailure(String);
 
 fn bind_scaling_worker(cpu: Option<usize>) -> Result<(), String> {
     let Some(cpu) = cpu else {
@@ -2127,10 +2743,13 @@ fn bind_scaling_worker(cpu: Option<usize>) -> Result<(), String> {
 
 impl Drop for CalibrationThreadPool {
     fn drop(&mut self) {
+        self.poisoned.store(true, AtomicOrdering::Release);
+        self.gate
+            .abort(self.generation.load(AtomicOrdering::Acquire));
         for request in &self.requests {
             let _ignored = request.send(ThreadPoolMessage::Stop);
         }
-        for worker in self.workers.drain(..) {
+        for worker in self.workers.drain(..).flatten() {
             let _ignored = worker.join();
         }
     }
@@ -2968,6 +3587,160 @@ struct SampledOperation {
     statistics: CalibrationStatistics,
 }
 
+fn sample_thread_scaling_operation(
+    pool: &CalibrationThreadPool,
+    worker_count: usize,
+    spec: &MeasurementSpec<'_>,
+    policy: CalibrationPolicy,
+) -> Result<SampledOperation, CalibrationError> {
+    let preliminary_calibration = thread_scaling_operations_per_sample(
+        pool,
+        worker_count,
+        policy.target_sample_duration_ms,
+        spec.max_operations_per_sample,
+        false,
+    )?;
+    for _ in 0..policy.warmup_batches {
+        black_box(pool.execute_batch(worker_count, preliminary_calibration.operations)?);
+    }
+    let mut operation_calibration = thread_scaling_operations_per_sample(
+        pool,
+        worker_count,
+        policy.target_sample_duration_ms,
+        spec.max_operations_per_sample,
+        true,
+    )?;
+    let mut samples = Vec::with_capacity(policy.samples_per_measurement as usize);
+    for _ in 0..policy.samples_per_measurement {
+        let (_, elapsed) =
+            time_thread_scaling_batch(pool, worker_count, operation_calibration.operations)?;
+        samples.push(picoseconds_per_operation(
+            elapsed,
+            operation_calibration.operations,
+        ));
+    }
+    let statistics = summarize(&samples, spec.bytes_per_operation);
+    operation_calibration.converged = operation_calibration.operations
+        < spec.max_operations_per_sample
+        && recorded_batch_confirms_target(
+            &statistics,
+            operation_calibration.operations,
+            policy.target_sample_duration_ms,
+        );
+    Ok(SampledOperation {
+        operation_calibration,
+        samples,
+        statistics,
+    })
+}
+
+fn thread_scaling_operations_per_sample(
+    pool: &CalibrationThreadPool,
+    worker_count: usize,
+    target_ms: u64,
+    operation_cap: u64,
+    require_target_convergence: bool,
+) -> Result<OperationCalibration, CalibrationError> {
+    let target = Duration::from_millis(target_ms.max(1));
+    let operation_cap = operation_cap.max(1);
+    if require_target_convergence {
+        return calibrated_thread_scaling_operations_for_target(
+            pool,
+            worker_count,
+            target,
+            operation_cap,
+        );
+    }
+    let mut operations = 1_u64;
+    loop {
+        let (_, elapsed) = time_thread_scaling_batch(pool, worker_count, operations)?;
+        if elapsed >= OPERATION_CALIBRATION_FLOOR || operations >= operation_cap {
+            return Ok(OperationCalibration {
+                operations: scaled_operations_for_elapsed(
+                    operations,
+                    elapsed,
+                    target,
+                    operation_cap,
+                ),
+                converged: true,
+            });
+        }
+        operations = operations.saturating_mul(2).min(operation_cap);
+    }
+}
+
+fn calibrated_thread_scaling_operations_for_target(
+    pool: &CalibrationThreadPool,
+    worker_count: usize,
+    target: Duration,
+    operation_cap: u64,
+) -> Result<OperationCalibration, CalibrationError> {
+    let mut operations = 1_u64;
+    let initial_elapsed = loop {
+        let (_, elapsed) = time_thread_scaling_batch(pool, worker_count, operations)?;
+        if elapsed >= OPERATION_CALIBRATION_FLOOR || operations >= operation_cap {
+            break elapsed;
+        }
+        operations = operations.saturating_mul(2).min(operation_cap);
+    };
+
+    operations = scaled_operations_for_elapsed(operations, initial_elapsed, target, operation_cap);
+    let mut best_operations = operations;
+    let mut best_distance = u128::MAX;
+    let mut confirmations = 0_u8;
+    for _ in 0..OPERATION_CALIBRATION_MAX_REFINEMENTS {
+        let (_, elapsed) = time_thread_scaling_batch(pool, worker_count, operations)?;
+        let distance = elapsed.as_nanos().abs_diff(target.as_nanos());
+        if distance < best_distance {
+            best_operations = operations;
+            best_distance = distance;
+        }
+        if sample_duration_matches_target(elapsed, target) {
+            confirmations = confirmations.saturating_add(1);
+            if confirmations >= OPERATION_CALIBRATION_CONFIRMATIONS {
+                return Ok(OperationCalibration {
+                    operations,
+                    converged: operations < operation_cap,
+                });
+            }
+            continue;
+        }
+        confirmations = 0;
+        let refined = scaled_operations_for_elapsed(operations, elapsed, target, operation_cap);
+        if refined == operations {
+            return Ok(OperationCalibration {
+                operations: best_operations,
+                converged: false,
+            });
+        }
+        operations = refined;
+    }
+    Ok(OperationCalibration {
+        operations: best_operations,
+        converged: false,
+    })
+}
+
+fn time_thread_scaling_batch(
+    pool: &CalibrationThreadPool,
+    worker_count: usize,
+    iterations: u64,
+) -> Result<(u64, Duration), CalibrationError> {
+    let started = Instant::now();
+    let value = black_box(pool.execute_batch(worker_count, iterations)?);
+    let finished = Instant::now();
+    let elapsed = finished.checked_duration_since(started).ok_or_else(|| {
+        thread_scaling_protocol("monotonic clock moved backwards during a scaling batch")
+    })?;
+    Ok((value, elapsed))
+}
+
+fn picoseconds_per_operation(elapsed: Duration, operations: u64) -> u64 {
+    let elapsed_ps = elapsed.as_nanos().saturating_mul(1_000);
+    let per_operation = elapsed_ps.div_ceil(u128::from(operations.max(1))).max(1);
+    u64::try_from(per_operation).unwrap_or(u64::MAX)
+}
+
 fn sample_operation<T>(
     spec: &MeasurementSpec<'_>,
     policy: CalibrationPolicy,
@@ -3381,6 +4154,16 @@ mod tests {
         measurement
     }
 
+    fn is_thread_scaling_failure<T>(result: &Result<T, CalibrationError>, detail: &str) -> bool {
+        matches!(
+            result,
+            Err(CalibrationError::PrimitiveSetup { primitive, source })
+                if *primitive == "thread-scaling-memory-scan"
+                    && source.downcast_ref::<ThreadScalingFailure>().is_some()
+                    && source.to_string().contains(detail)
+        )
+    }
+
     #[test]
     fn scheduler_acceptance_requires_worker_and_numa_stability() {
         let diagnostic = measurement_with_status("native-wal-group-flush", "unstable");
@@ -3526,7 +4309,6 @@ mod tests {
             |operations| {
                 measured_operations.push(operations);
                 match measured_operations.as_slice() {
-                    [1] => Duration::from_millis(1),
                     [.., 225] if measured_operations.len() <= 3 => target,
                     [.., 225] => Duration::from_millis(100),
                     [.., 507] => target,
@@ -3556,12 +4338,12 @@ mod tests {
 
     #[test]
     fn thread_scaling_workers_own_distinct_working_sets() -> Result<(), CalibrationError> {
-        let worker_count = 2;
+        let worker_count = 3;
         let working_set_bytes = 4_096;
         let scans_per_operation = 3;
         let input = byte_input(working_set_bytes);
-        let expected = sequential_sum_reference(&input)
-            .wrapping_mul(u64::try_from(worker_count * scans_per_operation).unwrap_or(u64::MAX));
+        let expected_per_worker = sequential_sum_reference(&input)
+            .wrapping_mul(u64::try_from(scans_per_operation).unwrap_or(u64::MAX));
         let pool = CalibrationThreadPool::create(
             worker_count,
             working_set_bytes,
@@ -3584,7 +4366,203 @@ mod tests {
             specification.bytes_per_operation,
             worker_count * working_set_bytes * scans_per_operation
         );
-        assert_eq!(pool.execute(), expected);
+        assert_eq!(
+            pool.execute_batch(2, 7)?,
+            expected_per_worker.wrapping_mul(14)
+        );
+        assert_eq!(pool.worker_command_counts(), vec![1, 1, 0]);
+        assert_eq!(pool.worker_iteration_counts(), vec![7, 7, 0]);
+        assert_eq!(pool.worker_early_start_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_pool_reuses_the_canonical_worker_prefix() -> Result<(), CalibrationError> {
+        let pool = CalibrationThreadPool::create(4, 4_096, 1, None)?;
+        let addresses = pool.worker_input_addresses.clone();
+
+        pool.execute_batch(4, 2)?;
+        pool.execute_batch(2, 3)?;
+        pool.execute_batch(1, 5)?;
+
+        assert_eq!(pool.worker_input_addresses, addresses);
+        assert_eq!(pool.worker_command_counts(), vec![3, 2, 1, 1]);
+        assert_eq!(pool.worker_iteration_counts(), vec![10, 5, 2, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_pool_poison_prevents_stale_response_reuse() -> Result<(), CalibrationError> {
+        let mut pool = CalibrationThreadPool::create(2, 4_096, 1, None)?;
+        pool.stop_worker_for_test(1)?;
+
+        let first = pool.execute_batch(2, 1);
+        let second = pool.execute_batch(1, 1);
+
+        assert!(is_thread_scaling_failure(
+            &first,
+            "disconnected during dispatch"
+        ));
+        assert!(is_thread_scaling_failure(&second, "pool is poisoned"));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_pool_validates_every_batch_checksum() -> Result<(), CalibrationError> {
+        let mut pool = CalibrationThreadPool::create(2, 4_096, 2, None)?;
+        pool.expected_per_worker = pool.expected_per_worker.wrapping_add(1);
+
+        let error = pool.execute_batch(2, 7);
+
+        assert!(is_thread_scaling_failure(
+            &error,
+            "worker 0 batch correctness failed at 7 iterations"
+        ));
+        assert!(is_thread_scaling_failure(
+            &pool.execute_batch(1, 1),
+            "pool is poisoned"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_pool_rejects_compensating_worker_corruption() -> Result<(), CalibrationError>
+    {
+        let pool = CalibrationThreadPool::create(2, 4_096, 2, None)?;
+        pool.set_worker_result_offset_for_test(0, 1)?;
+        pool.set_worker_result_offset_for_test(1, u64::MAX)?;
+
+        let error = pool.execute_batch(2, 7);
+
+        assert!(is_thread_scaling_failure(
+            &error,
+            "worker 0 batch correctness failed"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_measurement_aborts_on_external_reference_drift()
+    -> Result<(), CalibrationError> {
+        let pool = CalibrationThreadPool::create(1, 4_096, 1, None)?;
+        let specification = thread_scaling_measurement_spec(1, "test-affinity", 4_096);
+        let wrong_reference = pool.expected_per_worker.wrapping_add(1);
+
+        let error =
+            measure_thread_scaling_point(&pool, &specification, 1, test_policy(), wrong_reference);
+
+        assert!(is_thread_scaling_failure(
+            &error,
+            "measurement reference disagreed at 1 workers"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_batch_bounds_reject_zero_and_over_cap() -> Result<(), CalibrationError> {
+        let zero_pool = CalibrationThreadPool::create(1, 8, 1, None)?;
+        assert!(is_thread_scaling_failure(
+            &zero_pool.execute_batch(1, 0),
+            "outside 1..="
+        ));
+
+        let cap_pool = CalibrationThreadPool::create(1, 8, 1, None)?;
+        assert_eq!(
+            cap_pool.execute_batch(1, THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE)?,
+            cap_pool
+                .expected_per_worker
+                .wrapping_mul(THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE)
+        );
+
+        let over_cap_pool = CalibrationThreadPool::create(1, 8, 1, None)?;
+        assert!(is_thread_scaling_failure(
+            &over_cap_pool.execute_batch(
+                1,
+                THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE.saturating_add(1)
+            ),
+            "outside 1..="
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_response_validation_rejects_stale_misattributed_and_duplicate_evidence() {
+        assert!(
+            validate_thread_pool_ready(
+                ThreadPoolResponse::Ready {
+                    generation: 6,
+                    worker_index: 0,
+                },
+                7,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_thread_pool_completion(
+                ThreadPoolResponse::Completed {
+                    generation: 7,
+                    worker_index: 1,
+                    value: 0,
+                },
+                7,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_thread_pool_completion(
+                ThreadPoolResponse::Ready {
+                    generation: 7,
+                    worker_index: 0,
+                },
+                7,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn thread_scaling_pool_cancels_other_workers_after_mid_batch_failure()
+    -> Result<(), CalibrationError> {
+        let pool = CalibrationThreadPool::create(2, 4_096, 1, None)?;
+        pool.fail_worker_after_release_for_test(1)?;
+        let iteration_counts = Arc::clone(&pool.worker_iteration_counts);
+        let started = Instant::now();
+
+        let result = pool.execute_batch(2, THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE);
+        drop(pool);
+        let elapsed = Instant::now()
+            .checked_duration_since(started)
+            .ok_or_else(|| thread_scaling_protocol("test monotonic clock moved backwards"))?;
+
+        assert!(is_thread_scaling_failure(
+            &result,
+            "failed before completion"
+        ));
+        assert!(
+            iteration_counts[0].load(AtomicOrdering::SeqCst)
+                < THREAD_SCALING_MAX_OPERATIONS_PER_SAMPLE
+        );
+        assert!(elapsed < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_scaling_pool_drop_aborts_workers_waiting_at_start_gate()
+    -> Result<(), CalibrationError> {
+        let pool = CalibrationThreadPool::create(2, 4_096, 1, None)?;
+        let generation = pool.dispatch_without_release_for_test(2, 1)?;
+        let started = Instant::now();
+
+        drop(pool);
+
+        let elapsed = Instant::now()
+            .checked_duration_since(started)
+            .ok_or_else(|| thread_scaling_protocol("test monotonic clock moved backwards"))?;
+        assert_eq!(generation, 1);
+        assert!(elapsed < Duration::from_secs(1));
         Ok(())
     }
 

@@ -128,8 +128,27 @@ cannot be mixed in one recommendation.
 The curve is measured from the maximum visible worker prefix down to one
 worker, then serialized in canonical ascending order. Each smaller prefix is
 therefore measured immediately after a larger superset exercised the same
-processors, instead of first admitting idle processors at each larger point.
-Warmups, convergence probes, the retained-sample median, correctness, and the
+processors. One persistent maximum-size pool retains the same bound thread and
+private first-touch buffer for every point; a point dispatches only the exact
+canonical worker prefix that the scheduler later consumes.
+
+One scaling sample is one typed batch command per active worker, not one
+coordinator dispatch per logical scan. Commands carry a monotonic generation
+and the calibrated iteration count. Every active worker acknowledges that
+generation before a shared start gate releases the prefix, performs every real
+scan inside its local iteration loop, and returns one generation- and
+worker-identified completion. The coordinator rejects a missing, duplicate,
+stale, or disconnected response and permanently poisons that pool. The frozen
+operation cap is enforced at the pool boundary. A poisoned generation wakes
+workers waiting at the gate, while released workers check cancellation between
+real scan iterations; teardown is therefore bounded by one scan iteration per
+worker rather than the remaining batch. Timing starts before dispatch, ends
+after the last active worker response using the monotonic-clock checked
+difference, and is divided once by the batch iteration count. It therefore
+includes bounded dispatch and rendezvous overhead and the slowest worker,
+while avoiding thousands of channel round trips inside a 225-millisecond
+sample. Warmups,
+convergence probes, the retained-sample median, correctness, and the
 four-percent MAD limit remain the independent authority for every point.
 
 `thread_scaling` derives a scheduler-facing decision mechanically from that
@@ -187,6 +206,17 @@ references use independent loops; CRC32C uses a portable bitwise Castagnoli
 reference; BLAKE3 compares one-shot and chunked incremental APIs. A failed
 comparison makes the cell `rejected`. A correct diagnostic cell outside the
 frozen MAD or range bound is `unstable`.
+
+Thread scaling is deliberately stricter than the general cell rule. The pool
+compares every worker completion—not merely the wrapping aggregate—against the
+independent per-worker reference multiplied by that batch's iteration count.
+A mismatched worker, stale generation, missing response, or protocol failure
+aborts calibration through `PrimitiveSetup`; no partial calibration receipt or
+`rejected` thread-scaling cell is emitted. This exception prevents compensating
+worker errors from manufacturing a correct aggregate and prevents incomplete
+topology evidence from looking like an ordinary candidate-kernel rejection.
+Only an arithmetically correct thread-scaling point can reach timing, where
+convergence or variance may still leave the complete point `unstable`.
 
 Scheduler acceptance is narrower than diagnostic stability. Every measurement
 must be correct and total duration must remain inside the mode window. The
