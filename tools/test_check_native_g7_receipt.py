@@ -558,6 +558,7 @@ def receipt() -> dict:
         },
         "execution_authority": {
             "status": "measured",
+            "database_queue_wait_millis": 60_000,
             "topology_digest": "4" * 64,
             "runner_executable_blake3": "e" * 64,
             "calibration_executable_blake3": "e" * 64,
@@ -1037,6 +1038,27 @@ class G7ReceiptTests(unittest.TestCase):
                 else:
                     evidence["unexpected"] = 0
                 with self.assertRaisesRegex(GateFailure, "authority.*fields"):
+                    validate(payload, "a" * 40)
+
+    def test_execution_authority_requires_exact_database_queue_wait(self) -> None:
+        self.assertEqual(validate(receipt(), "a" * 40)["status"], "passed")
+        for mutation, value in (
+            ("missing", None),
+            ("bool", True),
+            ("zero", 0),
+            ("wrong", 60_001),
+            ("extra", 60_000),
+        ):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                evidence = payload["execution_authority"]
+                if mutation == "missing":
+                    del evidence["database_queue_wait_millis"]
+                elif mutation == "extra":
+                    evidence["unexpected_queue_wait"] = value
+                else:
+                    evidence["database_queue_wait_millis"] = value
+                with self.assertRaisesRegex(GateFailure, "authority.*(fields|queue wait)"):
                     validate(payload, "a" * 40)
 
     def test_execution_authority_binds_topology_and_exact_runner(self) -> None:

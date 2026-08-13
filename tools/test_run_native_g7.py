@@ -88,6 +88,7 @@ class NativeG7ControllerTests(unittest.TestCase):
             surfaces.add("background-maintenance")
         return {
             "status": "measured",
+            "database_queue_wait_millis": 60_000,
             "topology_digest": "9" * 64,
             "runner_executable_blake3": "8" * 64,
             "calibration_executable_blake3": "8" * 64,
@@ -99,6 +100,36 @@ class NativeG7ControllerTests(unittest.TestCase):
             "completed_jobs": 9,
             "numa_steal_status": "disabled",
         }
+
+    def test_execution_authority_requires_exact_database_queue_wait(self) -> None:
+        validate_execution_authority_evidence(
+            self.execution_authority(),
+            calibration_executable_blake3="8" * 64,
+            topology_digest="9" * 64,
+            background=False,
+        )
+        for mutation, value in (
+            ("missing", None),
+            ("bool", True),
+            ("zero", 0),
+            ("wrong", 59_999),
+            ("extra", 60_000),
+        ):
+            with self.subTest(mutation=mutation):
+                evidence = self.execution_authority()
+                if mutation == "missing":
+                    del evidence["database_queue_wait_millis"]
+                elif mutation == "extra":
+                    evidence["unexpected_queue_wait"] = value
+                else:
+                    evidence["database_queue_wait_millis"] = value
+                with self.assertRaisesRegex(RuntimeError, "authority.*(fields|queue wait)"):
+                    validate_execution_authority_evidence(
+                        evidence,
+                        calibration_executable_blake3="8" * 64,
+                        topology_digest="9" * 64,
+                        background=False,
+                    )
 
     def test_execution_authority_requires_exact_runner_and_every_surface(self) -> None:
         evidence = self.execution_authority(background=True)

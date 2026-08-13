@@ -71,6 +71,7 @@ const STRICT_GROUP_COMMIT_QUEUE_CAPACITY: usize = 64;
 const STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT: usize = 32;
 const STRICT_GROUP_COMMIT_COLLECTION_WAIT: Duration = Duration::ZERO;
 const STRICT_GROUP_COMMIT_EXECUTION_WAIT: Duration = Duration::from_secs(60);
+const G7_DATABASE_QUEUE_WAIT: Duration = Duration::from_secs(60);
 const SEED_BATCH_DOCUMENTS: usize = 512;
 const MAX_SEED_COHORTS: usize = 2;
 const SEED_PARTITION_RULE: &str = "batch-index-modulo-cohort-count-ordinal-commit-v1";
@@ -2693,13 +2694,11 @@ impl ExecutionAuthority {
     }
 
     fn reinstall(&self, database: &mut NativeDatabase) -> Result<(), Box<dyn Error>> {
-        database
-            .set_resource_governor_with_execution_pool(
-                Arc::clone(&self.governor),
-                Arc::clone(&self.execution_pool),
-                Duration::ZERO,
-            )
-            .map_err(|error| format!("G7 execution authority install failed: {error}"))?;
+        install_database_execution_authority(
+            database,
+            Arc::clone(&self.governor),
+            Arc::clone(&self.execution_pool),
+        )?;
         if database.resource_governor().is_none() || database.execution_pool().is_none() {
             return Err("G7 database did not retain its execution authority".into());
         }
@@ -2711,10 +2710,10 @@ impl ExecutionAuthority {
         product: &mut NativeProduct,
         surface: &str,
     ) -> Result<(), Box<dyn Error>> {
-        product.set_resource_governor_with_execution_pool(
+        install_product_execution_authority(
+            product,
             Arc::clone(&self.governor),
             Arc::clone(&self.execution_pool),
-            Duration::ZERO,
         )?;
         if !product.has_execution_authority() {
             return Err("G7 product did not retain its execution authority".into());
@@ -2744,6 +2743,7 @@ impl ExecutionAuthority {
         let completed_jobs = self.execution_pool.completed_jobs();
         Ok(json!({
             "status": "measured",
+            "database_queue_wait_millis": G7_DATABASE_QUEUE_WAIT.as_millis(),
             "topology_digest": self.topology_digest,
             "runner_executable_blake3": self.executable_blake3,
             "calibration_executable_blake3": self.calibration.identity.executable_blake3,
@@ -2756,6 +2756,34 @@ impl ExecutionAuthority {
             "numa_steal_status": serde_json::to_value(&self.topology)?["numa_steal_policy"]["status"],
         }))
     }
+}
+
+fn install_database_execution_authority(
+    database: &mut NativeDatabase,
+    governor: Arc<NativeResourceGovernor>,
+    execution_pool: Arc<NativeExecutionPool>,
+) -> Result<(), Box<dyn Error>> {
+    database
+        .set_resource_governor_with_execution_pool(
+            governor,
+            execution_pool,
+            G7_DATABASE_QUEUE_WAIT,
+        )
+        .map_err(|error| format!("G7 execution authority install failed: {error}").into())
+}
+
+fn install_product_execution_authority(
+    product: &mut NativeProduct,
+    governor: Arc<NativeResourceGovernor>,
+    execution_pool: Arc<NativeExecutionPool>,
+) -> Result<(), Box<dyn Error>> {
+    product
+        .set_resource_governor_with_execution_pool(
+            governor,
+            execution_pool,
+            G7_DATABASE_QUEUE_WAIT,
+        )
+        .map_err(Into::into)
 }
 
 impl SearchFixture {
@@ -6446,6 +6474,206 @@ fn physical_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn database_queue_wait_policy(workers: u64) -> NativeGovernorPolicy {
+        let memory_bytes = 1_024 * 1_024 * 1_024;
+        NativeGovernorPolicy {
+            schema: "hyphae-native-governor-policy-v1".to_owned(),
+            mode: hyphae_native_runtime::GovernorMode::Mixed,
+            hardware_fingerprint: "1".repeat(64),
+            calibration_cache_key: "2".repeat(64),
+            calibrated_worker_limit: workers,
+            reserved_system_threads: 0,
+            schedulable_compute_threads: workers,
+            io_slots: 1,
+            memory_bytes,
+            memory_headroom_percent: 15,
+            admission_queue_capacity: workers * 2,
+            foreground_burst_limit: 16,
+            class_limits: [
+                WorkloadClass::ForegroundPoint,
+                WorkloadClass::ForegroundBounded,
+                WorkloadClass::Mutation,
+                WorkloadClass::Bulk,
+                WorkloadClass::Maintenance,
+                WorkloadClass::Recovery,
+                WorkloadClass::Administrative,
+            ]
+            .into_iter()
+            .map(|class| hyphae_native_runtime::GovernorClassLimit {
+                class,
+                compute_threads: if class == WorkloadClass::ForegroundPoint {
+                    1
+                } else {
+                    workers
+                },
+                io_slots: 1,
+                memory_bytes,
+            })
+            .collect(),
+        }
+    }
+
+    fn database_queue_wait_pool(
+        root: &Path,
+        policy: &NativeGovernorPolicy,
+    ) -> Result<Arc<NativeExecutionPool>, Box<dyn Error>> {
+        let mut profile = HardwareProfile::discover(root)?;
+        profile.fingerprint.clone_from(&policy.hardware_fingerprint);
+        profile.cpu.logical_processors_available =
+            usize::try_from(policy.schedulable_compute_threads)?;
+        profile.cpu.processor_topology.clear();
+        Ok(Arc::new(NativeExecutionPool::new(&profile, policy)?))
+    }
+
+    fn wait_for_database_queue(governor: &NativeResourceGovernor, expected: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while governor.queued_requests() != expected && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        governor.queued_requests() == expected
+    }
+
+    #[test]
+    fn database_authority_waits_for_concurrent_point_reads_and_drains_usage()
+    -> Result<(), Box<dyn Error>> {
+        assert_eq!(G7_DATABASE_QUEUE_WAIT, Duration::from_secs(60));
+        for concurrency in [8_usize, 32] {
+            let root = std::env::temp_dir().join(format!(
+                "hyphae-g7-database-queue-wait-{}-{}-{concurrency}",
+                std::process::id(),
+                unique_nonce()
+            ));
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let mut database = NativeDatabase::create(&root)?;
+                let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+                seed.set(b"queued-read".to_vec(), b"value".to_vec(), None)?;
+                seed.commit()?;
+                database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+
+                let policy = database_queue_wait_policy(u64::try_from(concurrency)?);
+                let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+                let pool = database_queue_wait_pool(&root, &policy)?;
+                install_database_execution_authority(&mut database, Arc::clone(&governor), pool)?;
+                let held = governor.try_admit_owned(
+                    WorkloadClass::ForegroundPoint,
+                    hyphae_native_runtime::GovernorRequest {
+                        compute_threads: 0,
+                        io_slots: 1,
+                        memory_bytes: 0,
+                    },
+                )?;
+                let database = Arc::new(database);
+                let gate = Arc::new(Barrier::new(concurrency + 1));
+                let (queued, results) = thread::scope(|scope| {
+                    let handles = (0..concurrency)
+                        .map(|_| {
+                            let database = Arc::clone(&database);
+                            let gate = Arc::clone(&gate);
+                            scope.spawn(move || {
+                                gate.wait();
+                                database.get_latest_structure(b"queued-read", 0)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    gate.wait();
+                    let queued = wait_for_database_queue(&governor, concurrency);
+                    drop(held);
+                    let results = handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle
+                                .join()
+                                .map_err(|_| "queued database read panicked")?
+                                .map_err(Into::into)
+                        })
+                        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+                    Ok::<_, Box<dyn Error>>((queued, results))
+                })?;
+                assert!(queued, "all concurrent database reads must wait");
+                assert!(
+                    results
+                        .iter()
+                        .all(|value| value.as_deref() == Some(b"value"))
+                );
+                let usage = governor.usage_snapshot();
+                assert_eq!(usage.compute_threads, 0, "{usage:?}");
+                assert_eq!(usage.io_slots, 0, "{usage:?}");
+                assert_eq!(usage.memory_bytes, 0, "{usage:?}");
+                assert_eq!(usage.queued_requests, 0, "{usage:?}");
+                Ok(())
+            })();
+            fs::remove_dir_all(&root)?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn product_authority_waits_for_point_read_and_drains_usage() -> Result<(), Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-product-queue-wait-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let mut product = NativeProduct::create(&root)?;
+            let mut session = product_session();
+            let mut context = product_context(&session, 1);
+            context.durability = ProductDurabilityPolicy::MEMORY;
+            product.dispatch(
+                &mut session,
+                &context,
+                ProductOperation::StructureSet {
+                    key: b"queued-product-read".to_vec(),
+                    value: b"value".to_vec(),
+                    expires_at_micros: None,
+                },
+            )?;
+
+            let policy = database_queue_wait_policy(1);
+            let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+            let pool = database_queue_wait_pool(&root, &policy)?;
+            install_product_execution_authority(&mut product, Arc::clone(&governor), pool)?;
+            let held = governor.try_admit_owned(
+                WorkloadClass::ForegroundPoint,
+                hyphae_native_runtime::GovernorRequest {
+                    compute_threads: 0,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+            )?;
+            let reader = thread::spawn(move || {
+                product.dispatch(
+                    &mut session,
+                    &context,
+                    ProductOperation::StructureGet {
+                        key: b"queued-product-read".to_vec(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+            let queued = wait_for_database_queue(&governor, 1);
+            drop(held);
+            let response = reader
+                .join()
+                .map_err(|_| "queued product read panicked")?
+                .map_err(|error| format!("queued product read failed: {error}"))?;
+            assert!(queued, "the product read must wait for database admission");
+            assert_eq!(
+                response,
+                ProductResponse::StructureValue(Some(b"value".to_vec()))
+            );
+            let usage = governor.usage_snapshot();
+            assert_eq!(usage.compute_threads, 0, "{usage:?}");
+            assert_eq!(usage.io_slots, 0, "{usage:?}");
+            assert_eq!(usage.memory_bytes, 0, "{usage:?}");
+            assert_eq!(usage.queued_requests, 0, "{usage:?}");
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
 
     #[derive(Clone, Copy, Debug, Default)]
     struct CountEvidence(u64);

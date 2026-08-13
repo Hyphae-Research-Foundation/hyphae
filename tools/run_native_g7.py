@@ -1400,7 +1400,8 @@ def validate_execution_authority_evidence(
     background: bool,
 ) -> None:
     fields = {
-        "status", "topology_digest", "runner_executable_blake3",
+        "status", "database_queue_wait_millis", "topology_digest",
+        "runner_executable_blake3",
         "calibration_executable_blake3", "installations", "installed_surfaces",
         "registered_pools", "local_dispatches", "stolen_dispatches",
         "completed_jobs", "numa_steal_status",
@@ -1409,6 +1410,12 @@ def validate_execution_authority_evidence(
         raise RuntimeError("G7 execution authority evidence fields mismatch")
     if evidence["status"] != "measured":
         raise RuntimeError("G7 execution authority was not measured")
+    if (
+        not isinstance(evidence["database_queue_wait_millis"], int)
+        or isinstance(evidence["database_queue_wait_millis"], bool)
+        or evidence["database_queue_wait_millis"] != 60_000
+    ):
+        raise RuntimeError("G7 execution authority database queue wait differs")
     if (
         evidence["runner_executable_blake3"] != calibration_executable_blake3
         or evidence["calibration_executable_blake3"] != calibration_executable_blake3

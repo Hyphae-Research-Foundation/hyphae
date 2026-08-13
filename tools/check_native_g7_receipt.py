@@ -1593,7 +1593,8 @@ def validate_execution_authority_evidence(
 ) -> None:
     """Validate the single calibrated execution authority used by one G7 cell."""
     fields = {
-        "status", "topology_digest", "runner_executable_blake3",
+        "status", "database_queue_wait_millis", "topology_digest",
+        "runner_executable_blake3",
         "calibration_executable_blake3", "installations", "installed_surfaces",
         "registered_pools", "local_dispatches", "stolen_dispatches",
         "completed_jobs", "numa_steal_status",
@@ -1602,6 +1603,12 @@ def validate_execution_authority_evidence(
         raise GateFailure("G7 execution authority evidence fields mismatch")
     if not isinstance(initial_ann_bulk, dict):
         raise GateFailure("G7 execution authority has no ANN topology authority")
+    if (
+        not isinstance(evidence["database_queue_wait_millis"], int)
+        or isinstance(evidence["database_queue_wait_millis"], bool)
+        or evidence["database_queue_wait_millis"] != 60_000
+    ):
+        raise GateFailure("G7 execution authority database queue wait differs")
     runner = evidence["runner_executable_blake3"]
     calibration = evidence["calibration_executable_blake3"]
     if (
