@@ -285,6 +285,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
 - [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
 - [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
+- [ADR-0026: Bounded calibration resampling](adr/0026-calibration-resampling-policy.md)
 - [ADR-0027: Parallel search seed cohorts](adr/0027-parallel-search-seed-cohorts.md)
 
 ## Documentation contract
