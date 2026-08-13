@@ -7,8 +7,8 @@
 //! without serializing an opaque third-party index.
 
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     ops::ControlFlow,
 };
 
@@ -17,6 +17,9 @@ thread_local! {
     static SEARCH_SCRATCH_PEAKS: std::cell::Cell<(usize, usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0, 0)) };
     static ROUTING_QUERY_WORK: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    #[cfg(test)]
+    static SEARCH_QUERY_WORK: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
 }
 
@@ -59,6 +62,25 @@ fn reset_routing_query_work_for_test() {
 #[cfg(test)]
 fn routing_query_work_for_test() -> (usize, usize) {
     ROUTING_QUERY_WORK.get()
+}
+
+#[cfg(test)]
+fn record_search_distance_work_for_test(components: usize) {
+    let (evaluations, visited_components) = SEARCH_QUERY_WORK.get();
+    SEARCH_QUERY_WORK.set((
+        evaluations.saturating_add(1),
+        visited_components.saturating_add(components),
+    ));
+}
+
+#[cfg(test)]
+fn reset_search_query_work_for_test() {
+    SEARCH_QUERY_WORK.set((0, 0));
+}
+
+#[cfg(test)]
+fn search_query_work_for_test() -> (usize, usize) {
+    SEARCH_QUERY_WORK.get()
 }
 
 use hyphae_native_types::{Csn, ObjectId};
@@ -527,6 +549,132 @@ impl GraphNode {
 struct Candidate {
     object_id: ObjectId,
     distance: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OrderedCandidate(Candidate);
+
+impl PartialEq for OrderedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        compare_candidates(&self.0, &other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for OrderedCandidate {}
+
+impl PartialOrd for OrderedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_candidates(&self.0, &other.0)
+    }
+}
+
+trait QueryDistance {
+    fn distance_to(&self, vector: &Vector) -> Result<f64, AnnError>;
+}
+
+struct DenseDistanceQuery<'query> {
+    metric: Metric,
+    query: &'query Vector,
+}
+
+impl QueryDistance for DenseDistanceQuery<'_> {
+    fn distance_to(&self, vector: &Vector) -> Result<f64, AnnError> {
+        distance(self.metric, self.query, vector)
+    }
+}
+
+enum PreparedDistanceComponents {
+    Dense,
+    Sparse(Box<[(usize, f64)]>),
+}
+
+struct PreparedDistanceQuery<'query> {
+    metric: Metric,
+    query: &'query Vector,
+    cosine_query_norm: f64,
+    components: PreparedDistanceComponents,
+}
+
+impl<'query> PreparedDistanceQuery<'query> {
+    fn new(metric: Metric, query: &'query Vector) -> Self {
+        let components = if matches!(metric, Metric::Cosine | Metric::NegativeDot) {
+            // A prepared sparse query must never reserve more memory than its
+            // dense input. Stop at the first component beyond that threshold
+            // instead of collecting a transient unbounded sparse copy.
+            let sparse_capacity = query.dimension().saturating_mul(std::mem::size_of::<f32>())
+                / std::mem::size_of::<(usize, f64)>();
+            let mut sparse = Vec::with_capacity(sparse_capacity);
+            let mut sparse_capacity_exceeded = false;
+            for (index, value) in query.values().iter().enumerate() {
+                if *value != 0.0 {
+                    if sparse.len() == sparse_capacity {
+                        sparse_capacity_exceeded = true;
+                        break;
+                    }
+                    sparse.push((index, f64::from(*value)));
+                }
+            }
+            if sparse_capacity_exceeded {
+                PreparedDistanceComponents::Dense
+            } else {
+                PreparedDistanceComponents::Sparse(sparse.into_boxed_slice())
+            }
+        } else {
+            PreparedDistanceComponents::Dense
+        };
+        Self {
+            metric,
+            query,
+            cosine_query_norm: if metric == Metric::Cosine {
+                query.norm_squared.sqrt()
+            } else {
+                0.0
+            },
+            components,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_sparse(&self) -> bool {
+        matches!(self.components, PreparedDistanceComponents::Sparse(_))
+    }
+}
+
+impl QueryDistance for PreparedDistanceQuery<'_> {
+    fn distance_to(&self, vector: &Vector) -> Result<f64, AnnError> {
+        if self.query.dimension() != vector.dimension() {
+            return Err(AnnError::DimensionMismatch);
+        }
+        let PreparedDistanceComponents::Sparse(components) = &self.components else {
+            return distance(self.metric, self.query, vector);
+        };
+        #[cfg(test)]
+        record_search_distance_work_for_test(components.len());
+        let dot = components
+            .iter()
+            .map(|(index, value)| *value * f64::from(vector.values()[*index]))
+            .sum::<f64>();
+        match self.metric {
+            Metric::Cosine => {
+                if self.query.norm_squared == 0.0 || vector.norm_squared == 0.0 {
+                    return Err(AnnError::ZeroCosineVector);
+                }
+                Ok(1.0 - dot / (self.cosine_query_norm * vector.norm_squared.sqrt()))
+            }
+            // Dense accumulation can finish at negative zero because zero
+            // products retain an operand sign. Re-run that exact edge rather
+            // than letting sparse omission change the observable distance bit.
+            Metric::NegativeDot if dot == 0.0 => distance(self.metric, self.query, vector),
+            Metric::NegativeDot => Ok(-dot),
+            Metric::SquaredL2 => Err(AnnError::CorruptGraph),
+        }
+    }
 }
 
 /// Deterministic in-memory HNSW generation.
@@ -1398,10 +1546,11 @@ impl HnswIndex {
                 hits: Vec::new(),
             });
         };
+        let query = PreparedDistanceQuery::new(self.definition.metric, query);
         let mut visited = BTreeSet::new();
         visited.insert(current);
         for layer in (1..=self.max_level).rev() {
-            current = self.greedy_at_layer(query, current, layer, &mut visited)?;
+            current = self.greedy_at_layer(&query, current, layer, &mut visited)?;
         }
         let breadth = options
             .exact_rerank
@@ -1409,7 +1558,7 @@ impl HnswIndex {
             .max(options.k);
         let mut candidates = if let Some(allowlist) = allowlist {
             self.search_layer_filtered(
-                query,
+                &query,
                 &[current],
                 options.ef_search.max(breadth),
                 allowlist,
@@ -1417,7 +1566,7 @@ impl HnswIndex {
             )?
         } else {
             self.search_layer(
-                query,
+                &query,
                 &[current],
                 0,
                 options.ef_search.max(breadth),
@@ -1431,11 +1580,7 @@ impl HnswIndex {
         if let Some(rerank_count) = options.exact_rerank {
             candidates.truncate(rerank_count);
             for candidate in &mut candidates {
-                candidate.distance = distance(
-                    self.definition.metric,
-                    query,
-                    &self.entry(candidate.object_id)?.vector,
-                )?;
+                candidate.distance = query.distance_to(&self.entry(candidate.object_id)?.vector)?;
             }
             candidates.sort_by(compare_candidates);
         }
@@ -1631,6 +1776,10 @@ impl HnswIndex {
             return Ok(());
         };
         let query = self.entry(object_id)?.vector.clone();
+        let query_distance = DenseDistanceQuery {
+            metric: self.definition.metric,
+            query: &query,
+        };
         let previous_max_level = self.max_level;
         self.nodes.insert(object_id, GraphNode::new(level));
 
@@ -1638,13 +1787,14 @@ impl HnswIndex {
         visited.insert(entry_point);
         if previous_max_level > level {
             for layer in ((level + 1)..=previous_max_level).rev() {
-                entry_point = self.greedy_at_layer(&query, entry_point, layer, &mut visited)?;
+                entry_point =
+                    self.greedy_at_layer(&query_distance, entry_point, layer, &mut visited)?;
             }
         }
         let highest_shared_layer = level.min(previous_max_level);
         for layer in (0..=highest_shared_layer).rev() {
             let candidates = self.search_layer(
-                &query,
+                &query_distance,
                 &[entry_point],
                 layer,
                 usize::from(self.definition.config.ef_construction),
@@ -1741,13 +1891,12 @@ impl HnswIndex {
 
     fn greedy_at_layer(
         &self,
-        query: &Vector,
+        query: &impl QueryDistance,
         mut current: ObjectId,
         layer: u16,
         visited: &mut BTreeSet<ObjectId>,
     ) -> Result<ObjectId, AnnError> {
-        let mut current_distance =
-            distance(self.definition.metric, query, &self.entry(current)?.vector)?;
+        let mut current_distance = query.distance_to(&self.entry(current)?.vector)?;
         loop {
             let mut best = Candidate {
                 object_id: current,
@@ -1762,11 +1911,7 @@ impl HnswIndex {
                 visited.insert(*neighbor);
                 let candidate = Candidate {
                     object_id: *neighbor,
-                    distance: distance(
-                        self.definition.metric,
-                        query,
-                        &self.entry(*neighbor)?.vector,
-                    )?,
+                    distance: query.distance_to(&self.entry(*neighbor)?.vector)?,
                 };
                 if compare_candidates(&candidate, &best) == Ordering::Less {
                     best = candidate;
@@ -1782,35 +1927,30 @@ impl HnswIndex {
 
     fn search_layer(
         &self,
-        query: &Vector,
+        query: &impl QueryDistance,
         entry_points: &[ObjectId],
         layer: u16,
         breadth: usize,
         visited: &mut BTreeSet<ObjectId>,
     ) -> Result<Vec<Candidate>, AnnError> {
         let mut layer_visited = BTreeSet::new();
-        let mut frontier = Vec::new();
-        let mut best = Vec::new();
+        let mut frontier = BinaryHeap::new();
+        let mut best = BinaryHeap::new();
         for entry_point in entry_points {
             if !self.nodes.contains_key(entry_point) {
                 return Err(AnnError::CorruptGraph);
             }
-            layer_visited.insert(*entry_point);
+            if !layer_visited.insert(*entry_point) {
+                continue;
+            }
             visited.insert(*entry_point);
             let candidate = Candidate {
                 object_id: *entry_point,
-                distance: distance(
-                    self.definition.metric,
-                    query,
-                    &self.entry(*entry_point)?.vector,
-                )?,
+                distance: query.distance_to(&self.entry(*entry_point)?.vector)?,
             };
-            frontier.push(candidate);
-            best.push(candidate);
+            frontier.push(Reverse(OrderedCandidate(candidate)));
+            push_bounded_candidate(&mut best, candidate, breadth);
         }
-        sort_and_deduplicate_candidates(&mut frontier);
-        sort_and_deduplicate_candidates(&mut best);
-        best.truncate(breadth);
         #[cfg(test)]
         record_search_scratch(
             visited.len(),
@@ -1818,13 +1958,11 @@ impl HnswIndex {
             frontier.len(),
             best.len(),
         );
-        while !frontier.is_empty() {
-            frontier.sort_by(compare_candidates);
-            let candidate = frontier.remove(0);
+        while let Some(Reverse(OrderedCandidate(candidate))) = frontier.pop() {
             if best.len() >= breadth
-                && best
-                    .last()
-                    .is_some_and(|worst| compare_candidates(&candidate, worst) == Ordering::Greater)
+                && best.peek().is_some_and(|worst| {
+                    compare_candidates(&candidate, &worst.0) == Ordering::Greater
+                })
             {
                 break;
             }
@@ -1840,22 +1978,15 @@ impl HnswIndex {
                 visited.insert(*neighbor);
                 let neighbor = Candidate {
                     object_id: *neighbor,
-                    distance: distance(
-                        self.definition.metric,
-                        query,
-                        &self.entry(*neighbor)?.vector,
-                    )?,
+                    distance: query.distance_to(&self.entry(*neighbor)?.vector)?,
                 };
                 let admitted = best.len() < breadth
-                    || best.last().is_some_and(|worst| {
-                        compare_candidates(&neighbor, worst) == Ordering::Less
+                    || best.peek().is_some_and(|worst| {
+                        compare_candidates(&neighbor, &worst.0) == Ordering::Less
                     });
                 if admitted {
-                    frontier.push(neighbor);
-                    best.push(neighbor);
-                    best.sort_by(compare_candidates);
-                    best.dedup_by_key(|candidate| candidate.object_id);
-                    best.truncate(breadth);
+                    frontier.push(Reverse(OrderedCandidate(neighbor)));
+                    push_bounded_candidate(&mut best, neighbor, breadth);
                 }
             }
             #[cfg(test)]
@@ -1866,53 +1997,48 @@ impl HnswIndex {
                 best.len(),
             );
         }
-        Ok(best)
+        Ok(best
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| candidate.0)
+            .collect())
     }
 
     fn search_layer_filtered(
         &self,
-        query: &Vector,
+        query: &impl QueryDistance,
         entry_points: &[ObjectId],
         breadth: usize,
         allowlist: &BTreeSet<ObjectId>,
         visited: &mut BTreeSet<ObjectId>,
     ) -> Result<Vec<Candidate>, AnnError> {
         let mut layer_visited = BTreeSet::new();
-        let mut frontier = Vec::new();
-        let mut navigation = Vec::new();
-        let mut eligible = Vec::new();
+        let mut frontier = BinaryHeap::new();
+        let mut navigation = BinaryHeap::new();
+        let mut eligible = BinaryHeap::new();
         for entry_point in entry_points {
             if !self.nodes.contains_key(entry_point) {
                 return Err(AnnError::CorruptGraph);
             }
-            layer_visited.insert(*entry_point);
+            if !layer_visited.insert(*entry_point) {
+                continue;
+            }
             visited.insert(*entry_point);
             let candidate = Candidate {
                 object_id: *entry_point,
-                distance: distance(
-                    self.definition.metric,
-                    query,
-                    &self.entry(*entry_point)?.vector,
-                )?,
+                distance: query.distance_to(&self.entry(*entry_point)?.vector)?,
             };
-            frontier.push(candidate);
-            navigation.push(candidate);
+            frontier.push(Reverse(OrderedCandidate(candidate)));
+            push_bounded_candidate(&mut navigation, candidate, breadth);
             if allowlist.contains(entry_point) {
-                eligible.push(candidate);
+                push_bounded_candidate(&mut eligible, candidate, breadth);
             }
         }
-        sort_and_deduplicate_candidates(&mut frontier);
-        sort_and_deduplicate_candidates(&mut navigation);
-        sort_and_deduplicate_candidates(&mut eligible);
-        navigation.truncate(breadth);
-        eligible.truncate(breadth);
-        while !frontier.is_empty() {
-            frontier.sort_by(compare_candidates);
-            let candidate = frontier.remove(0);
+        while let Some(Reverse(OrderedCandidate(candidate))) = frontier.pop() {
             if navigation.len() >= breadth
-                && navigation
-                    .last()
-                    .is_some_and(|worst| compare_candidates(&candidate, worst) == Ordering::Greater)
+                && navigation.peek().is_some_and(|worst| {
+                    compare_candidates(&candidate, &worst.0) == Ordering::Greater
+                })
                 && eligible.len() >= breadth
             {
                 break;
@@ -1929,34 +2055,28 @@ impl HnswIndex {
                 visited.insert(*neighbor);
                 let neighbor = Candidate {
                     object_id: *neighbor,
-                    distance: distance(
-                        self.definition.metric,
-                        query,
-                        &self.entry(*neighbor)?.vector,
-                    )?,
+                    distance: query.distance_to(&self.entry(*neighbor)?.vector)?,
                 };
                 let navigation_admitted = navigation.len() < breadth
-                    || navigation.last().is_some_and(|worst| {
-                        compare_candidates(&neighbor, worst) == Ordering::Less
+                    || navigation.peek().is_some_and(|worst| {
+                        compare_candidates(&neighbor, &worst.0) == Ordering::Less
                     });
                 if navigation_admitted || allowlist.contains(&neighbor.object_id) {
-                    frontier.push(neighbor);
+                    frontier.push(Reverse(OrderedCandidate(neighbor)));
                 }
                 if navigation_admitted {
-                    navigation.push(neighbor);
-                    navigation.sort_by(compare_candidates);
-                    navigation.dedup_by_key(|candidate| candidate.object_id);
-                    navigation.truncate(breadth);
+                    push_bounded_candidate(&mut navigation, neighbor, breadth);
                 }
                 if allowlist.contains(&neighbor.object_id) {
-                    eligible.push(neighbor);
-                    eligible.sort_by(compare_candidates);
-                    eligible.dedup_by_key(|candidate| candidate.object_id);
-                    eligible.truncate(breadth);
+                    push_bounded_candidate(&mut eligible, neighbor, breadth);
                 }
             }
         }
-        Ok(eligible)
+        Ok(eligible
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| candidate.0)
+            .collect())
     }
 
     fn level_for(&self, object_id: ObjectId) -> u16 {
@@ -3280,6 +3400,8 @@ fn distance(metric: Metric, left: &Vector, right: &Vector) -> Result<f64, AnnErr
     if left.dimension() != right.dimension() {
         return Err(AnnError::DimensionMismatch);
     }
+    #[cfg(test)]
+    record_search_distance_work_for_test(left.dimension());
     match metric {
         Metric::Cosine => {
             let mut dot = 0.0_f64;
@@ -3317,6 +3439,17 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| left.object_id.cmp(&right.object_id))
 }
 
+fn push_bounded_candidate(
+    candidates: &mut BinaryHeap<OrderedCandidate>,
+    candidate: Candidate,
+    breadth: usize,
+) {
+    candidates.push(OrderedCandidate(candidate));
+    if candidates.len() > breadth {
+        candidates.pop();
+    }
+}
+
 fn strategy(allowlist: Option<&BTreeSet<ObjectId>>) -> AnnSearchStrategy {
     if allowlist.is_some() {
         AnnSearchStrategy::StableIdEligibilityTraversal
@@ -3339,6 +3472,7 @@ fn compare_hits(left: &VectorHit, right: &VectorHit) -> Ordering {
         .then_with(|| left.object_id.cmp(&right.object_id))
 }
 
+#[cfg(test)]
 fn sort_and_deduplicate_candidates(candidates: &mut Vec<Candidate>) {
     candidates.sort_by(compare_candidates);
     candidates.dedup_by_key(|candidate| candidate.object_id);
@@ -3351,12 +3485,171 @@ mod tests {
     use hyphae_native_types::{Csn, ObjectId};
 
     use super::{
-        AnnError, AnnRecallRisk, AnnSearchStrategy, HnswConfig, HnswIndex, HnswPartitionPlan,
-        HnswPartitionSummary, Metric, PartitionRoutingQuery, PartitionedAnnRoutingOutcome,
-        PartitionedHnswIndex, SearchOptions, Vector, VectorIndexDefinition, VectorRecord, distance,
+        AnnError, AnnRecallRisk, AnnSearchStrategy, Candidate, HnswConfig, HnswIndex,
+        HnswPartitionPlan, HnswPartitionSummary, Metric, PartitionRoutingQuery,
+        PartitionedAnnRoutingOutcome, PartitionedHnswIndex, PreparedDistanceQuery, QueryDistance,
+        SearchOptions, Vector, VectorIndexDefinition, VectorRecord, compare_candidates, distance,
         partition_routing_lower_bound, reset_routing_query_work_for_test,
-        routing_query_work_for_test, search_scratch_peaks,
+        reset_search_query_work_for_test, routing_query_work_for_test, search_query_work_for_test,
+        search_scratch_peaks, sort_and_deduplicate_candidates,
     };
+
+    fn vector_search_layer_reference(
+        index: &HnswIndex,
+        query: &impl QueryDistance,
+        entry_points: &[ObjectId],
+        layer: u16,
+        breadth: usize,
+        visited: &mut BTreeSet<ObjectId>,
+    ) -> Result<Vec<Candidate>, AnnError> {
+        let mut layer_visited = BTreeSet::new();
+        let mut frontier = Vec::new();
+        let mut best = Vec::new();
+        for entry_point in entry_points {
+            if !index.nodes.contains_key(entry_point) {
+                return Err(AnnError::CorruptGraph);
+            }
+            layer_visited.insert(*entry_point);
+            visited.insert(*entry_point);
+            let candidate = Candidate {
+                object_id: *entry_point,
+                distance: query.distance_to(&index.entry(*entry_point)?.vector)?,
+            };
+            frontier.push(candidate);
+            best.push(candidate);
+        }
+        sort_and_deduplicate_candidates(&mut frontier);
+        sort_and_deduplicate_candidates(&mut best);
+        best.truncate(breadth);
+        while !frontier.is_empty() {
+            frontier.sort_by(compare_candidates);
+            let candidate = frontier.remove(0);
+            if best.len() >= breadth
+                && best
+                    .last()
+                    .is_some_and(|worst| compare_candidates(&candidate, worst).is_gt())
+            {
+                break;
+            }
+            let neighbors = index
+                .nodes
+                .get(&candidate.object_id)
+                .and_then(|node| node.neighbors.get(usize::from(layer)))
+                .ok_or(AnnError::CorruptGraph)?;
+            for neighbor in neighbors {
+                if !layer_visited.insert(*neighbor) {
+                    continue;
+                }
+                visited.insert(*neighbor);
+                let neighbor = Candidate {
+                    object_id: *neighbor,
+                    distance: query.distance_to(&index.entry(*neighbor)?.vector)?,
+                };
+                let admitted = best.len() < breadth
+                    || best
+                        .last()
+                        .is_some_and(|worst| compare_candidates(&neighbor, worst).is_lt());
+                if admitted {
+                    frontier.push(neighbor);
+                    best.push(neighbor);
+                    best.sort_by(compare_candidates);
+                    best.dedup_by_key(|candidate| candidate.object_id);
+                    best.truncate(breadth);
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    fn vector_filtered_search_layer_reference(
+        index: &HnswIndex,
+        query: &impl QueryDistance,
+        entry_points: &[ObjectId],
+        breadth: usize,
+        allowlist: &BTreeSet<ObjectId>,
+        visited: &mut BTreeSet<ObjectId>,
+    ) -> Result<Vec<Candidate>, AnnError> {
+        let mut layer_visited = BTreeSet::new();
+        let mut frontier = Vec::new();
+        let mut navigation = Vec::new();
+        let mut eligible = Vec::new();
+        for entry_point in entry_points {
+            if !index.nodes.contains_key(entry_point) {
+                return Err(AnnError::CorruptGraph);
+            }
+            layer_visited.insert(*entry_point);
+            visited.insert(*entry_point);
+            let candidate = Candidate {
+                object_id: *entry_point,
+                distance: query.distance_to(&index.entry(*entry_point)?.vector)?,
+            };
+            frontier.push(candidate);
+            navigation.push(candidate);
+            if allowlist.contains(entry_point) {
+                eligible.push(candidate);
+            }
+        }
+        sort_and_deduplicate_candidates(&mut frontier);
+        sort_and_deduplicate_candidates(&mut navigation);
+        sort_and_deduplicate_candidates(&mut eligible);
+        navigation.truncate(breadth);
+        eligible.truncate(breadth);
+        while !frontier.is_empty() {
+            frontier.sort_by(compare_candidates);
+            let candidate = frontier.remove(0);
+            if navigation.len() >= breadth
+                && navigation
+                    .last()
+                    .is_some_and(|worst| compare_candidates(&candidate, worst).is_gt())
+                && eligible.len() >= breadth
+            {
+                break;
+            }
+            let neighbors = index
+                .nodes
+                .get(&candidate.object_id)
+                .and_then(|node| node.neighbors.first())
+                .ok_or(AnnError::CorruptGraph)?;
+            for neighbor in neighbors {
+                if !layer_visited.insert(*neighbor) {
+                    continue;
+                }
+                visited.insert(*neighbor);
+                let neighbor = Candidate {
+                    object_id: *neighbor,
+                    distance: query.distance_to(&index.entry(*neighbor)?.vector)?,
+                };
+                let navigation_admitted = navigation.len() < breadth
+                    || navigation
+                        .last()
+                        .is_some_and(|worst| compare_candidates(&neighbor, worst).is_lt());
+                if navigation_admitted || allowlist.contains(&neighbor.object_id) {
+                    frontier.push(neighbor);
+                }
+                if navigation_admitted {
+                    navigation.push(neighbor);
+                    navigation.sort_by(compare_candidates);
+                    navigation.dedup_by_key(|candidate| candidate.object_id);
+                    navigation.truncate(breadth);
+                }
+                if allowlist.contains(&neighbor.object_id) {
+                    eligible.push(neighbor);
+                    eligible.sort_by(compare_candidates);
+                    eligible.dedup_by_key(|candidate| candidate.object_id);
+                    eligible.truncate(breadth);
+                }
+            }
+        }
+        Ok(eligible)
+    }
+
+    fn assert_candidates_bitwise_equal(left: &[Candidate], right: &[Candidate]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.object_id, right.object_id);
+            assert_eq!(left.distance.to_bits(), right.distance.to_bits());
+        }
+    }
 
     fn object(value: u128) -> Result<ObjectId, Box<dyn std::error::Error>> {
         Ok(ObjectId::new(value)?)
@@ -4323,6 +4616,156 @@ mod tests {
             assert!(cardinality <= index.len());
         }
         assert!(best <= options.ef_search());
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_query_search_visits_only_nonzero_components() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let definition = VectorIndexDefinition::new(
+            object(1_010)?,
+            384,
+            Metric::Cosine,
+            HnswConfig::new(16, 96, 64, 128, 0x5a_4ce)?,
+        )?;
+        let records = (1..=64_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 384)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let index = HnswIndex::build(definition, records)?;
+        let query = Vector::new(std::iter::once(1.0).chain(std::iter::repeat_n(0.0, 383)))?;
+
+        reset_search_query_work_for_test();
+        let result = index.search(&query, SearchOptions::new(10, 64, Some(10))?)?;
+        let (distance_evaluations, visited_components) = search_query_work_for_test();
+
+        assert_eq!(result.hits.len(), 10);
+        assert!(distance_evaluations > 0);
+        assert_eq!(visited_components, distance_evaluations);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_distance_is_bitwise_equal_to_dense_for_sparse_and_dense_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sparse = Vector::new([1.0, -0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0])?;
+        let at_sparse_limit = Vector::new([1.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0])?;
+        let over_sparse_limit = Vector::new([1.0, 0.0, 3.0, -2.0, 0.0, 0.0, 0.0, 0.0])?;
+        let zero = Vector::new([0.0; 8])?;
+        let comparison_vectors = [
+            Vector::new([-3.0, 0.0, 2.0, 0.25, -0.0, 4.0, -5.0, 6.0])?,
+            Vector::new([1.0, 0.0, 3.0, -2.0, 0.0, 0.0, 0.0, 0.0])?,
+            Vector::new([0.0, -1.0, 0.0, 2.0, 0.0, -3.0, 0.0, 4.0])?,
+        ];
+
+        for metric in [Metric::Cosine, Metric::NegativeDot, Metric::SquaredL2] {
+            for query in [&sparse, &at_sparse_limit, &over_sparse_limit] {
+                let prepared = PreparedDistanceQuery::new(metric, query);
+                assert_eq!(
+                    prepared.is_sparse(),
+                    metric != Metric::SquaredL2 && query != &over_sparse_limit
+                );
+                for vector in &comparison_vectors {
+                    assert_eq!(
+                        prepared.distance_to(vector)?.to_bits(),
+                        distance(metric, query, vector)?.to_bits(),
+                        "prepared and dense distance diverged for {metric:?}"
+                    );
+                }
+            }
+        }
+
+        let prepared_zero = PreparedDistanceQuery::new(Metric::NegativeDot, &zero);
+        assert!(prepared_zero.is_sparse());
+        for vector in &comparison_vectors {
+            assert_eq!(
+                prepared_zero.distance_to(vector)?.to_bits(),
+                distance(Metric::NegativeDot, &zero, vector)?.to_bits()
+            );
+        }
+        let cosine_zero = PreparedDistanceQuery::new(Metric::Cosine, &zero);
+        assert_eq!(
+            cosine_zero.distance_to(&comparison_vectors[0]),
+            Err(AnnError::ZeroCosineVector)
+        );
+
+        let tied_left = Vector::new([1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])?;
+        let tied_right = Vector::new([1.0, 2.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0])?;
+        let prepared = PreparedDistanceQuery::new(Metric::Cosine, &at_sparse_limit);
+        assert_eq!(
+            prepared.distance_to(&tied_left)?.to_bits(),
+            prepared.distance_to(&tied_right)?.to_bits()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heap_search_layers_match_the_previous_vec_reference_bitwise()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for metric in [Metric::Cosine, Metric::NegativeDot, Metric::SquaredL2] {
+            let definition = VectorIndexDefinition::new(
+                object(1_020 + metric as u128)?,
+                8,
+                metric,
+                HnswConfig::new(16, 96, 32, 64, 0x5e_a4c)?,
+            )?;
+            let records = (1..=128_u16)
+                .map(|value| {
+                    Ok(VectorRecord {
+                        object_id: object(u128::from(value))?,
+                        creating_csn: csn(u64::from(value))?,
+                        vector: deterministic_vector(value, 8)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let index = HnswIndex::build(definition, records)?;
+            let query_vector = deterministic_vector(129, 8)?;
+            let query = PreparedDistanceQuery::new(metric, &query_vector);
+            let entry = index.entry_point.ok_or(AnnError::CorruptGraph)?;
+
+            let mut reference_visited = BTreeSet::new();
+            let reference = vector_search_layer_reference(
+                &index,
+                &query,
+                &[entry, entry],
+                0,
+                32,
+                &mut reference_visited,
+            )?;
+            let mut heap_visited = BTreeSet::new();
+            let heap = index.search_layer(&query, &[entry, entry], 0, 32, &mut heap_visited)?;
+            assert_candidates_bitwise_equal(&heap, &reference);
+            assert_eq!(heap_visited, reference_visited);
+
+            let allowlist = (1..=128_u128)
+                .filter(|value| value % 3 == 0)
+                .map(object)
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            let mut reference_filtered_visited = BTreeSet::new();
+            let reference_filtered = vector_filtered_search_layer_reference(
+                &index,
+                &query,
+                &[entry, entry],
+                32,
+                &allowlist,
+                &mut reference_filtered_visited,
+            )?;
+            let mut heap_filtered_visited = BTreeSet::new();
+            let heap_filtered = index.search_layer_filtered(
+                &query,
+                &[entry, entry],
+                32,
+                &allowlist,
+                &mut heap_filtered_visited,
+            )?;
+            assert_candidates_bitwise_equal(&heap_filtered, &reference_filtered);
+            assert_eq!(heap_filtered_visited, reference_filtered_visited);
+        }
         Ok(())
     }
 
