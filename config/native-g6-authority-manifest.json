@@ -27,7 +27,7 @@
     {"reference": "docs/gates/native-local-phase-1.md", "sha256": "5db43af78b2415b7b0d72f2c2e4954e24f30db3f8bfa469326ee64336300f1f0"},
     {"reference": "docs/adr/0023-native-local-product-and-competitive-scope.md", "sha256": "c4fc93447a3bbf109668c50b86a0f8031dacccc99fc87d6d028189098c03a3a0"},
     {"reference": "docs/roadmaps/native-g6-roadmap.md", "sha256": "67a44336d3ad70e14a57e607c6d73a909192328995df65d4cb5ee2451a8a9ea1"},
-    {"reference": "docs/native/local-product-v1.md", "sha256": "cf2ddab51850c5c1b9096e364d236444a6736a549a9cf9b5ccfcdfc6cc8cb485"},
+    {"reference": "docs/native/local-product-v1.md", "sha256": "207bf6e8c57d3f68d687770925d041e70eb0eef7e5fc71c38770f15f3f33d511"},
     {"reference": "docs/native/product-error-v1.md", "sha256": "1b64fd58d8e8e8cc48813443dede0c1ac45ca525db0849863b483612bfd800b8"},
     {"reference": "docs/native/catalog-api-v1.md", "sha256": "2201193d3dad3367c95bb4d9f044410c32c0363856176b44ee3a79dc7e645084"},
     {"reference": "docs/native/explain-v1.md", "sha256": "942245c0ac08bc6b22648cc633c6eff78e17351ba497b5ea5fe866d3f261db60"},
