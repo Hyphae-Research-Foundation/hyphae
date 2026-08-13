@@ -18532,6 +18532,32 @@ impl NativeDatabase {
         Ok(())
     }
 
+    fn validate_scheduled_cohort_batch(
+        &self,
+        batch: &NativeWriteBatch,
+        require_memory_only: bool,
+    ) -> Result<(), NativeRuntimeError> {
+        self.validate_optimistic_batch_preflight(batch)?;
+        if batch.durability != DurabilityClass::Group {
+            return Err(NativeRuntimeError::GroupCommitRequiresGroupDurability);
+        }
+        match (&self.resource_governor, &batch.resource_permit) {
+            (Some(governor), Some(permit))
+                if permit.is_admitted_by(governor)
+                    && permit.class() == WorkloadClass::Mutation
+                    && (!require_memory_only
+                        || (permit.request().compute_threads == 0
+                            && permit.request().io_slots == 0
+                            && permit.request().memory_bytes
+                                == batch.scheduler_queue_retained_memory_bytes()?)) =>
+            {
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(NativeRuntimeError::InvalidPreparedMutation),
+        }
+    }
+
     /// Commits independent group-durability batches with one page and WAL sync.
     ///
     /// Semantic admission failures are returned in their original request
@@ -20324,10 +20350,10 @@ impl DerefMut for NativeTransaction<'_> {
 }
 
 impl NativeWriteBatch {
-    fn retain_scheduler_queue_memory(mut self) -> Result<Self, NativeRuntimeError> {
-        let retained_memory_bytes = match self.mode {
+    fn scheduler_queue_retained_memory_bytes(&self) -> Result<u64, NativeRuntimeError> {
+        match self.mode {
             NativeWriteBatchMode::PhysicalAllEngineDelta => {
-                let measured = replay_delta_retained_memory_bytes(&self);
+                let measured = replay_delta_retained_memory_bytes(self);
                 let ledger = self
                     .delta
                     .as_ref()
@@ -20336,14 +20362,18 @@ impl NativeWriteBatch {
                 if measured == u64::MAX || measured != ledger {
                     return Err(NativeRuntimeError::InvalidPreparedMutation);
                 }
-                measured.max(1)
+                Ok(measured.max(1))
             }
-            NativeWriteBatchMode::Materialized => self
+            NativeWriteBatchMode::Materialized => Ok(self
                 .resource_permit
                 .as_ref()
-                .map_or(1, |permit| permit.request().memory_bytes.max(1)),
-            _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
-        };
+                .map_or(1, |permit| permit.request().memory_bytes.max(1))),
+            _ => Err(NativeRuntimeError::InvalidPreparedMutation),
+        }
+    }
+
+    fn retain_scheduler_queue_memory(mut self) -> Result<Self, NativeRuntimeError> {
+        let retained_memory_bytes = self.scheduler_queue_retained_memory_bytes()?;
         let Some(permit) = self.resource_permit.take() else {
             return Ok(self);
         };
@@ -48197,6 +48227,351 @@ mod tests {
             batches.push(batch.into());
         }
         Ok(batches)
+    }
+
+    fn cohort_preparation_policy() -> NativeGovernorPolicy {
+        let mut policy = engine_admission_test_policy();
+        policy.schedulable_compute_threads = 2;
+        policy.io_slots = 2;
+        let mut mutation_limits = 0;
+        for limit in &mut policy.class_limits {
+            if limit.class == WorkloadClass::Mutation {
+                limit.compute_threads = 2;
+                limit.io_slots = 2;
+                mutation_limits += 1;
+            }
+        }
+        assert_eq!(mutation_limits, 1, "test policy mutation class drifted");
+        policy
+    }
+
+    fn prepare_retained_cohort(
+        client: &NativeCommitClient,
+        concurrency: usize,
+        prefix: &str,
+    ) -> Result<Vec<NativeCommitBatch>, Box<dyn std::error::Error>> {
+        const COHORT_SIZE: usize = 32;
+        let start = Arc::new(Barrier::new(concurrency));
+        let mut batches = std::thread::scope(|scope| {
+            let producers = (0..concurrency)
+                .map(|producer| {
+                    let client = client.clone();
+                    let start = Arc::clone(&start);
+                    scope.spawn(move || {
+                        start.wait();
+                        (producer..COHORT_SIZE)
+                            .step_by(concurrency)
+                            .map(|position| {
+                                let mut batch =
+                                    client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+                                client.stage_delta_set(
+                                    &mut batch,
+                                    format!("{prefix}-{concurrency}-{position}").into_bytes(),
+                                    b"visible".to_vec(),
+                                    None,
+                                )?;
+                                client
+                                    .retain_cohort_batch(batch)
+                                    .map(|batch| (position, batch))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            producers
+                .into_iter()
+                .map(|producer| {
+                    producer
+                        .join()
+                        .map_err(|_| "cohort preparation producer panicked")?
+                        .map_err(Into::into)
+                })
+                .collect::<Result<Vec<Vec<_>>, Box<dyn std::error::Error>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        batches.sort_unstable_by_key(|(position, _)| *position);
+        if batches.len() != COHORT_SIZE
+            || batches
+                .iter()
+                .enumerate()
+                .any(|(position, (observed, _))| position != *observed)
+        {
+            return Err("retained cohort lost canonical order".into());
+        }
+        Ok(batches.into_iter().map(|(_, batch)| batch).collect())
+    }
+
+    #[test]
+    fn explicit_cohort_preparation_releases_compute_and_io_at_c1_c8_c32()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for concurrency in [1_usize, 8, 32] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+            database.set_resource_governor_with_queue_wait(
+                Arc::clone(&governor),
+                Duration::from_secs(2),
+            )?;
+            let scheduler = NativeCommitScheduler::start(
+                database,
+                GroupCommitConfig::new(32, Duration::ZERO, 32)?
+                    .with_execution_admission_wait(Duration::from_secs(2))?,
+            )?;
+            let client = scheduler.client();
+            let batches = prepare_retained_cohort(&client, concurrency, "retained-cohort")?;
+            let retained = governor.usage_snapshot();
+            assert_eq!(retained.compute_threads, 0, "{retained:?}");
+            assert_eq!(retained.io_slots, 0, "{retained:?}");
+            assert!(retained.memory_bytes > 0, "{retained:?}");
+
+            let completions = client
+                .enqueue_cohort(batches)?
+                .into_iter()
+                .map(NativePendingCommit::wait_with_evidence)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(completions.len(), 32);
+            assert!(completions.iter().all(|completion| {
+                completion.receipt.durability_cohort_size == 32
+                    && completion.page_synchronizations == 1
+                    && completion.wal_synchronizations == 1
+            }));
+            assert_eq!(
+                completions
+                    .iter()
+                    .map(|completion| completion.receipt.durability_cohort_position)
+                    .collect::<Vec<_>>(),
+                (0..32).collect::<Vec<_>>()
+            );
+            scheduler.shutdown()?;
+            assert_eq!(governor.usage_snapshot().compute_threads, 0);
+            assert_eq!(governor.usage_snapshot().io_slots, 0);
+            assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_cohort_batches_are_idempotent_through_atomic_enqueue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+        database.set_resource_governor_with_queue_wait(
+            Arc::clone(&governor),
+            Duration::from_millis(200),
+        )?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(32, Duration::ZERO, 32)?
+                .with_execution_admission_wait(Duration::from_millis(200))?,
+        )?;
+        let client = scheduler.client();
+
+        let mut valid = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut valid,
+            b"retained-idempotent".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        let retained = client.retain_cohort_batch(valid)?;
+        let first_retention = governor.usage_snapshot();
+        assert_eq!(first_retention.compute_threads, 0);
+        assert_eq!(first_retention.io_slots, 0);
+        assert!(first_retention.memory_bytes > 0);
+        let retained = client.retain_cohort_batch(retained)?;
+        assert_eq!(governor.usage_snapshot(), first_retention);
+
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let pending = client.enqueue_cohort(vec![retained])?;
+        assert_eq!(governor.usage_snapshot(), first_retention);
+        drop(collection_guard);
+        assert_eq!(
+            pending
+                .into_iter()
+                .next()
+                .ok_or("missing pending")?
+                .wait()?
+                .commit_csn,
+            Csn::new(1)?
+        );
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        scheduler.shutdown()?;
+        let database = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            database.get_latest_structure(b"retained-idempotent", 2)?,
+            Some(b"visible".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_cohort_batch_rejects_non_group_and_malformed_without_leaks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+        database.set_resource_governor_with_queue_wait(
+            Arc::clone(&governor),
+            Duration::from_millis(200),
+        )?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(32, Duration::ZERO, 32)?,
+        )?;
+        let client = scheduler.client();
+        let mut non_group = client.begin_optimistic_delta(1, DurabilityClass::Memory)?;
+        client.stage_delta_set(
+            &mut non_group,
+            b"retained-non-group".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        assert!(matches!(
+            client.retain_cohort_batch(non_group),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::GroupCommitRequiresGroupDurability
+                )
+        ));
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+
+        let malformed = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        assert!(matches!(
+            client.retain_cohort_batch(malformed),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::WalSemantic(_)
+                        | NativeRuntimeError::InvalidPreparedMutation
+                )
+        ));
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_cohort_batch_rejects_foreign_retain_and_enqueue_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary_temporary = TestDirectory::new();
+        let mut primary_database = NativeDatabase::create(primary_temporary.path())?;
+        let primary_governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+        primary_database.set_resource_governor_with_queue_wait(
+            Arc::clone(&primary_governor),
+            Duration::from_millis(200),
+        )?;
+        let primary_scheduler = NativeCommitScheduler::start(
+            primary_database,
+            GroupCommitConfig::new(32, Duration::ZERO, 32)?,
+        )?;
+        let primary_client = primary_scheduler.client();
+        let mut foreign = primary_client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        primary_client.stage_delta_set(
+            &mut foreign,
+            b"retained-foreign".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        let foreign = primary_client.retain_cohort_batch(foreign)?;
+        assert!(primary_governor.usage_snapshot().memory_bytes > 0);
+
+        let secondary_temporary = TestDirectory::new();
+        let mut secondary_database = NativeDatabase::create(secondary_temporary.path())?;
+        let secondary_governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+        secondary_database.set_resource_governor_with_queue_wait(
+            Arc::clone(&secondary_governor),
+            Duration::from_millis(200),
+        )?;
+        let secondary_scheduler = NativeCommitScheduler::start(
+            secondary_database,
+            GroupCommitConfig::new(32, Duration::ZERO, 32)?
+                .with_execution_admission_wait(Duration::from_millis(200))?,
+        )?;
+        assert!(matches!(
+            secondary_scheduler
+                .client()
+                .retain_cohort_batch(foreign),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(source.as_ref(), NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(primary_governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(secondary_governor.usage_snapshot().memory_bytes, 0);
+
+        let mut foreign_enqueue =
+            primary_client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        primary_client.stage_delta_set(
+            &mut foreign_enqueue,
+            b"retained-foreign-enqueue".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        let foreign_enqueue = primary_client.retain_cohort_batch(foreign_enqueue)?;
+        assert!(matches!(
+            secondary_scheduler
+                .client()
+                .enqueue_cohort(vec![foreign_enqueue]),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(source.as_ref(), NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert_eq!(primary_governor.usage_snapshot().memory_bytes, 0);
+        assert_eq!(secondary_governor.usage_snapshot().memory_bytes, 0);
+
+        secondary_scheduler.shutdown()?;
+        primary_scheduler.shutdown()?;
+        let primary = NativeDatabase::open(primary_temporary.path())?;
+        assert_eq!(primary.get_latest_structure(b"retained-foreign", 2)?, None);
+        assert_eq!(
+            primary.get_latest_structure(b"retained-foreign-enqueue", 2)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_explicit_cohort_cancellation_releases_all_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(cohort_preparation_policy()));
+        database.set_resource_governor_with_queue_wait(
+            Arc::clone(&governor),
+            Duration::from_millis(200),
+        )?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(2, Duration::ZERO, 2)?
+                .with_execution_admission_wait(Duration::from_millis(200))?,
+        )?;
+        let client = scheduler.client();
+        let batches = staged_group_delta_batches(&client, 1, 2, "retained-cancel")?
+            .into_iter()
+            .map(|batch| client.retain_cohort_batch(batch))
+            .collect::<Result<Vec<_>, _>>()?;
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let mut pending = client.enqueue_cohort(batches)?;
+        let cancelled = pending.remove(0);
+        assert_eq!(cancelled.cancel(), CommitCancellationOutcome::Cancelled);
+        drop(collection_guard);
+        assert!(matches!(
+            cancelled.wait(),
+            Err(GroupCommitSubmitError::Cancelled)
+        ));
+        let completion = pending
+            .pop()
+            .ok_or("missing uncancelled cohort member")?
+            .wait_with_evidence()?;
+        assert_eq!(completion.receipt.durability_cohort_size, 1);
+        assert_eq!(completion.page_synchronizations, 1);
+        assert_eq!(completion.wal_synchronizations, 1);
+        scheduler.shutdown()?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        Ok(())
     }
 
     #[test]

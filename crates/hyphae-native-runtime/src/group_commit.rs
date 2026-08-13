@@ -879,6 +879,45 @@ impl NativeCommitClient {
         )
     }
 
+    /// Seals one fully staged group batch for later explicit-cohort submission.
+    ///
+    /// The returned opaque batch can no longer be staged or mutated. It is not
+    /// queued: it retains only its bounded memory while compute and I/O
+    /// capacity are released for preparation of the remaining cohort members.
+    /// [`Self::enqueue_cohort`] remains the single atomic queue boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stopped scheduler, foreign or malformed batch authority,
+    /// non-group durability, or a batch whose admission cannot be reduced to
+    /// its bounded memory-only retained state.
+    pub fn retain_cohort_batch(
+        &self,
+        batch: impl Into<NativeCommitBatch>,
+    ) -> Result<NativeCommitBatch, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let batch = batch.into().into_inner();
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        let database = database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?;
+        database
+            .validate_scheduled_cohort_batch(&batch, false)
+            .map_err(GroupCommitSubmitError::runtime)?;
+        let batch = batch
+            .retain_scheduler_queue_memory()
+            .map_err(GroupCommitSubmitError::runtime)?;
+        database
+            .validate_scheduled_cohort_batch(&batch, true)
+            .map_err(GroupCommitSubmitError::runtime)?;
+        Ok(NativeCommitBatch::from(batch))
+    }
+
     /// Atomically enqueues one explicit group-durability cohort.
     ///
     /// The returned handles preserve request order. The worker executes this
@@ -896,20 +935,41 @@ impl NativeCommitClient {
         &self,
         batches: Vec<NativeCommitBatch>,
     ) -> Result<Vec<NativePendingCommit>, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
         let batches = batches
             .into_iter()
             .map(NativeCommitBatch::into_inner)
             .collect::<Vec<_>>();
         validate_explicit_cohort(&batches, self.maximum_explicit_cohort_size)?;
-        let batches = batches
-            .into_iter()
-            .map(NativeWriteBatch::retain_scheduler_queue_memory)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(GroupCommitSubmitError::runtime)?;
+        let retained_batches = {
+            let database_guard = self
+                .database
+                .read()
+                .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+            let database = database_guard
+                .as_ref()
+                .ok_or(GroupCommitSubmitError::Unavailable)?;
+            let mut retained_batches = Vec::with_capacity(batches.len());
+            for batch in batches {
+                database
+                    .validate_scheduled_cohort_batch(&batch, false)
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                let batch = batch
+                    .retain_scheduler_queue_memory()
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                database
+                    .validate_scheduled_cohort_batch(&batch, true)
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                retained_batches.push(batch);
+            }
+            retained_batches
+        };
         let submitted_at = Instant::now();
-        let mut requests = Vec::with_capacity(batches.len());
-        let mut pending = Vec::with_capacity(batches.len());
-        for batch in batches {
+        let mut requests = Vec::with_capacity(retained_batches.len());
+        let mut pending = Vec::with_capacity(retained_batches.len());
+        for batch in retained_batches {
             let control = NativeCommitControl::new();
             let state = Arc::clone(&control.state);
             let (response, receiver) = mpsc::sync_channel(1);

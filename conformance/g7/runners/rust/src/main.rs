@@ -5546,7 +5546,7 @@ enum CommitProducerCommand {
     Stop,
 }
 
-type PreparedCommitResult = Result<Vec<(usize, NativeDeltaWriteBatch)>, String>;
+type PreparedCommitResult = Result<Vec<(usize, NativeCommitBatch)>, String>;
 
 fn run_commit_producer(
     client: NativeCommitClient,
@@ -5582,6 +5582,9 @@ fn run_commit_producer(
                         strict_group_commit_value(sequence),
                         None,
                     )
+                    .map_err(|error| error.to_string())?;
+                let batch = client
+                    .retain_cohort_batch(batch)
                     .map_err(|error| error.to_string())?;
                 Ok((position, batch))
             })
@@ -5673,10 +5676,7 @@ fn measure_strict_group_commits(
                 {
                     return Err("strict group commit preparation lost canonical order".into());
                 }
-                let batches = prepared
-                    .into_iter()
-                    .map(|(_, batch)| NativeCommitBatch::from(batch))
-                    .collect();
+                let batches = prepared.into_iter().map(|(_, batch)| batch).collect();
                 let pending = cohort_client.enqueue_cohort(batches)?;
                 let outstanding = pending.len();
                 let completions = pending
@@ -7488,8 +7488,44 @@ mod tests {
         Ok(())
     }
 
+    fn strict_group_commit_mutation_cap_two_policy() -> NativeGovernorPolicy {
+        let memory_bytes = 128 * 1_024 * 1_024;
+        NativeGovernorPolicy {
+            schema: "hyphae-native-governor-policy-v1".to_owned(),
+            mode: hyphae_native_runtime::GovernorMode::Mixed,
+            hardware_fingerprint: "1".repeat(64),
+            calibration_cache_key: "2".repeat(64),
+            calibrated_worker_limit: 2,
+            reserved_system_threads: 0,
+            schedulable_compute_threads: 2,
+            io_slots: 2,
+            memory_bytes,
+            memory_headroom_percent: 15,
+            admission_queue_capacity: 64,
+            foreground_burst_limit: 16,
+            class_limits: [
+                WorkloadClass::ForegroundPoint,
+                WorkloadClass::ForegroundBounded,
+                WorkloadClass::Mutation,
+                WorkloadClass::Bulk,
+                WorkloadClass::Maintenance,
+                WorkloadClass::Recovery,
+                WorkloadClass::Administrative,
+            ]
+            .into_iter()
+            .map(|class| hyphae_native_runtime::GovernorClassLimit {
+                class,
+                compute_threads: 2,
+                io_slots: 2,
+                memory_bytes,
+            })
+            .collect(),
+        }
+    }
+
     #[test]
-    fn strict_group_commit_small_cohorts_survive_full_reopen() -> Result<(), Box<dyn Error>> {
+    fn strict_group_commit_small_cohorts_with_mutation_cap_two_survive_full_reopen()
+    -> Result<(), Box<dyn Error>> {
         const OBSERVATIONS: usize = 64;
         for concurrency in [1, 8, 32] {
             let root = std::env::temp_dir().join(format!(
@@ -7504,13 +7540,20 @@ mod tests {
             database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
             drop(database);
 
-            let baseline = NativeDatabase::open(&root)?;
+            let mut baseline = NativeDatabase::open(&root)?;
             let baseline_visible_csn = baseline
                 .recovery_report()
                 .visible_csn
                 .map(hyphae_native_types::Csn::get)
                 .ok_or("test baseline omitted its visible CSN")?;
             let baseline_committed_transactions = baseline.recovery_report().committed_transactions;
+            let governor = Arc::new(NativeResourceGovernor::new(
+                strict_group_commit_mutation_cap_two_policy(),
+            ));
+            baseline.set_resource_governor_with_queue_wait(
+                Arc::clone(&governor),
+                Duration::from_millis(100),
+            )?;
             let config = hyphae_native_runtime::GroupCommitConfig::new(
                 STRICT_GROUP_COMMIT_COHORT_WIDTH,
                 STRICT_GROUP_COMMIT_COLLECTION_WAIT,
@@ -7552,6 +7595,10 @@ mod tests {
             assert_eq!(reopen.missing_keys, 0);
             assert_eq!(reopen.mismatched_values, 0);
             assert_eq!(reopen.expected_state_digest, reopen.recovered_state_digest);
+            let usage = governor.usage_snapshot();
+            assert_eq!(usage.compute_threads, 0, "{usage:?}");
+            assert_eq!(usage.io_slots, 0, "{usage:?}");
+            assert_eq!(usage.memory_bytes, 0, "{usage:?}");
             fs::remove_dir_all(root)?;
         }
         Ok(())

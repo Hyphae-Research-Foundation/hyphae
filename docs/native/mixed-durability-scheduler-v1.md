@@ -95,8 +95,11 @@ returns `too late` and the waiter receives the definite commit or failure
 outcome even when its queue deadline has elapsed. There is no claim that a
 deadline bounds filesystem synchronization once persistence begins.
 
-Dropping a waiter is not cancellation. Once a request is `executing`, its
-database decision is independent of response delivery.
+Dropping a `NativePendingCommit` requests the same cancellation transition while
+its request is still `queued`. If that transition wins, the request is skipped
+without mutation. Once a request is `executing`, handle drop is too late: its
+database decision is independent of response delivery and must not be rolled
+back.
 
 ## Durability execution
 

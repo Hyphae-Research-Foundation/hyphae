@@ -36,14 +36,67 @@ full or the interval expires, whichever occurs first. A singleton cohort is
 valid and still receives one synchronization.
 
 The additive explicit-cohort path accepts between one and the configured
-maximum number of detached `group` batches in one call. It validates and
-retains every batch before inserting one indivisible FIFO command, returns one
+maximum number of detached `group` batches in one call. It validates every
+batch before inserting one indivisible FIFO command, returns one
 `NativePendingCommit` handle per request in input order, and never mixes that
 cohort with neighboring commands. Pre-insertion failure inserts nothing and
 produces no completion evidence. Although the transport uses one command, the
 submission gate reserves one queue-capacity unit per retained request. The
 worker releases those units when it claims the command, so an explicit cohort
 cannot multiply the configured request bound.
+
+### Explicit-cohort preparation boundary
+
+Concurrent preparation follows one linear ownership sequence:
+
+1. begin and stage each detached batch while its mutation permit owns bounded
+   compute, I/O, and memory;
+2. consume each fully staged batch with `NativeCommitClient::retain_cohort_batch`;
+3. collect the returned memory-only `NativeCommitBatch` values in canonical
+   request order; and
+4. pass the complete vector to `enqueue_cohort`, which performs the single
+   atomic queue insertion.
+
+`retain_cohort_batch` is a seal, not a submission. It checks that the scheduler
+still accepts work; that the batch belongs to the same database and governor
+authority; that its physical formats and mutation shape are valid and non-empty;
+and that it requests `group` durability. Foreign, non-`group`, malformed, or
+empty batches fail before queue insertion. The seal measures the exact retained
+batch memory from the engine-owned delta ledger or existing materialized
+allocation, reduces the mutation permit in place to
+`{compute: 0, io: 0, memory: measured}`, and revalidates that exact memory-only
+authority. It does not reacquire the governor, reserve queue capacity, stamp
+submission time, or create completion evidence. Sealing an already sealed batch
+is idempotent and must not expand its allocation.
+
+The returned `NativeCommitBatch` is opaque to further staging. This prevents a
+caller from adding mutations after releasing preparation resources. For
+compatibility, `enqueue_cohort` applies the same seal and validation to an
+unsealed input, but callers that prepare more batches than the mutation-class
+compute or I/O limit must seal each batch immediately after staging. The final
+enqueue revalidates every member against the scheduler authority before it
+constructs pending handles or attempts the one indivisible FIFO insertion.
+
+Ownership remains fail-closed across every pre-insertion exit:
+
+- a seal or enqueue validation error consumes and drops the rejected batch;
+- dropping a sealed but unqueued batch releases its retained memory and has no
+  database effect;
+- failure while assembling or atomically admitting a cohort drops every owned
+  batch, reserves no partial queue capacity, performs no mutation, and produces
+  no receipt; and
+- shutdown rejects a new seal or enqueue as unavailable. A batch retained by a
+  caller before shutdown remains caller-owned until it is dropped or its
+  rejected enqueue consumes it.
+
+After atomic insertion, dropping or explicitly cancelling a
+`NativePendingCommit` requests cancellation only while that request remains
+queued. A cancellation that wins consumes no transaction ID or CSN; the worker
+skips that member and dropping its batch releases the retained memory. Other
+live members remain one isolated cohort. Once execution claims a member,
+cancellation or handle drop cannot roll back its database decision. Shutdown
+stops new insertion and drains every live, uncancelled cohort ordered before its
+FIFO marker; queued cancelled members are skipped.
 
 Shutdown stops accepting new work, drains requests ordered before the shutdown
 marker, joins the worker, and closes the database handle. A worker-level
@@ -122,7 +175,8 @@ commits, submitted as full cohorts of 32 plus at most one final partial cohort.
 Configured producer concurrency (`1`, `8`, or `32`) controls preparation; it
 does not reduce the outstanding durable window. The runner measures the
 maximum simultaneously active producers instead of copying the configured
-value.
+value. Every producer seals each batch immediately after staging so one producer
+can prepare all 32 requests without retaining 32 compute or I/O allocations.
 
 The timed throughput window begins before cohort preparation and ends only
 after every pending completion in the window is durable. Per-request latency
@@ -165,6 +219,13 @@ Required executable evidence covers:
 - clean shutdown, post-shutdown rejection, and worker-failure unavailability;
 - explicit full and partial cohorts that remain isolated from neighboring FIFO
   commands and report one page and WAL synchronization;
+- memory-only sealing under producer concurrency `1`, `8`, and `32`, including
+  preparation of width 32 while the mutation class admits only two compute and
+  I/O allocations;
+- idempotent sealing plus rejection of foreign, non-`group`, empty, and
+  malformed batches without mutation, evidence, or resource leaks;
+- retained-batch drop, queued cancellation, pending-handle drop, admission
+  failure, and shutdown paths that release every owned allocation;
 - queue capacity charged by logical request, including an explicit cohort that
   fills the configured bound and prevents another admission until claim;
 - shutdown that drains an already accepted cohort after its bounded resource
