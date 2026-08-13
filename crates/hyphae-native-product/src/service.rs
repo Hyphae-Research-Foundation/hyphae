@@ -1672,7 +1672,11 @@ mod tests {
                 ProductResponse::StructureSet(_)
             ));
             let clients = (0..concurrency)
-                .map(|_| handle.open_session(test_principal(), ProductAuthorization::ALL))
+                .map(|_| {
+                    handle
+                        .open_session(test_principal(), ProductAuthorization::ALL)
+                        .map(Arc::new)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let hits_before = handle
                 .shared
@@ -1692,9 +1696,10 @@ mod tests {
             let start = Arc::new(std::sync::Barrier::new(concurrency + 1));
             let (completed, receive) = mpsc::sync_channel(concurrency);
             let mut workers = Vec::with_capacity(concurrency);
-            for (worker, client) in clients.into_iter().enumerate() {
+            for (worker, client) in clients.iter().enumerate() {
                 let start = Arc::clone(&start);
                 let completed = completed.clone();
+                let client = Arc::clone(client);
                 workers.push(thread::spawn(move || {
                     start.wait();
                     let result = (0..64_u128).try_for_each(|iteration| {
@@ -1735,6 +1740,7 @@ mod tests {
             for worker in workers {
                 worker.join().map_err(|_| "fast reader panicked")?;
             }
+            drop(clients);
             let classified = handle
                 .shared
                 .fast_structure_get_hits
