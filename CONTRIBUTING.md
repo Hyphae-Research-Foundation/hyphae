@@ -7,11 +7,10 @@ explicitly authorized.
 
 ## Branch flow
 
-`dev` is the default integration branch; every pull request targets `dev`.
-`main` is the protected release branch and only advances through a reviewed
-`dev`-to-`main` pull request once integration is green. Both branches require
-the complete hosted check suite; neither accepts direct pushes, force pushes,
-or deletions.
+`main` is the sole integration and release branch. Every pull request targets
+`main` and must pass the complete hosted check suite before merge. Direct
+pushes, force pushes, and branch deletion remain prohibited by repository
+protection; releases are tags on an exact, verified `main` commit.
 
 ## Development rules
 
