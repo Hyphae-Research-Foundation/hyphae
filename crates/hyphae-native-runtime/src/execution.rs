@@ -2631,28 +2631,23 @@ mod tests {
                 class: WorkloadClass::ForegroundBounded,
                 enqueued_at,
                 operation: Box::new(move || {
-                    let _ignored = stolen_worker_tx.send(
+                    let executed_at = Instant::now();
+                    let _ignored = stolen_worker_tx.send((
                         thread::current()
                             .name()
                             .unwrap_or("unnamed-worker")
                             .to_owned(),
-                    );
+                        executed_at,
+                    ));
                 }),
                 completed: Some(stolen_completed_tx),
                 targeted_completion: None,
             },
         );
-        assert!(matches!(
-            stolen_completed_rx.recv_timeout(steal_delay / 2),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
         assert!(stolen_completed_rx.recv_timeout(Duration::from_secs(2))?);
-        assert!(enqueued_at.elapsed() >= steal_delay);
-        assert!(
-            stolen_worker_rx
-                .recv_timeout(Duration::from_secs(2))?
-                .starts_with("hyphae-numa-0-")
-        );
+        let (stolen_worker, executed_at) = stolen_worker_rx.recv_timeout(Duration::from_secs(2))?;
+        assert!(executed_at.saturating_duration_since(enqueued_at) >= steal_delay);
+        assert!(stolen_worker.starts_with("hyphae-numa-0-"));
         let after = wake_returns(&pool);
         assert_eq!(after[0].saturating_sub(before[0]), 1);
         assert_eq!(after[1].saturating_sub(before[1]), 0);
